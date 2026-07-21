@@ -1165,6 +1165,132 @@ def test_authorize_retry_is_consumed_by_one_uncertain_attempt(tmp_path: Path) ->
     )
 
 
+def make_second_buy_attempt(
+    tmp_path: Path,
+) -> tuple[
+    FakeTrendSimClient,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    first_order = {
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "200",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    }
+    client.orders = [first_order]
+    retried = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+
+    assert retried["submitted_count"] == 1
+    return client, arguments, first_order, client.orders[-1]
+
+
+def test_old_terminal_order_does_not_mask_latest_attempt_absence(
+    tmp_path: Path,
+) -> None:
+    client, arguments, first_order, _ = make_second_buy_attempt(tmp_path)
+    client.orders = [first_order]
+
+    blocked = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:33:00+08:00"
+    )
+
+    assert blocked["status"] == "uncertain"
+    assert blocked["submitted_count"] == 0
+    assert len(client.requests) == 2
+
+
+def test_latest_attempt_authorization_records_and_consumes_exact_attempt(
+    tmp_path: Path,
+) -> None:
+    client, arguments, first_order, _ = make_second_buy_attempt(tmp_path)
+    client.orders = [first_order]
+    assert trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:33:00+08:00"
+    )["status"] == "uncertain"
+
+    resolution_path = trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="authorize-retry",
+        actor="ray",
+        reason="broker confirmed no second order",
+        resolved_at="2026-07-20T09:40:00+08:00",
+    )
+    resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+    retried = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:41:00+08:00"
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+
+    assert resolution["attempt_no"] == 2
+    assert retried["submitted_count"] == 1
+    assert client.requests[-1]["remark"] == trend_review.trend_attempt_remark(
+        "CN", "2026-07-20", action_key, 3
+    )
+
+
+def test_uncertain_attempt_rejects_a_second_resolution(tmp_path: Path) -> None:
+    client, arguments, first_order, second_order = make_second_buy_attempt(tmp_path)
+    client.orders = [
+        first_order,
+        {**second_order, "order_status": "UNKNOWN"},
+    ]
+    assert trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:33:00+08:00"
+    )["status"] == "uncertain"
+    first = trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="authorize-retry",
+        actor="ray",
+        reason="broker checked",
+        resolved_at="2026-07-20T09:40:00+08:00",
+    )
+
+    with pytest.raises(ValueError, match="already resolved"):
+        trend_review.resolve_trend_action(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+            resolution="authorize-retry",
+            actor="ray",
+            reason="duplicate approval",
+            resolved_at="2026-07-20T09:41:00+08:00",
+        )
+
+    assert len(list(first.parent.glob("*.json"))) == 1
+
+
 def test_legacy_intent_is_discovered_by_symbol_and_side(tmp_path: Path) -> None:
     request = {
         "market": "CN",

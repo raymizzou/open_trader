@@ -834,6 +834,7 @@ def _action_resolutions(
             raise ValueError(f"invalid trend action resolution: {path}") from exc
         resolution = payload.get("resolution")
         order_id = payload.get("futu_order_id")
+        attempt_no = payload.get("attempt_no")
         if (
             payload.get("schema_version")
             != "open_trader.trend_review.resolution.v1"
@@ -843,6 +844,9 @@ def _action_resolutions(
             or payload.get("symbol") != symbol
             or payload.get("futu_code") != futu_code
             or payload.get("side") != side
+            or not isinstance(attempt_no, int)
+            or isinstance(attempt_no, bool)
+            or attempt_no <= 0
             or resolution not in RESOLUTION_STATUSES
             or payload.get("status") != RESOLUTION_STATUSES.get(resolution)
             or not str(payload.get("actor") or "").strip()
@@ -909,36 +913,10 @@ def resolve_trend_action(
         / execution_date
         / action_key
     )
-    payload = {
-        "schema_version": "open_trader.trend_review.resolution.v1",
-        "market": market,
-        "execution_date": execution_date,
-        "action_key": action_key,
-        "symbol": symbol,
-        "futu_code": futu_code,
-        "side": side,
-        "resolution": resolution,
-        "status": RESOLUTION_STATUSES[resolution],
-        "actor": actor,
-        "reason": reason,
-        "futu_order_id": order_id if resolution == "confirm-submitted" else None,
-        "resolved_at": resolved_at,
-    }
-    body = _canonical_json_bytes(payload)
-    path = (
-        action_root
-        / "resolutions"
-        / (
-            f"{resolved_at.replace(':', '-')}-"
-            f"{hashlib.sha256(body).hexdigest()[:12]}.json"
-        )
-    )
     action_root.mkdir(parents=True, exist_ok=True)
     lock = os.open(action_root / ".resolution.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if path.exists() and path.read_bytes() == body:
-            return path
         resolutions = _action_resolutions(
             action_root,
             market=market,
@@ -958,25 +936,52 @@ def resolve_trend_action(
             futu_code=futu_code,
             side=side,
         )
-        attempt = max((item[3] for item in facts), default=0)
-        authorized = sum(
-            item.get("resolution") == "authorize-retry" for item in resolutions
-        )
-        uncertain = any(
-            event.get("status") == "uncertain"
-            and int(event.get("attempt") or 1) == attempt
+        action_attempt = max((item[3] for item in facts), default=0)
+        resolved_attempts = {
+            int(item["attempt_no"])
+            for item in resolutions
+        }
+        unresolved_attempts = {
+            int(event.get("attempt") or 1)
             for event in _action_events(action_root)
-        )
+            if event.get("status") == "uncertain"
+            and int(event.get("attempt") or 1) not in resolved_attempts
+        }
+        attempt_no = max(unresolved_attempts, default=0)
         if (
-            not attempt
-            or not uncertain
-            or authorized >= attempt
+            not attempt_no
+            or attempt_no != action_attempt
             or any(
                 item.get("resolution") in {"confirm-submitted", "abandon"}
                 for item in resolutions
             )
         ):
             raise ValueError("trend action is not uncertain or is already resolved")
+        payload = {
+            "schema_version": "open_trader.trend_review.resolution.v1",
+            "market": market,
+            "execution_date": execution_date,
+            "action_key": action_key,
+            "symbol": symbol,
+            "futu_code": futu_code,
+            "side": side,
+            "attempt_no": attempt_no,
+            "resolution": resolution,
+            "status": RESOLUTION_STATUSES[resolution],
+            "actor": actor,
+            "reason": reason,
+            "futu_order_id": order_id if resolution == "confirm-submitted" else None,
+            "resolved_at": resolved_at,
+        }
+        body = _canonical_json_bytes(payload)
+        path = (
+            action_root
+            / "resolutions"
+            / (
+                f"{resolved_at.replace(':', '-')}-"
+                f"{hashlib.sha256(body).hexdigest()[:12]}.json"
+            )
+        )
         return _write_immutable(path, body)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -1307,9 +1312,11 @@ def execute_trend_review_open(
             futu_code=futu_code,
             side=side,
         )
-        authorized_retries = sum(
-            item.get("resolution") == "authorize-retry" for item in resolutions
-        )
+        authorized_attempts = {
+            int(item["attempt_no"])
+            for item in resolutions
+            if item.get("resolution") == "authorize-retry"
+        }
         action_facts = _action_facts(root, futu_code=futu_code, side=side)
         buy_window_event = None
         if action_name == "BUY" and symbol not in sell_symbols:
@@ -1410,7 +1417,7 @@ def execute_trend_review_open(
                     item[0]
                     for item in action_facts
                     if not _result_path(item[0]).exists()
-                    and item[3] > authorized_retries
+                    and item[3] not in authorized_attempts
                 ),
                 None,
             )
@@ -1570,33 +1577,33 @@ def execute_trend_review_open(
                     )
                 ]
                 latest_attempt = max(item[3] for item in action_facts)
-                ambiguous_attempt = next(
-                    (
-                        remark
-                        for remark, candidates in requests_by_remark.items()
-                        if len(
-                            {
-                                str(order.get("order_id") or f"missing-{position}")
-                                for position, order in enumerate(orders)
-                                if str(order.get("remark") or "") == remark
-                                and any(
-                                    _order_has_action_identity(order, candidate)
-                                    for candidate in candidates
-                                )
-                            }
-                        )
-                        > 1
-                    ),
-                    None,
-                )
+                latest_requests = [
+                    intent_request
+                    for _, _, intent_request, attempt_no in action_facts
+                    if attempt_no == latest_attempt
+                ]
+                latest_matched = [
+                    order
+                    for order in orders
+                    if any(
+                        str(order.get("remark") or "")
+                        == str(candidate.get("remark") or "")
+                        and _order_has_action_identity(order, candidate)
+                        for candidate in latest_requests
+                    )
+                ]
+                latest_order_ids = {
+                    str(order.get("order_id") or f"missing-{position}")
+                    for position, order in enumerate(latest_matched)
+                }
                 position_zero = action_name == "SELL_ALL" and sell_quantity <= 0
                 inconclusive_reason = (
                     "broker action attempt is ambiguous"
-                    if ambiguous_attempt is not None
+                    if len(latest_order_ids) > 1
                     else "broker order status is absent"
-                    if not matched
+                    if not latest_matched
                     and not position_zero
-                    and authorized_retries < latest_attempt
+                    and latest_attempt not in authorized_attempts
                     else None
                 )
                 if inconclusive_reason is not None:
@@ -1734,13 +1741,11 @@ def execute_trend_review_open(
                         recorded_at=now,
                     )
                     continue
-                if not matched and not position_zero and authorized_retries == 0:
-                    continue
                 broker_statuses = {
                     str(order.get("order_status") or order.get("status") or "")
                     .strip()
                     .upper()
-                    for order in matched
+                    for order in latest_matched
                 }
                 if broker_statuses & ACTIVE_ORDER_STATUSES:
                     continue
