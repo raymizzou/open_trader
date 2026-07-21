@@ -191,6 +191,26 @@ def _expected_cn_holdings(expected_root: Path) -> int:
     )
 
 
+def _trend_execution_batch_errors(payload: Mapping[str, Any]) -> list[str]:
+    reports = payload.get("trend_reports")
+    if not isinstance(reports, Mapping):
+        return []
+    errors: list[str] = []
+    for broker in TREND_SIMULATE_MARKETS:
+        report = reports.get(broker)
+        if not isinstance(report, Mapping) or report.get(
+            "execution_batch_blocking"
+        ) is not True:
+            continue
+        reason = str(
+            report.get("execution_batch_error")
+            or report.get("status_text")
+            or "执行批次状态未知"
+        )
+        errors.append(f"{broker} 当前趋势报告执行批次阻断：{reason}")
+    return errors
+
+
 def validate_dashboard_payload(
     payload: dict[str, Any], *, expected_cn: int,
     expected_eastmoney_cny: Decimal | None = None,
@@ -303,6 +323,7 @@ def validate_dashboard_payload(
                 )
     if "tiger_" + "long_term_strategy" in payload:
         errors.append("Dashboard API 仍包含已退役策略")
+    errors.extend(_trend_execution_batch_errors(payload))
     return errors
 
 
@@ -1088,6 +1109,8 @@ def _check_trend_account_views(
         and isinstance(reviews, Mapping)
         and isinstance(controllers, Mapping)
     )
+    batch_errors = _trend_execution_batch_errors(payload)
+    assert not batch_errors, "；".join(batch_errors)
     for broker in TREND_SIMULATE_MARKETS:
         section = _select_account_tab(page, broker)
         _check_account_view_contract(page, section, broker)

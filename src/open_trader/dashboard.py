@@ -1374,22 +1374,57 @@ def _project_broker_trend_report(
                 )
                 execution_batch = batch
                 revision_anomaly = batch["report_sha256"] != latest_report_sha256
+    if execution_batch_error:
+        return {
+            "available": False,
+            "data_status": "unavailable",
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "status_text": execution_batch_error,
+            "execution_batch": None,
+            "execution_batch_blocking": True,
+            "execution_batch_error": execution_batch_error,
+            "artifact": "",
+            "report_sha256": "",
+            "latest_report_sha256": "",
+            "revision_anomaly": False,
+            "strategy_version": "",
+            "report_date": "",
+            "data_date": "",
+            "generated_at": "",
+            "option_attention": [],
+            "account_source_date": "",
+            "account_fresh": False,
+            "account_status": "",
+            "buy_window": buy_window,
+            "run_status": "",
+            "sell_actions": [],
+            "buy_actions": [],
+            "hold_actions": [],
+            "review_actions": [],
+            "risk_skips": [],
+            "risk_summary": {},
+            "drawdown_summary": {},
+            "actual_overlay": {},
+            "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+            "recent_protection_alert": None,
+            "audit": {},
+        }
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
     account = payload["account"]
     metadata = payload["metadata"]
     report_sha256 = _report_hash(payload)
-    if execution_batch_error:
-        sell_actions, buy_actions, hold_actions, review_actions = [], [], [], []
-    else:
-        executions = _trend_action_executions(
-            data_dir,
-            market=market,
-            execution_date=execution_date.isoformat(),
-            report_sha256=report_sha256,
-        )
-        sell_actions, buy_actions, hold_actions, review_actions = (
-            _project_trend_actions(payload, executions)
-        )
+    executions = _trend_action_executions(
+        data_dir,
+        market=market,
+        execution_date=execution_date.isoformat(),
+        report_sha256=report_sha256,
+    )
+    sell_actions, buy_actions, hold_actions, review_actions = (
+        _project_trend_actions(payload, executions)
+    )
     account_fresh = account.get("fresh") is True
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})

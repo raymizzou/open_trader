@@ -148,7 +148,10 @@ def test_dashboard_preserves_terminal_trend_action_status(
 def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     tmp_path: Path,
 ) -> None:
-    from open_trader.dashboard import load_dashboard_state
+    from open_trader.dashboard import (
+        load_dashboard_state,
+        load_historical_trend_report,
+    )
     from open_trader.trend_review import _report_hash
 
     config = replace(dashboard_config(tmp_path), trend_executor_host="")
@@ -206,13 +209,47 @@ def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     batch.write_text(json.dumps(invalid_batch), encoding="utf-8")
     report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
 
+    assert report["available"] is False
+    assert report["data_status"] == "unavailable"
     assert report["execution_batch"] is None
     assert report["execution_batch_blocking"] is True
     assert report["execution_batch_error"] == "执行批次无效，已阻止操作投影"
-    assert report["buy_actions"] == []
-    assert report["sell_actions"] == []
-    assert report["hold_actions"] == []
-    assert report["review_actions"] == []
+    assert report["status_text"] == report["execution_batch_error"]
+    assert report["artifact"] == ""
+    assert report["report_sha256"] == ""
+    assert report["latest_report_sha256"] == ""
+    assert report["risk_skips"] == []
+    assert report["risk_summary"] == {}
+    assert report["drawdown_summary"] == {}
+    assert report["actual_overlay"] == {}
+    assert report["audit"] == {}
+    assert report["counts"] == {"sell": 0, "buy": 0, "hold": 0, "review": 0}
+    assert all(
+        report[key] == []
+        for key in ("sell_actions", "buy_actions", "hold_actions", "review_actions")
+    )
+
+    historical = load_historical_trend_report(
+        config.data_dir,
+        config.reports_dir,
+        broker="tiger",
+        artifact="2026-07-17-r1.json",
+    )
+
+    assert historical["available"] is True
+    assert historical["artifact"] == "2026-07-17-r1.json"
+    assert historical["execution_batch_blocking"] is False
+    assert historical["buy_actions"][0]["symbol"] == "REVISION"
+
+    batch.unlink()
+    current_without_batch = load_dashboard_state(config).to_dict()["trend_reports"][
+        "tiger"
+    ]
+
+    assert current_without_batch["available"] is True
+    assert current_without_batch["artifact"] == "2026-07-17-r1.json"
+    assert current_without_batch["execution_batch_blocking"] is False
+    assert current_without_batch["buy_actions"][0]["symbol"] == "REVISION"
 
 
 @pytest.mark.parametrize(
@@ -272,9 +309,19 @@ def test_dashboard_fails_closed_when_existing_execution_batch_is_invalid(
 
     report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
 
+    assert report["available"] is False
+    assert report["data_status"] == "unavailable"
     assert report["execution_batch"] is None
     assert report["execution_batch_blocking"] is True
     assert report["execution_batch_error"] == "执行批次无效，已阻止操作投影"
+    assert report["artifact"] == ""
+    assert report["report_sha256"] == ""
+    assert report["latest_report_sha256"] == ""
+    assert report["risk_skips"] == []
+    assert report["risk_summary"] == {}
+    assert report["drawdown_summary"] == {}
+    assert report["actual_overlay"] == {}
+    assert report["audit"] == {}
     assert report["counts"] == {"sell": 0, "buy": 0, "hold": 0, "review": 0}
     assert all(
         report[key] == []
@@ -3335,10 +3382,12 @@ if(!renderTrendReportWorkspace(report).includes("report_locked"))throw new Error
 state.dashboard.trend_controllers.tiger={...healthy,last_success:null};
 if(!renderTrendReportWorkspace(report).includes("<dt>最近成功</dt><dd>—</dd>"))throw new Error("null last_success");
 state.dashboard.trend_controllers.tiger=healthy;
-const batchBlocked=renderTrendReportWorkspace({...report,
-  execution_batch:null,execution_batch_blocking:true,
-  execution_batch_error:"执行批次无效，已阻止操作投影",counts:{buy:0},
-  sell_actions:[],buy_actions:[],hold_actions:[],review_actions:[]});
+state.dashboard.trend_reports={tiger:{available:false,data_status:"unavailable",
+  broker:"tiger",execution_batch:null,execution_batch_blocking:true,
+  execution_batch_error:"执行批次无效，已阻止操作投影",
+  status_text:"执行批次无效，已阻止操作投影",counts:{buy:0},
+  sell_actions:[],buy_actions:[],hold_actions:[],review_actions:[]}};
+const batchBlocked=renderEmbeddedTrendReport("tiger");
 if(!batchBlocked.includes('class="trend-execution-batch-error"') ||
    !batchBlocked.includes("执行批次无效，已阻止操作投影") ||
    !batchBlocked.includes('class="trend-controller-status"') ||

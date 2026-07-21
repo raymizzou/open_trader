@@ -2405,6 +2405,41 @@ def test_acceptance_checks_readable_mapping_last_success_fields() -> None:
     )
 
 
+def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert controller["health"] == "healthy"  # type: ignore[index]
+    report.update({  # type: ignore[union-attr]
+        "available": False,
+        "data_status": "unavailable",
+        "execution_batch": None,
+        "execution_batch_blocking": True,
+        "execution_batch_error": "执行批次无效，已阻止操作投影",
+        "status_text": "执行批次无效，已阻止操作投影",
+        "artifact": "",
+        "report_sha256": "",
+        "sell_actions": [],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "risk_skips": [],
+        "risk_summary": {},
+        "audit": {},
+        "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+    })
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert errors == [
+        "tiger 当前趋势报告执行批次阻断：执行批次无效，已阻止操作投影"
+    ]
+    with pytest.raises(AssertionError, match="tiger.*执行批次无效"):
+        dashboard_acceptance._check_trend_account_views(
+            object(), payload, {}, {}
+        )
+
+
 def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     class Locator:
         def __init__(self, selector: str = "audit") -> None:

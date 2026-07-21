@@ -3134,9 +3134,11 @@ function renderEmbeddedTrendReport(broker) {
   const history = state.trendReportHistories[broker];
   if (history?.open) return renderTrendReportHistory(broker, history);
   const report = state.dashboard?.trend_reports?.[broker] || {};
-  return report.available
-    ? renderTrendReportWorkspace(report, true)
-    : `${renderTrendControllerStatus(broker)}<p class="account-empty">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
+  if (report.available) return renderTrendReportWorkspace(report, true);
+  const statusClass = report.execution_batch_blocking === true
+    ? "trend-execution-batch-error"
+    : "account-empty";
+  return `${renderTrendControllerStatus(broker)}<p class="${statusClass}">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
 }
 
 function renderTrendReportHistory(broker, history) {
