@@ -1389,11 +1389,15 @@ def _cycle_to_reconcile(
     now: datetime,
 ) -> ControllerCycle:
     durable = _durable_report_cycles(config, cycle, now)
+    completion: dict[str, bool] = {}
     if durable:
-        completion = {
-            item.execution_date: _execution_completed(config, item)
-            for item in durable
-        }
+        for item in durable:
+            try:
+                completion[item.execution_date] = _execution_completed(
+                    config, item
+                )
+            except ValueError:
+                completion[item.execution_date] = False
         unfinished = [
             item for item in durable if not completion[item.execution_date]
         ]
@@ -1428,7 +1432,10 @@ def _cycle_to_reconcile(
     for _ in range(10):
         if cursor.execution_date >= cycle.execution_date:
             return cycle
-        if not _execution_completed(config, cursor):
+        if cursor.execution_date in completion:
+            if not completion[cursor.execution_date]:
+                return cursor
+        elif not _execution_completed(config, cursor):
             return cursor
         execution = date.fromisoformat(cursor.execution_date)
         local = now.astimezone(TIMEZONES[cycle.market])
@@ -1475,8 +1482,11 @@ def run_trend_market_controller(
         )
 
     if revision:
-        initial_cycle = _derive_cycle(config, market, initial_now)
-        _request_revision(config, initial_cycle, initial_now)
+        current_cycle = _derive_cycle(config, market, initial_now)
+        revision_cycle = _cycle_to_reconcile(
+            config, current_cycle, initial_now
+        )
+        _request_revision(config, revision_cycle, initial_now)
 
     lock_path = config.data_dir / "runs" / f".trend_market_controller.{market}.lock"
     try:
@@ -1491,7 +1501,7 @@ def run_trend_market_controller(
                 phase="revision_requested",
                 last_success=None,
                 blocker=None,
-                next_check_at=initial_cycle.next_check_at,
+                next_check_at=revision_cycle.next_check_at,
             )
         raise
 

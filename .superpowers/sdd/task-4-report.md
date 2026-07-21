@@ -50,6 +50,11 @@ Implemented Task 4 on `feat/trend-market-controller-spec` from baseline
   not from ambient request state.
 - Malformed or invalid frozen reports fail closed and require an explicit
   revision; a pending revision may replace that artifact before execution.
+- Completion-validation errors retain their durable cycle as unfinished, so an
+  invalid historical report or batch remains the oldest catch-up blocker.
+  Explicit revision uses that same oldest-first selection before publishing a
+  request; it cannot accidentally request the current cycle while history is
+  blocked, and an existing historical execution batch still rejects revision.
 - Revision request creation and first batch lock share a per-execution-date
   gate, closing the request-versus-batch TOCTOU race.
 - Every revision request freezes its baseline path, byte SHA, and revision
@@ -155,24 +160,34 @@ control. Strengthening the concurrency test then reproduced three stale-inode
 failures before the waiting `RunLock` verified that its descriptor still
 matched the current lock path.
 
+The historical-revision regression first ran RED in two independent cases:
+completion validation raised before the invalid historical batch could be
+selected, and `run --revision` wrote the current cycle's request while an
+invalid historical r2 remained blocked. The fix retains validation failures as
+unfinished selection facts and routes explicit revision through the same
+oldest-first selector. A filesystem-backed persistent-loop test now proves the
+historical r2 request is durable while the controller lock is held, becomes a
+strictly bound r3 completion after lock release, executes once, and never
+creates a request for the current cycle.
+
 ### Final automated verification
 
 Controller tests:
 
 ```text
-66 passed in 4.30s
+68 passed in 4.48s
 ```
 
-Task-required controller/report/watcher/ledger suite:
+Focused report suites:
 
 ```text
-534 passed in 5.90s
+293 passed in 1.23s
 ```
 
 Full repository suite:
 
 ```text
-2865 passed in 47.50s
+2900 passed in 57.02s
 ```
 
 Static checks:

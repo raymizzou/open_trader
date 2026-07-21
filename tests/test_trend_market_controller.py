@@ -7,7 +7,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1583,6 +1583,147 @@ def test_multi_session_outage_reconciles_oldest_unfinished_cycle_first(
     assert controller._cycle_to_reconcile(config, current, now) == second_missing
 
 
+def test_invalid_historical_batch_remains_selected_but_cannot_be_revised(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    historical = active_cn_cycle()
+    current = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="morning",
+        market_open=True,
+        next_check_at=NOW + timedelta(seconds=5),
+    )
+    report_path, report = write_report(config, revision=2)
+    lock_trend_execution_batch(
+        config.data_dir,
+        market=historical.market,
+        execution_date=historical.execution_date,
+        report_path=report_path,
+        report=report,
+        locked_at=NOW.isoformat(),
+    )
+    report["schema_version"] = 999
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    selected = controller._cycle_to_reconcile(config, current, NOW)
+
+    assert selected.as_of_date == historical.as_of_date
+    assert selected.execution_date == historical.execution_date
+    with pytest.raises(ValueError, match="execution has begun"):
+        controller._request_revision(config, selected, NOW)
+    request_path, _ = controller._revision_paths(
+        config, selected.market, selected.as_of_date
+    )
+    assert not request_path.exists()
+
+
+def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    historical = active_cn_cycle()
+    current = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+        session="morning",
+        market_open=True,
+        next_check_at=NOW + timedelta(seconds=5),
+    )
+    invalid_path, invalid = write_report(config, revision=2)
+    invalid["schema_version"] = 999
+    invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: current)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args: protection_success()
+    )
+
+    blocked = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+    assert blocked["phase"] == "blocked"
+    assert "run --revision" in str(blocked["blocker"])
+
+    controller_lock = config.data_dir / "runs/.trend_market_controller.CN.lock"
+    with RunLock(controller_lock):
+        requested = run_trend_market_controller(
+            config, "CN", revision=True, once=True, now_fn=lambda: NOW
+        )
+
+    historical_request, historical_completion = controller._revision_paths(
+        config, historical.market, historical.as_of_date
+    )
+    current_request, _ = controller._revision_paths(
+        config, current.market, current.as_of_date
+    )
+    request = json.loads(historical_request.read_text(encoding="utf-8"))
+    assert requested["phase"] == "revision_requested"
+    assert request["execution_date"] == historical.execution_date
+    assert request["baseline_report_path"] == str(invalid_path)
+    assert request["baseline_revision"] == 2
+    assert not current_request.exists()
+
+    generated: list[tuple[str, bool]] = []
+    generated_ready = threading.Event()
+
+    def generate(
+        _config: DailyPremarketConfig,
+        _market: str,
+        run_date: str,
+        revision: bool,
+    ) -> None:
+        generated.append((run_date, revision))
+        r3_path, r3 = write_report(config, revision=3)
+        write_report_delivery_receipt(config, r3_path, r3, status="sent")
+        generated_ready.set()
+
+    def capture_close(
+        _config: DailyPremarketConfig, market: str, trading_date: str
+    ) -> None:
+        fact = controller._close_path(config, market, trading_date)
+        fact.parent.mkdir(parents=True, exist_ok=True)
+        fact.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+
+    def stop_after_reconcile(_seconds: float) -> None:
+        if controller._batch_path(
+            config, historical.market, historical.execution_date
+        ).exists():
+            raise RuntimeError("historical cycle reconciled")
+        assert generated_ready.wait(timeout=1)
+
+    with pytest.raises(RuntimeError, match="historical cycle reconciled"):
+        run_trend_market_controller(
+            config,
+            "CN",
+            once=False,
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_reconcile,
+        )
+
+    completion = json.loads(historical_completion.read_text(encoding="utf-8"))
+    completed_report = Path(str(completion["report_path"]))
+    assert load_trend_market_status(config, "CN", now=NOW)["blocker"] is None
+    assert generated == [(historical.report_run_date, True)]
+    assert completed_report.name == "2026-07-17-r3.json"
+    assert completion["request_sha256"] == hashlib.sha256(
+        historical_request.read_bytes()
+    ).hexdigest()
+    assert completion["report_sha256"] == _report_hash(
+        json.loads(completed_report.read_text(encoding="utf-8"))
+    )
+    assert controller._execution_completed(config, historical) is True
+    assert controller._cycle_to_reconcile(config, current, NOW) == current
+
+
 def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1607,9 +1748,15 @@ def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
         "execution_date": "2026-07-20",
     } == json.loads(request_path.read_text(encoding="utf-8"))
 
-    report_path, report = write_report(config)
+    next_config = controller_config(tmp_path / "next")
+    report_path = next_config.reports_dir / "trend_a_share/2026-07-20.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = valid_cn_report(
+        as_of_date="2026-07-20", execution_date="2026-07-21"
+    )
+    report_path.write_text(json.dumps(report), encoding="utf-8")
     lock_trend_execution_batch(
-        config.data_dir,
+        next_config.data_dir,
         market="CN",
         execution_date="2026-07-21",
         report_path=report_path,
@@ -1628,7 +1775,7 @@ def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
     monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: next_cycle)
     with pytest.raises(ValueError, match="execution has begun"):
         run_trend_market_controller(
-            config, "CN", revision=True, once=True, now_fn=lambda: NOW
+            next_config, "CN", revision=True, once=True, now_fn=lambda: NOW
         )
 
 

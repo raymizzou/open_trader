@@ -114,6 +114,12 @@ Ordinary premarket automation is unchanged by this work.
   evidence. A revision frozen after the request is recovered in place after a
   crash; a revision already present before the request is the baseline and
   therefore cannot satisfy it. A newer report with no receipt remains pending.
+- Explicit revision resolves the same oldest unfinished cycle as normal
+  reconciliation before publishing its request. A malformed historical report
+  or batch therefore remains the blocking catch-up target instead of silently
+  redirecting the correction to the current cycle. If that historical cycle
+  already has an execution batch, revision is rejected even when validation of
+  the batch or its report fails.
 - Revision baseline capture and immutable request publication hold the same
   per-market report lock used by the real report runner. Lock order is revision
   gate followed by report lock, and request creation occurs before the
@@ -219,6 +225,11 @@ Ordinary premarket automation is unchanged by this work.
 - Verify a revision request waits for the real CN/HK/US report lock, captures a
   report frozen by the prior holder as its baseline, and can only complete with
   r1 or later.
+- Verify an invalid historical rN remains the oldest unfinished catch-up cycle,
+  `run --revision` publishes a request for that historical identity while the
+  controller lock is held, and the persistent loop later completes it only
+  with a strictly receipt-bound rN+1. Verify no request is published for the
+  current cycle and no revision is allowed once a historical batch exists.
 - Verify that a report recovered during an active session does not interrupt protection monitoring.
 - Verify real CN/HK/US one-pass watcher failures return `abnormal` without
   sleeping, while persistent standalone watcher mode retains reconnect
