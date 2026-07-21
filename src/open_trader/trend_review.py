@@ -293,6 +293,97 @@ def _report_hash(report: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json_bytes(report)).hexdigest()
 
 
+def _protection_report(symbol: str, event_id: str) -> dict[str, object]:
+    return {
+        "strategy_snapshot": {"strategy_version": "protection-v1"},
+        "strategy_judgments": {
+            "formal_actions": [
+                {
+                    "action": "SELL_ALL",
+                    "symbol": symbol,
+                    "event_id": event_id,
+                    "reason": "protection_event",
+                }
+            ]
+        },
+    }
+
+
+def _protection_event_identity(
+    event: Mapping[str, object],
+    *,
+    market: str,
+    execution_date: str,
+    action_key: str,
+) -> tuple[str, int, str] | None:
+    if (
+        event.get("status") != "reason_added"
+        or event.get("strategy_version") != "protection-v1"
+    ):
+        return None
+    symbol = str(event.get("symbol") or "").strip()
+    event_id = str(event.get("reason_id") or "").strip()
+    futu_code = str(event.get("futu_code") or "").strip().upper()
+    try:
+        recorded_at = datetime.fromisoformat(str(event["recorded_at"]))
+        from .futu_symbols import to_futu_symbol
+
+        expected_futu_code = to_futu_symbol(market, symbol)
+    except (KeyError, TypeError, ValueError):
+        return None
+    report_sha = _report_hash(_protection_report(symbol, event_id))
+    if (
+        not symbol
+        or not event_id
+        or event.get("market") != market
+        or event.get("date") != execution_date
+        or event.get("action_index") != 0
+        or event.get("side") != "sell"
+        or event.get("reason") != "protection_event"
+        or futu_code != expected_futu_code
+        or action_key
+        != trend_action_key(market, execution_date, futu_code, "sell")
+        or event.get("report_sha256") != report_sha
+        or recorded_at.tzinfo is None
+        or recorded_at.utcoffset() is None
+    ):
+        return None
+    return report_sha, 0, "protection-v1"
+
+
+def _protection_fact_identities(
+    data_dir: Path, *, market: str, execution_date: str
+) -> set[tuple[str, str, str]]:
+    identities: set[tuple[str, str, str]] = set()
+    actions_root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+    )
+    for action_root in sorted(actions_root.glob("*")):
+        if not action_root.is_dir():
+            continue
+        for event in _action_events(action_root):
+            identity = _protection_event_identity(
+                event,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_root.name,
+            )
+            if identity is not None:
+                identities.add(
+                    (
+                        identity[0],
+                        str(event["futu_code"]).strip().upper(),
+                        "sell",
+                    )
+                )
+    return identities
+
+
 def _result_path(intent_path: Path) -> Path:
     return intent_path.with_name(intent_path.name.replace("-intent", "-result"))
 
@@ -440,6 +531,9 @@ def lock_trend_execution_batch(
             existing, market=market, execution_date=execution_date
         )
     legacy_facts: list[tuple[datetime, str]] = []
+    protection_facts = _protection_fact_identities(
+        data_dir, market=market, execution_date=execution_date
+    )
     ledger_root = (
         data_dir
         / "trend_review"
@@ -458,8 +552,13 @@ def lock_trend_execution_batch(
                 if fact_path.name.endswith("-result.json")
                 else "created_at"
             )
-            if timestamp_field == "submitted_at":
+            request = (
                 _result_request(fact_path, fact)
+                if timestamp_field == "submitted_at"
+                else fact["request"]
+            )
+            if not isinstance(request, Mapping):
+                raise TypeError
             created_at = datetime.fromisoformat(str(fact[timestamp_field]))
             report_sha = fact["report_sha256"]
         except (
@@ -483,7 +582,35 @@ def lock_trend_execution_batch(
             raise ValueError(
                 f"trend execution batch is blocked by invalid ledger fact: {fact_path}"
             )
-        legacy_facts.append((created_at, report_sha))
+        fact_identity = (
+            report_sha,
+            str(request.get("futu_code") or "").strip().upper(),
+            str(request.get("side") or "").strip().lower(),
+        )
+        exact_protection_fact = False
+        if fact_identity in protection_facts:
+            try:
+                quantity = _required_decimal(request.get("qty"), "target quantity")
+                attempt = _ledger_fact_attempt(fact_path, fact, request)
+                action_key = trend_action_key(
+                    market, execution_date, fact_identity[1], fact_identity[2]
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                exact_protection_fact = (
+                    fact.get("market") == market
+                    and fact.get("date") == execution_date
+                    and fact.get("action_index") == 0
+                    and request.get("market") == market
+                    and request.get("remark")
+                    == trend_attempt_remark(
+                        market, execution_date, action_key, attempt
+                    )
+                    and quantity > 0
+                )
+        if not exact_protection_fact:
+            legacy_facts.append((created_at, report_sha))
     selected_path = report_path
     selected_sha = _report_hash(report)
     if legacy_facts:
@@ -1054,6 +1181,7 @@ def _strict_action_facts(
     report_sha: str,
     action_index: int,
     strategy_version: str,
+    protection_identities: set[tuple[str, int, str]],
 ) -> tuple[list[Mapping[str, object]], set[str]]:
     requests: list[Mapping[str, object]] = []
     result_order_ids: set[str] = set()
@@ -1063,6 +1191,10 @@ def _strict_action_facts(
         )
     ).hexdigest()
     legacy_remark = f"trend-review:{market}:{execution_date}:{legacy_key[:24]}"
+    allowed_fact_identities = {
+        (report_sha, action_index),
+        *((item[0], item[1]) for item in protection_identities),
+    }
     for path, payload, request, attempt in facts:
         timestamp_name = (
             "submitted_at" if path.name.endswith("-result.json") else "created_at"
@@ -1077,11 +1209,14 @@ def _strict_action_facts(
             if attempt == 1
             else f"{legacy_key}-attempt-{attempt}-intent.json"
         )
+        fact_identity = (
+            payload.get("report_sha256"),
+            payload.get("action_index"),
+        )
         if (
             payload.get("market") != market
             or payload.get("date") != execution_date
-            or payload.get("report_sha256") != report_sha
-            or payload.get("action_index") != action_index
+            or fact_identity not in allowed_fact_identities
             or request.get("market") != market
             or str(request.get("futu_code") or "").strip().upper()
             != futu_code.upper()
@@ -1124,8 +1259,8 @@ def _strict_action_facts(
                 not isinstance(result, Mapping)
                 or result.get("market") != market
                 or result.get("date") != execution_date
-                or result_identity.get("report_sha256") != report_sha
-                or result_identity.get("action_index") != action_index
+                or result_identity.get("report_sha256") != fact_identity[0]
+                or result_identity.get("action_index") != fact_identity[1]
                 or result.get("request") != request
                 or not isinstance(result.get("response"), Mapping)
                 or submitted.tzinfo is None
@@ -1365,6 +1500,18 @@ def load_trend_action_audit(
         symbol=symbol,
         side=side,
     )
+    protection_identities = {
+        identity
+        for event in events
+        if (
+            identity := _protection_event_identity(
+                event,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+            )
+        )
+    }
     requests, result_order_ids = _strict_action_facts(
         facts,
         market=market,
@@ -1375,13 +1522,19 @@ def load_trend_action_audit(
         report_sha=report_sha,
         action_index=action_index,
         strategy_version=strategy_version,
+        protection_identities=protection_identities,
     )
+    allowed_event_identities = {
+        (report_sha, action_index, strategy_version),
+        *protection_identities,
+    }
     for event in events:
-        if (
-            event.get("report_sha256") != report_sha
-            or event.get("action_index") != action_index
-            or event.get("strategy_version") != strategy_version
-        ):
+        event_identity = (
+            event.get("report_sha256"),
+            event.get("action_index"),
+            event.get("strategy_version"),
+        )
+        if event_identity not in allowed_event_identities:
             raise ValueError("invalid trend action event identity")
         status = event.get("status")
         if status == "missed" and facts:
@@ -1400,8 +1553,8 @@ def load_trend_action_audit(
             symbol=symbol,
             futu_code=futu_code,
             side=side,
-            report_sha=report_sha,
-            action_index=action_index,
+            report_sha=str(event_identity[0]),
+            action_index=int(event_identity[1]),
             requests=requests,
             result_order_ids=result_order_ids,
         )
@@ -2676,19 +2829,7 @@ def execute_trend_review_stop(
         raise ValueError("trend review protection event is invalid")
     return execute_trend_review_open(
         data_dir=data_dir,
-        report={
-            "strategy_snapshot": {"strategy_version": "protection-v1"},
-            "strategy_judgments": {
-                "formal_actions": [
-                    {
-                        "action": "SELL_ALL",
-                        "symbol": symbol,
-                        "event_id": event_id,
-                        "reason": "protection_event",
-                    }
-                ]
-            },
-        },
+        report=_protection_report(symbol, event_id),
         client=client,
         market=market,
         execution_date=trading_date,
