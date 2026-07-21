@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import re
 import shutil
@@ -13,7 +14,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -30,6 +31,175 @@ from tests.test_dashboard import (
     write_csv,
     write_trend_history_report,
 )
+
+
+def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.trend_controller.status.v1",
+        "effective_mode": "execute",
+        "executor_host": "ray-mac",
+        "local_host": "ray-mac",
+        "pid": 4242,
+        "working_directory": "/srv/open_trader",
+        "git_sha": "abc1234",
+        "phase": "monitoring",
+        "heartbeat_at": heartbeat_at,
+        "last_success": "report_locked",
+        "blocker": None,
+        "next_check_at": "2026-07-21T09:31:05+08:00",
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "executor_host", "local_host", "health", "blocking"),
+    [
+        ("healthy", "ray-mac", "ray-mac", "healthy", False),
+        ("missing", "ray-mac", "ray-mac", "unavailable", True),
+        ("stale", "ray-mac", "ray-mac", "unavailable", True),
+        ("malformed", "ray-mac", "ray-mac", "unavailable", True),
+        ("wrong-host", "ray-mac", "ray-mac", "unavailable", True),
+        ("missing", "ray-mac", "readonly-copy", "readonly", False),
+        ("missing", "", "readonly-copy", "readonly", False),
+    ],
+)
+def test_dashboard_projects_strict_controller_health(
+    tmp_path: Path,
+    status: str,
+    executor_host: str,
+    local_host: str,
+    health: str,
+    blocking: bool,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    if status != "missing":
+        path.parent.mkdir(parents=True)
+        if status == "malformed":
+            path.write_text('{"phase":"monitoring"}', encoding="utf-8")
+        else:
+            heartbeat = now - timedelta(minutes=3) if status == "stale" else now
+            payload = _controller_status(heartbeat_at=heartbeat.isoformat())
+            if status == "wrong-host":
+                payload["local_host"] = "retired-host"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controllers = _load_trend_controllers(
+        tmp_path,
+        executor_host=executor_host,
+        now=now,
+        hostname_fn=lambda: local_host,
+    )
+
+    assert set(controllers) == {"eastmoney", "phillips", "tiger"}
+    controller = controllers["tiger"]
+    assert controller["effective_mode"] == (
+        "execute" if executor_host and executor_host == local_host else "readonly"
+    )
+    assert controller["executor_host"] == executor_host
+    assert controller["local_host"] == local_host
+    assert controller["health"] == health
+    assert controller["blocking"] is blocking
+    if health == "healthy":
+        assert controller["pid"] == 4242
+        assert controller["git_sha"] == "abc1234"
+        assert controller["phase"] == "monitoring"
+    if status == "stale":
+        assert controller["blocker"] == "controller heartbeat is stale"
+    if health == "readonly":
+        assert "OPEN_TRADER_TREND_EXECUTOR_HOST" in controller["reason"]
+
+
+@pytest.mark.parametrize("status", ["uncertain", "conflict", "missed"])
+def test_dashboard_preserves_terminal_trend_action_status(
+    tmp_path: Path, status: str,
+) -> None:
+    from open_trader.dashboard import _trend_action_executions
+
+    event = tmp_path / "trend_review/ledgers/US/actions/2026-07-20/key/event.json"
+    event.parent.mkdir(parents=True)
+    event.write_text(json.dumps({
+        "report_sha256": "a" * 64,
+        "symbol": "TRV",
+        "side": "buy",
+        "status": status,
+        "recorded_at": "2026-07-20T09:31:00-04:00",
+    }), encoding="utf-8")
+
+    executions = _trend_action_executions(
+        tmp_path, market="US", execution_date="2026-07-20",
+        report_sha256="a" * 64,
+    )
+
+    assert executions[("TRV", "buy")]["status"] == status
+
+
+def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_dashboard_state
+    from open_trader.trend_review import _report_hash
+
+    config = replace(dashboard_config(tmp_path), trend_executor_host="")
+    base = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    revised = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    revised["strategy_judgments"]["formal_actions"][0]["symbol"] = "REVISION"
+    revision_path = config.reports_dir / "trend_us_tiger/2026-07-17-r1.json"
+    revision_path.write_text(json.dumps(revised), encoding="utf-8")
+    base_path = config.reports_dir / "trend_us_tiger/2026-07-17.json"
+    batch = config.data_dir / "trend_review/ledgers/US/batches/2026-07-20.json"
+    batch.parent.mkdir(parents=True)
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1",
+        "market": "US",
+        "execution_date": "2026-07-20",
+        "report_path": str(base_path),
+        "report_sha256": _report_hash(base),
+        "locked_at": "2026-07-20T09:30:00-04:00",
+    }), encoding="utf-8")
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-20/key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(json.dumps({
+        "report_sha256": _report_hash(base),
+        "symbol": "VIXY",
+        "side": "buy",
+        "status": "missed",
+        "recorded_at": "2026-07-20T16:00:00-04:00",
+    }), encoding="utf-8")
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["artifact"] == "2026-07-17.json"
+    assert report["report_sha256"] == _report_hash(base)
+    assert report["execution_batch"]["report_sha256"] == _report_hash(base)
+    assert report["latest_report_sha256"] == _report_hash(revised)
+    assert report["revision_anomaly"] is True
+    assert report["buy_actions"][0]["symbol"] == "VIXY"
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+
+    invalid_batch = json.loads(batch.read_text(encoding="utf-8"))
+    invalid_batch["locked_at"] = "2026-07-20T09:30:00"
+    batch.write_text(json.dumps(invalid_batch), encoding="utf-8")
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["artifact"] == "2026-07-17-r1.json"
+    assert report["execution_batch"] is None
+    assert report["revision_anomaly"] is False
+    assert report["buy_actions"][0]["symbol"] == "REVISION"
 
 
 def relative_luminance(color: str) -> float:
@@ -3046,6 +3216,96 @@ console.log("ok");
 ''')
 
     assert "ok" in output
+
+
+def test_dashboard_renders_controller_facts_and_terminal_action_labels() -> None:
+    output = run_dashboard_js(r'''
+const report={
+  available:true,market:"US",broker:"tiger",broker_label:"老虎",market_label:"美股",
+  report_date:"2026-07-21",data_date:"2026-07-20",generated_at:"2026-07-21T08:00:00+08:00",
+  account_status:"已更新",buy_window:"美股常规交易时段",counts:{buy:3},sell_actions:[],
+  buy_actions:[
+    {symbol:"TRV",execution:{status:"uncertain"}},
+    {symbol:"ADM",execution:{status:"conflict"}},
+    {symbol:"PM",execution:{status:"missed"}},
+  ],hold_actions:[],review_actions:[],audit:{},revision_anomaly:true,
+  execution_batch:{report_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  latest_report_sha256:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+};
+const healthy={effective_mode:"execute",executor_host:"ray-mac",local_host:"ray-mac",
+  health:"healthy",blocking:false,pid:4242,working_directory:"/srv/open_trader",
+  git_sha:"abc1234",phase:"monitoring",heartbeat_at:"2026-07-21T09:31:00+08:00",
+  last_success:"report_locked",blocker:null,next_check_at:"2026-07-21T09:31:05+08:00"};
+state.dashboard={trend_controllers:{tiger:healthy}};
+const normal=renderTrendReportWorkspace(report);
+for(const text of ["策略控制器","执行模式","execute","执行主机","ray-mac","本地主机",
+  "PID","4242","Git SHA","abc1234","当前阶段","monitoring","心跳",
+  "最近成功","report_locked","当前阻塞","下次检查",
+  "状态不确定，禁止自动重试","订单事实冲突，禁止提交","已错过策略窗口",
+  "发现后续报告版本，执行仍锁定原批次","aaaaaaaaaaaa","bbbbbbbbbbbb"]){
+  if(!normal.includes(text))throw new Error(text+"\n"+normal);
+}
+state.dashboard.trend_controllers.tiger={...healthy,health:"unavailable",blocking:true,
+  phase:"unavailable",blocker:"controller heartbeat is stale",reason:"controller heartbeat is stale"};
+const blocked=renderTrendReportWorkspace(report);
+if(!blocked.includes('class="trend-controller-status blocking"') ||
+   !blocked.includes('data-health="unavailable"') ||
+   !blocked.includes("控制器不可用"))throw new Error(blocked);
+state.dashboard.trend_controllers.tiger={...healthy,effective_mode:"readonly",health:"readonly",
+  blocking:false,phase:"readonly",pid:null,reason:"local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST",
+  blocker:"local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"};
+const readonly=renderTrendReportWorkspace(report);
+if(!readonly.includes("只读部署，不运行本机控制器") || readonly.includes('class="trend-controller-status blocking"')){
+  throw new Error(readonly);
+}
+state.dashboard.trend_reports={tiger:{available:false,status_text:"报告生成中"}};
+const missingReport=renderEmbeddedTrendReport("tiger");
+if(!missingReport.includes('class="trend-controller-status"') || !missingReport.includes("报告生成中")){
+  throw new Error(missingReport);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_controller_card_is_responsive_at_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    rendered = json.loads(run_dashboard_js(r'''
+state.dashboard={trend_controllers:{tiger:{effective_mode:"execute",executor_host:"ray-mac",
+  local_host:"ray-mac",health:"unavailable",blocking:true,pid:4242,
+  working_directory:"/a/very/long/path/to/the/exact/accepted/dashboard/checkout",
+  git_sha:"1234567890abcdef1234567890abcdef12345678",phase:"report_generation_blocked",
+  heartbeat_at:"2026-07-21T09:31:00+08:00",last_success:"report_locked",
+  blocker:"controller heartbeat is stale after an intentionally long diagnostic message",
+  next_check_at:"2026-07-21T09:31:05+08:00",reason:"controller heartbeat is stale"}}};
+console.log(JSON.stringify(renderTrendReportWorkspace({available:true,market:"US",broker:"tiger",
+  broker_label:"老虎",market_label:"美股",counts:{},audit:{},sell_actions:[],buy_actions:[],
+  hold_actions:[],review_actions:[]})));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    errors: list[str] = []
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(f"<style>{css}</style>{rendered}")
+
+        assert errors == []
+        assert page.locator(".trend-controller-status").count() == 1
+        assert page.locator(".trend-controller-status dl").evaluate(
+            "node => getComputedStyle(node).gridTemplateColumns.split(' ').length"
+        ) == 1
+        assert page.locator(".trend-controller-status").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        browser.close()
 
 
 def test_dashboard_account_view_tabs_keep_exact_order_and_futu_unchanged() -> None:

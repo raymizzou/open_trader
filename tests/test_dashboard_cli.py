@@ -46,7 +46,8 @@ def test_dashboard_main_delegates_to_server(
 
     monkeypatch.setattr(cli, "serve_dashboard", fake_serve_dashboard)
     (tmp_path / "dashboard.env").write_text(
-        "OPEN_TRADER_EASTMONEY_PDF_PASSWORD=local-secret\n",
+        "OPEN_TRADER_EASTMONEY_PDF_PASSWORD=local-secret\n"
+        "OPEN_TRADER_TREND_EXECUTOR_HOST=ray-mac\n",
         encoding="utf-8",
     )
 
@@ -86,6 +87,7 @@ def test_dashboard_main_delegates_to_server(
     assert config.poll_seconds == 2.5
     assert config.futu_host == "192.0.2.10"
     assert config.futu_port == 22222
+    assert config.trend_executor_host == "ray-mac"
 
 
 def test_dashboard_help_includes_expected_options(

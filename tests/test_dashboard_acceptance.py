@@ -910,6 +910,34 @@ def valid_payload() -> dict[str, object]:
         ]},
         "trend_reports": trend_reports(),
         "trend_reviews": trend_reviews(),
+        "trend_controllers": trend_controllers(),
+    }
+
+
+def trend_controllers() -> dict[str, dict[str, object]]:
+    return {
+        broker: {
+            "market": market,
+            "effective_mode": "execute",
+            "executor_host": "ray-mac",
+            "local_host": "ray-mac",
+            "health": "healthy",
+            "blocking": False,
+            "reason": "",
+            "pid": 4242,
+            "working_directory": "/srv/open_trader",
+            "git_sha": "abc1234",
+            "phase": "monitoring",
+            "heartbeat_at": "2026-07-21T09:31:00+08:00",
+            "last_success": "report_locked",
+            "blocker": None,
+            "next_check_at": "2026-07-21T09:31:05+08:00",
+        }
+        for broker, market in (
+            ("tiger", "US"),
+            ("phillips", "HK"),
+            ("eastmoney", "CN"),
+        )
     }
 
 
@@ -1772,6 +1800,11 @@ class TabbedAccountLocator:
             return int(self.page.trend_broker is None)
         if self.selector == "#trend-report-workspace:visible .cn-trend-report":
             return int(self.page.trend_broker is not None)
+        if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            return int(
+                self.page.trend_broker is not None
+                and self.page.trend_broker != self.page.missing_controller_broker
+            )
         if self.selector == "#trend-report-workspace:visible .trend-discipline[open]":
             return int(self.page.trend_broker == "eastmoney") * (
                 0 if self.page.viewport_size["width"] <= 760 else 2
@@ -1853,6 +1886,9 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown count selector: {self.selector}")
 
     def get_attribute(self, name: str) -> str | None:
+        if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            assert name == "data-health"
+            return str(self.page.controllers[str(self.page.trend_broker)]["health"])
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.option-attention-table "
             r"tbody:nth\((\d+)\) \.option-attention-row:nth\((\d+)\) "
@@ -1919,6 +1955,28 @@ class TabbedAccountLocator:
                 return trend_review_workspace_text(str(self.page.trend_broker))
             broker = str(self.page.trend_broker)
             return self.page.workspace_texts[broker]
+        if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            controller = self.page.controllers[str(self.page.trend_broker)]
+            headline = (
+                "只读部署，不运行本机控制器"
+                if controller["effective_mode"] == "readonly"
+                else "控制器不可用"
+                if controller["health"] == "unavailable"
+                else "执行主机控制器正常"
+            )
+            return " ".join(str(value) for value in (
+                "策略控制器", headline,
+                "执行模式", controller["effective_mode"],
+                "执行主机", controller["executor_host"],
+                "本地主机", controller["local_host"],
+                "PID", controller["pid"] if controller["pid"] is not None else "—",
+                "Git SHA", controller["git_sha"],
+                "当前阶段", controller["phase"],
+                "心跳", controller["heartbeat_at"],
+                "最近成功", controller["last_success"],
+                "当前阻塞", controller["blocker"],
+                "下次检查", controller["next_check_at"],
+            ))
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.option-attention-table "
             r"tbody:nth\((\d+)\)",
@@ -2037,7 +2095,9 @@ class TabbedAccountLocator:
                 "filled": "全部成交",
                 "failed": "失败",
                 "blocked": "受阻",
-                "missed": "错过",
+                "uncertain": "状态不确定，禁止自动重试",
+                "conflict": "订单事实冲突，禁止提交",
+                "missed": "已错过策略窗口",
                 "incomplete": "未完成",
                 "early_revision_executed": "早期版本已执行",
             }
@@ -2130,8 +2190,10 @@ class TabbedAccountPage:
         *,
         cn_rows: dict[str, int] | None = None,
     ) -> None:
-        self.reports = (payload or valid_payload())["trend_reports"]  # type: ignore[assignment,index]
-        self.reviews = (payload or valid_payload())["trend_reviews"]  # type: ignore[assignment,index]
+        source = payload or valid_payload()
+        self.reports = source["trend_reports"]  # type: ignore[assignment]
+        self.reviews = source["trend_reviews"]  # type: ignore[assignment]
+        self.controllers = source.get("trend_controllers", trend_controllers())  # type: ignore[assignment]
         self.section_texts = dict(ACCOUNT_SECTION_TEXTS)
         self.entry_texts = {
             broker: (
@@ -2185,6 +2247,7 @@ class TabbedAccountPage:
         self.bounds_checks: list[str] = []
         self.undersized_target_selector = ""
         self.overflow_bounds_selector = ""
+        self.missing_controller_broker = ""
         self.document_overflow_broker = ""
         self.document_overflow_checks: list[str | None] = []
         self.workspace_view = "portfolio"
@@ -2241,6 +2304,69 @@ def tabbed_cn_page() -> TabbedAccountPage:
     return TabbedAccountPage(cn_rows={
         "futu": 1, "tiger": 0, "phillips": 1, "eastmoney": 0,
     })
+
+
+def test_acceptance_rejects_missing_trend_controller_card() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.missing_controller_broker = "tiger"
+
+    with pytest.raises(AssertionError, match="控制器"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            payload["trend_controllers"]["tiger"],  # type: ignore[index]
+        )
+
+
+def test_acceptance_rejects_unavailable_executor_controller() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({  # type: ignore[union-attr]
+        "health": "unavailable",
+        "blocking": True,
+        "phase": "unavailable",
+        "blocker": "controller heartbeat is stale",
+        "reason": "controller heartbeat is stale",
+    })
+
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    with pytest.raises(AssertionError, match="控制器不可用"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            controller,
+        )
+
+
+def test_acceptance_allows_readonly_controller_without_heartbeat() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({  # type: ignore[union-attr]
+        "effective_mode": "readonly",
+        "health": "readonly",
+        "blocking": False,
+        "pid": None,
+        "phase": "readonly",
+        "heartbeat_at": "",
+        "last_success": None,
+        "blocker": "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST",
+        "reason": "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST",
+        "next_check_at": "",
+    })
+
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:

@@ -2480,6 +2480,9 @@ def main(argv: list[str] | None = None) -> int:
             trend_review_cn_simulate_acc_id=simulate_account_ids["CN"],
             trend_review_us_simulate_acc_id=simulate_account_ids["US"],
             trend_review_hk_simulate_acc_id=simulate_account_ids["HK"],
+            trend_executor_host=config_values.get(
+                "OPEN_TRADER_TREND_EXECUTOR_HOST", ""
+            ).strip(),
         )
         serve_dashboard(
             config,

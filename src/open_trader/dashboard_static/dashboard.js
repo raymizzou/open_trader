@@ -2122,7 +2122,9 @@ function renderTrendExecutionRow(item, columnCount) {
   const status = String(execution.status || "pending");
   const statusLabel = {
     pending: "待执行", submitted: "已提交", partially_filled: "部分成交",
-    filled: "全部成交", failed: "失败", blocked: "受阻", missed: "错过",
+    filled: "全部成交", failed: "失败", blocked: "受阻",
+    uncertain: "状态不确定，禁止自动重试",
+    conflict: "订单事实冲突，禁止提交", missed: "已错过策略窗口",
     incomplete: "未完成", early_revision_executed: "早期版本已执行",
   }[status] || "待执行";
   const details = [statusLabel];
@@ -2543,6 +2545,10 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const strategyVersion = report.strategy_version
     ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
     : "";
+  const batchSha = report.execution_batch?.report_sha256;
+  const revisionAnomaly = report.revision_anomaly === true
+    ? `<p class="trend-revision-anomaly">发现后续报告版本，执行仍锁定原批次 · 批次 ${escapeHtml(String(batchSha || "—").slice(0, 12))} · 最新 ${escapeHtml(String(report.latest_report_sha256 || "—").slice(0, 12))}</p>`
+    : "";
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
@@ -2564,6 +2570,8 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
     </header>
+    ${renderTrendControllerStatus(report.broker)}
+    ${revisionAnomaly}
     ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date)}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
@@ -2574,6 +2582,32 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${isCn ? renderCnTrendDisciplines() : ""}
     ${isCn ? renderCnTrendAudit(audit) : renderTrendAudit(audit)}
   </${root}>`;
+}
+
+function renderTrendControllerStatus(broker) {
+  const controller = state.dashboard?.trend_controllers?.[broker];
+  if (!controller || typeof controller !== "object") return "";
+  const health = String(controller.health || "unavailable");
+  const blocking = controller.blocking === true;
+  const headline = health === "readonly"
+    ? "只读部署，不运行本机控制器"
+    : health === "healthy" ? "执行主机控制器正常" : "控制器不可用";
+  const facts = [
+    ["执行模式", controller.effective_mode],
+    ["执行主机", controller.executor_host],
+    ["本地主机", controller.local_host],
+    ["PID", controller.pid],
+    ["Git SHA", controller.git_sha],
+    ["当前阶段", controller.phase],
+    ["心跳", controller.heartbeat_at],
+    ["最近成功", controller.last_success],
+    ["当前阻塞", controller.blocker || controller.reason],
+    ["下次检查", controller.next_check_at],
+  ];
+  return `<section class="trend-controller-status${blocking ? " blocking" : ""}" data-health="${escapeHtml(health)}">
+    <header><h2>策略控制器</h2><strong>${escapeHtml(headline)}</strong></header>
+    <dl>${facts.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(hasValue(value) ? formatPlain(value) : "—")}</dd></div>`).join("")}</dl>
+  </section>`;
 }
 
 const OPTION_ATTENTION_COLUMNS = [
@@ -3078,7 +3112,7 @@ function renderEmbeddedTrendReport(broker) {
   const report = state.dashboard?.trend_reports?.[broker] || {};
   return report.available
     ? renderTrendReportWorkspace(report, true)
-    : `<p class="account-empty">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
+    : `${renderTrendControllerStatus(broker)}<p class="account-empty">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
 }
 
 function renderTrendReportHistory(broker, history) {

@@ -1075,12 +1075,19 @@ def _check_trend_account_views(
         "filled": "全部成交",
         "failed": "失败",
         "blocked": "受阻",
-        "missed": "错过",
+        "uncertain": "状态不确定，禁止自动重试",
+        "conflict": "订单事实冲突，禁止提交",
+        "missed": "已错过策略窗口",
         "incomplete": "未完成",
     }
     reports = payload.get("trend_reports")
     reviews = payload.get("trend_reviews")
-    assert isinstance(reports, Mapping) and isinstance(reviews, Mapping)
+    controllers = payload.get("trend_controllers")
+    assert (
+        isinstance(reports, Mapping)
+        and isinstance(reviews, Mapping)
+        and isinstance(controllers, Mapping)
+    )
     for broker in TREND_SIMULATE_MARKETS:
         section = _select_account_tab(page, broker)
         _check_account_view_contract(page, section, broker)
@@ -1163,6 +1170,9 @@ def _check_trend_account_views(
         report = reports.get(broker)
         assert isinstance(report, Mapping) and report.get("available") is True, (
             f"{broker} 当前趋势报告不可用"
+        )
+        _check_trend_controller_status(
+            page, panel, broker, controllers.get(broker)
         )
         _check_integrated_trend_ui(report_root, report, broker)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
@@ -2275,7 +2285,9 @@ def _check_account_holdings(
         )
         valid_statuses = {
             "待执行", "已提交", "部分成交", "全部成交", "失败",
-            "受阻", "错过", "未完成", "早期版本已执行",
+            "受阻", "状态不确定，禁止自动重试",
+            "订单事实冲突，禁止提交", "已错过策略窗口",
+            "未完成", "早期版本已执行",
         }
         assert all(
             status in valid_statuses
@@ -2339,6 +2351,61 @@ def _check_account_holdings(
         review = reviews.get(broker) if isinstance(reviews, Mapping) else None
         assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
         _check_trend_review(page, section, broker, review)
+
+
+def _check_trend_controller_status(
+    page: Any,
+    workspace: Any,
+    broker: str,
+    controller: object,
+) -> None:
+    assert isinstance(controller, Mapping), f"API 缺少 {broker} 趋势控制器状态"
+    card = workspace.locator(".trend-controller-status")
+    assert card.count() == 1, f"{broker} 趋势报告缺少控制器状态卡"
+    health = controller.get("health")
+    assert card.get_attribute("data-health") == health, (
+        f"{broker} 控制器状态卡健康标记与 API 不一致"
+    )
+    text = card.inner_text()
+    for label, key in (
+        ("执行模式", "effective_mode"),
+        ("执行主机", "executor_host"),
+        ("本地主机", "local_host"),
+        ("PID", "pid"),
+        ("Git SHA", "git_sha"),
+        ("当前阶段", "phase"),
+        ("心跳", "heartbeat_at"),
+        ("最近成功", "last_success"),
+        ("当前阻塞", "blocker"),
+        ("下次检查", "next_check_at"),
+    ):
+        assert label in text, f"{broker} 控制器状态卡缺少 {label}"
+        value = controller.get(key)
+        if value not in (None, ""):
+            assert str(value) in text, f"{broker} 控制器状态卡 {label} 与 API 不一致"
+    mode = controller.get("effective_mode")
+    if mode == "readonly":
+        assert health == "readonly" and controller.get("blocking") is False, (
+            f"{broker} 只读控制器状态无效"
+        )
+        assert "只读部署，不运行本机控制器" in text, (
+            f"{broker} 只读控制器缺少说明"
+        )
+    else:
+        assert mode == "execute", f"{broker} 控制器执行模式无效"
+        assert health == "healthy" and controller.get("blocking") is False, (
+            f"{broker} 控制器不可用或阻塞"
+        )
+    width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+    if width <= 760:
+        boxes = card.evaluate_all(
+            "nodes => nodes.map(node => node.getBoundingClientRect())"
+            ".map(r => ({x:r.x,width:r.width}))"
+        )
+        assert boxes and all(
+            box["x"] >= -1 and box["x"] + box["width"] <= width + 1
+            for box in boxes
+        ), f"{broker} 控制器状态卡超出 {width}px 视口"
 
 
 def _check_trend_review(
