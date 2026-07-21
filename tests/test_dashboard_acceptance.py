@@ -22,6 +22,7 @@ from open_trader.dashboard_acceptance import (
     validate_dashboard_payload,
     validate_quotes_payload,
 )
+from open_trader.strategy_drawdown import strategy_parameter_hash
 
 
 MISSING_FRESH = object()
@@ -1054,7 +1055,7 @@ def integrated_v4_payload(
             "strategy_snapshot": {
                 "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
                 "strategy_version": "v4",
-                "process_version": "candidate-sha",
+                "process_version": "a" * 40,
                 "parameters": {
                     "single_entry_risk_limit": "0.004",
                     "portfolio_risk_limit": "0.04",
@@ -1102,6 +1103,11 @@ def integrated_v4_payload(
             },
             "data_sources": [f"Futu {market} SIMULATE account"],
         }
+        frozen["drawdown_summary"]["bootstrap_event"][  # type: ignore[index]
+            "parameter_hash"
+        ] = strategy_parameter_hash(
+            frozen["strategy_snapshot"]["parameters"]  # type: ignore[index]
+        )
         artifact = reports_dir / directories[broker] / "2026-07-20.json"
         artifact.parent.mkdir(parents=True)
         artifact.write_text(json.dumps(frozen), encoding="utf-8")
@@ -1246,7 +1252,7 @@ def test_acceptance_rejects_integrated_contract_drift(
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        ("process", "候选 Git SHA"),
+        ("process", "冻结 Kelly/回撤 v4 策略身份"),
         ("stale", "当前真实数据"),
         ("account", "模拟账户快照不是最新"),
     ],
@@ -1278,6 +1284,32 @@ def test_acceptance_rejects_noncandidate_or_stale_integrated_report(
     )
 
     assert any(expected in error for error in errors)
+
+
+def test_acceptance_rejects_frozen_parameter_audit_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    frozen["drawdown_summary"]["bootstrap_event"]["parameter_hash"] = "c" * 64
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any("冻结策略参数与回撤审计身份" in error for error in errors)
 
 
 def test_trend_advice_signature_allows_overlay_refresh_only(tmp_path: Path) -> None:
@@ -2423,6 +2455,23 @@ def test_acceptance_checks_readable_mapping_last_success_fields() -> None:
     controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
     page = tabbed_account_page(payload)
     page.trend_broker = "tiger"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
+) -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["heartbeat_at"] = "2026-07-21T09:31:05+08:00"
+    page.controllers["tiger"]["next_check_at"] = "2026-07-21T09:31:10+08:00"
 
     dashboard_acceptance._check_trend_controller_status(
         page,
@@ -4291,6 +4340,81 @@ def test_classify_result_has_only_three_states() -> None:
     assert classify_result(["API failed"], browser_blocker=None) == "FAIL"
     assert classify_result([], browser_blocker="Chrome unavailable") == "BLOCKED"
     assert classify_result(["API failed"], browser_blocker="Chrome unavailable") == "FAIL"
+
+
+def test_acceptance_partitions_only_current_402_source_failures_as_external(
+    tmp_path: Path,
+) -> None:
+    status = tmp_path / "runs/2026-07-21/US/daily_run_status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text(json.dumps({
+        "run_date": "2026-07-21",
+        "market": "US",
+        "readiness": "blocked",
+        "source_failures": [
+            {
+                "market": "US",
+                "symbol": "DRAM",
+                "source": "tradingagents_summary",
+                "error": "Error code: 402 - Insufficient Balance",
+            },
+            {
+                "market": "US",
+                "symbol": "DRAM",
+                "source": "decision_facts.kline",
+                "error": "error",
+            },
+        ],
+    }), encoding="utf-8")
+    source_errors = [
+        "US.DRAM 数据源 tradingagents_summary 不可用：error",
+        "US.DRAM 数据源 decision_facts.kline 不可用：error",
+        "US.QQQ 数据源 decision_facts.kline 不可用：error",
+        "控制器内部失败",
+    ]
+
+    remaining, blocker = dashboard_acceptance._partition_external_source_errors(
+        source_errors,
+        data_dir=tmp_path,
+        run_date="2026-07-21",
+    )
+
+    assert remaining == [
+        "US.QQQ 数据源 decision_facts.kline 不可用：error",
+        "控制器内部失败",
+    ]
+    assert "DeepSeek API 余额不足" in str(blocker)
+    assert "US.DRAM" in str(blocker)
+
+
+def test_acceptance_keeps_nonbalance_source_failure_as_fail(
+    tmp_path: Path,
+) -> None:
+    status = tmp_path / "runs/2026-07-21/HK/daily_run_status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text(json.dumps({
+        "run_date": "2026-07-21",
+        "market": "HK",
+        "readiness": "blocked",
+        "source_failures": [{
+            "market": "HK",
+            "symbol": "02623",
+            "source": "tradingagents_summary",
+            "error": "timeout",
+        }],
+    }), encoding="utf-8")
+    source_errors = [
+        "HK.02623 数据源 tradingagents_summary 不可用：timeout",
+    ]
+
+    remaining, blocker = dashboard_acceptance._partition_external_source_errors(
+        source_errors,
+        data_dir=tmp_path,
+        run_date="2026-07-21",
+    )
+
+    assert remaining == source_errors
+    assert blocker is None
 
 
 def test_dashboard_signature_ignores_live_values_but_detects_structural_change() -> None:

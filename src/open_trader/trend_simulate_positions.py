@@ -356,7 +356,13 @@ def _action_events(
         ):
             raise ValueError(f"action event {path} has invalid identity")
         events.append((event_date, recorded_at, str(path), event))
-    events.sort(key=lambda item: item[:3])
+    events.sort(
+        key=lambda item: (
+            item[0],
+            datetime.fromisoformat(item[1]),
+            item[2],
+        )
+    )
     return events
 
 

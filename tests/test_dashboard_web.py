@@ -203,6 +203,37 @@ def test_dashboard_preserves_terminal_trend_action_status(
     assert executions[("TRV", "buy")]["status"] == status
 
 
+def test_dashboard_uses_latest_action_event_across_timezone_offsets(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _trend_action_executions
+
+    root = tmp_path / "trend_review/ledgers/US/actions/2026-07-20/key"
+    root.mkdir(parents=True)
+    common = {
+        "report_sha256": "a" * 64,
+        "symbol": "TRV",
+        "side": "buy",
+    }
+    (root / "later-by-name.json").write_text(json.dumps({
+        **common,
+        "status": "missed",
+        "recorded_at": "2026-07-21T09:01:01+08:00",
+    }), encoding="utf-8")
+    (root / "earlier-by-name.json").write_text(json.dumps({
+        **common,
+        "status": "filled",
+        "recorded_at": "2026-07-21T07:36:30-04:00",
+    }), encoding="utf-8")
+
+    executions = _trend_action_executions(
+        tmp_path, market="US", execution_date="2026-07-20",
+        report_sha256="a" * 64,
+    )
+
+    assert executions[("TRV", "buy")]["status"] == "filled"
+
+
 def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     tmp_path: Path,
 ) -> None:

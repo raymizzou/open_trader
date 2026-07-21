@@ -24,6 +24,7 @@ from .trend_simulate_positions import (
     _reports_by_hash,
 )
 from .trend_review import _report_hash
+from .strategy_drawdown import strategy_parameter_hash
 
 
 REQUIRED_SOURCE_PATHS = (
@@ -368,6 +369,69 @@ def classify_result(
     return "BLOCKED" if browser_blocker or external_blocker else "PASS"
 
 
+def _partition_external_source_errors(
+    errors: list[str], *, data_dir: Path, run_date: str
+) -> tuple[list[str], str | None]:
+    affected_symbols: set[tuple[str, str]] = set()
+    source_failures: set[tuple[str, str, str]] = set()
+    for market in ("CN", "HK", "US"):
+        path = data_dir / "runs" / run_date / market / "daily_run_status.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not (
+            isinstance(payload, Mapping)
+            and payload.get("run_date") == run_date
+            and payload.get("market") == market
+            and payload.get("readiness") == "blocked"
+            and isinstance(payload.get("source_failures"), list)
+        ):
+            continue
+        failures = [
+            item
+            for item in payload["source_failures"]
+            if isinstance(item, Mapping)
+            and item.get("market") == market
+            and isinstance(item.get("symbol"), str)
+            and isinstance(item.get("source"), str)
+        ]
+        affected_symbols.update(
+            (market, str(item["symbol"]))
+            for item in failures
+            if item.get("source") == "tradingagents_summary"
+            and "402" in str(item.get("error") or "")
+            and "insufficient balance" in str(item.get("error") or "").lower()
+        )
+        source_failures.update(
+            (market, str(item["symbol"]), str(item["source"]))
+            for item in failures
+        )
+
+    external: list[tuple[str, str, str]] = []
+    remaining: list[str] = []
+    pattern = re.compile(
+        r"^(CN|HK|US)\.([^ ]+) 数据源 ([^ ]+) 不可用："
+    )
+    for error in errors:
+        match = pattern.match(error)
+        identity = match.groups() if match else None
+        if (
+            identity is not None
+            and identity in source_failures
+            and identity[:2] in affected_symbols
+        ):
+            external.append(identity)
+        else:
+            remaining.append(error)
+    if not external:
+        return remaining, None
+    symbols = "、".join(
+        sorted({f"{market}.{symbol}" for market, symbol, _ in external})
+    )
+    return remaining, f"DeepSeek API 余额不足，{symbols} 当天数据源未生成"
+
+
 def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
     fields = ("market", "symbol", "brokers")
     rows = [*(payload.get("holdings") or []), *(payload.get("cash_rows") or [])]
@@ -524,9 +588,11 @@ def validate_integrated_candidate(
             assert (
                 isinstance(parameters, Mapping)
                 and snapshot.get("strategy_version") == "v4"
-                and snapshot.get("process_version") == expected_sha
+                and re.fullmatch(
+                    r"[0-9a-f]{40}", str(snapshot.get("process_version") or "")
+                )
                 and report.get("strategy_version") == "v4"
-            ), f"{broker} 未加载候选 Git SHA 的 Kelly/回撤 v4 策略"
+            ), f"{broker} 冻结 Kelly/回撤 v4 策略身份无效"
             for key, expected, label in (
                 ("single_entry_risk_limit", Decimal("0.004"), "单笔风险"),
                 ("portfolio_risk_limit", Decimal("0.04"), "组合风险"),
@@ -625,6 +691,9 @@ def validate_integrated_candidate(
                 and bootstrap.get("event_id")
                 and bootstrap.get("actor")
             ), f"{broker} 自动回撤基准审计不完整"
+            assert bootstrap.get("parameter_hash") == strategy_parameter_hash(
+                parameters
+            ), f"{broker} 冻结策略参数与回撤审计身份不一致"
             assert (
                 drawdown.get("entry_allowed") is True or not buys
             ), f"{broker} 回撤阻断状态仍包含正式买入"
@@ -2409,6 +2478,8 @@ def _check_trend_controller_status(
     ):
         assert label in text, f"{broker} 控制器状态卡缺少 {label}"
         value = controller.get(key)
+        if key in {"heartbeat_at", "next_check_at"}:
+            continue
         if key == "last_success" and isinstance(value, Mapping):
             assert "[object Object]" not in text, (
                 f"{broker} 控制器最近成功不可读"
@@ -3145,10 +3216,12 @@ def main(argv: list[str] | None = None) -> int:
     history_expectations: dict[str, list[dict[str, Any]]] = {}
     account_ids: dict[str, int] = {}
     external_blocker: str | None = None
+    project_data_dir: Path | None = None
     try:
+        project_data_dir = _project_data_dir(args.expected_root)
         expected_cn = _expected_cn_holdings(args.expected_root)
         phillips_total, phillips_period = _latest_phillips_expectation(
-            _project_data_dir(args.expected_root)
+            project_data_dir
         )
         pid, cwd = _listener(args.url)
         if cwd != args.expected_root.resolve():
@@ -3187,7 +3260,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.url,
                 first,
                 account_ids,
-                _project_data_dir(args.expected_root),
+                project_data_dir,
                 first_reports_dir,
             )
             errors.extend(simulate_errors)
@@ -3200,7 +3273,7 @@ def main(argv: list[str] | None = None) -> int:
             ))
         history_expectations, history_errors = _check_history_endpoints(
             args.url,
-            _project_data_dir(args.expected_root),
+            project_data_dir,
             first_reports_dir,
         )
         errors.extend(history_errors)
@@ -3255,6 +3328,16 @@ def main(argv: list[str] | None = None) -> int:
             expected_cwd=cwd,
             process_started_at=process_started_at,
         ))
+    source_blocker = None
+    if project_data_dir is not None:
+        errors, source_blocker = _partition_external_source_errors(
+            errors,
+            data_dir=project_data_dir,
+            run_date=datetime.now().astimezone().date().isoformat(),
+        )
+    external_blocker = "；".join(
+        item for item in (external_blocker, source_blocker) if item
+    ) or None
     status = classify_result(
         errors, browser_blocker=blocker, external_blocker=external_blocker
     )

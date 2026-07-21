@@ -1962,13 +1962,27 @@ def _trend_action_executions(
         / "actions"
         / execution_date
     )
-    for path in sorted(root.glob("*/*.json")):
+    ordered_events: list[tuple[int, float, str, dict[str, Any]]] = []
+    for path in root.glob("*/*.json"):
         try:
             event = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(event, dict):
             continue
+        try:
+            recorded_at = datetime.fromisoformat(str(event.get("recorded_at") or ""))
+        except ValueError:
+            recorded_at = None
+        if (
+            recorded_at is None
+            or recorded_at.tzinfo is None
+            or recorded_at.utcoffset() is None
+        ):
+            ordered_events.append((0, 0.0, str(path), event))
+        else:
+            ordered_events.append((1, recorded_at.timestamp(), str(path), event))
+    for _, _, _, event in sorted(ordered_events):
         if event.get("report_sha256") != report_sha256:
             continue
         symbol = str(event.get("symbol") or "").strip()

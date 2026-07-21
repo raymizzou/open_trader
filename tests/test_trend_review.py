@@ -486,6 +486,7 @@ class FakeTrendSimClient:
         self.positions = positions or []
         self.requests: list[dict[str, object]] = []
         self.orders: list[dict[str, object]] = []
+        self.list_order_calls: list[dict[str, object]] = []
         self.fail_orders = fail_orders
         self.accepted_before_failure = accepted_before_failure
 
@@ -520,6 +521,7 @@ class FakeTrendSimClient:
         }
 
     def list_orders(self, **kwargs: object) -> dict[str, object]:
+        self.list_order_calls.append(dict(kwargs))
         return {"orders": self.orders}
 
 
@@ -598,6 +600,38 @@ def test_action_identity_ignores_report_revision_and_strategy_version() -> None:
     ) != trend_review.trend_attempt_remark(
         "US", "2026-07-20", first, 2
     )
+
+
+def test_open_execution_lists_broker_orders_once_for_multiple_actions(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+        },
+        {
+            "action": "BUY", "symbol": "600002", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient()
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:30:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 2
+    assert len(client.requests) == 2
+    assert client.list_order_calls == [
+        {"start": "2026-07-20", "end": "2026-07-20"}
+    ]
 
 
 def test_execution_batch_keeps_first_report_sha(tmp_path: Path) -> None:
