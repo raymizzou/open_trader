@@ -1403,6 +1403,8 @@ def execute_trend_review_open(
         if action_name == "SELL_ALL" and not market_open and sell_quantity > 0:
             continue
         if action_facts:
+            request = action_facts[0][2]
+            broker_order: Mapping[str, object] | None = None
             pending_intent = next(
                 (
                     item[0]
@@ -1507,8 +1509,16 @@ def execute_trend_review_open(
                     )
                     blocked_status = "uncertain"
                     break
-            if pending_intent is None or broker_order is not None:
-                request = action_facts[0][2]
+            pending_sell_completed = (
+                pending_intent is not None
+                and action_name == "SELL_ALL"
+                and sell_quantity <= 0
+            )
+            if (
+                pending_intent is None
+                or broker_order is not None
+                or pending_sell_completed
+            ):
                 orders = _listed_orders(
                     client,
                     start=execution_date,
@@ -1559,6 +1569,7 @@ def execute_trend_review_open(
                         )
                     )
                 ]
+                latest_attempt = max(item[3] for item in action_facts)
                 ambiguous_attempt = next(
                     (
                         remark
@@ -1583,14 +1594,13 @@ def execute_trend_review_open(
                     "broker action attempt is ambiguous"
                     if ambiguous_attempt is not None
                     else "broker order status is absent"
-                    if action_name == "SELL_ALL"
-                    and not matched
+                    if not matched
                     and not position_zero
-                    and authorized_retries < max(item[3] for item in action_facts)
+                    and authorized_retries < latest_attempt
                     else None
                 )
                 if inconclusive_reason is not None:
-                    attempt = max(item[3] for item in action_facts)
+                    attempt = latest_attempt
                     _write_uncertain_action_event_once(
                         data_dir=data_dir,
                         market=market,
@@ -1735,7 +1745,7 @@ def execute_trend_review_open(
                 if broker_statuses & ACTIVE_ORDER_STATUSES:
                     continue
                 if broker_statuses - TERMINAL_ORDER_STATUSES:
-                    attempt = max(item[3] for item in action_facts)
+                    attempt = latest_attempt
                     reason = "broker order status is inconclusive"
                     _write_uncertain_action_event_once(
                         data_dir=data_dir,
@@ -1750,7 +1760,7 @@ def execute_trend_review_open(
                     )
                     blocked_status = "uncertain"
                     break
-                attempt = max(item[3] for item in action_facts) + 1
+                attempt = latest_attempt + 1
                 if action_name == "BUY":
                     if futu_code not in quote_prices:
                         _write_action_status_once(

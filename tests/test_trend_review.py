@@ -1117,6 +1117,54 @@ def test_only_authorize_retry_permits_attempt_two(tmp_path: Path) -> None:
     )
 
 
+def test_authorize_retry_is_consumed_by_one_uncertain_attempt(tmp_path: Path) -> None:
+    client = make_uncertain_buy(tmp_path)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+    trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="authorize-retry",
+        actor="ray",
+        reason="broker confirmed no first order",
+        resolved_at="2026-07-20T09:40:00+08:00",
+    )
+    attempt_two = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:41:00+08:00"
+    )
+    client.orders.clear()
+
+    blocked = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:42:00+08:00"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+    ]
+
+    assert attempt_two["submitted_count"] == 1
+    assert blocked["status"] == "uncertain"
+    assert blocked["submitted_count"] == 0
+    assert len(client.requests) == 2
+    assert any(
+        event.get("status") == "uncertain"
+        and event.get("attempt") == 2
+        and event.get("reason") == "broker order status is absent"
+        for event in events
+    )
+
+
 def test_legacy_intent_is_discovered_by_symbol_and_side(tmp_path: Path) -> None:
     request = {
         "market": "CN",
@@ -3054,6 +3102,46 @@ def test_stop_retries_intent_when_failed_order_is_absent_at_broker(
     assert result["status"] == "submitted"
     assert result["submitted_count"] == 1
     assert len(client.requests) == 2
+
+
+def test_pending_sell_with_zero_live_position_records_completion(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "300"}],
+        fail_orders=1,
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "market": "CN",
+        "symbol": "600001",
+        "trading_date": "2026-07-17",
+        "event_id": "event-1",
+        "client": client,
+    }
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_stop(
+            **arguments, now="2026-07-17T10:15:00+08:00"
+        )
+    client.positions = []
+
+    result = trend_review.execute_trend_review_stop(
+        **arguments, now="2026-07-17T10:16:00+08:00"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ]
+
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 1
+    assert any(
+        event.get("status") == "incomplete"
+        and event.get("reason") == "position_zero_confirmed"
+        for event in events
+    )
 
 
 def test_formal_and_protection_sells_merge_into_one_action(tmp_path: Path) -> None:

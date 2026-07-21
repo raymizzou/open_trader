@@ -518,16 +518,19 @@ def test_trend_review_loader_accepts_report_named_for_as_of_date(
 
 
 @pytest.mark.parametrize(
-    "available_buy_symbols",
+    ("available_buy_symbols", "quote_failure"),
     [
-        ("SH.600002", "SH.600003"),
-        ("SH.600002",),
+        (("SH.600002", "SH.600003"), None),
+        (("SH.600002",), None),
+        ((), "constructor"),
+        ((), "snapshot"),
     ],
 )
 def test_trend_review_open_passes_available_quotes_without_blocking_sell(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     available_buy_symbols: tuple[str, ...],
+    quote_failure: str | None,
 ) -> None:
     report_dir = tmp_path / "reports/trend_a_share"
     report_dir.mkdir(parents=True)
@@ -585,6 +588,25 @@ def test_trend_review_open_passes_available_quotes_without_blocking_sell(
     authorizations: list[str] = []
     quoted: list[list[str]] = []
     quote_closes: list[bool] = []
+
+    def get_snapshots(symbols: list[str]) -> dict[str, object]:
+        quoted.append(list(symbols))
+        if quote_failure == "snapshot":
+            raise RuntimeError("snapshot unavailable")
+        return {
+            symbol: SimpleNamespace(last_price=Decimal("10"))
+            for symbol in symbols
+            if symbol in available_buy_symbols
+        }
+
+    def quote_client(**kwargs: object) -> object:
+        if quote_failure == "constructor":
+            raise RuntimeError("OpenD unavailable")
+        return SimpleNamespace(
+            get_snapshots=get_snapshots,
+            close=lambda: quote_closes.append(True),
+        )
+
     monkeypatch.setattr(
         cli,
         "FutuSimulateOrderExecutionClient",
@@ -593,17 +615,7 @@ def test_trend_review_open_passes_available_quotes_without_blocking_sell(
     monkeypatch.setattr(
         cli,
         "FutuQuoteClient",
-        lambda **kwargs: SimpleNamespace(
-            get_snapshots=lambda symbols: (
-                quoted.append(list(symbols))
-                or {
-                    symbol: SimpleNamespace(last_price=Decimal("10"))
-                    for symbol in symbols
-                    if symbol in available_buy_symbols
-                }
-            ),
-            close=lambda: quote_closes.append(True),
-        ),
+        quote_client,
     )
     monkeypatch.setattr(
         cli,
@@ -638,11 +650,17 @@ def test_trend_review_open_passes_available_quotes_without_blocking_sell(
     assert captured["quote_prices"] == {
         symbol: Decimal("10") for symbol in available_buy_symbols
     }
-    assert quoted == [
-        ["SH.600002", "SH.600003"],
-        ["SH.600002", "SH.600003"],
-    ]
-    assert quote_closes == [True, True]
+    assert quoted == (
+        [
+            ["SH.600002", "SH.600003"],
+            ["SH.600002", "SH.600003"],
+        ]
+        if quote_failure != "constructor"
+        else []
+    )
+    assert quote_closes == (
+        [True, True] if quote_failure != "constructor" else []
+    )
     assert authorizations == ["checked", "checked", "checked", "checked"]
     assert result["artifact_path"] == str(tmp_path / "result.json")
     assert repeated["artifact_path"] == str(tmp_path / "result.json")

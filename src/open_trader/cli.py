@@ -352,11 +352,14 @@ def run_trend_review_open(
         )
         quote_prices: dict[str, Decimal] = {}
         if buy_symbols:
-            quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-            quote_prices = {
-                symbol: snapshot.last_price
-                for symbol, snapshot in quote.get_snapshots(buy_symbols).items()
-            }
+            try:
+                quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+                quote_prices = {
+                    symbol: snapshot.last_price
+                    for symbol, snapshot in quote.get_snapshots(buy_symbols).items()
+                }
+            except Exception:
+                quote_prices = {}
         client = ExecutorGuardedOrderClient(
             FutuSimulateOrderExecutionClient(
                 host=config.futu_host,
