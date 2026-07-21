@@ -31,6 +31,11 @@ Its implementation reuses the existing report generation, execution,
 protection monitoring, close capture, calendar, notification, and broker
 functions. It does not add a second implementation of those rules.
 
+The operational success criterion is not that external dependencies can never
+fail. It is that a started strategy self-recovers from safe failures, persists
+every transition, never silently loses a step, never duplicates an ambiguous
+order, and explicitly records an unavoidable missed window.
+
 Ordinary premarket automation is unchanged by this work.
 
 ## User Stories
@@ -57,17 +62,27 @@ Ordinary premarket automation is unchanged by this work.
 20. As the operator, I want the Dashboard to show controller PID, Git SHA, phase, latest success, blocker, and next check, so that failures are attributable.
 21. As the operator, I want a missing executor heartbeat shown as a blocking error, so that a dead controller is not confused with a pending order.
 22. As the operator, I want deployment verification to inspect the live controller processes and fresh logs, so that passing unit tests are not mistaken for a working scheduler.
+23. As the operator, I want a missing report generated even after a controller restart, so that report generation cannot be lost with its original trigger.
+24. As the operator, I want report recovery to continue without interrupting protection monitoring, so that an existing holding is never left unprotected while a new report is built.
+25. As the operator, I want the execution batch to lock one report at opening, so that a later revision cannot change a partially executed plan.
+26. As the operator, I want partially filled buys completed within the valid window and frozen risk limits, so that the actual opening matches the strategy as closely as possible.
+27. As the operator, I want simultaneous exit reasons merged into one close action, so that danger and protection signals cannot create duplicate sells.
+28. As the operator, I want a partially filled sell completed only after the prior order is conclusively terminal, so that the remaining position closes without overlapping orders.
+29. As the operator, I want one trend-market command namespace for run, status, and resolution, so that the operational interface is not split again.
+30. As the operator, I want an auditable manual resolution for uncertain orders, so that recovery decisions never require deleting or rewriting ledger files.
 
 ## Implementation Decisions
 
 ### Controller ownership
 
 - Install exactly one persistent trend controller for each enabled market on the designated executor machine.
-- Remove the separate trend report and watcher jobs after the corresponding controller is verified.
+- Replace the separate trend report and watcher jobs during a fenced migration; old and new executors are never active together.
 - Use `RunAtLoad` and `KeepAlive` with restart throttling. Calendar triggers no longer sequence business steps.
 - On every start and wake, derive the next action from durable facts rather than a mutable in-process state machine.
 - The controller lifecycle is: ensure a valid frozen report, reconcile eligible opening actions, monitor active protection lines during the session, and capture the close. The controller may enter at any point in this lifecycle after a restart.
 - Existing market calendars and window rules remain authoritative. CN and HK retain the 09:30–10:00 opening window; US retains its regular-session rule.
+- Protection monitoring has priority during an active session. If a report must be recovered during the session, the controller runs report generation as a supervised child task while monitoring continues; no new opening action is eligible until that report is frozen and validated.
+- Replace the old operational commands with one `trend-market` namespace containing `run`, `status`, and `resolve`. `launchd` calls `run`; an operator may call `run --revision` before execution begins to make an explicit report correction; `status` is read-only; `resolve` records explicit operator decisions. Existing business functions remain internal implementation.
 
 ### Execution mode
 
@@ -78,18 +93,32 @@ Ordinary premarket automation is unchanged by this work.
 - The order-writing adapter checks effective mode immediately before every broker mutation. Controller routing is not the only guard.
 - Automatic failover is not provided. Promoting another machine requires an explicit executor-host configuration change after the previous executor is stopped.
 
+### Report lifecycle
+
+- The executor is the only machine allowed to generate trend reports.
+- A missing report must be generated whenever the controller discovers it, including recovery during a trading session.
+- Report work remains one logical report for its data date and execution date. A failure before atomic freeze discards temporary output and recomputes that same report identity; it does not create a revision.
+- Once a report is frozen, delivery failure retries delivery only and never recomputes the report.
+- An explicit correction may create a revision before execution begins. At the first eligible execution check, atomically lock the latest valid report SHA as the day's execution batch.
+- A revision appearing after the execution batch is locked is an anomaly. Display and notify the difference, but do not add, remove, resize, or submit actions from it automatically.
+- If a recovered report freezes inside the valid window, it may execute after all validation passes. If it freezes after the window, preserve it for audit and mark its opening actions `missed`; never roll them into the next trading day.
+
 ### Action identity and duplicate prevention
 
 - Identify an opening action by market, execution date, symbol, and side. Report hashes and action indexes remain evidence but are not order identity.
-- Derive the Futu remark from that stable action identity so it is identical after restart, report revision, or sequential machine migration.
-- Before any submission, query the designated Futu simulated account for that remark.
+- Give each broker attempt a monotonic number under that stable action identity. Derive its Futu remark from the action identity and attempt number so it is identical after restart, report revision, or sequential machine migration.
+- Before any submission, query the designated Futu simulated account for every remark already belonging to the action and for the proposed attempt remark.
 - If an exact broker order exists, write or repair the immutable local result and do not submit.
 - If the remark exists but symbol, side, or quantity conflicts, record `conflict`, notify once, and do not submit.
 - If a local result exists, treat the action as reconciled and do not submit.
 - If a local intent exists without a result, reconcile against Futu. If no broker fact resolves the ambiguity, record `uncertain` and never resubmit automatically.
-- Only when neither a local execution fact nor a broker order exists may the controller atomically write a new intent and submit once.
+- Only when the proposed numbered attempt has neither a local execution fact nor a broker order, and the cumulative action is still eligible, may the controller atomically write its intent and submit once.
 - A later report revision with the same action identity cannot create a second order. An existing intent locks the submitted request facts.
-- Protection exits retain their stable event identity and use the same reconciliation policy.
+- Multiple exit reasons for the same open position lifecycle merge into one `SELL_ALL` action. Signal event IDs are attached as audit reasons; they are not separate order identities.
+- While a sell order is active or partially filled, submit no overlapping sell. After Futu conclusively reports cancellation or rejection, re-read the remaining position and create a numbered retry for only that quantity. An ambiguous state becomes `uncertain`.
+- A partially filled buy remains one cumulative opening action. Wait while an attempt is active. After it is conclusively terminal, aggregate confirmed fills and, while the window remains open, create a numbered attempt for the remaining target.
+- A buy retry may not make cumulative shares exceed the frozen plan quantity or cumulative notional exceed the frozen amount limit. Recalculate the remaining affordable quantity from confirmed fills, remaining budget, current quote, lot size, cash, and the existing risk limits.
+- When the buy window closes, retain the partial position and stop retrying the unfilled remainder.
 
 ### Validation and retry policy
 
@@ -97,7 +126,15 @@ Ordinary premarket automation is unchanged by this work.
 - Failures before intent creation may retry with bounded backoff while the action remains eligible.
 - Failures after intent creation are never treated as safe retries without a conclusive broker reconciliation.
 - When a valid window expires, write one durable `missed` fact and stop attempting the action.
-- Missing or invalid reports block execution. The controller may retry report generation or validation while the window remains open.
+- Missing reports trigger generation with bounded backoff until the report freezes, even if the execution window later closes. Invalid frozen reports block execution and require an explicit correction; they are never silently replaced.
+- Trend data or Futu being unavailable for an entire valid window is an unavoidable `missed` outcome. The controller continues the audit/report work but never violates the strategy window to force a fill.
+
+### Manual resolution
+
+- `uncertain` has exactly three explicit operator resolutions: confirm submitted with a Futu order ID, confirm not submitted and authorize one retry, or abandon the action.
+- The `trend-market resolve` command requires the market, stable action identity, resolution, actor, reason, and any required broker order ID.
+- Resolution writes a new immutable audit fact. It never edits or deletes an intent, result, broker fact, or earlier resolution.
+- Only an explicit “confirm not submitted and authorize retry” resolution may advance an ambiguous action to another numbered attempt.
 
 ### Status and observability
 
@@ -114,7 +151,8 @@ Ordinary premarket automation is unchanged by this work.
 - On the executor host, install or reload the three enabled controllers and verify that each has a fresh PID and heartbeat.
 - On a read-only host, unload any existing trend automation jobs and install none.
 - Deployment must report effective mode, local hostname, configured executor host, and every job it installed or removed.
-- The migration removes old report/watcher jobs only after the replacement controller for that market passes live verification.
+- Migration never runs old and new executors concurrently. Stop the old report/watcher jobs, verify their PIDs are absent, install the controller, reconcile existing Futu orders and ledgers, and only then enable execution.
+- A rollback must not directly restart the old watcher. Deploy the old source with trend automation stopped, reconcile all intents and Futu orders, and only then explicitly restore the old automation if it is still safe.
 
 ## Testing Decisions
 
@@ -122,15 +160,25 @@ Ordinary premarket automation is unchanged by this work.
 - Prefer end-to-end state-transition tests over new tests for pass-through scheduling helpers.
 - Preserve focused tests for the existing report, risk, execution, and protection modules; delete obsolete tests that only assert the removed launchd split.
 - Verify that report completion followed by restart does not regenerate the report.
+- Verify that failure before report freeze regenerates the same logical report, while delivery failure retries delivery without recomputing report content.
+- Verify that a report recovered during an active session does not interrupt protection monitoring.
+- Verify that a report recovered inside the window executes after validation, while one recovered after the window is preserved with `missed` actions.
+- Verify that the report SHA locked at opening remains the complete execution batch and that a later revision changes no automatic action.
 - Verify that broker acceptance followed by a crash before result persistence reconciles without a second submission.
 - Verify that an unresolved intent becomes `uncertain` and produces zero additional submissions.
+- Verify all three manual uncertainty resolutions through immutable audit facts, including that only the explicit retry resolution permits another attempt.
 - Verify that a broker order with the same remark but conflicting request facts becomes `conflict` and produces zero additional submissions.
 - Verify that report revisions with an unchanged action identity do not produce another order.
+- Verify that a partial buy waits for an active order, then submits only the remaining risk-limited quantity after a conclusive terminal state and before the window closes.
+- Verify that a partial buy is retained without further submission after the window closes.
+- Verify that simultaneous exit signals merge into one close action and that a sell retry covers only the confirmed remaining position after the prior order is terminal.
 - Verify that actions outside their valid window become `missed` and never submit.
 - Verify that hostname mismatch prevents report generation, controller installation, notifications, and every broker write.
 - Verify sequential migration by starting with no local ledger and an existing matching Futu order; the new executor must reconstruct the result without submitting.
 - Verify the installer renders exactly one controller job per enabled market on the executor and no trend jobs on a read-only host.
 - Verify restart recovery and heartbeat updates with launchd-focused integration tests.
+- Verify the operational CLI exposes only the `trend-market` run/status/resolve namespace and that removed report/watcher execution commands cannot be invoked.
+- Verify migration and rollback scripts never leave old and new trend executors active at the same time.
 - Before completion, run focused automated tests, the complete test suite, direct controller workflows that do not create unsafe live orders, process and launchd inspection, fresh-log inspection, and the final Dashboard `make acceptance` gate.
 - After an acceptance `PASS`, redeploy the exact accepted Git SHA and verify PID, working directory, Git SHA, heartbeat, fresh logs, and HTTP 200 from the review URL.
 
@@ -140,6 +188,7 @@ Ordinary premarket automation is unchanged by this work.
 - A single global controller coordinating all markets.
 - Active-active execution or an automatic distributed leader election protocol.
 - Automatic promotion of a read-only machine when the executor fails.
+- Cross-machine report or ledger synchronization for read-only deployments.
 - Real-money order placement.
 - Changes to trend selection, sizing, protection, Kelly, or review rules.
 - Retrospective submission after a strategy window has closed.
