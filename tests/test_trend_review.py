@@ -1364,14 +1364,6 @@ def test_result_only_attempt_number_is_not_reused(tmp_path: Path) -> None:
     trend_review.execute_trend_review_open(
         **arguments, now="2026-07-17T09:32:00+08:00"
     )
-    authorize_retry(
-        tmp_path,
-        execution_date="2026-07-17",
-        resolved_at="2026-07-17T09:32:30+08:00",
-    )
-    trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:33:00+08:00"
-    )
     second_request = client.requests[-1]
     attempt_two_intent = next(
         tmp_path.glob(
@@ -1402,17 +1394,8 @@ def test_result_only_attempt_number_is_not_reused(tmp_path: Path) -> None:
         },
     ]
 
-    waiting = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:34:00+08:00"
-    )
-    assert waiting["status"] == "uncertain"
-    authorize_retry(
-        tmp_path,
-        execution_date="2026-07-17",
-        resolved_at="2026-07-17T09:35:00+08:00",
-    )
     result = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:36:00+08:00"
+        **arguments, now="2026-07-17T09:34:00+08:00"
     )
     action_key = trend_review.trend_action_key(
         "CN", "2026-07-17", "SH.600001", "buy"
@@ -1891,17 +1874,6 @@ def test_incomplete_sell_all_recovers_after_execution_date_until_position_is_zer
         **arguments, now="2026-07-20T09:31:00+08:00"
     )
 
-    assert day_two["status"] == "uncertain"
-    authorize_retry(
-        tmp_path,
-        execution_date="2026-07-17",
-        side="sell",
-        resolved_at="2026-07-20T09:32:00+08:00",
-    )
-    day_two = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-20T09:33:00+08:00"
-    )
-
     assert day_two["submitted_count"] == 1
     assert [request["side"] for request in client.requests] == ["sell", "sell"]
     assert client.requests[-1]["qty"] == "100"
@@ -2029,18 +2001,6 @@ def test_sell_recovery_stops_only_for_valid_position_zero_terminal_status(
     recovered = trend_review.execute_trend_review_open(
         **arguments, now="2026-07-20T09:31:00+08:00"
     )
-
-    if expected_submitted:
-        assert recovered["status"] == "uncertain"
-        authorize_retry(
-            tmp_path,
-            execution_date="2026-07-17",
-            side="sell",
-            resolved_at="2026-07-20T09:32:00+08:00",
-        )
-        recovered = trend_review.execute_trend_review_open(
-            **arguments, now="2026-07-20T09:33:00+08:00"
-        )
 
     assert recovered["submitted_count"] == expected_submitted
     assert len(client.requests) == 1 + expected_submitted
@@ -2182,18 +2142,8 @@ def test_positive_sell_recovery_uses_broker_fills_and_live_retry_quantity(
         "dealt_avg_price": "10",
         "order_status": "CANCELLED_PART",
     }]
-    waiting = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-20T09:32:00+08:00"
-    )
-    assert waiting["status"] == "uncertain"
-    authorize_retry(
-        tmp_path,
-        execution_date="2026-07-17",
-        side="sell",
-        resolved_at="2026-07-20T09:33:00+08:00",
-    )
     recovered = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-20T09:34:00+08:00"
+        **arguments, now="2026-07-20T09:32:00+08:00"
     )
     latest = next(
         event
@@ -2264,15 +2214,10 @@ def test_partial_buy_amount_cap_uses_current_quote_and_confirmed_notional(
             "order_status": "CANCELLED_PART",
         }
     ]
-    assert trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:32:00+08:00"
-    )["status"] == "uncertain"
-    authorize_retry(tmp_path, execution_date="2026-07-17")
-
     result = trend_review.execute_trend_review_open(
         **{
             **arguments,
-            "now": "2026-07-17T09:41:00+08:00",
+            "now": "2026-07-17T09:32:00+08:00",
             "quote_prices": {"SH.600001": Decimal("15")},
         }
     )
@@ -2315,14 +2260,10 @@ def test_partial_buy_cash_below_one_lot_creates_no_attempt(tmp_path: Path) -> No
             "order_status": "CANCELLED_PART",
         }
     ]
-    trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:32:00+08:00"
-    )
-    authorize_retry(tmp_path, execution_date="2026-07-17")
     client.cash = "999"
 
     result = trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:41:00+08:00"
+        **arguments, now="2026-07-17T09:32:00+08:00"
     )
 
     assert result["submitted_count"] == 0
@@ -2363,15 +2304,10 @@ def test_partial_buy_risk_cap_limits_retry_lots(
             "order_status": "CANCELLED_PART",
         }
     ]
-    trend_review.execute_trend_review_open(
-        **arguments, now="2026-07-17T09:32:00+08:00"
-    )
-    authorize_retry(tmp_path, execution_date="2026-07-17")
-
     result = trend_review.execute_trend_review_open(
         **{
             **arguments,
-            "now": "2026-07-17T09:41:00+08:00",
+            "now": "2026-07-17T09:32:00+08:00",
             "quote_prices": {"SH.600001": Decimal("15")},
         }
     )
@@ -2425,6 +2361,216 @@ def test_partial_buy_after_window_is_marked_missed_once(tmp_path: Path) -> None:
     assert client.positions == [{"code": "SH.600001", "qty": "200"}]
     assert len(missed) == 1
     assert missed[0]["reason"] == "buy_window_closed"
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ]
+    partial = next(
+        event for event in events if event.get("status") == "partially_filled"
+    )
+    assert partial["filled_qty"] == "200"
+    assert partial["active_protection_line"] == "9.0"
+    protection = json.loads(
+        (tmp_path / "trend_a_share/protection_state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert protection["positions"]["600001"]["active_line"] == "9.0"
+
+
+def test_fully_filled_buy_observed_after_window_is_not_marked_missed(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "400",
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    }]
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T10:01:00+08:00"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ]
+
+    assert any(event.get("status") == "filled" for event in events)
+    assert not any(event.get("status") == "missed" for event in events)
+    assert json.loads(
+        (tmp_path / "trend_a_share/protection_state.json").read_text(
+            encoding="utf-8"
+        )
+    )["positions"]["600001"]["active_line"] == "9.0"
+
+
+def test_response_failure_partial_buy_reconciles_before_after_window_missed(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(fail_orders=1, accepted_before_failure=True)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+    with pytest.raises(RuntimeError, match="place order failed"):
+        trend_review.execute_trend_review_open(
+            **arguments, now="2026-07-17T09:31:00+08:00"
+        )
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "200",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    }]
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T10:01:00+08:00"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ]
+
+    assert any(event.get("status") == "partially_filled" for event in events)
+    assert sum(event.get("status") == "missed" for event in events) == 1
+    assert json.loads(
+        (tmp_path / "trend_a_share/protection_state.json").read_text(
+            encoding="utf-8"
+        )
+    )["positions"]["600001"]["active_line"] == "9.0"
+
+
+def test_partial_buy_restart_after_execution_date_records_durable_missed(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": cn_buy_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "200",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    }]
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ]
+
+    assert any(event.get("status") == "partially_filled" for event in events)
+    assert sum(event.get("status") == "missed" for event in events) == 1
+    assert next(
+        event for event in events if event.get("status") == "missed"
+    )["reason"] == "buy_window_closed"
+    assert len(client.requests) == 1
+
+
+def test_missing_buy_quote_skips_only_that_buy_after_sell(tmp_path: Path) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "300"}]
+    )
+    report = report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"},
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600003",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+        },
+    ])
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={"SH.600003": Decimal("10")},
+    )
+    missing_action_key = trend_review.trend_action_key(
+        "CN", "2026-07-17", "SH.600002", "buy"
+    )
+    missing_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            tmp_path
+            / "trend_review/ledgers/CN/actions/2026-07-17"
+            / missing_action_key
+        ).glob("*.json")
+    ]
+
+    assert result["submitted_count"] == 2
+    assert [request["side"] for request in client.requests] == ["sell", "buy"]
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.600001",
+        "SH.600003",
+    ]
+    assert any(
+        event.get("status") == "pending"
+        and event.get("reason") == "current_quote_unavailable"
+        for event in missing_events
+    )
 
 
 def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
@@ -2453,13 +2599,8 @@ def test_partial_buy_only_submits_unfilled_remainder(tmp_path: Path) -> None:
         }
     ]
 
-    waiting = trend_review.execute_trend_review_open(
-        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
-    )
-    assert waiting["status"] == "uncertain"
-    authorize_retry(tmp_path, execution_date="2026-07-17")
     result = trend_review.execute_trend_review_open(
-        **{**arguments, "now": "2026-07-17T09:41:00+08:00"}
+        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
     )
 
     assert result["submitted_count"] == 1
@@ -2508,13 +2649,8 @@ def test_existing_broker_retry_repairs_result_without_duplicate_submit(
         },
     ]
 
-    waiting = trend_review.execute_trend_review_open(
-        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
-    )
-    assert waiting["status"] == "uncertain"
-    authorize_retry(tmp_path, execution_date="2026-07-17")
     result = trend_review.execute_trend_review_open(
-        **{**arguments, "now": "2026-07-17T09:41:00+08:00"}
+        **{**arguments, "now": "2026-07-17T09:32:00+08:00"}
     )
 
     assert result["submitted_count"] == 0
@@ -2540,7 +2676,6 @@ def test_active_partial_buy_waits_instead_of_duplicate_submission(
         "execution_date": "2026-07-17",
         "quote_prices": TEST_QUOTE_PRICES,
         "now": "2026-07-17T09:31:00+08:00",
-        "quote_prices": TEST_QUOTE_PRICES,
     }
     trend_review.execute_trend_review_open(**arguments)
     request = client.requests[0]
@@ -2651,7 +2786,6 @@ def test_open_marks_intent_uncertain_when_failed_order_is_absent_at_broker(
         "execution_date": "2026-07-17",
         "now": "2026-07-17T09:31:00+08:00",
         "quote_prices": TEST_QUOTE_PRICES,
-        "quote_prices": TEST_QUOTE_PRICES,
     }
 
     with pytest.raises(RuntimeError, match="place order failed"):
@@ -2687,7 +2821,7 @@ def test_open_reconciles_accepted_order_after_response_failure(
     }
     result = trend_review.execute_trend_review_open(**arguments)
 
-    assert result["status"] == "unchanged"
+    assert result["status"] == "uncertain"
     assert len(client.requests) == 1
     assert list(tmp_path.glob("trend_review/ledgers/CN/open/*/*-result.json"))
 
@@ -3008,20 +3142,8 @@ def test_merged_sell_retry_uses_live_remaining_position(tmp_path: Path) -> None:
     ]
     client.positions = [{"code": "SH.600001", "qty": "100"}]
 
-    waiting = trend_review.execute_trend_review_stop(
-        **arguments, now="2026-07-17T10:16:00+08:00"
-    )
-    assert waiting["status"] == "uncertain"
-    assert len(client.requests) == 1
-    authorize_retry(
-        tmp_path,
-        execution_date="2026-07-17",
-        side="sell",
-        resolved_at="2026-07-17T10:17:00+08:00",
-    )
-
     retried = trend_review.execute_trend_review_stop(
-        **arguments, now="2026-07-17T10:18:00+08:00"
+        **arguments, now="2026-07-17T10:16:00+08:00"
     )
 
     assert retried["submitted_count"] == 1

@@ -779,6 +779,33 @@ def _write_uncertain_action_event_once(
     )
 
 
+def _write_action_status_once(
+    *,
+    data_dir: Path,
+    market: str,
+    execution_date: str,
+    action_key: str,
+    action_root: Path,
+    evidence: Mapping[str, object],
+    status: str,
+    reason: str,
+    recorded_at: str,
+) -> Path | None:
+    if any(
+        event.get("status") == status and event.get("reason") == reason
+        for event in _action_events(action_root)
+    ):
+        return None
+    return _write_action_event(
+        data_dir=data_dir,
+        market=market,
+        execution_date=execution_date,
+        action_key=action_key,
+        payload={**evidence, "status": status, "reason": reason},
+        recorded_at=recorded_at,
+    )
+
+
 def _action_resolutions(
     root: Path,
     *,
@@ -1284,6 +1311,12 @@ def execute_trend_review_open(
             item.get("resolution") == "authorize-retry" for item in resolutions
         )
         action_facts = _action_facts(root, futu_code=futu_code, side=side)
+        buy_window_event = None
+        if action_name == "BUY" and symbol not in sell_symbols:
+            if same_day and local_time < datetime.strptime("09:30", "%H:%M").time():
+                buy_window_event = ("pending", "buy_window_not_open")
+            elif local_current.date() > execution_day or not buy_window_open:
+                buy_window_event = ("missed", "buy_window_closed")
         if action_name == "SELL_ALL":
             reason_id = str(
                 action.get("event_id") or action.get("reason") or ""
@@ -1343,41 +1376,29 @@ def execute_trend_review_open(
             )
             if position_zero_complete:
                 continue
-        if not same_day and not (
-            local_current.date() > execution_day
+        if local_current.date() < execution_day:
+            continue
+        if (
+            not same_day
             and action_name == "SELL_ALL"
-            and bool(action_facts)
+            and not (local_current.date() > execution_day and bool(action_facts))
         ):
             continue
-        if action_name == "BUY" and (symbol in sell_symbols or not buy_window_open):
-            if symbol not in sell_symbols:
-                event_status = (
-                    "pending"
-                    if local_time < datetime.strptime("09:30", "%H:%M").time()
-                    else "missed"
-                )
-                event_reason = (
-                    "buy_window_not_open"
-                    if event_status == "pending"
-                    else "buy_window_closed"
-                )
-                if not any(
-                    event.get("status") == event_status
-                    and event.get("reason") == event_reason
-                    for event in _action_events(action_events_root)
-                ):
-                    _write_action_event(
-                        data_dir=data_dir,
-                        market=market,
-                        execution_date=execution_date,
-                        action_key=action_key,
-                        payload={
-                            **action_evidence,
-                            "status": event_status,
-                            "reason": event_reason,
-                        },
-                        recorded_at=now,
-                    )
+        if action_name == "BUY" and symbol in sell_symbols:
+            continue
+        if action_name == "BUY" and not action_facts and buy_window_event:
+            event_status, event_reason = buy_window_event
+            _write_action_status_once(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                action_root=action_events_root,
+                evidence=action_evidence,
+                status=event_status,
+                reason=event_reason,
+                recorded_at=now,
+            )
             continue
         if action_name == "SELL_ALL" and not market_open and sell_quantity > 0:
             continue
@@ -1471,23 +1492,22 @@ def execute_trend_review_open(
                         recorded_at=now,
                     )
                     raise RuntimeError(reason)
-                if broker_order is not None:
-                    continue
-                _write_uncertain_action_event_once(
-                    data_dir=data_dir,
-                    market=market,
-                    execution_date=execution_date,
-                    action_key=action_key,
-                    action_root=action_events_root,
-                    evidence=action_evidence,
-                    attempt=pending_attempt,
-                    reason="intent has no conclusive broker fact",
-                    target_qty=str(request.get("qty") or ""),
-                    recorded_at=now,
-                )
-                blocked_status = "uncertain"
-                break
-            else:
+                if broker_order is None:
+                    _write_uncertain_action_event_once(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        action_root=action_events_root,
+                        evidence=action_evidence,
+                        attempt=pending_attempt,
+                        reason="intent has no conclusive broker fact",
+                        target_qty=str(request.get("qty") or ""),
+                        recorded_at=now,
+                    )
+                    blocked_status = "uncertain"
+                    break
+            if pending_intent is None or broker_order is not None:
                 request = action_facts[0][2]
                 orders = _listed_orders(
                     client,
@@ -1584,8 +1604,6 @@ def execute_trend_review_open(
                     )
                     blocked_status = "uncertain"
                     break
-                if not matched and not position_zero and authorized_retries == 0:
-                    continue
                 target_quantity = _required_decimal(request.get("qty"), "target quantity")
                 dealt_by_order = {
                     str(order.get("order_id") or index): _required_decimal(
@@ -1692,6 +1710,22 @@ def execute_trend_review_open(
                         )
                 if remaining <= 0:
                     continue
+                if action_name == "BUY" and buy_window_event:
+                    event_status, event_reason = buy_window_event
+                    _write_action_status_once(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        action_root=action_events_root,
+                        evidence=action_evidence,
+                        status=event_status,
+                        reason=event_reason,
+                        recorded_at=now,
+                    )
+                    continue
+                if not matched and not position_zero and authorized_retries == 0:
+                    continue
                 broker_statuses = {
                     str(order.get("order_status") or order.get("status") or "")
                     .strip()
@@ -1717,22 +1751,20 @@ def execute_trend_review_open(
                     blocked_status = "uncertain"
                     break
                 attempt = max(item[3] for item in action_facts) + 1
-                if authorized_retries < attempt - 1:
-                    reason = "remaining quantity requires retry authorization"
-                    _write_uncertain_action_event_once(
-                        data_dir=data_dir,
-                        market=market,
-                        execution_date=execution_date,
-                        action_key=action_key,
-                        action_root=action_events_root,
-                        evidence=action_evidence,
-                        attempt=attempt - 1,
-                        reason=reason,
-                        recorded_at=now,
-                    )
-                    blocked_status = "uncertain"
-                    break
                 if action_name == "BUY":
+                    if futu_code not in quote_prices:
+                        _write_action_status_once(
+                            data_dir=data_dir,
+                            market=market,
+                            execution_date=execution_date,
+                            action_key=action_key,
+                            action_root=action_events_root,
+                            evidence=action_evidence,
+                            status="pending",
+                            reason="current_quote_unavailable",
+                            recorded_at=now,
+                        )
+                        continue
                     remaining = Decimal(
                         _remaining_buy_quantity(
                             action,
@@ -1796,18 +1828,19 @@ def execute_trend_review_open(
                     continue
         else:
             if action_name == "BUY":
-                lot_size = int(action.get("lot_size") or 0)
-                frozen_quantity = _required_decimal(
-                    action.get("estimated_shares"), "estimated shares"
-                )
-                if (
-                    not symbol
-                    or lot_size <= 0
-                    or frozen_quantity <= 0
-                    or frozen_quantity != frozen_quantity.to_integral_value()
-                    or frozen_quantity % lot_size
-                ):
-                    raise ValueError("trend review buy action is invalid")
+                if futu_code not in quote_prices:
+                    _write_action_status_once(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        action_root=action_events_root,
+                        evidence=action_evidence,
+                        status="pending",
+                        reason="current_quote_unavailable",
+                        recorded_at=now,
+                    )
+                    continue
                 quantity = _remaining_buy_quantity(
                     action,
                     report,

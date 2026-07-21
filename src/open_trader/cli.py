@@ -357,8 +357,6 @@ def run_trend_review_open(
                 symbol: snapshot.last_price
                 for symbol, snapshot in quote.get_snapshots(buy_symbols).items()
             }
-            if set(quote_prices) != set(buy_symbols):
-                raise ValueError("trend review opening quotes are unavailable")
         client = ExecutorGuardedOrderClient(
             FutuSimulateOrderExecutionClient(
                 host=config.futu_host,

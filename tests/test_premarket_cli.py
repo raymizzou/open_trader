@@ -517,8 +517,17 @@ def test_trend_review_loader_accepts_report_named_for_as_of_date(
     ) == report
 
 
-def test_trend_review_open_caps_frozen_actions_with_opening_quotes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "available_buy_symbols",
+    [
+        ("SH.600002", "SH.600003"),
+        ("SH.600002",),
+    ],
+)
+def test_trend_review_open_passes_available_quotes_without_blocking_sell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    available_buy_symbols: tuple[str, ...],
 ) -> None:
     report_dir = tmp_path / "reports/trend_a_share"
     report_dir.mkdir(parents=True)
@@ -529,15 +538,27 @@ def test_trend_review_open_caps_frozen_actions_with_opening_quotes(
         "generated_at": "2026-07-16T18:00:00+08:00",
         "metadata": {"market": "CN", "broker": "eastmoney"},
         "strategy_judgments": {
-            "formal_actions": [{
-                "action": "BUY",
-                "symbol": "600001",
-                "target_weight": "0.04",
-                "lot_size": 100,
-                "estimated_shares": 300,
-                "target_amount": "3000",
-                "atr": "0.5",
-            }],
+            "formal_actions": [
+                {"action": "SELL_ALL", "symbol": "600001"},
+                {
+                    "action": "BUY",
+                    "symbol": "600002",
+                    "target_weight": "0.04",
+                    "lot_size": 100,
+                    "estimated_shares": 300,
+                    "target_amount": "3000",
+                    "atr": "0.5",
+                },
+                {
+                    "action": "BUY",
+                    "symbol": "600003",
+                    "target_weight": "0.04",
+                    "lot_size": 100,
+                    "estimated_shares": 300,
+                    "target_amount": "3000",
+                    "atr": "0.5",
+                },
+            ],
             "holding_decisions": [],
             "top10_candidates": [],
         },
@@ -576,7 +597,9 @@ def test_trend_review_open_caps_frozen_actions_with_opening_quotes(
             get_snapshots=lambda symbols: (
                 quoted.append(list(symbols))
                 or {
-                    "SH.600001": SimpleNamespace(last_price=Decimal("10"))
+                    symbol: SimpleNamespace(last_price=Decimal("10"))
+                    for symbol in symbols
+                    if symbol in available_buy_symbols
                 }
             ),
             close=lambda: quote_closes.append(True),
@@ -604,7 +627,7 @@ def test_trend_review_open_caps_frozen_actions_with_opening_quotes(
     result = cli.run_trend_review_open(config, "CN", "2026-07-17")
     revised = json.loads(json.dumps(report))
     revised["generated_at"] = "2026-07-16T18:01:00+08:00"
-    revised["strategy_judgments"]["formal_actions"][0]["estimated_shares"] = 200
+    revised["strategy_judgments"]["formal_actions"][1]["estimated_shares"] = 200
     (report_dir / "2026-07-16-r1.json").write_text(
         json.dumps(revised), encoding="utf-8"
     )
@@ -612,8 +635,13 @@ def test_trend_review_open_caps_frozen_actions_with_opening_quotes(
 
     assert captured["report"] == report
     assert executed_reports == [report, report]
-    assert captured["quote_prices"] == {"SH.600001": Decimal("10")}
-    assert quoted == [["SH.600001"], ["SH.600001"]]
+    assert captured["quote_prices"] == {
+        symbol: Decimal("10") for symbol in available_buy_symbols
+    }
+    assert quoted == [
+        ["SH.600002", "SH.600003"],
+        ["SH.600002", "SH.600003"],
+    ]
     assert quote_closes == [True, True]
     assert authorizations == ["checked", "checked", "checked", "checked"]
     assert result["artifact_path"] == str(tmp_path / "result.json")
