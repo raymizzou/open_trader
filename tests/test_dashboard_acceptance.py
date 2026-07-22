@@ -1468,6 +1468,21 @@ def test_acceptance_allows_only_the_audited_v4_overheat_trim_compatibility(
         account_ids=account_ids,
     ) == []
 
+    frozen["strategy_snapshot"]["parameters"] = old_parameters
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    rollback_errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+    assert any("冻结策略参数与回撤审计身份" in error for error in rollback_errors)
+
+    frozen["strategy_snapshot"]["parameters"] = updated_parameters
     frozen["strategy_snapshot"]["parameters"]["overheat_trim_fraction"] = "0.31"
     artifact.write_text(json.dumps(frozen), encoding="utf-8")
     report["report_sha256"] = _report_hash(frozen)

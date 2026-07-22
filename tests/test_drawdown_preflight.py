@@ -154,6 +154,12 @@ def test_preflight_accepts_the_approved_v4_overheat_trim_transition(
     assert after["audit_events"][:-1] == before["audit_events"]
     assert after["audit_events"][-1]["event_type"] == "parameter_compatibility"
 
+    before_rollback = state_path.read_bytes()
+    rollback = run_preflight(tmp_path, {"US": old})
+    assert rollback["status"] == "failed"
+    assert rollback["markets"][0]["failure_status"] == "parameter_mismatch"
+    assert state_path.read_bytes() == before_rollback
+
 
 def test_late_preflight_reports_entries_blocked_until_eligible_date(
     tmp_path: Path,

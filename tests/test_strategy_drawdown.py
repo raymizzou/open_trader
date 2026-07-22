@@ -174,6 +174,20 @@ def test_v4_overheat_trim_compatibility_appends_only_a_validated_audit_event(
     assert replay == decision
     assert state_path.read_bytes() == state_after_first_transition
 
+    with pytest.raises(
+        ValueError, match="strategy parameters changed without a version bump"
+    ):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            **{
+                **request,
+                "baseline_equity": None,
+                "source_date": None,
+                "entry_eligible_from": None,
+            },
+        )
+    assert state_path.read_bytes() == state_after_first_transition
+
 
 @pytest.mark.parametrize(
     "parameters",

@@ -297,16 +297,16 @@ def valid_strategy_parameter_audit_identity(
     if not isinstance(bootstrap_event, Mapping):
         return False
     old_hash = bootstrap_event.get("parameter_hash")
-    if old_hash == current_hash:
-        return True
-    return (
-        isinstance(parameter_compatibility_event, dict)
-        and _valid_parameter_compatibility_event(parameter_compatibility_event)
-        and _record_key(parameter_compatibility_event) == key
-        and parameter_compatibility_event.get("old_parameter_hash") == old_hash
-        and parameter_compatibility_event.get("new_parameter_hash") == current_hash
-        and _approved_overheat_trim_transition(key, parameters, old_hash)
-    )
+    if parameter_compatibility_event is not None:
+        return (
+            isinstance(parameter_compatibility_event, dict)
+            and _valid_parameter_compatibility_event(parameter_compatibility_event)
+            and _record_key(parameter_compatibility_event) == key
+            and parameter_compatibility_event.get("old_parameter_hash") == old_hash
+            and parameter_compatibility_event.get("new_parameter_hash") == current_hash
+            and _approved_overheat_trim_transition(key, parameters, old_hash)
+        )
+    return old_hash == current_hash
 
 
 def automatic_bootstrap_strategy_drawdown(
@@ -359,52 +359,49 @@ def automatic_bootstrap_strategy_drawdown(
         if record is not None:
             if event is None:
                 raise ValueError("strategy parameter identity is unavailable")
-            if event.get("parameter_hash") != parameter_hash:
+            compatibility_events = [
+                item
+                for item in events
+                if isinstance(item, dict)
+                and item.get("event_type") == "parameter_compatibility"
+                and _record_key(item) == key
+            ]
+            if compatibility_events:
+                if not (
+                    len(compatibility_events) == 1
+                    and valid_strategy_parameter_audit_identity(
+                        market=key[0],
+                        strategy_id=key[1],
+                        strategy_version=key[2],
+                        parameters=parameters,
+                        bootstrap_event=event,
+                        parameter_compatibility_event=compatibility_events[0],
+                    )
+                ):
+                    raise ValueError("strategy parameters changed without a version bump")
+            elif event.get("parameter_hash") != parameter_hash:
                 old_hash = event.get("parameter_hash")
-                compatibility_events = [
-                    item
-                    for item in events
-                    if isinstance(item, dict)
-                    and item.get("event_type") == "parameter_compatibility"
-                    and _record_key(item) == key
-                ]
                 if not _approved_overheat_trim_transition(
                     key, parameters, old_hash
                 ):
                     raise ValueError("strategy parameters changed without a version bump")
-                if compatibility_events:
-                    if not (
-                        len(compatibility_events) == 1
-                        and valid_strategy_parameter_audit_identity(
-                            market=key[0],
-                            strategy_id=key[1],
-                            strategy_version=key[2],
-                            parameters=parameters,
-                            bootstrap_event=event,
-                            parameter_compatibility_event=compatibility_events[0],
-                        )
-                    ):
-                        raise ValueError(
-                            "strategy parameters changed without a version bump"
-                        )
-                else:
-                    assert isinstance(old_hash, str)
-                    events.append({
-                        "event_id": _parameter_compatibility_event_id(
-                            key, old_hash, parameter_hash
-                        ),
-                        "event_type": "parameter_compatibility",
-                        "market": key[0],
-                        "strategy_id": key[1],
-                        "strategy_version": key[2],
-                        "actor": actor.strip(),
-                        "occurred_at": occurred_at,
-                        "old_parameter_hash": old_hash,
-                        "new_parameter_hash": parameter_hash,
-                        "compatibility_revision": OVERHEAT_TRIM_COMPATIBILITY_REVISION,
-                        "accepted_git_sha": accepted_git_sha,
-                    })
-                    _write_state(path, payload)
+                assert isinstance(old_hash, str)
+                events.append({
+                    "event_id": _parameter_compatibility_event_id(
+                        key, old_hash, parameter_hash
+                    ),
+                    "event_type": "parameter_compatibility",
+                    "market": key[0],
+                    "strategy_id": key[1],
+                    "strategy_version": key[2],
+                    "actor": actor.strip(),
+                    "occurred_at": occurred_at,
+                    "old_parameter_hash": old_hash,
+                    "new_parameter_hash": parameter_hash,
+                    "compatibility_revision": OVERHEAT_TRIM_COMPATIBILITY_REVISION,
+                    "accepted_git_sha": accepted_git_sha,
+                })
+                _write_state(path, payload)
             assert isinstance(record, dict)
             return _decision_from_record(
                 record,
