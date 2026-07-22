@@ -264,20 +264,17 @@ def automatic_bootstrap_strategy_drawdown(
     strategy_id: str,
     strategy_version: str,
     parameters: Mapping[str, object],
-    baseline_equity: Decimal,
-    source_date: str,
+    baseline_equity: Decimal | None,
+    source_date: str | None,
     accepted_git_sha: str,
     actor: str,
     occurred_at: str,
     reason: str,
-    entry_eligible_from: str,
+    entry_eligible_from: str | None,
     entry_date: str | None = None,
 ) -> dict[str, object]:
     key = _strategy_key(market, strategy_id, strategy_version)
-    equity = _positive_decimal(baseline_equity, "baseline_equity")
     parameter_hash = strategy_parameter_hash(parameters)
-    _canonical_date(source_date, "source_date")
-    _canonical_date(entry_eligible_from, "entry_eligible_from")
     if entry_date is not None:
         _canonical_date(entry_date, "entry_date")
     _canonical_timestamp(occurred_at, "occurred_at")
@@ -321,6 +318,15 @@ def automatic_bootstrap_strategy_drawdown(
             )
         if event is not None:
             raise ValueError("automatic bootstrap event has no strategy record")
+        if (
+            baseline_equity is None
+            or source_date is None
+            or entry_eligible_from is None
+        ):
+            raise ValueError("completed-date frozen Futu baseline is unavailable")
+        equity = _positive_decimal(baseline_equity, "baseline_equity")
+        _canonical_date(source_date, "source_date")
+        _canonical_date(entry_eligible_from, "entry_eligible_from")
         record = _new_record(key, equity=equity, updated_at=occurred_at)
         event = {
             "event_id": event_id,

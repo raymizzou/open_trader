@@ -906,22 +906,26 @@ def load_futu_simulate_trend_account(
     simulate_acc_id: int,
     market: str,
     expected_date: str,
+    account_client: object | None = None,
     account_factory: Callable[..., object] = FutuSimulateOrderExecutionClient,
 ) -> AccountSnapshot:
     market = market.strip().upper()
     if market not in {"CN", "HK", "US"}:
         raise ValueError(f"unsupported trend review market: {market}")
-    client = account_factory(
-        host=host,
-        port=port,
-        simulate_acc_id=simulate_acc_id,
-        trd_market=market,
-    )
+    owns_client = account_client is None
+    client = account_client
+    if client is None:
+        client = account_factory(
+            host=host,
+            port=port,
+            simulate_acc_id=simulate_acc_id,
+            trd_market=market,
+        )
     try:
         snapshot = client.account_snapshot()
     finally:
         close = getattr(client, "close", None)
-        if callable(close):
+        if owns_client and callable(close):
             close()
     if not isinstance(snapshot, Mapping):
         raise ValueError("Futu simulation account snapshot must be an object")
@@ -3346,7 +3350,7 @@ def _write_delivery_receipt(
     return payload
 
 
-def _read_delivery_receipt(
+def read_delivery_receipt(
     path: Path,
     *,
     artifact_stem: str,
@@ -3398,6 +3402,9 @@ def _read_delivery_receipt(
         )
     if not isinstance(protection_state, dict):
         raise ValueError("delivery receipt has no embedded protection state")
+    if protection_state != report_payload.get("protection_state"):
+        raise ValueError("delivery receipt protection state mismatch")
+    _validate_protection_state(protection_state)
     hashes = _payload_hashes(markdown, report_json, protection_state)
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")
@@ -3502,7 +3509,7 @@ def _artifact_stem(
         ):
             number += 1
             continue
-        receipt = _read_delivery_receipt(receipt_path, artifact_stem=stem)
+        receipt = read_delivery_receipt(receipt_path, artifact_stem=stem)
         if receipt is not None:
             if receipt["status"] != "sent" or not _final_pair_matches(
                 receipt, markdown_path, json_path
@@ -3612,7 +3619,7 @@ def _recover_receipt_report(
     notifier: Notifier,
 ) -> AShareTrendRunResult | None:
     receipt_path = _receipt_path(config.data_dir, artifact_stem)
-    receipt = _read_delivery_receipt(
+    receipt = read_delivery_receipt(
         receipt_path,
         artifact_stem=artifact_stem,
     )
@@ -4234,7 +4241,7 @@ def run_a_share_trend_report(
         ):
             return AShareTrendRunResult("existing", base_markdown, base_json)
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
-        receipt = _read_delivery_receipt(
+        receipt = read_delivery_receipt(
             receipt_path,
             artifact_stem=artifact_stem,
         )

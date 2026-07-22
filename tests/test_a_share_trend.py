@@ -166,6 +166,38 @@ def test_futu_simulation_account_rejects_invalid_boundary_rows(
         )
 
 
+def test_futu_simulation_account_borrows_existing_client() -> None:
+    class Client:
+        closed = False
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = Client()
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-22",
+        account_client=client,
+        account_factory=lambda **_kwargs: pytest.fail(
+            "borrowed account opened another context"
+        ),
+    )
+
+    assert account.net_value == Decimal("100")
+    assert client.closed is False
+
+
 def test_futu_simulation_account_ignores_explicit_zero_quantity_rows() -> None:
     class Client:
         def account_snapshot(self) -> dict[str, object]:
@@ -4489,7 +4521,10 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
         generated_at="2026-07-14T17:00:00+08:00",
         artifact_stem="2026-07-14",
         markdown="old report",
-        report_json='{\n  "delivery_status": "delivery_failed"\n}\n',
+        report_json=(
+            '{\n  "delivery_status": "delivery_failed",\n'
+            '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+        ),
         protection_state={"schema_version": 1, "positions": {}},
     )
     old_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -4508,17 +4543,23 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
             generated_at="2026-07-14T17:00:00+08:00",
             artifact_stem="2026-07-14",
             markdown="new report",
-            report_json='{\n  "delivery_status": "sent"\n}\n',
+            report_json=(
+                '{\n  "delivery_status": "sent",\n'
+                '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+            ),
             protection_state={"schema_version": 1, "positions": {}},
         )
 
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == old_receipt
-    recovered = trend_module._read_delivery_receipt(
+    recovered = trend_module.read_delivery_receipt(
         receipt_path, artifact_stem="2026-07-14"
     )
     assert recovered is not None
     assert recovered["markdown"] == "old report"
-    assert recovered["report_json"] == '{\n  "delivery_status": "delivery_failed"\n}\n'
+    assert recovered["report_json"] == (
+        '{\n  "delivery_status": "delivery_failed",\n'
+        '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+    )
 
 
 def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(

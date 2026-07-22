@@ -248,6 +248,319 @@ def interrupted(message: str = "网络中断") -> FutuQuoteError:
     return FutuQuoteError(message, error_type="quote_server_interrupted")
 
 
+def test_once_watcher_returns_abnormal_when_reconnect_client_fails(
+    tmp_path: Path,
+) -> None:
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=None,
+        quote_client_factory=lambda: (_ for _ in ()).throw(interrupted()),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: pytest.fail("once watcher slept on reconnect"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_watcher_returns_abnormal_when_calendar_fails(tmp_path: Path) -> None:
+    quote = SequenceQuote([], trading_days=interrupted("calendar offline"))
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=quote,
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: pytest.fail("once watcher slept on calendar"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+    assert quote.closed is True
+
+
+def test_once_watcher_does_not_close_borrowed_quote(tmp_path: Path) -> None:
+    quote = SequenceQuote([], trading_days=["2026-07-22"])
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path, symbol=None),
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        quote_client=quote,
+        close_quote_client=False,
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=5,
+        once=True,
+        now_fn=lambda: datetime.fromisoformat("2026-07-22T09:31:00+08:00"),
+    )
+
+    assert result.status == "completed"
+    assert quote.closed is False
+
+
+def test_once_watcher_persists_interruption_until_recovery(tmp_path: Path) -> None:
+    portfolio_path = portfolio(tmp_path, symbol=None)
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingNotifier()
+    now = datetime.fromisoformat("2026-07-22T09:31:00+08:00")
+
+    def watch(quote: SequenceQuote) -> object:
+        return watch_a_share_protection(
+            portfolio_path=portfolio_path,
+            state_path=tmp_path / "state.json",
+            events_path=events_path,
+            quote_client=quote,
+            close_quote_client=False,
+            notifier=notifier,
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: now,
+        )
+
+    failed = SequenceQuote([], trading_days=interrupted("OpenD unavailable"))
+    for _ in range(2):
+        with pytest.raises(FutuQuoteError, match="OpenD unavailable"):
+            watch(failed)
+
+    assert watch(SequenceQuote([], trading_days=["2026-07-22"])).status == "completed"
+
+    with pytest.raises(FutuQuoteError, match="OpenD unavailable"):
+        watch(SequenceQuote([], trading_days=interrupted("OpenD unavailable")))
+
+    assert [title for title, _ in notifier.messages] == [
+        "A股价格监控中断",
+        "A股价格监控恢复",
+        "A股价格监控中断",
+    ]
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "monitor_interrupted",
+        "monitor_recovered",
+        "monitor_interrupted",
+    ]
+
+
+def test_once_watcher_returns_abnormal_when_snapshot_fails(tmp_path: Path) -> None:
+    quote = SequenceQuote([interrupted("snapshot offline")])
+
+    result = run_once(tmp_path, quote=quote)
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+    assert quote.closed is True
+
+
+def test_once_watcher_recovers_after_snapshot_outage_ends(tmp_path: Path) -> None:
+    portfolio_path = portfolio(tmp_path)
+    state_path = state(tmp_path)
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingNotifier()
+
+    def watch(snapshot: dict[str, Decimal] | Exception) -> object:
+        return watch_a_share_protection(
+            portfolio_path=portfolio_path,
+            state_path=state_path,
+            events_path=events_path,
+            quote_client=SequenceQuote([snapshot]),
+            close_quote_client=False,
+            notifier=notifier,
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: datetime.fromisoformat("2026-07-15T09:31:00+08:00"),
+        )
+
+    for _ in range(2):
+        with pytest.raises(FutuQuoteError, match="snapshot offline"):
+            watch(interrupted("snapshot offline"))
+
+    assert [title for title, _ in notifier.messages] == ["A股价格监控中断"]
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "monitor_interrupted"
+    ]
+
+    assert watch({"SH.600900": Decimal("28")}).status == "completed"
+    assert [title for title, _ in notifier.messages] == [
+        "A股价格监控中断",
+        "A股价格监控恢复",
+    ]
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "monitor_interrupted",
+        "monitor_recovered",
+    ]
+
+
+def test_once_watcher_waits_for_complete_snapshots_before_recovery(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = portfolio(tmp_path)
+    state_path = state(tmp_path)
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingNotifier()
+
+    def watch(snapshot: dict[str, Decimal] | Exception) -> object:
+        return watch_a_share_protection(
+            portfolio_path=portfolio_path,
+            state_path=state_path,
+            events_path=events_path,
+            quote_client=SequenceQuote([snapshot]),
+            close_quote_client=False,
+            notifier=notifier,
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: datetime.fromisoformat("2026-07-15T09:31:00+08:00"),
+        )
+
+    with pytest.raises(FutuQuoteError, match="snapshot offline"):
+        watch(interrupted("snapshot offline"))
+
+    assert watch({}).status == "abnormal"
+    assert watch({}).status == "abnormal"
+    assert [
+        event["event_type"]
+        for event in read_events(events_path)
+        if str(event["event_type"]).startswith("monitor_")
+    ] == ["monitor_interrupted"]
+    assert [
+        title for title, _ in notifier.messages if "监控" in title
+    ] == ["A股价格监控中断"]
+
+    assert watch({"SH.600900": Decimal("28")}).status == "completed"
+    assert [
+        event["event_type"]
+        for event in read_events(events_path)
+        if str(event["event_type"]).startswith("monitor_")
+    ] == ["monitor_interrupted", "monitor_recovered"]
+    assert [
+        title for title, _ in notifier.messages if "监控" in title
+    ] == ["A股价格监控中断", "A股价格监控恢复"]
+
+
+def test_once_watcher_returns_abnormal_when_account_snapshot_fails(
+    tmp_path: Path,
+) -> None:
+    result = _watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=SequenceQuote([{"SH.600900": Decimal("28")}]),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: pytest.fail("once watcher slept"),
+        account_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("account snapshot offline")
+        ),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_watcher_returns_abnormal_when_failed_client_cannot_close(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=tmp_path / "events.jsonl",
+        quote_client=Quote([], trading_days=interrupted("calendar offline")),
+        notifier=RecordingNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: pytest.fail("once watcher slept"),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_completed_result_becomes_abnormal_when_client_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = run_once(
+        tmp_path,
+        quote=Quote([{"SH.600900": Decimal("28")}]),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_holiday_result_becomes_abnormal_when_client_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = run_once(tmp_path, quote=Quote([], trading_days=[]))
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_once_no_comparable_result_becomes_abnormal_when_client_close_fails(
+    tmp_path: Path,
+) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    result = run_once(
+        tmp_path,
+        quote=Quote([]),
+        state_path=state(tmp_path, active_line=None),
+    )
+
+    assert result.status == "abnormal"
+    assert result.exception_count >= 1
+
+
+def test_persistent_holiday_close_failure_still_raises(tmp_path: Path) -> None:
+    class Quote(SequenceQuote):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        watch_a_share_protection(
+            portfolio_path=portfolio(tmp_path),
+            state_path=state(tmp_path),
+            events_path=tmp_path / "events.jsonl",
+            quote_client=Quote([], trading_days=[]),
+            notifier=RecordingNotifier(),
+            poll_seconds=5,
+            reconnect_seconds=60,
+            once=False,
+            now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+            sleep_fn=lambda _seconds: pytest.fail("holiday watcher slept"),
+        )
+
+
 def test_watcher_calls_review_open_and_stop_hooks_once(tmp_path: Path) -> None:
     opens: list[str] = []
     stops: list[Mapping[str, object]] = []
@@ -876,7 +1189,7 @@ def test_existing_same_day_trigger_without_receipt_retries_after_restart(
     ]
 
 
-def test_opend_failure_reconnects_once_and_announces_recovery(tmp_path: Path) -> None:
+def test_persistent_watcher_reconnects_and_announces_recovery(tmp_path: Path) -> None:
     failed = SequenceQuote([interrupted()])
     recovered = SequenceQuote([{"SH.600900": Decimal("28")}])
     replacements = iter([recovered])
@@ -893,15 +1206,19 @@ def test_opend_failure_reconnects_once_and_announces_recovery(tmp_path: Path) ->
         notifier=notifier,
         poll_seconds=5,
         reconnect_seconds=60,
-        once=True,
+        once=False,
         now_fn=SequenceClock(
-            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:01+08:00"]
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:01+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
         ),
         sleep_fn=sleeps.append,
     )
 
-    assert result.status == "completed"
-    assert sleeps == [60]
+    assert result.status == "closed"
+    assert sleeps == [60, 5]
     assert failed.closed is True
     assert recovered.closed is True
     assert sum("中断" in title for title, _ in notifier.messages) == 1
@@ -912,7 +1229,7 @@ def test_opend_failure_reconnects_once_and_announces_recovery(tmp_path: Path) ->
     ]
 
 
-def test_calendar_failure_uses_the_same_reconnect_path(tmp_path: Path) -> None:
+def test_persistent_watcher_calendar_failure_uses_reconnect_path(tmp_path: Path) -> None:
     failed = SequenceQuote([], trading_days=interrupted())
     recovered = SequenceQuote([{"SH.600900": Decimal("28")}])
     sleeps: list[float] = []
@@ -926,19 +1243,23 @@ def test_calendar_failure_uses_the_same_reconnect_path(tmp_path: Path) -> None:
         notifier=RecordingNotifier(),
         poll_seconds=5,
         reconnect_seconds=60,
-        once=True,
+        once=False,
         now_fn=SequenceClock(
-            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:01+08:00"]
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:01+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
         ),
         sleep_fn=sleeps.append,
     )
 
-    assert result.status == "completed"
-    assert sleeps == [60]
+    assert result.status == "closed"
+    assert sleeps == [60, 5]
     assert recovered.calendar_calls == [("2026-07-15", "2026-07-15")]
 
 
-def test_initial_opend_failure_retries_until_a_client_is_available(
+def test_persistent_watcher_retries_until_a_client_is_available(
     tmp_path: Path,
 ) -> None:
     recovered = SequenceQuote([{"SH.600900": Decimal("28")}])
@@ -961,15 +1282,19 @@ def test_initial_opend_failure_retries_until_a_client_is_available(
         notifier=notifier,
         poll_seconds=5,
         reconnect_seconds=60,
-        once=True,
+        once=False,
         now_fn=SequenceClock(
-            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:01+08:00"]
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:01+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
         ),
         sleep_fn=sleeps.append,
     )
 
-    assert result.status == "completed"
-    assert sleeps == [60]
+    assert result.status == "closed"
+    assert sleeps == [60, 5]
     assert sum("中断" in title for title, _ in notifier.messages) == 1
     assert sum("恢复" in title for title, _ in notifier.messages) == 1
 
@@ -1291,7 +1616,31 @@ def test_manual_quote_exception_is_sent_to_feishu_not_macos(tmp_path: Path) -> N
     assert macos.messages == []
 
 
-def test_report_lock_contention_retries_without_stopping_watcher(
+def test_once_report_lock_contention_returns_abnormal_without_sleep(
+    tmp_path: Path,
+) -> None:
+    report_lock_path = tmp_path / "data/runs/.trend_a_share_report.lock"
+
+    with RunLock(report_lock_path):
+        result = watch_a_share_protection(
+            portfolio_path=portfolio(tmp_path),
+            state_path=state(tmp_path),
+            events_path=tmp_path / "events.jsonl",
+            report_lock_path=report_lock_path,
+            quote_client=SequenceQuote([{"SH.600900": Decimal("28")}]),
+            notifier=RecordingNotifier(),
+            poll_seconds=5,
+            reconnect_seconds=60,
+            once=True,
+            now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+            sleep_fn=lambda _seconds: pytest.fail("once watcher slept on lock"),
+        )
+
+    assert result.status == "abnormal"
+    assert result.exception_count == 1
+
+
+def test_persistent_report_lock_contention_retries_without_stopping_watcher(
     tmp_path: Path,
 ) -> None:
     report_lock_path = tmp_path / "data/runs/.trend_a_share_report.lock"
@@ -1312,12 +1661,16 @@ def test_report_lock_contention_retries_without_stopping_watcher(
         notifier=RecordingNotifier(),
         poll_seconds=5,
         reconnect_seconds=60,
-        once=True,
+        once=False,
         now_fn=SequenceClock(
-            ["2026-07-15T09:30:00+08:00", "2026-07-15T09:30:05+08:00"]
+            [
+                "2026-07-15T09:30:00+08:00",
+                "2026-07-15T09:30:05+08:00",
+                "2026-07-15T15:00:01+08:00",
+            ]
         ),
         sleep_fn=release_report_lock,
     )
 
-    assert result.status == "completed"
-    assert sleeps == [5]
+    assert result.status == "closed"
+    assert sleeps == [5, 5]

@@ -5,6 +5,7 @@ import json
 import plistlib
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -46,7 +47,9 @@ from open_trader.trading_plan import (
 )
 
 
-def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
+def test_load_env_config_parses_required_values_and_executor_host(
+    tmp_path: Path,
+) -> None:
     env = tmp_path / "daily.env"
     env.write_text(
         "\n".join(
@@ -77,6 +80,7 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
                 "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID=101",
                 "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID=102",
                 "OPEN_TRADER_TREND_REVIEW_HK_SIMULATE_ACC_ID=103",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST=ray-mac",
                 "DEEPSEEK_API_KEY=secret",
             ]
         ),
@@ -113,6 +117,27 @@ def test_load_env_config_parses_required_values(tmp_path: Path) -> None:
     assert config.trend_review_cn_simulate_acc_id == 101
     assert config.trend_review_us_simulate_acc_id == 102
     assert config.trend_review_hk_simulate_acc_id == 103
+    assert config.trend_executor_host == "ray-mac"
+
+
+def test_load_env_config_defaults_executor_host_to_empty(tmp_path: Path) -> None:
+    env = tmp_path / "daily.env"
+    env.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={tmp_path}",
+                f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+                "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+                "OPEN_TRADER_DEADLINE=21:10",
+                "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+                "OPEN_TRADER_FUTU_PORT=11111",
+                "DEEPSEEK_API_KEY=secret",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_env_config(env).trend_executor_host == ""
 
 
 def test_shared_env_loader_accepts_other_positive_a_share_pool_ids(
@@ -1380,6 +1405,47 @@ def test_require_trend_review_config_returns_selected_market_values(
 
     assert daily_premarket.require_trend_review_config(config, "CN") == 101
     assert daily_premarket.require_trend_review_config(config, "US") == 102
+
+
+def test_trend_execution_mode_requires_exact_named_host(tmp_path: Path) -> None:
+    config = replace(_daily_config(tmp_path), trend_executor_host="ray-mac")
+
+    matched = daily_premarket.trend_execution_mode(
+        config,
+        hostname_fn=lambda: "ray-mac",
+    )
+    assert matched.mode == "execute"
+    assert matched.reason == "executor host matched"
+
+    mismatch = daily_premarket.trend_execution_mode(
+        config,
+        hostname_fn=lambda: "laptop",
+    )
+    assert mismatch.mode == "readonly"
+    assert mismatch.executor_host == "ray-mac"
+    assert mismatch.local_host == "laptop"
+    assert mismatch.reason == (
+        "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
+    )
+
+
+def test_missing_executor_host_is_readonly(tmp_path: Path) -> None:
+    config = _daily_config(tmp_path)
+
+    mode = daily_premarket.trend_execution_mode(
+        config,
+        hostname_fn=lambda: "ray-mac",
+    )
+    assert mode.mode == "readonly"
+    assert mode.executor_host == ""
+    assert mode.local_host == "ray-mac"
+    assert mode.reason == "OPEN_TRADER_TREND_EXECUTOR_HOST is not configured"
+
+    with pytest.raises(ValueError, match="trend automation is readonly"):
+        daily_premarket.require_trend_executor(
+            config,
+            hostname_fn=lambda: "ray-mac",
+        )
 
 
 def _daily_runner(
@@ -4027,7 +4093,22 @@ def test_launchd_template_runs_daily_premarket_command() -> None:
     assert "OPEN_TRADER_REPO" in template
 
 
-def test_launchd_installer_default_renders_hk_and_us_jobs(
+def test_launchd_template_runs_persistent_trend_controller() -> None:
+    template = (
+        Path(__file__).resolve().parents[1]
+        / "ops/launchd/com.open-trader.trend-market-controller.plist.template"
+    ).read_text(encoding="utf-8")
+
+    assert "trend-market" in template
+    assert "run" in template
+    assert "OPEN_TRADER_CONFIG" in template
+    assert "<key>RunAtLoad</key>\n  <true/>" in template
+    assert "<key>KeepAlive</key>\n  <true/>" in template
+    assert "<key>ThrottleInterval</key>\n  <integer>30</integer>" in template
+    assert "StartCalendarInterval" not in template
+
+
+def test_launchd_installer_default_renders_only_three_controllers(
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -4038,6 +4119,7 @@ def test_launchd_installer_default_renders_hk_and_us_jobs(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4051,29 +4133,52 @@ def test_launchd_installer_default_renders_hk_and_us_jobs(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    plists = _launchd_plists(result.stdout)
-    by_label = {payload["Label"]: payload for payload in plists}
-    assert set(by_label) == {
+    labels = {payload["Label"] for payload in _launchd_plists(result.stdout)}
+    assert labels == {
+        "com.open-trader.trend-market-controller.cn",
+        "com.open-trader.trend-market-controller.hk",
+        "com.open-trader.trend-market-controller.us",
+    }
+    assert "com.open-trader.premarket" not in result.stdout
+
+
+def test_launchd_installer_retires_all_premarket_jobs(tmp_path: Path) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    labels = (
+        "com.open-trader.premarket",
         "com.open-trader.premarket.hk",
         "com.open-trader.premarket.us",
-    }
-    _assert_launchd_job(
-        by_label["com.open-trader.premarket.hk"],
-        repo=repo,
-        market="HK",
-        hour=8,
-        minute=0,
     )
-    _assert_launchd_job(
-        by_label["com.open-trader.premarket.us"],
-        repo=repo,
-        market="US",
-        hour=18,
-        minute=30,
+    for label in labels:
+        (agents / f"{label}.plist").write_text("retired\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST=another-host",
+            ]
+        ),
+        encoding="utf-8",
     )
 
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--market", "all"],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
 
-def test_launchd_installer_renders_cn_report_and_watcher(tmp_path: Path) -> None:
+    assert "effective mode: readonly" in result.stdout
+    assert all(not (agents / f"{label}.plist").exists() for label in labels)
+
+
+def test_launchd_installer_renders_cn_controller(tmp_path: Path) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
@@ -4082,6 +4187,7 @@ def test_launchd_installer_renders_cn_report_and_watcher(tmp_path: Path) -> None
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4091,6 +4197,7 @@ def test_launchd_installer_renders_cn_report_and_watcher(tmp_path: Path) -> None
         [
             str(repo / "scripts/install_daily_premarket_launchd.sh"),
             "--dry-run",
+            "--trend-only",
             "--market",
             "CN",
         ],
@@ -4101,101 +4208,16 @@ def test_launchd_installer_renders_cn_report_and_watcher(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     plists = _launchd_plists(result.stdout)
-    assert {item["Label"] for item in plists} == {
-        "com.open-trader.trend-a-share-report",
-        "com.open-trader.trend-a-share-watch",
-    }
-    by_label = {item["Label"]: item for item in plists}
-    report = by_label["com.open-trader.trend-a-share-report"]
-    watch = by_label["com.open-trader.trend-a-share-watch"]
-    assert report["EnvironmentVariables"] == {"PYTHONPATH": f"{repo}/src"}
-    assert watch["EnvironmentVariables"] == {"PYTHONPATH": f"{repo}/src"}
-    assert report["ProgramArguments"] == [
-        f"{repo}/.venv/bin/python",
-        "-m",
-        "open_trader",
-        "trend-a-share-report",
-        "--date",
-        "today",
-        "--config",
-        f"{repo}/config/daily_premarket.env",
-    ]
-    assert watch["ProgramArguments"] == [
-        f"{repo}/.venv/bin/python",
-        "-m",
-        "open_trader",
-        "watch-trend-a-share",
-        "--config",
-        f"{repo}/config/daily_premarket.env",
-    ]
-    for payload, hour, minute, log_stem in [
-        (report, 17, 0, "launchd-CN-report"),
-        (watch, 9, 25, "launchd-CN-watch"),
-    ]:
-        assert payload["WorkingDirectory"] == str(repo)
-        assert {item["Weekday"] for item in payload["StartCalendarInterval"]} == {
-            1,
-            2,
-            3,
-            4,
-            5,
-        }
-        assert {item["Hour"] for item in payload["StartCalendarInterval"]} == {
-            hour
-        }
-        assert {item["Minute"] for item in payload["StartCalendarInterval"]} == {
-            minute
-        }
-        assert payload["StandardOutPath"] == (
-            f"{repo}/logs/daily_premarket/{log_stem}.out.log"
-        )
-        assert payload["StandardErrorPath"] == (
-            f"{repo}/logs/daily_premarket/{log_stem}.err.log"
-        )
-
-
-def test_launchd_installer_explicit_all_includes_cn_jobs(tmp_path: Path) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    (repo / "config/daily_premarket.env").write_text(
-        f"OPEN_TRADER_REPO={repo}\nOPEN_TRADER_PYTHON=.venv/bin/python\n",
-        encoding="utf-8",
+    assert len(plists) == 1
+    _assert_trend_controller_job(
+        plists[0],
+        repo=repo,
+        config=repo / "config/daily_premarket.env",
+        market="CN",
     )
 
-    result = subprocess.run(
-        [
-            str(repo / "scripts/install_daily_premarket_launchd.sh"),
-            "--dry-run",
-            "--market",
-            "all",
-        ],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
-    )
 
-    assert {item["Label"] for item in _launchd_plists(result.stdout)} == {
-        "com.open-trader.premarket.hk",
-        "com.open-trader.premarket.us",
-        "com.open-trader.trend-a-share-report",
-        "com.open-trader.trend-a-share-watch",
-    }
-
-
-@pytest.mark.parametrize(
-    ("market", "label", "hour", "minute"),
-    [
-        ("HK", "com.open-trader.premarket.hk", 8, 0),
-        ("US", "com.open-trader.premarket.us", 18, 30),
-    ],
-)
-def test_launchd_installer_renders_single_market_job(
-    market: str,
-    label: str,
-    hour: int,
-    minute: int,
+def test_launchd_installer_trend_all_renders_exactly_three_controllers(
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -4206,6 +4228,8 @@ def test_launchd_installer_renders_single_market_job(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST=wrong-host",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4215,8 +4239,9 @@ def test_launchd_installer_renders_single_market_job(
         [
             str(repo / "scripts/install_daily_premarket_launchd.sh"),
             "--dry-run",
+            "--trend-only",
             "--market",
-            market,
+            "all",
         ],
         check=True,
         capture_output=True,
@@ -4225,32 +4250,39 @@ def test_launchd_installer_renders_single_market_job(
     )
 
     plists = _launchd_plists(result.stdout)
-    assert len(plists) == 1
-    assert plists[0]["Label"] == label
-    _assert_launchd_job(
-        plists[0],
-        repo=repo,
-        market=market,
-        hour=hour,
-        minute=minute,
-    )
+    assert {item["Label"] for item in plists} == {
+        "com.open-trader.trend-market-controller.cn",
+        "com.open-trader.trend-market-controller.hk",
+        "com.open-trader.trend-market-controller.us",
+    }
+    assert f"local host: {_local_hostname()}" in result.stdout
+    assert f"configured executor host: {_local_hostname()}" in result.stdout
+    assert "effective mode: execute" in result.stdout
+    for payload, market in zip(plists, ["CN", "HK", "US"], strict=True):
+        _assert_trend_controller_job(
+            payload,
+            repo=repo,
+            config=repo / "config/daily_premarket.env",
+            market=market,
+        )
 
 
-@pytest.mark.parametrize(
-    ("market", "report_hour", "watch_hour"),
-    [("HK", 18, 18), ("US", 9, 9)],
-)
-def test_launchd_installer_renders_separate_trend_market_jobs(
+@pytest.mark.parametrize("market", ["CN", "HK", "US"])
+def test_launchd_installer_renders_single_trend_market_controller(
     market: str,
-    report_hour: int,
-    watch_hour: int,
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
     (repo / "config/daily_premarket.env").write_text(
-        f"OPEN_TRADER_REPO={repo}\nOPEN_TRADER_PYTHON=.venv/bin/python\n",
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -4266,24 +4298,144 @@ def test_launchd_installer_renders_separate_trend_market_jobs(
     )
 
     plists = _launchd_plists(result.stdout)
-    by_label = {item["Label"]: item for item in plists}
-    prefix = f"com.open-trader.trend-{market.lower()}"
-    assert set(by_label) == {f"{prefix}-report", f"{prefix}-watch"}
-    report = by_label[f"{prefix}-report"]
-    watch = by_label[f"{prefix}-watch"]
-    assert report["ProgramArguments"][3:7] == [
-        "trend-market-report", "--market", market, "--date",
-    ]
-    assert watch["ProgramArguments"][3:6] == [
-        "watch-trend-market", "--market", market,
-    ]
-    assert {item["Hour"] for item in report["StartCalendarInterval"]} == {report_hour}
-    assert {item["Minute"] for item in report["StartCalendarInterval"]} == {0}
-    assert {item["Hour"] for item in watch["StartCalendarInterval"]} == {watch_hour}
-    assert {item["Minute"] for item in watch["StartCalendarInterval"]} == {1}
-    expected_weekdays = {1, 2, 3, 4, 5} if market == "HK" else {2, 3, 4, 5, 6}
-    assert {item["Weekday"] for item in report["StartCalendarInterval"]} == expected_weekdays
-    assert {item["Weekday"] for item in watch["StartCalendarInterval"]} == expected_weekdays
+    assert len(plists) == 1
+    _assert_trend_controller_job(
+        plists[0],
+        repo=repo,
+        config=repo / "config/daily_premarket.env",
+        market=market,
+    )
+
+
+def test_launchd_installer_binds_shared_config_but_runs_installer_checkout(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "shared/config.env"
+    config.parent.mkdir()
+    configured_repo = tmp_path / "configured-repo"
+    configured_python = tmp_path / "shared-python/bin/python"
+    config.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={configured_repo}",
+                f"OPEN_TRADER_PYTHON={configured_python}",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--config",
+            str(config),
+            "--dry-run",
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    payload = _launchd_plists(result.stdout)[0]
+    _assert_trend_controller_job(
+        payload,
+        repo=repo,
+        config=config,
+        market="US",
+        python=configured_python,
+    )
+    assert str(configured_repo) not in str(payload)
+
+
+def test_launchd_installer_parses_single_quoted_values_like_runtime_dotenv(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "shared config #1/config.env"
+    config.parent.mkdir()
+    configured_repo = tmp_path / "configured repo #1"
+    python = "bin/python #runner"
+    config.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO='{configured_repo}'",
+                f"OPEN_TRADER_PYTHON='{python}'",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST='wrong host #old'",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST='{_local_hostname()}'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--config",
+            str(config),
+            "--dry-run",
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    payload = _launchd_plists(result.stdout)[0]
+    _assert_trend_controller_job(
+        payload,
+        repo=repo,
+        config=config,
+        market="US",
+        python=configured_repo / python,
+    )
+    assert f"configured executor host: {_local_hostname()}" in result.stdout
+
+
+@pytest.mark.parametrize("executor_host", [None, "another-host"])
+def test_launchd_installer_readonly_renders_no_trend_controller(
+    tmp_path: Path,
+    executor_host: str | None,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    lines = [f"OPEN_TRADER_REPO={repo}", "OPEN_TRADER_PYTHON=.venv/bin/python"]
+    if executor_host is not None:
+        lines.append(f"OPEN_TRADER_TREND_EXECUTOR_HOST={executor_host}")
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(lines), encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--dry-run",
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert _launchd_plists(result.stdout) == []
+    assert "effective mode: readonly" in result.stdout
+    assert "configured executor host: " in result.stdout
 
 
 def test_launchd_installer_rejects_unsupported_market_argument(
@@ -4316,116 +4468,6 @@ def test_launchd_installer_rejects_unsupported_market_argument(
 
     assert result.returncode == 2
     assert "usage:" in result.stderr
-
-
-def test_launchd_installer_removes_legacy_agent_before_installing_split_jobs(
-    tmp_path: Path,
-) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    agents = home / "Library/LaunchAgents"
-    agents.mkdir(parents=True)
-    legacy = agents / "com.open-trader.premarket.plist"
-    legacy.write_text("legacy\n", encoding="utf-8")
-    fake_bin = _fake_launchctl_bin(tmp_path)
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--market", "all"],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
-    )
-
-    assert not legacy.exists()
-    assert (agents / "com.open-trader.premarket.hk.plist").exists()
-    assert (agents / "com.open-trader.premarket.us.plist").exists()
-    assert (agents / "com.open-trader.trend-a-share-report.plist").exists()
-    assert (agents / "com.open-trader.trend-a-share-watch.plist").exists()
-
-
-def test_launchd_installer_removes_legacy_agent_for_single_market_install(
-    tmp_path: Path,
-) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    agents = home / "Library/LaunchAgents"
-    agents.mkdir(parents=True)
-    legacy = agents / "com.open-trader.premarket.plist"
-    legacy.write_text("legacy\n", encoding="utf-8")
-    fake_bin = _fake_launchctl_bin(tmp_path)
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [
-            str(repo / "scripts/install_daily_premarket_launchd.sh"),
-            "--market",
-            "HK",
-        ],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
-    )
-
-    assert not legacy.exists()
-    assert (agents / "com.open-trader.premarket.hk.plist").exists()
-    assert not (agents / "com.open-trader.premarket.us.plist").exists()
-
-
-def test_launchd_installer_cn_only_preserves_legacy_agent(tmp_path: Path) -> None:
-    repo = _copy_launchd_installer_assets(tmp_path)
-    home = tmp_path / "home"
-    agents = home / "Library/LaunchAgents"
-    agents.mkdir(parents=True)
-    legacy = agents / "com.open-trader.premarket.plist"
-    legacy.write_text("legacy\n", encoding="utf-8")
-    fake_bin = _fake_launchctl_bin(tmp_path)
-    (repo / "config/daily_premarket.env").write_text(
-        "\n".join(
-            [
-                f"OPEN_TRADER_REPO={repo}",
-                "OPEN_TRADER_PYTHON=.venv/bin/python",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [
-            str(repo / "scripts/install_daily_premarket_launchd.sh"),
-            "--market",
-            "CN",
-        ],
-        check=True,
-        capture_output=True,
-        encoding="utf-8",
-        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
-    )
-
-    assert legacy.exists()
-    assert "removed legacy launchd agent" not in result.stdout
-    assert (agents / "com.open-trader.trend-a-share-report.plist").exists()
-    assert (agents / "com.open-trader.trend-a-share-watch.plist").exists()
-    assert not (agents / "com.open-trader.premarket.hk.plist").exists()
-    assert not (agents / "com.open-trader.premarket.us.plist").exists()
 
 
 def test_launchd_installer_dry_run_does_not_remove_legacy_agent(
@@ -4466,6 +4508,510 @@ def test_launchd_installer_dry_run_does_not_remove_legacy_agent(
     assert not (agents / "com.open-trader.premarket.us.plist").exists()
 
 
+def test_launchd_installer_executor_migrates_only_requested_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label in _all_trend_labels():
+        (agents / f"{label}.plist").write_text("old\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+        },
+    )
+
+    assert not (agents / "com.open-trader.trend-us-report.plist").exists()
+    assert not (agents / "com.open-trader.trend-us-watch.plist").exists()
+    assert (agents / "com.open-trader.trend-market-controller.us.plist").exists()
+    for label in _all_trend_labels():
+        if ".us" in label or "trend-us-" in label:
+            continue
+        assert (agents / f"{label}.plist").exists()
+    calls = launchctl_log.read_text(encoding="utf-8").splitlines()
+    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    for label in ["com.open-trader.trend-us-report", "com.open-trader.trend-us-watch"]:
+        bootout_index = next(i for i, call in enumerate(calls) if call.endswith(label))
+        print_index = next(
+            i
+            for i, call in enumerate(calls)
+            if call.startswith("print ") and call.endswith(label)
+        )
+        assert bootout_index < print_index < load_index
+    controller_print = next(
+        i
+        for i, call in enumerate(calls)
+        if call.startswith("print ")
+        and call.endswith("com.open-trader.trend-market-controller.us")
+    )
+    assert controller_print < load_index
+    assert not any("trend-hk-" in call or "controller.hk" in call for call in calls)
+    assert not any("trend-a-share" in call or "controller.cn" in call for call in calls)
+
+
+@pytest.mark.parametrize("status_mode", ["fresh", "eventual-fresh"])
+def test_launchd_installer_waits_for_fresh_matching_controller_status(
+    tmp_path: Path, status_mode: str,
+) -> None:
+    result, repo, calls = _run_fake_controller_install(
+        tmp_path, status_mode=status_mode
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "verified launchd controller: US pid=4242" in result.stdout
+    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    post_load_prints = [
+        call for i, call in enumerate(calls)
+        if i > load_index
+        and call.startswith("print ")
+        and call.endswith("com.open-trader.trend-market-controller.us")
+    ]
+    assert len(post_load_prints) == (2 if status_mode == "eventual-fresh" else 1)
+    runtime_log = (
+        repo
+        / "logs/daily_premarket/launchd-trend-controller-us.out.log"
+    ).read_text(encoding="utf-8")
+    assert "controller_runtime: " in runtime_log
+    assert '"pid": 4242' in runtime_log
+
+
+@pytest.mark.parametrize(
+    "status_mode",
+    [
+        "stale", "malformed", "pid-mismatch", "cwd-mismatch", "cwd-missing",
+        "sha-mismatch",
+    ],
+)
+def test_launchd_installer_fails_closed_on_unmatched_controller_status(
+    tmp_path: Path, status_mode: str,
+) -> None:
+    result, _repo, calls = _run_fake_controller_install(
+        tmp_path, status_mode=status_mode
+    )
+
+    assert result.returncode == 1
+    assert "controller did not write fresh matching status" in result.stderr
+    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    assert any(
+        i > load_index
+        and call.startswith("print ")
+        and call.endswith("com.open-trader.trend-market-controller.us")
+        for i, call in enumerate(calls)
+    )
+
+
+def test_launchd_installer_readonly_cleans_all_trend_automation(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label in _all_trend_labels():
+        (agents / f"{label}.plist").write_text("old\n", encoding="utf-8")
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                "OPEN_TRADER_TREND_EXECUTOR_HOST=another-host",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+        },
+    )
+
+    assert "effective mode: readonly" in result.stdout
+    assert not any((agents / f"{label}.plist").exists() for label in _all_trend_labels())
+    calls = launchctl_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("load ") for call in calls)
+    for label in _all_trend_labels():
+        assert any(call.endswith(label) for call in calls)
+
+
+def test_launchd_installer_refuses_load_while_legacy_label_is_present(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_PRINT_EXIT": "0",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "legacy launchd job is still loaded" in result.stderr
+    calls = launchctl_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("load ") for call in calls)
+
+
+def test_launchd_installer_rejects_orphan_process_for_selected_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    pgrep_log = tmp_path / "pgrep.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_PGREP_LOG": str(pgrep_log),
+            "OPEN_TRADER_PGREP_MATCH": "watch-trend-market",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "legacy trend process is still running for US" in result.stderr
+    assert not any(
+        call.startswith("load ")
+        for call in launchctl_log.read_text(encoding="utf-8").splitlines()
+    )
+    patterns = pgrep_log.read_text(encoding="utf-8").splitlines()
+    assert any("watch-trend-market" in pattern for pattern in patterns)
+    assert all("--market[[:space:]]+HK" not in pattern for pattern in patterns)
+
+
+def test_launchd_installer_stops_all_labels_before_orphan_process_fence(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PGREP_MATCH": "--market[[:space:]]+HK",
+        },
+    )
+
+    assert result.returncode == 1
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    first_probe = next(i for i, call in enumerate(calls) if call.startswith("pgrep "))
+    for market in ["cn", "hk", "us"]:
+        print_index = next(
+            i
+            for i, call in enumerate(calls)
+            if call.startswith("launchctl print ")
+            and call.endswith(f"trend-market-controller.{market}")
+        )
+        assert print_index < first_probe
+    assert not any(call.startswith("launchctl load ") for call in calls)
+
+
+def test_launchd_installer_fences_every_selected_market_before_first_load(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PRESENT_LABEL": "com.open-trader.trend-hk-report",
+            "OPEN_TRADER_PRESENT_PRINTS": "2",
+            "OPEN_TRADER_PRINT_STATE": str(tmp_path / "print-state"),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    probes = [i for i, call in enumerate(calls) if call.startswith("pgrep ")]
+    first_load = next(
+        i for i, call in enumerate(calls) if call.startswith("launchctl load ")
+    )
+    assert len(probes) == 6
+    first_probe = min(probes)
+    delayed_prints = [
+        i
+        for i, call in enumerate(calls)
+        if call.startswith("launchctl print ")
+        and call.endswith("com.open-trader.trend-hk-report")
+    ]
+    assert len(delayed_prints) == 3
+    for label in _all_trend_labels():
+        assert any(
+            i < first_probe
+            and call.startswith("launchctl print ")
+            and call.endswith(label)
+            for i, call in enumerate(calls)
+        )
+    assert max(probes) < first_load
+
+
+def test_launchd_installer_fails_after_five_present_label_checks(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    present = "com.open-trader.trend-us-report"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PRESENT_LABEL": present,
+        },
+    )
+
+    assert result.returncode == 1
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    prints = [
+        call
+        for call in calls
+        if call.startswith("launchctl print ") and call.endswith(present)
+    ]
+    assert len(prints) == 5
+    assert not any(call.startswith("pgrep ") for call in calls)
+    assert not any(call.startswith("launchctl load ") for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("market", "error_label"),
+    [
+        ("US", "com.open-trader.trend-us-report"),
+        ("all", "com.open-trader.trend-hk-report"),
+    ],
+)
+def test_launchd_installer_fails_closed_on_launchctl_print_error(
+    tmp_path: Path,
+    market: str,
+    error_label: str,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    operations = tmp_path / "operations.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            market,
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_OPERATION_LOG": str(operations),
+            "OPEN_TRADER_PRINT_ERROR_LABEL": error_label,
+            "OPEN_TRADER_PRINT_ERROR_STATUS": "3",
+            "OPEN_TRADER_PRINT_ERROR_MESSAGE": "I/O error",
+        },
+    )
+
+    assert result.returncode == 1
+    assert f"failed to inspect launchd label: {error_label}" in result.stderr
+    assert "I/O error" in result.stderr
+    calls = operations.read_text(encoding="utf-8").splitlines()
+    error_prints = [
+        call
+        for call in calls
+        if call.startswith("launchctl print ") and call.endswith(error_label)
+    ]
+    assert len(error_prints) == 1
+    assert not any(call.startswith("pgrep ") for call in calls)
+    assert not any(call.startswith("launchctl load ") for call in calls)
+
+
+def test_launchd_installer_readonly_fails_when_orphan_process_remains(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    _write_launchd_executor_config(repo, "another-host")
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_PGREP_MATCH": "trend-a-share-report",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "legacy trend process is still running for CN" in result.stderr
+    assert "readonly host: no trend controller installed" not in result.stdout
+    assert not any(
+        call.startswith("load ")
+        for call in launchctl_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_launchd_installer_does_not_match_other_market_legacy_process(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    pgrep_log = tmp_path / "pgrep.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_PGREP_LOG": str(pgrep_log),
+            "OPEN_TRADER_PGREP_MATCH": "--market[[:space:]]+HK",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    patterns = pgrep_log.read_text(encoding="utf-8").splitlines()
+    assert len(patterns) == 2
+    assert all(pattern.startswith("-f ^") for pattern in patterns)
+    assert all("--market[[:space:]]+US" in pattern for pattern in patterns)
+
+
 def test_daily_env_example_has_required_keys_without_real_secrets() -> None:
     example = (
         Path(__file__).resolve().parents[1] / "config/daily_premarket.env.example"
@@ -4503,6 +5049,7 @@ def test_launchd_installer_expands_tilde_paths_for_launchd(
             [
                 "OPEN_TRADER_REPO=~/projects/open_trader",
                 "OPEN_TRADER_PYTHON=~/.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4516,7 +5063,6 @@ def test_launchd_installer_expands_tilde_paths_for_launchd(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    assert f"{home}/projects/open_trader" in result.stdout
     assert f"{home}/.venv/bin/python" in result.stdout
     assert "~/projects/open_trader" not in result.stdout
     assert "~/.venv/bin/python" not in result.stdout
@@ -4533,6 +5079,7 @@ def test_launchd_installer_resolves_relative_python_under_repo(
             [
                 f"OPEN_TRADER_REPO={repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4565,6 +5112,7 @@ def test_launchd_installer_uses_last_duplicate_env_values_like_runtime_parser(
                 f"OPEN_TRADER_PYTHON={first_repo / '.venv/bin/python'}",
                 f"OPEN_TRADER_REPO={second_repo}",
                 "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4579,7 +5127,6 @@ def test_launchd_installer_uses_last_duplicate_env_values_like_runtime_parser(
     )
 
     assert str(first_repo) not in result.stdout
-    assert f"<string>{second_repo}</string>" in result.stdout
     assert f"<string>{second_repo}/.venv/bin/python</string>" in result.stdout
 
 
@@ -4620,7 +5167,8 @@ def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
         "\n".join(
             [
                 f"OPEN_TRADER_REPO={repo} # literal suffix",
-                f"OPEN_TRADER_PYTHON={repo / '.venv/bin/python'}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
             ]
         ),
         encoding="utf-8",
@@ -4634,7 +5182,7 @@ def test_launchd_installer_preserves_inline_comment_text_like_runtime_parser(
         env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
     )
 
-    assert f"{repo} # literal suffix" in result.stdout
+    assert f"{repo} # literal suffix/.venv/bin/python" in result.stdout
 
 
 def test_launchd_uninstaller_defaults_to_hk_us_and_legacy_plists(
@@ -4708,7 +5256,8 @@ def test_launchd_uninstaller_removes_only_cn_jobs(tmp_path: Path) -> None:
     us = agents / "com.open-trader.premarket.us.plist"
     cn_report = agents / "com.open-trader.trend-a-share-report.plist"
     cn_watch = agents / "com.open-trader.trend-a-share-watch.plist"
-    for path in [hk, us, cn_report, cn_watch]:
+    cn_controller = agents / "com.open-trader.trend-market-controller.cn.plist"
+    for path in [hk, us, cn_report, cn_watch, cn_controller]:
         path.write_text("plist\n", encoding="utf-8")
 
     subprocess.run(
@@ -4730,6 +5279,7 @@ def test_launchd_uninstaller_removes_only_cn_jobs(tmp_path: Path) -> None:
     assert us.exists()
     assert not cn_report.exists()
     assert not cn_watch.exists()
+    assert not cn_controller.exists()
 
 
 def test_launchd_uninstaller_explicit_all_removes_cn_jobs(tmp_path: Path) -> None:
@@ -4741,8 +5291,7 @@ def test_launchd_uninstaller_explicit_all_removes_cn_jobs(tmp_path: Path) -> Non
         agents / "com.open-trader.premarket.hk.plist",
         agents / "com.open-trader.premarket.us.plist",
         agents / "com.open-trader.premarket.plist",
-        agents / "com.open-trader.trend-a-share-report.plist",
-        agents / "com.open-trader.trend-a-share-watch.plist",
+        *(agents / f"{label}.plist" for label in _all_trend_labels()),
     ]
     for path in paths:
         path.write_text("plist\n", encoding="utf-8")
@@ -4763,6 +5312,160 @@ def test_launchd_uninstaller_explicit_all_removes_cn_jobs(tmp_path: Path) -> Non
     )
 
     assert not any(path.exists() for path in paths)
+
+
+def test_launchd_uninstaller_trend_only_removes_only_requested_market(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label in _all_trend_labels():
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+
+    subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(tmp_path / "launchctl.log"),
+        },
+    )
+
+    for label in _all_trend_labels():
+        exists = (agents / f"{label}.plist").exists()
+        assert exists is not ("trend-us-" in label or ".us" in label)
+    calls = (tmp_path / "launchctl.log").read_text(encoding="utf-8").splitlines()
+    for label in [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+    ]:
+        assert any(call.startswith("bootout ") and call.endswith(label) for call in calls)
+        assert any(call.startswith("print ") and call.endswith(label) for call in calls)
+
+
+@pytest.mark.parametrize(
+    "present_label",
+    [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+    ],
+)
+def test_launchd_uninstaller_preserves_selected_plist_when_label_remains_loaded(
+    tmp_path: Path,
+    present_label: str,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    selected = [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+    ]
+    for label in selected:
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+    log = tmp_path / "launchctl.log"
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(log),
+            "OPEN_TRADER_PRESENT_LABEL": present_label,
+        },
+    )
+
+    target = agents / f"{present_label}.plist"
+    assert result.returncode == 1
+    assert target.exists()
+    assert f"launchd job is still loaded: {present_label}" in result.stderr
+    assert f"removed launchd agent: {target}" not in result.stdout
+
+
+def test_launchd_uninstaller_all_stops_after_residual_label(tmp_path: Path) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label in _all_trend_labels():
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+    present = "com.open-trader.trend-hk-watch"
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "all",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(tmp_path / "launchctl.log"),
+            "OPEN_TRADER_PRESENT_LABEL": present,
+        },
+    )
+
+    assert result.returncode == 1
+    assert (agents / f"{present}.plist").exists()
+    assert (agents / "com.open-trader.trend-market-controller.us.plist").exists()
+
+
+def test_launchd_uninstaller_accepts_failed_bootout_when_print_is_absent(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    selected = [
+        "com.open-trader.trend-market-controller.us",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+    ]
+    for label in selected:
+        (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/uninstall_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{_fake_launchctl_bin(tmp_path)}:/usr/bin:/bin",
+            "OPEN_TRADER_BOOTOUT_EXIT": "5",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not any((agents / f"{label}.plist").exists() for label in selected)
 
 
 def test_launchd_uninstaller_rejects_unsupported_market_argument(
@@ -4789,39 +5492,82 @@ def test_launchd_uninstaller_rejects_unsupported_market_argument(
 
 
 def _launchd_plists(plist_text: str) -> list[dict[str, object]]:
-    documents = [
-        f"<?xml{document}"
-        for document in plist_text.split("<?xml")
-        if document.strip()
-    ]
+    documents: list[str] = []
+    remaining = plist_text
+    while "<?xml" in remaining:
+        _, _, remaining = remaining.partition("<?xml")
+        body, end, remaining = remaining.partition("</plist>")
+        if not end:
+            break
+        documents.append(f"<?xml{body}</plist>")
     return [plistlib.loads(document.encode("utf-8")) for document in documents]
 
 
-def _assert_launchd_job(
+def _assert_trend_controller_job(
     payload: dict[str, object],
     *,
     repo: Path,
+    config: Path,
     market: str,
-    hour: int,
-    minute: int,
+    python: Path | None = None,
 ) -> None:
-    args = payload["ProgramArguments"]
-    assert isinstance(args, list)
-    args = [str(arg) for arg in args]
-    market_index = args.index("--market")
-    assert args[market_index + 1] == market
-    assert args[args.index("--date") + 1] == "today"
-    assert args[args.index("--config") + 1] == f"{repo}/config/daily_premarket.env"
-    intervals = payload["StartCalendarInterval"]
-    assert isinstance(intervals, list)
-    assert {item["Weekday"] for item in intervals} == {1, 2, 3, 4, 5}
-    assert {item["Hour"] for item in intervals} == {hour}
-    assert {item["Minute"] for item in intervals} == {minute}
+    lower = market.lower()
+    assert payload["Label"] == f"com.open-trader.trend-market-controller.{lower}"
+    assert payload["WorkingDirectory"] == str(repo)
+    assert payload["EnvironmentVariables"] == {"PYTHONPATH": f"{repo}/src"}
+    assert payload["ProgramArguments"] == [
+        str(python or repo / ".venv/bin/python"),
+        "-m",
+        "open_trader",
+        "trend-market",
+        "run",
+        "--market",
+        market,
+        "--config",
+        str(config),
+    ]
+    assert payload["RunAtLoad"] is True
+    assert payload["KeepAlive"] is True
+    assert payload["ThrottleInterval"] == 30
+    assert "StartCalendarInterval" not in payload
     assert payload["StandardOutPath"] == (
-        f"{repo}/logs/daily_premarket/launchd-{market}.out.log"
+        f"{repo}/logs/daily_premarket/launchd-trend-controller-{lower}.out.log"
     )
     assert payload["StandardErrorPath"] == (
-        f"{repo}/logs/daily_premarket/launchd-{market}.err.log"
+        f"{repo}/logs/daily_premarket/launchd-trend-controller-{lower}.err.log"
+    )
+
+
+def _local_hostname() -> str:
+    return subprocess.run(
+        ["hostname"], check=True, capture_output=True, encoding="utf-8"
+    ).stdout.strip()
+
+
+def _all_trend_labels() -> list[str]:
+    return [
+        "com.open-trader.trend-a-share-report",
+        "com.open-trader.trend-a-share-watch",
+        "com.open-trader.trend-hk-report",
+        "com.open-trader.trend-hk-watch",
+        "com.open-trader.trend-us-report",
+        "com.open-trader.trend-us-watch",
+        "com.open-trader.trend-market-controller.cn",
+        "com.open-trader.trend-market-controller.hk",
+        "com.open-trader.trend-market-controller.us",
+    ]
+
+
+def _write_launchd_executor_config(repo: Path, executor_host: str) -> None:
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={repo}",
+                "OPEN_TRADER_PYTHON=.venv/bin/python",
+                f"OPEN_TRADER_TREND_EXECUTOR_HOST={executor_host}",
+            ]
+        ),
+        encoding="utf-8",
     )
 
 
@@ -4829,8 +5575,141 @@ def _fake_launchctl_bin(tmp_path: Path) -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     launchctl = fake_bin / "launchctl"
-    launchctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    launchctl.write_text(
+        """#!/usr/bin/env bash
+state_dir="$HOME/.open-trader-fake-launchctl"
+mkdir -p "$state_dir"
+
+write_controller_status() {
+  status_mode="$1"
+  status_pid="$2"
+  status_repo="$3"
+  status_sha="$4"
+  status_market="$5"
+  status_path="$status_repo/data/trend_controller/$status_market/status.json"
+  mkdir -p "$(dirname "$status_path")" "$status_repo/logs/daily_premarket"
+  : >> "$status_repo/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$status_market" | tr '[:upper:]' '[:lower:]').out.log"
+  : >> "$status_repo/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$status_market" | tr '[:upper:]' '[:lower:]').err.log"
+  if [[ "$status_mode" == "missing" ]]; then
+    return
+  fi
+  if [[ "$status_mode" == "malformed" ]]; then
+    printf '{' > "$status_path"
+    return
+  fi
+  heartbeat="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if [[ "$status_mode" == "stale" || "$status_mode" == "eventual-fresh" ]]; then
+    heartbeat="2000-01-01T00:00:00Z"
+  elif [[ "$status_mode" == "pid-mismatch" ]]; then
+    status_pid=$((status_pid + 1))
+  elif [[ "$status_mode" == "cwd-mismatch" ]]; then
+    status_repo="/wrong/review"
+  elif [[ "$status_mode" == "cwd-missing" ]]; then
+    status_repo=""
+  elif [[ "$status_mode" == "sha-mismatch" ]]; then
+    status_sha="old-sha"
+  fi
+  printf '%s\\n' "{\\"schema_version\\":\\"open_trader.trend_controller.status.v1\\",\\"effective_mode\\":\\"execute\\",\\"executor_host\\":\\"fake-host\\",\\"local_host\\":\\"fake-host\\",\\"pid\\":$status_pid,\\"working_directory\\":\\"$status_repo\\",\\"git_sha\\":\\"$status_sha\\",\\"phase\\":\\"monitoring\\",\\"heartbeat_at\\":\\"$heartbeat\\",\\"last_success\\":null,\\"blocker\\":null,\\"next_check_at\\":\\"$heartbeat\\"}" > "$status_path"
+}
+
+if [[ -n "${OPEN_TRADER_LAUNCHCTL_LOG:-}" ]]; then
+  printf '%s\\n' "$*" >> "$OPEN_TRADER_LAUNCHCTL_LOG"
+fi
+if [[ -n "${OPEN_TRADER_OPERATION_LOG:-}" ]]; then
+  printf 'launchctl %s\\n' "$*" >> "$OPEN_TRADER_OPERATION_LOG"
+fi
+if [[ "${1:-}" == "print" ]]; then
+  if [[ -n "${OPEN_TRADER_PRINT_ERROR_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRINT_ERROR_LABEL" ]]; then
+    echo "Bad request." >&2
+    echo "${OPEN_TRADER_PRINT_ERROR_MESSAGE:-I/O error}" >&2
+    exit "${OPEN_TRADER_PRINT_ERROR_STATUS:-3}"
+  fi
+  if [[ -n "${OPEN_TRADER_PRESENT_LABEL:-}" && "$*" == *"$OPEN_TRADER_PRESENT_LABEL" ]]; then
+    if [[ -z "${OPEN_TRADER_PRESENT_PRINTS:-}" ]]; then
+      exit 0
+    fi
+    count=0
+    if [[ -f "${OPEN_TRADER_PRINT_STATE:-}" ]]; then
+      read -r count < "$OPEN_TRADER_PRINT_STATE"
+    fi
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$OPEN_TRADER_PRINT_STATE"
+    if [[ "$count" -le "$OPEN_TRADER_PRESENT_PRINTS" ]]; then
+      exit 0
+    fi
+  fi
+  label="${*: -1}"
+  label="${label##*/}"
+  state="$state_dir/$label"
+  if [[ -f "$state" ]]; then
+    status_pid="$(sed -n '1p' "$state")"
+    status_repo="$(sed -n '2p' "$state")"
+    status_sha="$(sed -n '3p' "$state")"
+    status_market="$(sed -n '4p' "$state")"
+    if [[ "${OPEN_TRADER_FAKE_CONTROLLER_STATUS_MODE:-fresh}" == "eventual-fresh" ]]; then
+      count=0
+      if [[ -f "$state.prints" ]]; then
+        read -r count < "$state.prints"
+      fi
+      count=$((count + 1))
+      printf '%s\\n' "$count" > "$state.prints"
+      if [[ "$count" -ge 2 ]]; then
+        write_controller_status fresh "$status_pid" "$status_repo" "$status_sha" "$status_market"
+      fi
+    fi
+    echo "pid = $status_pid"
+    exit 0
+  fi
+  echo "Bad request." >&2
+  echo "Could not find service '$*' in domain for user gui" >&2
+  exit "${OPEN_TRADER_PRINT_EXIT:-113}"
+fi
+if [[ "${1:-}" == "bootout" ]]; then
+  label="${*: -1}"
+  label="${label##*/}"
+  rm -f "$state_dir/$label" "$state_dir/$label.prints"
+  exit "${OPEN_TRADER_BOOTOUT_EXIT:-0}"
+fi
+if [[ "${1:-}" == "load" ]]; then
+  plist="${2:-}"
+  label="$(basename "$plist" .plist)"
+  status_market="$(printf '%s' "${label##*.}" | tr '[:lower:]' '[:upper:]')"
+  status_repo="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$plist")"
+  status_sha="$(git -C "$status_repo" rev-parse HEAD)"
+  status_pid=4242
+  printf '%s\\n%s\\n%s\\n%s\\n' \
+    "$status_pid" "$status_repo" "$status_sha" "$status_market" > "$state_dir/$label"
+  write_controller_status "${OPEN_TRADER_FAKE_CONTROLLER_STATUS_MODE:-fresh}" \
+    "$status_pid" "$status_repo" "$status_sha" "$status_market"
+  exit 0
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
     launchctl.chmod(0o755)
+    pgrep = fake_bin / "pgrep"
+    pgrep.write_text(
+        """#!/usr/bin/env bash
+if [[ -n "${OPEN_TRADER_PGREP_LOG:-}" ]]; then
+  printf '%s\\n' "$*" >> "$OPEN_TRADER_PGREP_LOG"
+fi
+if [[ -n "${OPEN_TRADER_OPERATION_LOG:-}" ]]; then
+  printf 'pgrep %s\\n' "$*" >> "$OPEN_TRADER_OPERATION_LOG"
+fi
+pattern="${*: -1}"
+if [[ -n "${OPEN_TRADER_PGREP_MATCH:-}" && "$pattern" == *"$OPEN_TRADER_PGREP_MATCH"* ]]; then
+  echo "4242"
+  exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    pgrep.chmod(0o755)
+    sleep = fake_bin / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    sleep.chmod(0o755)
     return fake_bin
 
 
@@ -4845,10 +5724,7 @@ def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
         repo / "ops/launchd/com.open-trader.premarket.plist.template",
     )
     for name in [
-        "com.open-trader.trend-a-share-report.plist.template",
-        "com.open-trader.trend-a-share-watch.plist.template",
-        "com.open-trader.trend-market-report.plist.template",
-        "com.open-trader.trend-market-watch.plist.template",
+        "com.open-trader.trend-market-controller.plist.template",
     ]:
         source = source_root / "ops/launchd" / name
         shutil.copy2(source, repo / "ops/launchd" / name)
@@ -4860,4 +5736,46 @@ def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
         source_root / "scripts/uninstall_daily_premarket_launchd.sh",
         repo / "scripts/uninstall_daily_premarket_launchd.sh",
     )
+    python = repo / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Codex",
+            "-c", "user.email=codex@example.invalid", "commit", "-qm", "fixture",
+        ],
+        check=True,
+    )
     return repo
+
+
+def _run_fake_controller_install(
+    tmp_path: Path, *, status_mode: str,
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    launchctl_log = tmp_path / "launchctl.log"
+    _write_launchd_executor_config(repo, _local_hostname())
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_daily_premarket_launchd.sh"),
+            "--trend-only",
+            "--market",
+            "US",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "OPEN_TRADER_LAUNCHCTL_LOG": str(launchctl_log),
+            "OPEN_TRADER_FAKE_CONTROLLER_STATUS_MODE": status_mode,
+        },
+    )
+    calls = launchctl_log.read_text(encoding="utf-8").splitlines()
+    return result, repo, calls

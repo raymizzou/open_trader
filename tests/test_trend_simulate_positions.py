@@ -9,7 +9,10 @@ from typing import Any
 
 import pytest
 
-from open_trader.trend_simulate_positions import TrendSimulatePositionService
+from open_trader.trend_simulate_positions import (
+    TrendSimulatePositionService,
+    _action_events,
+)
 
 
 REPORT_DIRS = {
@@ -123,6 +126,25 @@ def _position(code: str = "US.TRV") -> dict[str, str]:
         "market_val": "3340.80",
         "pl_ratio": "0.60",
     }
+
+
+def test_action_events_sort_aware_timestamps_by_actual_instant(
+    tmp_path: Path,
+) -> None:
+    _write_action_event(
+        tmp_path,
+        status="missed",
+        recorded_at="2026-07-21T09:01:01+08:00",
+    )
+    _write_action_event(
+        tmp_path,
+        status="filled",
+        recorded_at="2026-07-21T07:36:30-04:00",
+    )
+
+    events = _action_events(tmp_path / "data", "US")
+
+    assert [event[3]["status"] for event in events] == ["missed", "filled"]
 
 
 class FakeClient:

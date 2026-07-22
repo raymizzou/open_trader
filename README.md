@@ -8,7 +8,8 @@ reviewable action reports.
 
 It is designed for a workflow where a human investor remains in control:
 Open Trader reads data, calls analysis models, checks live quotes through Futu
-OpenD, and writes reports. It does not place orders automatically.
+OpenD, and writes reports. The Trend Animals controller can also submit guarded
+Futu simulated orders from one explicitly designated executor host.
 
 ## Features
 
@@ -27,6 +28,8 @@ OpenD, and writes reports. It does not place orders automatically.
 - Check trading plans against live Futu OpenD quotes.
 - Generate reviewable trade-action CSV and Markdown reports.
 - Generate the US trend report for Tiger and the HK trend report for Phillips.
+- Run one self-reconciling Trend Animals controller per market on a named host,
+  with broker reconciliation before every simulated order.
 - Show Futu as a read-only US/HK options-attention aggregate in the dashboard.
 - View a local realtime portfolio dashboard with live quote refresh and stale
   data warnings.
@@ -38,8 +41,10 @@ This project is not financial advice and does not replace human review. Model
 outputs can be incomplete, stale, or wrong. Always review generated advice,
 plans, quote checks, and trade actions before making any investment decision.
 
-Open Trader does not submit orders. Any order placement should remain a separate,
-explicit, human-approved step.
+Ordinary workflows and the Dashboard do not submit orders. The Trend Animals
+controller may submit Futu simulated orders only from the configured executor;
+it never places real-money orders. Review the executor hostname and controller
+status before enabling that automation.
 
 ## Quick Start
 
@@ -122,6 +127,8 @@ Important keys:
   HK daily runs use a fixed `09:00` Asia/Shanghai deadline.
 - `OPEN_TRADER_FUTU_HOST`: Futu OpenD host, usually `127.0.0.1`.
 - `OPEN_TRADER_FUTU_PORT`: Futu OpenD quote port, usually `11111`.
+- `OPEN_TRADER_TREND_EXECUTOR_HOST`: exact `hostname` output of the only machine
+  allowed to generate trend reports and submit simulated trend orders.
 - `OPEN_TRADER_CLASSIFIER_MODEL`: defaults to `deepseek-v4-flash`.
 
 Tiger OpenAPI account sync uses Tiger's official
@@ -535,44 +542,188 @@ tail -n 100 logs/daily_premarket/launchd-US.out.log
 tail -n 100 logs/daily_premarket/launchd-US.err.log
 ```
 
-### Deploy HK/US Trend Jobs
+### Operate Trend Market Controllers
 
-The Trend Animals workflows use separate report and protection-watch jobs. HK
-uses Phillips statement positions/cash plus Futu quotes; US refreshes the Tiger
-real account directly. The dashboard projects option attention from those US/HK
-reports under Futu. Configure the pool lists and explicitly managed current
-positions in `config/daily_premarket.env`, then install:
+Trend Animals has one operational entry point: `trend-market`. On the single
+execution machine, put the exact hostname in the local, Git-ignored config:
 
 ```bash
-scripts/install_daily_premarket_launchd.sh --dry-run --trend-only --market all
-scripts/install_daily_premarket_launchd.sh --trend-only --market all
+hostname
+# Set the exact output only on the execution machine:
+OPEN_TRADER_TREND_EXECUTOR_HOST=ray-mac
 ```
 
-Loaded labels and Shanghai start times are:
+An absent or non-matching value makes that deployment `readonly`. A read-only
+machine displays existing data but generates no trend report, runs no trend
+controller, changes no order, watches no protection line, captures no close,
+and sends no trend-task notification. There is no automatic failover: promote a
+new executor only after stopping the old one, reconciling its Futu orders and
+immutable ledgers, and explicitly changing this hostname.
 
-- `com.open-trader.trend-hk-report` at 18:00 and `trend-hk-watch` at 18:01.
-- `com.open-trader.trend-us-report` at 09:00 and `trend-us-watch` at 09:01,
-  Tuesday through Saturday in Shanghai so Friday's US session is included.
-
-Reports retry every 10 minutes for at most one hour. Watchers preflight
-immediately, then sleep until the next HK or New York regular session. Verify or
-remove them with:
+Install one persistent `RunAtLoad`/`KeepAlive` controller for each CN, HK, and
+US market. Pass an absolute shared config path when deploying from a worktree:
 
 ```bash
-launchctl list | rg 'com.open-trader.trend-(hk|us)'
-plutil -lint ~/Library/LaunchAgents/com.open-trader.trend-{hk,us}-{report,watch}.plist
-tail -n 100 logs/daily_premarket/launchd-trend-{HK,US}-{report,watch}.out.log
-scripts/uninstall_daily_premarket_launchd.sh --trend-only --market all
+scripts/install_daily_premarket_launchd.sh \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env \
+  --dry-run --trend-only --market all
+scripts/install_daily_premarket_launchd.sh \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env \
+  --trend-only --market all
 ```
 
-Manual runs use the same generic commands:
+The executor installs exactly these labels; a read-only install removes all
+legacy trend jobs and controllers and installs none:
+
+```text
+com.open-trader.trend-market-controller.cn
+com.open-trader.trend-market-controller.hk
+com.open-trader.trend-market-controller.us
+```
+
+Use the same namespace for status, foreground operation, report correction,
+and an auditable uncertainty decision:
 
 ```bash
-.venv/bin/python -m open_trader trend-market-report --market HK --date today
-.venv/bin/python -m open_trader trend-market-report --market US --date today
-.venv/bin/python -m open_trader watch-trend-market --market HK --once
-.venv/bin/python -m open_trader watch-trend-market --market US --once
+.venv/bin/python -m open_trader trend-market status --market US \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
+.venv/bin/python -m open_trader trend-market run --market US \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
+.venv/bin/python -m open_trader trend-market run --market US --revision \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
+.venv/bin/python -m open_trader trend-market resolve \
+  --market US --execution-date 2026-07-20 --symbol TRV --side buy \
+  --resolution confirm-submitted --futu-order-id SIM-42 \
+  --actor ray --reason "verified in Futu order history" \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env
 ```
+
+`status` is read-only. `run` is normally owned by `launchd`; `run --revision`
+requests a corrected report only before execution has locked its batch. An
+uncertain action accepts exactly one immutable resolution:
+
+- `confirm-submitted`: record the verified Futu order ID and never resubmit.
+- `authorize-retry`: confirm no order was submitted and authorize exactly one
+  next numbered attempt; omit `--futu-order-id`.
+- `abandon`: make the action terminal without another attempt; omit the order ID.
+
+Every resolution requires a non-empty actor and reason. It appends an audit fact
+and never edits or deletes an intent, broker observation, result, or earlier
+resolution. Only `authorize-retry` permits an unresolved intent to advance.
+
+The controller retries a missing report with bounded backoff for the same data
+and execution dates, even after the buy window closes. Failure before atomic
+freeze recomputes that same logical report; failure delivering a frozen report
+retries delivery only. The first eligible execution check freezes the latest
+valid report SHA as the day's batch. A later revision is reported as an anomaly
+and cannot resize or add actions to that batch.
+
+An action identity is `(market, execution_date, symbol, side)`. Attempts receive
+numbered deterministic Futu remarks, and the controller reconciles current and
+historical broker orders plus immutable local facts before every submission.
+Partially filled buys wait for the active attempt to become terminal, then may
+complete only inside the market window and within frozen shares, amount, cash,
+lot-size, and risk caps. At window close the partial position is retained and
+the remainder is marked `missed` once; it is never submitted late. Same-day
+formal and protection exits merge into one sell action, with no overlapping
+sell while an earlier attempt is active or ambiguous.
+
+Migration is fenced: inspect the current jobs and processes, then run the
+installer. Before loading a new controller, it must unload the selected legacy
+jobs and verify both their labels and processes are gone. If an orphan process
+remains or any fence check fails, it loads no new controller; stop and diagnose
+the orphan, then rerun the installer. A newly loaded controller reconciles the
+immutable ledger against current and historical Futu orders before any eligible
+submission. Independently verify that no old report/watcher PID remains before
+trusting the new controllers:
+
+```bash
+launchctl list | rg 'com\.open-trader\.(trend|premarket)'
+ps aux | rg 'open_trader .*trend|trend-market run'
+scripts/install_daily_premarket_launchd.sh \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env \
+  --trend-only --market all
+launchctl list | rg 'com\.open-trader\.trend-market-controller\.(cn|hk|us)'
+ps aux | rg 'open_trader trend-market run'
+tail -n 100 logs/daily_premarket/launchd-trend-controller-*.out.log
+```
+
+Controller status is stored at
+`data/trend_controller/<MARKET>/status.json`; verify its mode, executor/local
+host, PID, working directory, Git SHA, phase, heartbeat, blocker, and next check.
+Rollback is also fenced: stop all trend automation, deploy the old source with
+automation still stopped, reconcile every local intent against Futu, and only
+then explicitly restore an old watcher if the facts prove it safe. Never start
+an old watcher directly while a controller may still be alive.
+
+After the final acceptance result is `PASS`, redeploy the exact accepted SHA;
+do not treat the acceptance process itself as the deployment. From the accepted
+worktree, confirm its SHA and clean state, restart all controllers with the
+shared config, then restart the Dashboard from that exact worktree:
+
+```bash
+cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec
+export ACCEPTED_SHA=replace-with-full-accepted-sha
+test "$(git rev-parse HEAD)" = "$ACCEPTED_SHA"
+test -z "$(git status --short)"
+
+pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p || true
+scripts/install_daily_premarket_launchd.sh \
+  --config /Users/ray/projects/open_trader/config/daily_premarket.env \
+  --trend-only --market all
+
+screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
+screen -dmS open_trader_dashboard_8766 zsh -lc \
+  'cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec && exec env PYTHONPATH=src .venv/bin/python -u -m open_trader dashboard --portfolio /Users/ray/projects/open_trader/data/latest/portfolio.csv --data-dir /Users/ray/projects/open_trader/data --reports-dir /Users/ray/projects/open_trader/reports --config /Users/ray/projects/open_trader/config/daily_premarket.env --poll-seconds 5 --host 127.0.0.1 --port 8766 >> /tmp/open_trader_dashboard_8766.log 2>&1'
+```
+
+For each CN/HK/US status document, verify the PID is live, `working_directory`
+is the accepted worktree, `git_sha` equals `$ACCEPTED_SHA`, and `heartbeat_at`
+advances between two reads. Then check fresh controller/Dashboard logs and both
+Dashboard endpoints. Compare the final process list with the pre-install list:
+each controller status PID must be new, and its `lstart` timestamp must be after
+the exact-SHA reinstall:
+
+```bash
+.venv/bin/python - <<'PY'
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import time
+
+accepted_sha = os.environ["ACCEPTED_SHA"]
+worktree = "/Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec"
+root = Path("/Users/ray/projects/open_trader/data/trend_controller")
+
+def read(market):
+    return json.loads((root / market / "status.json").read_text(encoding="utf-8"))
+
+before = {market: read(market) for market in ("CN", "HK", "US")}
+time.sleep(10)
+for market, previous in before.items():
+    current = read(market)
+    pid = int(current["pid"])
+    os.kill(pid, 0)
+    assert current["working_directory"] == worktree
+    assert current["git_sha"] == accepted_sha
+    assert datetime.fromisoformat(current["heartbeat_at"]) > datetime.fromisoformat(
+        previous["heartbeat_at"]
+    )
+    print(market, pid, current["git_sha"], current["heartbeat_at"])
+PY
+
+pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p
+tail -n 80 /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
+tail -n 80 /tmp/open_trader_dashboard_8766.log
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
+curl -sS http://127.0.0.1:8766/api/dashboard | \
+  .venv/bin/python -m json.tool >/dev/null
+```
+
+The review deployment is valid only when the URL returns HTTP 200, the API is
+valid JSON, all three heartbeats advance, and the process/status/log evidence
+belongs to the accepted SHA.
 
 ## Outputs
 

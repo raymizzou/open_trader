@@ -26,7 +26,7 @@ from .a_share_trend import (
     _holding_snapshot,
     _is_systemic_futu_error,
     _process_version,
-    _read_delivery_receipt,
+    read_delivery_receipt,
     _redact_api_key,
     _report_payload,
     _row_tm_id,
@@ -700,7 +700,7 @@ def _market_artifact_stem(
         stem = f"{as_of_date}-r{number}"
         markdown_path = paths.reports / f"{stem}.md"
         json_path = paths.reports / f"{stem}.json"
-        receipt = _read_delivery_receipt(
+        receipt = read_delivery_receipt(
             _market_receipt_path(paths, stem), artifact_stem=stem
         )
         if receipt is not None and (
@@ -742,7 +742,7 @@ def _recover_market_receipt(
     notifier: Notifier,
 ) -> AShareTrendRunResult | None:
     receipt_path = _market_receipt_path(paths, artifact_stem)
-    receipt = _read_delivery_receipt(receipt_path, artifact_stem=artifact_stem)
+    receipt = read_delivery_receipt(receipt_path, artifact_stem=artifact_stem)
     if receipt is None:
         return None
     markdown_path = paths.reports / f"{artifact_stem}.md"

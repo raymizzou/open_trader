@@ -85,6 +85,7 @@ def watch_a_share_protection(
     state_path: Path,
     events_path: Path,
     quote_client: object | None,
+    close_quote_client: bool = True,
     notifier: Notifier,
     poll_seconds: float,
     reconnect_seconds: float,
@@ -124,8 +125,48 @@ def watch_a_share_protection(
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
-    interrupted = False
+    interrupted = _monitor_interrupted(events_path)
     now = first_now
+
+    def outcome(status: str, *, failed: bool = False) -> AShareWatchResult:
+        nonlocal client
+        result = _result(
+            status,
+            positions,
+            trigger_count,
+            exception_count + int(failed),
+            unknown_quote_count,
+            events_path,
+        )
+        if client is None or not close_quote_client:
+            return result
+        closing_client = client
+        client = None
+        try:
+            _close(closing_client)
+        except Exception:
+            if not once:
+                raise
+            if status != "abnormal":
+                result = _result(
+                    "abnormal",
+                    positions,
+                    trigger_count,
+                    exception_count + 1,
+                    unknown_quote_count,
+                    events_path,
+                )
+        return result
+
+    def recover_monitor() -> None:
+        nonlocal interrupted
+        if interrupted:
+            _record_recovery(
+                events_path, notifier, trading_date, now,
+                market_label=market_label,
+            )
+            interrupted = False
+
     try:
         while True:
             session = session_fn(now)
@@ -141,6 +182,10 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
+                    if once and not close_quote_client:
+                        raise
+                    if once:
+                        return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
@@ -161,27 +206,24 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
-                    _close(client)
+                    if once and not close_quote_client:
+                        raise
+                    failed_client = client
                     client = None
+                    try:
+                        _close(failed_client)
+                    except Exception:
+                        if not once:
+                            raise
+                    if once:
+                        return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
                 calendar_checked = True
-                if interrupted:
-                    _record_recovery(
-                        events_path, notifier, trading_date, now,
-                        market_label=market_label,
-                    )
-                    interrupted = False
                 if trading_date not in trading_days:
-                    return _result(
-                        "holiday",
-                        positions,
-                        trigger_count,
-                        exception_count,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    recover_monitor()
+                    return outcome("holiday")
 
             if on_session_open is not None:
                 exception_count += _run_review_callback(
@@ -202,14 +244,8 @@ def watch_a_share_protection(
                 )
 
             if session == "closed":
-                return _result(
-                    "closed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
+                recover_monitor()
+                return outcome("closed")
             if session == "before":
                 opening = now.astimezone(session_timezone).replace(
                     hour=9, minute=30, second=0, microsecond=0
@@ -289,8 +325,12 @@ def watch_a_share_protection(
                         and event.get("event_type")
                         == "quote_unknown_notification_delivered"
                     }
-            except RuntimeError as exc:
-                if str(exc) != "daily premarket run already active":
+            except Exception as exc:
+                if once:
+                    return outcome("abnormal", failed=True)
+                if not isinstance(exc, RuntimeError) or str(exc) != (
+                    "daily premarket run already active"
+                ):
                     raise
                 sleep_fn(poll_seconds)
                 now = now_fn()
@@ -363,15 +403,9 @@ def watch_a_share_protection(
                 comparable[to_futu_symbol(market, symbol)] = (symbol, active_line)
 
             if not comparable:
+                recover_monitor()
                 if once:
-                    return _result(
-                        "completed",
-                        positions,
-                        trigger_count,
-                        exception_count,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    return outcome("completed")
                 sleep_fn(poll_seconds)
                 now = now_fn()
                 continue
@@ -385,17 +419,23 @@ def watch_a_share_protection(
                         market_label=market_label, broker_label=broker_label,
                     )
                     interrupted = True
-                _close(client)
+                if once and not close_quote_client:
+                    raise
+                failed_client = client
                 client = None
+                try:
+                    _close(failed_client)
+                except Exception:
+                    if not once:
+                        raise
+                if once:
+                    return outcome("abnormal", failed=True)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
-            if interrupted:
-                _record_recovery(
-                    events_path, notifier, trading_date, now,
-                    market_label=market_label,
-                )
-                interrupted = False
+            snapshots_complete = comparable.keys() <= snapshots.keys()
+            if snapshots_complete:
+                recover_monitor()
 
             for futu_symbol, (symbol, active_line) in comparable.items():
                 snapshot = snapshots.get(futu_symbol)
@@ -470,18 +510,11 @@ def watch_a_share_protection(
                     )
 
             if once:
-                return _result(
-                    "completed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
+                return outcome("completed" if snapshots_complete else "abnormal")
             sleep_fn(poll_seconds)
             now = now_fn()
     finally:
-        if client is not None:
+        if client is not None and close_quote_client:
             _close(client)
 
 
@@ -763,6 +796,14 @@ def _optional_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError, AttributeError):
         return None
     return result if result.is_finite() else None
+
+
+def _monitor_interrupted(events_path: Path) -> bool:
+    for event in reversed(load_watch_events(events_path)):
+        event_type = event.get("event_type")
+        if event_type in {"monitor_interrupted", "monitor_recovered"}:
+            return event_type == "monitor_interrupted"
+    return False
 
 
 def _record_interruption(

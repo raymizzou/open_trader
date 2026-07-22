@@ -710,7 +710,9 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
 
     monkeypatch.setattr(
-        dashboard_module, "_shanghai_date", lambda: date(2026, 7, 15)
+        dashboard_module,
+        "_trend_market_date",
+        lambda _market, *, now=None: date(2026, 7, 15),
     )
     for directory, account_source_date, data_sources in [
         (
@@ -1060,6 +1062,38 @@ def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
     assert report["data_status"] == "current"
     assert report["report_date"] == "2026-07-15"
     assert report["option_attention"] == current_attention
+
+
+def test_dashboard_uses_market_local_date_for_current_us_report(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    (reports_dir / "2026-07-20.json").write_text(json.dumps({
+        "execution_date": "2026-07-21",
+        "as_of_date": "2026-07-20",
+        "generated_at": "2026-07-21T22:44:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "option_attention": [option_attention("QQQ")],
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        now=datetime(
+            2026, 7, 22, 1, 0, tzinfo=dashboard_module.SHANGHAI
+        ),
+    )["tiger"]
+
+    assert report["data_status"] == "current"
+    assert report["report_date"] == "2026-07-21"
 
 
 def test_dashboard_hk_friday_report_is_current_then_stale_then_current_for_execution(

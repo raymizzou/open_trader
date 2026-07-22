@@ -5,6 +5,7 @@ import math
 import os
 import socket
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
@@ -29,6 +30,19 @@ class OrderExecutionClient(Protocol):
 
     def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
         """Submit a normalized Kelly order request and return execution metadata."""
+
+
+class ExecutorGuardedOrderClient:
+    def __init__(self, delegate: object, authorize: Callable[[], object]) -> None:
+        self._delegate = delegate
+        self._authorize = authorize
+
+    def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._authorize()
+        return self._delegate.place_order(request)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
 
 
 class FutuSimulateOrderExecutionClient:
@@ -69,6 +83,11 @@ class FutuSimulateOrderExecutionClient:
         self.port = port
         self.trd_market = trd_market
         self.account = self._select_simulate_account(simulate_acc_id)
+        # Current orders are refreshed before every action. Cache only the
+        # rate-limited history query for this short-lived reconciliation client.
+        self._history_order_cache: dict[
+            tuple[str | None, str | None], list[dict[str, Any]]
+        ] = {}
 
     def place_order(self, request: dict[str, Any]) -> dict[str, Any]:
         side = str(request["side"]).strip().lower()
@@ -119,6 +138,7 @@ class FutuSimulateOrderExecutionClient:
         start: str | None = None,
         end: str | None = None,
     ) -> dict[str, Any]:
+        active = self._query("order_list_query")
         kwargs: dict[str, object] = {
             "trd_env": TRD_ENV_SIMULATE,
             "acc_id": self.account["acc_id"],
@@ -127,14 +147,41 @@ class FutuSimulateOrderExecutionClient:
         if start is not None or end is not None:
             kwargs["start"] = start
             kwargs["end"] = end
-        ret_code, data = self.context.history_order_list_query(**kwargs)
-        if ret_code != 0:
-            raise FutuOrderExecutionError(
-                str(data), error_type="history_order_list_query_failed"
+        cache_key = (start, end)
+        if cache_key not in self._history_order_cache:
+            ret_code, data = self.context.history_order_list_query(**kwargs)
+            if ret_code != 0:
+                raise FutuOrderExecutionError(
+                    str(data), error_type="history_order_list_query_failed"
+                )
+            self._history_order_cache[cache_key] = [
+                dict(item) for item in _records(data)
+            ]
+        history = self._history_order_cache[cache_key]
+        orders: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in [*active, *history]:
+            order_id = _first_text(item, ("order_id", "orderid")).strip()
+            identity = (
+                ("id", order_id)
+                if order_id
+                else (
+                    "json",
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                )
             )
+            if identity not in seen:
+                seen.add(identity)
+                orders.append(item)
         return {
             "acc_id": self.account["acc_id"],
-            "orders": [dict(item) for item in _records(data)],
+            "orders": orders,
         }
 
     def _query(self, method_name: str) -> list[dict[str, Any]]:

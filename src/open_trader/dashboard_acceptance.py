@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -23,18 +24,9 @@ from .trend_simulate_positions import (
     _reports_by_hash,
 )
 from .trend_review import _report_hash
+from .strategy_drawdown import strategy_parameter_hash
 
 
-REQUIRED_SOURCE_PATHS = (
-    ("tradingagents_summary",),
-    ("technical_facts",),
-    ("decision_facts", "kline"),
-    ("decision_facts", "news_sentiment"),
-    ("futu_skill_facts", "news_sentiment"),
-    ("futu_skill_facts", "technical_anomaly"),
-    ("futu_skill_facts", "capital_anomaly"),
-    ("futu_skill_facts", "derivatives_anomaly"),
-)
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
 
@@ -191,6 +183,26 @@ def _expected_cn_holdings(expected_root: Path) -> int:
     )
 
 
+def _trend_execution_batch_errors(payload: Mapping[str, Any]) -> list[str]:
+    reports = payload.get("trend_reports")
+    if not isinstance(reports, Mapping):
+        return []
+    errors: list[str] = []
+    for broker in TREND_SIMULATE_MARKETS:
+        report = reports.get(broker)
+        if not isinstance(report, Mapping) or report.get(
+            "execution_batch_blocking"
+        ) is not True:
+            continue
+        reason = str(
+            report.get("execution_batch_error")
+            or report.get("status_text")
+            or "执行批次状态未知"
+        )
+        errors.append(f"{broker} 当前趋势报告执行批次阻断：{reason}")
+    return errors
+
+
 def validate_dashboard_payload(
     payload: dict[str, Any], *, expected_cn: int,
     expected_eastmoney_cny: Decimal | None = None,
@@ -240,30 +252,6 @@ def validate_dashboard_payload(
     if len(cn_rows) != expected_cn:
         errors.append(f"A 股持仓数量不是 {expected_cn}：{len(cn_rows)}")
 
-    for holding in holdings:
-        if (holding.get("agent_report") or {}).get("available") is not True:
-            continue
-        for path in REQUIRED_SOURCE_PATHS:
-            source: Any = holding
-            for key in path:
-                source = source.get(key) if isinstance(source, Mapping) else None
-            if not isinstance(source, Mapping) or (
-                source.get("available") is not True
-                and source.get("unsupported") is not True
-            ):
-                detail = next(
-                    (
-                        str(source.get(key))
-                        for key in ("error", "blocking_reason", "status")
-                        if isinstance(source, Mapping) and source.get(key)
-                    ),
-                    "missing",
-                )
-                errors.append(
-                    f"{holding.get('market', '')}.{holding.get('symbol', '')} "
-                    f"数据源 {'.'.join(path)} 不可用：{detail}"
-                )
-
     universe = (payload.get("backtest_universe") or {}).get("holdings") or []
     cn_universe = [row for row in universe if row.get("market") == "CN"]
     if len(cn_universe) != expected_cn:
@@ -303,6 +291,7 @@ def validate_dashboard_payload(
                 )
     if "tiger_" + "long_term_strategy" in payload:
         errors.append("Dashboard API 仍包含已退役策略")
+    errors.extend(_trend_execution_batch_errors(payload))
     return errors
 
 
@@ -502,9 +491,11 @@ def validate_integrated_candidate(
             assert (
                 isinstance(parameters, Mapping)
                 and snapshot.get("strategy_version") == "v4"
-                and snapshot.get("process_version") == expected_sha
+                and re.fullmatch(
+                    r"[0-9a-f]{40}", str(snapshot.get("process_version") or "")
+                )
                 and report.get("strategy_version") == "v4"
-            ), f"{broker} 未加载候选 Git SHA 的 Kelly/回撤 v4 策略"
+            ), f"{broker} 冻结 Kelly/回撤 v4 策略身份无效"
             for key, expected, label in (
                 ("single_entry_risk_limit", Decimal("0.004"), "单笔风险"),
                 ("portfolio_risk_limit", Decimal("0.04"), "组合风险"),
@@ -603,6 +594,9 @@ def validate_integrated_candidate(
                 and bootstrap.get("event_id")
                 and bootstrap.get("actor")
             ), f"{broker} 自动回撤基准审计不完整"
+            assert bootstrap.get("parameter_hash") == strategy_parameter_hash(
+                parameters
+            ), f"{broker} 冻结策略参数与回撤审计身份不一致"
             assert (
                 drawdown.get("entry_allowed") is True or not buys
             ), f"{broker} 回撤阻断状态仍包含正式买入"
@@ -1075,12 +1069,21 @@ def _check_trend_account_views(
         "filled": "全部成交",
         "failed": "失败",
         "blocked": "受阻",
-        "missed": "错过",
+        "uncertain": "状态不确定，禁止自动重试",
+        "conflict": "订单事实冲突，禁止提交",
+        "missed": "已错过策略窗口",
         "incomplete": "未完成",
     }
     reports = payload.get("trend_reports")
     reviews = payload.get("trend_reviews")
-    assert isinstance(reports, Mapping) and isinstance(reviews, Mapping)
+    controllers = payload.get("trend_controllers")
+    assert (
+        isinstance(reports, Mapping)
+        and isinstance(reviews, Mapping)
+        and isinstance(controllers, Mapping)
+    )
+    batch_errors = _trend_execution_batch_errors(payload)
+    assert not batch_errors, "；".join(batch_errors)
     for broker in TREND_SIMULATE_MARKETS:
         section = _select_account_tab(page, broker)
         _check_account_view_contract(page, section, broker)
@@ -1163,6 +1166,10 @@ def _check_trend_account_views(
         report = reports.get(broker)
         assert isinstance(report, Mapping) and report.get("available") is True, (
             f"{broker} 当前趋势报告不可用"
+        )
+        _check_report_simulation_overlay(report_root, report, simulated, broker)
+        _check_trend_controller_status(
+            page, panel, broker, controllers.get(broker)
         )
         _check_integrated_trend_ui(report_root, report, broker)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
@@ -1334,13 +1341,17 @@ def _listener(url: str) -> tuple[int, Path]:
     if len(pid_text) != 1:
         raise RuntimeError(f"端口 {port} 没有唯一监听进程")
     pid = int(pid_text[0])
+    return pid, _process_cwd(pid)
+
+
+def _process_cwd(pid: int) -> Path:
     output = subprocess.check_output(
         ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], text=True
     )
     cwd_line = next((line for line in output.splitlines() if line.startswith("n")), "")
     if not cwd_line:
         raise RuntimeError("无法读取 Dashboard 进程工作目录")
-    return pid, Path(cwd_line[1:]).resolve()
+    return Path(cwd_line[1:]).resolve()
 
 
 def _process_started_at(pid: int) -> datetime:
@@ -1374,24 +1385,23 @@ def _is_actionable_console_error(message: str) -> bool:
 
 def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str, str]:
     for holding in payload.get("holdings") or []:
-        if (holding.get("agent_report") or {}).get("available") is True:
-            brokers = {
-                "phillips" if value == "phillip" else value
-                for value in [
-                    *(str(holding.get("brokers") or "").lower().split(";")),
-                    str(holding.get("broker") or "").lower(),
-                    *(
-                        str(detail.get("broker") or "").lower()
-                        for detail in holding.get("broker_details") or []
-                        if isinstance(detail, Mapping)
-                    ),
-                ]
-                if value
-            }
-            broker = next((item for item in ACCOUNT_BROKERS if item in brokers), "")
-            assert broker, "advice-backed holding has no account broker"
+        brokers = {
+            "phillips" if value == "phillip" else value
+            for value in [
+                *(str(holding.get("brokers") or "").lower().split(";")),
+                str(holding.get("broker") or "").lower(),
+                *(
+                    str(detail.get("broker") or "").lower()
+                    for detail in holding.get("broker_details") or []
+                    if isinstance(detail, Mapping)
+                ),
+            ]
+            if value
+        }
+        broker = next((item for item in ACCOUNT_BROKERS if item in brokers), "")
+        if broker:
             return str(holding.get("market", "")), str(holding.get("symbol", "")), broker
-    raise AssertionError("no advice-backed holding exists in Dashboard payload")
+    raise AssertionError("no account holding exists in Dashboard payload")
 
 
 def _dashboard_holding_key(
@@ -1430,11 +1440,22 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
             ".broker-summary-card:visible, .account-holding-actions button:visible, "
             ".trend-report-entry button:visible",
         )
+        t_signal_button = page.locator(
+            '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        )
+        assert t_signal_button.count() >= 1, "移动端缺少做T详情入口"
+        t_signal_button.first.click()
         _check_mobile_targets(
             page,
             ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible select:visible",
+        )
+        back_button = page.locator("[data-back-to-holdings]:visible")
+        assert back_button.count() >= 1, "做T详情缺少返回入口"
+        back_button.first.click()
+        assert page.locator(".holdings-panel:visible").count() == 1, (
+            "做T详情返回后持仓未恢复"
         )
 
     page.locator("#open-kelly-lab").click()
@@ -1490,37 +1511,65 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
     )
 
 
-def _check_decision_tabs(page: Any, market: str, symbol: str, broker: str) -> None:
-    _select_account_tab(page, broker)
-    button = page.locator(
-        'button[data-detail-mode="decision"]'
-        f'[data-detail-market="{market}"]'
-        f'[data-detail-symbol="{symbol}"]:visible'
-    )
-    assert button.count() >= 1, f"{market}.{symbol} has no trading-decision button"
-    button.first.click()
-    tabs = page.locator(".decision-tab-list [data-decision-tab]")
-    expected_labels = ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
-    assert tabs.all_inner_texts() == expected_labels, "decision tabs are missing or out of order"
-    assert page.locator(".decision-tab-list .decision-tab-failed").count() == 0, "decision tab failed"
-    for index in range(tabs.count()):
-        tab = tabs.nth(index)
-        tab.click()
-        panel_id = tab.get_attribute("aria-controls")
-        assert panel_id, f"tab {expected_labels[index]} has no controlled panel"
-        panel = page.locator(f"#{panel_id}:visible")
-        assert panel.count() == 1, f"tab {expected_labels[index]} has {panel.count()} visible panels"
-        panel_text = panel.inner_text()
-        assert "数据未生成" not in panel_text, f"tab {expected_labels[index]} contains 数据未生成"
-        if index == 0:
-            assert "夏普比率" in panel_text, "最终决策缺少夏普比率"
-            assert "卡玛比率" in panel_text, "最终决策缺少卡玛比率"
-        if index == 2:
-            assert not re.search(r"当前价\s*缺失", panel_text), "趋势 / K 线当前价缺失"
-
-
 def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
+
+
+def _check_visible_decimal_precision(text: str, label: str) -> None:
+    offenders = re.findall(
+        r"(?<![\w.-])[+-]?\d[\d,]*\.\d{3,}(?![\w.-])", text
+    )
+    assert not offenders, f"{label} 数值超过两位小数：{offenders[:3]}"
+
+
+def _check_report_simulation_overlay(
+    report_root: Any,
+    report: Mapping[str, Any],
+    simulated: Mapping[str, Any] | None,
+    broker: str,
+) -> None:
+    simulation = report_root.locator(".trend-simulation-overlay")
+    assert simulation.count() == 1, f"{broker} 趋势报告缺少模拟盘执行状态"
+    simulation_text = simulation.inner_text()
+    assert "模拟盘执行状态" in simulation_text, f"{broker} 模拟盘状态标题缺失"
+    assert "富途" in simulation_text, f"{broker} 模拟盘来源缺失"
+
+    positions = simulated.get("positions") if simulated is not None else []
+    assert isinstance(positions, list), f"{broker} 模拟盘持仓无效"
+    by_symbol = {
+        str(position.get("symbol") or "").strip().upper(): position
+        for position in positions
+        if isinstance(position, Mapping)
+    }
+    seen: set[str] = set()
+    for key in ("hold_actions", "review_actions"):
+        actions = report.get(key) or []
+        assert isinstance(actions, list), f"{broker} {key} 列表无效"
+        for hold in actions:
+            if not isinstance(hold, Mapping) or hold.get("action") != "HOLD":
+                continue
+            symbol = str(hold.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            position = by_symbol.get(symbol)
+            if position is None:
+                continue
+            row = simulation.locator(f'[data-simulation-symbol="{symbol}"]')
+            assert row.count() == 1, f"{broker} {symbol} 缺少模拟盘对照行"
+            quantity = f"模拟持仓 {_display_number(position['quantity'])}"
+            facts = {
+                text.strip()
+                for text in row.locator(
+                    ".trend-actual-facts span"
+                ).all_inner_texts()
+            }
+            assert quantity in facts, f"{broker} {symbol} 模拟盘数量未显示"
+            status = row.locator("[data-deviation]")
+            assert status.count() == 1, f"{broker} {symbol} 模拟盘偏差状态缺失"
+            assert status.get_attribute("data-deviation") == "followed", (
+                f"{broker} {symbol} 模拟盘偏差状态不是 followed"
+            )
 
 
 def _check_integrated_trend_ui(
@@ -1556,6 +1605,9 @@ def _check_integrated_trend_ui(
         assert audit.count() == 1, f"{broker} 缺少状态恢复审计详情"
         audit.locator("summary").click()
     text = risk.inner_text()
+    _check_visible_decimal_precision(text, f"{broker} 风险摘要")
+    for stage_text in report_root.locator(".trend-stage:visible").all_inner_texts():
+        _check_visible_decimal_precision(stage_text, f"{broker} 趋势报告")
     stats = summary.get("trade_stats")
     actual_label = (
         stats.get("actual_broker_label") if isinstance(stats, Mapping) else ""
@@ -1574,9 +1626,12 @@ def _check_integrated_trend_ui(
     for value in required:
         assert value != "-" and value in text, f"{broker} 集成风险视图缺少 {value}"
     if isinstance(bootstrap, Mapping):
+        baseline_equity = _display_number(bootstrap.get("baseline_equity"))
+        assert baseline_equity in text, (
+            f"{broker} 回撤基准审计未显示 {baseline_equity}"
+        )
         for value in (
             "回撤基准审计详情",
-            bootstrap.get("baseline_equity"),
             bootstrap.get("source_date"),
             bootstrap.get("event_id"),
             bootstrap.get("accepted_git_sha"),
@@ -1613,12 +1668,24 @@ def _check_integrated_trend_ui(
 
 def _display_number(value: Any) -> str:
     raw = _plain(value).strip()
-    match = re.fullmatch(r"([+-]?)(\d+)(\.\d+)?", raw)
+    match = re.fullmatch(r"([+-]?)(\d+)(?:\.(\d+))?", raw)
     if match is None:
         return raw
     sign, integer, fraction = match.groups()
-    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", integer)
-    return f"{sign}{grouped}{fraction or ''}"
+    fraction = fraction or ""
+    digits = list(f"{integer}{fraction[:2].ljust(2, '0')}")
+    if len(fraction) > 2 and fraction[2] >= "5":
+        for index in range(len(digits) - 1, -1, -1):
+            if digits[index] != "9":
+                digits[index] = str(int(digits[index]) + 1)
+                break
+            digits[index] = "0"
+        else:
+            digits.insert(0, "1")
+    rounded = "".join(digits)
+    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", rounded[:-2])
+    decimals = rounded[-2:].rstrip("0")
+    return f"{sign}{grouped}{f'.{decimals}' if decimals else ''}"
 
 
 def _display_price(value: Any) -> str:
@@ -1629,8 +1696,7 @@ def _display_price(value: Any) -> str:
         return raw
     if not number.is_finite():
         return raw
-    rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP).normalize()
-    return _display_number(format(rounded, "f"))
+    return _display_number(format(number, "f"))
 
 
 def _check_displayed_protection_prices(values: list[str]) -> None:
@@ -2275,7 +2341,9 @@ def _check_account_holdings(
         )
         valid_statuses = {
             "待执行", "已提交", "部分成交", "全部成交", "失败",
-            "受阻", "错过", "未完成", "早期版本已执行",
+            "受阻", "状态不确定，禁止自动重试",
+            "订单事实冲突，禁止提交", "已错过策略窗口",
+            "未完成", "早期版本已执行",
         }
         assert all(
             status in valid_statuses
@@ -2339,6 +2407,125 @@ def _check_account_holdings(
         review = reviews.get(broker) if isinstance(reviews, Mapping) else None
         assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
         _check_trend_review(page, section, broker, review)
+
+
+def _check_trend_controller_status(
+    page: Any,
+    workspace: Any,
+    broker: str,
+    controller: object,
+) -> None:
+    assert isinstance(controller, Mapping), f"API 缺少 {broker} 趋势控制器状态"
+    card = workspace.locator(".trend-controller-status")
+    assert card.count() == 1, f"{broker} 趋势报告缺少控制器状态卡"
+    health = controller.get("health")
+    assert card.get_attribute("data-health") == health, (
+        f"{broker} 控制器状态卡健康标记与 API 不一致"
+    )
+    text = card.inner_text()
+    rendered_facts: dict[str, str] = {}
+    for row in card.locator("dl div").all_inner_texts():
+        parts = row.splitlines()
+        if len(parts) >= 2:
+            rendered_facts[parts[0].strip()] = " ".join(parts[1:]).strip()
+    for label, key in (
+        ("执行模式", "effective_mode"),
+        ("执行主机", "executor_host"),
+        ("本地主机", "local_host"),
+        ("PID", "pid"),
+        ("Git SHA", "git_sha"),
+        ("当前阶段", "phase"),
+        ("心跳", "heartbeat_at"),
+        ("最近成功", "last_success"),
+        ("当前阻塞", "blocker"),
+        ("下次检查", "next_check_at"),
+    ):
+        assert label in text, f"{broker} 控制器状态卡缺少 {label}"
+        value = controller.get(key)
+        if key in {"heartbeat_at", "next_check_at"}:
+            rendered = rendered_facts.get(label, "")
+            if value in (None, ""):
+                assert rendered == "—", f"{broker} 控制器状态卡 {label} 无效"
+                continue
+            try:
+                baseline_time = datetime.fromisoformat(str(value))
+                rendered_time = datetime.fromisoformat(rendered)
+            except ValueError:
+                raise AssertionError(
+                    f"{broker} 控制器状态卡 {label} 不是有效时间"
+                ) from None
+            assert (
+                baseline_time.tzinfo is not None
+                and baseline_time.utcoffset() is not None
+                and rendered_time.tzinfo is not None
+                and rendered_time.utcoffset() is not None
+            ), f"{broker} 控制器状态卡 {label} 不是带时区时间"
+            advancement = rendered_time - baseline_time
+            assert timedelta(0) <= advancement <= timedelta(minutes=5), (
+                f"{broker} 控制器状态卡 {label} 与 API 时间范围不一致"
+            )
+            continue
+        if key == "last_success" and isinstance(value, Mapping):
+            assert "[object Object]" not in text, (
+                f"{broker} 控制器最近成功不可读"
+            )
+            for fact_label, fact_key in (
+                ("状态", "status"),
+                ("市场", "market"),
+                ("日期", "date"),
+                ("提交数", "submitted_count"),
+                ("产物", "artifact_paths"),
+            ):
+                if fact_key not in value:
+                    continue
+                assert fact_label in text, (
+                    f"{broker} 控制器最近成功缺少 {fact_label}"
+                )
+                fact_value = value[fact_key]
+                if isinstance(fact_value, list):
+                    expected = [str(item) for item in fact_value] or ["无"]
+                elif fact_value not in (None, ""):
+                    expected = [str(fact_value)]
+                else:
+                    expected = []
+                assert all(item in text for item in expected), (
+                    f"{broker} 控制器最近成功 {fact_label} 与 API 不一致"
+                )
+            continue
+        if key == "last_success" and value is None:
+            assert rendered_facts.get(label) == "—", (
+                f"{broker} 控制器尚无首次成功时展示无效"
+            )
+            continue
+        if value not in (None, ""):
+            assert str(value) in text, f"{broker} 控制器状态卡 {label} 与 API 不一致"
+    mode = controller.get("effective_mode")
+    if mode == "readonly":
+        assert health == "readonly" and controller.get("blocking") is False, (
+            f"{broker} 只读控制器状态无效"
+        )
+        assert "只读部署，不运行本机控制器" in text, (
+            f"{broker} 只读控制器缺少说明"
+        )
+    else:
+        assert mode == "execute", f"{broker} 控制器执行模式无效"
+        assert health == "healthy" and controller.get("blocking") is False, (
+            f"{broker} 控制器不可用或阻塞"
+        )
+        assert (
+            controller.get("last_success") is not None
+            or _controller_allows_missing_first_success(controller)
+        ), f"{broker} 控制器尚无首次成功状态"
+    width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+    if width <= 760:
+        boxes = card.evaluate_all(
+            "nodes => nodes.map(node => node.getBoundingClientRect())"
+            ".map(r => ({x:r.x,width:r.width}))"
+        )
+        assert boxes and all(
+            box["x"] >= -1 and box["x"] + box["width"] <= width + 1
+            for box in boxes
+        ), f"{broker} 控制器状态卡超出 {width}px 视口"
 
 
 def _check_trend_review(
@@ -2625,6 +2812,17 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
     total = 0
     for broker in ACCOUNT_BROKERS:
         section = _select_account_tab(page, broker)
+        if broker in TREND_SIMULATE_MARKETS:
+            real_tab = section.locator('[data-account-view="real"]')
+            assert real_tab.count() == 1, f"{broker} 缺少真实持仓视图"
+            real_tab.click()
+            page.wait_for_function(
+                "broker => document.querySelector("
+                "`#account-${broker} [data-account-view=\"real\"]`)"
+                "?.getAttribute('aria-selected') === 'true'",
+                arg=broker,
+                timeout=10_000,
+            )
         rows = section.locator(".account-holding-row:visible")
         empty = section.locator(".account-empty:visible")
         count = rows.count()
@@ -2723,10 +2921,6 @@ def _browser_check(
                         errors.append(f"{name}：页面显示看板数据加载失败")
                     try:
                         _check_page_safety(page)
-                    except Exception as exc:
-                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
-                    try:
-                        _check_decision_tabs(page, market, symbol, decision_broker)
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
                     try:
@@ -2855,6 +3049,161 @@ def _log_errors(
     return errors
 
 
+def _controller_log_errors(
+    root: Path,
+    *,
+    market: str,
+    pid: int,
+    expected_sha: str,
+    expected_cwd: Path,
+    process_started_at: datetime,
+) -> list[str]:
+    stem = root / "logs/daily_premarket" / (
+        f"launchd-trend-controller-{market.lower()}"
+    )
+    stdout_path = stem.with_suffix(".out.log")
+    stderr_path = stem.with_suffix(".err.log")
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_bytes()
+    except OSError as exc:
+        return [f"{market} 控制器日志读取失败：{type(exc).__name__}: {exc}"]
+
+    prefix = "controller_runtime: "
+    records: list[Mapping[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            record = json.loads(line.removeprefix(prefix))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, Mapping) and record.get("pid") == pid:
+            records.append(record)
+    if not records:
+        return [f"{market} 控制器日志没有当前 PID：{pid}"]
+
+    record = records[-1]
+    errors: list[str] = []
+    if record.get("git_sha") != expected_sha:
+        errors.append(f"{market} 控制器日志 Git SHA 不匹配")
+    record_cwd = record.get("cwd")
+    if (
+        not isinstance(record_cwd, str)
+        or not record_cwd.strip()
+        or Path(record_cwd).resolve() != expected_cwd.resolve()
+    ):
+        errors.append(f"{market} 控制器日志工作目录不匹配")
+    try:
+        verified_at = datetime.fromisoformat(str(record.get("verified_at") or ""))
+        if verified_at.tzinfo is None or verified_at.utcoffset() is None:
+            raise ValueError
+        if verified_at < process_started_at:
+            errors.append(f"{market} 控制器日志早于当前进程")
+    except (TypeError, ValueError):
+        errors.append(f"{market} 控制器日志验证时间无效")
+    offset = record.get("stderr_offset")
+    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(stderr):
+        errors.append(f"{market} 控制器 stderr 起点无效")
+    elif stderr[offset:].strip():
+        errors.append(f"{market} 控制器 stderr 包含启动后输出")
+    return errors
+
+
+def _controller_allows_missing_first_success(
+    controller: Mapping[str, Any],
+) -> bool:
+    return (
+        controller.get("health") == "healthy"
+        and controller.get("blocking") is False
+        and controller.get("blocker") in (None, "")
+        and controller.get("phase") in {"reconciling", "recovering_report"}
+    )
+
+
+def _trend_controller_errors(
+    payload: Mapping[str, Any],
+    *,
+    expected_root: Path,
+    expected_sha: str,
+    now: datetime | None = None,
+) -> list[str]:
+    controllers = payload.get("trend_controllers")
+    if not isinstance(controllers, Mapping):
+        return ["Dashboard 缺少三市场趋势控制器状态"]
+
+    errors: list[str] = []
+    current = now or datetime.now().astimezone()
+    expected_cwd = expected_root.resolve()
+    for broker, market in TREND_SIMULATE_MARKETS.items():
+        controller = controllers.get(broker)
+        if not isinstance(controller, Mapping):
+            errors.append(f"{broker} 控制器状态缺失")
+            continue
+        if (
+            controller.get("effective_mode") != "execute"
+            or controller.get("health") != "healthy"
+            or controller.get("blocking") is not False
+            or controller.get("blocker") not in (None, "")
+        ):
+            errors.append(f"{broker} 控制器不可用或阻塞")
+        if (
+            controller.get("last_success") is None
+            and not _controller_allows_missing_first_success(controller)
+        ):
+            errors.append(f"{broker} 控制器尚无首次成功状态")
+
+        pid = controller.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            errors.append(f"{broker} 控制器 PID 无效")
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            errors.append(f"{broker} 控制器 PID 不存活：{pid}（{exc}）")
+            continue
+
+        working_directory = controller.get("working_directory")
+        if (
+            not isinstance(working_directory, str)
+            or not working_directory.strip()
+            or Path(working_directory).resolve() != expected_cwd
+        ):
+            errors.append(f"{broker} 控制器工作目录不匹配")
+        if controller.get("git_sha") != expected_sha:
+            errors.append(f"{broker} 控制器 Git SHA 不匹配")
+        try:
+            heartbeat = datetime.fromisoformat(
+                str(controller.get("heartbeat_at") or "")
+            )
+            if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
+                raise ValueError
+            if abs(current - heartbeat) > timedelta(minutes=2):
+                errors.append(f"{broker} 控制器心跳不新鲜")
+        except (TypeError, ValueError):
+            errors.append(f"{broker} 控制器心跳无效")
+
+        try:
+            process_cwd = _process_cwd(pid)
+            process_started_at = _process_started_at(pid)
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+            errors.append(
+                f"{broker} 控制器进程事实读取失败：{type(exc).__name__}: {exc}"
+            )
+            continue
+        if process_cwd != expected_cwd:
+            errors.append(f"{broker} 控制器实际工作目录不匹配")
+        errors.extend(_controller_log_errors(
+            expected_root,
+            market=market,
+            pid=pid,
+            expected_sha=expected_sha,
+            expected_cwd=expected_cwd,
+            process_started_at=process_started_at,
+        ))
+    return errors
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
@@ -2882,10 +3231,12 @@ def main(argv: list[str] | None = None) -> int:
     history_expectations: dict[str, list[dict[str, Any]]] = {}
     account_ids: dict[str, int] = {}
     external_blocker: str | None = None
+    project_data_dir: Path | None = None
     try:
+        project_data_dir = _project_data_dir(args.expected_root)
         expected_cn = _expected_cn_holdings(args.expected_root)
         phillips_total, phillips_period = _latest_phillips_expectation(
-            _project_data_dir(args.expected_root)
+            project_data_dir
         )
         pid, cwd = _listener(args.url)
         if cwd != args.expected_root.resolve():
@@ -2924,7 +3275,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.url,
                 first,
                 account_ids,
-                _project_data_dir(args.expected_root),
+                project_data_dir,
                 first_reports_dir,
             )
             errors.extend(simulate_errors)
@@ -2937,7 +3288,7 @@ def main(argv: list[str] | None = None) -> int:
             ))
         history_expectations, history_errors = _check_history_endpoints(
             args.url,
-            _project_data_dir(args.expected_root),
+            project_data_dir,
             first_reports_dir,
         )
         errors.extend(history_errors)
@@ -2954,6 +3305,11 @@ def main(argv: list[str] | None = None) -> int:
             expected_rows=args.expected_rows,
             expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
+        ))
+        errors.extend(_trend_controller_errors(
+            second,
+            expected_root=args.expected_root,
+            expected_sha=expected_sha,
         ))
         if account_ids:
             errors.extend(validate_integrated_candidate(

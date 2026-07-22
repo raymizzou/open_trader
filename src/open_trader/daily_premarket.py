@@ -6,13 +6,14 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 from zoneinfo import ZoneInfo
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
@@ -115,6 +116,15 @@ class DailyPremarketConfig:
     trend_review_cn_simulate_acc_id: int = 0
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
+    trend_executor_host: str = ""
+
+
+@dataclass(frozen=True)
+class TrendExecutionMode:
+    mode: Literal["execute", "readonly"]
+    executor_host: str
+    local_host: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -145,18 +155,39 @@ class _LatestPromotion:
 
 
 class RunLock:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, wait: bool = False) -> None:
         self.path = path
+        self.wait = wait
         self._handle: object | None = None
 
     def __enter__(self) -> RunLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+        while True:
+            handle = self.path.open("a+", encoding="utf-8")
+            try:
+                operation = (
+                    fcntl.LOCK_EX
+                    if self.wait
+                    else fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                fcntl.flock(handle.fileno(), operation)
+            except BlockingIOError as exc:
+                handle.close()
+                raise RuntimeError("daily premarket run already active") from exc
+            if not self.wait:
+                break
+            try:
+                current = self.path.stat()
+            except FileNotFoundError:
+                current = None
+            locked = os.fstat(handle.fileno())
+            if current is not None and (current.st_dev, current.st_ino) == (
+                locked.st_dev,
+                locked.st_ino,
+            ):
+                break
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
-            raise RuntimeError("daily premarket run already active") from exc
         handle.seek(0)
         handle.truncate()
         handle.write(str(os.getpid()))
@@ -278,6 +309,7 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_review_cn_simulate_acc_id=review_account_ids["CN"],
         trend_review_us_simulate_acc_id=review_account_ids["US"],
         trend_review_hk_simulate_acc_id=review_account_ids["HK"],
+        trend_executor_host=values.get("OPEN_TRADER_TREND_EXECUTOR_HOST", ""),
     )
 
 
@@ -310,6 +342,34 @@ def require_trend_review_config(
     if account_id <= 0:
         raise ValueError(f"{market} trend review config is incomplete")
     return account_id
+
+
+def trend_execution_mode(
+    config: DailyPremarketConfig,
+    *,
+    hostname_fn: Callable[[], str] = socket.gethostname,
+) -> TrendExecutionMode:
+    executor = config.trend_executor_host.strip()
+    local = hostname_fn().strip()
+    if executor and local == executor:
+        return TrendExecutionMode("execute", executor, local, "executor host matched")
+    reason = (
+        "OPEN_TRADER_TREND_EXECUTOR_HOST is not configured"
+        if not executor
+        else "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
+    )
+    return TrendExecutionMode("readonly", executor, local, reason)
+
+
+def require_trend_executor(
+    config: DailyPremarketConfig,
+    *,
+    hostname_fn: Callable[[], str] = socket.gethostname,
+) -> TrendExecutionMode:
+    mode = trend_execution_mode(config, hostname_fn=hostname_fn)
+    if mode.mode != "execute":
+        raise ValueError(f"trend automation is readonly: {mode.reason}")
+    return mode
 
 
 def _positive_tm_ids(value: str) -> tuple[int, ...]:

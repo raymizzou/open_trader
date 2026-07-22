@@ -10,8 +10,8 @@ from .a_share_trend_watch import (
     AShareWatchResult,
     _close,
     _load_active_lines,
+    _monitor_interrupted,
     _record_interruption,
-    _record_recovery,
     _run_review_callback,
     _notify_trend_review_deadline,
     watch_a_share_protection,
@@ -27,6 +27,17 @@ MARKET_TIMEZONES = {
 }
 MARKET_LABELS = {"HK": "港股", "US": "美股"}
 BROKER_LABELS = {"HK": "辉立", "US": "老虎"}
+
+
+def _abnormal_result(events_path: Path) -> AShareWatchResult:
+    return AShareWatchResult(
+        status="abnormal",
+        watched_symbol_count=0,
+        trigger_count=0,
+        exception_count=1,
+        unknown_quote_count=0,
+        events_path=events_path,
+    )
 
 
 def market_session(now: datetime, market: str) -> str:
@@ -77,6 +88,7 @@ def watch_market_protection(
     events_path: Path,
     report_lock_path: Path,
     quote_client: object | None,
+    close_quote_client: bool = True,
     notifier: Notifier,
     poll_seconds: float,
     reconnect_seconds: float,
@@ -90,7 +102,7 @@ def watch_market_protection(
     market = _market(market)
     timezone = MARKET_TIMEZONES[market]
     client = quote_client
-    interrupted = False
+    interrupted = _monitor_interrupted(events_path)
     now = now_fn()
     while True:
         if client is None:
@@ -110,6 +122,8 @@ def watch_market_protection(
                         broker_label=BROKER_LABELS[market],
                     )
                     interrupted = True
+                if once:
+                    return _abnormal_result(events_path)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
@@ -151,26 +165,37 @@ def watch_market_protection(
                     broker_label=BROKER_LABELS[market],
                 )
                 interrupted = True
-            _close(client)
+            if once and not close_quote_client:
+                raise
+            failed_client = client
             client = None
+            try:
+                _close(failed_client)
+            except Exception:
+                if not once:
+                    raise
+            if once:
+                return _abnormal_result(events_path)
             sleep_fn(reconnect_seconds)
             now = now_fn()
             continue
-        if interrupted:
-            _record_recovery(
-                events_path,
-                notifier,
-                opening.date().isoformat(),
-                now,
-                market_label=MARKET_LABELS[market],
-            )
         break
 
-    account_loader(
-        portfolio_path,
-        expected_date=opening.date().isoformat(),
-        timezone=timezone,
-    )
+    try:
+        account_loader(
+            portfolio_path,
+            expected_date=opening.date().isoformat(),
+            timezone=timezone,
+        )
+    except Exception:
+        if not once:
+            raise
+        if close_quote_client:
+            try:
+                _close(client)
+            except Exception:
+                pass
+        return _abnormal_result(events_path)
     local_now = now.astimezone(timezone)
     if opening > local_now:
         sleep_fn((opening - local_now).total_seconds())
@@ -180,6 +205,7 @@ def watch_market_protection(
         state_path=state_path,
         events_path=events_path,
         quote_client=client,
+        close_quote_client=close_quote_client,
         notifier=notifier,
         poll_seconds=poll_seconds,
         reconnect_seconds=reconnect_seconds,

@@ -296,3 +296,75 @@ def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
     assert result == 2
     assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
     assert account_calls == []
+
+
+def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_baseline(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+
+    class Quote:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(self, **_: object) -> list[str]:
+            return ["2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-07-20T08:00:00+08:00"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "live_trend_strategy_snapshot",
+        lambda market, process_version, pool_ids: {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+            "strategy_version": "v4",
+            "parameters": {"market": market},
+        },
+    )
+    for market, equity in (("CN", "100"), ("HK", "200"), ("US", "300")):
+        automatic_bootstrap_strategy_drawdown(
+            config.data_dir,
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
+            strategy_version="v4",
+            parameters={"market": market},
+            baseline_equity=Decimal(equity),
+            source_date="2026-07-17",
+            accepted_git_sha="a" * 40,
+            actor="deployment",
+            occurred_at="2026-07-18T08:00:00+08:00",
+            reason="first_activation",
+            entry_eligible_from="2026-07-20",
+        )
+
+    result = cli.main([
+        "trend-drawdown-preflight",
+        "--config", str(tmp_path / "daily.env"),
+        "--repo", str(tmp_path),
+    ])
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ready"
+    assert [item["status"] for item in output["markets"]] == [
+        "ready", "ready", "ready"
+    ]

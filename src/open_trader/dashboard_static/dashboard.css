@@ -1805,6 +1805,74 @@ table {
   text-align: center;
 }
 
+.trend-controller-status {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.trend-controller-status.blocking {
+  border-left-color: var(--danger);
+}
+
+.trend-controller-status header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.trend-controller-status h2,
+.trend-controller-status dl,
+.trend-controller-status dd,
+.trend-controller-status dt {
+  margin: 0;
+}
+
+.trend-controller-status header strong,
+.trend-controller-status dd {
+  overflow-wrap: anywhere;
+}
+
+.trend-controller-status[data-health="unavailable"] header strong {
+  color: var(--danger);
+}
+
+.trend-controller-status dl {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.trend-controller-status dl div {
+  background: var(--surface-soft);
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.trend-controller-status dt {
+  color: var(--muted);
+}
+
+.trend-controller-status dd {
+  font-weight: 700;
+}
+
+.trend-revision-anomaly,
+.trend-execution-batch-error {
+  background: var(--surface-soft);
+  border-left: 3px solid var(--danger);
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding: 10px 14px;
+}
+
 .trend-risk-summary {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -4214,6 +4282,9 @@ tbody tr.active-row,
 .action-card-metrics div,
 .action-card,
 .backtest-metric-card,
+.trend-controller-status dl div,
+.trend-revision-anomaly,
+.trend-execution-batch-error,
 .trend-risk-summary dl div,
 .trend-actual-facts span,
 .cn-trend-card td:nth-child(-n + 2),
@@ -4326,7 +4397,14 @@ table {
   }
 
   .trend-report-header,
-  .trend-report-header dl {
+  .trend-report-header dl,
+  .trend-controller-status dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-controller-status header {
+    align-items: stretch;
+    display: grid;
     grid-template-columns: minmax(0, 1fr);
   }
 

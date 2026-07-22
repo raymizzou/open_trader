@@ -87,23 +87,40 @@ class DashboardQuoteService:
         items_by_symbol = _items_by_sorted_symbol(universe.items)
         requested_symbols = list(items_by_symbol)
         us_symbols = [symbol for symbol in requested_symbols if symbol.startswith("US.")]
+        symbols_by_prefix: dict[str, list[str]] = {}
+        for symbol in items_by_symbol:
+            symbols_by_prefix.setdefault(symbol.split(".", 1)[0], []).append(symbol)
         client: DashboardQuoteClient | None = None
         market_states: dict[str, str] = {}
+        snapshot_errors: list[tuple[str, FutuQuoteError]] = []
         state_error: FutuQuoteError | None = None
 
         try:
-            snapshots: dict[str, DashboardQuoteSnapshot]
+            snapshots: dict[str, DashboardQuoteSnapshot] = {}
             if requested_symbols:
                 client = self._new_client()
-                snapshots = client.get_dashboard_snapshots(requested_symbols)
-                if us_symbols:
+                for prefix, symbols in symbols_by_prefix.items():
+                    try:
+                        snapshots.update(client.get_dashboard_snapshots(symbols))
+                    except FutuQuoteError as exc:
+                        snapshot_errors.append((prefix, exc))
+                if len(snapshot_errors) == len(symbols_by_prefix):
+                    raise snapshot_errors[0][1]
+                if us_symbols and not any(
+                    prefix == "US" for prefix, _ in snapshot_errors
+                ):
                     try:
                         market_states = client.get_market_states(us_symbols)
                     except FutuQuoteError as exc:
                         state_error = exc
-            else:
-                snapshots = {}
         except FutuQuoteError as exc:
+            failed_quotes = self.last_quotes
+            if any(prefix == "US" for prefix, _ in snapshot_errors):
+                failed_quotes = {
+                    symbol: quote
+                    for symbol, quote in failed_quotes.items()
+                    if not symbol.startswith("US.")
+                }
             return QuoteRefreshResult(
                 status="failed",
                 requested_count=len(requested_symbols),
@@ -111,16 +128,19 @@ class DashboardQuoteService:
                 missing_count=0,
                 fetched_at=fetched_at,
                 last_success_at=self.last_success_at,
-                stale=bool(self.last_quotes),
-                quotes=_mark_stale(self.last_quotes),
+                stale=bool(failed_quotes),
+                quotes=_mark_stale(failed_quotes),
                 diagnostic=_error_diagnostic(exc),
             )
         finally:
             if client is not None and hasattr(client, "close"):
                 client.close()
 
-        if state_error is None and any(
-            symbol not in market_states for symbol in us_symbols
+        us_snapshots_succeeded = not any(
+            prefix == "US" for prefix, _ in snapshot_errors
+        )
+        if us_snapshots_succeeded and state_error is None and any(
+            not market_states.get(symbol) for symbol in us_symbols
         ):
             state_error = FutuQuoteError(
                 "incomplete US market states",
@@ -143,7 +163,7 @@ class DashboardQuoteService:
         }
         reused_us_quotes = (
             _last_good_us_quotes(self.last_quotes, us_symbols)
-            if state_error is not None
+            if us_snapshots_succeeded and state_error is not None
             else {}
         )
         if reused_us_quotes:
@@ -165,16 +185,40 @@ class DashboardQuoteService:
             and quote["status"] == "ok"
             and not quote["current_session_quote"]
         )
-        status = "partial" if missing_count or fallback_count or state_error else "ok"
-        diagnostic = _partial_diagnostic(
-            missing_count, fallback_count, state_error, bool(reused_us_quotes)
+        status = (
+            "partial"
+            if missing_count or fallback_count or snapshot_errors or state_error
+            else "ok"
         )
-        cacheable = missing_count == 0 and state_error is None
+        diagnostic = _partial_diagnostic(
+            missing_count,
+            fallback_count,
+            snapshot_errors,
+            state_error,
+            bool(reused_us_quotes),
+        )
+        cacheable = not snapshot_errors and missing_count == 0 and state_error is None
+        us_cacheable = (
+            bool(us_symbols)
+            and us_snapshots_succeeded
+            and state_error is None
+            and all(quotes[symbol]["status"] == "ok" for symbol in us_symbols)
+        )
         if cacheable:
             self.last_success_at = fetched_at
             self.last_quotes = {
                 futu_symbol: dict(quote)
                 for futu_symbol, quote in quotes.items()
+            }
+        elif us_cacheable:
+            self.last_success_at = fetched_at
+            self.last_quotes = {
+                **{
+                    symbol: dict(quote)
+                    for symbol, quote in self.last_quotes.items()
+                    if not symbol.startswith("US.")
+                },
+                **{symbol: dict(quotes[symbol]) for symbol in us_symbols},
             }
 
         return QuoteRefreshResult(
@@ -340,10 +384,14 @@ def _last_good_us_quotes(
 def _partial_diagnostic(
     missing_count: int,
     fallback_count: int,
+    snapshot_errors: list[tuple[str, FutuQuoteError]],
     state_error: FutuQuoteError | None,
     reused_us_quotes: bool = False,
 ) -> dict[str, Any]:
     messages: list[str] = []
+    if snapshot_errors:
+        prefix, error = snapshot_errors[0]
+        messages.append(f"{prefix} 行情获取失败：{error}")
     if missing_count:
         messages.append(f"缺失 {missing_count} 个标的行情。")
     if fallback_count:
@@ -356,28 +404,32 @@ def _partial_diagnostic(
         )
     if not messages:
         return {}
+    primary_error = snapshot_errors[0][1] if snapshot_errors else state_error
     error_type = (
-        state_error.error_type
-        if state_error is not None
+        primary_error.error_type
+        if primary_error is not None
         else "missing_quotes" if missing_count else "session_quote_fallback"
     )
     next_step = (
-        state_error.next_step
-        if state_error is not None
+        primary_error.next_step
+        if primary_error is not None
         else f"请人工复核缺失 {missing_count} 个标的行情，再决定是否执行相关交易动作。"
         if missing_count
         else "请人工复核当前时段报价，再决定是否执行相关交易动作。"
     )
-    return {
+    diagnostic = {
         "error_type": error_type,
         "message": " ".join(messages),
         "next_step": next_step,
         "opend_reachable": (
-            state_error.opend_reachable if state_error is not None else True
+            primary_error.opend_reachable if primary_error is not None else True
         ),
-        "context_ok": state_error.context_ok if state_error is not None else True,
-        "snapshot_ok": state_error.snapshot_ok if state_error is not None else True,
+        "context_ok": primary_error.context_ok if primary_error is not None else True,
+        "snapshot_ok": primary_error.snapshot_ok if primary_error is not None else True,
     }
+    if snapshot_errors:
+        diagnostic["market"] = snapshot_errors[0][0]
+    return diagnostic
 
 
 def _error_diagnostic(error: FutuQuoteError) -> dict[str, Any]:

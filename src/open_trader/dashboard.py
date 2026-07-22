@@ -4,12 +4,13 @@ import csv
 import copy
 import json
 import re
+import socket
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
@@ -68,7 +69,8 @@ from .technical_facts import (
     technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
 )
-from .trend_review import _report_hash
+from .trend_review import _report_hash, _validate_execution_batch
+from .trend_market_controller import _valid_status
 from .strategy_drawdown import valid_drawdown_decision
 from .trend_api_stats import load_trend_api_stats
 from .tradingagents_summary import (
@@ -153,6 +155,11 @@ TREND_REVIEW_METRICS = {
 }
 TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+TREND_MARKET_TIMEZONES = {
+    "CN": SHANGHAI,
+    "HK": ZoneInfo("Asia/Hong_Kong"),
+    "US": ZoneInfo("America/New_York"),
+}
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,7 @@ class DashboardConfig:
     trend_review_cn_simulate_acc_id: int = 0
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
+    trend_executor_host: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,6 +193,7 @@ class DashboardState:
     backtest_universe: dict[str, list[dict[str, str]]]
     trend_reports: dict[str, dict[str, Any]]
     trend_reviews: dict[str, dict[str, Any]]
+    trend_controllers: dict[str, dict[str, object]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -208,6 +217,7 @@ class DashboardState:
             "backtest_universe": self.backtest_universe,
             "trend_reports": self.trend_reports,
             "trend_reviews": self.trend_reviews,
+            "trend_controllers": self.trend_controllers,
         }
 
 
@@ -332,7 +342,119 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             cash_details=raw_cash_details,
         ),
         trend_reviews=_load_trend_reviews(config.data_dir),
+        trend_controllers=_load_trend_controllers(
+            config.data_dir,
+            executor_host=config.trend_executor_host,
+        ),
     )
+
+
+def _load_trend_controllers(
+    data_dir: Path,
+    *,
+    executor_host: str,
+    now: datetime | None = None,
+    hostname_fn: Callable[[], str] = socket.gethostname,
+) -> dict[str, dict[str, object]]:
+    local_host = hostname_fn().strip()
+    executor_host = executor_host.strip()
+    current = now or datetime.now(SHANGHAI)
+    effective_mode = (
+        "execute" if executor_host and executor_host == local_host else "readonly"
+    )
+
+    def base(
+        market: str, health: str, blocking: bool, reason: str
+    ) -> dict[str, object]:
+        return {
+            "market": market,
+            "effective_mode": effective_mode,
+            "executor_host": executor_host,
+            "local_host": local_host,
+            "health": health,
+            "blocking": blocking,
+            "reason": reason,
+            "pid": None,
+            "working_directory": "",
+            "git_sha": "",
+            "phase": "readonly" if health == "readonly" else "unavailable",
+            "heartbeat_at": "",
+            "last_success": None,
+            "blocker": reason or None,
+            "next_check_at": "",
+        }
+
+    def load(market: str) -> dict[str, object]:
+        if not executor_host or executor_host != local_host:
+            reason = (
+                "OPEN_TRADER_TREND_EXECUTOR_HOST is not configured"
+                if not executor_host
+                else "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
+            )
+            return base(market, "readonly", False, reason)
+        path = data_dir / "trend_controller" / market / "status.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return base(
+                market, "unavailable", True, "controller status file is missing"
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return base(
+                market, "unavailable", True, "controller status is malformed"
+            )
+        if not isinstance(payload, dict) or not _valid_status(payload):
+            return base(
+                market, "unavailable", True, "controller status is malformed"
+            )
+        if (
+            payload["effective_mode"] != "execute"
+            or payload["executor_host"] != executor_host
+            or payload["local_host"] != local_host
+        ):
+            return base(
+                market, "unavailable", True, "controller hostname does not match"
+            )
+        heartbeat = datetime.fromisoformat(str(payload["heartbeat_at"]))
+        if abs(current - heartbeat) > timedelta(minutes=2):
+            return {
+                **base(market, "unavailable", True, "controller heartbeat is stale"),
+                **payload,
+                "health": "unavailable",
+                "blocking": True,
+                "reason": "controller heartbeat is stale",
+                "blocker": "controller heartbeat is stale",
+            }
+        unhealthy_phase = payload["phase"] in {
+            "starting",
+            "blocked",
+            "uncertain",
+            "conflict",
+            "missed",
+        }
+        if payload["blocker"] not in (None, "") or unhealthy_phase:
+            reason = str(
+                payload["blocker"] or f"controller phase is {payload['phase']}"
+            )
+            return {
+                **payload,
+                "market": market,
+                "health": "unavailable",
+                "blocking": True,
+                "reason": reason,
+            }
+        return {
+            **payload,
+            "market": market,
+            "health": "healthy",
+            "blocking": False,
+            "reason": "",
+        }
+
+    return {
+        broker: load(market)
+        for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
+    }
 
 
 def _trend_review_unavailable(
@@ -488,12 +610,12 @@ def _load_trend_reports(
     reports_dir: Path,
     *,
     today: date | None = None,
+    now: datetime | None = None,
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if broker_positions is None or cash_details is None:
         broker_positions, cash_details = _latest_broker_details(data_dir)
-    report_date = (today or _shanghai_date()).isoformat()
     reports = {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
@@ -503,7 +625,9 @@ def _load_trend_reports(
             market_label=market_label,
             broker_label=broker_label,
             buy_window=buy_window,
-            report_date=report_date,
+            report_date=(
+                today or _trend_market_date(market, now=now)
+            ).isoformat(),
             broker_positions=broker_positions,
             cash_details=cash_details,
         )
@@ -694,6 +818,11 @@ def _project_futu_attention(
 
 def _shanghai_date(now: datetime | None = None) -> date:
     return (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI).date()
+
+
+def _trend_market_date(market: str, *, now: datetime | None = None) -> date:
+    reference_now = now or datetime.now(SHANGHAI)
+    return reference_now.astimezone(TREND_MARKET_TIMEZONES[market]).date()
 
 
 def _latest_valid_report_payload(
@@ -1184,6 +1313,7 @@ def _load_broker_trend_report(
         report_date=report_date,
         broker_positions=broker_positions,
         cash_details=cash_details,
+        use_execution_batch=True,
     )
 
 
@@ -1200,7 +1330,118 @@ def _project_broker_trend_report(
     report_date: str,
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
+    use_execution_batch: bool = False,
 ) -> dict[str, Any]:
+    _, latest_payload, *_ = selected
+    latest_report_sha256 = _report_hash(latest_payload)
+    execution_batch: dict[str, object] | None = None
+    execution_batch_error = ""
+    revision_anomaly = False
+    if use_execution_batch:
+        batch_path = (
+            data_dir
+            / "trend_review"
+            / "ledgers"
+            / market
+            / "batches"
+            / f"{selected[2].isoformat()}.json"
+        )
+        try:
+            batch_text = batch_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            execution_batch_error = "执行批次无效，已阻止操作投影"
+        else:
+            try:
+                batch = json.loads(batch_text)
+                batch = _validate_execution_batch(
+                    batch,
+                    market=market,
+                    execution_date=selected[2].isoformat(),
+                )
+                locked_path = Path(str(batch["report_path"])).resolve()
+                if locked_path.parent != reports_dir.resolve():
+                    raise ValueError
+                locked = _validated_trend_report_artifact(
+                    reports_dir,
+                    artifact=locked_path.name,
+                    market=market,
+                    broker=broker,
+                )
+                if (
+                    locked is None
+                    or locked[0].resolve() != locked_path
+                    or locked[2] != selected[2]
+                    or _report_hash(locked[1]) != batch.get("report_sha256")
+                ):
+                    raise ValueError
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                ValueError,
+            ):
+                execution_batch_error = "执行批次无效，已阻止操作投影"
+            else:
+                (
+                    path,
+                    payload,
+                    execution_date,
+                    as_of_date,
+                    freshness_date,
+                    generated_at,
+                    _,
+                ) = locked
+                selected = (
+                    path,
+                    payload,
+                    execution_date,
+                    as_of_date,
+                    freshness_date,
+                    generated_at,
+                )
+                execution_batch = batch
+                revision_anomaly = batch["report_sha256"] != latest_report_sha256
+    if execution_batch_error:
+        return {
+            "available": False,
+            "data_status": "unavailable",
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "status_text": execution_batch_error,
+            "execution_batch": None,
+            "execution_batch_blocking": True,
+            "execution_batch_error": execution_batch_error,
+            "artifact": "",
+            "report_sha256": "",
+            "latest_report_sha256": "",
+            "revision_anomaly": False,
+            "strategy_version": "",
+            "report_date": "",
+            "data_date": "",
+            "generated_at": "",
+            "option_attention": [],
+            "account_source_date": "",
+            "account_fresh": False,
+            "account_status": "",
+            "buy_window": buy_window,
+            "run_status": "",
+            "sell_actions": [],
+            "buy_actions": [],
+            "hold_actions": [],
+            "review_actions": [],
+            "risk_skips": [],
+            "risk_summary": {},
+            "drawdown_summary": {},
+            "actual_overlay": {},
+            "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+            "recent_protection_alert": None,
+            "audit": {},
+        }
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
     account = payload["account"]
     metadata = payload["metadata"]
@@ -1245,6 +1486,11 @@ def _project_broker_trend_report(
         "available": True,
         "artifact": path.name,
         "report_sha256": report_sha256,
+        "execution_batch": execution_batch,
+        "execution_batch_blocking": bool(execution_batch_error),
+        "execution_batch_error": execution_batch_error,
+        "latest_report_sha256": latest_report_sha256,
+        "revision_anomaly": revision_anomaly,
         "strategy_version": str(
             (payload.get("strategy_snapshot") or {}).get("strategy_version") or ""
         ),
@@ -1726,13 +1972,27 @@ def _trend_action_executions(
         / "actions"
         / execution_date
     )
-    for path in sorted(root.glob("*/*.json")):
+    ordered_events: list[tuple[int, float, str, dict[str, Any]]] = []
+    for path in root.glob("*/*.json"):
         try:
             event = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(event, dict):
             continue
+        try:
+            recorded_at = datetime.fromisoformat(str(event.get("recorded_at") or ""))
+        except ValueError:
+            recorded_at = None
+        if (
+            recorded_at is None
+            or recorded_at.tzinfo is None
+            or recorded_at.utcoffset() is None
+        ):
+            ordered_events.append((0, 0.0, str(path), event))
+        else:
+            ordered_events.append((1, recorded_at.timestamp(), str(path), event))
+    for _, _, _, event in sorted(ordered_events):
         if event.get("report_sha256") != report_sha256:
             continue
         symbol = str(event.get("symbol") or "").strip()

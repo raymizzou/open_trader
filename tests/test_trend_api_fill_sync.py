@@ -54,6 +54,10 @@ class FakeFutuContext:
         }
         return 0, FakeDataFrame([row, dict(row)])
 
+    def order_list_query(self, **kwargs: object) -> tuple[int, FakeDataFrame]:
+        self.calls.append(("active_orders", dict(kwargs)))
+        return 0, FakeDataFrame([])
+
     def history_deal_list_query(self, **kwargs: object) -> tuple[int, FakeDataFrame]:
         raise AssertionError("Futu SIMULATE does not support deal history")
 
@@ -114,7 +118,7 @@ def test_futu_simulate_adapter_deduplicates_orders_and_fills_without_trusting_ze
     }]
     assert result["account_id"] == "101"
     assert result["source_id"] == "simulation:futu:101"
-    assert [name for name, _ in context.calls] == ["orders"]
+    assert [name for name, _ in context.calls] == ["active_orders", "orders"]
 
 
 def test_futu_cn_order_aggregate_accepts_exchange_prefixed_symbol() -> None:
