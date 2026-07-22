@@ -7,7 +7,7 @@ import re
 import socket
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -1031,6 +1031,10 @@ def _write_notification_state(path: Path, state: Mapping[str, object]) -> None:
         temp.unlink(missing_ok=True)
 
 
+def _notification_retry_lock(path: Path) -> RunLock:
+    return RunLock(path.with_suffix(".lock"))
+
+
 def _controller_feishu_payload(
     title: str,
     message: str,
@@ -1089,13 +1093,20 @@ def _notify_channels_once(
         / execution_date
         / f"{digest}.json"
     )
-    if path.exists():
+    existing_v2 = path.exists()
+    if existing_v2:
         state = _read_json(path, "trend controller notification")
         if (
             state.get("schema_version")
             == "open_trader.trend_controller.notification.v1"
         ):
             return True
+        if (
+            state.get("schema_version")
+            != "open_trader.trend_controller.notification.v2"
+        ):
+            raise ValueError(f"invalid trend controller notification: {path}")
+        lock = _notification_retry_lock(path)
     else:
         state = {
             "schema_version": "open_trader.trend_controller.notification.v2",
@@ -1110,67 +1121,90 @@ def _notify_channels_once(
             "feishu_message": feishu_payload[1] if feishu_payload else "",
             "channels": [],
         }
-    if (
-        state.get("schema_version")
-        != "open_trader.trend_controller.notification.v2"
-    ):
-        raise ValueError(f"invalid trend controller notification: {path}")
+        lock = nullcontext()
+    try:
+        with lock:
+            if existing_v2:
+                state = _read_json(path, "trend controller notification")
+                if (
+                    state.get("schema_version")
+                    == "open_trader.trend_controller.notification.v1"
+                ):
+                    return True
+                if (
+                    state.get("schema_version")
+                    != "open_trader.trend_controller.notification.v2"
+                ):
+                    raise ValueError(
+                        f"invalid trend controller notification: {path}"
+                    )
+            channels = [
+                channel
+                for channel in state.get("channels", [])
+                if isinstance(channel, str)
+            ]
+            if (
+                non_feishu_payload is not None
+                and not state.get("non_feishu_attempted")
+            ):
+                try:
+                    attempts = send_notification_with_results(
+                        build_notifier(config),
+                        *non_feishu_payload,
+                        channels={"macos", "xiaoai"},
+                    )
+                except Exception:
+                    attempts = []
+                channels.extend(
+                    attempt.channel
+                    for attempt in attempts
+                    if attempt.success and attempt.channel not in channels
+                )
+                state["non_feishu_attempted"] = True
 
-    channels = [
-        channel
-        for channel in state.get("channels", [])
-        if isinstance(channel, str)
-    ]
-    if non_feishu_payload is not None and not state.get("non_feishu_attempted"):
-        try:
-            attempts = send_notification_with_results(
-                build_notifier(config),
-                *non_feishu_payload,
-                channels={"macos", "xiaoai"},
+            feishu_delivered = any(
+                channel in {"feishu", "feishu_app"} for channel in channels
             )
-        except Exception:
-            attempts = []
-        channels.extend(
-            attempt.channel
-            for attempt in attempts
-            if attempt.success and attempt.channel not in channels
-        )
-        state["non_feishu_attempted"] = True
+            if (
+                feishu_payload is not None
+                and not feishu_delivered
+                and int(state.get("feishu_attempts", 0)) < 2
+            ):
+                try:
+                    attempts = send_notification_with_results(
+                        build_notifier(config),
+                        str(state["feishu_title"]),
+                        str(state["feishu_message"]),
+                        channels={"feishu", "feishu_app"},
+                    )
+                except Exception:
+                    attempts = []
+                channels.extend(
+                    attempt.channel
+                    for attempt in attempts
+                    if attempt.success and attempt.channel not in channels
+                )
+                state["feishu_attempts"] = int(
+                    state.get("feishu_attempts", 0)
+                ) + 1
 
-    feishu_delivered = any(
-        channel in {"feishu", "feishu_app"} for channel in channels
-    )
-    if (
-        feishu_payload is not None
-        and not feishu_delivered
-        and int(state.get("feishu_attempts", 0)) < 2
-    ):
-        try:
-            attempts = send_notification_with_results(
-                build_notifier(config),
-                str(state["feishu_title"]),
-                str(state["feishu_message"]),
-                channels={"feishu", "feishu_app"},
-            )
-        except Exception:
-            attempts = []
-        channels.extend(
-            attempt.channel
-            for attempt in attempts
-            if attempt.success and attempt.channel not in channels
-        )
-        state["feishu_attempts"] = int(state.get("feishu_attempts", 0)) + 1
-
-    state["channels"] = channels
-    _write_notification_state(path, state)
-    requested = []
-    if non_feishu_payload is not None:
-        requested.append(any(channel in {"macos", "xiaoai"} for channel in channels))
-    if feishu_payload is not None:
-        requested.append(
-            any(channel in {"feishu", "feishu_app"} for channel in channels)
-        )
-    return bool(requested) and all(requested)
+            state["channels"] = channels
+            _write_notification_state(path, state)
+            requested = []
+            if non_feishu_payload is not None:
+                requested.append(
+                    any(channel in {"macos", "xiaoai"} for channel in channels)
+                )
+            if feishu_payload is not None:
+                requested.append(
+                    any(
+                        channel in {"feishu", "feishu_app"}
+                        for channel in channels
+                    )
+                )
+            return bool(requested) and all(requested)
+    except RuntimeError:
+        return False
 
 
 def _notify_once(title: str, message: str, key: object) -> bool:
@@ -1211,7 +1245,7 @@ def _retry_pending_feishu_notifications(config: DailyPremarketConfig) -> None:
         )
     ):
         try:
-            with RunLock(path.with_suffix(".lock")):
+            with _notification_retry_lock(path):
                 try:
                     state = _read_json(path, "trend controller notification")
                 except ValueError:

@@ -92,9 +92,10 @@ def _retry_pending_feishu_notifications_in_process(
     finished: object,
     attempts: object,
     release: object,
+    entered: object | None = None,
 ) -> None:
     controller.build_notifier = lambda _config: CompositeNotifier([
-        BlockingProcessFeishu(attempts, release)
+        BlockingProcessFeishu(attempts, release, entered)
     ])
     start.wait()
     try:
@@ -105,13 +106,21 @@ def _retry_pending_feishu_notifications_in_process(
 
 
 class BlockingProcessFeishu(FeishuWebhookNotifier):
-    def __init__(self, attempts: object, release: object) -> None:
+    def __init__(
+        self,
+        attempts: object,
+        release: object,
+        entered: object | None = None,
+    ) -> None:
         self.attempts = attempts
         self.release = release
+        self.entered = entered
 
     def notify(self, title: str, message: str) -> None:
         with self.attempts.get_lock():
             self.attempts.value += 1
+        if self.entered is not None:
+            self.entered.set()
         self.release.wait(timeout=5)
 
 
@@ -258,6 +267,95 @@ def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
             process.join(timeout=5)
 
     assert all(process.exitcode == 0 for process in processes)
+    assert attempts.value == 1
+
+
+def test_direct_notification_retry_and_scanner_send_feishu_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(controller_config(tmp_path), notifiers=("feishu",))
+    context = multiprocessing.get_context("spawn")
+    attempts = context.Value("i", 0)
+    finished = context.Value("i", 0)
+    release = context.Event()
+    entered = context.Event()
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "snapshot_failed",
+            "occurred_at": "2026-07-22T10:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "retry title",
+            "feishu_message": "retry message",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([
+            BlockingProcessFeishu(attempts, release)
+        ]),
+    )
+    start = context.Event()
+    scanner = context.Process(
+        target=_retry_pending_feishu_notifications_in_process,
+        args=(config, start, finished, attempts, release, entered),
+    )
+    scanner.start()
+    start.set()
+    assert entered.wait(timeout=5)
+    direct_finished = threading.Event()
+    direct_results: list[bool] = []
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:01+08:00",
+    )
+
+    def retry_directly() -> None:
+        direct_results.append(
+            controller._notify_once(
+                "US 趋势控制器阻塞", "retry unavailable", key
+            )
+        )
+        direct_finished.set()
+
+    direct = threading.Thread(target=retry_directly)
+    direct.start()
+    deadline = time.monotonic() + 5
+    try:
+        while (
+            attempts.value < 2
+            and not direct_finished.is_set()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert attempts.value == 1
+        assert direct_finished.wait(timeout=5)
+        assert direct_results == [False]
+    finally:
+        release.set()
+        direct.join(timeout=5)
+        scanner.join(timeout=5)
+
+    assert scanner.exitcode == 0
     assert attempts.value == 1
 
 
