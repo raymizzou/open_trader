@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from datetime import datetime
 from decimal import Decimal
@@ -88,10 +89,12 @@ class FlakyOrderFeishuNotifier(RecordingFeishuNotifier):
         super().__init__()
         self.failures = failures
         self.order_attempt_count = 0
+        self.order_attempts: list[tuple[str, str]] = []
 
     def notify(self, title: str, message: str) -> None:
         if "卖出失败" in title:
             self.order_attempt_count += 1
+            self.order_attempts.append((title, message))
             if self.failures:
                 self.failures -= 1
                 raise RuntimeError("Feishu unavailable")
@@ -855,6 +858,122 @@ def test_protection_callback_group_exhausts_after_next_watcher_iteration(
         == "trend_review_callback_failure_notification_delivered_feishu"
         for event in events
     )
+
+
+@pytest.mark.parametrize(
+    ("second_subset_failure", "expected_attempt_count"),
+    [(False, 2), (True, 3)],
+    ids=("callbacks-recover", "different-subset-fails"),
+)
+def test_failed_callback_group_retries_frozen_payload(
+    tmp_path: Path,
+    second_subset_failure: bool,
+    expected_attempt_count: int,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_hk_details(data_dir)
+    state_path = data_dir / "trend_hk_phillips/protection_state.json"
+    events_path = data_dir / "trend_hk_phillips/watch_events.jsonl"
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {
+            "00700": {"active_line": "11"},
+            "00941": {"active_line": "11"},
+        },
+    })
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {
+                symbol: QuoteSnapshot(symbol, Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    callback_count = 0
+
+    def fail_first_iteration(_event: object) -> None:
+        nonlocal callback_count
+        callback_count += 1
+        if callback_count <= 2 or (
+            second_subset_failure and callback_count == 3
+        ):
+            raise RuntimeError("simulate order failed")
+
+    feishu = FlakyOrderFeishuNotifier(failures=1)
+    macos = RecordingMacOSNotifier()
+    for _ in range(2):
+        watch_market_protection(
+            market="HK",
+            data_dir=data_dir,
+            portfolio_path=tmp_path / "unused.csv",
+            state_path=state_path,
+            events_path=events_path,
+            report_lock_path=None,
+            quote_client=Quote(),
+            notifier=CompositeNotifier([feishu, macos]),
+            poll_seconds=5,
+            reconnect_seconds=60,
+            once=True,
+            now_fn=lambda: datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI),
+            sleep_fn=lambda seconds: None,
+            on_protection_trigger=fail_first_iteration,
+        )
+
+    assert feishu.order_attempt_count == expected_attempt_count
+    assert feishu.order_attempts[0] == feishu.order_attempts[1]
+    assert "- 00700" in feishu.order_attempts[1][1]
+    assert "- 00941" in feishu.order_attempts[1][1]
+    assert sum(
+        title == "趋势模拟执行失败 · 2026-07-16"
+        for title, _ in macos.messages
+    ) == 1
+
+
+def test_directionless_callback_failures_share_stable_batch_identity(
+    tmp_path: Path,
+) -> None:
+    events_path = tmp_path / "watch_events.jsonl"
+    feishu = RecordingFeishuNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI)
+
+    for reason in ("批次异常一", "批次异常二"):
+        market_watch_module._run_review_callback(
+            lambda _value, _reason=reason: (_ for _ in ()).throw(
+                RuntimeError(_reason)
+            ),
+            "2026-07-16",
+            events_path=events_path,
+            trading_date="2026-07-16",
+            now=now,
+            notifier=notifier,
+            market="HK",
+            market_label="港股",
+            broker_label="辉立",
+        )
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    attempts = [
+        event
+        for event in events
+        if event["event_type"]
+        == "trend_review_callback_failure_notification_attempted_feishu"
+    ]
+    expected_group_id = hashlib.sha256(
+        b"2026-07-16|HK|failed"
+    ).hexdigest()
+    assert [title for title, _ in feishu.messages] == [
+        "【需处理｜辉立｜港股批次执行失败｜2026-07-16】"
+    ]
+    assert len(attempts) == 1
+    assert attempts[0]["group_id"] == expected_group_id
 
 
 def test_session_review_callback_failure_does_not_stop_watcher(tmp_path: Path) -> None:

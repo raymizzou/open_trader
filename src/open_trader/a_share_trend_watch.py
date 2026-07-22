@@ -70,6 +70,9 @@ def append_watch_event(
     reason: str = "",
     channel: str = "",
     group_id: str = "",
+    notification_title: str = "",
+    notification_message: str = "",
+    group_symbols: list[str] | None = None,
 ) -> dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
@@ -89,6 +92,12 @@ def append_watch_event(
         event["channel"] = channel
     if group_id:
         event["group_id"] = group_id
+    if notification_title:
+        event["notification_title"] = notification_title
+    if notification_message:
+        event["notification_message"] = notification_message
+    if group_symbols is not None:
+        event["group_symbols"] = group_symbols
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     return event
@@ -240,6 +249,13 @@ def watch_a_share_protection(
                     recover_monitor()
                     return outcome("holiday")
 
+            _retry_pending_callback_feishu_groups(
+                events_path=events_path,
+                notifier=notifier,
+                trading_date=trading_date,
+                now=now,
+                market=market,
+            )
             if on_session_open is not None:
                 exception_count += _run_review_callback(
                     on_session_open,
@@ -610,81 +626,24 @@ def _notify_trend_review_deadline(
         group_id = _order_group_id(
             trading_date, market, group.side, group.status, symbols
         )
-        group_events = [
-            event for event in prior if event.get("group_id") == group_id
-        ]
-        if any(
-            event.get("event_type") in {
-                "trend_review_deadline_notification_delivered_feishu",
-                "trend_review_deadline_notification_exhausted_feishu",
-            }
-            for event in group_events
-        ):
-            continue
-        attempt_count = sum(
-            event.get("event_type")
-            == "trend_review_deadline_notification_attempted_feishu"
-            for event in group_events
-        )
-        if attempt_count >= 2:
-            continue
         title, message = render_order_alert(
             group,
             broker_label=BROKER_LABELS[market],
             trading_date=trading_date,
         )
-        attempts = send_notification_with_results(
-            notifier,
-            title,
-            message,
-            channels={"feishu", "feishu_app"},
-        )
-        append_watch_event(
-            events_path,
-            symbol="",
+        _send_persisted_feishu_group(
+            events_path=events_path,
+            notifier=notifier,
             trading_date=trading_date,
-            event_type="trend_review_deadline_notification_attempted_feishu",
-            occurred_at=now.isoformat(timespec="seconds"),
-            last_price=None,
-            active_line=None,
+            now=now,
             market=market,
-            reason=group.status,
-            channel="feishu",
+            status=group.status,
+            event_prefix="trend_review_deadline_notification",
             group_id=group_id,
+            symbols=symbols,
+            title=title,
+            message=message,
         )
-        if any(attempt.success for attempt in attempts):
-            for symbol in symbols:
-                append_watch_event(
-                    events_path,
-                    symbol=symbol,
-                    trading_date=trading_date,
-                    event_type=(
-                        "trend_review_deadline_notification_delivered_feishu"
-                    ),
-                    occurred_at=now.isoformat(timespec="seconds"),
-                    last_price=None,
-                    active_line=None,
-                    market=market,
-                    reason=group.status,
-                    channel="feishu",
-                    group_id=group_id,
-                )
-        elif attempt_count == 1:
-            append_watch_event(
-                events_path,
-                symbol="",
-                trading_date=trading_date,
-                event_type=(
-                    "trend_review_deadline_notification_exhausted_feishu"
-                ),
-                occurred_at=now.isoformat(timespec="seconds"),
-                last_price=None,
-                active_line=None,
-                market=market,
-                reason=group.status,
-                channel="feishu",
-                group_id=group_id,
-            )
 
 
 def _latest_valid_action(action_dir: Path) -> Mapping[str, object] | None:
@@ -802,9 +761,9 @@ def _notify_review_callback_batch_failure(
     broker_label: str,
     reason: str,
 ) -> None:
-    group_id = _order_group_id(
-        trading_date, market, "batch", "failed", [brief_zh_detail(reason)]
-    )
+    group_id = hashlib.sha256(
+        f"{trading_date}|{market}|failed".encode("utf-8")
+    ).hexdigest()
     title, message = render_attention(
         broker_label,
         f"{market_label}批次执行失败",
@@ -814,13 +773,14 @@ def _notify_review_callback_batch_failure(
         action="查看不可变动作账本与控制器日志",
         detail=brief_zh_detail(reason),
     )
-    _send_callback_feishu_group(
+    _send_persisted_feishu_group(
         events_path=events_path,
         notifier=notifier,
         trading_date=trading_date,
         now=now,
         market=market,
         status="failed",
+        event_prefix="trend_review_callback_failure_notification",
         group_id=group_id,
         symbols=[],
         title=title,
@@ -848,13 +808,14 @@ def _notify_review_callback_failure_groups(
             broker_label=broker_label,
             trading_date=trading_date,
         )
-        _send_callback_feishu_group(
+        _send_persisted_feishu_group(
             events_path=events_path,
             notifier=notifier,
             trading_date=trading_date,
             now=now,
             market=market,
             status=group.status,
+            event_prefix="trend_review_callback_failure_notification",
             group_id=group_id,
             symbols=symbols,
             title=title,
@@ -862,7 +823,7 @@ def _notify_review_callback_failure_groups(
         )
 
 
-def _send_callback_feishu_group(
+def _send_persisted_feishu_group(
     *,
     events_path: Path,
     notifier: Notifier,
@@ -870,6 +831,7 @@ def _send_callback_feishu_group(
     now: datetime,
     market: str,
     status: str,
+    event_prefix: str,
     group_id: str,
     symbols: list[str],
     title: str,
@@ -879,22 +841,39 @@ def _send_callback_feishu_group(
         event
         for event in load_watch_events(events_path)
         if event.get("group_id") == group_id
+        and str(event.get("event_type") or "").startswith(event_prefix)
     ]
-    prefix = "trend_review_callback_failure_notification"
     if any(
         event.get("event_type") in {
-            f"{prefix}_delivered_feishu",
-            f"{prefix}_exhausted_feishu",
+            f"{event_prefix}_delivered_feishu",
+            f"{event_prefix}_exhausted_feishu",
         }
         for event in prior
     ):
         return
     attempt_count = sum(
-        event.get("event_type") == f"{prefix}_attempted_feishu"
+        event.get("event_type") == f"{event_prefix}_attempted_feishu"
         for event in prior
     )
     if attempt_count >= 2:
         return
+    first_attempt = next(
+        (
+            event
+            for event in prior
+            if event.get("event_type")
+            == f"{event_prefix}_attempted_feishu"
+        ),
+        None,
+    )
+    if first_attempt is not None:
+        title = str(first_attempt.get("notification_title") or title)
+        message = str(first_attempt.get("notification_message") or message)
+        stored_symbols = first_attempt.get("group_symbols")
+        if isinstance(stored_symbols, list) and all(
+            isinstance(symbol, str) for symbol in stored_symbols
+        ):
+            symbols = stored_symbols
     attempts = send_notification_with_results(
         notifier,
         title,
@@ -905,7 +884,7 @@ def _send_callback_feishu_group(
         events_path,
         symbol="",
         trading_date=trading_date,
-        event_type=f"{prefix}_attempted_feishu",
+        event_type=f"{event_prefix}_attempted_feishu",
         occurred_at=now.isoformat(timespec="seconds"),
         last_price=None,
         active_line=None,
@@ -913,6 +892,9 @@ def _send_callback_feishu_group(
         reason=status,
         channel="feishu",
         group_id=group_id,
+        notification_title=title,
+        notification_message=message,
+        group_symbols=symbols,
     )
     if any(attempt.success for attempt in attempts):
         for symbol in symbols or [""]:
@@ -920,7 +902,7 @@ def _send_callback_feishu_group(
                 events_path,
                 symbol=symbol,
                 trading_date=trading_date,
-                event_type=f"{prefix}_delivered_feishu",
+                event_type=f"{event_prefix}_delivered_feishu",
                 occurred_at=now.isoformat(timespec="seconds"),
                 last_price=None,
                 active_line=None,
@@ -934,7 +916,7 @@ def _send_callback_feishu_group(
             events_path,
             symbol="",
             trading_date=trading_date,
-            event_type=f"{prefix}_exhausted_feishu",
+            event_type=f"{event_prefix}_exhausted_feishu",
             occurred_at=now.isoformat(timespec="seconds"),
             last_price=None,
             active_line=None,
@@ -942,6 +924,68 @@ def _send_callback_feishu_group(
             reason=status,
             channel="feishu",
             group_id=group_id,
+        )
+
+
+def _retry_pending_callback_feishu_groups(
+    *,
+    events_path: Path,
+    notifier: Notifier,
+    trading_date: str,
+    now: datetime,
+    market: str,
+) -> None:
+    prefix = "trend_review_callback_failure_notification"
+    events = [
+        event
+        for event in load_watch_events(events_path)
+        if event.get("trading_date") == trading_date
+        and event.get("market") == market
+        and str(event.get("event_type") or "").startswith(prefix)
+    ]
+    group_ids = {
+        str(event.get("group_id") or "") for event in events
+    } - {""}
+    for group_id in sorted(group_ids):
+        group_events = [
+            event for event in events if event.get("group_id") == group_id
+        ]
+        attempts = [
+            event
+            for event in group_events
+            if event.get("event_type") == f"{prefix}_attempted_feishu"
+        ]
+        if len(attempts) != 1 or any(
+            event.get("event_type") in {
+                f"{prefix}_delivered_feishu",
+                f"{prefix}_exhausted_feishu",
+            }
+            for event in group_events
+        ):
+            continue
+        attempt = attempts[0]
+        title = attempt.get("notification_title")
+        message = attempt.get("notification_message")
+        symbols = attempt.get("group_symbols")
+        if (
+            not isinstance(title, str)
+            or not isinstance(message, str)
+            or not isinstance(symbols, list)
+            or not all(isinstance(symbol, str) for symbol in symbols)
+        ):
+            continue
+        _send_persisted_feishu_group(
+            events_path=events_path,
+            notifier=notifier,
+            trading_date=trading_date,
+            now=now,
+            market=market,
+            status=str(attempt.get("reason") or "failed"),
+            event_prefix=prefix,
+            group_id=group_id,
+            symbols=symbols,
+            title=title,
+            message=message,
         )
 
 
