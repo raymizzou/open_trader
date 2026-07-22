@@ -92,3 +92,29 @@ def test_protection_alert_hides_non_numeric_price_detail() -> None:
 
     assert "活动保护线：详见控制器日志" in message
     assert "/Users/" not in message
+
+
+def test_group_order_alerts_skips_unsafe_symbol() -> None:
+    groups = group_order_alerts("US", [{
+        "symbol": "HIG Traceback: /Users/ray/secret",
+        "side": "buy",
+        "status": "incomplete",
+        "target_qty": "10",
+    }])
+
+    assert groups == []
+
+
+def test_order_alert_replaces_unsafe_quantity() -> None:
+    group = group_order_alerts("US", [{
+        "symbol": "HIG",
+        "side": "buy",
+        "status": "incomplete",
+        "target_qty": "10 Traceback: /Users/ray/secret",
+    }])[0]
+
+    _, message = render_order_alert(group, broker_label="老虎", trading_date="2026-07-22")
+
+    assert "- HIG｜目标 数量无效" in message
+    assert "/Users/" not in message
+    assert "Traceback" not in message

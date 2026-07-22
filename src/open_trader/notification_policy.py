@@ -62,15 +62,15 @@ def group_order_alerts(
     normalized_market = market.strip().upper()
     grouped: dict[tuple[str, str], dict[str, OrderAlertItem]] = {}
     for event in events:
-        symbol = str(event.get("symbol") or "").strip().upper()
+        symbol = _symbol(event.get("symbol"))
         side = str(event.get("side") or "").strip().lower()
         status = str(event.get("status") or "").strip().lower()
         if not symbol or side not in SIDE_LABELS or status not in STATUS_LABELS:
             continue
         grouped.setdefault((side, status), {})[symbol] = OrderAlertItem(
             symbol=symbol,
-            filled_qty=str(event.get("filled_qty") or "").strip(),
-            target_qty=str(event.get("target_qty") or "").strip(),
+            filled_qty=_quantity_text(event.get("filled_qty")),
+            target_qty=_quantity_text(event.get("target_qty")),
             reason=_reason_label(event.get("reason")),
         )
     return [
@@ -82,6 +82,28 @@ def group_order_alerts(
         )
         for (side, status), items in sorted(grouped.items())
     ]
+
+
+def _symbol(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if (
+        not 1 <= len(text) <= 16
+        or not text.isascii()
+        or not text[0].isalnum()
+        or not all(character.isalnum() or character in ".-" for character in text)
+    ):
+        return ""
+    return text
+
+
+def _quantity_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return text if len(text) <= 64 and Decimal(text).is_finite() else "数量无效"
+    except InvalidOperation:
+        return "数量无效"
 
 
 def _reason_label(value: object) -> str:
