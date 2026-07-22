@@ -1211,38 +1211,45 @@ def _retry_pending_feishu_notifications(config: DailyPremarketConfig) -> None:
         )
     ):
         try:
-            state = _read_json(path, "trend controller notification")
-        except ValueError:
+            with RunLock(path.with_suffix(".lock")):
+                try:
+                    state = _read_json(path, "trend controller notification")
+                except ValueError:
+                    continue
+                channels = [
+                    channel
+                    for channel in state.get("channels", [])
+                    if isinstance(channel, str)
+                ]
+                if (
+                    state.get("schema_version")
+                    != "open_trader.trend_controller.notification.v2"
+                    or state.get("feishu_attempts") != 1
+                    or any(
+                        channel in {"feishu", "feishu_app"}
+                        for channel in channels
+                    )
+                ):
+                    continue
+                try:
+                    attempts = send_notification_with_results(
+                        build_notifier(config),
+                        str(state.get("feishu_title") or ""),
+                        str(state.get("feishu_message") or ""),
+                        channels={"feishu", "feishu_app"},
+                    )
+                except Exception:
+                    attempts = []
+                channels.extend(
+                    attempt.channel
+                    for attempt in attempts
+                    if attempt.success and attempt.channel not in channels
+                )
+                state["feishu_attempts"] = 2
+                state["channels"] = channels
+                _write_notification_state(path, state)
+        except RuntimeError:
             continue
-        channels = [
-            channel
-            for channel in state.get("channels", [])
-            if isinstance(channel, str)
-        ]
-        if (
-            state.get("schema_version")
-            != "open_trader.trend_controller.notification.v2"
-            or state.get("feishu_attempts") != 1
-            or any(channel in {"feishu", "feishu_app"} for channel in channels)
-        ):
-            continue
-        try:
-            attempts = send_notification_with_results(
-                build_notifier(config),
-                str(state.get("feishu_title") or ""),
-                str(state.get("feishu_message") or ""),
-                channels={"feishu", "feishu_app"},
-            )
-        except Exception:
-            attempts = []
-        channels.extend(
-            attempt.channel
-            for attempt in attempts
-            if attempt.success and attempt.channel not in channels
-        )
-        state["feishu_attempts"] = 2
-        state["channels"] = channels
-        _write_notification_state(path, state)
 
 
 def _notify_protection_blocker(

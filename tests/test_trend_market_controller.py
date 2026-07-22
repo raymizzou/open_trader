@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import multiprocessing
 import socket
 import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
@@ -82,6 +84,35 @@ class RecordingMacOS(MacOSNotifier):
 
     def notify(self, title: str, message: str) -> None:
         self.messages.append((title, message))
+
+
+def _retry_pending_feishu_notifications_in_process(
+    config: DailyPremarketConfig,
+    start: object,
+    finished: object,
+    attempts: object,
+    release: object,
+) -> None:
+    controller.build_notifier = lambda _config: CompositeNotifier([
+        BlockingProcessFeishu(attempts, release)
+    ])
+    start.wait()
+    try:
+        controller._retry_pending_feishu_notifications(config)
+    finally:
+        with finished.get_lock():
+            finished.value += 1
+
+
+class BlockingProcessFeishu(FeishuWebhookNotifier):
+    def __init__(self, attempts: object, release: object) -> None:
+        self.attempts = attempts
+        self.release = release
+
+    def notify(self, title: str, message: str) -> None:
+        with self.attempts.get_lock():
+            self.attempts.value += 1
+        self.release.wait(timeout=5)
 
 
 def test_controller_notification_retries_only_feishu_once(
@@ -168,6 +199,66 @@ def test_controller_notification_stops_after_one_retry(
     controller._retry_pending_feishu_notifications(config)
 
     assert feishu.attempt_count == 2
+
+
+def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
+    config = controller_config(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    attempts = context.Value("i", 0)
+    finished = context.Value("i", 0)
+    release = context.Event()
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "snapshot_failed",
+            "occurred_at": "2026-07-22T10:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "retry title",
+            "feishu_message": "retry message",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    start = context.Event()
+    processes = [
+        context.Process(
+            target=_retry_pending_feishu_notifications_in_process,
+            args=(config, start, finished, attempts, release),
+        )
+        for _ in range(3)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    deadline = time.monotonic() + 5
+    try:
+        while (
+            attempts.value < 3
+            and finished.value < 2
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert attempts.value == 1
+        assert finished.value == 2
+    finally:
+        release.set()
+        for process in processes:
+            process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert attempts.value == 1
 
 
 def test_legacy_controller_notification_is_not_replayed(
