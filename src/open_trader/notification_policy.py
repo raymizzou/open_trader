@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 
 MARKET_LABELS = {"CN": "A股", "HK": "港股", "US": "美股"}
@@ -89,16 +90,30 @@ def _reason_label(value: object) -> str:
         return ""
     if text in REASON_LABELS:
         return REASON_LABELS[text]
-    return text if any("\u4e00" <= character <= "\u9fff" for character in text) else "详见动作账本"
+    return "详见动作账本"
 
 
 def brief_zh_detail(value: object) -> str:
-    text = str(value or "").strip().splitlines()[0] if str(value or "").strip() else ""
+    raw = str(value or "").strip()
+    text = raw.splitlines()[0] if raw else ""
     if not text:
         return ""
-    if "/Users/" in text or "/private/" in text or not any("\u4e00" <= character <= "\u9fff" for character in text):
+    if (
+        "/Users/" in raw
+        or "/private/" in raw
+        or any(character.isascii() and character.isalpha() for character in text)
+        or not any("\u4e00" <= character <= "\u9fff" for character in text)
+    ):
         return "详见控制器日志"
     return text[:160]
+
+
+def _numeric_detail(value: object) -> str:
+    text = str(value).strip()
+    try:
+        return text if len(text) <= 64 and Decimal(text).is_finite() else "详见控制器日志"
+    except InvalidOperation:
+        return "详见控制器日志"
 
 
 def render_daily_title(broker_label: str, market_label: str, report_date: str) -> str:
@@ -117,7 +132,7 @@ def render_attention(
 ) -> tuple[str, str]:
     lines = [f"发生：{happened}", f"影响：{impact}", f"现在做：{action}"]
     if detail:
-        lines.append(f"原因：{detail}")
+        lines.append(f"原因：{brief_zh_detail(detail)}")
     return f"【需处理｜{source}｜{problem}｜{event_date}】", "\n".join(lines)
 
 
@@ -131,7 +146,8 @@ def render_protection_alert(
 ) -> tuple[str, str]:
     return (
         f"【紧急｜{broker_label}｜{market_label}保护线触发｜{symbol}】",
-        f"最新价：{last_price}\n活动保护线：{active_line}\n现在做：人工确认并全部卖出",
+        f"最新价：{_numeric_detail(last_price)}\n"
+        f"活动保护线：{_numeric_detail(active_line)}\n现在做：人工确认并全部卖出",
     )
 
 

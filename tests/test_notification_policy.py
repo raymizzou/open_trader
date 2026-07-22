@@ -50,3 +50,45 @@ def test_fixed_feishu_title_levels() -> None:
     )
     assert brief_zh_detail("failed at /Users/ray/secret.json") == "详见控制器日志"
     assert brief_zh_detail("行情连接超时\ntraceback") == "行情连接超时"
+
+
+def test_attention_hides_mixed_technical_detail() -> None:
+    _, message = render_attention(
+        "系统",
+        "连接故障",
+        "2026-07-22",
+        happened="连接超时",
+        impact="行情监控可能中断",
+        action="检查网络",
+        detail="行情连接超时 Traceback: /Users/ray/secret.json",
+    )
+
+    assert message.endswith("原因：详见控制器日志")
+    assert "/Users/" not in message
+    assert "Traceback" not in message
+
+
+def test_order_alert_hides_arbitrary_chinese_containing_reason() -> None:
+    group = group_order_alerts("US", [
+        {
+            "symbol": "HIG",
+            "side": "buy",
+            "status": "incomplete",
+            "reason": "订单失败 Traceback: /private/token=secret",
+        },
+    ])[0]
+
+    _, message = render_order_alert(group, broker_label="老虎", trading_date="2026-07-22")
+
+    assert "原因：详见动作账本" in message
+    assert "/private/" not in message
+    assert "Traceback" not in message
+
+
+def test_protection_alert_hides_non_numeric_price_detail() -> None:
+    _, message = render_protection_alert(
+        "老虎", "美股", "HIG", last_price="133.90", active_line="/Users/ray/secret"
+    )
+
+    assert "活动保护线：详见控制器日志" in message
+    assert "/Users/" not in message
