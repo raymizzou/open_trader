@@ -166,6 +166,38 @@ def test_futu_simulation_account_rejects_invalid_boundary_rows(
         )
 
 
+def test_futu_simulation_account_borrows_existing_client() -> None:
+    class Client:
+        closed = False
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = Client()
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-22",
+        account_client=client,
+        account_factory=lambda **_kwargs: pytest.fail(
+            "borrowed account opened another context"
+        ),
+    )
+
+    assert account.net_value == Decimal("100")
+    assert client.closed is False
+
+
 def test_futu_simulation_account_ignores_explicit_zero_quantity_rows() -> None:
     class Client:
         def account_snapshot(self) -> dict[str, object]:

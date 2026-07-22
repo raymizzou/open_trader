@@ -906,22 +906,26 @@ def load_futu_simulate_trend_account(
     simulate_acc_id: int,
     market: str,
     expected_date: str,
+    account_client: object | None = None,
     account_factory: Callable[..., object] = FutuSimulateOrderExecutionClient,
 ) -> AccountSnapshot:
     market = market.strip().upper()
     if market not in {"CN", "HK", "US"}:
         raise ValueError(f"unsupported trend review market: {market}")
-    client = account_factory(
-        host=host,
-        port=port,
-        simulate_acc_id=simulate_acc_id,
-        trd_market=market,
-    )
+    owns_client = account_client is None
+    client = account_client
+    if client is None:
+        client = account_factory(
+            host=host,
+            port=port,
+            simulate_acc_id=simulate_acc_id,
+            trd_market=market,
+        )
     try:
         snapshot = client.account_snapshot()
     finally:
         close = getattr(client, "close", None)
-        if callable(close):
+        if owns_client and callable(close):
             close()
     if not isinstance(snapshot, Mapping):
         raise ValueError("Futu simulation account snapshot must be an object")
