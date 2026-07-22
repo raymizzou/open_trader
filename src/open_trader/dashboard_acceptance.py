@@ -2416,6 +2416,12 @@ def _check_trend_controller_status(
     controller: object,
 ) -> None:
     assert isinstance(controller, Mapping), f"API 缺少 {broker} 趋势控制器状态"
+    baseline_controller = controller
+    controller = page.evaluate(
+        "broker => state.dashboard?.trend_controllers?.[broker] ?? null",
+        broker,
+    )
+    assert isinstance(controller, Mapping), f"页面缺少 {broker} 趋势控制器状态"
     card = workspace.locator(".trend-controller-status")
     assert card.count() == 1, f"{broker} 趋势报告缺少控制器状态卡"
     health = controller.get("health")
@@ -2441,7 +2447,11 @@ def _check_trend_controller_status(
         ("下次检查", "next_check_at"),
     ):
         assert label in text, f"{broker} 控制器状态卡缺少 {label}"
-        value = controller.get(key)
+        value = (
+            baseline_controller.get(key)
+            if key in {"heartbeat_at", "next_check_at"}
+            else controller.get(key)
+        )
         if key in {"heartbeat_at", "next_check_at"}:
             rendered = rendered_facts.get(label, "")
             if value in (None, ""):

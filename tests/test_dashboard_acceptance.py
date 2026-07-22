@@ -2516,7 +2516,9 @@ class TabbedAccountPage:
 
     def evaluate(
         self, expression: str, argument: object | None = None,
-    ) -> bool | list[int] | None:
+    ) -> bool | list[int] | Mapping[str, object] | None:
+        if expression == "broker => state.dashboard?.trend_controllers?.[broker] ?? null":
+            return self.controllers.get(str(argument))
         if "openResearchChat" in expression:
             self.script_evaluations.append((expression, argument))
             self.research_open = True
@@ -2680,6 +2682,21 @@ def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
     page.trend_broker = "tiger"
     page.controllers["tiger"]["heartbeat_at"] = "2026-07-21T09:31:05+08:00"
     page.controllers["tiger"]["next_check_at"] = "2026-07-21T09:31:10+08:00"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+def test_acceptance_uses_browser_snapshot_when_controller_phase_advances() -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["phase"] = "reconciling"
 
     dashboard_acceptance._check_trend_controller_status(
         page,
