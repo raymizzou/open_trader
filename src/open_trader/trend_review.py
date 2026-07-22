@@ -1605,10 +1605,12 @@ def load_trend_action_audit(
         status = event.get("status")
         if status == "missed" and facts:
             raise ValueError("invalid trend action event evidence")
-        if status not in {"filled", "partially_filled"} and not (
+        if status not in {"filled", "partially_filled", "submitted"} and not (
             status == "incomplete"
             and event.get("reason") == "position_zero_confirmed"
         ):
+            continue
+        if status == "submitted" and "observation_path" not in event:
             continue
         position_qty, broker_filled, broker_order_ids = _validate_broker_evidence(
             data_dir,
@@ -1649,7 +1651,7 @@ def load_trend_action_audit(
                 or target_qty > frozen_target
             ):
                 raise ValueError("invalid trend action event evidence")
-        elif position_qty != 0:
+        elif status == "incomplete" and position_qty != 0:
             raise ValueError("invalid trend action event evidence")
     if filled_terminal and any(
         event.get("status") == "missed" for event in events
@@ -1690,6 +1692,10 @@ def overheat_trim_progress(
     dealt_by_order: dict[str, Decimal] = {}
     below_lot = False
     source_paths: list[str] = []
+    submitted_order_ids: set[str] = set()
+    observed_order_statuses: dict[str, str] = {}
+    uncertain_action = False
+    abandoned_action = False
     for date_root in sorted(action_dates.glob("*")):
         if not date_root.is_dir():
             continue
@@ -1703,7 +1709,7 @@ def overheat_trim_progress(
             continue
         if not (ledger / "batches" / f"{execution_date}.json").is_file():
             continue
-        events, _ = load_trend_action_audit(
+        events, resolutions = load_trend_action_audit(
             data_dir,
             market=market,
             execution_date=execution_date,
@@ -1723,6 +1729,9 @@ def overheat_trim_progress(
         ):
             continue
         source_paths.append(str(action_root.relative_to(data_dir)))
+        abandoned_action = abandoned_action or any(
+            item.get("resolution") == "abandon" for item in resolutions
+        )
         facts = _action_facts(
             ledger / "open" / execution_date,
             futu_code=futu_code,
@@ -1746,6 +1755,17 @@ def overheat_trim_progress(
         if any(event.get("status") == "below_lot" for event in events):
             below_lot = True
         for event in events:
+            status = event.get("status")
+            order_ids = event.get("order_ids")
+            if status in {"submitted", "partially_filled"} and isinstance(
+                order_ids, list
+            ):
+                submitted_order_ids.update(
+                    str(order_id).strip()
+                    for order_id in order_ids
+                    if str(order_id).strip()
+                )
+            uncertain_action = uncertain_action or status == "uncertain"
             if event.get("status") not in {"filled", "partially_filled"}:
                 continue
             observation = event.get("observation_path")
@@ -1777,6 +1797,34 @@ def overheat_trim_progress(
                         order.get("dealt_qty", "0"), "broker dealt quantity"
                     ),
                 )
+        for event in events:
+            observation = event.get("observation_path")
+            if not isinstance(observation, str):
+                continue
+            observation_path = ledger / "open" / execution_date / observation
+            try:
+                payload = json.loads(observation_path.read_text(encoding="utf-8"))
+                orders = payload["orders"]
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+            ) as exc:
+                raise ValueError("invalid overheat trim lifecycle fact") from exc
+            if not isinstance(orders, list):
+                raise ValueError("invalid overheat trim lifecycle fact")
+            for order in orders:
+                if not isinstance(order, Mapping):
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                order_id = str(order.get("order_id") or "").strip()
+                broker_status = str(
+                    order.get("order_status") or order.get("status") or ""
+                ).strip().upper()
+                if not order_id:
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                observed_order_statuses[order_id] = broker_status or "AMBIGUOUS"
     if len(targets) > 1:
         raise ValueError("conflicting overheat trim lifecycle targets")
     target = next(iter(targets), Decimal("0"))
@@ -1790,11 +1838,29 @@ def overheat_trim_progress(
         if target and filled >= target
         else "pending"
     )
+    terminal_order_ids = {
+        order_id
+        for order_id, broker_status in observed_order_statuses.items()
+        if broker_status in TERMINAL_ORDER_STATUSES
+    }
+    active_order = any(
+        broker_status in ACTIVE_ORDER_STATUSES
+        for broker_status in observed_order_statuses.values()
+    )
+    ambiguous_order = any(
+        broker_status not in TERMINAL_ORDER_STATUSES | ACTIVE_ORDER_STATUSES
+        for broker_status in observed_order_statuses.values()
+    )
+    has_unresolved_order = active_order or ambiguous_order or (
+        not abandoned_action
+        and (uncertain_action or bool(submitted_order_ids - terminal_order_ids))
+    )
     return {
         "lifecycle_target_qty": format(target, "f"),
         "filled_qty": format(filled, "f"),
         "status": status,
         "source_paths": source_paths,
+        "has_unresolved_order": has_unresolved_order,
     }
 
 
@@ -1941,10 +2007,66 @@ def resolve_trend_action(
             if event.get("status") == "uncertain"
             and int(event.get("attempt") or 1) not in resolved_attempts
         }
-        attempt_no = max(unresolved_attempts, default=0)
+        partial_retry_attempt = 0
+        if resolution == "authorize-retry" and any(
+            payload.get("sell_goal") == "partial_30"
+            for _, payload, _, _ in facts
+        ):
+            events, _ = load_trend_action_audit(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                symbol=symbol,
+                side=side,
+            )
+            for event in events:
+                observation = event.get("observation_path")
+                if not isinstance(observation, str):
+                    continue
+                path = (
+                    data_dir
+                    / "trend_review"
+                    / "ledgers"
+                    / market
+                    / "open"
+                    / execution_date
+                    / observation
+                )
+                try:
+                    observed = json.loads(path.read_text(encoding="utf-8"))
+                    orders = observed["orders"]
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    TypeError,
+                ) as exc:
+                    raise ValueError("invalid trend action event evidence") from exc
+                if not isinstance(orders, list):
+                    raise ValueError("invalid trend action event evidence")
+                for order in orders:
+                    if not isinstance(order, Mapping):
+                        raise ValueError("invalid trend action event evidence")
+                    broker_status = str(
+                        order.get("order_status") or order.get("status") or ""
+                    ).strip().upper()
+                    if broker_status not in TERMINAL_ORDER_STATUSES:
+                        continue
+                    matching_attempts = [
+                        attempt
+                        for _, _, request, attempt in facts
+                        if _order_matches_request(order, request)
+                    ]
+                    if matching_attempts:
+                        partial_retry_attempt = max(
+                            partial_retry_attempt, *matching_attempts
+                        )
+        attempt_no = partial_retry_attempt or max(unresolved_attempts, default=0)
         if (
             not attempt_no
             or attempt_no != action_attempt
+            or attempt_no in resolved_attempts
             or any(
                 item.get("resolution") in {"confirm-submitted", "abandon"}
                 for item in resolutions
@@ -2359,6 +2481,9 @@ def execute_trend_review_open(
             lifecycle_filled = _required_decimal(
                 progress["filled_qty"], "lifecycle filled quantity"
             )
+            if not action_facts and progress["has_unresolved_order"]:
+                blocked_status = "unresolved"
+                continue
             if lifecycle_target > 0 or progress["source_paths"]:
                 partial_metadata = {
                     "sell_goal": "partial_30",
@@ -2890,7 +3015,11 @@ def execute_trend_review_open(
                             orders=matched,
                             recorded_at=now,
                         )
-                        if position_zero or filled > 0
+                        if (
+                            position_zero
+                            or filled > 0
+                            or action_name == "SELL_PARTIAL"
+                        )
                         else {}
                     )
                     _write_action_event(
@@ -2938,7 +3067,10 @@ def execute_trend_review_open(
                         )
                 if remaining <= 0:
                     continue
-                if action_name == "SELL_PARTIAL":
+                if (
+                    action_name == "SELL_PARTIAL"
+                    and latest_attempt not in authorized_attempts
+                ):
                     continue
                 if action_name == "BUY" and buy_window_event:
                     event_status, event_reason = buy_window_event
