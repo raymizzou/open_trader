@@ -1747,6 +1747,50 @@ def test_dashboard_projects_partial_sell_goal_and_manual_real_account_guidance(
     assert actual["frozen_action_label"] == "止盈减仓 30%"
     assert actual["manual_execution_guidance"] == "按实盘下单时持仓的 30% 向下取整"
     assert actual["actual_reference_quantity"] == ""
+    below_lot = dashboard_module._project_trend_actual_item(
+        {**partial, "estimated_shares": 0},
+        None,
+        nav_hkd=None,
+        market="US",
+        price_fx_to_hkd=None,
+        price_fx_note="",
+        risk_skip=False,
+    )
+    assert below_lot["simulation_quantity"] == "0"
+
+
+def test_dashboard_projects_only_strict_partial_sells_and_full_exit_wins() -> None:
+    valid_partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "SH.600001",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 300,
+        "lot_size": 100,
+        "overheat_signals": ["boiling"],
+    }
+    invalid_partial = {
+        **valid_partial,
+        "symbol": "600002",
+        "estimated_shares": 301,
+    }
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "formal_actions": [
+                valid_partial,
+                {"action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"},
+                invalid_partial,
+            ],
+            "holding_decisions": [],
+        },
+    }
+
+    sells, _, _, reviews = dashboard_module._project_trend_actions(payload, {})
+
+    assert [item["action"] for item in sells] == ["SELL_ALL"]
+    assert reviews == [invalid_partial]
 
 
 @pytest.mark.parametrize(

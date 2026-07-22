@@ -530,6 +530,73 @@ def test_acceptance_recognizes_only_strict_partial_sell_actions() -> None:
     assert dashboard_acceptance._trend_action_needs_review(
         {**partial, "overheat_signals": []}
     )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "estimated_shares": 301, "lot_size": 100}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": ["boiling", "boiling"]}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": [{"signal": "boiling"}]}
+    )
+
+
+def test_acceptance_suppresses_partial_when_same_symbol_has_full_exit(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "SH.600001",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 300,
+        "lot_size": 100,
+        "overheat_signals": ["boiling"],
+    }
+    full = {"action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"}
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [partial, full],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "available": True,
+        "broker": "eastmoney",
+        "market": "CN",
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "sell_actions": [full],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 1, "buy": 0, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": "2026-07-15.json",
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "eastmoney", projected
+    )
 
 
 def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:

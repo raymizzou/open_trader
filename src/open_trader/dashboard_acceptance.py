@@ -13,7 +13,11 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
-from .dashboard import _is_dashboard_holding, _read_csv_rows
+from .dashboard import (
+    _is_dashboard_holding,
+    _read_csv_rows,
+    _valid_partial_trend_action,
+)
 from .daily_premarket import _optional_positive_tm_id, _read_env_file
 from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
@@ -1716,36 +1720,11 @@ def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     if action == "BUY":
         return reason not in (None, "") and not known_reason
     if action == "SELL_PARTIAL":
-        return not _valid_partial_sell_action(item)
+        return not _valid_partial_trend_action(dict(item))
     return (
         action == "MANUAL_REVIEW"
         or action not in {"SELL_ALL", "SELL_PARTIAL", "HOLD", "MANUAL_REVIEW"}
         or action in {"SELL_ALL", "HOLD"} and not known_reason
-    )
-
-
-def _valid_partial_sell_action(item: Mapping[str, Any]) -> bool:
-    try:
-        target_fraction = Decimal(str(item.get("target_fraction")))
-        position_started_for = str(item.get("position_started_for") or "")
-        valid_position_date = datetime.strptime(
-            position_started_for, "%Y-%m-%d"
-        ).strftime("%Y-%m-%d") == position_started_for
-    except (InvalidOperation, TypeError, ValueError):
-        return False
-    return (
-        item.get("reason") == "overheat_take_profit"
-        and target_fraction == Decimal("0.30")
-        and valid_position_date
-        and isinstance(item.get("estimated_shares"), int)
-        and not isinstance(item.get("estimated_shares"), bool)
-        and item["estimated_shares"] >= 0
-        and isinstance(item.get("lot_size"), int)
-        and not isinstance(item.get("lot_size"), bool)
-        and item["lot_size"] > 0
-        and isinstance(item.get("overheat_signals"), list)
-        and bool(item["overheat_signals"])
-        and all(signal in {"boiling", "champagne"} for signal in item["overheat_signals"])
     )
 
 
@@ -1840,10 +1819,27 @@ def _check_trend_artifact_projection(
     assert isinstance(holdings, list) and all(
         isinstance(item, Mapping) for item in holdings
     ), f"{broker} 冻结报告持仓动作无效"
+    def canonical_sell_symbol(item: Mapping[str, Any]) -> str:
+        try:
+            return to_futu_symbol(expected_market, str(item.get("symbol") or ""))
+        except ValueError:
+            return ""
+
+    full_exit_symbols = {
+        symbol
+        for item in formal
+        if item.get("action") == "SELL_ALL"
+        and not _trend_action_needs_review(item)
+        if (symbol := canonical_sell_symbol(item))
+    }
     sells = [
         item for item in formal
         if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
         and not _trend_action_needs_review(item)
+        and not (
+            item.get("action") == "SELL_PARTIAL"
+            and canonical_sell_symbol(item) in full_exit_symbols
+        )
     ]
     buys = [
         item for item in formal

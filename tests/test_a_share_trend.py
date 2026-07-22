@@ -2800,7 +2800,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
             "今日动作：卖出 1｜买入 1｜持有 1｜复核 2",
             "",
             "卖出",
-            "1. AAPL 苹果｜右侧趋势已结束｜保护线 190",
+            "1. AAPL 苹果｜右侧趋势已结束｜全部卖出｜保护线 190",
             "",
             "买入",
             "1. CRWD CrowdStrike｜美股常规交易时段｜约 2 股｜金额上限 500｜保护线 198",
@@ -2844,6 +2844,7 @@ def test_partial_action_is_a_formal_trim_in_feishu_and_markdown() -> None:
     assert "沸腾/开香槟过热止盈｜止盈减仓 30%｜模拟预计数量 300 股" in message
     assert "今日无买卖动作" not in message
     assert "止盈减仓 30%" in markdown
+    assert "全部卖出 0｜止盈减仓 30% 1" in markdown
     assert "模拟预计数量 300 股" in markdown
     assert "无需卖出" not in markdown
 

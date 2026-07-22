@@ -2680,6 +2680,8 @@ def _append_feishu_action_sections(
                 ]
                 if warnings:
                     line += f"｜提示 {'、'.join(warnings)}"
+            elif item.get("action") == "SELL_ALL":
+                line += f"｜{_action_label('SELL_ALL')}"
             if item.get("active_line") not in {None, ""}:
                 line += f"｜保护线 {_feishu_money(item['active_line'])}"
             lines.append(line)
@@ -2868,6 +2870,8 @@ def render_markdown(report: TrendReport) -> str:
         for item in report.holdings
         if item.action in {"SELL_ALL", "SELL_PARTIAL"}
     ]
+    full_sells = [item for item in sells if item.action == "SELL_ALL"]
+    partial_sells = [item for item in sells if item.action == "SELL_PARTIAL"]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
     others = [item for item in report.holdings if item.action not in ACTION_LABELS]
@@ -2881,7 +2885,8 @@ def render_markdown(report: TrendReport) -> str:
         "## 操作摘要",
         "",
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
-        f"全部卖出 {len(sells)}｜允许买入 {len(report.buy_actions)}｜"
+        f"全部卖出 {len(full_sells)}｜止盈减仓 30% {len(partial_sells)}｜"
+        f"允许买入 {len(report.buy_actions)}｜"
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
     ]
     if report.strategy_snapshot.get("strategy_version") in {"v3", "v4"}:

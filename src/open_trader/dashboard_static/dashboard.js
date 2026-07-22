@@ -2566,6 +2566,7 @@ function renderCnTrendDisciplines() {
       <li>沸腾或开香槟：每个完整持仓生命周期首次出现时止盈减仓 30%</li>
       <li>两种信号合并为一次；模拟盘按下单时持仓向下取整为整手</li>
       <li>剩余仓位继续受活动保护线和强制清仓条件约束</li>
+      <li>Trend Animals API 未提供波动率放大字段；本地不推断</li>
     </ol></details>
   </section>`;
 }
@@ -2748,6 +2749,7 @@ function renderOptionAttentionTransition(transition) {
 function optionAttentionAction(action) {
   if (action === "BUY") return "允许买入";
   if (action === "SELL_ALL") return "卖出复核";
+  if (action === "SELL_PARTIAL") return "止盈减仓 30%";
   if (action === "HOLD") return "继续持有";
   return "观察";
 }
