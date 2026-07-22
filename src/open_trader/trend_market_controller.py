@@ -56,6 +56,8 @@ from .trend_review import (
     execute_trend_review_stop,
     load_trend_action_audit,
     lock_trend_execution_batch,
+    overheat_trim_progress,
+    _preflight_open_actions,
     record_trend_review_missed_buys,
 )
 
@@ -452,10 +454,14 @@ def _valid_report(
         )
     ):
         return False
+    try:
+        _preflight_open_actions(payload, market)
+    except ValueError:
+        return False
     for action in actions:
         if (
             not isinstance(action, dict)
-            or action.get("action") not in {"BUY", "SELL_ALL"}
+            or action.get("action") not in {"BUY", "SELL_ALL", "SELL_PARTIAL"}
             or not str(action.get("symbol") or "").strip()
         ):
             return False
@@ -700,10 +706,10 @@ def _run_stop(
     event: Mapping[str, object],
     *,
     quote_client: object | None = None,
-) -> None:
+) -> dict[str, object]:
     client = _new_order_client(config, market, quote_client)
     try:
-        execute_trend_review_stop(
+        result = execute_trend_review_stop(
             data_dir=config.data_dir,
             market=market,
             symbol=str(event.get("symbol") or ""),
@@ -714,6 +720,21 @@ def _run_stop(
         )
     finally:
         client.close()
+    if result.get("status") == "uncertain":
+        _notify_once(
+            f"{market} 保护卖出待人工确认",
+            "保护触发已记录，但先前卖出订单状态不确定；请立即核对 Futu 持仓和订单。",
+            (
+                config,
+                market,
+                str(event.get("trading_date") or ""),
+                "protection_sell",
+                "uncertain",
+                str(event.get("occurred_at") or ""),
+            ),
+            channels={"feishu", "feishu_app"},
+        )
+    return result
 
 
 def _run_protection_pass(
@@ -866,7 +887,7 @@ def _execute_locked_report(
     sell_symbols = {
         str(action.get("symbol") or "").strip()
         for action in actions
-        if action.get("action") == "SELL_ALL"
+        if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     eligible_buys = sum(
         action.get("action") == "BUY"
@@ -996,7 +1017,13 @@ def _load_report_for_as_of(
     return None
 
 
-def _notify_once(title: str, message: str, key: object) -> bool:
+def _notify_once(
+    title: str,
+    message: str,
+    key: object,
+    *,
+    channels: set[str] | None = None,
+) -> bool:
     if not (
         isinstance(key, tuple)
         and len(key) == 6
@@ -1019,7 +1046,7 @@ def _notify_once(title: str, message: str, key: object) -> bool:
         return True
     try:
         attempts = send_notification_with_results(
-            build_notifier(config), title, message
+            build_notifier(config), title, message, channels=channels
         )
     except Exception:
         return False
@@ -1568,7 +1595,7 @@ def _execution_completed(
     sell_symbols = {
         str(action.get("symbol") or "").strip()
         for action in actions
-        if action.get("action") == "SELL_ALL"
+        if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     for action in actions:
         action_name = str(action.get("action") or "")
@@ -1591,10 +1618,54 @@ def _execution_completed(
             item.get("status") in {"filled", "missed"} for item in events
         ):
             continue
+        if action_name == "SELL_PARTIAL":
+            if any(
+                item.get("sell_goal") == "partial_30"
+                and item.get("status") == "below_lot"
+                for item in events
+            ):
+                continue
+            for item in events:
+                if (
+                    item.get("sell_goal") != "partial_30"
+                    or item.get("status") not in {"filled", "partially_filled"}
+                ):
+                    continue
+                try:
+                    filled = Decimal(str(item.get("filled_qty")))
+                    target = Decimal(str(item.get("lifecycle_target_qty")))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if (
+                    filled.is_finite()
+                    and target.is_finite()
+                    and target > 0
+                ):
+                    continue
+                return False
+            progress = overheat_trim_progress(
+                config.data_dir,
+                market=cycle.market,
+                symbol=symbol,
+                position_started_for=str(action.get("position_started_for") or ""),
+            )
+            try:
+                filled = Decimal(str(progress["filled_qty"]))
+                target = Decimal(str(progress["lifecycle_target_qty"]))
+            except (InvalidOperation, KeyError, TypeError, ValueError):
+                return False
+            if not (
+                filled.is_finite()
+                and target.is_finite()
+                and target > 0
+                and filled >= target
+            ):
+                return False
+            continue
         if action_name == "SELL_ALL" and any(
-            item.get("status") == "filled"
-            or item.get("status") == "incomplete"
+            item.get("status") in {"filled", "incomplete"}
             and item.get("reason") == "position_zero_confirmed"
+            and item.get("sell_goal") in {None, "position_zero"}
             for item in events
         ):
             continue

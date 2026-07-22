@@ -613,6 +613,22 @@ def partial_sell_report(
     ])
 
 
+def lock_partial_report(tmp_path: Path, execution_date: str) -> dict[str, object]:
+    report = partial_sell_report()
+    report_path = tmp_path / f"reports/{execution_date}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date=execution_date,
+        report_path=report_path,
+        report=report,
+        locked_at=f"{execution_date}T09:30:00+08:00",
+    )
+    return report
+
+
 def test_partial_action_validation() -> None:
     valid = partial_sell_report()
     assert trend_review._preflight_open_actions(valid, "CN")[0] == [
@@ -688,7 +704,48 @@ def test_legacy_sell_all_immutable_facts_remain_compatible(tmp_path: Path) -> No
     )
 
     assert events[-1]["status"] == "submitted"
-    assert "sell_goal" not in events[-1]
+    assert events[-1]["sell_goal"] == "position_zero"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sell_goal", "position_zero"),
+        ("lifecycle_target_qty", "300.5"),
+        ("lifecycle_target_qty", "250"),
+    ],
+)
+def test_partial_audit_rejects_tampered_goal_metadata(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    intent_path = next(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-17/*-intent.json"
+    ))
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    intent[field] = value
+    intent_path.write_text(json.dumps(intent), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid trend action fact"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="sell",
+        )
 
 
 @pytest.mark.parametrize(
@@ -924,6 +981,77 @@ def test_partial_abandon_leaves_the_lifecycle_pending_for_a_later_report(
 
     assert progress | {"status": "pending", "filled_qty": "0"} == progress
     assert client.requests[-1]["qty"] == "300"
+
+
+def test_partial_abandon_does_not_consume_a_reconciled_fill(tmp_path: Path) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    request = dict(client.requests[0])
+    client.orders.clear()
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:32:00+08:00",
+        quote_prices={},
+    )
+    client.orders = [{
+        **request,
+        "order_id": "SIM-1",
+        "code": "SH.600001",
+        "trd_side": "SELL",
+        "dealt_qty": "300",
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    }]
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:33:00+08:00",
+        quote_prices={},
+    )
+    trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        symbol="600001",
+        side="sell",
+        resolution="abandon",
+        actor="ray",
+        reason="manual reconciliation supersedes the partial attempt",
+        resolved_at="2026-07-17T09:34:00+08:00",
+    )
+
+    progress = trend_review.overheat_trim_progress(
+        tmp_path,
+        market="CN",
+        symbol="600001",
+        position_started_for="2026-07-01",
+    )
+
+    assert progress == {
+        "lifecycle_target_qty": "0",
+        "filled_qty": "0",
+        "status": "pending",
+        "source_paths": [],
+        "has_unresolved_order": False,
+    }
 
 
 @pytest.mark.parametrize("order_status", ["FILLED_PART", ""])
@@ -3202,6 +3330,35 @@ def test_formal_sell_all_suppresses_conflicting_buy(tmp_path: Path) -> None:
     assert [request["side"] for request in client.requests] == ["sell"]
 
 
+def test_formal_partial_sell_suppresses_conflicting_buy(tmp_path: Path) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report_with_actions([
+            {
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "lot_size": 100,
+                "estimated_shares": 200,
+                "atr": "0.5",
+            },
+            partial_sell_report()["strategy_judgments"]["formal_actions"][0],
+        ]),
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 1
+    assert [request["side"] for request in client.requests] == ["sell"]
+
+
 def test_open_submits_all_sells_before_frozen_buys_regardless_of_report_order(
     tmp_path: Path,
 ) -> None:
@@ -4700,6 +4857,390 @@ def test_stop_sells_full_simulate_position_once(tmp_path: Path) -> None:
     assert repeated["submitted_count"] == 0
 
 
+def test_protection_upgrade_does_not_overlap_a_prior_partial_order(
+    tmp_path: Path,
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+
+    result = trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    ]
+
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 1
+    assert any(
+        event.get("status") == "reason_added"
+        and event.get("reason_id") == "protection-1"
+        and event.get("sell_goal") == "position_zero"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("dealt_qty", "order_status", "live_qty"),
+    [
+        ("0", "CANCELLED_ALL", "1000"),
+        ("300", "FILLED_ALL", "700"),
+    ],
+)
+def test_protection_upgrade_uses_live_remainder_after_terminal_partial_order(
+    tmp_path: Path,
+    dealt_qty: str,
+    order_status: str,
+    live_qty: str,
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    client.orders[0].update(
+        {"dealt_qty": dealt_qty, "order_status": order_status}
+    )
+    client.positions = [{"code": "SH.600001", "qty": live_qty}]
+
+    result = trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[-1]["qty"] == live_qty
+    assert client.requests[-1]["remark"] == trend_review.trend_attempt_remark(
+        "CN",
+        "2026-07-17",
+        trend_review.trend_action_key(
+            "CN", "2026-07-17", "SH.600001", "sell"
+        ),
+        2,
+    )
+
+
+def test_protection_upgrade_ignores_a_prior_position_lifecycle(
+    tmp_path: Path,
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    client.orders[0].update({"dealt_qty": "300", "order_status": "FILLED_ALL"})
+    write_protection_state(
+        tmp_path / "trend_a_share/protection_state.json",
+        {
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "position_started_for": "2026-07-18",
+                    "updated_for": "2026-07-18",
+                }
+            },
+        },
+    )
+
+    trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+
+    assert client.requests[-1]["remark"] == trend_review.trend_attempt_remark(
+        "CN",
+        "2026-07-18",
+        trend_review.trend_action_key(
+            "CN", "2026-07-18", "SH.600001", "sell"
+        ),
+        1,
+    )
+
+
+def test_protection_upgrade_uses_the_latest_partial_lifecycle_action(
+    tmp_path: Path,
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    lock_partial_report(tmp_path, "2026-07-18")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    client.orders[0].update(
+        {"dealt_qty": "100", "order_status": "CANCELLED_PART"}
+    )
+    client.positions = [{"code": "SH.600001", "qty": "900"}]
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:32:00+08:00",
+        quote_prices={},
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-18",
+        now="2026-07-18T09:31:00+08:00",
+        quote_prices={},
+    )
+
+    result = trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+
+    assert result["status"] == "submitted"
+    assert len(client.requests) == 2
+    assert client.requests[-1]["remark"] == trend_review.trend_attempt_remark(
+        "CN",
+        "2026-07-18",
+        trend_review.trend_action_key(
+            "CN", "2026-07-18", "SH.600001", "sell"
+        ),
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("old_order_status", "expected_status"),
+    [("SUBMITTED", "submitted"), ("UNKNOWN", "uncertain")],
+)
+def test_protection_upgrade_checks_earlier_partial_order_history(
+    tmp_path: Path, old_order_status: str, expected_status: str
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    lock_partial_report(tmp_path, "2026-07-18")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    first_order = dict(client.orders[0])
+    client.orders[0].update({"order_status": "CANCELLED_ALL"})
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:32:00+08:00",
+        quote_prices={},
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-18",
+        now="2026-07-18T09:31:00+08:00",
+        quote_prices={},
+    )
+    client.orders = [
+        {**first_order, "order_status": old_order_status},
+        {**client.orders[-1], "order_status": "CANCELLED_ALL"},
+    ]
+
+    result = trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+
+    assert result["status"] == expected_status
+    assert result["submitted_count"] == 0
+    assert len(client.requests) == 2
+    assert client.list_order_calls[-1]["start"] == "2026-07-17"
+
+
+def test_protection_upgrade_waits_for_uncertain_partial_then_sells_live_remainder(
+    tmp_path: Path,
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "quote_prices": {},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    client.orders.clear()
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:32:00+08:00"
+    )
+
+    blocked = trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+
+    assert blocked["status"] == "uncertain"
+    assert len(client.requests) == 1
+    authorize_retry(
+        tmp_path,
+        execution_date="2026-07-17",
+        side="sell",
+        resolved_at="2026-07-18T10:16:00+08:00",
+    )
+    resolved = trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:17:00+08:00",
+    )
+
+    assert resolved["submitted_count"] == 1
+    assert client.requests[-1]["qty"] == "1000"
+
+
+def test_position_zero_upgrade_audits_only_the_full_exit_attempt(
+    tmp_path: Path,
+) -> None:
+    report = lock_partial_report(tmp_path, "2026-07-17")
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    client.orders[0].update({"dealt_qty": "300", "order_status": "FILLED_ALL"})
+    client.positions = [{"code": "SH.600001", "qty": "700"}]
+    trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:15:00+08:00",
+    )
+    client.orders[-1].update({"dealt_qty": "700", "order_status": "FILLED_ALL"})
+    client.positions = []
+    trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-18",
+        event_id="protection-1",
+        client=client,
+        now="2026-07-18T10:16:00+08:00",
+    )
+    events, _ = trend_review.load_trend_action_audit(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        symbol="600001",
+        side="sell",
+    )
+    terminal = next(
+        event
+        for event in events
+        if event.get("reason") == "position_zero_confirmed"
+    )
+
+    assert terminal | {
+        "sell_goal": "position_zero",
+        "filled_qty": "700",
+        "target_qty": "700",
+        "order_ids": ["SIM-2"],
+    } == terminal
+
+
 def test_stop_retries_intent_when_failed_order_is_absent_at_broker(
     tmp_path: Path,
 ) -> None:
@@ -5144,7 +5685,9 @@ def test_sell_recovery_never_overlaps_inconclusive_broker_state(
 
     assert result["submitted_count"] == 0
     assert len(client.requests) == 1
-    if broker_fact != "active":
+    if broker_fact == "active":
+        assert result["status"] == "submitted"
+    else:
         assert any(event.get("status") == "uncertain" for event in events)
 
 

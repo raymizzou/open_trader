@@ -2758,6 +2758,7 @@ def render_trend_feishu_text(
         for item in holdings
         if item.get("action") == "SELL_PARTIAL"
         and not _trend_action_needs_review(item)
+        and item not in sells
     )
     buys = [
         item
@@ -3202,7 +3203,7 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     formal_actions = [
         _json_value(asdict(item))
         for item in report.holdings
-        if item.action == "SELL_ALL"
+        if item.action in {"SELL_ALL", "SELL_PARTIAL"}
     ]
     for item in report.buy_actions:
         action = _json_value(asdict(item))

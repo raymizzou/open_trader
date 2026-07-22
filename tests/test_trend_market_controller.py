@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -759,6 +760,221 @@ def write_report(
     return path, report
 
 
+def partial_sell_action(symbol: str = "600001") -> dict[str, object]:
+    return {
+        "action": "SELL_PARTIAL",
+        "symbol": symbol,
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "lot_size": 100,
+        "estimated_shares": 300,
+        "position_started_for": "2026-07-01",
+        "overheat_signals": ["boiling"],
+    }
+
+
+def test_valid_report_accepts_only_strict_partial_sell_actions(tmp_path: Path) -> None:
+    config = controller_config(tmp_path)
+    path, report = write_report(config)
+    actions = report["strategy_judgments"]["formal_actions"]  # type: ignore[index]
+    actions.append(partial_sell_action())
+
+    assert controller._valid_report(config, "CN", "2026-07-20", path, report)
+
+    for key, value in (
+        ("target_fraction", "0.29"),
+        ("lot_size", "100.0"),
+        ("estimated_shares", 250),
+        ("position_started_for", "2026-7-01"),
+        ("overheat_signals", ["unknown"]),
+    ):
+        invalid = json.loads(json.dumps(report))
+        invalid["strategy_judgments"]["formal_actions"][-1][key] = value
+        assert not controller._valid_report(
+            config, "CN", "2026-07-20", path, invalid
+        )
+    conflicting = json.loads(json.dumps(report))
+    conflicting["strategy_judgments"]["formal_actions"].append({
+        "action": "SELL_ALL", "symbol": "600001"
+    })
+    assert not controller._valid_report(
+        config, "CN", "2026-07-20", path, conflicting
+    )
+
+
+def test_execution_completion_distinguishes_partial_and_full_sell_goals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cycle = active_cn_cycle()
+    config = controller_config(tmp_path)
+    report_path, report = write_report(config)
+    report["strategy_judgments"]["formal_actions"].append(partial_sell_action())  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=report_path,
+        report=report,
+        locked_at=NOW.isoformat(),
+    )
+    events: list[dict[str, object]] = []
+    resolutions: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "load_trend_action_audit",
+        lambda *_args, **_kwargs: (events, resolutions),
+    )
+    progress = {
+        "status": "complete",
+        "filled_qty": "300",
+        "lifecycle_target_qty": "300",
+    }
+    monkeypatch.setattr(
+        controller,
+        "overheat_trim_progress",
+        lambda *_args, **_kwargs: progress,
+        raising=False,
+    )
+
+    events[:] = [{"status": "below_lot", "sell_goal": "partial_30"}]
+    assert controller._execution_completed(config, cycle)
+    events[:] = [{
+        "status": "filled",
+        "sell_goal": "partial_30",
+        "filled_qty": "200",
+        "lifecycle_target_qty": "300",
+    }]
+    assert controller._execution_completed(config, cycle)
+    events[:] = [{
+        "status": "filled",
+        "sell_goal": "partial_30",
+        "filled_qty": "not-a-number",
+        "lifecycle_target_qty": "300",
+    }]
+    assert not controller._execution_completed(config, cycle)
+    events.clear()
+    resolutions[:] = [{"resolution": "abandon"}]
+    assert controller._execution_completed(config, cycle)
+
+    full_config = controller_config(tmp_path / "full")
+    full_path, full_report = write_report(full_config)
+    full_report["strategy_judgments"]["formal_actions"].append({  # type: ignore[index]
+        "action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"
+    })
+    full_path.write_text(json.dumps(full_report), encoding="utf-8")
+    lock_trend_execution_batch(
+        full_config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=full_path,
+        report=full_report,
+        locked_at=NOW.isoformat(),
+    )
+    resolutions.clear()
+    events[:] = [{
+        "status": "filled",
+        "sell_goal": "partial_30",
+        "filled_qty": "300",
+        "lifecycle_target_qty": "300",
+    }]
+    assert not controller._execution_completed(full_config, cycle)
+    events[:] = [{
+        "status": "incomplete",
+        "reason": "position_zero_confirmed",
+        "sell_goal": "position_zero",
+    }]
+    assert controller._execution_completed(full_config, cycle)
+
+
+def test_controller_executes_partial_and_full_sells_before_buys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report_path, report = write_report(config)
+    report["strategy_judgments"]["formal_actions"] = [  # type: ignore[index]
+        {
+            "action": "BUY",
+            "symbol": "600003",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 200,
+            "target_amount": "2000",
+            "atr": "0.5",
+        },
+        partial_sell_action("600001"),
+        {"action": "SELL_ALL", "symbol": "600002", "reason": "danger_signal"},
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    class Orders:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [
+                    {"code": "SH.600001", "qty": "1000"},
+                    {"code": "SH.600002", "qty": "300"},
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": str(request["side"]).upper(),
+                "dealt_qty": "0",
+                "order_status": "SUBMITTED",
+            })
+            return {"futu_order_id": order_id}
+
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: object) -> dict[str, object]:
+            return {
+                str(symbol): SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols  # type: ignore[union-attr]
+            }
+
+    orders = Orders()
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args: orders)
+
+    result = controller._execute_locked_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_path,
+        report,
+        quote_client=Quote(),
+    )
+
+    assert result["submitted_count"] == 3
+    assert [request["side"] for request in orders.requests] == ["sell", "sell", "buy"]
+    assert {request["futu_code"] for request in orders.requests[:2]} == {
+        "SH.600001", "SH.600002"
+    }
+
+
 def write_report_delivery_receipt(
     config: DailyPremarketConfig,
     report_path: Path,
@@ -1079,7 +1295,7 @@ def test_close_review_failure_is_nonblocking_progress(
     write_report(config)
     monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
     reason = "无权限获取SH.000985的行情，请检查A股市场指数行情权限"
-    notifications: list[tuple[str, str, object]] = []
+    notifications: list[tuple[str, str, object, object]] = []
     monkeypatch.setattr(
         controller,
         "_capture_close",
@@ -3933,6 +4149,48 @@ def test_run_protection_pass_returns_watcher_result(
     )
 
     assert controller._run_protection_pass(config, "CN", "2026-07-20") is expected
+
+
+def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    expected = {"status": "uncertain", "submitted_count": 0}
+    notifications: list[tuple[str, str, object, object]] = []
+
+    class Orders:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    orders = Orders()
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args: orders)
+    monkeypatch.setattr(
+        controller, "execute_trend_review_stop", lambda **_kwargs: expected
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_once",
+        lambda title, message, key, **kwargs: notifications.append(
+            (title, message, key, kwargs.get("channels"))
+        ) or True,
+    )
+
+    assert controller._run_stop(
+        config,
+        "CN",
+        {
+            "symbol": "600001",
+            "trading_date": "2026-07-20",
+            "event_id": "protection-1",
+            "occurred_at": NOW.isoformat(),
+        },
+    ) is expected
+    assert orders.closed is True
+    assert len(notifications) == 1
+    assert notifications[0][2][3:5] == ("protection_sell", "uncertain")
+    assert notifications[0][3] == {"feishu", "feishu_app"}
 
 
 def test_default_protection_loader_gates_each_new_account_context(
