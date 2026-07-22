@@ -118,3 +118,21 @@ def test_order_alert_replaces_unsafe_quantity() -> None:
     assert "- HIG｜目标 数量无效" in message
     assert "/Users/" not in message
     assert "Traceback" not in message
+
+
+def test_protection_alert_normalizes_symbol_and_hides_unsafe_title_detail() -> None:
+    title, _ = render_protection_alert(
+        "老虎", "美股", "b1", last_price="133.90", active_line="134.1650"
+    )
+    unsafe_title, _ = render_protection_alert(
+        "老虎",
+        "美股",
+        "HIG Traceback: /Users/ray/secret",
+        last_price="133.90",
+        active_line="134.1650",
+    )
+
+    assert unsafe_title == "【紧急｜老虎｜美股保护线触发｜未知标的】"
+    assert "/Users/" not in unsafe_title
+    assert "Traceback" not in unsafe_title
+    assert title == "【紧急｜老虎｜美股保护线触发｜B1】"

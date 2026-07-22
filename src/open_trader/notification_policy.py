@@ -166,8 +166,9 @@ def render_protection_alert(
     last_price: object,
     active_line: object,
 ) -> tuple[str, str]:
+    normalized_symbol = _symbol(symbol) or "未知标的"
     return (
-        f"【紧急｜{broker_label}｜{market_label}保护线触发｜{symbol}】",
+        f"【紧急｜{broker_label}｜{market_label}保护线触发｜{normalized_symbol}】",
         f"最新价：{_numeric_detail(last_price)}\n"
         f"活动保护线：{_numeric_detail(active_line)}\n现在做：人工确认并全部卖出",
     )
