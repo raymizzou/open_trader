@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
+from .daily_premarket import send_notification_with_results
 from .notifications import Notifier, NullNotifier
 from .t_signal import (
     TMarketFacts,
@@ -212,9 +213,16 @@ def _apply_notification_state(
     if getattr(notifier, "records_delivery", True) is False:
         return signal, False
 
-    try:
-        notifier.notify(_notification_title(signal), _notification_message(signal))
-    except Exception as exc:
+    attempts = send_notification_with_results(
+        notifier,
+        _notification_title(signal),
+        _notification_message(signal),
+        channels={"macos", "xiaoai"},
+    )
+    failures = [
+        attempt for attempt in attempts if not attempt.success and not attempt.suppressed
+    ]
+    if failures:
         return _append_notification_event(
             signal,
             event_type="notification_failed",
@@ -226,7 +234,19 @@ def _apply_notification_state(
             last_attempted_dedupe_key=signal.notification.dedupe_key,
             event_at=notified_at,
             status="review",
-            error=f"notification failed: {exc}",
+            error=f"notification failed: {failures[0].error or failures[0].error_type}",
+        ), False
+    if not attempts:
+        return _append_notification_event(
+            signal,
+            event_type="notification_suppressed",
+            message_zh=f"{signal.action} 通知因飞书策略未发送，信号已保留在 UI 中。",
+            notified=False,
+            should_notify=False,
+            last_notified_at=_previous_last_notified_at(previous),
+            last_notified_dedupe_key=_previous_last_notified_dedupe_key(previous),
+            last_attempted_dedupe_key=signal.notification.dedupe_key,
+            event_at=notified_at,
         ), False
     return _append_notification_event(
         signal,
