@@ -809,6 +809,15 @@ def test_execution_completion_distinguishes_partial_and_full_sell_goals(
     config = controller_config(tmp_path)
     report_path, report = write_report(config)
     report["strategy_judgments"]["formal_actions"].append(partial_sell_action())  # type: ignore[index]
+    report["strategy_judgments"]["formal_actions"].append({  # type: ignore[index]
+        "action": "BUY",
+        "symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 200,
+        "target_amount": "2000",
+        "atr": "0.5",
+    })
     report_path.write_text(json.dumps(report), encoding="utf-8")
     lock_trend_execution_batch(
         config.data_dir,
@@ -895,6 +904,15 @@ def test_controller_executes_partial_and_full_sells_before_buys(
     report["strategy_judgments"]["formal_actions"] = [  # type: ignore[index]
         {
             "action": "BUY",
+            "symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 200,
+            "target_amount": "2000",
+            "atr": "0.5",
+        },
+        {
+            "action": "BUY",
             "symbol": "600003",
             "target_weight": "0.04",
             "lot_size": 100,
@@ -973,6 +991,7 @@ def test_controller_executes_partial_and_full_sells_before_buys(
     assert {request["futu_code"] for request in orders.requests[:2]} == {
         "SH.600001", "SH.600002"
     }
+    assert orders.requests[-1]["futu_code"] == "SH.600003"
 
 
 def write_report_delivery_receipt(

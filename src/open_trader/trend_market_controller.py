@@ -885,13 +885,14 @@ def _execute_locked_report(
         now=now,
     )
     sell_symbols = {
-        str(action.get("symbol") or "").strip()
+        to_futu_symbol(market, str(action.get("symbol") or ""))
         for action in actions
         if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     eligible_buys = sum(
         action.get("action") == "BUY"
-        and str(action.get("symbol") or "").strip() not in sell_symbols
+        and to_futu_symbol(market, str(action.get("symbol") or ""))
+        not in sell_symbols
         for action in actions
     )
     if missed == eligible_buys == len(actions):
@@ -906,7 +907,12 @@ def _execute_locked_report(
         {
             to_futu_symbol(market, str(action["symbol"]))
             for action in actions
-            if allow_new_buys and action["action"] == "BUY"
+            if (
+                allow_new_buys
+                and action["action"] == "BUY"
+                and to_futu_symbol(market, str(action["symbol"]))
+                not in sell_symbols
+            )
         }
     )
     quote = quote_client
@@ -1593,14 +1599,17 @@ def _execution_completed(
         return True
 
     sell_symbols = {
-        str(action.get("symbol") or "").strip()
+        to_futu_symbol(cycle.market, str(action.get("symbol") or ""))
         for action in actions
         if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     for action in actions:
         action_name = str(action.get("action") or "")
         symbol = str(action.get("symbol") or "").strip()
-        if action_name == "BUY" and symbol in sell_symbols:
+        if (
+            action_name == "BUY"
+            and to_futu_symbol(cycle.market, symbol) in sell_symbols
+        ):
             continue
         events, resolutions = load_trend_action_audit(
             config.data_dir,

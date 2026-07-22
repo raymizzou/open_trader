@@ -954,19 +954,22 @@ def record_trend_review_missed_buys(
         and current.time().replace(tzinfo=None) <= window_end
     ):
         return 0
+    from .futu_symbols import to_futu_symbol
+
     report_sha = _report_hash(report)
     sell_symbols = {
-        str(action.get("symbol") or "").strip()
+        to_futu_symbol(market, str(action.get("symbol") or ""))
         for action in actions
         if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     completed = 0
     for index, action in enumerate(actions):
         symbol = str(action.get("symbol") or "").strip()
-        if action.get("action") != "BUY" or symbol in sell_symbols:
+        if (
+            action.get("action") != "BUY"
+            or to_futu_symbol(market, symbol) in sell_symbols
+        ):
             continue
-        from .futu_symbols import to_futu_symbol
-
         futu_code = to_futu_symbol(market, symbol)
         action_key = trend_action_key(
             market, execution_date, futu_code, "buy"
@@ -2510,7 +2513,7 @@ def execute_trend_review_open(
     artifacts: list[str] = []
     blocked_status: str | None = None
     sell_symbols = {
-        str(action.get("symbol") or "").strip()
+        to_futu_symbol(market, str(action.get("symbol") or ""))
         for action in actions
         if (
             isinstance(action, Mapping)
@@ -2616,8 +2619,13 @@ def execute_trend_review_open(
             for item in resolutions
             if item.get("resolution") == "authorize-retry"
         }
+        partial_abandoned = action_name == "SELL_ALL" and any(
+            item.get("resolution") == "abandon" for item in resolutions
+        ) and any(
+            item[1].get("sell_goal") == "partial_30" for item in action_facts
+        )
         buy_window_event = None
-        if action_name == "BUY" and symbol not in sell_symbols:
+        if action_name == "BUY" and futu_code not in sell_symbols:
             if same_day and local_time < datetime.strptime("09:30", "%H:%M").time():
                 buy_window_event = ("pending", "buy_window_not_open")
             elif local_current.date() > execution_day or not buy_window_open:
@@ -2645,7 +2653,11 @@ def execute_trend_review_open(
                     recorded_at=now,
                 )
         if any(
-            item.get("resolution") in {"confirm-submitted", "abandon"}
+            item.get("resolution") == "confirm-submitted"
+            or (
+                item.get("resolution") == "abandon"
+                and not partial_abandoned
+            )
             for item in resolutions
         ):
             continue
@@ -2797,7 +2809,7 @@ def execute_trend_review_open(
             and not (local_current.date() > execution_day and bool(action_facts))
         ):
             continue
-        if action_name == "BUY" and symbol in sell_symbols:
+        if action_name == "BUY" and futu_code in sell_symbols:
             continue
         if action_name == "BUY" and not action_facts and buy_window_event:
             event_status, event_reason = buy_window_event
@@ -2837,6 +2849,10 @@ def execute_trend_review_open(
                     for item in action_facts
                     if not _result_path(item[0]).exists()
                     and item[3] not in authorized_attempts
+                    and (
+                        not partial_abandoned
+                        or item[1].get("sell_goal") != "partial_30"
+                    )
                 ),
                 None,
             )
@@ -3052,6 +3068,11 @@ def execute_trend_review_open(
                     for _, _, intent_request, attempt_no in action_facts
                     if attempt_no == latest_attempt
                 ]
+                latest_is_abandoned_partial = partial_abandoned and all(
+                    payload.get("sell_goal") == "partial_30"
+                    for _, payload, _, attempt_no in action_facts
+                    if attempt_no == latest_attempt
+                )
                 latest_matched = [
                     order
                     for order in orders
@@ -3074,6 +3095,7 @@ def execute_trend_review_open(
                     if not latest_matched
                     and not position_zero
                     and latest_attempt not in authorized_attempts
+                    and not latest_is_abandoned_partial
                     else None
                 )
                 if inconclusive_reason is not None:
