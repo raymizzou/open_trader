@@ -2195,6 +2195,68 @@ function renderTrendTradeStats(stats) {
       ${row(actualLabel, stats.actual)}`;
 }
 
+function trendSimulationActions(report) {
+  const ordered = ["sell_actions", "buy_actions", "hold_actions", "review_actions", "risk_skips"]
+    .flatMap((key) => Array.isArray(report?.[key]) ? report[key] : []);
+  const seen = new Set();
+  return ordered.filter((item) => {
+    const symbol = String(item?.symbol || "").trim().toUpperCase();
+    if (!symbol || seen.has(symbol)) return false;
+    seen.add(symbol);
+    return true;
+  });
+}
+
+function trendSimulationDeviation(action, quantity) {
+  if (action.action === "BUY" && !action.execution) return ["pending", "待执行"];
+  if (action.action === "HOLD") return quantity > 0 ? ["followed", "一致"] : ["not_held", "未持有"];
+  if (action.action === "SELL_ALL") return quantity === 0 ? ["followed", "一致"] : ["missed_sell", "待卖出"];
+  return ["review", "待核对"];
+}
+
+function renderTrendSimulationOverlay(report, payload) {
+  const summary = '<summary>模拟盘执行状态 · 富途</summary>';
+  if (!payload || payload.loading) {
+    return `<details class="trend-simulation-overlay" open>${summary}<p>模拟盘持仓加载中</p></details>`;
+  }
+  if (payload.available !== true) {
+    return `<details class="trend-simulation-overlay" open>${summary}<p>${escapeHtml(formatPlain(payload.error || "模拟盘持仓不可用"))}</p></details>`;
+  }
+  const positions = Array.isArray(payload.positions) ? payload.positions : [];
+  const positionsBySymbol = new Map(positions.map((position) => [
+    String(position?.symbol || "").trim().toUpperCase(), position,
+  ]).filter(([symbol]) => symbol));
+  const actions = trendSimulationActions(report);
+  const reportSymbols = new Set(actions.map((action) => String(action.symbol).trim().toUpperCase()));
+  const renderRow = (action, position, external = false) => {
+    const symbol = String(action?.symbol || position?.symbol || "").trim().toUpperCase();
+    const quantity = numericValue(position?.quantity) ?? 0;
+    const [deviation, label] = external
+      ? ["outside_report_addition", "报告外持仓"]
+      : trendSimulationDeviation(action, quantity);
+    const reportQuantity = firstPresent(action?.estimated_shares, action?.target_quantity, action?.quantity);
+    const protectionLine = firstPresent(action?.active_line, action?.estimated_initial_line);
+    const facts = [
+      hasValue(reportQuantity) ? `报告数量 ${formatDisplayNumber(reportQuantity)}` : "",
+      `模拟持仓 ${formatDisplayNumber(position?.quantity ?? 0)}`,
+      hasValue(action?.close) ? `报告价格 ${formatDisplayNumber(action.close)}` : "",
+      hasValue(position?.cost_price) ? `模拟成本 ${formatDisplayNumber(position.cost_price)}` : "",
+      hasValue(position?.last_price) ? `模拟现价 ${formatDisplayNumber(position.last_price)}` : "",
+      hasValue(protectionLine) ? `保护线 ${formatDisplayNumber(protectionLine)}` : "",
+    ];
+    const name = action?.name || position?.name || "";
+    return `<div class="trend-actual-row" data-simulation-symbol="${escapeHtml(symbol)}"><header><strong>${escapeHtml(`${symbol} ${formatPlain(name)}`.trim())}</strong><span data-deviation="${escapeHtml(deviation)}">${escapeHtml(label)}</span></header>
+      <div class="trend-actual-facts">${facts.filter(Boolean).map((fact) => `<span>${escapeHtml(fact)}</span>`).join("")}</div></div>`;
+  };
+  const rows = actions.map((action) => {
+    const symbol = String(action.symbol).trim().toUpperCase();
+    return renderRow(action, positionsBySymbol.get(symbol));
+  }).join("") + positions
+    .filter((position) => !reportSymbols.has(String(position?.symbol || "").trim().toUpperCase()))
+    .map((position) => renderRow({}, position, true)).join("");
+  return `<details class="trend-simulation-overlay" open>${summary}<div class="trend-actual-rows">${rows || "<p>暂无报告动作或模拟持仓</p>"}</div></details>`;
+}
+
 function renderTrendActualOverlay(overlay) {
   if (!overlay || typeof overlay !== "object") return "";
   const broker = formatPlain(overlay.broker_label || "实盘");
@@ -2239,16 +2301,16 @@ function renderTrendActualOverlay(overlay) {
   </details>`;
 }
 
-function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate) {
+function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate, simulationOverlay = "") {
   const hasPlanRisk = summary && typeof summary === "object" && hasValue(summary.status);
   const hasDrawdown = drawdown && typeof drawdown === "object" && hasValue(drawdown.status);
   const hasActualOverlay = actualOverlay && typeof actualOverlay === "object";
-  if (!hasPlanRisk && !hasDrawdown && !hasActualOverlay) return "";
+  if (!hasPlanRisk && !hasDrawdown && !hasActualOverlay && !simulationOverlay) return "";
   const planned = hasPlanRisk ? `${formatDisplayNumber(summary.portfolio_planned_risk)}（${trendRiskPercent(summary.portfolio_planned_risk_pct)} / ${trendRiskPercent(summary.portfolio_risk_limit_pct)}）` : "";
   const remaining = hasPlanRisk ? `${formatDisplayNumber(summary.portfolio_remaining_risk)}（${trendRiskPercent(summary.portfolio_remaining_risk_pct)}）` : "";
   const single = hasPlanRisk ? `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）` : "";
   const buffer = hasPlanRisk ? `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）` : "";
-  const status = hasPlanRisk ? summary.status : hasDrawdown ? drawdown.status : "actual";
+  const status = hasPlanRisk ? summary.status : hasDrawdown ? drawdown.status : hasActualOverlay ? "actual" : "simulation";
   const kellyPhase = hasPlanRisk ? ({
     cold_start: "冷启动",
     active_all_samples: "全样本启用",
@@ -2307,6 +2369,7 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate) {
       <dl><div><dt>策略累计回撤</dt><dd>${trendRiskPercent(drawdown.drawdown_pct)} / ${trendRiskPercent(drawdown.drawdown_limit_pct)}</dd></div>
       <div><dt>策略模拟净值</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.current_equity))}</dd></div>
       <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}${recoveryRows}</div>` : ""}
+    ${simulationOverlay}
     ${renderTrendActualOverlay(actualOverlay)}
   </section>`;
 }
@@ -2576,7 +2639,8 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${renderTrendControllerStatus(report.broker)}
     ${batchError}
     ${revisionAnomaly}
-    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date)}
+    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date,
+      renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]))}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}
@@ -2827,7 +2891,8 @@ async function setAccountView(broker, view) {
   state.selectedHoldingDetail = "decision";
   state.selectedDecisionTab = "final";
   syncDecisionDeepLink();
-  if (view === "simulate" && !Object.hasOwn(state.trendSimulatePositions, broker)) {
+  const needsSimulation = view === "simulate" || view === "report";
+  if (needsSimulation && !Object.hasOwn(state.trendSimulatePositions, broker)) {
     await loadTrendSimulatePositions(broker);
   } else {
     renderAccountViewPanelOnly(broker);
@@ -2862,7 +2927,7 @@ async function loadTrendSimulatePositions(broker) {
       error: error instanceof Error ? error.message : String(error),
     };
   }
-  if (state.brokerFilter === broker && state.accountViews[broker] === "simulate") {
+  if (state.brokerFilter === broker && ["simulate", "report"].includes(state.accountViews[broker])) {
     renderAccountViewPanelOnly(broker);
   }
 }

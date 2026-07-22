@@ -3676,6 +3676,52 @@ console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:call
     assert rendered["attributionStates"].count("报告关联冲突") == 1
 
 
+def test_dashboard_report_loads_simulation_and_keeps_real_comparison() -> None:
+    output = run_dashboard_js(r'''
+function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{add(){},remove(){}},
+  setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
+  querySelector(){return null;}};}
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-tiger-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>[];
+state.dashboard={
+  summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reviews:{tiger:{available:true,market_label:"美股"}},
+  trend_reports:{tiger:{
+    available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",
+    risk_summary:{},drawdown_summary:{},actual_overlay:{available:true,
+      broker_label:"老虎",status_text:"账户实时同步",notice:"只读对照，不影响模拟建议与自动执行",
+      items:[],outside_positions:[]},
+    sell_actions:[],buy_actions:[{action:"BUY",symbol:"HST",name:"HOST酒店及度假村",
+      estimated_shares:"1635",close:"24.44",estimated_initial_line:"23.428857142857"}],
+    hold_actions:[{action:"HOLD",symbol:"GPN",name:"环汇有限公司",close:"80.07",active_line:"74.3550"},
+      {action:"HOLD",symbol:"TOST",name:"Toast",close:"30.37",active_line:"28.305071428571"}],
+    review_actions:[],risk_skips:[],counts:{},audit:{},
+  }},
+};
+state.brokerFilter="tiger";
+const urls=[];
+globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>({available:true,broker:"tiger",positions:[
+  {symbol:"GPN",name:"环汇有限公司",quantity:"485.0",cost_price:"80.99",last_price:"80.07"},
+  {symbol:"TOST",name:"Toast",quantity:"1296.0",cost_price:"30.594999999999995",last_price:"30.37"},
+]})};};
+await setAccountView("tiger","report");
+console.log(JSON.stringify({urls,html:panel.innerHTML}));
+''')
+    rendered = json.loads(output)
+    html = rendered["html"]
+    assert rendered["urls"] == ["/api/trend-simulate-positions/tiger"]
+    for text in (
+        "模拟盘执行状态", "富途", "实盘执行辅助", "老虎", "GPN",
+        "模拟持仓 485", "TOST", "模拟持仓 1,296",
+    ):
+        assert text in html
+    assert html.count('data-deviation="followed"') == 2
+    assert html.count("一致") == 2
+    assert "未持有" not in html
+
+
 def test_dashboard_report_history_is_inline_exact_and_restores_scroll() -> None:
     output = run_dashboard_js(r'''
 function mount(){const classes=new Set();return {innerHTML:"",textContent:"",attributes:{},classList:{
@@ -3695,8 +3741,10 @@ state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:
   cash_rows:[],holdings:[],trend_reports:{tiger:current},trend_reviews:{tiger:{available:true,market_label:"美股"}}};
 state.brokerFilter="tiger";
 const urls=[];
-globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>url.endsWith("2026-07-16.json")
-  ? historical : [{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}]};};
+globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>url.includes("trend-simulate-positions")
+  ? {available:true,broker:"tiger",positions:[]}
+  : url.endsWith("2026-07-16.json") ? historical
+  : [{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}]};};
 await setAccountView("tiger","report");
 const currentHtml=panel.innerHTML;
 await openTrendReportHistory("tiger");
@@ -3716,6 +3764,7 @@ console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restored
 ''')
     rendered = json.loads(output)
     assert rendered["urls"] == [
+        "/api/trend-simulate-positions/tiger",
         "/api/trend-reports/tiger/history",
         "/api/trend-reports/tiger/history/2026-07-16.json",
         "/api/trend-reports/tiger/history/2026-07-16.json",
