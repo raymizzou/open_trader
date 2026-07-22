@@ -290,6 +290,25 @@ def test_once_watcher_returns_abnormal_when_calendar_fails(tmp_path: Path) -> No
     assert quote.closed is True
 
 
+def test_once_watcher_does_not_close_borrowed_quote(tmp_path: Path) -> None:
+    quote = SequenceQuote([], trading_days=["2026-07-22"])
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path, symbol=None),
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        quote_client=quote,
+        close_quote_client=False,
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=5,
+        once=True,
+        now_fn=lambda: datetime.fromisoformat("2026-07-22T09:31:00+08:00"),
+    )
+
+    assert result.status == "completed"
+    assert quote.closed is False
+
+
 def test_once_watcher_returns_abnormal_when_snapshot_fails(tmp_path: Path) -> None:
     quote = SequenceQuote([interrupted("snapshot offline")])
 

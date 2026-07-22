@@ -85,6 +85,7 @@ def watch_a_share_protection(
     state_path: Path,
     events_path: Path,
     quote_client: object | None,
+    close_quote_client: bool = True,
     notifier: Notifier,
     poll_seconds: float,
     reconnect_seconds: float,
@@ -137,7 +138,7 @@ def watch_a_share_protection(
             unknown_quote_count,
             events_path,
         )
-        if client is None:
+        if client is None or not close_quote_client:
             return result
         closing_client = client
         client = None
@@ -172,6 +173,8 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
+                    if once and not close_quote_client:
+                        raise
                     if once:
                         return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
@@ -194,6 +197,8 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
+                    if once and not close_quote_client:
+                        raise
                     failed_client = client
                     client = None
                     try:
@@ -408,6 +413,8 @@ def watch_a_share_protection(
                         market_label=market_label, broker_label=broker_label,
                     )
                     interrupted = True
+                if once and not close_quote_client:
+                    raise
                 failed_client = client
                 client = None
                 try:
@@ -504,7 +511,7 @@ def watch_a_share_protection(
             sleep_fn(poll_seconds)
             now = now_fn()
     finally:
-        if client is not None:
+        if client is not None and close_quote_client:
             _close(client)
 
 

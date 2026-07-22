@@ -156,6 +156,41 @@ def test_once_market_watcher_returns_abnormal_when_calendar_fails(
     assert quote.closed is True
 
 
+def test_once_market_watcher_reraises_failure_for_borrowed_quote(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        closed = False
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            raise watcher_error("calendar offline")
+
+        def close(self) -> None:
+            self.closed = True
+
+    quote = Quote()
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    with pytest.raises(FutuQuoteError, match="calendar offline"):
+        watch_market_protection(
+            market="HK",
+            data_dir=tmp_path / "data",
+            portfolio_path=tmp_path / "unused.csv",
+            state_path=tmp_path / "state.json",
+            events_path=tmp_path / "events.jsonl",
+            report_lock_path=tmp_path / "report.lock",
+            quote_client=quote,
+            close_quote_client=False,
+            notifier=NullNotifier(),
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: now,
+        )
+
+    assert quote.closed is False
+
+
 def test_once_market_watcher_returns_abnormal_when_snapshot_fails(
     tmp_path: Path,
 ) -> None:

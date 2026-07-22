@@ -88,6 +88,7 @@ def watch_market_protection(
     events_path: Path,
     report_lock_path: Path,
     quote_client: object | None,
+    close_quote_client: bool = True,
     notifier: Notifier,
     poll_seconds: float,
     reconnect_seconds: float,
@@ -164,6 +165,8 @@ def watch_market_protection(
                     broker_label=BROKER_LABELS[market],
                 )
                 interrupted = True
+            if once and not close_quote_client:
+                raise
             failed_client = client
             client = None
             try:
@@ -195,10 +198,11 @@ def watch_market_protection(
     except Exception:
         if not once:
             raise
-        try:
-            _close(client)
-        except Exception:
-            pass
+        if close_quote_client:
+            try:
+                _close(client)
+            except Exception:
+                pass
         return _abnormal_result(events_path)
     local_now = now.astimezone(timezone)
     if opening > local_now:
@@ -209,6 +213,7 @@ def watch_market_protection(
         state_path=state_path,
         events_path=events_path,
         quote_client=client,
+        close_quote_client=close_quote_client,
         notifier=notifier,
         poll_seconds=poll_seconds,
         reconnect_seconds=reconnect_seconds,
