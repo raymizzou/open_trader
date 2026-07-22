@@ -620,6 +620,7 @@ def test_partial_action_validation() -> None:
     invalid_actions = [
         {"target_fraction": "0.29"},
         {"lot_size": "100.5"},
+        {"lot_size": "100.0"},
         {"estimated_shares": -100},
         {"estimated_shares": 250},
         {"position_started_for": "2026-7-01"},
@@ -640,6 +641,17 @@ def test_partial_action_validation() -> None:
         del report["strategy_judgments"]["formal_actions"][0][field]
         with pytest.raises(ValueError, match="partial sell action is invalid"):
             trend_review._preflight_open_actions(report, "CN")
+
+
+def test_partial_and_full_sell_for_one_symbol_are_rejected() -> None:
+    partial = partial_sell_report()["strategy_judgments"]["formal_actions"][0]
+    report = report_with_actions([
+        partial,
+        {"action": "SELL_ALL", "symbol": "SH.600001"},
+    ])
+
+    with pytest.raises(ValueError, match="conflicting sell actions"):
+        trend_review._preflight_open_actions(report, "CN")
 
 
 def test_legacy_sell_all_immutable_facts_remain_compatible(tmp_path: Path) -> None:
@@ -754,6 +766,34 @@ def test_partial_live_position_freezes_target_before_first_intent(
         } == payload
 
 
+def test_partial_facts_never_enter_generic_retry_recovery(tmp_path: Path) -> None:
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000"}]
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": partial_sell_report(),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-17",
+        "quote_prices": {},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T09:31:00+08:00"
+    )
+    client.orders[0].update({"dealt_qty": "0", "order_status": "CANCELLED_PART"})
+
+    recovered = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-17T16:30:00+08:00"
+    )
+
+    assert recovered["submitted_count"] == 0
+    assert len(client.requests) == 1
+    assert not list(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-17/*-attempt-2-intent.json"
+    ))
+
+
 def test_partial_below_lot_is_an_audited_terminal_fact(tmp_path: Path) -> None:
     report = partial_sell_report(symbol="00700", lot_size=200, estimated_shares=0)
     report_path = tmp_path / "reports/2026-07-17.json"
@@ -809,6 +849,64 @@ def test_partial_below_lot_is_an_audited_terminal_fact(tmp_path: Path) -> None:
     tampered = json.loads(event_path.read_text(encoding="utf-8"))
     tampered["target_qty"] = "200"
     event_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="HK",
+            execution_date="2026-07-17",
+            symbol="00700",
+            side="sell",
+        )
+
+
+def test_below_lot_audit_recomputes_observed_live_target(tmp_path: Path) -> None:
+    report = partial_sell_report(symbol="00700", lot_size=200, estimated_shares=0)
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="HK",
+        execution_date="2026-07-17",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=FakeTrendSimClient(
+            positions=[{"code": "HK.00700", "qty": "300"}]
+        ),
+        market="HK",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices={},
+    )
+    event_path = next(tmp_path.glob(
+        "trend_review/ledgers/HK/actions/2026-07-17/*/*.json"
+    ))
+    event = json.loads(event_path.read_text(encoding="utf-8"))
+    observation_path = (
+        tmp_path
+        / "trend_review/ledgers/HK/open/2026-07-17"
+        / event["observation_path"]
+    )
+    observation = json.loads(observation_path.read_text(encoding="utf-8"))
+    observation["position_qty"] = "1000"
+    body = trend_review._canonical_json_bytes(observation)
+    digest = hashlib.sha256(body).hexdigest()
+    action_key = trend_review.trend_action_key(
+        "HK", "2026-07-17", "HK.00700", "sell"
+    )
+    replacement = observation_path.with_name(
+        f"{action_key}-observation-{digest[:12]}.json"
+    )
+    replacement.write_bytes(body)
+    event["observation_path"] = replacement.name
+    event["observation_sha256"] = digest
+    event_path.write_text(json.dumps(event), encoding="utf-8")
 
     with pytest.raises(ValueError, match="invalid trend action event evidence"):
         trend_review.load_trend_action_audit(

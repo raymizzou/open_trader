@@ -1557,7 +1557,14 @@ def load_trend_action_audit(
             requests=(),
             result_order_ids=set(),
         )
-        if position_qty <= 0 or broker_filled != 0 or broker_order_ids:
+        if (
+            position_qty <= 0
+            or _overheat_trim_quantity(
+                position_qty, target_fraction, int(lot_size)
+            ) != 0
+            or broker_filled != 0
+            or broker_order_ids
+        ):
             raise ValueError("invalid trend action event evidence")
     protection_identities = {
         identity
@@ -1964,6 +1971,7 @@ def _preflight_open_actions(
     from .futu_symbols import to_futu_symbol
 
     validated: list[Mapping[str, object]] = []
+    sell_actions_by_symbol: dict[str, set[str]] = {}
     for action in actions:
         if not isinstance(action, Mapping):
             raise ValueError("trend review action is invalid")
@@ -1971,7 +1979,12 @@ def _preflight_open_actions(
         symbol = str(action.get("symbol") or "").strip()
         if action_name not in {"BUY", "SELL_ALL", "SELL_PARTIAL"} or not symbol:
             raise ValueError("trend review action is invalid")
-        to_futu_symbol(market, symbol)
+        futu_code = to_futu_symbol(market, symbol)
+        if action_name in {"SELL_ALL", "SELL_PARTIAL"}:
+            existing = sell_actions_by_symbol.setdefault(futu_code, set())
+            if existing and action_name not in existing:
+                raise ValueError("trend review has conflicting sell actions")
+            existing.add(action_name)
         if action_name == "BUY":
             try:
                 target_weight = _required_decimal(
@@ -1999,6 +2012,9 @@ def _preflight_open_actions(
                     action.get("target_fraction"), "target fraction"
                 )
                 lot = _required_decimal(action.get("lot_size"), "lot size")
+                if isinstance(action.get("lot_size"), bool):
+                    raise TypeError
+                lot_size = int(action.get("lot_size"))
                 estimate = _required_decimal(
                     action.get("estimated_shares"), "estimated shares"
                 )
@@ -2011,6 +2027,7 @@ def _preflight_open_actions(
                 fraction != Decimal("0.30")
                 or lot <= 0
                 or lot != lot.to_integral_value()
+                or lot != Decimal(lot_size)
                 or estimate < 0
                 or estimate != estimate.to_integral_value()
                 or estimate % lot
@@ -2139,24 +2156,9 @@ def execute_trend_review_open(
             / action_key
         )
         action_facts = _action_facts(root, futu_code=futu_code, side=side)
-        partial_metadata: dict[str, object] = {}
         if action_name == "SELL_PARTIAL" and action_facts:
-            first_partial_fact = action_facts[0][1]
-            try:
-                lifecycle_target = _required_decimal(
-                    first_partial_fact.get("lifecycle_target_qty"),
-                    "lifecycle target quantity",
-                )
-            except ValueError as exc:
-                raise ValueError("invalid trend review partial sell fact") from exc
-            if lifecycle_target <= 0:
-                raise ValueError("invalid trend review partial sell fact")
-            partial_metadata = {
-                "sell_goal": "partial_30",
-                "position_started_for": str(action["position_started_for"]),
-                "lifecycle_target_qty": format(lifecycle_target, "f"),
-            }
-            action_evidence = {**action_evidence, **partial_metadata}
+            continue
+        partial_metadata: dict[str, object] = {}
         resolutions = _action_resolutions(
             action_events_root,
             market=market,
