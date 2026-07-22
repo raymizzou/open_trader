@@ -892,7 +892,11 @@ def _attribute_actual_fills(
         for action in fact["formal_actions"]:
             if not isinstance(action, Mapping):
                 continue
-            side = {"BUY": "buy", "SELL_ALL": "sell"}.get(str(action.get("action") or ""))
+            side = {
+                "BUY": "buy",
+                "SELL_ALL": "sell",
+                "SELL_PARTIAL": "sell",
+            }.get(str(action.get("action") or ""))
             symbol = str(action.get("symbol") or "").strip().upper()
             if side and symbol:
                 actions[(str(fact["market"]), str(fact["execution_date"]), symbol, side)].append(fact)

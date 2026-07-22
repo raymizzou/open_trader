@@ -4276,6 +4276,33 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     assert payload["strategy_judgments"]["formal_actions"] == []
 
 
+def test_generated_report_keeps_v4_identity_kelly_scope_and_drawdown_continuity(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
+    state_path = config.data_dir / "trend_drawdown/state.json"
+    before = json.loads(state_path.read_text(encoding="utf-8"))
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    snapshot = payload["strategy_snapshot"]
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v4"
+    assert snapshot["strategy_version"] == "v4"
+    assert snapshot["parameters"]["kelly_sample_scope"] == (
+        "market+strategy_id+opening_strategy_version"
+    )
+    after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert after["audit_events"] == before["audit_events"]
+
+
 def test_report_runner_sends_exact_broker_v4_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
