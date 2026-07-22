@@ -427,8 +427,6 @@ def _load_trend_controllers(
             }
         unhealthy_phase = payload["phase"] in {
             "starting",
-            "reconciling",
-            "recovering_report",
             "blocked",
             "uncertain",
             "conflict",

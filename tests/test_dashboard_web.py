@@ -121,8 +121,9 @@ def test_dashboard_projects_strict_controller_health(
         assert "OPEN_TRADER_TREND_EXECUTOR_HOST" in controller["reason"]
 
 
+@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
 def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
-    tmp_path: Path,
+    tmp_path: Path, phase: str,
 ) -> None:
     from open_trader.dashboard import _load_trend_controllers
 
@@ -131,7 +132,7 @@ def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
     path.parent.mkdir(parents=True)
     payload = _controller_status(heartbeat_at=now.isoformat())
     payload.update({
-        "phase": "recovering_report",
+        "phase": phase,
         "last_success": None,
         "blocker": "report generation failed: upstream unavailable",
     })
@@ -149,12 +150,34 @@ def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
     assert controller["reason"] == payload["blocker"]
 
 
+@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
+def test_dashboard_projects_unblocked_progress_phase_as_healthy(
+    tmp_path: Path, phase: str,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    path.parent.mkdir(parents=True)
+    payload = _controller_status(heartbeat_at=now.isoformat())
+    payload.update({"phase": phase, "blocker": None})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controller = _load_trend_controllers(
+        tmp_path,
+        executor_host="ray-mac",
+        now=now,
+        hostname_fn=lambda: "ray-mac",
+    )["tiger"]
+
+    assert controller["health"] == "healthy"
+    assert controller["blocking"] is False
+    assert controller["reason"] == ""
+
+
 @pytest.mark.parametrize(
     "phase",
-    [
-        "starting", "reconciling", "recovering_report", "blocked", "uncertain",
-        "conflict", "missed",
-    ],
+    ["starting", "blocked", "uncertain", "conflict", "missed"],
 )
 def test_dashboard_projects_unhealthy_controller_phase_as_unavailable(
     tmp_path: Path, phase: str,

@@ -5054,8 +5054,9 @@ def _controller_runtime_errors(
     )
 
 
+@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
 def test_acceptance_rejects_fresh_blocked_controller(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
     now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
     payload = _controller_runtime_payload(tmp_path, now=now)
@@ -5063,7 +5064,7 @@ def test_acceptance_rejects_fresh_blocked_controller(
     controller.update({  # type: ignore[union-attr]
         "health": "unavailable",
         "blocking": True,
-        "phase": "recovering_report",
+        "phase": phase,
         "blocker": "report generation failed",
     })
 
@@ -5072,6 +5073,20 @@ def test_acceptance_rejects_fresh_blocked_controller(
     )
 
     assert any("tiger" in error and "阻塞" in error for error in errors)
+
+
+@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
+def test_acceptance_accepts_healthy_in_progress_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller["phase"] = phase  # type: ignore[index]
+
+    assert _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    ) == []
 
 
 def test_acceptance_accepts_matching_controller_runtime(
