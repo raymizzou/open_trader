@@ -88,7 +88,13 @@ def _default_context_factory(*, host: str, port: int) -> Any:
             context_ok=False,
             snapshot_ok=False,
         ) from exc
-    return OpenQuoteContext(host=host, port=port)
+    context = OpenQuoteContext(
+        host=host,
+        port=port,
+        is_async_connect=True,
+    )
+    context.set_sync_query_connect_timeout(3.0)
+    return context
 
 
 def _can_connect_to_opend(host: str, port: int) -> bool:

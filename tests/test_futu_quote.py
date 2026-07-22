@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import sys
+from types import SimpleNamespace
 
 import pytest
 
+import open_trader.futu_quote as futu_quote
 from open_trader.futu_quote import (
     DashboardQuoteSnapshot,
     FutuQuoteClient,
@@ -12,6 +15,34 @@ from open_trader.futu_quote import (
 )
 from open_trader.futu_watch import QuoteSnapshot
 from open_trader.kline_technical_facts import DailyKlineBar
+
+
+def test_default_context_factory_uses_bounded_async_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Context:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+            self.timeout: float | None = None
+
+        def set_sync_query_connect_timeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+    monkeypatch.setitem(
+        sys.modules, "futu", SimpleNamespace(OpenQuoteContext=Context)
+    )
+    context = futu_quote._default_context_factory(
+        host="127.0.0.1", port=11111
+    )
+
+    assert calls == [{
+        "host": "127.0.0.1",
+        "port": 11111,
+        "is_async_connect": True,
+    }]
+    assert context.timeout == 3.0
 
 
 class FakeDataFrame:
