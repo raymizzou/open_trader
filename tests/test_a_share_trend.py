@@ -2827,10 +2827,8 @@ def test_partial_action_is_a_formal_trim_in_feishu_and_markdown() -> None:
     )
     markdown = render_markdown(built)
 
-    assert [
-        (item["action"], item["estimated_shares"])
-        for item in payload["strategy_judgments"]["formal_actions"]
-    ] == [("SELL_PARTIAL", 300)]
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "SELL_PARTIAL"
+    assert payload["strategy_judgments"]["formal_actions"] == []
     assert "今日动作：卖出 1｜买入 0｜持有 0｜复核 0" in message
     assert "沸腾/开香槟过热止盈｜约 300 股" in message
     assert "今日无买卖动作" not in message
