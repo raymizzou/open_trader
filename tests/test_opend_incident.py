@@ -145,6 +145,7 @@ def test_recovery_ignores_health_observed_before_incident_creation(
     state = read_incident(tmp_path)
     state["first_detected_at"] = "2026-07-22T10:00:00+08:00"
     state["updated_at"] = "2026-07-22T10:00:00+08:00"
+    state["feishu_delivered_at"] = "2026-07-22T10:00:00+08:00"
     path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
     record_opend_health(
@@ -320,5 +321,28 @@ def test_delivered_channel_without_timestamp_raises_for_fallback(
             occurred_at=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
             send_feishu=lambda _title, _message: pytest.fail(
                 "delivered channel without timestamp must not suppress fallback"
+            ),
+        )
+
+
+def test_delivery_before_incident_creation_raises_for_fallback(
+    tmp_path: Path,
+) -> None:
+    create_active_incident(tmp_path, category="connectivity")
+    path = incident_path(tmp_path)
+    state = read_incident(tmp_path)
+    state["first_detected_at"] = "2026-07-22T10:00:00+08:00"
+    state["updated_at"] = "2026-07-22T10:00:00+08:00"
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(OpenDIncidentStateError):
+        record_opend_failure(
+            data_dir=tmp_path,
+            market="HK",
+            category="connectivity",
+            reason="连接超时",
+            occurred_at=datetime.fromisoformat("2026-07-22T10:00:01+08:00"),
+            send_feishu=lambda _title, _message: pytest.fail(
+                "stale delivery must not suppress fallback"
             ),
         )

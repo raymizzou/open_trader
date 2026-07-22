@@ -54,16 +54,13 @@ def _incident_path(data_dir: Path, category: OpenDCategory) -> Path:
     )
 
 
-def _timestamp(value: object, *, allow_empty: bool = False) -> bool:
+def _parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str):
-        return False
-    if allow_empty and not value:
-        return True
+        return None
     try:
-        datetime.fromisoformat(value)
+        return datetime.fromisoformat(value)
     except ValueError:
-        return False
-    return True
+        return None
 
 
 def _read(path: Path, category: OpenDCategory) -> dict[str, object] | None:
@@ -79,13 +76,22 @@ def _read(path: Path, category: OpenDCategory) -> dict[str, object] | None:
         payload.get("feishu_delivered_at") if isinstance(payload, dict) else None
     )
     channels = payload.get("channels") if isinstance(payload, dict) else None
+    first_detected_at = _parse_timestamp(
+        payload.get("first_detected_at") if isinstance(payload, dict) else None
+    )
+    updated_at = _parse_timestamp(
+        payload.get("updated_at") if isinstance(payload, dict) else None
+    )
+    delivered_at_timestamp = (
+        _parse_timestamp(delivered_at) if delivered_at else None
+    )
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != SCHEMA
         or payload.get("category") != category
         or not isinstance(payload.get("active"), bool)
-        or not _timestamp(payload.get("first_detected_at"))
-        or not _timestamp(payload.get("updated_at"))
+        or first_detected_at is None
+        or updated_at is None
         or not isinstance(payload.get("affected_markets"), list)
         or not all(isinstance(market, str) for market in payload["affected_markets"])
         or not isinstance(reasons, dict)
@@ -98,13 +104,23 @@ def _read(path: Path, category: OpenDCategory) -> dict[str, object] | None:
         or not isinstance(attempts, int)
         or isinstance(attempts, bool)
         or not 0 <= attempts <= 2
-        or not _timestamp(delivered_at, allow_empty=True)
+        or not isinstance(delivered_at, str)
+        or bool(delivered_at) and delivered_at_timestamp is None
         or not isinstance(channels, list)
         or not all(isinstance(channel, str) for channel in channels)
         or bool(delivered_at) != bool(channels)
         or any(channel not in {"feishu", "feishu_app"} for channel in channels)
         or len(channels) > 1
         or bool(delivered_at) and attempts == 0
+        or (
+            delivered_at_timestamp is not None
+            and (
+                first_detected_at is None
+                or (delivered_at_timestamp.tzinfo is None)
+                != (first_detected_at.tzinfo is None)
+                or delivered_at_timestamp < first_detected_at
+            )
+        )
     ):
         raise ValueError(f"invalid OpenD incident state: {path}")
     return payload
