@@ -21,7 +21,10 @@ from open_trader.dashboard_acceptance import (
     validate_dashboard_payload,
     validate_quotes_payload,
 )
-from open_trader.strategy_drawdown import strategy_parameter_hash
+from open_trader.strategy_drawdown import (
+    automatic_bootstrap_strategy_drawdown,
+    strategy_parameter_hash,
+)
 
 
 MISSING_FRESH = object()
@@ -1393,6 +1396,90 @@ def test_acceptance_rejects_frozen_parameter_audit_identity_mismatch(
         account_ids=account_ids,
     )
 
+    assert any("冻结策略参数与回撤审计身份" in error for error in errors)
+
+
+def test_acceptance_allows_only_the_audited_v4_overheat_trim_compatibility(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    parameters = frozen["strategy_snapshot"]["parameters"]
+    assert isinstance(parameters, dict)
+    old_parameters = dict(parameters)
+    updated_parameters = {
+        **old_parameters,
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+    }
+    decision = automatic_bootstrap_strategy_drawdown(
+        tmp_path / "state",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        parameters=old_parameters,
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    decision = automatic_bootstrap_strategy_drawdown(
+        tmp_path / "state",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        parameters=updated_parameters,
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha="b" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-21T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from=None,
+    )
+    frozen["strategy_snapshot"]["parameters"] = updated_parameters
+    frozen["drawdown_summary"]["bootstrap_event"]["parameter_hash"] = (
+        strategy_parameter_hash(old_parameters)
+    )
+    frozen["drawdown_summary"]["parameter_compatibility_event"] = decision[
+        "parameter_compatibility_event"
+    ]
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+    frozen["strategy_snapshot"]["parameters"]["overheat_trim_fraction"] = "0.31"
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
     assert any("冻结策略参数与回撤审计身份" in error for error in errors)
 
 

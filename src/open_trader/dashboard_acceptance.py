@@ -28,7 +28,7 @@ from .trend_simulate_positions import (
     _reports_by_hash,
 )
 from .trend_review import _report_hash
-from .strategy_drawdown import strategy_parameter_hash
+from .strategy_drawdown import valid_strategy_parameter_audit_identity
 
 
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
@@ -600,8 +600,15 @@ def validate_integrated_candidate(
                 and bootstrap.get("event_id")
                 and bootstrap.get("actor")
             ), f"{broker} 自动回撤基准审计不完整"
-            assert bootstrap.get("parameter_hash") == strategy_parameter_hash(
-                parameters
+            assert valid_strategy_parameter_audit_identity(
+                market=market,
+                strategy_id=str(snapshot.get("strategy_id") or ""),
+                strategy_version="v4",
+                parameters=parameters,
+                bootstrap_event=bootstrap,
+                parameter_compatibility_event=drawdown.get(
+                    "parameter_compatibility_event"
+                ),
             ), f"{broker} 冻结策略参数与回撤审计身份不一致"
             assert (
                 drawdown.get("entry_allowed") is True or not buys

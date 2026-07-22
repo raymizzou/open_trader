@@ -125,6 +125,36 @@ def test_existing_state_does_not_require_repeated_frozen_baseline(
     assert state_path.read_bytes() == before
 
 
+def test_preflight_accepts_the_approved_v4_overheat_trim_transition(
+    tmp_path: Path,
+) -> None:
+    old = market_input("US")
+    assert run_preflight(tmp_path, {"US": old})["status"] == "ready"
+    state_path = tmp_path / "data/trend_drawdown/state.json"
+    before = json.loads(state_path.read_text(encoding="utf-8"))
+    parameters = dict(old.strategy_snapshot["parameters"])
+    parameters.update({
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+    })
+
+    result = run_preflight(
+        tmp_path,
+        {"US": replace(old, strategy_snapshot={**old.strategy_snapshot, "parameters": parameters})},
+    )
+
+    after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert result["status"] == "ready"
+    assert result["markets"][0]["status"] == "ready"
+    assert after["records"] == before["records"]
+    assert after["audit_events"][:-1] == before["audit_events"]
+    assert after["audit_events"][-1]["event_type"] == "parameter_compatibility"
+
+
 def test_late_preflight_reports_entries_blocked_until_eligible_date(
     tmp_path: Path,
 ) -> None:

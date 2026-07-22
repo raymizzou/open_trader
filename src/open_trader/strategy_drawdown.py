@@ -15,6 +15,15 @@ STATE_SCHEMA_VERSION = "open_trader.strategy_drawdown_state.v1"
 SNAPSHOT_SCHEMA_VERSION = "open_trader.strategy_drawdown_snapshot.v1"
 DECISION_SCHEMA_VERSION = "open_trader.strategy_drawdown.v1"
 DRAWDOWN_LIMIT = Decimal("0.05")
+OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
+OVERHEAT_TRIM_COMPATIBILITY_PARAMETERS = {
+    "overheat_trim_fraction": "0.30",
+    "overheat_trim_once_per_position": True,
+    "overheat_trim_signals": ["boiling", "champagne"],
+    "overheat_trim_rounding": "floor_to_market_lot",
+    "overheat_trim_below_lot": "no_order_terminal",
+    "full_exit_precedes_partial_exit": True,
+}
 DECISION_FIELDS = {
     "schema_version",
     "market",
@@ -34,6 +43,7 @@ DECISION_FIELDS = {
     "observed_at",
     "bootstrap_event",
     "recovery_event",
+    "parameter_compatibility_event",
 }
 
 
@@ -48,7 +58,12 @@ def valid_drawdown_decision(
 ) -> bool:
     if not isinstance(value, Mapping) or frozenset(value) not in {
         frozenset(DECISION_FIELDS),
-        frozenset(DECISION_FIELDS - {"bootstrap_event", "recovery_event"}),
+        frozenset(DECISION_FIELDS - {"parameter_compatibility_event"}),
+        frozenset(
+            DECISION_FIELDS - {
+                "bootstrap_event", "recovery_event", "parameter_compatibility_event",
+            }
+        ),
     }:
         return False
     try:
@@ -97,6 +112,13 @@ def valid_drawdown_decision(
     if recovery_event is not None and (
         not _valid_recovery_event(recovery_event)
         or _record_key(recovery_event) != key
+    ):
+        return False
+    compatibility_event = value.get("parameter_compatibility_event")
+    if compatibility_event is not None and (
+        not _valid_parameter_compatibility_event(compatibility_event)
+        or _record_key(compatibility_event) != key
+        or not isinstance(bootstrap_event, dict)
     ):
         return False
     pending_until = (
@@ -257,6 +279,36 @@ def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def valid_strategy_parameter_audit_identity(
+    *,
+    market: str,
+    strategy_id: str,
+    strategy_version: str,
+    parameters: Mapping[str, object],
+    bootstrap_event: object,
+    parameter_compatibility_event: object,
+) -> bool:
+    """Accept the frozen hash, or the single approved v4 trim transition."""
+    try:
+        key = _strategy_key(market, strategy_id, strategy_version)
+        current_hash = strategy_parameter_hash(parameters)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(bootstrap_event, Mapping):
+        return False
+    old_hash = bootstrap_event.get("parameter_hash")
+    if old_hash == current_hash:
+        return True
+    return (
+        isinstance(parameter_compatibility_event, dict)
+        and _valid_parameter_compatibility_event(parameter_compatibility_event)
+        and _record_key(parameter_compatibility_event) == key
+        and parameter_compatibility_event.get("old_parameter_hash") == old_hash
+        and parameter_compatibility_event.get("new_parameter_hash") == current_hash
+        and _approved_overheat_trim_transition(key, parameters, old_hash)
+    )
+
+
 def automatic_bootstrap_strategy_drawdown(
     data_dir: Path,
     *,
@@ -308,7 +360,51 @@ def automatic_bootstrap_strategy_drawdown(
             if event is None:
                 raise ValueError("strategy parameter identity is unavailable")
             if event.get("parameter_hash") != parameter_hash:
-                raise ValueError("strategy parameters changed without a version bump")
+                old_hash = event.get("parameter_hash")
+                compatibility_events = [
+                    item
+                    for item in events
+                    if isinstance(item, dict)
+                    and item.get("event_type") == "parameter_compatibility"
+                    and _record_key(item) == key
+                ]
+                if not _approved_overheat_trim_transition(
+                    key, parameters, old_hash
+                ):
+                    raise ValueError("strategy parameters changed without a version bump")
+                if compatibility_events:
+                    if not (
+                        len(compatibility_events) == 1
+                        and valid_strategy_parameter_audit_identity(
+                            market=key[0],
+                            strategy_id=key[1],
+                            strategy_version=key[2],
+                            parameters=parameters,
+                            bootstrap_event=event,
+                            parameter_compatibility_event=compatibility_events[0],
+                        )
+                    ):
+                        raise ValueError(
+                            "strategy parameters changed without a version bump"
+                        )
+                else:
+                    assert isinstance(old_hash, str)
+                    events.append({
+                        "event_id": _parameter_compatibility_event_id(
+                            key, old_hash, parameter_hash
+                        ),
+                        "event_type": "parameter_compatibility",
+                        "market": key[0],
+                        "strategy_id": key[1],
+                        "strategy_version": key[2],
+                        "actor": actor.strip(),
+                        "occurred_at": occurred_at,
+                        "old_parameter_hash": old_hash,
+                        "new_parameter_hash": parameter_hash,
+                        "compatibility_revision": OVERHEAT_TRIM_COMPATIBILITY_REVISION,
+                        "accepted_git_sha": accepted_git_sha,
+                    })
+                    _write_state(path, payload)
             assert isinstance(record, dict)
             return _decision_from_record(
                 record,
@@ -675,6 +771,8 @@ def _valid_audit_event(value: object) -> bool:
         return _valid_automatic_bootstrap_event(value)
     if isinstance(value, dict) and value.get("event_type") == "snapshot_recovery":
         return _valid_recovery_event(value)
+    if isinstance(value, dict) and value.get("event_type") == "parameter_compatibility":
+        return _valid_parameter_compatibility_event(value)
     if not isinstance(value, dict) or set(value) != {
         "event_id",
         "event_type",
@@ -758,6 +856,80 @@ def _valid_automatic_bootstrap_event(value: object) -> bool:
         and _is_sha256(value["parameter_hash"])
         and value["reason"] in {"first_activation", "new_strategy_version"}
     )
+
+
+def _valid_parameter_compatibility_event(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "event_id",
+        "event_type",
+        "market",
+        "strategy_id",
+        "strategy_version",
+        "actor",
+        "occurred_at",
+        "old_parameter_hash",
+        "new_parameter_hash",
+        "compatibility_revision",
+        "accepted_git_sha",
+    }:
+        return False
+    try:
+        key = _strategy_key(
+            str(value["market"]),
+            str(value["strategy_id"]),
+            str(value["strategy_version"]),
+        )
+    except ValueError:
+        return False
+    old_hash = value["old_parameter_hash"]
+    new_hash = value["new_parameter_hash"]
+    return (
+        value["event_type"] == "parameter_compatibility"
+        and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v4"
+        and key[2] == "v4"
+        and isinstance(value["event_id"], str)
+        and value["event_id"] == _parameter_compatibility_event_id(
+            key, str(old_hash), str(new_hash)
+        )
+        and isinstance(value["actor"], str)
+        and bool(value["actor"].strip())
+        and _is_canonical_timestamp(value["occurred_at"])
+        and _is_sha256(old_hash)
+        and _is_sha256(new_hash)
+        and old_hash != new_hash
+        and value["compatibility_revision"] == OVERHEAT_TRIM_COMPATIBILITY_REVISION
+        and _is_sha1(value["accepted_git_sha"])
+    )
+
+
+def _parameter_compatibility_event_id(
+    key: tuple[str, str, str], old_hash: str, new_hash: str,
+) -> str:
+    return "parameter-compatibility-" + hashlib.sha256(
+        "|".join((*key, old_hash, new_hash, OVERHEAT_TRIM_COMPATIBILITY_REVISION)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _approved_overheat_trim_transition(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> bool:
+    if (
+        not _is_sha256(old_hash)
+        or key[1] != f"trend_animals_warm_to_hot/{key[0]}/v4"
+        or key[2] != "v4"
+    ):
+        return False
+    previous_parameters = dict(parameters)
+    missing = object()
+    for name, expected in OVERHEAT_TRIM_COMPATIBILITY_PARAMETERS.items():
+        actual = previous_parameters.pop(name, missing)
+        if type(actual) is not type(expected) or actual != expected:
+            return False
+    return strategy_parameter_hash(previous_parameters) == old_hash
 
 
 def _valid_recovery_event(value: object) -> bool:
@@ -1007,6 +1179,16 @@ def _decision_from_record(
         ),
         None,
     )
+    compatibility_event = next(
+        (
+            dict(event)
+            for event in reversed(events if isinstance(events, list) else [])
+            if isinstance(event, dict)
+            and event.get("event_type") == "parameter_compatibility"
+            and _record_key(event) == _record_key(record)
+        ),
+        None,
+    )
     pending_until = (
         str(bootstrap_event["entry_eligible_from"])
         if not paused
@@ -1015,7 +1197,7 @@ def _decision_from_record(
         and entry_date < str(bootstrap_event["entry_eligible_from"])
         else None
     )
-    return {
+    decision = {
         "schema_version": DECISION_SCHEMA_VERSION,
         "market": record["market"],
         "strategy_id": record["strategy_id"],
@@ -1043,3 +1225,6 @@ def _decision_from_record(
         "bootstrap_event": bootstrap_event,
         "recovery_event": recovery_event,
     }
+    if compatibility_event is not None:
+        decision["parameter_compatibility_event"] = compatibility_event
+    return decision
