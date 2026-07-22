@@ -1739,7 +1739,7 @@ console.log(JSON.stringify({
         "money": "3,064,187.62",
         "integer": "10,000",
         "trailing": "2,932",
-        "signed": "1,234,567.5",
+        "signed": "+1,234,567.5",
         "symbol": "02840",
         "percent": "21.13%",
         "input": "100000",
@@ -1758,6 +1758,21 @@ console.log(JSON.stringify([
 ]));
 ''')
     assert json.loads(output) == ["485", "1,296", "30.59", "23.43"]
+
+
+def test_dashboard_display_number_preserves_lossless_integer_semantics() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify([
+  formatDisplayNumber("9007199254740993"),
+  formatDisplayNumber("+1234567.50"),
+  formatDisplayNumber("00001234"),
+]));
+''')
+    assert json.loads(output) == [
+        "9,007,199,254,740,993",
+        "+1,234,567.5",
+        "00,001,234",
+    ]
 
 
 def test_dashboard_account_table_formats_values_but_not_symbol() -> None:
@@ -2159,7 +2174,7 @@ console.log(JSON.stringify({condition,facts,keywords,bollinger,technical,action,
     assert "上期复盘 · 2026-07-16" in rendered["review"]
     assert "条件触发 <strong>5,000 次</strong>" in rendered["review"]
     assert "期初数量 <strong>25,142.16</strong>" in rendered["review"]
-    assert "本期期初数量 <strong>1,234</strong>" in rendered["review"]
+    assert "本期期初数量 <strong>00,001,234</strong>" in rendered["review"]
 
 
 def test_dashboard_formats_numeric_suggested_notional_in_both_action_views() -> None:

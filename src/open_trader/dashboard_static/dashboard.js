@@ -7094,11 +7094,14 @@ function splitList(value) {
 
 function formatDisplayNumber(value) {
   const raw = formatPlain(value).trim();
-  if (!/^([+-]?)(\d+)(\.\d+)?$/.test(raw)) return raw;
-  const number = Number(raw);
-  return Number.isFinite(number)
-    ? number.toLocaleString("zh-CN", {maximumFractionDigits: 2})
-    : raw;
+  const match = raw.match(/^([+-]?)(\d+)(?:\.(\d+))?$/);
+  if (!match) return raw;
+  const [, sign, rawInteger, rawFraction = ""] = match;
+  const rounded = (BigInt(`${rawInteger}${rawFraction.slice(0, 2).padEnd(2, "0")}`)
+    + ((rawFraction[2] || "0") >= "5" ? 1n : 0n)).toString().padStart(rawInteger.length + 2, "0");
+  const integer = rounded.slice(0, -2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const fraction = rounded.slice(-2).replace(/0+$/, "");
+  return `${sign}${integer}${fraction ? `.${fraction}` : ""}`;
 }
 
 function formatDecisionTarget(value) {
