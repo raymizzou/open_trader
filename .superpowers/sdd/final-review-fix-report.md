@@ -282,3 +282,176 @@ The requested automated and direct in-process regression workflows passed. Live
 controller/OpenD/launchd/Screen checks and `make acceptance` were intentionally
 not run because this task required all controllers to remain stopped and forbade
 live-process mutation.
+
+## Follow-up Important findings
+
+Fixed the two remaining Important findings from the final review:
+
+1. The standalone/default protection account loader now performs the existing
+   uncached quote-protocol gate immediately before every new load-created Futu
+   account context. Injected controller account loaders remain unchanged.
+2. A close-capture `FutuOrderExecutionError` now detaches and closes the failed
+   shared account before retry. Quote and unrelated action failures do not take
+   this reset path.
+
+Controllers and all live processes remained stopped and untouched.
+
+### RED
+
+Command:
+
+```text
+.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_default_protection_loader_gates_each_new_account_context tests/test_trend_market_controller.py::test_controller_close_capture_rebuilds_failed_shared_account_on_retry -q
+```
+
+Exact result:
+
+```text
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+________ test_default_protection_loader_gates_each_new_account_context _________
+
+E       Failed: DID NOT RAISE FutuQuoteError
+
+tests/test_trend_market_controller.py:3710: Failed
+____ test_controller_close_capture_rebuilds_failed_shared_account_on_retry _____
+
+E       AssertionError: assert ['shared acco... read failed'] == ['shared acco...failed', None]
+E
+E         At index 2 diff: 'shared account read failed' != None
+E         Use -v to get more diff
+
+tests/test_trend_market_controller.py:4020: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_trend_market_controller.py::test_default_protection_loader_gates_each_new_account_context
+FAILED tests/test_trend_market_controller.py::test_controller_close_capture_rebuilds_failed_shared_account_on_retry
+2 failed in 0.64s
+```
+
+### Implementation
+
+- Reused `_gate_futu_trade_context` in only `_run_protection_pass`'s default
+  account loader, passing through a borrowed quote or allowing the gate to own
+  and close its temporary quote.
+- Added `reset_account` beside `reset_quote`, detaching the shared reference
+  before suppressing close errors, and reused it in the existing account-loader
+  failure path.
+- Wrapped only controller close capture so `FutuOrderExecutionError` resets the
+  borrowed shared account and re-raises the original error.
+
+### Focused GREEN
+
+Command:
+
+```text
+.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_default_protection_loader_gates_each_new_account_context tests/test_trend_market_controller.py::test_controller_close_capture_rebuilds_failed_shared_account_on_retry -q
+```
+
+Exact output:
+
+```text
+..                                                                       [100%]
+2 passed in 0.29s
+```
+
+### Controller suite
+
+Command:
+
+```text
+.venv/bin/python -m pytest tests/test_trend_market_controller.py -q
+```
+
+Exact output:
+
+```text
+........................................................................ [ 69%]
+...............................                                          [100%]
+103 passed in 3.95s
+```
+
+### Full affected suites
+
+Command:
+
+```text
+.venv/bin/python -m pytest tests/test_futu_quote.py tests/test_a_share_trend.py tests/test_a_share_trend_watch.py tests/test_market_trend_watch.py tests/test_kelly_order_execution.py tests/test_trend_market_controller.py tests/test_trend_review.py -q
+```
+
+Exact output:
+
+```text
+........................................................................ [ 11%]
+........................................................................ [ 23%]
+........................................................................ [ 34%]
+........................................................................ [ 46%]
+........................................................................ [ 58%]
+........................................................................ [ 69%]
+........................................................................ [ 81%]
+........................................................................ [ 93%]
+...........................................                              [100%]
+619 passed in 5.72s
+```
+
+### Full repository suite
+
+Command:
+
+```text
+.venv/bin/python -m pytest -q
+```
+
+Exact output:
+
+```text
+........................................................................ [  2%]
+........................................................................ [  4%]
+........................................................................ [  7%]
+........................................................................ [  9%]
+........................................................................ [ 12%]
+........................................................................ [ 14%]
+........................................................................ [ 16%]
+........................................................................ [ 19%]
+........................................................................ [ 21%]
+........................................................................ [ 24%]
+........................................................................ [ 26%]
+........................................................................ [ 28%]
+........................................................................ [ 31%]
+........................................................................ [ 33%]
+........................................................................ [ 36%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 43%]
+........................................................................ [ 45%]
+........................................................................ [ 48%]
+........................................................................ [ 50%]
+........................................................................ [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 57%]
+........................................................................ [ 60%]
+........................................................................ [ 62%]
+........................................................................ [ 65%]
+........................................................................ [ 67%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 77%]
+........................................................................ [ 79%]
+........................................................................ [ 82%]
+........................................................................ [ 84%]
+........................................................................ [ 86%]
+........................................................................ [ 89%]
+........................................................................ [ 91%]
+........................................................................ [ 94%]
+........................................................................ [ 96%]
+........................................................................ [ 98%]
+.................................                                        [100%]
+2985 passed in 86.61s (0:01:26)
+```
+
+### Follow-up verification boundary
+
+The focused controller workflow, controller suite, affected suites, and full
+repository suite passed. Live controller/OpenD/launchd/Screen checks and
+`make acceptance` remained intentionally out of scope because this task required
+controllers to remain stopped and prohibited live-process mutation.

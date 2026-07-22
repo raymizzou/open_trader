@@ -36,6 +36,7 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import (
     ExecutorGuardedOrderClient,
+    FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
 )
 from .market_trend import market_paths, run_market_trend_report
@@ -733,6 +734,9 @@ def _run_protection_pass(
             _path: Path, *, expected_date: str, timezone: ZoneInfo
         ) -> object:
             del timezone
+            _gate_futu_trade_context(
+                config, market, quote_client=quote_client
+            )
             return load_futu_simulate_trend_account(
                 host=config.futu_host,
                 port=config.futu_port,
@@ -1817,6 +1821,13 @@ def run_trend_market_controller(
         with suppress(Exception):
             close_client(failed_client)
 
+    def reset_account() -> None:
+        nonlocal account_client
+        failed_client = account_client
+        account_client = None
+        with suppress(Exception):
+            close_client(failed_client)
+
     def shared_account() -> object:
         nonlocal account_client
         if account_client is None:
@@ -1848,10 +1859,7 @@ def run_trend_market_controller(
                 account_client=client,
             )
         except Exception:
-            failed_client = account_client
-            account_client = None
-            with suppress(Exception):
-                close_client(failed_client)
+            reset_account()
             raise
 
     try:
@@ -2172,14 +2180,18 @@ def run_trend_market_controller(
                         config, market, cycle.as_of_date
                     ) is not None
                 ):
-                    _capture_close(
-                        config,
-                        market,
-                        cycle.as_of_date,
-                        quote_client=shared_quote(),
-                        account_client=account_client,
-                        account_client_factory=shared_account,
-                    )
+                    try:
+                        _capture_close(
+                            config,
+                            market,
+                            cycle.as_of_date,
+                            quote_client=shared_quote(),
+                            account_client=account_client,
+                            account_client_factory=shared_account,
+                        )
+                    except FutuOrderExecutionError:
+                        reset_account()
+                        raise
                     _complete_close(config, market, cycle.as_of_date, now)
                     if last_success is None or cycle.session == "closed":
                         last_success = {

@@ -18,6 +18,7 @@ from open_trader import a_share_trend as a_share_trend
 from open_trader import trend_market_controller as controller
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_symbols import to_futu_symbol
+from open_trader.kelly_order_execution import FutuOrderExecutionError
 from open_trader.trend_market_controller import (
     ControllerCycle,
     load_trend_market_status,
@@ -3658,6 +3659,70 @@ def test_run_protection_pass_returns_watcher_result(
     assert controller._run_protection_pass(config, "CN", "2026-07-20") is expected
 
 
+def test_default_protection_loader_gates_each_new_account_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    events: list[object] = []
+    quotes: list[object] = []
+
+    class Quote:
+        closed = False
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            events.append(("gate", kwargs))
+            if len(quotes) == 2:
+                raise controller.FutuQuoteError("quote protocol offline")
+            return ["2026-07-20"]
+
+        def close(self) -> None:
+            self.closed = True
+            events.append("close")
+
+    def quote_factory(**_kwargs: object) -> object:
+        quote = Quote()
+        quotes.append(quote)
+        return quote
+
+    def load_account(**_kwargs: object) -> object:
+        events.append("load")
+        return SimpleNamespace(positions=())
+
+    def watch(*, account_loader: Callable[..., object], **_kwargs: object) -> object:
+        account_loader(
+            config.portfolio,
+            expected_date="2026-07-20",
+            timezone=controller.TIMEZONES["CN"],
+        )
+        return account_loader(
+            config.portfolio,
+            expected_date="2026-07-20",
+            timezone=controller.TIMEZONES["CN"],
+        )
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", quote_factory)
+    monkeypatch.setattr(controller, "load_futu_simulate_trend_account", load_account)
+    monkeypatch.setattr(controller, "watch_a_share_protection", watch)
+
+    with pytest.raises(controller.FutuQuoteError, match="quote protocol offline"):
+        controller._run_protection_pass(config, "CN", "2026-07-20")
+
+    gate_calls = [event[1] for event in events if isinstance(event, tuple)]
+    assert [event if isinstance(event, str) else event[0] for event in events] == [
+        "gate",
+        "close",
+        "load",
+        "gate",
+        "close",
+    ]
+    assert all(call["use_cache"] is False for call in gate_calls)
+    assert len(quotes) == 2
+    assert all(quote.closed for quote in quotes)
+
+
 @pytest.mark.parametrize("market_open", [True, False])
 def test_abnormal_protection_result_disables_new_buys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market_open: bool
@@ -3849,6 +3914,119 @@ def test_controller_close_capture_borrows_readers_without_closing_or_recreating(
     assert captured[0]["benchmark"] is quote
     assert quote.closed is False
     assert account.closed is False
+
+
+def test_controller_close_capture_rebuilds_failed_shared_account_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    report_path, report = write_report(config)
+    report["metadata"]["simulate_acc_id"] = 101  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    cycle = replace(active_cn_cycle(), session="closed", market_open=False)
+    current = NOW
+    times = iter((NOW, NOW, NOW.replace(second=5), NOW.replace(second=10)))
+    account_clients: list[object] = []
+    gate_calls: list[dict[str, object]] = []
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            gate_calls.append(kwargs)
+            return ["2026-07-20"]
+
+        def close(self) -> None:
+            pass
+
+    class Account:
+        close_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            if self is account_clients[0]:
+                raise FutuOrderExecutionError(
+                    "shared account read failed", error_type="query_failed"
+                )
+            return {"acc_id": 101, "positions": []}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self is account_clients[0] and current == NOW:
+                raise RuntimeError("stale account close failed")
+
+    def account_factory(**_kwargs: object) -> object:
+        account = Account()
+        account_clients.append(account)
+        return account
+
+    def now_fn() -> datetime:
+        nonlocal current
+        current = next(times)
+        return current
+
+    def capture(**kwargs: object) -> None:
+        fact = controller._close_path(config, "CN", cycle.as_of_date)
+        fact.parent.mkdir(parents=True, exist_ok=True)
+        fact.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: Quote())
+    monkeypatch.setattr(
+        controller, "FutuSimulateOrderExecutionClient", account_factory
+    )
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda _config, _market, _now, **_kwargs: cycle,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
+    monkeypatch.setattr(controller, "benchmark_fact", lambda *_args: {})
+    monkeypatch.setattr(controller, "capture_trend_review_close", capture)
+    monkeypatch.setattr(
+        controller, "build_trend_review_projection", lambda *_args: None
+    )
+    blockers: list[object] = []
+
+    class StopController(RuntimeError):
+        pass
+
+    def stop_after_second_attempt(_seconds: float) -> None:
+        status = json.loads(
+            (config.data_dir / "trend_controller/CN/status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        blockers.append(status["blocker"])
+        if len(blockers) == 3:
+            raise StopController
+
+    with pytest.raises(StopController):
+        run_trend_market_controller(
+            config, "CN", now_fn=now_fn, sleep_fn=stop_after_second_attempt
+        )
+
+    assert blockers == [
+        "shared account read failed",
+        "shared account read failed",
+        None,
+    ]
+    assert len(account_clients) == 2
+    assert [client.close_calls for client in account_clients] == [1, 1]
+    assert len(gate_calls) == 2
 
 
 def test_fresh_zero_position_sell_writes_terminal_evidence(
