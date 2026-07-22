@@ -54,15 +54,57 @@ def _incident_path(data_dir: Path, category: OpenDCategory) -> Path:
     )
 
 
+def _timestamp(value: object, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    if allow_empty and not value:
+        return True
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _read(path: Path, category: OpenDCategory) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
+    reasons = payload.get("reasons") if isinstance(payload, dict) else None
+    attempts = (
+        payload.get("feishu_attempts") if isinstance(payload, dict) else None
+    )
+    delivered_at = (
+        payload.get("feishu_delivered_at") if isinstance(payload, dict) else None
+    )
+    channels = payload.get("channels") if isinstance(payload, dict) else None
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != SCHEMA
         or payload.get("category") != category
+        or not isinstance(payload.get("active"), bool)
+        or not _timestamp(payload.get("first_detected_at"))
+        or not _timestamp(payload.get("updated_at"))
+        or not isinstance(payload.get("affected_markets"), list)
+        or not all(isinstance(market, str) for market in payload["affected_markets"])
+        or not isinstance(reasons, dict)
+        or not all(
+            isinstance(market, str) and isinstance(reason, str)
+            for market, reason in reasons.items()
+        )
+        or not isinstance(payload.get("healthy_markets"), list)
+        or not all(isinstance(market, str) for market in payload["healthy_markets"])
+        or not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or not 0 <= attempts <= 2
+        or not _timestamp(delivered_at, allow_empty=True)
+        or not isinstance(channels, list)
+        or not all(isinstance(channel, str) for channel in channels)
+        or (
+            bool(delivered_at)
+            and not any(channel in {"feishu", "feishu_app"} for channel in channels)
+        )
     ):
         raise ValueError(f"invalid OpenD incident state: {path}")
     return payload
@@ -176,6 +218,11 @@ def record_opend_health(
                 path = _incident_path(data_dir, category)
                 state = _read(path, category)
                 if state is None or state.get("active") is not True:
+                    continue
+                first_detected_at = datetime.fromisoformat(
+                    str(state["first_detected_at"])
+                )
+                if observed_at <= first_detected_at:
                     continue
                 healthy = {str(item) for item in state["healthy_markets"]}
                 healthy.add(market)

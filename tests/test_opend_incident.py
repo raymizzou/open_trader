@@ -136,6 +136,36 @@ def test_recovery_waits_for_all_three_when_all_heartbeats_are_fresh(
     assert read_incident(tmp_path)["active"] is False
 
 
+def test_recovery_ignores_health_observed_before_incident_creation(
+    tmp_path: Path,
+) -> None:
+    write_controller_statuses(tmp_path, cn="09:59:50", hk="09:59:50", us="09:59:50")
+    create_active_incident(tmp_path, category="connectivity")
+    path = incident_path(tmp_path)
+    state = read_incident(tmp_path)
+    state["first_detected_at"] = "2026-07-22T10:00:00+08:00"
+    state["updated_at"] = "2026-07-22T10:00:00+08:00"
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    record_opend_health(
+        tmp_path, "CN", datetime.fromisoformat("2026-07-22T09:59:59+08:00")
+    )
+    record_opend_health(
+        tmp_path, "CN", datetime.fromisoformat("2026-07-22T10:00:00+08:00")
+    )
+
+    assert read_incident(tmp_path)["healthy_markets"] == []
+    assert read_incident(tmp_path)["active"] is True
+    for market in ("CN", "HK", "US"):
+        record_opend_health(
+            tmp_path,
+            market,
+            datetime.fromisoformat("2026-07-22T10:00:01+08:00"),
+        )
+
+    assert read_incident(tmp_path)["active"] is False
+
+
 def test_categories_are_separate_and_each_stops_after_one_retry(
     tmp_path: Path,
 ) -> None:
@@ -201,4 +231,26 @@ def test_malformed_incident_state_raises_for_controller_fallback(
             reason="连接超时",
             occurred_at=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
             send_feishu=lambda _title, _message: "feishu_app",
+        )
+
+
+def test_invalid_delivered_timestamp_in_valid_header_raises_for_fallback(
+    tmp_path: Path,
+) -> None:
+    create_active_incident(tmp_path, category="connectivity")
+    path = incident_path(tmp_path)
+    state = read_incident(tmp_path)
+    state["feishu_delivered_at"] = "untrusted timestamp"
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(OpenDIncidentStateError):
+        record_opend_failure(
+            data_dir=tmp_path,
+            market="HK",
+            category="connectivity",
+            reason="连接超时",
+            occurred_at=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+            send_feishu=lambda _title, _message: pytest.fail(
+                "invalid state must not suppress fallback"
+            ),
         )
