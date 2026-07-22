@@ -652,8 +652,36 @@ def _generate_report(
         raise RuntimeError(f"{market} trend report generation returned {result.status}")
 
 
-def _new_order_client(config: DailyPremarketConfig, market: str) -> object:
+def _gate_futu_trade_context(
+    config: DailyPremarketConfig,
+    market: str,
+    *,
+    quote_client: object | None = None,
+) -> None:
+    owns_quote = quote_client is None
+    quote = quote_client
+    if quote is None:
+        quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+    try:
+        trading_date = datetime.now(TIMEZONES[market]).date().isoformat()
+        quote.get_trading_days(
+            market=market,
+            start=trading_date,
+            end=trading_date,
+            use_cache=False,
+        )
+    finally:
+        if owns_quote:
+            quote.close()
+
+
+def _new_order_client(
+    config: DailyPremarketConfig,
+    market: str,
+    quote_client: object | None = None,
+) -> object:
     account_id = require_trend_review_config(config, market)
+    _gate_futu_trade_context(config, market, quote_client=quote_client)
     return ExecutorGuardedOrderClient(
         FutuSimulateOrderExecutionClient(
             host=config.futu_host,
@@ -669,8 +697,10 @@ def _run_stop(
     config: DailyPremarketConfig,
     market: str,
     event: Mapping[str, object],
+    *,
+    quote_client: object | None = None,
 ) -> None:
-    client = _new_order_client(config, market)
+    client = _new_order_client(config, market, quote_client)
     try:
         execute_trend_review_stop(
             data_dir=config.data_dir,
@@ -715,7 +745,9 @@ def _run_protection_pass(
         host=config.futu_host,
         port=config.futu_port,
     )
-    callback = lambda event: _run_stop(config, market, event)
+    callback = lambda event: _run_stop(
+        config, market, event, quote_client=quote_client
+    )
     if market == "CN":
         return watch_a_share_protection(
             portfolio_path=config.portfolio,
@@ -781,6 +813,7 @@ def _execute_locked_report(
     report: Mapping[str, object],
     *,
     allow_new_buys: bool = True,
+    quote_client: object | None = None,
 ) -> dict[str, object]:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     now = datetime.now(TIMEZONES[market]).isoformat(timespec="seconds")
@@ -851,22 +884,27 @@ def _execute_locked_report(
             if allow_new_buys and action["action"] == "BUY"
         }
     )
-    quote = None
+    quote = quote_client
+    owns_quote = False
     prices: dict[str, Decimal] = {}
     client = None
     try:
         if symbols:
             try:
-                quote = FutuQuoteClient(
-                    host=config.futu_host, port=config.futu_port
-                )
+                if quote is None:
+                    quote = FutuQuoteClient(
+                        host=config.futu_host, port=config.futu_port
+                    )
+                    owns_quote = True
                 prices = {
                     symbol: snapshot.last_price
                     for symbol, snapshot in quote.get_snapshots(symbols).items()
                 }
             except Exception:
                 prices = {}
-        client = _new_order_client(config, market)
+        client = _new_order_client(
+            config, market, quote_client if quote_client is not None else quote
+        )
         execution = execute_trend_review_open(
             data_dir=config.data_dir,
             report=locked_report,
@@ -880,14 +918,20 @@ def _execute_locked_report(
             raise RuntimeError("current quote unavailable for pending trend buy")
         return execution
     finally:
-        if quote is not None:
+        if quote is not None and owns_quote:
             quote.close()
         if client is not None:
             client.close()
 
 
 def _capture_close(
-    config: DailyPremarketConfig, market: str, trading_date: str
+    config: DailyPremarketConfig,
+    market: str,
+    trading_date: str,
+    *,
+    quote_client: object | None = None,
+    account_client: object | None = None,
+    account_client_factory: Callable[[], object] | None = None,
 ) -> None:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     path = _close_path(config, market, trading_date)
@@ -898,11 +942,19 @@ def _capture_close(
     if report_item is None:
         raise FileNotFoundError(f"no {market} trend report for {trading_date}")
     _, report = report_item
-    quote = None
-    client = None
+    quote = quote_client
+    client = account_client
+    owns_quote = quote is None
+    owns_client = client is None and account_client_factory is None
     try:
-        quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-        client = _new_order_client(config, market)
+        if quote is None:
+            quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+        if client is None:
+            client = (
+                account_client_factory()
+                if account_client_factory is not None
+                else _new_order_client(config, market, quote)
+            )
         capture_trend_review_close(
             data_dir=config.data_dir,
             market=market,
@@ -914,9 +966,9 @@ def _capture_close(
         )
         build_trend_review_projection(config.data_dir, market)
     finally:
-        if quote is not None:
+        if quote is not None and owns_quote:
             quote.close()
-        if client is not None:
+        if client is not None and owns_client:
             client.close()
 
 
@@ -1765,27 +1817,35 @@ def run_trend_market_controller(
         with suppress(Exception):
             close_client(failed_client)
 
-    def load_account(
-        _path: Path, *, expected_date: str, timezone: ZoneInfo
-    ) -> object:
+    def shared_account() -> object:
         nonlocal account_client
-        del timezone
-        account_id = require_trend_review_config(config, market)
         if account_client is None:
+            account_id = require_trend_review_config(config, market)
+            _gate_futu_trade_context(
+                config, market, quote_client=shared_quote()
+            )
             account_client = FutuSimulateOrderExecutionClient(
                 host=config.futu_host,
                 port=config.futu_port,
                 simulate_acc_id=account_id,
                 trd_market=market,
             )
+        return account_client
+
+    def load_account(
+        _path: Path, *, expected_date: str, timezone: ZoneInfo
+    ) -> object:
+        nonlocal account_client
+        del timezone
         try:
+            client = shared_account()
             return load_futu_simulate_trend_account(
                 host=config.futu_host,
                 port=config.futu_port,
-                simulate_acc_id=account_id,
+                simulate_acc_id=require_trend_review_config(config, market),
                 market=market,
                 expected_date=expected_date,
-                account_client=account_client,
+                account_client=client,
             )
         except Exception:
             failed_client = account_client
@@ -2044,6 +2104,7 @@ def run_trend_market_controller(
                             selected[0],
                             selected[1],
                             allow_new_buys=False,
+                            quote_client=shared_quote(),
                         )
                     else:
                         execution = _execute_locked_report(
@@ -2052,6 +2113,7 @@ def run_trend_market_controller(
                             work_cycle.execution_date,
                             selected[0],
                             selected[1],
+                            quote_client=shared_quote(),
                         )
                     last_success = execution
                     operation_failures = 0
@@ -2110,7 +2172,14 @@ def run_trend_market_controller(
                         config, market, cycle.as_of_date
                     ) is not None
                 ):
-                    _capture_close(config, market, cycle.as_of_date)
+                    _capture_close(
+                        config,
+                        market,
+                        cycle.as_of_date,
+                        quote_client=shared_quote(),
+                        account_client=account_client,
+                        account_client_factory=shared_account,
+                    )
                     _complete_close(config, market, cycle.as_of_date, now)
                     if last_success is None or cycle.session == "closed":
                         last_success = {

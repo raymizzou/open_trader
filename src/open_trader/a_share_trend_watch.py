@@ -433,7 +433,9 @@ def watch_a_share_protection(
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
-            recover_monitor()
+            snapshots_complete = comparable.keys() <= snapshots.keys()
+            if snapshots_complete:
+                recover_monitor()
 
             for futu_symbol, (symbol, active_line) in comparable.items():
                 snapshot = snapshots.get(futu_symbol)
@@ -508,7 +510,7 @@ def watch_a_share_protection(
                     )
 
             if once:
-                return outcome("completed")
+                return outcome("completed" if snapshots_complete else "abnormal")
             sleep_fn(poll_seconds)
             now = now_fn()
     finally:

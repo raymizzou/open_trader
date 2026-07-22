@@ -426,6 +426,41 @@ def test_trading_day_cache_refreshes_after_five_minutes() -> None:
         _clear_trading_days_cache()
 
 
+def test_trading_day_cache_can_be_bypassed_for_protocol_gate() -> None:
+    class ChangingCalendarContext(FakeOpenQuoteContext):
+        def request_trading_days(
+            self, *, market: object, start: str, end: str
+        ) -> tuple[int, object]:
+            self.calendar_calls = getattr(self, "calendar_calls", 0) + 1
+            return 0, [{"time": f"2026-07-{13 + self.calendar_calls}"}]
+
+    _clear_trading_days_cache()
+    client = FutuQuoteClient(
+        host="127.0.0.1",
+        port=11111,
+        context_factory=ChangingCalendarContext,
+        connectivity_checker=lambda host, port: True,
+    )
+
+    try:
+        assert client.get_trading_days(
+            market="US", start="2026-07-14", end="2026-07-20"
+        ) == ["2026-07-14"]
+        assert client.get_trading_days(
+            market="US",
+            start="2026-07-14",
+            end="2026-07-20",
+            use_cache=False,
+        ) == ["2026-07-15"]
+        assert client.get_trading_days(
+            market="US", start="2026-07-14", end="2026-07-20"
+        ) == ["2026-07-15"]
+        assert client.context.calendar_calls == 2
+    finally:
+        client.close()
+        _clear_trading_days_cache()
+
+
 def test_trading_day_cache_does_not_cache_failures() -> None:
     class RecoveringCalendarContext(FakeOpenQuoteContext):
         def request_trading_days(

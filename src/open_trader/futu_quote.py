@@ -205,10 +205,21 @@ class FutuQuoteClient:
             snapshot_ok=error_type == "market_state_failed",
         )
 
-    def get_cn_trading_days(self, *, start: str, end: str) -> list[str]:
-        return self.get_trading_days(market="CN", start=start, end=end)
+    def get_cn_trading_days(
+        self, *, start: str, end: str, use_cache: bool = True
+    ) -> list[str]:
+        return self.get_trading_days(
+            market="CN", start=start, end=end, use_cache=use_cache
+        )
 
-    def get_trading_days(self, *, market: str, start: str, end: str) -> list[str]:
+    def get_trading_days(
+        self,
+        *,
+        market: str,
+        start: str,
+        end: str,
+        use_cache: bool = True,
+    ) -> list[str]:
         normalized_market = market.strip().upper()
         if normalized_market not in {"CN", "HK", "US"}:
             raise ValueError(f"unsupported Futu market: {market}")
@@ -221,12 +232,13 @@ class FutuQuoteClient:
             end,
         )
         now = self._monotonic_fn()
-        cached = _TRADING_DAYS_CACHE.get(cache_key)
-        if cached is not None:
-            expires_at, trading_days = cached
-            if expires_at > now:
-                return list(trading_days)
-            del _TRADING_DAYS_CACHE[cache_key]
+        if use_cache:
+            cached = _TRADING_DAYS_CACHE.get(cache_key)
+            if cached is not None:
+                expires_at, trading_days = cached
+                if expires_at > now:
+                    return list(trading_days)
+                del _TRADING_DAYS_CACHE[cache_key]
         try:
             from futu import TradeDateMarket
 

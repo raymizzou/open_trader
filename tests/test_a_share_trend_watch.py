@@ -401,6 +401,53 @@ def test_once_watcher_recovers_after_snapshot_outage_ends(tmp_path: Path) -> Non
     ]
 
 
+def test_once_watcher_waits_for_complete_snapshots_before_recovery(
+    tmp_path: Path,
+) -> None:
+    portfolio_path = portfolio(tmp_path)
+    state_path = state(tmp_path)
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingNotifier()
+
+    def watch(snapshot: dict[str, Decimal] | Exception) -> object:
+        return watch_a_share_protection(
+            portfolio_path=portfolio_path,
+            state_path=state_path,
+            events_path=events_path,
+            quote_client=SequenceQuote([snapshot]),
+            close_quote_client=False,
+            notifier=notifier,
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: datetime.fromisoformat("2026-07-15T09:31:00+08:00"),
+        )
+
+    with pytest.raises(FutuQuoteError, match="snapshot offline"):
+        watch(interrupted("snapshot offline"))
+
+    assert watch({}).status == "abnormal"
+    assert watch({}).status == "abnormal"
+    assert [
+        event["event_type"]
+        for event in read_events(events_path)
+        if str(event["event_type"]).startswith("monitor_")
+    ] == ["monitor_interrupted"]
+    assert [
+        title for title, _ in notifier.messages if "监控" in title
+    ] == ["A股价格监控中断"]
+
+    assert watch({"SH.600900": Decimal("28")}).status == "completed"
+    assert [
+        event["event_type"]
+        for event in read_events(events_path)
+        if str(event["event_type"]).startswith("monitor_")
+    ] == ["monitor_interrupted", "monitor_recovered"]
+    assert [
+        title for title, _ in notifier.messages if "监控" in title
+    ] == ["A股价格监控中断", "A股价格监控恢复"]
+
+
 def test_once_watcher_returns_abnormal_when_account_snapshot_fails(
     tmp_path: Path,
 ) -> None:

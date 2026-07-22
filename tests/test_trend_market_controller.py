@@ -243,6 +243,98 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
     assert account_clients[0].closed is True
 
 
+def test_new_order_client_does_not_construct_trade_context_when_gate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    calls: list[dict[str, object]] = []
+
+    class DeadQuote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            calls.append(kwargs)
+            raise controller.FutuQuoteError("quote protocol offline")
+
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: pytest.fail("dead gate constructed trade context"),
+    )
+
+    with pytest.raises(controller.FutuQuoteError, match="quote protocol offline"):
+        controller._new_order_client(config, "CN", quote_client=DeadQuote())
+
+    assert calls == [{
+        "market": "CN",
+        "start": calls[0]["end"],
+        "end": calls[0]["end"],
+        "use_cache": False,
+    }]
+
+
+def test_controller_lazy_account_does_not_construct_trade_context_when_gate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    gate_calls: list[dict[str, object]] = []
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            gate_calls.append(kwargs)
+            raise controller.FutuQuoteError("quote protocol offline")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: Quote())
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: pytest.fail("dead gate constructed account context"),
+    )
+
+    def protect(
+        _config: DailyPremarketConfig,
+        _market: str,
+        day: str,
+        *,
+        account_loader: Callable[..., object],
+        **_kwargs: object,
+    ) -> object:
+        return account_loader(
+            config.portfolio,
+            expected_date=day,
+            timezone=controller.TIMEZONES["CN"],
+        )
+
+    monkeypatch.setattr(controller, "_run_protection_pass", protect)
+    monkeypatch.setattr(
+        controller, "_derive_cycle", lambda *_args, **_kwargs: active_cn_cycle()
+    )
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "blocked"
+    assert gate_calls[0]["use_cache"] is False
+
+
 def test_controller_rebuilds_shared_clients_after_reader_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -449,7 +541,9 @@ def test_controller_rebuilds_account_when_failed_account_close_raises(
     monkeypatch.setattr(
         controller,
         "FutuQuoteClient",
-        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+        lambda **_kwargs: SimpleNamespace(
+            get_trading_days=lambda **_query: [], close=lambda: None
+        ),
     )
     monkeypatch.setattr(
         controller, "FutuSimulateOrderExecutionClient", account_factory
@@ -515,6 +609,9 @@ def test_controller_shutdown_attempts_every_cleanup_after_close_failure(
     cleanup: list[str] = []
 
     class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return []
+
         def close(self) -> None:
             cleanup.append("quote")
 
@@ -702,7 +799,9 @@ def patch_controller_quote(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         controller,
         "FutuQuoteClient",
-        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+        lambda **_kwargs: SimpleNamespace(
+            get_trading_days=lambda **_query: [], close=lambda: None
+        ),
     )
 
 
@@ -721,7 +820,10 @@ def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None
     )
 
     def capture(
-        config: DailyPremarketConfig, market: str, trading_date: str
+        config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         path = (
             config.data_dir
@@ -774,13 +876,16 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, market, day, path, report: calls.append(
+        lambda _config, market, day, path, report, **_kwargs: calls.append(
             ("execute", market, (day, path.name))
         )
         or {"status": "submitted", "submitted_count": 1},
     )
     def capture_close(
-        _config: DailyPremarketConfig, market: str, day: str
+        _config: DailyPremarketConfig,
+        market: str,
+        day: str,
+        **_kwargs: object,
     ) -> None:
         calls.append(("close", market, day))
         path = config.data_dir / "trend_review/daily" / market / f"{day}.json"
@@ -835,7 +940,7 @@ def test_report_failure_before_freeze_retries_same_logical_dates(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
 
     first = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
@@ -914,7 +1019,10 @@ def test_report_blocker_remains_visible_when_close_capture_fails(
     close_attempts: list[str] = []
 
     def capture_close(
-        _config: DailyPremarketConfig, _market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        _market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         close_attempts.append(trading_date)
         raise RuntimeError("close unavailable")
@@ -1000,7 +1108,10 @@ def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
         lambda *_args, **_kwargs: failed.wait(timeout=1),
     )
     def capture_close(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         path = (
             config.data_dir
@@ -1087,7 +1198,7 @@ def test_restart_after_report_freeze_does_not_regenerate(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
 
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
@@ -1113,7 +1224,9 @@ def test_report_is_not_locked_or_executed_before_market_opens(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: pytest.fail("report executed before the market opened"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "report executed before the market opened"
+        ),
     )
 
     before_open = datetime.fromisoformat("2026-07-20T09:00:00+08:00")
@@ -1152,7 +1265,7 @@ def test_report_recovery_during_session_keeps_protection_ticks_running(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
 
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
@@ -1194,7 +1307,7 @@ def test_heartbeat_is_written_before_slow_reconciliation_work(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
 
     result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
@@ -1214,7 +1327,7 @@ def test_controller_process_version_is_fixed_across_status_updates(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
     version_calls = 0
 
@@ -1301,11 +1414,14 @@ def test_heartbeat_refreshes_before_each_calendar_call(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
 
     def capture_close(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         path = (
             config.data_dir
@@ -1354,7 +1470,7 @@ def test_report_finished_after_window_is_preserved_and_actions_become_missed(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, _market, _day, path, _report: calls.append(path)
+        lambda _config, _market, _day, path, _report, **_kwargs: calls.append(path)
         or {"status": "missed_window", "submitted_count": 0},
     )
 
@@ -1419,12 +1535,14 @@ def test_report_future_keeps_its_execution_date_when_cycle_advances(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, _market, execution_date, _path, _report: executed.append(
+        lambda _config, _market, execution_date, _path, _report, **_kwargs: executed.append(
             execution_date
         )
         or {"status": "missed_window", "submitted_count": 0},
     )
-    monkeypatch.setattr(controller, "_capture_close", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_capture_close", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
     sleeps = 0
 
@@ -1473,7 +1591,7 @@ def test_later_revision_does_not_change_locked_batch(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, _market, _date, path, _report: executed.append(path)
+        lambda _config, _market, _date, path, _report, **_kwargs: executed.append(path)
         or {"status": "unchanged", "submitted_count": 0},
     )
     monkeypatch.setattr(
@@ -1585,7 +1703,7 @@ def test_controller_restart_reconciles_existing_futu_order_without_submit(
     )
     calls = 0
 
-    def execute(*_args: object) -> dict[str, object]:
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
         nonlocal calls
         calls += 1
         return {"status": "unchanged", "submitted_count": 0, "repaired_count": 1}
@@ -1754,7 +1872,7 @@ def test_broker_failure_uses_bounded_backoff_without_stopping_protection(
 
     attempts: list[datetime] = []
 
-    def execute(*_args: object) -> dict[str, object]:
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
         attempts.append(current)
         if len(attempts) == 1:
             raise RuntimeError("broker offline")
@@ -1797,12 +1915,15 @@ def test_close_capture_is_recovered_once_after_session_close(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "missed_window", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "missed_window", "submitted_count": 0},
     )
     calls = 0
 
     def capture(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         nonlocal calls
         calls += 1
@@ -1916,7 +2037,9 @@ def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle
     monkeypatch.setattr(
         controller, "_run_protection_pass", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(controller, "_capture_close", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_capture_close", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
 
     def execute(
@@ -1925,6 +2048,7 @@ def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle
         execution_date: str,
         path: Path,
         report: dict[str, object],
+        **_kwargs: object,
     ) -> dict[str, object]:
         lock_trend_execution_batch(
             config.data_dir,
@@ -2036,6 +2160,7 @@ def test_restart_after_batch_lock_reconciles_prior_until_missed_fact(
         execution_date: str,
         _path: Path,
         _report: dict[str, object],
+        **_kwargs: object,
     ) -> dict[str, object]:
         assert execution_date == prior.execution_date
         action_key = trend_action_key(
@@ -2077,7 +2202,9 @@ def test_restart_after_batch_lock_reconciles_prior_until_missed_fact(
     monkeypatch.setattr(
         controller, "_run_protection_pass", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(controller, "_capture_close", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_capture_close", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
     after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
 
@@ -2123,7 +2250,7 @@ def test_next_morning_reconciles_unfinished_prior_batch(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, _market, execution_date, _path, _report: executed.append(
+        lambda _config, _market, execution_date, _path, _report, **_kwargs: executed.append(
             execution_date
         )
         or {"status": "missed_window", "submitted_count": 0},
@@ -2134,7 +2261,10 @@ def test_next_morning_reconciles_unfinished_prior_batch(
     captured: list[str] = []
 
     def capture(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         captured.append(trading_date)
         path = (
@@ -2208,7 +2338,7 @@ def test_weekend_reconciles_unfinished_prior_batch(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, _market, execution_date, _path, _report: executed.append(
+        lambda _config, _market, execution_date, _path, _report, **_kwargs: executed.append(
             execution_date
         )
         or {"status": "missed_window", "submitted_count": 0},
@@ -2216,7 +2346,10 @@ def test_weekend_reconciles_unfinished_prior_batch(
     captured: list[str] = []
 
     def capture(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         captured.append(trading_date)
         path = (
@@ -2274,7 +2407,10 @@ def test_active_session_restart_recovers_prior_close_after_protection(
         return protection_success()
 
     def capture(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         calls.append(("close", trading_date))
         path = (
@@ -2294,7 +2430,7 @@ def test_active_session_restart_recovers_prior_close_after_protection(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: {"status": "unchanged", "submitted_count": 0},
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
     )
 
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
@@ -2871,7 +3007,10 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
         generated_ready.set()
 
     def capture_close(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         fact = controller._close_path(config, market, trading_date)
         fact.parent.mkdir(parents=True, exist_ok=True)
@@ -2986,7 +3125,9 @@ def test_pending_revision_does_not_lock_or_execute_the_base_report(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: pytest.fail("base report executed while revision was pending"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "base report executed while revision was pending"
+        ),
     )
 
     result = run_trend_market_controller(
@@ -3061,7 +3202,7 @@ def test_revision_replaces_invalid_frozen_report_before_execution(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda _config, _market, _date, path, _report: executed.append(path)
+        lambda _config, _market, _date, path, _report, **_kwargs: executed.append(path)
         or {"status": "unchanged", "submitted_count": 0},
     )
 
@@ -3094,7 +3235,9 @@ def test_malformed_expected_frozen_report_blocks_without_regeneration(
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
-        lambda *_args: pytest.fail("malformed frozen report was executed"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "malformed frozen report was executed"
+        ),
     )
 
     result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
@@ -3164,7 +3307,10 @@ def test_controller_recovers_failed_delivery_for_valid_frozen_report(
         lambda *_args, **_kwargs: protection_success(),
     )
     def capture_delivery_close(
-        _config: DailyPremarketConfig, market: str, trading_date: str
+        _config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
     ) -> None:
         path = (
             config.data_dir
@@ -3535,7 +3681,9 @@ def test_abnormal_protection_result_disables_new_buys(
     allow_flags: list[bool] = []
 
     def execute(
-        *_args: object, allow_new_buys: bool = True
+        *_args: object,
+        allow_new_buys: bool = True,
+        **_kwargs: object,
     ) -> dict[str, object]:
         allow_flags.append(allow_new_buys)
         return {"status": "unchanged", "submitted_count": 0}
@@ -3636,6 +3784,71 @@ def test_capture_close_closes_quote_if_order_client_construction_fails(
         controller._capture_close(config, "CN", "2026-07-17")
 
     assert quote.closed is True
+
+
+def test_controller_close_capture_borrows_readers_without_closing_or_recreating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    captured: list[dict[str, object]] = []
+
+    class Quote:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Account:
+        closed = False
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"acc_id": 101, "positions": []}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def close(self) -> None:
+            self.closed = True
+
+    quote = Quote()
+    account = Account()
+    monkeypatch.setattr(
+        controller,
+        "FutuQuoteClient",
+        lambda **_kwargs: pytest.fail("borrowed close capture opened quote"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_new_order_client",
+        lambda *_args, **_kwargs: pytest.fail(
+            "borrowed close capture opened order wrapper"
+        ),
+    )
+    monkeypatch.setattr(controller, "benchmark_fact", lambda client, *_args: client)
+    monkeypatch.setattr(
+        controller,
+        "capture_trend_review_close",
+        lambda **kwargs: captured.append(kwargs),
+    )
+    monkeypatch.setattr(
+        controller, "build_trend_review_projection", lambda *_args: None
+    )
+
+    controller._capture_close(
+        config,
+        "CN",
+        "2026-07-17",
+        quote_client=quote,
+        account_client=account,
+    )
+
+    assert captured[0]["simulate_snapshot"] == {"acc_id": 101, "positions": []}
+    assert captured[0]["orders"] == []
+    assert captured[0]["benchmark"] is quote
+    assert quote.closed is False
+    assert account.closed is False
 
 
 def test_fresh_zero_position_sell_writes_terminal_evidence(
