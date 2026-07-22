@@ -1605,7 +1605,7 @@ def load_trend_action_audit(
         status = event.get("status")
         if status == "missed" and facts:
             raise ValueError("invalid trend action event evidence")
-        if status != "filled" and not (
+        if status not in {"filled", "partially_filled"} and not (
             status == "incomplete"
             and event.get("reason") == "position_zero_confirmed"
         ):
@@ -1637,14 +1637,15 @@ def load_trend_action_audit(
             or target_qty != expected_target
         ):
             raise ValueError("invalid trend action event evidence")
-        if status == "filled":
+        if status in {"filled", "partially_filled"}:
             frozen_target = _required_decimal(
                 action.get("estimated_shares"), "estimated shares"
             ) if side == "buy" else expected_target
             if (
                 not requests
                 or not broker_order_ids
-                or filled_qty < target_qty
+                or (status == "filled" and filled_qty < target_qty)
+                or (status == "partially_filled" and filled_qty >= target_qty)
                 or target_qty > frozen_target
             ):
                 raise ValueError("invalid trend action event evidence")
@@ -1665,6 +1666,194 @@ def load_trend_action_audit(
         action_attempts={item[3] for item in facts},
     )
     return events, resolutions
+
+
+def overheat_trim_progress(
+    data_dir: Path,
+    *,
+    market: str,
+    symbol: str,
+    position_started_for: str,
+) -> dict[str, object]:
+    """Rebuild one partial-sell lifecycle from validated immutable facts."""
+    market = _market(market)
+    symbol = symbol.strip()
+    position_started_for = date.fromisoformat(position_started_for).isoformat()
+    if not symbol:
+        raise ValueError("trend action identity is invalid")
+    from .futu_symbols import to_futu_symbol
+
+    futu_code = to_futu_symbol(market, symbol)
+    ledger = data_dir / "trend_review" / "ledgers" / market
+    action_dates = ledger / "actions"
+    targets: set[Decimal] = set()
+    dealt_by_order: dict[str, Decimal] = {}
+    below_lot = False
+    source_paths: list[str] = []
+    for date_root in sorted(action_dates.glob("*")):
+        if not date_root.is_dir():
+            continue
+        try:
+            execution_date = date.fromisoformat(date_root.name).isoformat()
+        except ValueError:
+            continue
+        action_key = trend_action_key(market, execution_date, futu_code, "sell")
+        action_root = date_root / action_key
+        if not action_root.is_dir():
+            continue
+        if not (ledger / "batches" / f"{execution_date}.json").is_file():
+            continue
+        events, _ = load_trend_action_audit(
+            data_dir,
+            market=market,
+            execution_date=execution_date,
+            symbol=symbol,
+            side="sell",
+        )
+        _, _, action, _ = _locked_action_context(
+            data_dir,
+            market=market,
+            execution_date=execution_date,
+            symbol=symbol,
+            side="sell",
+        )
+        if (
+            action.get("action") != "SELL_PARTIAL"
+            or action.get("position_started_for") != position_started_for
+        ):
+            continue
+        source_paths.append(str(action_root.relative_to(data_dir)))
+        facts = _action_facts(
+            ledger / "open" / execution_date,
+            futu_code=futu_code,
+            side="sell",
+        )
+        payloads = [item[1] for item in facts] + events
+        for payload in payloads:
+            if payload.get("sell_goal") != "partial_30":
+                raise ValueError("invalid overheat trim lifecycle fact")
+            if payload.get("position_started_for") != position_started_for:
+                raise ValueError("invalid overheat trim lifecycle fact")
+            try:
+                targets.add(
+                    _required_decimal(
+                        payload.get("lifecycle_target_qty"),
+                        "lifecycle target quantity",
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError("invalid overheat trim lifecycle fact") from exc
+        if any(event.get("status") == "below_lot" for event in events):
+            below_lot = True
+        for event in events:
+            if event.get("status") not in {"filled", "partially_filled"}:
+                continue
+            observation = event.get("observation_path")
+            if not isinstance(observation, str):
+                raise ValueError("invalid overheat trim lifecycle fact")
+            observation_path = ledger / "open" / execution_date / observation
+            try:
+                payload = json.loads(observation_path.read_text(encoding="utf-8"))
+                orders = payload["orders"]
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+            ) as exc:
+                raise ValueError("invalid overheat trim lifecycle fact") from exc
+            if not isinstance(orders, list):
+                raise ValueError("invalid overheat trim lifecycle fact")
+            for order in orders:
+                if not isinstance(order, Mapping):
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                order_id = str(order.get("order_id") or "").strip()
+                if not order_id:
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                dealt_by_order[order_id] = max(
+                    dealt_by_order.get(order_id, Decimal("0")),
+                    _required_decimal(
+                        order.get("dealt_qty", "0"), "broker dealt quantity"
+                    ),
+                )
+    if len(targets) > 1:
+        raise ValueError("conflicting overheat trim lifecycle targets")
+    target = next(iter(targets), Decimal("0"))
+    filled = sum(dealt_by_order.values(), start=Decimal("0"))
+    if filled > target:
+        raise ValueError("overheat trim fills exceed lifecycle target")
+    status = (
+        "below_lot"
+        if below_lot
+        else "complete"
+        if target and filled >= target
+        else "pending"
+    )
+    return {
+        "lifecycle_target_qty": format(target, "f"),
+        "filled_qty": format(filled, "f"),
+        "status": status,
+        "source_paths": source_paths,
+    }
+
+
+def rebuild_overheat_trim_projection(
+    data_dir: Path,
+    *,
+    market: str,
+    state_path: Path,
+) -> dict[str, object]:
+    """Persist only derived trim fields; immutable action facts stay authoritative."""
+    from .a_share_trend import load_protection_state, write_protection_state
+
+    state = load_protection_state(state_path)
+    positions = state.get("positions")
+    if not isinstance(positions, dict):
+        raise ValueError("protection state positions must be an object")
+    rebuilt_positions: dict[str, object] = {}
+    rebuilt = {"schema_version": 1, "positions": rebuilt_positions}
+    changed = False
+    for symbol, raw_state in positions.items():
+        if not isinstance(raw_state, Mapping):
+            raise ValueError(f"protection state for {symbol} must be an object")
+        position = dict(raw_state)
+        started_for = position.get("position_started_for")
+        if not isinstance(started_for, str) or not started_for:
+            rebuilt_positions[symbol] = position
+            continue
+        progress = overheat_trim_progress(
+            data_dir,
+            market=market,
+            symbol=symbol,
+            position_started_for=started_for,
+        )
+        fields = {
+            "overheat_trim_status": progress["status"],
+            "overheat_trim_target_qty": progress["lifecycle_target_qty"],
+            "overheat_trim_filled_qty": progress["filled_qty"],
+            "overheat_trim_started_for": started_for,
+        }
+        if progress["lifecycle_target_qty"] == "0" and not progress["source_paths"]:
+            fields = {}
+        for key in (
+            "overheat_trim_status",
+            "overheat_trim_target_qty",
+            "overheat_trim_filled_qty",
+            "overheat_trim_started_for",
+        ):
+            if key not in fields:
+                changed = changed or key in position
+                position.pop(key, None)
+        if fields:
+            changed = changed or any(
+                position.get(key) != value for key, value in fields.items()
+            )
+            position.update(fields)
+        rebuilt_positions[symbol] = position
+    if changed:
+        write_protection_state(state_path, rebuilt)
+    return rebuilt
 
 
 def resolve_trend_action(
@@ -2156,9 +2345,33 @@ def execute_trend_review_open(
             / action_key
         )
         action_facts = _action_facts(root, futu_code=futu_code, side=side)
-        if action_name == "SELL_PARTIAL" and action_facts:
-            continue
         partial_metadata: dict[str, object] = {}
+        if action_name == "SELL_PARTIAL":
+            progress = overheat_trim_progress(
+                data_dir,
+                market=market,
+                symbol=symbol,
+                position_started_for=str(action["position_started_for"]),
+            )
+            lifecycle_target = _required_decimal(
+                progress["lifecycle_target_qty"], "lifecycle target quantity"
+            )
+            lifecycle_filled = _required_decimal(
+                progress["filled_qty"], "lifecycle filled quantity"
+            )
+            if lifecycle_target > 0 or progress["source_paths"]:
+                partial_metadata = {
+                    "sell_goal": "partial_30",
+                    "position_started_for": str(action["position_started_for"]),
+                    "lifecycle_target_qty": format(lifecycle_target, "f"),
+                }
+                action_evidence = {**action_evidence, **partial_metadata}
+                sell_quantity = int(lifecycle_target - lifecycle_filled)
+                if (
+                    progress["status"] in {"complete", "below_lot"}
+                    or sell_quantity <= 0
+                ):
+                    continue
         resolutions = _action_resolutions(
             action_events_root,
             market=market,
@@ -2231,12 +2444,14 @@ def execute_trend_review_open(
             else 0
         )
         if action_name == "SELL_PARTIAL":
+            if partial_metadata:
+                sell_quantity = int(lifecycle_target - lifecycle_filled)
             if any(
                 event.get("status") == "below_lot"
                 for event in _action_events(action_events_root)
             ):
                 continue
-            if not action_facts:
+            if not action_facts and not partial_metadata:
                 try:
                     live_positions = _positive_positions(snapshot)
                     matching_positions = [
@@ -2675,7 +2890,7 @@ def execute_trend_review_open(
                             orders=matched,
                             recorded_at=now,
                         )
-                        if position_zero or filled >= target_quantity
+                        if position_zero or filled > 0
                         else {}
                     )
                     _write_action_event(
@@ -2722,6 +2937,8 @@ def execute_trend_review_open(
                             active_line=protection_fact["active_protection_line"],
                         )
                 if remaining <= 0:
+                    continue
+                if action_name == "SELL_PARTIAL":
                     continue
                 if action_name == "BUY" and buy_window_event:
                     event_status, event_reason = buy_window_event
@@ -3013,6 +3230,8 @@ def execute_trend_review_open(
         )
         artifacts.append(str(result_path))
         submitted += 1
+    state_path = data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
+    rebuild_overheat_trim_projection(data_dir, market=market, state_path=state_path)
     return {
         "status": (
             blocked_status

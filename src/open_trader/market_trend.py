@@ -38,7 +38,6 @@ from .a_share_trend import (
     evaluate_candidate,
     load_futu_simulate_trend_account,
     live_trend_strategy_snapshot,
-    load_protection_state,
     load_watch_events,
     render_trend_failure_text,
     render_trend_feishu_text,
@@ -59,7 +58,7 @@ from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
-from .trend_review import freeze_report_evidence
+from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
 from .strategy_drawdown import observe_strategy_equity
 
 
@@ -840,7 +839,9 @@ def _attempt_market_report(
         if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
             return AShareTrendRunResult("waiting", None, None)
 
-        prior_state = load_protection_state(paths.state)
+        prior_state = rebuild_overheat_trim_projection(
+            config.data_dir, market=market, state_path=paths.state
+        )
         configured = (
             config.trend_us_symbols if market == "US" else config.trend_hk_symbols
         )

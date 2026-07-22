@@ -47,7 +47,11 @@ from .trend_animals import (
     TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
-from .trend_review import _floor_to_lot, freeze_report_evidence
+from .trend_review import (
+    _floor_to_lot,
+    freeze_report_evidence,
+    rebuild_overheat_trim_projection,
+)
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
@@ -2206,8 +2210,14 @@ def build_report(
             new_state["initial_line"] = str(initial_line)
         if active_line is not None:
             new_state["active_line"] = str(active_line)
-        if isinstance(old_state.get("overheat_trim_status"), str):
-            new_state["overheat_trim_status"] = old_state["overheat_trim_status"]
+        for key in (
+            "overheat_trim_status",
+            "overheat_trim_target_qty",
+            "overheat_trim_filled_qty",
+            "overheat_trim_started_for",
+        ):
+            if isinstance(old_state.get(key), str):
+                new_state[key] = old_state[key]
         new_positions[symbol] = new_state
     sell_symbols = {
         holding.symbol for holding in holdings if holding.action == "SELL_ALL"
@@ -3285,6 +3295,20 @@ def _validate_protection_state(payload: object) -> dict[str, object]:
         position_started_for = state.get("position_started_for")
         if position_started_for is not None and not isinstance(position_started_for, str):
             raise ValueError(f"protection state for {symbol} has invalid start date")
+        trim_status = state.get("overheat_trim_status")
+        if trim_status is not None and trim_status not in {
+            "pending", "complete", "below_lot"
+        }:
+            raise ValueError(f"protection state for {symbol} has invalid trim status")
+        for key in ("overheat_trim_target_qty", "overheat_trim_filled_qty"):
+            value = state.get(key)
+            if value is not None and (
+                _optional_decimal(value) is None or _decimal(value) < 0
+            ):
+                raise ValueError(f"protection state for {symbol} has invalid trim quantity")
+        trim_started_for = state.get("overheat_trim_started_for")
+        if trim_started_for is not None and not isinstance(trim_started_for, str):
+            raise ValueError(f"protection state for {symbol} has invalid trim start date")
         if not isinstance(state.get("updated_for"), str):
             raise ValueError(f"protection state for {symbol} has no update date")
     return payload
@@ -4171,8 +4195,10 @@ def _attempt_report(
             "misses": sum(event.get("cache") == "miss" for event in cache_events),
             "events": [dict(event) for event in cache_events],
         }
-        prior_state = load_protection_state(
-            config.data_dir / "trend_a_share/protection_state.json"
+        prior_state = rebuild_overheat_trim_projection(
+            config.data_dir,
+            market="CN",
+            state_path=config.data_dir / "trend_a_share/protection_state.json",
         )
         watch_events = load_watch_events(
             config.data_dir / "trend_a_share/watch_events.jsonl"

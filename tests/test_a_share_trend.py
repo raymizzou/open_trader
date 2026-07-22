@@ -2029,6 +2029,9 @@ def test_position_zero_allows_a_later_overheat_trim_lifecycle() -> None:
                 "atr14": "1",
                 "position_started_for": "2026-07-01",
                 "overheat_trim_status": "complete",
+                "overheat_trim_target_qty": "300",
+                "overheat_trim_filled_qty": "300",
+                "overheat_trim_started_for": "2026-07-01",
                 "updated_for": "2026-07-13",
             }
         },
@@ -2063,6 +2066,12 @@ def test_position_zero_allows_a_later_overheat_trim_lifecycle() -> None:
         prior_state=zeroed.protection_state,
     )
     assert terminal.holdings[0].action == "HOLD"
+    assert terminal.protection_state["positions"]["600001"] | {
+        "overheat_trim_status": "complete",
+        "overheat_trim_target_qty": "300",
+        "overheat_trim_filled_qty": "300",
+        "overheat_trim_started_for": "2026-07-01",
+    } == terminal.protection_state["positions"]["600001"]
     assert zeroed.protection_state == {"schema_version": 1, "positions": {}}
     assert reentered.holdings[0].action == "SELL_PARTIAL"
     assert reentered.holdings[0].position_started_for == "2026-07-16"
