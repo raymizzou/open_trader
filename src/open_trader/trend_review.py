@@ -1695,7 +1695,6 @@ def overheat_trim_progress(
     submitted_order_ids: set[str] = set()
     observed_order_statuses: dict[str, str] = {}
     uncertain_action = False
-    abandoned_action = False
     for date_root in sorted(action_dates.glob("*")):
         if not date_root.is_dir():
             continue
@@ -1729,7 +1728,7 @@ def overheat_trim_progress(
         ):
             continue
         source_paths.append(str(action_root.relative_to(data_dir)))
-        abandoned_action = abandoned_action or any(
+        action_abandoned = any(
             item.get("resolution") == "abandon" for item in resolutions
         )
         facts = _action_facts(
@@ -1757,15 +1756,19 @@ def overheat_trim_progress(
         for event in events:
             status = event.get("status")
             order_ids = event.get("order_ids")
-            if status in {"submitted", "partially_filled"} and isinstance(
-                order_ids, list
+            if (
+                not action_abandoned
+                and status in {"submitted", "partially_filled"}
+                and isinstance(order_ids, list)
             ):
                 submitted_order_ids.update(
                     str(order_id).strip()
                     for order_id in order_ids
                     if str(order_id).strip()
                 )
-            uncertain_action = uncertain_action or status == "uncertain"
+            uncertain_action = uncertain_action or (
+                not action_abandoned and status == "uncertain"
+            )
             if event.get("status") not in {"filled", "partially_filled"}:
                 continue
             observation = event.get("observation_path")
@@ -1797,6 +1800,8 @@ def overheat_trim_progress(
                         order.get("dealt_qty", "0"), "broker dealt quantity"
                     ),
                 )
+        if action_abandoned:
+            continue
         for event in events:
             observation = event.get("observation_path")
             if not isinstance(observation, str):
@@ -1851,9 +1856,8 @@ def overheat_trim_progress(
         broker_status not in TERMINAL_ORDER_STATUSES | ACTIVE_ORDER_STATUSES
         for broker_status in observed_order_statuses.values()
     )
-    has_unresolved_order = active_order or ambiguous_order or (
-        not abandoned_action
-        and (uncertain_action or bool(submitted_order_ids - terminal_order_ids))
+    has_unresolved_order = active_order or ambiguous_order or uncertain_action or bool(
+        submitted_order_ids - terminal_order_ids
     )
     return {
         "lifecycle_target_qty": format(target, "f"),

@@ -1072,6 +1072,69 @@ def test_partial_authorized_retry_uses_one_remaining_frozen_attempt(
     assert len(client.requests) == 2
 
 
+def test_partial_abandon_does_not_clear_a_later_unresolved_action(
+    tmp_path: Path,
+) -> None:
+    report = partial_sell_report()
+    client = FakeTrendSimClient(positions=[{"code": "SH.600001", "qty": "1000"}])
+    for execution_date in ("2026-07-17", "2026-07-18", "2026-07-19"):
+        report_path = tmp_path / f"reports/{execution_date}.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        trend_review.lock_trend_execution_batch(
+            tmp_path,
+            market="CN",
+            execution_date=execution_date,
+            report_path=report_path,
+            report=report,
+            locked_at=f"{execution_date}T09:30:00+08:00",
+        )
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=report,
+            client=client,
+            market="CN",
+            execution_date=execution_date,
+            now=f"{execution_date}T09:31:00+08:00",
+            quote_prices={},
+        )
+        if execution_date == "2026-07-17":
+            client.orders.clear()
+            trend_review.execute_trend_review_open(
+                data_dir=tmp_path,
+                report=report,
+                client=client,
+                market="CN",
+                execution_date=execution_date,
+                now="2026-07-17T09:32:00+08:00",
+                quote_prices={},
+            )
+            trend_review.resolve_trend_action(
+                tmp_path,
+                market="CN",
+                execution_date=execution_date,
+                symbol="600001",
+                side="sell",
+                resolution="abandon",
+                actor="ray",
+                reason="the original order cannot be identified",
+                resolved_at="2026-07-17T09:33:00+08:00",
+            )
+
+    progress = trend_review.overheat_trim_progress(
+        tmp_path,
+        market="CN",
+        symbol="600001",
+        position_started_for="2026-07-01",
+    )
+
+    assert progress["has_unresolved_order"] is True
+    assert len(client.requests) == 2
+    assert not list(tmp_path.glob(
+        "trend_review/ledgers/CN/open/2026-07-19/*-intent.json"
+    ))
+
+
 def test_partial_below_lot_is_an_audited_terminal_fact(tmp_path: Path) -> None:
     report = partial_sell_report(symbol="00700", lot_size=200, estimated_shares=0)
     report_path = tmp_path / "reports/2026-07-17.json"
