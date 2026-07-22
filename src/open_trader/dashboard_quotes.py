@@ -88,8 +88,8 @@ class DashboardQuoteService:
         requested_symbols = list(items_by_symbol)
         us_symbols = [symbol for symbol in requested_symbols if symbol.startswith("US.")]
         symbols_by_market: dict[str, list[str]] = {}
-        for symbol, item in items_by_symbol.items():
-            symbols_by_market.setdefault(item.market, []).append(symbol)
+        for symbol in items_by_symbol:
+            symbols_by_market.setdefault(symbol.split(".", 1)[0], []).append(symbol)
         client: DashboardQuoteClient | None = None
         market_states: dict[str, str] = {}
         snapshot_errors: list[tuple[str, FutuQuoteError]] = []
@@ -106,7 +106,9 @@ class DashboardQuoteService:
                         snapshot_errors.append((market, exc))
                 if len(snapshot_errors) == len(symbols_by_market):
                     raise snapshot_errors[0][1]
-                if us_symbols:
+                if us_symbols and not any(
+                    market == "US" for market, _ in snapshot_errors
+                ):
                     try:
                         market_states = client.get_market_states(us_symbols)
                     except FutuQuoteError as exc:
