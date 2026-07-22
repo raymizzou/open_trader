@@ -709,3 +709,74 @@ tail -n 80 /tmp/open_trader_dashboard_8766.log
 ```
 
 Expected: clean worktree, exact accepted SHA, new PIDs, worktree cwd, fresh logs, and HTTP `200`. Only then provide `http://127.0.0.1:8766/`.
+
+### Task 6: Persist watcher interruption state across once-passes
+
+**Files:**
+- Modify: `src/open_trader/a_share_trend_watch.py`
+- Modify: `src/open_trader/market_trend_watch.py`
+- Test: `tests/test_a_share_trend_watch.py`
+- Test: `tests/test_market_trend_watch.py`
+
+**Interfaces:**
+- Consumes: existing immutable `monitor_interrupted` and `monitor_recovered` events.
+- Produces: `_monitor_interrupted(events_path: Path) -> bool`; both watcher entry points restore their interruption state from the latest durable monitor event.
+
+- [ ] **Step 1: Write failing consecutive once-pass tests**
+
+For A-share, run two borrowed once-passes against failing calendar quotes using the same event path and notifier, then one successful pass and one new failure. Assert notification titles and event types are exactly:
+
+```python
+["A股价格监控中断", "A股价格监控恢复", "A股价格监控中断"]
+```
+
+```python
+["monitor_interrupted", "monitor_recovered", "monitor_interrupted"]
+```
+
+For HK, run two borrowed once-passes against quotes whose `get_trading_days()` raises the same `FutuQuoteError`. Assert both raise to the controller, but only one `港股价格监控中断` notification and one `monitor_interrupted` event are produced.
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_a_share_trend_watch.py::test_once_watcher_persists_interruption_until_recovery \
+  tests/test_market_trend_watch.py::test_once_market_watcher_deduplicates_durable_interruption \
+  -q
+```
+
+Expected: FAIL because every new once-pass resets `interrupted = False` and sends the same interruption again.
+
+- [ ] **Step 3: Implement the shared durable-state lookup**
+
+Add beside the existing interruption record helpers:
+
+```python
+def _monitor_interrupted(events_path: Path) -> bool:
+    for event in reversed(load_watch_events(events_path)):
+        event_type = event.get("event_type")
+        if event_type in {"monitor_interrupted", "monitor_recovered"}:
+            return event_type == "monitor_interrupted"
+    return False
+```
+
+Initialize `interrupted = _monitor_interrupted(events_path)` in `watch_a_share_protection`. Import the helper in `market_trend_watch.py` and use the same initialization there. Do not add timers, counters, or a second notification ledger: the existing event stream already provides the required durable state.
+
+- [ ] **Step 4: Verify GREEN and commit**
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_a_share_trend_watch.py \
+  tests/test_market_trend_watch.py \
+  -q
+.venv/bin/python -m pytest -q
+git add \
+  src/open_trader/a_share_trend_watch.py \
+  src/open_trader/market_trend_watch.py \
+  tests/test_a_share_trend_watch.py \
+  tests/test_market_trend_watch.py \
+  docs/superpowers/plans/2026-07-22-futu-controller-connection-lifecycle.md
+git commit -m "fix: deduplicate persistent quote interruptions"
+```
+
+Expected: watcher suites and full suite PASS. Keep all controllers stopped until Task 4 connection reuse is implemented and reviewed.
