@@ -1760,6 +1760,64 @@ console.log(JSON.stringify([
     assert json.loads(output) == ["485", "1,296", "30.59", "23.43"]
 
 
+def test_dashboard_trend_stages_format_only_numeric_fields_losslessly() -> None:
+    output = run_dashboard_js(r'''
+const cn = [
+  renderCnSellOrHoldStage("卖出", [{
+    symbol:"02840",name:"SPDR 金",close:"24.545714285714",strength:"99.876",
+    temperature_prev:"温",temperature_curr:"热",reason:"left_trend_right_side",
+    active_line:"9007199254740993",entry_hints:["编号 00001234"],
+    execution:{status:"partially_filled",filled_qty:"13.129",target_qty:"23.428",
+      avg_fill_price:"207.185",order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
+  }], "sell"),
+  renderCnBuyStage({buy_window:"09:30–10:00",buy_actions:[{
+    symbol:"600001",name:"测试",filter_price:"1234567.505",close:"24.545714285714",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99.876",
+    industry:"科技",industry_temperature:"热",market_cap:"12345.678",amount:"2.345",
+    target_weight:"0.04123456",target_amount:"39970.419",estimated_shares:"9007199254740993",
+    estimated_initial_line:"23.428857142857",
+  }],risk_skips:[{symbol:"600002",name:"跳过",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"科技",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04123456",target_amount:"8888.888"}]}),
+].join("");
+const us = [
+  renderMarketSellOrHoldStage("持有", [{
+    symbol:"00001234",name:"编号测试",close:"30.594999999999995",strength:"90.444",
+    reason:"trend_intact",active_line:"28.305071428571",
+  }], "hold"),
+  renderMarketBuyStage({buy_window:"常规时段",buy_actions:[{
+    symbol:"EA",name:"艺电",close:"207.185",strength:"99.876",industry:"通讯服务",
+    target_weight:"0.04123456",target_amount:"4941.499",estimated_shares:"9007199254740993",
+    estimated_initial_line:"205.46930",execution:{status:"partially_filled",
+      filled_qty:"13.129",target_qty:"23.428",avg_fill_price:"207.185",
+      order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
+  }],risk_skips:[]}),
+].join("");
+console.log(JSON.stringify({cn,us}));
+''')
+    rendered = json.loads(output)
+    combined = rendered["cn"] + rendered["us"]
+    for expected in (
+        "1,234,567.51", "24.55", "99.88", "12,345.68", "2.35",
+        "39,970.42", "8,888.89", "9,007,199,254,740,993 股", "23.43", "30.59",
+        "90.44", "28.31", "4,941.5", "205.47", "成交 13.13 / 23.43",
+        "均价 207.19", "目标仓位 4.12%",
+    ):
+        assert expected in combined
+    for preserved in (
+        "02840 SPDR 金", "600001 测试", "00001234 编号测试",
+        "订单 00001234", "2026-07-22T09:30:00+08:00", "编号 00001234",
+    ):
+        assert preserved in combined
+    for raw in (
+        "24.545714285714", "99.876", "12345.678", "2.345", "39970.419",
+        "30.594999999999995", "90.444", "28.305071428571", "4941.499", "8888.888",
+        "13.129", "23.428", "207.185",
+    ):
+        assert raw not in combined
+
+
 def test_dashboard_display_number_preserves_lossless_integer_semantics() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify([
@@ -3766,6 +3824,28 @@ console.log(JSON.stringify({current,historical,loading,unavailable}));
         assert "未持有" not in state_html
     assert "模拟盘持仓加载中" in rendered["loading"]
     assert "OpenD 模拟账户不可用" in rendered["unavailable"]
+
+
+def test_dashboard_simulation_overlay_escapes_every_hostile_rendered_fact() -> None:
+    output = run_dashboard_js(r'''
+const attack='"><img src=x onerror=alert(1)>';
+const html=renderTrendSimulationOverlay({
+  sell_actions:[],hold_actions:[],review_actions:[],risk_skips:[],
+  buy_actions:[{action:"BUY",symbol:attack,name:attack,estimated_shares:attack,
+    close:attack,estimated_initial_line:attack}],
+},{available:true,positions:[{symbol:attack,name:attack,quantity:attack,
+  cost_price:attack,last_price:attack}]});
+const unavailable=renderTrendSimulationOverlay({}, {available:false,error:attack});
+console.log(JSON.stringify({html,unavailable}));
+''')
+    rendered = json.loads(output)
+    assert "<img" not in rendered["html"]
+    assert '<img' not in rendered["unavailable"]
+    assert 'data-simulation-symbol="&quot;&gt;&lt;IMG' in rendered["html"]
+    assert "&lt;img src=x onerror=alert(1)&gt;" in rendered["html"]
+    assert "报告数量 &quot;&gt;&lt;img" in rendered["html"]
+    assert "模拟持仓 &quot;&gt;&lt;img" in rendered["html"]
+    assert "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;" in rendered["unavailable"]
 
 
 def test_dashboard_report_history_is_inline_exact_and_restores_scroll() -> None:
