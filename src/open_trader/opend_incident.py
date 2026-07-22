@@ -101,10 +101,10 @@ def _read(path: Path, category: OpenDCategory) -> dict[str, object] | None:
         or not _timestamp(delivered_at, allow_empty=True)
         or not isinstance(channels, list)
         or not all(isinstance(channel, str) for channel in channels)
-        or (
-            bool(delivered_at)
-            and not any(channel in {"feishu", "feishu_app"} for channel in channels)
-        )
+        or bool(delivered_at) != bool(channels)
+        or any(channel not in {"feishu", "feishu_app"} for channel in channels)
+        or len(channels) > 1
+        or bool(delivered_at) and attempts == 0
     ):
         raise ValueError(f"invalid OpenD incident state: {path}")
     return payload
@@ -139,7 +139,7 @@ def record_opend_failure(
 ) -> bool:
     lock_path = data_dir / "trend_controller/shared/opend-incidents.lock"
     path = _incident_path(data_dir, category)
-    now_text = occurred_at.isoformat(timespec="seconds")
+    now_text = occurred_at.isoformat()
     try:
         with RunLock(lock_path, wait=True):
             state = _read(path, category)
@@ -227,7 +227,7 @@ def record_opend_health(
                 healthy = {str(item) for item in state["healthy_markets"]}
                 healthy.add(market)
                 state["healthy_markets"] = sorted(healthy)
-                state["updated_at"] = observed_at.isoformat(timespec="seconds")
+                state["updated_at"] = observed_at.isoformat()
                 quorum = _fresh_markets(data_dir, observed_at) | {market}
                 if quorum <= healthy:
                     state["active"] = False

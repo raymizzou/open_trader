@@ -166,6 +166,30 @@ def test_recovery_ignores_health_observed_before_incident_creation(
     assert read_incident(tmp_path)["active"] is False
 
 
+def test_recovery_ignores_health_before_subsecond_failure(
+    tmp_path: Path,
+) -> None:
+    fault_at = datetime.fromisoformat("2026-07-22T10:00:00.900000+08:00")
+    record_opend_failure(
+        data_dir=tmp_path,
+        market="CN",
+        category="connectivity",
+        reason="连接超时",
+        occurred_at=fault_at,
+        send_feishu=lambda _title, _message: "feishu_app",
+    )
+
+    assert read_incident(tmp_path)["first_detected_at"] == fault_at.isoformat()
+    record_opend_health(
+        tmp_path,
+        "CN",
+        datetime.fromisoformat("2026-07-22T10:00:00.100000+08:00"),
+    )
+
+    assert read_incident(tmp_path)["healthy_markets"] == []
+    assert read_incident(tmp_path)["active"] is True
+
+
 def test_categories_are_separate_and_each_stops_after_one_retry(
     tmp_path: Path,
 ) -> None:
@@ -252,5 +276,49 @@ def test_invalid_delivered_timestamp_in_valid_header_raises_for_fallback(
             occurred_at=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
             send_feishu=lambda _title, _message: pytest.fail(
                 "invalid state must not suppress fallback"
+            ),
+        )
+
+
+def test_inconsistent_delivered_state_with_zero_attempts_raises_for_fallback(
+    tmp_path: Path,
+) -> None:
+    create_active_incident(tmp_path, category="connectivity")
+    path = incident_path(tmp_path)
+    state = read_incident(tmp_path)
+    state["feishu_attempts"] = 0
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(OpenDIncidentStateError):
+        record_opend_failure(
+            data_dir=tmp_path,
+            market="HK",
+            category="connectivity",
+            reason="连接超时",
+            occurred_at=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+            send_feishu=lambda _title, _message: pytest.fail(
+                "inconsistent delivery state must not suppress fallback"
+            ),
+        )
+
+
+def test_delivered_channel_without_timestamp_raises_for_fallback(
+    tmp_path: Path,
+) -> None:
+    create_active_incident(tmp_path, category="connectivity")
+    path = incident_path(tmp_path)
+    state = read_incident(tmp_path)
+    state["feishu_delivered_at"] = ""
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(OpenDIncidentStateError):
+        record_opend_failure(
+            data_dir=tmp_path,
+            market="HK",
+            category="connectivity",
+            reason="连接超时",
+            occurred_at=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+            send_feishu=lambda _title, _message: pytest.fail(
+                "delivered channel without timestamp must not suppress fallback"
             ),
         )
