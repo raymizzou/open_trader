@@ -2502,6 +2502,7 @@ def _risk_percent(value: object) -> str:
 
 ACTION_LABELS = {
     "SELL_ALL": "全部卖出",
+    "SELL_PARTIAL": "止盈减仓 30%",
     "HOLD": "继续持有",
     "MANUAL_REVIEW": "人工复核",
 }
@@ -2515,6 +2516,7 @@ REASON_LABELS = {
     "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
+    "overheat_take_profit": "沸腾/开香槟过热止盈",
     "a_share_only": "仅限 A 股股票",
     "temperature_missing": "个股趋势温度缺失",
     "temperature_transition_not_entry": "不是温转热或温转沸",
@@ -2644,6 +2646,8 @@ def _append_feishu_action_sections(
         lines.extend(["", "卖出"])
         for index, item in enumerate(sells, 1):
             line = f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            if item.get("action") == "SELL_PARTIAL":
+                line += f"｜约 {item.get('estimated_shares', '-')} 股"
             if item.get("active_line") not in {None, ""}:
                 line += f"｜保护线 {_feishu_money(item['active_line'])}"
             lines.append(line)
@@ -2736,7 +2740,8 @@ def render_trend_feishu_text(
     sells = [
         item
         for item in formal
-        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        and not _trend_action_needs_review(item)
     ]
     buys = [
         item
@@ -2819,7 +2824,11 @@ def render_markdown(report: TrendReport) -> str:
         if report.metadata.get("broker") == "tiger"
         else NON_REALTIME_ACCOUNT_WARNING
     )
-    sells = [item for item in report.holdings if item.action == "SELL_ALL"]
+    sells = [
+        item
+        for item in report.holdings
+        if item.action in {"SELL_ALL", "SELL_PARTIAL"}
+    ]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
     others = [item for item in report.holdings if item.action not in ACTION_LABELS]
@@ -2886,7 +2895,12 @@ def render_markdown(report: TrendReport) -> str:
     lines.extend(["## 开盘前：确认卖出", ""])
     if sells:
         for item in sells:
-            line = f"- {item.symbol} {item.name}｜{_reason_label(item.reason)}"
+            line = (
+                f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
+                f"{_reason_label(item.reason)}"
+            )
+            if item.action == "SELL_PARTIAL":
+                line += f"｜约 {item.estimated_shares} 股"
             if item.active_line is not None:
                 line += f"｜活动保护线 {_money(item.active_line)}"
             lines.append(line)

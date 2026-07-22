@@ -2807,6 +2807,38 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
     assert "http" not in message.lower()
 
 
+def test_partial_action_is_a_formal_trim_in_feishu_and_markdown() -> None:
+    held_account = account("600001")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=replace(
+            held_account,
+            positions=(replace(held_account.positions[0], quantity=Decimal("1000")),),
+        ),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars()},
+    )
+
+    payload = trend_module._report_payload(built)
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+    markdown = render_markdown(built)
+
+    assert [
+        (item["action"], item["estimated_shares"])
+        for item in payload["strategy_judgments"]["formal_actions"]
+    ] == [("SELL_PARTIAL", 300)]
+    assert "今日动作：卖出 1｜买入 0｜持有 0｜复核 0" in message
+    assert "沸腾/开香槟过热止盈｜约 300 股" in message
+    assert "今日无买卖动作" not in message
+    assert "止盈减仓 30%" in markdown
+    assert "约 300 股" in markdown
+    assert "无需卖出" not in markdown
+
+
 def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     payload = {
         "execution_date": "2026-07-15",
