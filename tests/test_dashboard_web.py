@@ -1721,7 +1721,7 @@ const sandbox = { document: { addEventListener() {} }, console, URLSearchParams 
     return result.stdout
 
 
-def test_dashboard_display_number_preserves_precision_and_identifiers() -> None:
+def test_dashboard_display_number_formats_numeric_text_only() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({
   money: formatDisplayNumber("3064187.62"),
@@ -1729,7 +1729,7 @@ console.log(JSON.stringify({
   trailing: formatDisplayNumber("2932.00"),
   signed: formatDisplayNumber("+1234567.50"),
   symbol: formatPlain("02840"),
-  percent: formatPlain("21.13%"),
+  percent: formatDisplayNumber("21.13%"),
   input: "100000",
   profit: pnlClass("12.50%"),
   loss: pnlClass("-12.50%"),
@@ -1738,14 +1738,26 @@ console.log(JSON.stringify({
     assert json.loads(output) == {
         "money": "3,064,187.62",
         "integer": "10,000",
-        "trailing": "2,932.00",
-        "signed": "+1,234,567.50",
+        "trailing": "2,932",
+        "signed": "1,234,567.5",
         "symbol": "02840",
         "percent": "21.13%",
         "input": "100000",
         "profit": "pnl-profit",
         "loss": "pnl-loss",
     }
+
+
+def test_dashboard_numbers_never_show_more_than_two_decimal_places() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify([
+  formatDisplayNumber("485.0"),
+  formatDisplayNumber("1296"),
+  formatDisplayNumber("30.594999999999995"),
+  formatDisplayNumber("23.428857142857142857"),
+]));
+''')
+    assert json.loads(output) == ["485", "1,296", "30.59", "23.43"]
 
 
 def test_dashboard_account_table_formats_values_but_not_symbol() -> None:
@@ -1757,8 +1769,8 @@ console.log(renderAccountTable([{key:"futu:HK:02840:0",holding:{},display:{
 }}]));
 ''')
     assert "10,000" in output
-    assert "2,932.00" in output
-    assert "HKD 31,845,000.00" in output
+    assert "2,932" in output
+    assert "HKD 31,845,000" in output
     assert ">02840<" in output
     assert 'class="number-cell account-holding-pnl pnl-loss"' in output
 
@@ -1809,22 +1821,22 @@ const decision = Object.fromEntries(decisionMetricCells({
 console.log(JSON.stringify({quote,kelly,backtest,trend,decision,input:state.standardBacktest.initialCash}));
 ''')
     rendered = json.loads(output)
-    assert rendered["quote"] == "1,234,567.50"
+    assert rendered["quote"] == "1,234,567.5"
     for expected in (
-        "USD 1,234,567.50", "USD +2,932.00", "<dt>订单</dt>",
-        "<dd>10,000</dd>", "HK.02840", "00001234", "1,234,567.50",
-        "29,320,000.00",
+        "USD 1,234,567.5", "USD +2,932", "<dt>订单</dt>",
+        "<dd>10,000</dd>", "HK.02840", "00001234", "1,234,567.5",
+        "29,320,000",
     ):
         assert expected in rendered["kelly"]
     for expected in (
-        "10,000", "21.13%", "2026-07-16", "2,932.00", "1,234.50",
+        "10,000", "21.13%", "2026-07-16", "2,932", "1,234.5",
         "100,000", "1,000 基点", "00001234",
     ):
         assert expected in rendered["backtest"]
     assert "全部卖出 10,000" in rendered["trend"]
     assert "正式买入 2,932" in rendered["trend"]
     assert "2026-07-16" in rendered["trend"]
-    assert rendered["decision"]["目标价"] == ">= 1,234,567.50"
+    assert rendered["decision"]["目标价"] == ">= 1,234,567.5"
     assert rendered["input"] == "100000"
 
 
@@ -1860,15 +1872,15 @@ console.log(JSON.stringify({kelly,trend,grouped,omitted}));
 ''')
     rendered = json.loads(output)
     for expected in (
-        "10,000 个实验", "HKD 29,320,000.00", "10,000 赢 / 2,932 亏",
-        "1,234.50", "21.13%", "2026-07-16 09:30",
+        "10,000 个实验", "HKD 29,320,000", "10,000 赢 / 2,932 亏",
+        "1,234.5", "21.13%", "2026-07-16 09:30",
     ):
         assert expected in rendered["kelly"]
     assert ">02840 SPDR 金<" in rendered["trend"]
     for expected in (
-        "10,000 股", "金额上限", "29,320,000.00", "预计保护线", "1,234,567.50",
-        "活动保护线", "强度 10,000", "科技｜10,000｜2,932.00",
-        "API 成本：1,234.50",
+        "10,000 股", "金额上限", "29,320,000", "预计保护线", "1,234,567.5",
+        "活动保护线", "强度 10,000", "科技｜10,000｜2,932",
+        "API 成本：1,234.5",
     ):
         assert expected in rendered["trend"]
     assert "×10,000" in rendered["grouped"]
@@ -1894,9 +1906,9 @@ renderSummary();
 console.log(JSON.stringify({header,summary:{cash:elements["summary-cash-note"].textContent,brokers:elements["summary-brokers"].textContent,weight:elements["summary-holding-weight"].textContent}}));
 ''')
     rendered = json.loads(output)
-    assert rendered["header"]["cash"] == "现金类资产 HKD 10,000.00 · 持仓 10,000"
+    assert rendered["header"]["cash"] == "现金类资产 HKD 10,000 · 持仓 10,000"
     assert rendered["header"]["weight"] == "21.13%"
-    assert rendered["summary"]["cash"] == "现金类资产 HKD 10,000.00 · 3.28% · 持仓 10,000"
+    assert rendered["summary"]["cash"] == "现金类资产 HKD 10,000 · 3.28% · 持仓 10,000"
     assert rendered["summary"]["brokers"] == "2,932 个"
     assert rendered["summary"]["weight"] == "21.13%"
 
@@ -1937,7 +1949,7 @@ console.log(JSON.stringify({
 }));
 ''')
     rendered = json.loads(output)
-    assert "现金 HKD 451,097.00" in rendered["tiger"]
+    assert "现金 HKD 451,097" in rendered["tiger"]
     assert "可交易额度 HKD 488,032.24" in rendered["tiger"]
     assert "现金构成" in rendered["tiger"]
     assert "USD 现金" in rendered["tiger"]
@@ -2019,12 +2031,12 @@ console.log(renderBrokerDetailSection([
 ''')
     assert "<td>00001234</td>" in output
     assert '<td class="number-cell">10,000</td>' in output
-    assert '<td class="number-cell">2,932.00</td>' in output
-    assert '<td class="number-cell">1,234,567.50</td>' in output
-    assert '<td class="number-cell">29,320,000.00</td>' in output
-    assert '<td class="number-cell pnl-profit">+1,234.50</td>' in output
-    assert '<td class="number-cell pnl-loss">-12.50%</td>' in output
-    assert '<td class="number-cell">0.00%</td>' in output
+    assert '<td class="number-cell">2,932</td>' in output
+    assert '<td class="number-cell">1,234,567.5</td>' in output
+    assert '<td class="number-cell">29,320,000</td>' in output
+    assert '<td class="number-cell pnl-profit">+1,234.5</td>' in output
+    assert '<td class="number-cell pnl-loss">-12.5%</td>' in output
+    assert '<td class="number-cell">0%</td>' in output
 
 
 def test_dashboard_action_card_formats_price_and_quantity_fields_only() -> None:
@@ -2035,9 +2047,9 @@ console.log(renderActionCard({
 }));
 ''')
     assert "<strong>HK.02840</strong>" in output
-    assert "<div><span>限价</span><strong>1,234,567.50</strong></div>" in output
+    assert "<div><span>限价</span><strong>1,234,567.5</strong></div>" in output
     assert "<div><span>数量</span><strong>10,000</strong></div>" in output
-    assert "<div><span>金额</span><strong>HKD 29,320,000.00</strong></div>" in output
+    assert "<div><span>金额</span><strong>HKD 29,320,000</strong></div>" in output
 
 
 def test_dashboard_kelly_realized_pnl_classes_cover_all_polarities() -> None:
@@ -2050,9 +2062,9 @@ console.log(JSON.stringify({profit:render("+1234.50"),loss:render("-1234.50"),ze
 ''')
     rendered = json.loads(output)
     assert '<div class="primary">\n            <dt>可用资金</dt>\n            <dd>USD 1</dd>' in rendered["profit"]
-    assert '<div class="pnl-profit">\n            <dt>已实现盈亏</dt>\n            <dd>USD +1,234.50</dd>' in rendered["profit"]
-    assert '<div class="pnl-loss">\n            <dt>已实现盈亏</dt>\n            <dd>USD -1,234.50</dd>' in rendered["loss"]
-    assert '<div>\n            <dt>已实现盈亏</dt>\n            <dd>USD 0.00</dd>' in rendered["zero"]
+    assert '<div class="pnl-profit">\n            <dt>已实现盈亏</dt>\n            <dd>USD +1,234.5</dd>' in rendered["profit"]
+    assert '<div class="pnl-loss">\n            <dt>已实现盈亏</dt>\n            <dd>USD -1,234.5</dd>' in rendered["loss"]
+    assert '<div>\n            <dt>已实现盈亏</dt>\n            <dd>USD 0</dd>' in rendered["zero"]
     assert "pnl-profit" not in rendered["zero"]
     assert "pnl-loss" not in rendered["zero"]
 
@@ -2079,15 +2091,15 @@ console.log(JSON.stringify({
 ''')
     rendered = json.loads(output)
     assert rendered["values"] == [
-        "+1,234,567.50", "+1,234,567.50", "-1,234,567.50", "0.00", "+12.50%",
+        "+1,234,567.5", "+1,234,567.5", "-1,234,567.5", "0", "+12.5%",
     ]
     assert rendered["drawdowns"] == ["-8.25%", "-8.25%", "0%"]
     assert ">+16.67%</td>" in rendered["account"]
     assert ">12.50%</td>" in rendered["account"]  # generic account weight stays unsigned
-    assert '<strong class="pnl-profit">+12.50%</strong>' in rendered["backtest"]
+    assert '<strong class="pnl-profit">+12.5%</strong>' in rendered["backtest"]
     assert '<span>最大回撤</span><strong class="pnl-loss">-8.25%</strong>' in rendered["backtest"]
     assert ">60.00%</strong>" in rendered["backtest"]
-    assert ">+12.50%</dd>" in rendered["plan"]
+    assert ">+12.5%</dd>" in rendered["plan"]
     assert '<dt>最大回撤</dt><dd class="pnl-loss">-8.25%</dd>' in rendered["plan"]
 
 
@@ -2096,7 +2108,7 @@ def test_dashboard_signed_pnl_covers_kelly_sample_pnl() -> None:
 const kelly=renderKellyParameterDerivation({sample_stage:"sufficient",avg_net_win_pct:"12.50%",avg_net_loss_pct:"-8.25%"});
 console.log(kelly);
 ''')
-    assert "+12.50% / -8.25%" in output
+    assert "+12.5% / -8.25%" in output
 
 
 def test_dashboard_remaining_numeric_leaves_group_only_numeric_values() -> None:
@@ -2134,20 +2146,20 @@ console.log(JSON.stringify({condition,facts,keywords,bollinger,technical,action,
     assert 'data-plan-condition="00001234"' in rendered["condition"]
     assert "25,142.16" in rendered["facts"] and "21.13%" in rendered["facts"]
     assert ">00001234</span>" in rendered["keywords"] and ">5,000</em>" in rendered["keywords"]
-    for expected in ("1,234,567.50", "2,000,000.00", "3,000,000.00"):
+    for expected in ("1,234,567.5", "2,000,000", "3,000,000"):
         assert expected in rendered["bollinger"]
     assert "21.13%" in rendered["bollinger"]
     assert "2026-07-16 当前价" in rendered["technical"]
-    assert "1,234,567.50" in rendered["technical"]
+    assert "1,234,567.5" in rendered["technical"]
     assert "21.13%" in rendered["technical"] and "等待确认" in rendered["technical"]
-    for expected in ("MACD 1,234,567.50", "Signal 2,000,000.00", "Hist 3,000,000.00", "MA20 1,234,567.50"):
+    for expected in ("MACD 1,234,567.5", "Signal 2,000,000", "Hist 3,000,000", "MA20 1,234,567.5"):
         assert expected in rendered["technical"]
-    for expected in ("1,234,567.50", "25,142.16", "HKD 29,320,000.00", "2,000,000.00"):
+    for expected in ("1,234,567.5", "25,142.16", "HKD 29,320,000", "2,000,000"):
         assert expected in rendered["action"]
     assert "上期复盘 · 2026-07-16" in rendered["review"]
     assert "条件触发 <strong>5,000 次</strong>" in rendered["review"]
     assert "期初数量 <strong>25,142.16</strong>" in rendered["review"]
-    assert "本期期初数量 <strong>00,001,234</strong>" in rendered["review"]
+    assert "本期期初数量 <strong>1,234</strong>" in rendered["review"]
 
 
 def test_dashboard_formats_numeric_suggested_notional_in_both_action_views() -> None:
@@ -2159,8 +2171,8 @@ const action={
 console.log(JSON.stringify({band:renderTradeDecisionBand(action,{}),card:renderActionCard(action)}));
 ''')
     rendered = json.loads(output)
-    assert "USD 29,320,000.00" in rendered["band"]
-    assert "USD 29,320,000.00" in rendered["card"]
+    assert "USD 29,320,000" in rendered["band"]
+    assert "USD 29,320,000" in rendered["card"]
 
 
 def test_dashboard_t_signal_formats_only_price_numeric_leaves() -> None:
@@ -2175,7 +2187,7 @@ console.log(JSON.stringify({details:renderTSignalDetails(signal),timeline:render
 ''')
     rendered = json.loads(output)
     for expected in (
-        "1,234,567.50", "2,000,000.00", "1,234,567.50 / 3,000,000.00",
+        "1,234,567.5", "2,000,000", "1,234,567.5 / 3,000,000",
     ):
         assert expected in rendered["details"]
     assert "21.13%" in rendered["details"]
@@ -2195,8 +2207,8 @@ console.log(JSON.stringify({
 }));
 ''')
     assert json.loads(output) == {
-        "lower": ">= 1,234,567.50",
-        "range": "1,234,567.50 - 2,000,000.00",
+        "lower": ">= 1,234,567.5",
+        "range": "1,234,567.5 - 2,000,000",
         "date": "2026-07-16",
         "identifier": "编号 00001234",
         "numericId": "00001234-56",
@@ -2599,8 +2611,8 @@ const active = renderQuotePrice({market:"US", asset_class:"stock"}, {
   last_price:"61.50", price_session:"overnight",
   price_time:"2026-07-15 03:03:01.150", current_session_quote:true,
 });
-if(!active.includes("夜盘") || !active.includes("61.50") || !active.includes("03:03 ET"))throw new Error(active);
-if((active.match(/61\.50/g)||[]).length!==1)throw new Error("price repeated: "+active);
+if(!active.includes("夜盘") || !active.includes("61.5") || !active.includes("03:03 ET"))throw new Error(active);
+if((active.match(/61\.5/g)||[]).length!==1)throw new Error("price repeated: "+active);
 const fallback = renderQuotePrice({market:"US", asset_class:"option"}, {
   last_price:"0.59", price_session:"regular", price_time:"",
   current_session_quote:false,
@@ -3207,9 +3219,9 @@ console.log(JSON.stringify({first,second,market,cards:renderBrokerSummaryCards()
     assert result["second"]["broker"] == "tiger"
     assert 'id="account-tiger"' in result["second"]["html"]
     assert "老虎" in result["second"]["label"]
-    assert result["first"]["value"] == "HKD 4,000.00"
-    assert result["second"]["value"] == "HKD 4,000.00"
-    assert result["market"]["value"] == "HKD 4,000.00"
+    assert result["first"]["value"] == "HKD 4,000"
+    assert result["second"]["value"] == "HKD 4,000"
+    assert result["market"]["value"] == "HKD 4,000"
     assert "HK · 老虎 · 0 条" in result["market"]["label"]
     assert 'data-broker="tiger"' in result["cards"]
     assert 'href="#account-tiger"' not in result["cards"]
@@ -4496,7 +4508,7 @@ for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核
   "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓",
   "正式买入 1","全部卖出 0","继续持有 0","人工复核 1",
   "EA 艺电","207.27","99.8","通讯服务","4%","4,941.49","23 股",
-  "205.46930","BOTZ Global X Robotics ETF","趋势信号不完整",
+  "205.47","BOTZ Global X Robotics ETF","趋势信号不完整",
   "部分成交","成交 13 / 23","均价 207.18","订单 SIM-123","2026-07-17T10:01:00-04:00",
   "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
   if (!us.includes(text)) throw new Error(text + "\n" + us);
@@ -4565,7 +4577,7 @@ const html = renderTrendReportWorkspace({
   hold_actions:[],review_actions:[],audit:{},
 });
 for (const text of ["组合计划风险","风险预算内",
-  "Kelly 阶段","全样本启用 · 30 个合格模拟闭环","当前 Kelly 上限","1.2626%",
+  "Kelly 阶段","全样本启用 · 30 个合格模拟闭环","当前 Kelly 上限","1.26%",
   "合格的富途模拟闭环；实盘结果不参与计算",
   "策略累计回撤",
   "暂停新开仓","策略累计回撤已达到 5%，需人工解锁",
@@ -4690,7 +4702,7 @@ const html = renderTrendReportWorkspace({
       attribution_status:"unconfirmed",risk_note:"风险未纳入估算"}]},
   sell_actions:[],buy_actions:[],risk_skips:[],hold_actions:[],review_actions:[],audit:{},
 });
-for (const text of ["实盘执行辅助","东方财富","偏差 6","真实账户净值 HKD 108,000.00",
+for (const text of ["实盘执行辅助","东方财富","偏差 6","真实账户净值 HKD 108,000",
   "结单数据，非实时","模拟数量 300","实盘参考数量 400","真实持仓 200",
   "冻结参考价 CNY 10","按冻结参考价估算，不代表实时风险上限",
   "少买","跳过","漏卖","追买","超买","报告外加仓",
@@ -5588,7 +5600,7 @@ for (const required of [
   "HK.02840",
   "SIM-10002",
   "卖出",
-  "218.80",
+  "218.8",
   "100",
   "0",
   "待成交",
@@ -5701,7 +5713,7 @@ if (!secondHtml.includes("突破 10D Mock 第一批") || trendNameCount !== 1) {
 if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT") || !secondHtml.includes("US.TSM") || !secondHtml.includes("HK.06951")) {
   throw new Error("kelly lab second tab content missing: " + secondHtml);
 }
-for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。", "US.MSFT", "SIM-20001", "买入", "505.10", "20", "拒单"]) {
+for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。", "US.MSFT", "SIM-20001", "买入", "505.1", "20", "拒单"]) {
   if (!secondHtml.includes(required)) {
     throw new Error("kelly second tab order sync missing " + required + ": " + secondHtml);
   }
@@ -7316,9 +7328,9 @@ for (const required of [
   "日线布林带",
   "中性区间",
   "当前价格位于日线布林带区间内",
-  "下轨 380.00",
-  "中轨 405.00",
-  "上轨 430.00"
+  "下轨 380",
+  "中轨 405",
+  "上轨 430"
 ]) {
   if (!card.includes(required)) {
     throw new Error("missing K-line bollinger fact " + required + ": " + card);
@@ -8242,7 +8254,7 @@ renderHoldings();
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
-for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1,940.00", "HKD 15,132.00", "期权关注", "今日暂无趋势报告"]) {
+for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1,940", "HKD 15,132", "期权关注", "今日暂无趋势报告"]) {
   if (!renderedHoldings.includes(required)) {
     throw new Error("account holdings missing " + required + ": " + renderedHoldings);
   }
@@ -8285,7 +8297,7 @@ state.dashboard.holdings.push({
 state.selectedHoldingKey = "";
 selectBroker("phillips");
 const renderedWithOther = elements["holdings-body"].innerHTML;
-if (!renderedWithOther.includes(">JP<") || !renderedWithOther.includes(">Toyota<") || !renderedWithOther.includes("HKD 300.00")) {
+if (!renderedWithOther.includes(">JP<") || !renderedWithOther.includes(">Toyota<") || !renderedWithOther.includes("HKD 300")) {
   throw new Error("non-standard markets should remain ordinary account rows: " + renderedWithOther);
 }
 `, sandbox);

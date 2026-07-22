@@ -2150,7 +2150,7 @@ function trendKellyPercent(value) {
   if (!hasValue(value)) return "禁用（固定风险仓位）";
   const number = Number(value);
   if (!Number.isFinite(number)) return "禁用（固定风险仓位）";
-  return `${(number * 100).toFixed(4).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1")}%`;
+  return `${(number * 100).toFixed(2).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1")}%`;
 }
 
 function renderTrendRiskRow(item, columnCount, status) {
@@ -7094,10 +7094,11 @@ function splitList(value) {
 
 function formatDisplayNumber(value) {
   const raw = formatPlain(value).trim();
-  const match = raw.match(/^([+-]?)(\d+)(\.\d+)?$/);
-  if (!match) return raw;
-  const [, sign, integer, fraction = ""] = match;
-  return `${sign}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`;
+  if (!/^([+-]?)(\d+)(\.\d+)?$/.test(raw)) return raw;
+  const number = Number(raw);
+  return Number.isFinite(number)
+    ? number.toLocaleString("zh-CN", {maximumFractionDigits: 2})
+    : raw;
 }
 
 function formatDecisionTarget(value) {
