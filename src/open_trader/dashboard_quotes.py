@@ -114,6 +114,13 @@ class DashboardQuoteService:
                     except FutuQuoteError as exc:
                         state_error = exc
         except FutuQuoteError as exc:
+            failed_quotes = self.last_quotes
+            if any(prefix == "US" for prefix, _ in snapshot_errors):
+                failed_quotes = {
+                    symbol: quote
+                    for symbol, quote in failed_quotes.items()
+                    if not symbol.startswith("US.")
+                }
             return QuoteRefreshResult(
                 status="failed",
                 requested_count=len(requested_symbols),
@@ -121,8 +128,8 @@ class DashboardQuoteService:
                 missing_count=0,
                 fetched_at=fetched_at,
                 last_success_at=self.last_success_at,
-                stale=bool(self.last_quotes),
-                quotes=_mark_stale(self.last_quotes),
+                stale=bool(failed_quotes),
+                quotes=_mark_stale(failed_quotes),
                 diagnostic=_error_diagnostic(exc),
             )
         finally:
@@ -133,7 +140,7 @@ class DashboardQuoteService:
             prefix == "US" for prefix, _ in snapshot_errors
         )
         if us_snapshots_succeeded and state_error is None and any(
-            symbol not in market_states for symbol in us_symbols
+            not market_states.get(symbol) for symbol in us_symbols
         ):
             state_error = FutuQuoteError(
                 "incomplete US market states",
@@ -191,11 +198,27 @@ class DashboardQuoteService:
             bool(reused_us_quotes),
         )
         cacheable = not snapshot_errors and missing_count == 0 and state_error is None
+        us_cacheable = (
+            bool(us_symbols)
+            and us_snapshots_succeeded
+            and state_error is None
+            and all(quotes[symbol]["status"] == "ok" for symbol in us_symbols)
+        )
         if cacheable:
             self.last_success_at = fetched_at
             self.last_quotes = {
                 futu_symbol: dict(quote)
                 for futu_symbol, quote in quotes.items()
+            }
+        elif us_cacheable:
+            self.last_success_at = fetched_at
+            self.last_quotes = {
+                **{
+                    symbol: dict(quote)
+                    for symbol, quote in self.last_quotes.items()
+                    if not symbol.startswith("US.")
+                },
+                **{symbol: dict(quotes[symbol]) for symbol in us_symbols},
             }
 
         return QuoteRefreshResult(
