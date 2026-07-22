@@ -1821,11 +1821,13 @@ def overheat_trim_progress(
         else:
             events = []
             action_abandoned = False
-            payloads = [
-                item[1]
+            facts = [
+                item
                 for item in facts
                 if item[1].get("sell_goal") == "partial_30"
+                and item[1].get("position_started_for") == position_started_for
             ]
+            payloads = [item[1] for item in facts]
             if not payloads:
                 continue
         if not payloads:

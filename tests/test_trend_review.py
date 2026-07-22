@@ -943,6 +943,69 @@ def test_partial_restart_recovers_bare_intent_with_frozen_evidence(
     assert projection["positions"]["600001"]["overheat_trim_target_qty"] == "300"
 
 
+def test_partial_progress_ignores_bare_intent_from_closed_lifecycle(
+    tmp_path: Path,
+) -> None:
+    old_report = lock_partial_report(tmp_path, "2026-07-17")
+
+    class CrashAfterIntent(FakeTrendSimClient):
+        def place_order(self, _request: dict[str, object]) -> dict[str, object]:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=old_report,
+            client=CrashAfterIntent(positions=[{"code": "SH.600001", "qty": "1000"}]),
+            market="CN",
+            execution_date="2026-07-17",
+            now="2026-07-17T09:31:00+08:00",
+            quote_prices={},
+        )
+    (tmp_path / "trend_review/ledgers/CN/batches/2026-07-17.json").unlink()
+
+    new_report = partial_sell_report(position_started_for="2026-07-18")
+    report_path = tmp_path / "reports/2026-07-18.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(new_report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-18",
+        report_path=report_path,
+        report=new_report,
+        locked_at="2026-07-18T09:30:00+08:00",
+    )
+    state_path = tmp_path / "trend_a_share/protection_state.json"
+    write_protection_state(
+        state_path,
+        {"schema_version": 1, "positions": {"600001": {
+            "position_started_for": "2026-07-18",
+            "updated_for": "2026-07-18",
+        }}},
+    )
+    client = FakeTrendSimClient(positions=[{"code": "SH.600001", "qty": "500"}])
+
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=new_report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-18",
+        now="2026-07-18T09:31:00+08:00",
+        quote_prices={},
+    )
+    projection = trend_review.rebuild_overheat_trim_projection(
+        tmp_path, market="CN", state_path=state_path
+    )
+
+    assert client.requests[-1]["qty"] == "100"
+    assert projection["positions"]["600001"] | {
+        "overheat_trim_started_for": "2026-07-18",
+        "overheat_trim_target_qty": "100",
+    } == projection["positions"]["600001"]
+
+
 def test_partial_lifecycle_reuses_confirmed_remainder_on_a_later_report(
     tmp_path: Path,
 ) -> None:
