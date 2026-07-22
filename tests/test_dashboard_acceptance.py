@@ -1373,7 +1373,7 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
         "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
         "Kelly 阶段 当前 Kelly 上限 富途模拟盘交易统计 东方财富实盘交易统计",
         "策略累计回撤 纪律内 实盘执行辅助 东方财富 超买 报告外加仓",
-        "基准已自动建立 回撤基准审计详情 100000 2026-07-17 automatic-bootstrap-audit ",
+        "基准已自动建立 回撤基准审计详情 100,000 2026-07-17 automatic-bootstrap-audit ",
         "candidate-sha parameter-hash acceptance 2026-07-20T08:00:00+08:00 2026-07-20 ",
         "状态恢复审计详情 snapshot-recovery-audit snapshot.json state-hash 2026-07-20T08:30:00+08:00",
         "5% 是风险预算目标，不是最大损失保证。",

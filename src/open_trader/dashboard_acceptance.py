@@ -1626,9 +1626,12 @@ def _check_integrated_trend_ui(
     for value in required:
         assert value != "-" and value in text, f"{broker} 集成风险视图缺少 {value}"
     if isinstance(bootstrap, Mapping):
+        baseline_equity = _display_number(bootstrap.get("baseline_equity"))
+        assert baseline_equity in text, (
+            f"{broker} 回撤基准审计未显示 {baseline_equity}"
+        )
         for value in (
             "回撤基准审计详情",
-            bootstrap.get("baseline_equity"),
             bootstrap.get("source_date"),
             bootstrap.get("event_id"),
             bootstrap.get("accepted_git_sha"),
