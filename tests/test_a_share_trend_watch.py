@@ -244,6 +244,25 @@ def read_events(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def write_action(
+    data_dir: Path, key: str, payload: dict[str, object]
+) -> None:
+    path = (
+        data_dir
+        / "trend_review/ledgers/US/actions/2026-07-22"
+        / key
+        / "2026-07-22T15-30-00-04-00.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            **payload,
+            "recorded_at": "2026-07-22T15:30:00-04:00",
+        }),
+        encoding="utf-8",
+    )
+
+
 def interrupted(message: str = "网络中断") -> FutuQuoteError:
     return FutuQuoteError(message, error_type="quote_server_interrupted")
 
@@ -642,49 +661,152 @@ def test_closed_trading_day_runs_compensation_before_exit(tmp_path: Path) -> Non
     assert opens == ["2026-07-15"]
 
 
-def test_trend_review_deadline_notification_is_sent_once(tmp_path: Path) -> None:
+def test_deadline_groups_same_side_and_status(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
-    action = (
-        data_dir
-        / "trend_review/ledgers/CN/actions/2026-07-15/key"
-        / "2026-07-15T09-31-00+08-00.json"
-    )
-    action.parent.mkdir(parents=True)
-    action.write_text(
-        json.dumps(
-            {
-                "symbol": "600900",
-                "status": "submitted",
-                "recorded_at": "2026-07-15T09:31:00+08:00",
-            }
-        ),
-        encoding="utf-8",
-    )
-    events = data_dir / "trend_a_share/watch_events.jsonl"
-    notifier = RecordingNotifier()
+    write_action(data_dir, "hig-buy", {
+        "symbol": "HIG",
+        "side": "buy",
+        "status": "incomplete",
+        "filled_qty": "5",
+        "target_qty": "10",
+    })
+    write_action(data_dir, "hst-buy", {
+        "symbol": "HST",
+        "side": "buy",
+        "status": "incomplete",
+        "target_qty": "20",
+    })
+    write_action(data_dir, "spy-sell", {
+        "symbol": "SPY",
+        "side": "sell",
+        "status": "incomplete",
+        "target_qty": "3",
+    })
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
 
     _notify_trend_review_deadline(
         data_dir=data_dir,
-        market="CN",
-        trading_date="2026-07-15",
-        now=datetime.fromisoformat("2026-07-15T09:59:00+08:00"),
-        events_path=events,
-        notifier=notifier,
+        market="US",
+        trading_date="2026-07-22",
+        now=datetime.fromisoformat("2026-07-22T15:30:00-04:00"),
+        events_path=data_dir / "trend_us/watch_events.jsonl",
+        notifier=CompositeNotifier([feishu, macos]),
     )
-    for _ in range(2):
+
+    assert [title for title, _ in feishu.messages] == [
+        "【需处理｜老虎｜美股买入未完成｜2026-07-22】",
+        "【需处理｜老虎｜美股卖出未完成｜2026-07-22】",
+    ]
+    assert "- HIG" in feishu.messages[0][1]
+    assert "- HST" in feishu.messages[0][1]
+    assert "- SPY" in feishu.messages[1][1]
+    assert [title for title, _ in macos.messages] == [
+        "趋势模拟执行未完成 · 2026-07-22",
+        "趋势模拟执行未完成 · 2026-07-22",
+        "趋势模拟执行未完成 · 2026-07-22",
+    ]
+
+
+def test_deadline_retries_failed_feishu_group_without_repeating_macos(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_action(data_dir, "hig-buy", {
+        "symbol": "HIG", "side": "buy", "status": "incomplete",
+    })
+    write_action(data_dir, "hst-buy", {
+        "symbol": "HST", "side": "buy", "status": "incomplete",
+    })
+    feishu = FlakyNotifier(failures=1)
+    macos = RecordingMacOSNotifier()
+    events_path = data_dir / "trend_us/watch_events.jsonl"
+
+    for second in (0, 5, 10):
         _notify_trend_review_deadline(
             data_dir=data_dir,
-            market="CN",
-            trading_date="2026-07-15",
-            now=datetime.fromisoformat("2026-07-15T10:00:00+08:00"),
-            events_path=events,
-            notifier=notifier,
+            market="US",
+            trading_date="2026-07-22",
+            now=datetime.fromisoformat(
+                f"2026-07-22T15:30:{second:02d}-04:00"
+            ),
+            events_path=events_path,
+            notifier=CompositeNotifier([feishu, macos]),
         )
 
-    assert notifier.messages == [
-        ("趋势模拟执行未完成 · 2026-07-15", "600900 · 已提交")
-    ]
-    assert read_events(events)[0]["event_type"] == "trend_review_deadline_notified"
+    assert feishu.attempt_count == 2
+    assert len(feishu.messages) == 1
+    assert len(macos.messages) == 2
+    assert sum(
+        event["event_type"]
+        == "trend_review_deadline_notification_delivered_feishu"
+        for event in read_events(events_path)
+    ) == 2
+
+
+def test_deadline_exhausts_feishu_group_after_two_failures(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    write_action(data_dir, "hig-buy", {
+        "symbol": "HIG", "side": "buy", "status": "incomplete",
+    })
+    feishu = FlakyNotifier(failures=2)
+    events_path = data_dir / "trend_us/watch_events.jsonl"
+
+    for second in (0, 5, 10):
+        _notify_trend_review_deadline(
+            data_dir=data_dir,
+            market="US",
+            trading_date="2026-07-22",
+            now=datetime.fromisoformat(
+                f"2026-07-22T15:30:{second:02d}-04:00"
+            ),
+            events_path=events_path,
+            notifier=feishu,
+        )
+
+    events = read_events(events_path)
+    assert feishu.attempt_count == 2
+    assert any(
+        event["event_type"]
+        == "trend_review_deadline_notification_exhausted_feishu"
+        for event in events
+    )
+    assert not any(
+        event["event_type"]
+        == "trend_review_deadline_notification_delivered_feishu"
+        for event in events
+    )
+
+
+def test_legacy_deadline_notification_is_final(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_action(data_dir, "hig-buy", {
+        "symbol": "HIG", "side": "buy", "status": "incomplete",
+    })
+    events_path = data_dir / "trend_us/watch_events.jsonl"
+    append_watch_event(
+        events_path,
+        symbol="HIG",
+        trading_date="2026-07-22",
+        event_type="trend_review_deadline_notified",
+        occurred_at="2026-07-22T15:30:00-04:00",
+        last_price=None,
+        active_line=None,
+    )
+    feishu = RecordingNotifier()
+
+    _notify_trend_review_deadline(
+        data_dir=data_dir,
+        market="US",
+        trading_date="2026-07-22",
+        now=datetime.fromisoformat("2026-07-22T15:31:00-04:00"),
+        events_path=events_path,
+        notifier=feishu,
+    )
+
+    assert feishu.messages == []
 
 
 def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:

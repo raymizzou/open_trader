@@ -49,7 +49,9 @@ from .notification_policy import (
     BROKER_LABELS,
     MARKET_LABELS,
     brief_zh_detail,
+    group_order_alerts,
     render_attention,
+    render_order_alert,
 )
 from .opend_incident import (
     OpenDIncidentStateError,
@@ -1242,6 +1244,93 @@ def _notify_feishu_once(title: str, message: str, key: object) -> bool:
         non_feishu_payload=None,
         feishu_payload=(title, message),
     )
+
+
+def _latest_action_events(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+) -> list[Mapping[str, object]]:
+    root = (
+        config.data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+    )
+    events: list[Mapping[str, object]] = []
+    for action_dir in sorted(root.glob("*")):
+        paths = sorted(action_dir.glob("*.json"))
+        if not paths:
+            continue
+        try:
+            event = json.loads(paths[-1].read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(event, Mapping):
+            events.append(event)
+    return events
+
+
+def _notify_order_groups(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    events: list[Mapping[str, object]],
+    occurred_at: str,
+) -> int:
+    sent = 0
+    for group in group_order_alerts(market, events):
+        title, message = render_order_alert(
+            group,
+            broker_label=BROKER_LABELS[market],
+            trading_date=execution_date,
+        )
+        key = (
+            config,
+            market,
+            execution_date,
+            f"order_{group.side}_{group.status}",
+            f"{group.side}:{group.status}",
+            occurred_at,
+        )
+        sent += int(_notify_feishu_once(title, message, key))
+    return sent
+
+
+def _notify_order_groups_or_batch_failure(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    events: list[Mapping[str, object]],
+    occurred_at: str,
+    status: str,
+) -> int:
+    if group_order_alerts(market, events):
+        return _notify_order_groups(
+            config, market, execution_date, events, occurred_at
+        )
+    title, message = render_attention(
+        BROKER_LABELS[market],
+        f"{MARKET_LABELS[market]}批次执行失败",
+        execution_date,
+        happened="订单执行异常，但无法从动作账本确认方向",
+        impact="相关订单状态需要人工核对",
+        action="查看不可变动作账本与控制器日志",
+    )
+    return int(_notify_feishu_once(
+        title,
+        message,
+        (
+            config,
+            market,
+            execution_date,
+            "order_batch_failed",
+            status,
+            occurred_at,
+        ),
+    ))
 
 
 def _notify_controller_failure(
@@ -2526,7 +2615,8 @@ def run_trend_market_controller(
                     if status in {"uncertain", "conflict"}:
                         blocker = status
                         phase = status
-                        _notify_once(
+                        occurred_at = now.isoformat(timespec="seconds")
+                        _notify_non_feishu_once(
                             f"{market} 趋势订单 {status}",
                             "自动提交已停止，请核对不可变账本与 Futu 订单。",
                             (
@@ -2535,12 +2625,29 @@ def run_trend_market_controller(
                                 work_cycle.execution_date,
                                 "execution",
                                 status,
-                                now.isoformat(timespec="seconds"),
+                                occurred_at,
                             ),
+                        )
+                        _notify_order_groups_or_batch_failure(
+                            config,
+                            market,
+                            work_cycle.execution_date,
+                            [
+                                event
+                                for event in _latest_action_events(
+                                    config,
+                                    market,
+                                    work_cycle.execution_date,
+                                )
+                                if event.get("status") == status
+                            ],
+                            occurred_at,
+                            status,
                         )
                     elif status == "missed_window":
                         phase = "missed"
-                        _notify_once(
+                        occurred_at = now.isoformat(timespec="seconds")
+                        _notify_non_feishu_once(
                             f"{market} 趋势买入已错过窗口",
                             "报告已保留，未完成的买入不会追单。",
                             (
@@ -2549,8 +2656,25 @@ def run_trend_market_controller(
                                 work_cycle.execution_date,
                                 "opening_actions",
                                 "buy_window_closed",
-                                now.isoformat(timespec="seconds"),
+                                occurred_at,
                             ),
+                        )
+                        _notify_order_groups_or_batch_failure(
+                            config,
+                            market,
+                            work_cycle.execution_date,
+                            [
+                                event
+                                for event in _latest_action_events(
+                                    config,
+                                    market,
+                                    work_cycle.execution_date,
+                                )
+                                if event.get("status")
+                                in {"missed", "missed_window"}
+                            ],
+                            occurred_at,
+                            status,
                         )
                     else:
                         phase = (

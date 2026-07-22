@@ -66,6 +66,24 @@ def controller_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+def write_controller_action(
+    config: DailyPremarketConfig,
+    key: str,
+    payload: dict[str, object],
+) -> None:
+    path = (
+        config.data_dir
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / key
+        / "2026-07-20T09-31-00+08-00.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({**payload, "recorded_at": NOW.isoformat()}),
+        encoding="utf-8",
+    )
+
+
 class FlakyFeishu(FeishuWebhookNotifier):
     def __init__(self, failures: int) -> None:
         self.failures = failures
@@ -2312,6 +2330,160 @@ def test_report_finished_after_window_is_preserved_and_actions_become_missed(
     assert result["phase"] == "missed"
     assert report_path.exists()
     assert result["last_success"]["submitted_count"] == 0
+
+
+def test_controller_groups_uncertain_actions_by_side_for_feishu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        write_controller_action(config, "600001-buy", {
+            "symbol": "600001", "side": "buy", "status": "uncertain",
+        })
+        write_controller_action(config, "600002-buy", {
+            "symbol": "600002", "side": "buy", "status": "uncertain",
+        })
+        write_controller_action(config, "600003-sell", {
+            "symbol": "600003", "side": "sell", "status": "uncertain",
+        })
+        return {"status": "uncertain", "submitted_count": 0}
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    non_feishu: list[tuple[str, str]] = []
+    feishu: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_non_feishu_once",
+        lambda title, message, _key: non_feishu.append((title, message)) or True,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, message, _key: feishu.append((title, message)) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert [title for title, _ in non_feishu] == ["CN 趋势订单 uncertain"]
+    assert [title for title, _ in feishu] == [
+        "【需处理｜东方财富｜A股买入状态不确定｜2026-07-20】",
+        "【需处理｜东方财富｜A股卖出状态不确定｜2026-07-20】",
+    ]
+    assert "- 600001" in feishu[0][1]
+    assert "- 600002" in feishu[0][1]
+
+
+def test_controller_groups_missed_buys_for_feishu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        for symbol in ("600001", "600002"):
+            write_controller_action(config, f"{symbol}-buy", {
+                "symbol": symbol,
+                "side": "buy",
+                "status": "missed",
+                "reason": "buy_window_closed",
+            })
+        return {"status": "missed_window", "submitted_count": 0}
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    non_feishu: list[str] = []
+    feishu: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_non_feishu_once",
+        lambda title, _message, _key: non_feishu.append(title) or True,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, message, _key: feishu.append((title, message)) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert non_feishu == ["CN 趋势买入已错过窗口"]
+    assert [title for title, _ in feishu] == [
+        "【需处理｜东方财富｜A股买入错过窗口｜2026-07-20】"
+    ]
+    assert "- 600001" in feishu[0][1]
+    assert "- 600002" in feishu[0][1]
+
+
+def test_controller_submitted_actions_create_no_feishu_order_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        write_controller_action(config, "600001-buy", {
+            "symbol": "600001", "side": "buy", "status": "submitted",
+        })
+        return {"status": "submitted", "submitted_count": 1}
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    feishu: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, _message, _key: feishu.append(title) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert feishu == []
+
+
+def test_controller_directionless_abnormal_execution_uses_batch_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {
+            "status": "uncertain",
+            "submitted_count": 0,
+        },
+    )
+    feishu: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_non_feishu_once",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, _message, _key: feishu.append(title) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert feishu == ["【需处理｜东方财富｜A股批次执行失败｜2026-07-20】"]
 
 
 def test_report_future_keeps_its_execution_date_when_cycle_advances(
