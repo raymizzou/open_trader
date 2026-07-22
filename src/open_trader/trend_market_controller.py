@@ -7,6 +7,7 @@ import re
 import socket
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -1759,8 +1760,10 @@ def run_trend_market_controller(
 
     def reset_quote() -> None:
         nonlocal quote_client
-        close_client(quote_client)
+        failed_client = quote_client
         quote_client = None
+        with suppress(Exception):
+            close_client(failed_client)
 
     def load_account(
         _path: Path, *, expected_date: str, timezone: ZoneInfo
@@ -1785,8 +1788,10 @@ def run_trend_market_controller(
                 account_client=account_client,
             )
         except Exception:
-            close_client(account_client)
+            failed_client = account_client
             account_client = None
+            with suppress(Exception):
+                close_client(failed_client)
             raise
 
     try:
@@ -2183,7 +2188,13 @@ def run_trend_market_controller(
                 return status_payload
             sleep_fn(5)
     finally:
-        close_client(account_client)
-        close_client(quote_client)
-        pool.shutdown(wait=not once, cancel_futures=True)
-        lock.__exit__(None, None, None)
+        try:
+            close_client(account_client)
+        finally:
+            try:
+                close_client(quote_client)
+            finally:
+                try:
+                    pool.shutdown(wait=not once, cancel_futures=True)
+                finally:
+                    lock.__exit__(None, None, None)

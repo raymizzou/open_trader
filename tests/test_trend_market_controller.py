@@ -342,6 +342,254 @@ def test_controller_rebuilds_shared_clients_after_reader_failures(
     assert all(account.closed for account in account_clients)
 
 
+def test_controller_rebuilds_quote_when_failed_quote_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    quote_clients: list[object] = []
+
+    class Quote:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self is quote_clients[0]:
+                raise RuntimeError("quote close failed")
+
+    def quote_factory(**_kwargs: object) -> object:
+        quote = Quote()
+        quote_clients.append(quote)
+        return quote
+
+    def protect(
+        *_args: object, quote_client: object, **_kwargs: object
+    ) -> object:
+        if quote_client is quote_clients[0]:
+            raise controller.FutuQuoteError("quote operation failed")
+        return protection_success()
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", quote_factory)
+    monkeypatch.setattr(controller, "_run_protection_pass", protect)
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+
+    class StopLoop(RuntimeError):
+        pass
+
+    with pytest.raises(StopLoop):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
+        )
+
+    assert len(quote_clients) == 2
+    assert [quote.close_calls for quote in quote_clients] == [1, 1]
+
+
+def test_controller_rebuilds_account_when_failed_account_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    account_clients: list[object] = []
+    operation_errors: list[str] = []
+
+    class Account:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self is account_clients[0]:
+                raise RuntimeError("account close failed")
+
+    def account_factory(**_kwargs: object) -> object:
+        account = Account()
+        account_clients.append(account)
+        return account
+
+    def protect(
+        _config: DailyPremarketConfig,
+        _market: str,
+        day: str,
+        *,
+        account_loader: Callable[..., object],
+        **_kwargs: object,
+    ) -> object:
+        try:
+            account_loader(
+                config.portfolio,
+                expected_date=day,
+                timezone=controller.TIMEZONES["CN"],
+            )
+        except Exception as exc:
+            operation_errors.append(str(exc))
+            raise
+        return protection_success()
+
+    monkeypatch.setattr(
+        controller,
+        "FutuQuoteClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        controller, "FutuSimulateOrderExecutionClient", account_factory
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("account operation failed")
+        )
+        if kwargs["account_client"] is account_clients[0]
+        else SimpleNamespace(positions=()),
+    )
+    monkeypatch.setattr(controller, "_run_protection_pass", protect)
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+
+    class StopLoop(RuntimeError):
+        pass
+
+    sleeps = 0
+
+    def stop_after_two_loops(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_two_loops,
+        )
+
+    assert len(account_clients) == 2
+    assert [account.close_calls for account in account_clients] == [1, 1]
+    assert operation_errors == ["account operation failed"]
+
+
+def test_controller_shutdown_attempts_every_cleanup_after_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    cleanup: list[str] = []
+
+    class Quote:
+        def close(self) -> None:
+            cleanup.append("quote")
+
+    class Account:
+        def close(self) -> None:
+            cleanup.append("account")
+            raise RuntimeError("account close failed")
+
+    class Pool:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def shutdown(self, **_kwargs: object) -> None:
+            cleanup.append("pool")
+
+    def protect(
+        _config: DailyPremarketConfig,
+        _market: str,
+        day: str,
+        *,
+        account_loader: Callable[..., object],
+        **_kwargs: object,
+    ) -> object:
+        account_loader(
+            config.portfolio,
+            expected_date=day,
+            timezone=controller.TIMEZONES["CN"],
+        )
+        return protection_success()
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: Quote())
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: Account(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_futu_simulate_trend_account",
+        lambda **_kwargs: SimpleNamespace(positions=()),
+    )
+    monkeypatch.setattr(controller, "ThreadPoolExecutor", Pool)
+    monkeypatch.setattr(controller, "_run_protection_pass", protect)
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+
+    with pytest.raises(RuntimeError, match="account close failed"):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=lambda _seconds: (_ for _ in ()).throw(
+                RuntimeError("stop loop")
+            ),
+        )
+
+    assert cleanup == ["account", "quote", "pool"]
+    lock_path = config.data_dir / "runs/.trend_market_controller.CN.lock"
+    with RunLock(lock_path):
+        pass
+
+
 def valid_cn_report(
     *, as_of_date: str, execution_date: str, buy: bool = False
 ) -> dict[str, object]:
