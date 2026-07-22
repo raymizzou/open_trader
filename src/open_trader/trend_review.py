@@ -1765,6 +1765,7 @@ def overheat_trim_progress(
     futu_code = to_futu_symbol(market, symbol)
     ledger = data_dir / "trend_review" / "ledgers" / market
     action_dates = ledger / "actions"
+    open_dates = ledger / "open"
     targets: set[Decimal] = set()
     dealt_by_order: dict[str, Decimal] = {}
     below_lot = False
@@ -1772,50 +1773,70 @@ def overheat_trim_progress(
     submitted_order_ids: set[str] = set()
     observed_order_statuses: dict[str, str] = {}
     uncertain_action = False
-    for date_root in sorted(action_dates.glob("*")):
-        if not date_root.is_dir():
-            continue
+    date_names = {
+        path.name
+        for root in (action_dates, open_dates)
+        for path in root.glob("*")
+        if path.is_dir()
+    }
+    for date_name in sorted(date_names):
         try:
-            execution_date = date.fromisoformat(date_root.name).isoformat()
+            execution_date = date.fromisoformat(date_name).isoformat()
         except ValueError:
             continue
         action_key = trend_action_key(market, execution_date, futu_code, "sell")
-        action_root = date_root / action_key
-        if not action_root.is_dir():
-            continue
-        if not (ledger / "batches" / f"{execution_date}.json").is_file():
-            continue
-        events, resolutions = load_trend_action_audit(
-            data_dir,
-            market=market,
-            execution_date=execution_date,
-            symbol=symbol,
-            side="sell",
-        )
-        _, _, action, _ = _locked_action_context(
-            data_dir,
-            market=market,
-            execution_date=execution_date,
-            symbol=symbol,
-            side="sell",
-        )
-        if (
-            action.get("action") != "SELL_PARTIAL"
-            or action.get("position_started_for") != position_started_for
-        ):
-            continue
-        action_abandoned = any(
-            item.get("resolution") == "abandon" for item in resolutions
-        )
-        if action_abandoned:
-            continue
-        source_paths.append(str(action_root.relative_to(data_dir)))
+        action_root = action_dates / execution_date / action_key
         facts = _action_facts(
-            ledger / "open" / execution_date,
+            open_dates / execution_date,
             futu_code=futu_code,
             side="sell",
         )
-        payloads = [item[1] for item in facts] + events
+        if not facts and not action_root.is_dir():
+            continue
+        has_batch = (ledger / "batches" / f"{execution_date}.json").is_file()
+        if has_batch:
+            events, resolutions = load_trend_action_audit(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                symbol=symbol,
+                side="sell",
+            )
+            _, _, action, _ = _locked_action_context(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                symbol=symbol,
+                side="sell",
+            )
+            if (
+                action.get("action") != "SELL_PARTIAL"
+                or action.get("position_started_for") != position_started_for
+            ):
+                continue
+            action_abandoned = any(
+                item.get("resolution") == "abandon" for item in resolutions
+            )
+            payloads = [item[1] for item in facts] + events
+        else:
+            events = []
+            action_abandoned = False
+            payloads = [
+                item[1]
+                for item in facts
+                if item[1].get("sell_goal") == "partial_30"
+            ]
+            if not payloads:
+                continue
+        if not payloads:
+            continue
+        source_paths.append(
+            str(
+                (action_root if action_root.is_dir() else facts[0][0]).relative_to(
+                    data_dir
+                )
+            )
+        )
         for payload in payloads:
             if payload.get("sell_goal") == "position_zero":
                 continue
@@ -1832,6 +1853,8 @@ def overheat_trim_progress(
                 )
             except ValueError as exc:
                 raise ValueError("invalid overheat trim lifecycle fact") from exc
+        if facts and not events and not action_abandoned:
+            uncertain_action = True
         if any(
             event.get("sell_goal") == "partial_30"
             and event.get("status") == "below_lot"
@@ -2373,7 +2396,7 @@ def _preflight_open_actions(
     from .futu_symbols import to_futu_symbol
 
     validated: list[Mapping[str, object]] = []
-    sell_actions_by_symbol: dict[str, set[str]] = {}
+    sell_actions_by_symbol: set[str] = set()
     for action in actions:
         if not isinstance(action, Mapping):
             raise ValueError("trend review action is invalid")
@@ -2383,10 +2406,9 @@ def _preflight_open_actions(
             raise ValueError("trend review action is invalid")
         futu_code = to_futu_symbol(market, symbol)
         if action_name in {"SELL_ALL", "SELL_PARTIAL"}:
-            existing = sell_actions_by_symbol.setdefault(futu_code, set())
-            if existing and action_name not in existing:
+            if futu_code in sell_actions_by_symbol:
                 raise ValueError("trend review has conflicting sell actions")
-            existing.add(action_name)
+            sell_actions_by_symbol.add(futu_code)
         if action_name == "BUY":
             try:
                 target_weight = _required_decimal(

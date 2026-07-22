@@ -1618,6 +1618,17 @@ def _execution_completed(
             symbol=symbol,
             side="buy" if action_name == "BUY" else "sell",
         )
+        position_zero_events = [
+            item for item in events if item.get("sell_goal") == "position_zero"
+        ]
+        if position_zero_events:
+            if any(
+                item.get("status") in {"filled", "incomplete"}
+                and item.get("reason") == "position_zero_confirmed"
+                for item in position_zero_events
+            ):
+                continue
+            return False
         if any(
             item.get("resolution") in {"confirm-submitted", "abandon"}
             for item in resolutions

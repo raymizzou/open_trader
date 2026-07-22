@@ -855,6 +855,23 @@ def test_execution_completion_distinguishes_partial_and_full_sell_goals(
         "lifecycle_target_qty": "300",
     }]
     assert controller._execution_completed(config, cycle)
+    for protection_status in ("submitted", "partially_filled"):
+        events[:] = [
+            {
+                "status": "filled",
+                "sell_goal": "partial_30",
+                "filled_qty": "300",
+                "lifecycle_target_qty": "300",
+            },
+            {"status": protection_status, "sell_goal": "position_zero"},
+        ]
+        assert not controller._execution_completed(config, cycle)
+    events[-1] = {
+        "status": "incomplete",
+        "reason": "position_zero_confirmed",
+        "sell_goal": "position_zero",
+    }
+    assert controller._execution_completed(config, cycle)
     events[:] = [{
         "status": "filled",
         "sell_goal": "partial_30",
