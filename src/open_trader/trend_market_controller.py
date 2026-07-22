@@ -51,6 +51,12 @@ from .notification_policy import (
     brief_zh_detail,
     render_attention,
 )
+from .opend_incident import (
+    OpenDIncidentStateError,
+    classify_opend_error,
+    record_opend_failure,
+    record_opend_health,
+)
 from .trend_review import (
     _canonical_json_bytes,
     _report_hash,
@@ -1238,6 +1244,107 @@ def _notify_feishu_once(title: str, message: str, key: object) -> bool:
     )
 
 
+def _notify_controller_failure(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    action: str,
+    error: BaseException,
+    occurred_at: datetime,
+) -> bool:
+    title = (
+        f"{market} 趋势复盘待恢复"
+        if action == "review"
+        else f"{market} 趋势控制器阻塞"
+    )
+    notification_action = "controller" if action == "review" else action
+    reason = brief_zh_detail(str(error))
+    category = classify_opend_error(error)
+    occurred_text = occurred_at.isoformat(timespec="seconds")
+    if category is None:
+        identity = str(
+            getattr(error, "error_type", error.__class__.__name__)
+        )
+        return _notify_once(
+            title,
+            reason,
+            (
+                config,
+                market,
+                execution_date,
+                notification_action,
+                identity,
+                occurred_text,
+            ),
+        )
+
+    _notify_non_feishu_once(
+        title,
+        str(error),
+        (
+            config,
+            market,
+            execution_date,
+            notification_action,
+            str(error),
+            occurred_text,
+        ),
+    )
+    if category == "connectivity":
+        problem = "OpenD 连接故障"
+        happened = "OpenD 连接异常"
+        next_action = "检查 OpenD 登录与网络"
+    else:
+        problem = "OpenD 请求限频"
+        happened = "OpenD 请求已触发限频"
+        next_action = "暂停手工重跑，等待限频窗口恢复"
+    shared_title, shared_message = render_attention(
+        "系统",
+        problem,
+        execution_date,
+        happened=happened,
+        impact="CN、HK、US 行情与订单监控可能中断",
+        action=next_action,
+        detail=reason,
+    )
+
+    def send_shared_feishu(title: str, message: str) -> str | None:
+        attempts = send_notification_with_results(
+            build_notifier(config),
+            title,
+            message,
+            channels={"feishu", "feishu_app"},
+        )
+        return next(
+            (attempt.channel for attempt in attempts if attempt.success), None
+        )
+
+    try:
+        return record_opend_failure(
+            data_dir=config.data_dir,
+            market=market,
+            category=category,
+            reason=reason,
+            occurred_at=occurred_at,
+            send_feishu=send_shared_feishu,
+            title=shared_title,
+            message=shared_message,
+        )
+    except OpenDIncidentStateError:
+        return _notify_once(
+            title,
+            reason,
+            (
+                config,
+                market,
+                execution_date,
+                notification_action,
+                category,
+                occurred_text,
+            ),
+        )
+
+
 def _retry_pending_feishu_notifications(config: DailyPremarketConfig) -> None:
     for path in sorted(
         (config.data_dir / "trend_controller").glob(
@@ -2218,17 +2325,13 @@ def run_trend_market_controller(
                 cycle_failures += 1
                 cycle_retry_after = _retry_at(now, cycle_failures)
                 cycle_blocker = str(exc)
-                _notify_once(
-                    f"{market} 趋势控制器阻塞",
-                    cycle_blocker,
-                    (
-                        config,
-                        market,
-                        now.astimezone(TIMEZONES[market]).date().isoformat(),
-                        "calendar",
-                        cycle_blocker,
-                        now.isoformat(timespec="seconds"),
-                    ),
+                _notify_controller_failure(
+                    config,
+                    market,
+                    now.astimezone(TIMEZONES[market]).date().isoformat(),
+                    "calendar",
+                    exc,
+                    now,
                 )
                 status_payload = _record_status(
                     config,
@@ -2244,6 +2347,8 @@ def run_trend_market_controller(
                     return status_payload
                 sleep_fn(5)
                 continue
+            with suppress(OpenDIncidentStateError):
+                record_opend_health(config.data_dir, market, now)
             cycle_failures = 0
             cycle_retry_after = None
             cycle_blocker = None
@@ -2510,17 +2615,13 @@ def run_trend_market_controller(
                             "missed",
                         }:
                             phase = "recovering_review"
-                        _notify_once(
-                            f"{market} 趋势复盘待恢复",
-                            str(exc),
-                            (
-                                config,
-                                market,
-                                cycle.execution_date,
-                                "controller",
-                                str(exc),
-                                now.isoformat(timespec="seconds"),
-                            ),
+                        _notify_controller_failure(
+                            config,
+                            market,
+                            cycle.execution_date,
+                            "review",
+                            exc,
+                            now,
                         )
                     else:
                         if last_success is None or cycle.session == "closed":
@@ -2546,17 +2647,13 @@ def run_trend_market_controller(
                     phase = "blocked"
                 elif phase != "recovering_report":
                     phase = "blocked"
-                _notify_once(
-                    f"{market} 趋势控制器阻塞",
-                    blocker,
-                    (
-                        config,
-                        market,
-                        cycle.execution_date,
-                        "controller",
-                        blocker,
-                        now.isoformat(timespec="seconds"),
-                    ),
+                _notify_controller_failure(
+                    config,
+                    market,
+                    cycle.execution_date,
+                    "controller",
+                    exc,
+                    now,
                 )
                 blocker = cycle_blocker or report_blocker or operation_blocker
 

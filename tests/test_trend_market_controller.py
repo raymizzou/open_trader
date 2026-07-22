@@ -432,6 +432,151 @@ def test_protection_blocker_notifies_feishu_once_per_market_day(
     assert feishu.attempt_count == 1
 
 
+def _record_controller_notification_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, set[str]]]:
+    sent: list[tuple[str, str, set[str]]] = []
+
+    def send(
+        _notifier: object,
+        title: str,
+        message: str,
+        *,
+        channels: set[str],
+    ) -> list[SimpleNamespace]:
+        sent.append((title, message, channels))
+        channel = "feishu_app" if "feishu" in channels else "macos"
+        return [SimpleNamespace(channel=channel, success=True)]
+
+    monkeypatch.setattr(controller, "send_notification_with_results", send)
+    return sent
+
+
+def test_different_connectivity_errors_share_one_controller_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    controller._notify_controller_failure(
+        config,
+        "CN",
+        "2026-07-22",
+        "calendar",
+        RuntimeError("Connect timeout"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    )
+    controller._notify_controller_failure(
+        config,
+        "HK",
+        "2026-07-22",
+        "controller",
+        RuntimeError("protocol disconnected"),
+        datetime.fromisoformat("2026-07-22T10:00:01+08:00"),
+    )
+
+    feishu = [item for item in sent if "feishu" in item[2]]
+    assert len(feishu) == 1
+    assert feishu[0][0] == "【需处理｜系统｜OpenD 连接故障｜2026-07-22】"
+    assert "影响：CN、HK、US 行情与订单监控可能中断" in feishu[0][1]
+    state = json.loads(
+        (
+            config.data_dir
+            / "trend_controller/shared/incidents/opend-connectivity.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["affected_markets"] == ["CN", "HK"]
+
+
+def test_connectivity_and_rate_limit_are_separate_controller_incidents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    for error in (RuntimeError("network down"), RuntimeError("请求频率太高")):
+        controller._notify_controller_failure(
+            config,
+            "US",
+            "2026-07-22",
+            "controller",
+            error,
+            datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+        )
+
+    feishu_titles = [title for title, _, channels in sent if "feishu" in channels]
+    assert feishu_titles == [
+        "【需处理｜系统｜OpenD 连接故障｜2026-07-22】",
+        "【需处理｜系统｜OpenD 请求限频｜2026-07-22】",
+    ]
+    assert (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-connectivity.json"
+    ).exists()
+    assert (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-rate-limit.json"
+    ).exists()
+
+
+def test_shared_incident_state_failure_falls_back_to_per_market_feishu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    incident = (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-connectivity.json"
+    )
+    incident.parent.mkdir(parents=True, exist_ok=True)
+    incident.write_text("{}", encoding="utf-8")
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    controller._notify_controller_failure(
+        config,
+        "CN",
+        "2026-07-22",
+        "controller",
+        RuntimeError("Connect timeout"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    )
+
+    feishu = [item for item in sent if "feishu" in item[2]]
+    assert len(feishu) == 1
+    assert feishu[0][0] == "【需处理｜东方财富｜A股趋势控制器阻塞｜2026-07-22】"
+
+
+def test_unknown_controller_errors_stay_per_market(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        RuntimeError("unknown broker response"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    )
+
+    feishu = [item for item in sent if "feishu" in item[2]]
+    assert len(feishu) == 1
+    assert feishu[0][0] == "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】"
+    assert not (
+        config.data_dir / "trend_controller/shared/incidents"
+    ).exists()
+    states = list(
+        config.data_dir.glob(
+            "trend_controller/US/notifications/2026-07-22/*.json"
+        )
+    )
+    assert len(states) == 1
+    assert json.loads(states[0].read_text(encoding="utf-8"))["reason"] == (
+        "RuntimeError"
+    )
+
+
 def active_cn_cycle() -> ControllerCycle:
     return ControllerCycle(
         market="CN",
@@ -442,6 +587,43 @@ def active_cn_cycle() -> ControllerCycle:
         market_open=True,
         next_check_at=datetime.fromisoformat("2026-07-20T09:31:05+08:00"),
     )
+
+
+def test_successful_controller_cycle_records_opend_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    write_report(config)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    incident = (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-connectivity.json"
+    )
+    incident.parent.mkdir(parents=True, exist_ok=True)
+    incident.write_text(
+        json.dumps({
+            "schema_version": "open_trader.opend_incident.v1",
+            "category": "connectivity",
+            "active": True,
+            "first_detected_at": "2026-07-20T09:30:00+08:00",
+            "updated_at": "2026-07-20T09:30:00+08:00",
+            "affected_markets": ["CN"],
+            "reasons": {"CN": "连接超时"},
+            "healthy_markets": [],
+            "feishu_attempts": 1,
+            "feishu_delivered_at": "2026-07-20T09:30:00+08:00",
+            "channels": ["feishu_app"],
+        }),
+        encoding="utf-8",
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "monitoring"
+    assert json.loads(incident.read_text(encoding="utf-8"))["active"] is False
 
 
 def test_repeated_controller_and_watcher_calendar_queries_stay_below_futu_quota(
@@ -1481,8 +1663,8 @@ def test_close_review_failure_is_nonblocking_progress(
         "artifact_paths": [],
     }
     assert result["next_check_at"] == "2026-07-20T15:01:10+08:00"
-    assert notifications[0][1] == reason
-    assert notifications[0][2][3:5] == ("controller", reason)
+    assert notifications[0][1] == "详见控制器日志"
+    assert notifications[0][2][3:5] == ("controller", "snapshot_failed")
 
 
 def test_review_backoff_does_not_delay_order_execution(
