@@ -5107,6 +5107,31 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_partial_sell_with_simulation_target_at_desktop_and_mobile() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  market:"CN", broker_label:"东方财富", market_label:"A股", report_date:"2026-07-15",
+  data_date:"2026-07-14", generated_at:"now", account_status:"已更新", buy_window:"09:30–10:00",
+  counts:{sell:2}, buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+  sell_actions:[
+    {action:"SELL_PARTIAL",symbol:"600001",name:"过热",close:"10",temperature_prev:"热",temperature_curr:"沸",strength:"99",reason:"overheat_take_profit",active_line:"9",estimated_shares:300,lot_size:100,overheat_signals:["boiling"],execution:{status:"partially_filled",target_qty:"300",filled_qty:"100"}},
+    {action:"SELL_ALL",symbol:"600002",name:"危险",close:"8",temperature_prev:"热",temperature_curr:"平",strength:"80",reason:"danger_signal",active_line:"7"},
+  ],
+  actual_overlay:{available:true,broker_label:"东方财富",status_text:"结单数据，非实时",notice:"不会自动交易真实账户",items:[{symbol:"600001",name:"过热",frozen_action_label:"止盈减仓 30%",simulation_quantity:"300",actual_reference_quantity:"",actual_quantity:"1000",actual_market_value:"10000",currency:"CNY",deviation:"review",deviation_label:"待人工复核",manual_execution_guidance:"按实盘下单时持仓的 30% 向下取整",risk_note:"保护线仍有效"}],outside_positions:[]},
+};
+for (const mobile of [false, true]) {
+  window = {matchMedia: () => ({matches: mobile})};
+  const html = renderTrendReportWorkspace(report);
+  for (const text of ["止盈减仓 30%", "全部卖出", "模拟目标数量 300", "模拟已成交 100", "模拟剩余数量 200", "模拟预计数量 300", "按实盘下单时持仓的 30% 向下取整"]) {
+    if (!html.includes(text)) throw new Error(text + "\n" + html);
+  }
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_cn_buy_scroller_is_keyboard_reachable_only_on_desktop() -> None:
     output = run_dashboard_js(r'''
 const report={market:"CN",counts:{},sell_actions:[],buy_actions:[],hold_actions:[],audit:{}};

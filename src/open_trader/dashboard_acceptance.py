@@ -103,8 +103,10 @@ TREND_REASON_LABELS = {
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
+    "holding_lot_size_unavailable": "持仓整手信息不可用",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
+    "overheat_take_profit": "沸腾/开香槟过热止盈",
     "a_share_only": "仅限 A 股股票",
     "temperature_missing": "个股趋势温度缺失",
     "temperature_transition_not_entry": "不是温转热或温转沸",
@@ -1713,10 +1715,37 @@ def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     known_reason = isinstance(reason, str) and reason in TREND_REASON_LABELS
     if action == "BUY":
         return reason not in (None, "") and not known_reason
+    if action == "SELL_PARTIAL":
+        return not _valid_partial_sell_action(item)
     return (
         action == "MANUAL_REVIEW"
-        or action not in {"SELL_ALL", "HOLD", "MANUAL_REVIEW"}
+        or action not in {"SELL_ALL", "SELL_PARTIAL", "HOLD", "MANUAL_REVIEW"}
         or action in {"SELL_ALL", "HOLD"} and not known_reason
+    )
+
+
+def _valid_partial_sell_action(item: Mapping[str, Any]) -> bool:
+    try:
+        target_fraction = Decimal(str(item.get("target_fraction")))
+        position_started_for = str(item.get("position_started_for") or "")
+        valid_position_date = datetime.strptime(
+            position_started_for, "%Y-%m-%d"
+        ).strftime("%Y-%m-%d") == position_started_for
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return (
+        item.get("reason") == "overheat_take_profit"
+        and target_fraction == Decimal("0.30")
+        and valid_position_date
+        and isinstance(item.get("estimated_shares"), int)
+        and not isinstance(item.get("estimated_shares"), bool)
+        and item["estimated_shares"] >= 0
+        and isinstance(item.get("lot_size"), int)
+        and not isinstance(item.get("lot_size"), bool)
+        and item["lot_size"] > 0
+        and isinstance(item.get("overheat_signals"), list)
+        and bool(item["overheat_signals"])
+        and all(signal in {"boiling", "champagne"} for signal in item["overheat_signals"])
     )
 
 
@@ -1813,7 +1842,8 @@ def _check_trend_artifact_projection(
     ), f"{broker} 冻结报告持仓动作无效"
     sells = [
         item for item in formal
-        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        and not _trend_action_needs_review(item)
     ]
     buys = [
         item for item in formal
@@ -1889,7 +1919,7 @@ def _check_action_trend_stages(
     stage_texts: list[str], report: Mapping[str, Any], broker: str,
 ) -> None:
     expected = (
-        ("优先处理 · 卖出触发", "sell_actions", "全部卖出"),
+        ("优先处理 · 卖出触发", "sell_actions", None),
         ("需要确认 · 人工复核", "review_actions", "人工复核"),
         (
             f"{_plain(report.get('buy_window'))} · 正式买入计划",
@@ -1907,6 +1937,13 @@ def _check_action_trend_stages(
             continue
         for item in rows:
             assert isinstance(item, Mapping), f"{broker} 的 {title} 动作格式无效"
+            action = (
+                "止盈减仓 30%"
+                if item.get("action") == "SELL_PARTIAL"
+                else "全部卖出"
+                if key == "sell_actions"
+                else action
+            )
             assert action in text, f"{broker} 的 {title} 缺少动作 {action}"
             for value in (item.get("symbol"), item.get("name")):
                 if value:

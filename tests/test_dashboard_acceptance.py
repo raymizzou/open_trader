@@ -514,6 +514,24 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
         )
 
 
+def test_acceptance_recognizes_only_strict_partial_sell_actions() -> None:
+    partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "AAPL",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 3,
+        "lot_size": 1,
+        "overheat_signals": ["boiling"],
+    }
+
+    assert not dashboard_acceptance._trend_action_needs_review(partial)
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": []}
+    )
+
+
 def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
     with pytest.raises(AssertionError, match="产物文件名无效"):
         dashboard_acceptance._check_trend_artifact_projection(

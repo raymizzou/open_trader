@@ -1671,6 +1671,84 @@ def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(
     assert "已挂" not in json.dumps(first_overlay, ensure_ascii=False)
 
 
+def test_dashboard_projects_partial_sell_goal_and_manual_real_account_guidance(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload = {
+        "strategy_judgments": {
+            "formal_actions": [
+                {
+                    "action": "SELL_PARTIAL",
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "reason": "overheat_take_profit",
+                    "estimated_shares": 3,
+                    "lot_size": 1,
+                    "target_fraction": "0.30",
+                    "position_started_for": "2026-07-01",
+                    "overheat_signals": ["boiling"],
+                },
+                {"action": "SELL_ALL", "symbol": "MSFT", "reason": "danger_signal"},
+            ],
+            "holding_decisions": [],
+        },
+    }
+    report_sha256 = _report_hash(payload)
+    event_path = (
+        tmp_path
+        / "trend_review/ledgers/US/actions/2026-07-15/partial/event.json"
+    )
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text(json.dumps({
+        "report_sha256": report_sha256,
+        "symbol": "AAPL",
+        "side": "sell",
+        "status": "partially_filled",
+        "sell_goal": "partial_30",
+        "lifecycle_target_qty": "3",
+        "target_qty": "3",
+        "filled_qty": "1",
+        "recorded_at": "2026-07-15T10:00:00-04:00",
+    }), encoding="utf-8")
+
+    executions = dashboard_module._trend_action_executions(
+        tmp_path,
+        market="US",
+        execution_date="2026-07-15",
+        report_sha256=report_sha256,
+    )
+    sells, *_ = dashboard_module._project_trend_actions(payload, executions)
+    partial = sells[0]
+    actual = dashboard_module._project_trend_actual_item(
+        partial,
+        None,
+        nav_hkd=None,
+        market="US",
+        price_fx_to_hkd=None,
+        price_fx_note="",
+        risk_skip=False,
+    )
+
+    assert [item["action"] for item in sells] == ["SELL_PARTIAL", "SELL_ALL"]
+    assert partial["execution"] == {
+        "status": "partially_filled",
+        "sell_goal": "partial_30",
+        "lifecycle_target_qty": "3",
+        "target_qty": "3",
+        "filled_qty": "1",
+        "remaining_qty": "2",
+        "avg_fill_price": "",
+        "order_ids": [],
+        "updated_at": "2026-07-15T10:00:00-04:00",
+        "reason": "",
+    }
+    assert actual["frozen_action_label"] == "止盈减仓 30%"
+    assert actual["manual_execution_guidance"] == "按实盘下单时持仓的 30% 向下取整"
+    assert actual["actual_reference_quantity"] == ""
+
+
 @pytest.mark.parametrize(
     (
         "market",

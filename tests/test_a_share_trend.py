@@ -2841,11 +2841,43 @@ def test_partial_action_is_a_formal_trim_in_feishu_and_markdown() -> None:
         payload["strategy_judgments"]["holding_decisions"][0]
     ]
     assert "今日动作：卖出 1｜买入 0｜持有 0｜复核 0" in message
-    assert "沸腾/开香槟过热止盈｜约 300 股" in message
+    assert "沸腾/开香槟过热止盈｜止盈减仓 30%｜模拟预计数量 300 股" in message
     assert "今日无买卖动作" not in message
     assert "止盈减仓 30%" in markdown
-    assert "约 300 股" in markdown
+    assert "模拟预计数量 300 股" in markdown
     assert "无需卖出" not in markdown
+
+
+def test_partial_action_labels_simulated_target_signals_and_warnings() -> None:
+    held_account = account("600001")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=replace(
+            held_account,
+            positions=(replace(held_account.positions[0], quantity=Decimal("1000")),),
+        ),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": None},
+    )
+
+    payload = trend_module._report_payload(built)
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+    markdown = render_markdown(built)
+
+    for text in (
+        "止盈减仓 30%",
+        "模拟预计数量 300 股",
+        "每手 100 股",
+        "触发信号 沸腾",
+        "持仓日线数据不可用",
+    ):
+        assert text in message
+        assert text in markdown
+    assert trend_module.REASON_LABELS["holding_lot_size_unavailable"] == "持仓整手信息不可用"
 
 
 def test_trend_feishu_text_uses_short_no_trade_template() -> None:

@@ -2523,6 +2523,7 @@ REASON_LABELS = {
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
+    "holding_lot_size_unavailable": "持仓整手信息不可用",
     "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
@@ -2657,7 +2658,28 @@ def _append_feishu_action_sections(
         for index, item in enumerate(sells, 1):
             line = f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
             if item.get("action") == "SELL_PARTIAL":
-                line += f"｜约 {item.get('estimated_shares', '-')} 股"
+                signals = {
+                    "boiling": "沸腾",
+                    "champagne": "开香槟",
+                }
+                line += f"｜{_action_label('SELL_PARTIAL')}"
+                line += f"｜模拟预计数量 {item.get('estimated_shares', '-')} 股"
+                if item.get("lot_size") not in {None, ""}:
+                    line += f"｜每手 {item['lot_size']} 股"
+                triggered = [
+                    signals[value]
+                    for value in item.get("overheat_signals", [])
+                    if value in signals
+                ]
+                if triggered:
+                    line += f"｜触发信号 {'、'.join(triggered)}"
+                warnings = [
+                    _reason_label(value)
+                    for value in item.get("warnings", [])
+                    if value in REASON_LABELS
+                ]
+                if warnings:
+                    line += f"｜提示 {'、'.join(warnings)}"
             if item.get("active_line") not in {None, ""}:
                 line += f"｜保护线 {_feishu_money(item['active_line'])}"
             lines.append(line)
@@ -2917,7 +2939,27 @@ def render_markdown(report: TrendReport) -> str:
                 f"{_reason_label(item.reason)}"
             )
             if item.action == "SELL_PARTIAL":
-                line += f"｜约 {item.estimated_shares} 股"
+                signals = {
+                    "boiling": "沸腾",
+                    "champagne": "开香槟",
+                }
+                line += f"｜模拟预计数量 {item.estimated_shares} 股"
+                if item.lot_size is not None:
+                    line += f"｜每手 {item.lot_size} 股"
+                triggered = [
+                    signals[value]
+                    for value in item.overheat_signals
+                    if value in signals
+                ]
+                if triggered:
+                    line += f"｜触发信号 {'、'.join(triggered)}"
+                warnings = [
+                    _reason_label(value)
+                    for value in item.warnings
+                    if value in REASON_LABELS
+                ]
+                if warnings:
+                    line += f"｜提示 {'、'.join(warnings)}"
             if item.active_line is not None:
                 line += f"｜活动保护线 {_money(item.active_line)}"
             lines.append(line)

@@ -878,7 +878,7 @@ def _trend_action_needs_review(item: dict[str, Any]) -> bool:
     return (
         action == "MANUAL_REVIEW"
         or action not in ACTION_LABELS
-        or action in {"SELL_ALL", "HOLD"} and not known_reason
+        or action in {"SELL_ALL", "SELL_PARTIAL", "HOLD"} and not known_reason
     )
 
 
@@ -899,7 +899,7 @@ def _project_trend_actions(
                 {"execution": executions[key]}
                 if (key := (
                     str(item.get("symbol") or "").strip(),
-                    {"BUY": "buy", "SELL_ALL": "sell"}.get(
+                    {"BUY": "buy", "SELL_ALL": "sell", "SELL_PARTIAL": "sell"}.get(
                         item.get("action"), ""
                     ),
                 )) in executions
@@ -912,7 +912,7 @@ def _project_trend_actions(
     sell_actions = [
         item
         for item in formal
-        if item.get("action") == "SELL_ALL"
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
         and not _trend_action_needs_review(item)
     ]
     buy_actions = [
@@ -1784,6 +1784,7 @@ def _project_trend_actual_item(
         "frozen_action_label": {
             "BUY": "正式买入",
             "SELL_ALL": "全部卖出",
+            "SELL_PARTIAL": "止盈减仓 30%",
             "HOLD": "继续持有",
             "SKIP": "跳过",
             "MANUAL_REVIEW": "人工复核",
@@ -1825,6 +1826,8 @@ def _project_trend_actual_item(
             else "暂无策略保护线，风险未纳入估算"
         ),
     }
+    if frozen_action == "SELL_PARTIAL":
+        item["manual_execution_guidance"] = "按实盘下单时持仓的 30% 向下取整"
     if frozen_action == "BUY" and price_fx_note:
         item["reference_note"] = price_fx_note
     return item
@@ -2011,6 +2014,22 @@ def _trend_action_executions(
             "updated_at": str(event.get("recorded_at") or ""),
             "reason": str(event.get("reason") or ""),
         }
+        if event.get("sell_goal") == "partial_30":
+            execution = executions[(symbol, side)]
+            execution["sell_goal"] = "partial_30"
+            execution["lifecycle_target_qty"] = str(
+                event.get("lifecycle_target_qty") or ""
+            )
+            try:
+                lifecycle_target = Decimal(execution["lifecycle_target_qty"])
+                filled = Decimal(execution["filled_qty"])
+            except (InvalidOperation, ValueError):
+                pass
+            else:
+                if lifecycle_target.is_finite() and filled.is_finite():
+                    execution["remaining_qty"] = _decimal_text(
+                        max(Decimal("0"), lifecycle_target - filled)
+                    )
     return executions
 
 

@@ -607,6 +607,11 @@ uncertain action accepts exactly one immutable resolution:
   next numbered attempt; omit `--futu-order-id`.
 - `abandon`: make the action terminal without another attempt; omit the order ID.
 
+For `SELL_PARTIAL`, `abandon` ends only that current action and does not consume
+the lifecycle's remaining 30% target. A later report with an explicit overheat
+signal may resume the original lifecycle remainder; disappearing signals alone
+do not cancel an already-triggered action.
+
 Every resolution requires a non-empty actor and reason. It appends an audit fact
 and never edits or deletes an intent, broker observation, result, or earlier
 resolution. Only `authorize-retry` permits an unresolved intent to advance.
