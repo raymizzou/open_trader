@@ -77,15 +77,18 @@ class RecordingXiaoaiNotifier(XiaoaiSSHNotifier):
 
 class RecordingFeishuNotifier(FeishuWebhookNotifier):
     def __init__(self) -> None:
-        pass
+        self.messages: list[tuple[str, str]] = []
 
     def notify(self, title: str, message: str) -> None:
-        pass
+        self.messages.append((title, message))
 
 
 class RecordingMacOSNotifier(MacOSNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
     def notify(self, title: str, message: str) -> None:
-        pass
+        self.messages.append((title, message))
 
 
 def watcher_error(message: str) -> FutuQuoteError:
@@ -196,7 +199,9 @@ def test_once_market_watcher_deduplicates_durable_interruption(
 ) -> None:
     error = watcher_error("calendar offline")
     events_path = tmp_path / "events.jsonl"
-    notifier = RecordingXiaoaiNotifier()
+    feishu = RecordingFeishuNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
     now = datetime(2026, 7, 22, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
 
     class Quote:
@@ -221,7 +226,8 @@ def test_once_market_watcher_deduplicates_durable_interruption(
                 now_fn=lambda: now,
             )
 
-    assert [title for title, _ in notifier.messages] == ["港股价格监控中断"]
+    assert feishu.messages == []
+    assert [title for title, _ in macos.messages] == ["港股价格监控中断"]
     assert [
         json.loads(line)["event_type"]
         for line in events_path.read_text(encoding="utf-8").splitlines()
@@ -278,7 +284,9 @@ def test_once_market_watcher_recovers_after_snapshot_outage_ends(
 ) -> None:
     state_path = tmp_path / "state.json"
     events_path = tmp_path / "events.jsonl"
-    notifier = RecordingXiaoaiNotifier()
+    feishu = RecordingFeishuNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
     write_protection_state(state_path, {
         "schema_version": 1,
         "positions": {"00700": {"active_line": "11"}},
@@ -319,7 +327,8 @@ def test_once_market_watcher_recovers_after_snapshot_outage_ends(
         with pytest.raises(FutuQuoteError, match="snapshot offline"):
             watch(watcher_error("snapshot offline"))
 
-    assert [title for title, _ in notifier.messages] == ["港股价格监控中断"]
+    assert feishu.messages == []
+    assert [title for title, _ in macos.messages] == ["港股价格监控中断"]
     assert [
         json.loads(line)["event_type"]
         for line in events_path.read_text(encoding="utf-8").splitlines()
@@ -328,7 +337,7 @@ def test_once_market_watcher_recovers_after_snapshot_outage_ends(
     assert watch({"HK.00700": QuoteSnapshot("HK.00700", Decimal("12"))}).status == (
         "completed"
     )
-    assert [title for title, _ in notifier.messages] == [
+    assert [title for title, _ in macos.messages] == [
         "港股价格监控中断",
         "港股价格监控恢复",
     ]

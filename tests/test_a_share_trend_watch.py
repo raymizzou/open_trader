@@ -312,7 +312,9 @@ def test_once_watcher_does_not_close_borrowed_quote(tmp_path: Path) -> None:
 def test_once_watcher_persists_interruption_until_recovery(tmp_path: Path) -> None:
     portfolio_path = portfolio(tmp_path, symbol=None)
     events_path = tmp_path / "events.jsonl"
-    notifier = RecordingNotifier()
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
     now = datetime.fromisoformat("2026-07-22T09:31:00+08:00")
 
     def watch(quote: SequenceQuote) -> object:
@@ -339,7 +341,8 @@ def test_once_watcher_persists_interruption_until_recovery(tmp_path: Path) -> No
     with pytest.raises(FutuQuoteError, match="OpenD unavailable"):
         watch(SequenceQuote([], trading_days=interrupted("OpenD unavailable")))
 
-    assert [title for title, _ in notifier.messages] == [
+    assert feishu.messages == []
+    assert [title for title, _ in macos.messages] == [
         "A股价格监控中断",
         "A股价格监控恢复",
         "A股价格监控中断",
@@ -365,7 +368,9 @@ def test_once_watcher_recovers_after_snapshot_outage_ends(tmp_path: Path) -> Non
     portfolio_path = portfolio(tmp_path)
     state_path = state(tmp_path)
     events_path = tmp_path / "events.jsonl"
-    notifier = RecordingNotifier()
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
 
     def watch(snapshot: dict[str, Decimal] | Exception) -> object:
         return watch_a_share_protection(
@@ -385,13 +390,14 @@ def test_once_watcher_recovers_after_snapshot_outage_ends(tmp_path: Path) -> Non
         with pytest.raises(FutuQuoteError, match="snapshot offline"):
             watch(interrupted("snapshot offline"))
 
-    assert [title for title, _ in notifier.messages] == ["A股价格监控中断"]
+    assert feishu.messages == []
+    assert [title for title, _ in macos.messages] == ["A股价格监控中断"]
     assert [event["event_type"] for event in read_events(events_path)] == [
         "monitor_interrupted"
     ]
 
     assert watch({"SH.600900": Decimal("28")}).status == "completed"
-    assert [title for title, _ in notifier.messages] == [
+    assert [title for title, _ in macos.messages] == [
         "A股价格监控中断",
         "A股价格监控恢复",
     ]
@@ -407,7 +413,9 @@ def test_once_watcher_waits_for_complete_snapshots_before_recovery(
     portfolio_path = portfolio(tmp_path)
     state_path = state(tmp_path)
     events_path = tmp_path / "events.jsonl"
-    notifier = RecordingNotifier()
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
 
     def watch(snapshot: dict[str, Decimal] | Exception) -> object:
         return watch_a_share_protection(
@@ -434,7 +442,7 @@ def test_once_watcher_waits_for_complete_snapshots_before_recovery(
         if str(event["event_type"]).startswith("monitor_")
     ] == ["monitor_interrupted"]
     assert [
-        title for title, _ in notifier.messages if "监控" in title
+        title for title, _ in macos.messages if "监控" in title
     ] == ["A股价格监控中断"]
 
     assert watch({"SH.600900": Decimal("28")}).status == "completed"
@@ -444,7 +452,7 @@ def test_once_watcher_waits_for_complete_snapshots_before_recovery(
         if str(event["event_type"]).startswith("monitor_")
     ] == ["monitor_interrupted", "monitor_recovered"]
     assert [
-        title for title, _ in notifier.messages if "监控" in title
+        title for title, _ in macos.messages if "监控" in title
     ] == ["A股价格监控中断", "A股价格监控恢复"]
 
 
@@ -727,6 +735,39 @@ def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
     }
 
 
+def test_feishu_policy_keeps_only_b1_and_preserves_other_channels(tmp_path: Path) -> None:
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    voice = RecordingXiaoaiNotifier()
+    notifier = CompositeNotifier([feishu, macos, voice])
+
+    _deliver_trigger_notification(
+        events_path=tmp_path / "events.jsonl",
+        notifier=notifier,
+        trading_date="2026-07-22",
+        now=datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+        symbol="600900",
+        position_name="长江电力",
+        last_price=Decimal("27.30"),
+        active_line=Decimal("27.31"),
+        delivered_feishu=set(),
+        delivered_macos=set(),
+        replay=False,
+        market_label="A股",
+        broker_label="东方财富",
+    )
+
+    assert feishu.messages == [(
+        "【紧急｜东方财富｜A股保护线触发｜600900】",
+        "最新价：27.30\n活动保护线：27.31\n现在做：人工确认并全部卖出",
+    )]
+    assert macos.messages == [(
+        "A股保护线触发 · 600900",
+        "最新价 27.30 <= 活动保护线 27.31\n建议动作：全部卖出（人工执行）",
+    )]
+    assert voice.messages[0][0] == "A股保护线触发 · 600900"
+
+
 def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
     voice = RecordingXiaoaiNotifier()
     events_path = tmp_path / "events.jsonl"
@@ -747,7 +788,7 @@ def test_trigger_queues_one_voice_alert_with_name(tmp_path: Path) -> None:
     assert read_events(events_path)[-1]["event_type"].endswith("queued_xiaoai")
 
 
-def test_voice_failure_is_terminal_and_warns_feishu(tmp_path: Path) -> None:
+def test_voice_failure_is_terminal_without_feishu_follow_up(tmp_path: Path) -> None:
     voice = RecordingXiaoaiNotifier(fail=True)
     feishu = RecordingNotifier()
     events_path = tmp_path / "events.jsonl"
@@ -760,7 +801,7 @@ def test_voice_failure_is_terminal_and_warns_feishu(tmp_path: Path) -> None:
     )
 
     assert voice.attempt_count == 1
-    assert sum("语音播报失败" in title for title, _ in feishu.messages) == 1
+    assert not any("语音播报失败" in title for title, _ in feishu.messages)
     assert read_events(events_path)[-1]["reason"] == "音箱连接或播放失败"
 
 
@@ -854,7 +895,7 @@ def test_voice_and_feishu_failure_never_recurse(tmp_path: Path) -> None:
     )
 
     assert voice.attempt_count == 1
-    assert feishu.attempt_count == 2
+    assert feishu.attempt_count == 1
 
 
 def test_held_symbol_can_speak_again_on_next_trading_date(tmp_path: Path) -> None:
@@ -1119,12 +1160,11 @@ def test_missing_protection_line_is_visible_and_never_compared(tmp_path: Path) -
     assert quote.snapshot_calls == []
     assert [event["event_type"] for event in read_events(events_path)] == [
         "protection_line_missing",
-        "protection_line_missing_notification_delivered",
     ]
-    assert any("人工" in message for _, message in notifier.messages)
+    assert notifier.messages == []
 
 
-def test_missing_line_notification_retries_next_poll_after_failure(
+def test_missing_line_is_not_sent_to_feishu(
     tmp_path: Path,
 ) -> None:
     feishu = FlakyNotifier(failures=1)
@@ -1149,12 +1189,12 @@ def test_missing_line_notification_retries_next_poll_after_failure(
         sleep_fn=lambda seconds: None,
     )
 
-    assert feishu.attempt_count == 2
+    assert feishu.attempt_count == 0
+    assert feishu.messages == []
     assert macos.messages == []
     assert result.exception_count == 1
     assert [event["event_type"] for event in read_events(events_path)] == [
         "protection_line_missing",
-        "protection_line_missing_notification_delivered",
     ]
 
 
@@ -1194,7 +1234,9 @@ def test_persistent_watcher_reconnects_and_announces_recovery(tmp_path: Path) ->
     recovered = SequenceQuote([{"SH.600900": Decimal("28")}])
     replacements = iter([recovered])
     sleeps: list[float] = []
-    notifier = RecordingNotifier()
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
     events_path = tmp_path / "events.jsonl"
 
     result = watch_a_share_protection(
@@ -1221,8 +1263,9 @@ def test_persistent_watcher_reconnects_and_announces_recovery(tmp_path: Path) ->
     assert sleeps == [60, 5]
     assert failed.closed is True
     assert recovered.closed is True
-    assert sum("中断" in title for title, _ in notifier.messages) == 1
-    assert sum("恢复" in title for title, _ in notifier.messages) == 1
+    assert feishu.messages == []
+    assert sum("中断" in title for title, _ in macos.messages) == 1
+    assert sum("恢复" in title for title, _ in macos.messages) == 1
     assert [event["event_type"] for event in read_events(events_path)] == [
         "monitor_interrupted",
         "monitor_recovered",
@@ -1265,7 +1308,9 @@ def test_persistent_watcher_retries_until_a_client_is_available(
     recovered = SequenceQuote([{"SH.600900": Decimal("28")}])
     clients: list[object] = [interrupted("OpenD unavailable"), recovered]
     sleeps: list[float] = []
-    notifier = RecordingNotifier()
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    notifier = CompositeNotifier([feishu, macos])
 
     def factory() -> object:
         item = clients.pop(0)
@@ -1295,8 +1340,9 @@ def test_persistent_watcher_retries_until_a_client_is_available(
 
     assert result.status == "closed"
     assert sleeps == [60, 5]
-    assert sum("中断" in title for title, _ in notifier.messages) == 1
-    assert sum("恢复" in title for title, _ in notifier.messages) == 1
+    assert feishu.messages == []
+    assert sum("中断" in title for title, _ in macos.messages) == 1
+    assert sum("恢复" in title for title, _ in macos.messages) == 1
 
 
 def test_missing_quote_is_recorded_unknown_not_safe(tmp_path: Path) -> None:
@@ -1315,13 +1361,11 @@ def test_missing_quote_is_recorded_unknown_not_safe(tmp_path: Path) -> None:
     assert result.trigger_count == 0
     assert [event["event_type"] for event in read_events(events_path)] == [
         "quote_unknown",
-        "quote_unknown_notification_delivered",
     ]
-    assert any("未知" in message for _, message in notifier.messages)
-    assert not any("安全" in message for _, message in notifier.messages)
+    assert notifier.messages == []
 
 
-def test_quote_notification_retries_after_failed_process_restarts(
+def test_unknown_quote_is_not_sent_to_feishu(
     tmp_path: Path,
 ) -> None:
     events_path = tmp_path / "events.jsonl"
@@ -1343,11 +1387,10 @@ def test_quote_notification_retries_after_failed_process_restarts(
 
     assert first.unknown_quote_count == 1
     assert second.unknown_quote_count == 0
-    assert failed.attempt_count == 1
-    assert len(delivered.messages) == 1
+    assert failed.attempt_count == 0
+    assert failed.messages == delivered.messages == []
     assert [event["event_type"] for event in read_events(events_path)] == [
         "quote_unknown",
-        "quote_unknown_notification_delivered",
     ]
 
 
@@ -1404,8 +1447,10 @@ def test_trigger_notification_replays_after_price_rebounds(tmp_path: Path) -> No
 
     assert first.trigger_count == 1
     assert restarted.trigger_count == 0
-    assert "今日已触发活动保护线 27.31" in feishu.messages[0][1]
-    assert "最新价 28.00 <=" not in feishu.messages[0][1]
+    assert feishu.messages == [(
+        "【紧急｜东方财富｜A股保护线触发｜600900】",
+        "最新价：27.30\n活动保护线：27.31\n现在做：人工确认并全部卖出",
+    )]
     assert len(macos.messages) == 1
     assert [event["event_type"] for event in read_events(events_path)] == [
         "protection_triggered",
@@ -1436,7 +1481,7 @@ def test_trigger_notification_replays_before_quote_unknown_handling(
         notifier=CompositeNotifier([feishu, macos]),
     )
 
-    assert any("此前提醒未完整送达" in message for _, message in feishu.messages)
+    assert feishu.messages[0][0] == "【紧急｜东方财富｜A股保护线触发｜600900】"
     assert len(macos.messages) == 1
     assert [event["event_type"] for event in read_events(events_path)][:3] == [
         "protection_triggered",
@@ -1594,7 +1639,7 @@ def test_manual_exception_null_notifier_never_writes_delivery_receipt(
     assert [event["event_type"] for event in read_events(events_path)] == [fact_type]
 
 
-def test_manual_quote_exception_is_sent_to_feishu_not_macos(tmp_path: Path) -> None:
+def test_manual_quote_exception_is_not_sent_to_feishu(tmp_path: Path) -> None:
     quote = SequenceQuote([{}])
     feishu = RecordingNotifier()
     macos = RecordingMacOSNotifier()
@@ -1612,7 +1657,7 @@ def test_manual_quote_exception_is_sent_to_feishu_not_macos(tmp_path: Path) -> N
         sleep_fn=lambda seconds: None,
     )
 
-    assert len(feishu.messages) == 1
+    assert feishu.messages == []
     assert macos.messages == []
 
 

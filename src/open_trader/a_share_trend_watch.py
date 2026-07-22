@@ -15,6 +15,7 @@ from .a_share_trend import AccountSnapshot, load_watch_events
 from .daily_premarket import RunLock, send_notification_with_results
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
+from .notification_policy import render_protection_alert
 from .notifications import (
     CompositeNotifier,
     Notifier,
@@ -305,25 +306,11 @@ def watch_a_share_protection(
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "protection_line_missing"
                     }
-                    delivered_lines = {
-                        str(event.get("symbol", ""))
-                        for event in prior_events
-                        if event.get("trading_date") == trading_date
-                        and event.get("event_type")
-                        == "protection_line_missing_notification_delivered"
-                    }
                     reported_quotes = {
                         str(event.get("symbol", ""))
                         for event in prior_events
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "quote_unknown"
-                    }
-                    delivered_quotes = {
-                        str(event.get("symbol", ""))
-                        for event in prior_events
-                        if event.get("trading_date") == trading_date
-                        and event.get("event_type")
-                        == "quote_unknown_notification_delivered"
                     }
             except Exception as exc:
                 if once:
@@ -361,6 +348,7 @@ def watch_a_share_protection(
                     delivered_macos=delivered_alerts_macos,
                     replay=True,
                     market_label=market_label,
+                    broker_label=broker_label,
                 )
 
             comparable: dict[str, tuple[str, Decimal]] = {}
@@ -379,26 +367,6 @@ def watch_a_share_protection(
                         )
                         reported_lines.add(symbol)
                         exception_count += 1
-                    if symbol not in delivered_lines:
-                        attempts = send_notification_with_results(
-                            notifier,
-                            f"{market_label}保护线缺失 · {symbol}",
-                            "当前持仓缺少活动保护线，未进行价格比较；请立即人工检查。",
-                            channels={"feishu", "feishu_app"},
-                        )
-                        if any(attempt.success for attempt in attempts):
-                            append_watch_event(
-                                events_path,
-                                symbol=symbol,
-                                trading_date=trading_date,
-                                event_type=(
-                                    "protection_line_missing_notification_delivered"
-                                ),
-                                occurred_at=now.isoformat(timespec="seconds"),
-                                last_price=None,
-                                active_line=None,
-                            )
-                            delivered_lines.add(symbol)
                     continue
                 comparable[to_futu_symbol(market, symbol)] = (symbol, active_line)
 
@@ -452,24 +420,6 @@ def watch_a_share_protection(
                         )
                         reported_quotes.add(symbol)
                         unknown_quote_count += 1
-                    if symbol not in delivered_quotes:
-                        attempts = send_notification_with_results(
-                            notifier,
-                            f"{market_label}实时价格未知 · {symbol}",
-                            f"未取得有效实时价格，活动保护线 {active_line} 的状态未知；请立即人工核价。",
-                            channels={"feishu", "feishu_app"},
-                        )
-                        if any(attempt.success for attempt in attempts):
-                            append_watch_event(
-                                events_path,
-                                symbol=symbol,
-                                trading_date=trading_date,
-                                event_type="quote_unknown_notification_delivered",
-                                occurred_at=now.isoformat(timespec="seconds"),
-                                last_price=None,
-                                active_line=active_line,
-                            )
-                            delivered_quotes.add(symbol)
                     continue
                 if snapshot.last_price > active_line:
                     continue
@@ -507,6 +457,7 @@ def watch_a_share_protection(
                         delivered_macos=delivered_alerts_macos,
                         replay=False,
                         market_label=market_label,
+                        broker_label=broker_label,
                     )
 
             if once:
@@ -651,6 +602,7 @@ def _deliver_trigger_notification(
     delivered_macos: set[str],
     replay: bool,
     market_label: str = "A股",
+    broker_label: str = "东方财富",
 ) -> None:
     if replay:
         message = (
@@ -662,24 +614,33 @@ def _deliver_trigger_notification(
             f"最新价 {last_price} <= 活动保护线 {active_line}\n"
             "建议动作：全部卖出（人工执行）"
         )
-    for channels, event_type, delivered in (
+    for channels, event_type, delivered, title, body in (
         (
             {"feishu", "feishu_app"},
             "protection_triggered_notification_delivered_feishu",
             delivered_feishu,
+            *render_protection_alert(
+                broker_label,
+                market_label,
+                symbol,
+                last_price=last_price,
+                active_line=active_line,
+            ),
         ),
         (
             {"macos"},
             "protection_triggered_notification_delivered_macos",
             delivered_macos,
+            f"{market_label}保护线触发 · {symbol}",
+            message,
         ),
     ):
         if symbol in delivered:
             continue
         attempts = send_notification_with_results(
             notifier,
-            f"{market_label}保护线触发 · {symbol}",
-            message,
+            title,
+            body,
             channels=channels,
         )
         if any(attempt.success for attempt in attempts):
@@ -742,22 +703,6 @@ def _deliver_trigger_notification(
         active_line=active_line,
         market=market_label,
         reason=reason,
-    )
-    if attempt.success:
-        return
-    send_notification_with_results(
-        notifier,
-        "Open Trader 语音播报失败",
-        "\n".join(
-            [
-                f"市场：{market_label}",
-                f"标的：{position_name or symbol}（{symbol}）",
-                "原事件：活动保护线触发",
-                f"失败原因：{reason}",
-                "处理：语音不重试，请按原保护线通知人工确认。",
-            ]
-        ),
-        channels={"feishu", "feishu_app"},
     )
 
 
@@ -829,6 +774,7 @@ def _record_interruption(
         notifier,
         f"{market_label}价格监控中断",
         f"Futu OpenD 实时价格不可用：{error}\n请立即在{broker_label}人工核价。",
+        channels={"macos", "xiaoai"},
     )
 
 
@@ -853,6 +799,7 @@ def _record_recovery(
         notifier,
         f"{market_label}价格监控恢复",
         "Futu OpenD 实时价格已恢复，活动保护线监控继续运行。",
+        channels={"macos", "xiaoai"},
     )
 
 
