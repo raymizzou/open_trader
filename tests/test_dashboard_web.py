@@ -3719,7 +3719,53 @@ console.log(JSON.stringify({urls,html:panel.innerHTML}));
         assert text in html
     assert html.count('data-deviation="followed"') == 2
     assert html.count("一致") == 2
+    assert 'data-deviation="pending">待执行' in html
     assert "未持有" not in html
+
+
+def test_dashboard_historical_report_omits_simulation_reconciliation() -> None:
+    output = run_dashboard_js(r'''
+const report={
+  available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",
+  report_date:"2026-07-17",data_date:"2026-07-16",counts:{},audit:{},
+  risk_summary:{},drawdown_summary:{},
+  sell_actions:[{action:"SELL_ALL",symbol:"EXIT",name:"Exit",close:"10",active_line:"9"}],
+  buy_actions:[{action:"BUY",symbol:"MISSED",name:"Missed",execution:{status:"missed"}}],
+  hold_actions:[],review_actions:[],risk_skips:[],
+};
+state.trendSimulatePositions.tiger={available:true,broker:"tiger",positions:[
+  {symbol:"EXTRA",name:"Outside",quantity:"12",cost_price:"8",last_price:"9"},
+]};
+const current=renderTrendReportWorkspace(report,true,false);
+const historical=renderTrendReportWorkspace(report,true,true);
+const loading=renderTrendSimulationOverlay(report,{loading:true});
+const unavailable=renderTrendSimulationOverlay(report,{available:false,error:"OpenD 模拟账户不可用"});
+console.log(JSON.stringify({current,historical,loading,unavailable}));
+''')
+    rendered = json.loads(output)
+    current = rendered["current"]
+    historical = rendered["historical"]
+    assert 'class="trend-simulation-overlay"' in current
+    assert "模拟盘执行状态" in current
+    assert re.search(
+        r'data-simulation-symbol="EXIT".*?data-deviation="followed">一致',
+        current,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'data-simulation-symbol="EXTRA".*?data-deviation="outside_report_addition">报告外持仓',
+        current,
+        re.DOTALL,
+    )
+    assert 'class="trend-simulation-overlay"' not in historical
+    assert "模拟盘执行状态" not in historical
+    assert "EXIT" in historical
+    assert "已错过策略窗口" in historical
+    for state_html in (rendered["loading"], rendered["unavailable"]):
+        assert "data-simulation-symbol" not in state_html
+        assert "未持有" not in state_html
+    assert "模拟盘持仓加载中" in rendered["loading"]
+    assert "OpenD 模拟账户不可用" in rendered["unavailable"]
 
 
 def test_dashboard_report_history_is_inline_exact_and_restores_scroll() -> None:

@@ -2640,7 +2640,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${batchError}
     ${revisionAnomaly}
     ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date,
-      renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]))}
+      historical ? "" : renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]))}
     <div class="cn-trend-actions">
       ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}
