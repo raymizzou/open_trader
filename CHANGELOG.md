@@ -3,6 +3,18 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-22
+
+- Replaced separate trend report and watcher jobs with one resilient controller
+  per market: only the designated executor host can generate reports or submit
+  orders, failed reports retry, incomplete actions reconcile by stable broker
+  identity, and duplicate orders are rejected before submission.
+- Retired the TradingAgents daily-report dependency, added state-change/cooldown
+  alert suppression, isolated quote failures by market, and made Dashboard
+  simulation-versus-real-account comparisons and numeric precision truthful.
+- Verified `3025` tests, live controller and Dashboard processes, desktop/mobile
+  flows, and the Dashboard acceptance gate (`PASS`) on deployed SHA `2f51376`.
+
 ## 2026-07-20
 
 - Added fixed-risk and conservative Kelly sizing to frozen CN/HK/US trend
