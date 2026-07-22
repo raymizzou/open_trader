@@ -1167,6 +1167,7 @@ def _check_trend_account_views(
         assert isinstance(report, Mapping) and report.get("available") is True, (
             f"{broker} 当前趋势报告不可用"
         )
+        _check_report_simulation_overlay(report_root, report, simulated, broker)
         _check_trend_controller_status(
             page, panel, broker, controllers.get(broker)
         )
@@ -1514,6 +1515,52 @@ def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
 
 
+def _check_visible_decimal_precision(text: str, label: str) -> None:
+    offenders = re.findall(
+        r"(?<![\w.-])[+-]?\d[\d,]*\.\d{3,}(?![\w.-])", text
+    )
+    assert not offenders, f"{label} 数值超过两位小数：{offenders[:3]}"
+
+
+def _check_report_simulation_overlay(
+    report_root: Any,
+    report: Mapping[str, Any],
+    simulated: Mapping[str, Any] | None,
+    broker: str,
+) -> None:
+    simulation = report_root.locator(".trend-simulation-overlay")
+    assert simulation.count() == 1, f"{broker} 趋势报告缺少模拟盘执行状态"
+    simulation_text = simulation.inner_text()
+    assert "模拟盘执行状态" in simulation_text, f"{broker} 模拟盘状态标题缺失"
+    assert "富途" in simulation_text, f"{broker} 模拟盘来源缺失"
+
+    positions = simulated.get("positions") if simulated is not None else []
+    assert isinstance(positions, list), f"{broker} 模拟盘持仓无效"
+    by_symbol = {
+        str(position.get("symbol") or "").strip().upper(): position
+        for position in positions
+        if isinstance(position, Mapping)
+    }
+    holds = report.get("hold_actions") or []
+    assert isinstance(holds, list), f"{broker} 继续持有列表无效"
+    for hold in holds:
+        if not isinstance(hold, Mapping):
+            continue
+        symbol = str(hold.get("symbol") or "").strip().upper()
+        position = by_symbol.get(symbol)
+        if position is None:
+            continue
+        row = simulation.locator(f'[data-simulation-symbol="{symbol}"]')
+        assert row.count() == 1, f"{broker} {symbol} 缺少模拟盘对照行"
+        quantity = f"模拟持仓 {_display_number(position['quantity'])}"
+        assert quantity in row.inner_text(), f"{broker} {symbol} 模拟盘数量未显示"
+        status = row.locator("[data-deviation]")
+        assert status.count() == 1, f"{broker} {symbol} 模拟盘偏差状态缺失"
+        assert status.get_attribute("data-deviation") == "followed", (
+            f"{broker} {symbol} 模拟盘偏差状态不是 followed"
+        )
+
+
 def _check_integrated_trend_ui(
     report_root: Any, report: Mapping[str, Any], broker: str,
 ) -> None:
@@ -1547,6 +1594,9 @@ def _check_integrated_trend_ui(
         assert audit.count() == 1, f"{broker} 缺少状态恢复审计详情"
         audit.locator("summary").click()
     text = risk.inner_text()
+    _check_visible_decimal_precision(text, f"{broker} 风险摘要")
+    for stage_text in report_root.locator(".trend-stage:visible").all_inner_texts():
+        _check_visible_decimal_precision(stage_text, f"{broker} 趋势报告")
     stats = summary.get("trade_stats")
     actual_label = (
         stats.get("actual_broker_label") if isinstance(stats, Mapping) else ""
@@ -1604,12 +1654,17 @@ def _check_integrated_trend_ui(
 
 def _display_number(value: Any) -> str:
     raw = _plain(value).strip()
-    match = re.fullmatch(r"([+-]?)(\d+)(\.\d+)?", raw)
+    match = re.fullmatch(r"([+-]?)(\d+)(?:\.(\d+))?", raw)
     if match is None:
         return raw
     sign, integer, fraction = match.groups()
-    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", integer)
-    return f"{sign}{grouped}{fraction or ''}"
+    digits = f"{integer}{(fraction or '')[:2].ljust(2, '0')}"
+    rounded = str(
+        int(digits) + int(bool(fraction and len(fraction) > 2 and fraction[2] >= "5"))
+    ).zfill(len(integer) + 2)
+    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", rounded[:-2])
+    decimals = rounded[-2:].rstrip("0")
+    return f"{sign}{grouped}{f'.{decimals}' if decimals else ''}"
 
 
 def _display_price(value: Any) -> str:

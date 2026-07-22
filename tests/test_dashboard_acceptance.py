@@ -1392,6 +1392,10 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
         def inner_text(self) -> str:
             return text
 
+        def all_inner_texts(self) -> list[str]:
+            assert self.selector == ".trend-stage:visible"
+            return ["正式买入 30.59 保护线 23.43"]
+
         def locator(self, selector: str) -> "Locator":
             return Locator(f"{self.selector} {selector}")
 
@@ -1414,6 +1418,66 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
     )
     assert ".trend-risk-summary .trend-drawdown-bootstrap-audit summary" in clicked
     assert ".trend-risk-summary .trend-drawdown-recovery-audit summary" in clicked
+
+
+def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
+    dashboard_acceptance._check_visible_decimal_precision(
+        "模拟持仓 485 成本 30.59 保护线 23.43", "模拟盘"
+    )
+    with pytest.raises(AssertionError, match="超过两位小数"):
+        dashboard_acceptance._check_visible_decimal_precision(
+            "成本 30.594999", "模拟盘"
+        )
+
+
+def test_acceptance_cross_checks_report_simulation_overlay() -> None:
+    checked: list[str] = []
+
+    class Locator:
+        def __init__(
+            self,
+            name: str,
+            *,
+            text: str = "",
+            attribute: str | None = None,
+        ) -> None:
+            self.name = name
+            self.text = text
+            self.attribute = attribute
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self) -> str:
+            checked.append(f"text:{self.name}")
+            return self.text
+
+        def locator(self, selector: str) -> "Locator":
+            if self.name == "simulation":
+                assert selector == '[data-simulation-symbol="GPN"]'
+                return Locator("GPN", text="GPN 模拟持仓 485")
+            assert self.name == "GPN" and selector == "[data-deviation]"
+            return Locator("status", attribute="followed")
+
+        def get_attribute(self, name: str) -> str | None:
+            assert name == "data-deviation"
+            checked.append(f"attribute:{self.name}")
+            return self.attribute
+
+    class Root:
+        def locator(self, selector: str) -> Locator:
+            assert selector == ".trend-simulation-overlay"
+            return Locator("simulation", text="模拟盘执行状态 · 富途")
+
+    dashboard_acceptance._check_report_simulation_overlay(
+        Root(),
+        {"hold_actions": [{"action": "HOLD", "symbol": "GPN"}]},
+        {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
+        "tiger",
+    )
+
+    assert "text:GPN" in checked
+    assert "attribute:status" in checked
 
 
 def test_acceptance_checks_exact_trend_review_content() -> None:
