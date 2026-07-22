@@ -24,13 +24,16 @@ class FakeQuoteClient:
         self.states = states or {}
         self.state_error = state_error
         self.requested_symbols: list[str] = []
+        self.requested_batches: list[list[str]] = []
         self.requested_state_symbols: list[str] = []
         self.closed = False
 
     def get_dashboard_snapshots(
         self, futu_symbols: Sequence[str]
     ) -> dict[str, DashboardQuoteSnapshot]:
-        self.requested_symbols = list(futu_symbols)
+        symbols = list(futu_symbols)
+        self.requested_batches.append(symbols)
+        self.requested_symbols.extend(symbols)
         return self.snapshots
 
     def get_market_states(self, futu_symbols: Sequence[str]) -> dict[str, str]:
@@ -404,7 +407,97 @@ def test_quote_service_requests_cn_holding_with_futu_exchange_prefix(
     ).refresh()
 
     assert client.requested_symbols == ["SH.600025", "US.AAPL", "US.MSFT"]
+    assert client.requested_batches == [["SH.600025"], ["US.AAPL", "US.MSFT"]]
     assert result.quotes["SH.600025"]["last_price"] == "9.81"
+
+
+def test_quote_service_keeps_us_quotes_when_cn_snapshot_batch_fails(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    with config.portfolio_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES).writerow(
+            {
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "600900",
+                "name": "长江电力",
+                "total_quantity": "100",
+            }
+        )
+    full_client = FakeQuoteClient(
+        {
+            "SH.600900": session_snapshot(last="30"),
+            "US.AAPL": session_snapshot(last="160"),
+            "US.MSFT": session_snapshot(last="500"),
+        },
+        {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
+    )
+    service = DashboardQuoteService(config=config, client_factory=lambda: full_client)
+    full_result = service.refresh().to_dict()
+    cached_quotes = {symbol: dict(quote) for symbol, quote in service.last_quotes.items()}
+
+    class CnPermissionErrorClient:
+        def __init__(self) -> None:
+            self.snapshot_requests: list[list[str]] = []
+            self.state_requests: list[list[str]] = []
+            self.close_count = 0
+
+        def get_dashboard_snapshots(
+            self, futu_symbols: Sequence[str]
+        ) -> dict[str, DashboardQuoteSnapshot]:
+            symbols = list(futu_symbols)
+            self.snapshot_requests.append(symbols)
+            if any(symbol.startswith(("SH.", "SZ.", "BJ.")) for symbol in symbols):
+                raise FutuQuoteError(
+                    "无权限获取SH.600900的行情，请检查A股市场股票行情权限",
+                    error_type="snapshot_failed",
+                    opend_reachable=True,
+                    context_ok=True,
+                    snapshot_ok=False,
+                )
+            return {
+                "US.AAPL": session_snapshot(last="165"),
+                "US.MSFT": session_snapshot(last="510"),
+            }
+
+        def get_market_states(self, futu_symbols: Sequence[str]) -> dict[str, str]:
+            self.state_requests.append(list(futu_symbols))
+            return {symbol: "MORNING" for symbol in futu_symbols}
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = CnPermissionErrorClient()
+    created_clients: list[CnPermissionErrorClient] = []
+
+    def client_factory() -> CnPermissionErrorClient:
+        created_clients.append(client)
+        return client
+
+    service.client_factory = client_factory
+
+    result = service.refresh().to_dict()
+
+    assert len(created_clients) == 1
+    assert client.snapshot_requests == [
+        ["SH.600900"],
+        ["US.AAPL", "US.MSFT"],
+    ]
+    assert client.state_requests == [["US.AAPL", "US.MSFT"]]
+    assert client.close_count == 1
+    assert result["status"] == "partial"
+    assert result["quote_count"] == 2
+    assert result["missing_count"] == 1
+    assert result["quotes"]["SH.600900"]["status"] == "missing_quote"
+    assert result["quotes"]["US.AAPL"]["last_price"] == "165"
+    assert result["quotes"]["US.MSFT"]["last_price"] == "510"
+    assert result["us_session_status"] == "active"
+    assert result["diagnostic"]["market"] == "CN"
+    assert "无权限获取SH.600900的行情" in result["diagnostic"]["message"]
+    assert result["last_success_at"] == full_result["last_success_at"]
+    assert service.last_quotes == cached_quotes
 
 
 def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> None:
