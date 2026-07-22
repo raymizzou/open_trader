@@ -38,7 +38,10 @@
 - Modify `纪律.md`, `CONTEXT.md`, and `README.md`: record the approved rule, compatibility exception, and `abandon` lifecycle behavior.
 - Test in `tests/test_a_share_trend.py`, `tests/test_market_trend.py`, `tests/test_trend_review.py`, `tests/test_trend_market_controller.py`, `tests/test_trend_api_stats.py`, `tests/test_trend_api_fill_sync.py`, `tests/test_dashboard.py`, `tests/test_dashboard_web.py`, and `tests/test_dashboard_acceptance.py`.
 
-The frozen `SELL_PARTIAL` action must contain these exact facts:
+The final frozen executable `SELL_PARTIAL` action must contain these exact facts. Task 1
+keeps it in `holding_decisions` only; Task 4 moves it into `formal_actions` in the same
+commit that makes the controller and executor accept it, so an intermediate branch never
+causes an existing full-exit report to be rejected.
 
 ```json
 {
@@ -183,6 +186,11 @@ symbols = sorted({
 ```
 
 Add a market test proving a held symbol outside the candidate list is included exactly once.
+
+Keep `SELL_PARTIAL` in `holding_decisions` at this stage. Do not add it to
+`formal_actions` until Task 4 wires the report and controller together. This keeps
+intermediate reports compatible with the old controller while Task 2 establishes the
+immutable executor contract.
 
 - [ ] **Step 5: Add the unchanged-v4 strategy contract**
 
@@ -415,8 +423,10 @@ git commit -m "feat: recover overheat trims by position lifecycle"
 ### Task 4: Let the controller upgrade partial sells to full exits safely
 
 **Files:**
+- Modify: `src/open_trader/a_share_trend.py:3030-3090`
 - Modify: `src/open_trader/trend_market_controller.py:390-465,630-980,1535-1605`
 - Modify: `src/open_trader/trend_review.py:1129-1610,1935-3090`
+- Test: `tests/test_a_share_trend.py`
 - Test: `tests/test_trend_market_controller.py`
 - Test: `tests/test_trend_review.py`
 
@@ -470,6 +480,12 @@ or status=filled and sell_goal=partial_30 and filled_qty >= lifecycle_target_qty
 ```
 
 For `SELL_ALL` or a protection upgrade, completion still requires an authoritative zero-position observation (`position_zero_confirmed`) under `sell_goal=position_zero`. Never let a generic `filled` partial event satisfy that check.
+
+In the same change, add validated `SELL_PARTIAL` holding decisions to
+`strategy_judgments.formal_actions`; do not duplicate or recompute fields. Add a
+regression test that a report containing both `SELL_PARTIAL` and `SELL_ALL` passes
+`_valid_report`, executes sells before buys, and does not cause the controller to reject
+the full-exit action.
 
 - [ ] **Step 4: Implement no-overlap full-exit upgrade**
 
