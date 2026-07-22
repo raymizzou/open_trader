@@ -1059,6 +1059,282 @@ def test_report_blocker_remains_visible_when_close_capture_fails(
     assert observed[-1] == "report generation failed: upstream unavailable"
 
 
+def test_close_review_failure_is_nonblocking_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(),
+        session="closed",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
+    )
+    now = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
+    )
+    write_report(config)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    reason = "无权限获取SH.000985的行情，请检查A股市场指数行情权限"
+    notifications: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "_capture_close",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            controller.FutuQuoteError(reason)
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_once",
+        lambda title, message, key: notifications.append((title, message, key))
+        or True,
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: now
+    )
+
+    assert result["phase"] == "recovering_review"
+    assert result["blocker"] is None
+    assert result["last_success"] == {
+        "status": "reconciled",
+        "market": "CN",
+        "date": cycle.execution_date,
+        "submitted_count": 0,
+        "artifact_paths": [],
+    }
+    assert result["next_check_at"] == "2026-07-20T15:01:10+08:00"
+    assert notifications[0][1] == reason
+    assert notifications[0][2][3:5] == ("controller", reason)
+
+
+def test_review_backoff_does_not_delay_order_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(),
+        session="closed",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
+    )
+    current = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
+    )
+    write_report(config)
+    due_checks = 0
+
+    def execution_due(*_args: object) -> bool:
+        nonlocal due_checks
+        due_checks += 1
+        return due_checks == 2
+
+    executions: list[str] = []
+    monkeypatch.setattr(controller, "_execution_due", execution_due)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda _config, _market, execution_date, *_args, **_kwargs: executions.append(
+            execution_date
+        )
+        or {
+            "status": "submitted",
+            "market": "CN",
+            "date": execution_date,
+            "submitted_count": 1,
+            "artifact_paths": ["intent.json"],
+        },
+    )
+    close_attempts: list[str] = []
+
+    def capture_close(
+        _config: DailyPremarketConfig,
+        _market: str,
+        trading_date: str,
+        **_kwargs: object,
+    ) -> None:
+        close_attempts.append(trading_date)
+        raise controller.FutuQuoteError("CN index permission unavailable")
+
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
+
+    class StopController(RuntimeError):
+        pass
+
+    sleeps = 0
+
+    def advance(_seconds: float) -> None:
+        nonlocal current, sleeps
+        sleeps += 1
+        current += timedelta(seconds=5)
+        if sleeps == 2:
+            raise StopController
+
+    with pytest.raises(StopController):
+        run_trend_market_controller(
+            config, "CN", now_fn=lambda: current, sleep_fn=advance
+        )
+
+    result = load_trend_market_status(config, "CN", now=current)
+    assert close_attempts == [cycle.as_of_date]
+    assert executions == [cycle.execution_date]
+    assert result["phase"] == "recovering_review"
+    assert result["blocker"] is None
+    assert result["last_success"] == {
+        "status": "submitted",
+        "market": "CN",
+        "date": cycle.execution_date,
+        "submitted_count": 1,
+        "artifact_paths": ["intent.json"],
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("trend review daily fact is invalid"),
+        FileExistsError("immutable artifact collision"),
+    ],
+)
+def test_close_review_integrity_failure_remains_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(active_cn_cycle(), session="closed", market_open=False)
+    now = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
+    )
+    write_report(config)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(
+        controller,
+        "_capture_close",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: now
+    )
+
+    assert result["phase"] == "blocked"
+    assert result["blocker"] == str(failure)
+
+
+def test_close_review_recovery_completes_once_after_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    cycle = replace(
+        active_cn_cycle(),
+        session="closed",
+        market_open=False,
+        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
+    )
+    current = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
+    capture_close = controller._capture_close
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
+    )
+    report_path, report = write_report(config)
+    report["metadata"]["simulate_acc_id"] = 101  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    class Account:
+        def account_snapshot(self) -> dict[str, object]:
+            return {"acc_id": 101, "net_value": "100000", "positions": []}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: Account(),
+    )
+    benchmark_attempts = 0
+
+    def benchmark(
+        _quote: object, market: str, trading_date: str
+    ) -> dict[str, str]:
+        nonlocal benchmark_attempts
+        benchmark_attempts += 1
+        if benchmark_attempts == 1:
+            raise controller.FutuQuoteError("CN index permission unavailable")
+        return {
+            "date": trading_date,
+            "close": "5833.72",
+            "source_id": "CSI_ALL_SHARE_PRICE",
+            "futu_symbol": "SH.000985",
+        }
+
+    projections: list[str] = []
+    monkeypatch.setattr(controller, "benchmark_fact", benchmark)
+    monkeypatch.setattr(
+        controller,
+        "build_trend_review_projection",
+        lambda _data_dir, market: projections.append(market),
+    )
+    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
+
+    class StopController(RuntimeError):
+        pass
+
+    sleeps = 0
+
+    def advance(_seconds: float) -> None:
+        nonlocal current, sleeps
+        sleeps += 1
+        current += timedelta(seconds=5)
+        if sleeps == 4:
+            raise StopController
+
+    with pytest.raises(StopController):
+        run_trend_market_controller(
+            config, "CN", now_fn=lambda: current, sleep_fn=advance
+        )
+
+    fact = controller._close_path(config, "CN", cycle.as_of_date)
+    completion = controller._close_completion_path(
+        config, "CN", cycle.as_of_date
+    )
+    result = load_trend_market_status(config, "CN", now=current)
+    assert benchmark_attempts == 2
+    assert fact.exists()
+    assert completion.exists()
+    assert projections == ["CN"]
+    assert result["phase"] == "closed"
+    assert result["last_success"] == {
+        "status": "close_captured",
+        "date": cycle.as_of_date,
+    }
+
+
 def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -121,7 +121,9 @@ def test_dashboard_projects_strict_controller_health(
         assert "OPEN_TRADER_TREND_EXECUTOR_HOST" in controller["reason"]
 
 
-@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
+@pytest.mark.parametrize(
+    "phase", ["reconciling", "recovering_report", "recovering_review"]
+)
 def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
     tmp_path: Path, phase: str,
 ) -> None:
@@ -150,7 +152,9 @@ def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
     assert controller["reason"] == payload["blocker"]
 
 
-@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
+@pytest.mark.parametrize(
+    "phase", ["reconciling", "recovering_report", "recovering_review"]
+)
 def test_dashboard_projects_unblocked_progress_phase_as_healthy(
     tmp_path: Path, phase: str,
 ) -> None:

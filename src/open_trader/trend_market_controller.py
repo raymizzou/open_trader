@@ -1791,6 +1791,8 @@ def run_trend_market_controller(
     report_failures = 0
     report_retry_after: datetime | None = None
     report_blocker: str | None = None
+    review_failures = 0
+    review_retry_after: datetime | None = None
     operation_failures = 0
     operation_retry_after: datetime | None = None
     operation_blocker: str | None = None
@@ -2095,6 +2097,10 @@ def run_trend_market_controller(
                     operation_retry_after is not None
                     and now < operation_retry_after
                 )
+                review_delayed = (
+                    review_retry_after is not None
+                    and now < review_retry_after
+                )
                 if operation_delayed:
                     blocker = report_blocker or operation_blocker
                     phase = "blocked"
@@ -2167,6 +2173,20 @@ def run_trend_market_controller(
                         )
                     report_target = None
 
+                if (
+                    review_delayed
+                    and blocker is None
+                    and phase
+                    not in {
+                        "blocked",
+                        "recovering_report",
+                        "uncertain",
+                        "conflict",
+                        "missed",
+                    }
+                ):
+                    phase = "recovering_review"
+
                 close_due = (
                     cycle.session == "closed"
                     or now.astimezone(TIMEZONES[market]).date()
@@ -2175,6 +2195,7 @@ def run_trend_market_controller(
                 if (
                     close_due
                     and not operation_delayed
+                    and not review_delayed
                     and not _close_completed(config, market, cycle.as_of_date)
                     and _load_report_for_as_of(
                         config, market, cycle.as_of_date
@@ -2189,20 +2210,47 @@ def run_trend_market_controller(
                             account_client=account_client,
                             account_client_factory=shared_account,
                         )
+                        _complete_close(config, market, cycle.as_of_date, now)
                     except FutuOrderExecutionError:
                         reset_account()
                         raise
-                    _complete_close(config, market, cycle.as_of_date, now)
-                    if last_success is None or cycle.session == "closed":
-                        last_success = {
-                            "status": "close_captured",
-                            "date": cycle.as_of_date,
-                        }
-                    operation_failures = 0
-                    operation_retry_after = None
-                    operation_blocker = None
-                    if cycle.session == "closed":
-                        phase = "closed"
+                    except FutuQuoteError as exc:
+                        reset_quote()
+                        review_failures += 1
+                        review_retry_after = _retry_at(now, review_failures)
+                        if blocker is None and phase not in {
+                            "blocked",
+                            "recovering_report",
+                            "uncertain",
+                            "conflict",
+                            "missed",
+                        }:
+                            phase = "recovering_review"
+                        _notify_once(
+                            f"{market} 趋势复盘待恢复",
+                            str(exc),
+                            (
+                                config,
+                                market,
+                                cycle.execution_date,
+                                "controller",
+                                str(exc),
+                                now.isoformat(timespec="seconds"),
+                            ),
+                        )
+                    else:
+                        if last_success is None or cycle.session == "closed":
+                            last_success = {
+                                "status": "close_captured",
+                                "date": cycle.as_of_date,
+                            }
+                        operation_failures = 0
+                        operation_retry_after = None
+                        operation_blocker = None
+                        review_failures = 0
+                        review_retry_after = None
+                        if cycle.session == "closed":
+                            phase = "closed"
             except Exception as exc:
                 if isinstance(exc, FutuQuoteError):
                     reset_quote()
@@ -2253,6 +2301,7 @@ def run_trend_market_controller(
             next_check = (
                 operation_retry_after
                 or report_retry_after
+                or review_retry_after
                 or cycle.next_check_at
             )
             status_payload = _record_status(
