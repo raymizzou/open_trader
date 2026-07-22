@@ -273,6 +273,71 @@ def test_once_market_watcher_returns_abnormal_when_snapshot_fails(
     assert quote.closed is True
 
 
+def test_once_market_watcher_recovers_after_snapshot_outage_ends(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingXiaoaiNotifier()
+    write_protection_state(state_path, {
+        "schema_version": 1,
+        "positions": {"00700": {"active_line": "11"}},
+    })
+
+    class Quote:
+        def __init__(self, snapshot: dict[str, QuoteSnapshot] | Exception) -> None:
+            self.snapshot = snapshot
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-22"]
+
+        def get_snapshots(self, _symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            if isinstance(self.snapshot, Exception):
+                raise self.snapshot
+            return self.snapshot
+
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    def watch(snapshot: dict[str, QuoteSnapshot] | Exception) -> object:
+        return watch_market_protection(
+            market="HK",
+            data_dir=tmp_path / "data",
+            portfolio_path=tmp_path / "unused.csv",
+            state_path=state_path,
+            events_path=events_path,
+            report_lock_path=tmp_path / "report.lock",
+            quote_client=Quote(snapshot),
+            close_quote_client=False,
+            notifier=notifier,
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: now,
+        )
+
+    for _ in range(2):
+        with pytest.raises(FutuQuoteError, match="snapshot offline"):
+            watch(watcher_error("snapshot offline"))
+
+    assert [title for title, _ in notifier.messages] == ["港股价格监控中断"]
+    assert [
+        json.loads(line)["event_type"]
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ] == ["monitor_interrupted"]
+
+    assert watch({"HK.00700": QuoteSnapshot("HK.00700", Decimal("12"))}).status == (
+        "completed"
+    )
+    assert [title for title, _ in notifier.messages] == [
+        "港股价格监控中断",
+        "港股价格监控恢复",
+    ]
+    assert [
+        json.loads(line)["event_type"]
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ] == ["monitor_interrupted", "monitor_recovered"]
+
+
 def test_once_market_watcher_returns_abnormal_when_account_snapshot_fails(
     tmp_path: Path,
 ) -> None:

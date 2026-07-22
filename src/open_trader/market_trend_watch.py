@@ -12,7 +12,6 @@ from .a_share_trend_watch import (
     _load_active_lines,
     _monitor_interrupted,
     _record_interruption,
-    _record_recovery,
     _run_review_callback,
     _notify_trend_review_deadline,
     watch_a_share_protection,
@@ -180,14 +179,6 @@ def watch_market_protection(
             sleep_fn(reconnect_seconds)
             now = now_fn()
             continue
-        if interrupted:
-            _record_recovery(
-                events_path,
-                notifier,
-                opening.date().isoformat(),
-                now,
-                market_label=MARKET_LABELS[market],
-            )
         break
 
     try:

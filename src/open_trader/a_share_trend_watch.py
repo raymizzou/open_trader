@@ -158,6 +158,15 @@ def watch_a_share_protection(
                 )
         return result
 
+    def recover_monitor() -> None:
+        nonlocal interrupted
+        if interrupted:
+            _record_recovery(
+                events_path, notifier, trading_date, now,
+                market_label=market_label,
+            )
+            interrupted = False
+
     try:
         while True:
             session = session_fn(now)
@@ -212,13 +221,8 @@ def watch_a_share_protection(
                     now = now_fn()
                     continue
                 calendar_checked = True
-                if interrupted:
-                    _record_recovery(
-                        events_path, notifier, trading_date, now,
-                        market_label=market_label,
-                    )
-                    interrupted = False
                 if trading_date not in trading_days:
+                    recover_monitor()
                     return outcome("holiday")
 
             if on_session_open is not None:
@@ -240,6 +244,7 @@ def watch_a_share_protection(
                 )
 
             if session == "closed":
+                recover_monitor()
                 return outcome("closed")
             if session == "before":
                 opening = now.astimezone(session_timezone).replace(
@@ -398,6 +403,7 @@ def watch_a_share_protection(
                 comparable[to_futu_symbol(market, symbol)] = (symbol, active_line)
 
             if not comparable:
+                recover_monitor()
                 if once:
                     return outcome("completed")
                 sleep_fn(poll_seconds)
@@ -427,12 +433,7 @@ def watch_a_share_protection(
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
-            if interrupted:
-                _record_recovery(
-                    events_path, notifier, trading_date, now,
-                    market_label=market_label,
-                )
-                interrupted = False
+            recover_monitor()
 
             for futu_symbol, (symbol, active_line) in comparable.items():
                 snapshot = snapshots.get(futu_symbol)
