@@ -1422,7 +1422,7 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
 
 def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
     dashboard_acceptance._check_visible_decimal_precision(
-        "模拟持仓 485 成本 30.59 保护线 23.43", "模拟盘"
+        "模拟持仓 485 / 1,296 成本 30.59 保护线 23.43", "模拟盘"
     )
     with pytest.raises(AssertionError, match="超过两位小数"):
         dashboard_acceptance._check_visible_decimal_precision(
@@ -1430,54 +1430,94 @@ def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
         )
 
 
-def test_acceptance_cross_checks_report_simulation_overlay() -> None:
+def simulation_overlay_root(rendered_quantity: str) -> tuple[object, list[str]]:
     checked: list[str] = []
 
     class Locator:
-        def __init__(
-            self,
-            name: str,
-            *,
-            text: str = "",
-            attribute: str | None = None,
-        ) -> None:
+        def __init__(self, name: str) -> None:
             self.name = name
-            self.text = text
-            self.attribute = attribute
 
         def count(self) -> int:
             return 1
 
         def inner_text(self) -> str:
-            checked.append(f"text:{self.name}")
-            return self.text
+            if self.name == "simulation":
+                return "模拟盘执行状态 · 富途"
+            assert self.name == "GPN"
+            return f"GPN 模拟持仓 {rendered_quantity}"
+
+        def all_inner_texts(self) -> list[str]:
+            assert self.name == "facts"
+            checked.append("facts")
+            return [f"模拟持仓 {rendered_quantity}"]
 
         def locator(self, selector: str) -> "Locator":
             if self.name == "simulation":
                 assert selector == '[data-simulation-symbol="GPN"]'
-                return Locator("GPN", text="GPN 模拟持仓 485")
-            assert self.name == "GPN" and selector == "[data-deviation]"
-            return Locator("status", attribute="followed")
+                checked.append("row:GPN")
+                return Locator("GPN")
+            assert self.name == "GPN"
+            if selector == ".trend-actual-facts span":
+                return Locator("facts")
+            assert selector == "[data-deviation]"
+            return Locator("status")
 
         def get_attribute(self, name: str) -> str | None:
-            assert name == "data-deviation"
+            assert self.name == "status" and name == "data-deviation"
             checked.append(f"attribute:{self.name}")
-            return self.attribute
+            return "followed"
 
     class Root:
         def locator(self, selector: str) -> Locator:
             assert selector == ".trend-simulation-overlay"
-            return Locator("simulation", text="模拟盘执行状态 · 富途")
+            return Locator("simulation")
+
+    return Root(), checked
+
+
+def test_acceptance_cross_checks_review_hold_simulation_overlay() -> None:
+    root, checked = simulation_overlay_root("485")
 
     dashboard_acceptance._check_report_simulation_overlay(
-        Root(),
-        {"hold_actions": [{"action": "HOLD", "symbol": "GPN"}]},
+        root,
+        {
+            "hold_actions": [],
+            "review_actions": [{"action": "HOLD", "symbol": "GPN"}],
+        },
         {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
         "tiger",
     )
 
-    assert "text:GPN" in checked
+    assert "row:GPN" in checked
+    assert "facts" in checked
     assert "attribute:status" in checked
+
+
+@pytest.mark.parametrize("rendered_quantity", ["485.1", "4850"])
+def test_acceptance_rejects_inexact_simulation_quantity(
+    rendered_quantity: str,
+) -> None:
+    root, _checked = simulation_overlay_root(rendered_quantity)
+
+    with pytest.raises(AssertionError, match="模拟盘数量未显示"):
+        dashboard_acceptance._check_report_simulation_overlay(
+            root,
+            {
+                "hold_actions": [{"action": "HOLD", "symbol": "GPN"}],
+                "review_actions": [],
+            },
+            {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
+            "tiger",
+        )
+
+
+def test_acceptance_formats_arbitrary_size_number_without_integer_conversion() -> None:
+    integer = "00" + "1" * 4_998
+    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", integer)
+
+    assert dashboard_acceptance._display_number(f"+{integer}.005") == (
+        f"+{grouped}.01"
+    )
 
 
 def test_acceptance_checks_exact_trend_review_content() -> None:

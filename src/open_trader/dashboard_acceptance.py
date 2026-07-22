@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
@@ -1541,24 +1541,35 @@ def _check_report_simulation_overlay(
         for position in positions
         if isinstance(position, Mapping)
     }
-    holds = report.get("hold_actions") or []
-    assert isinstance(holds, list), f"{broker} 继续持有列表无效"
-    for hold in holds:
-        if not isinstance(hold, Mapping):
-            continue
-        symbol = str(hold.get("symbol") or "").strip().upper()
-        position = by_symbol.get(symbol)
-        if position is None:
-            continue
-        row = simulation.locator(f'[data-simulation-symbol="{symbol}"]')
-        assert row.count() == 1, f"{broker} {symbol} 缺少模拟盘对照行"
-        quantity = f"模拟持仓 {_display_number(position['quantity'])}"
-        assert quantity in row.inner_text(), f"{broker} {symbol} 模拟盘数量未显示"
-        status = row.locator("[data-deviation]")
-        assert status.count() == 1, f"{broker} {symbol} 模拟盘偏差状态缺失"
-        assert status.get_attribute("data-deviation") == "followed", (
-            f"{broker} {symbol} 模拟盘偏差状态不是 followed"
-        )
+    seen: set[str] = set()
+    for key in ("hold_actions", "review_actions"):
+        actions = report.get(key) or []
+        assert isinstance(actions, list), f"{broker} {key} 列表无效"
+        for hold in actions:
+            if not isinstance(hold, Mapping) or hold.get("action") != "HOLD":
+                continue
+            symbol = str(hold.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            position = by_symbol.get(symbol)
+            if position is None:
+                continue
+            row = simulation.locator(f'[data-simulation-symbol="{symbol}"]')
+            assert row.count() == 1, f"{broker} {symbol} 缺少模拟盘对照行"
+            quantity = f"模拟持仓 {_display_number(position['quantity'])}"
+            facts = {
+                text.strip()
+                for text in row.locator(
+                    ".trend-actual-facts span"
+                ).all_inner_texts()
+            }
+            assert quantity in facts, f"{broker} {symbol} 模拟盘数量未显示"
+            status = row.locator("[data-deviation]")
+            assert status.count() == 1, f"{broker} {symbol} 模拟盘偏差状态缺失"
+            assert status.get_attribute("data-deviation") == "followed", (
+                f"{broker} {symbol} 模拟盘偏差状态不是 followed"
+            )
 
 
 def _check_integrated_trend_ui(
@@ -1658,10 +1669,17 @@ def _display_number(value: Any) -> str:
     if match is None:
         return raw
     sign, integer, fraction = match.groups()
-    digits = f"{integer}{(fraction or '')[:2].ljust(2, '0')}"
-    rounded = str(
-        int(digits) + int(bool(fraction and len(fraction) > 2 and fraction[2] >= "5"))
-    ).zfill(len(integer) + 2)
+    fraction = fraction or ""
+    digits = list(f"{integer}{fraction[:2].ljust(2, '0')}")
+    if len(fraction) > 2 and fraction[2] >= "5":
+        for index in range(len(digits) - 1, -1, -1):
+            if digits[index] != "9":
+                digits[index] = str(int(digits[index]) + 1)
+                break
+            digits[index] = "0"
+        else:
+            digits.insert(0, "1")
+    rounded = "".join(digits)
     grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", rounded[:-2])
     decimals = rounded[-2:].rstrip("0")
     return f"{sign}{grouped}{f'.{decimals}' if decimals else ''}"
@@ -1675,8 +1693,7 @@ def _display_price(value: Any) -> str:
         return raw
     if not number.is_finite():
         return raw
-    rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP).normalize()
-    return _display_number(format(rounded, "f"))
+    return _display_number(format(number, "f"))
 
 
 def _check_displayed_protection_prices(values: list[str]) -> None:
