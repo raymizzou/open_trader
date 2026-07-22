@@ -430,7 +430,7 @@ def test_quote_service_batches_holdings_by_futu_exchange_prefix(
     assert result.quotes["SH.600025"]["last_price"] == "9.81"
 
 
-def test_quote_service_keeps_us_quotes_when_cn_snapshot_batch_fails(
+def test_quote_service_keeps_us_quotes_when_sh_snapshot_prefix_fails(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -503,7 +503,7 @@ def test_quote_service_keeps_us_quotes_when_cn_snapshot_batch_fails(
     assert service.last_quotes == cached_quotes
 
 
-def test_quote_service_keeps_cn_quotes_when_us_snapshot_batch_fails(
+def test_quote_service_does_not_reuse_cached_us_quotes_when_us_snapshot_prefix_fails(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -519,21 +519,31 @@ def test_quote_service_keeps_cn_quotes_when_us_snapshot_batch_fails(
             }
         )
 
-    client = FakeQuoteClient(
-        {"SH.600900": session_snapshot(last="30")},
+    first_client = FakeQuoteClient(
+        {
+            "SH.600900": session_snapshot(last="30"),
+            "US.AAPL": session_snapshot(last="160"),
+            "US.MSFT": session_snapshot(last="500"),
+        },
         {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
+    )
+    service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
+    first_result = service.refresh().to_dict()
+    cached_quotes = {symbol: dict(quote) for symbol, quote in service.last_quotes.items()}
+    us_snapshot_error = FutuQuoteError(
+        "无权限获取美股行情",
+        error_type="us_snapshot_failed",
+        snapshot_ok=False,
+    )
+    client = FakeQuoteClient(
+        {"SH.600900": session_snapshot(last="31")},
         snapshot_errors={
-            "US": FutuQuoteError(
-                "无权限获取美股行情",
-                error_type="snapshot_failed",
-                snapshot_ok=False,
-            )
+            "US": us_snapshot_error,
         },
     )
+    service.client_factory = lambda: client
 
-    result = DashboardQuoteService(
-        config=config, client_factory=lambda: client
-    ).refresh().to_dict()
+    result = service.refresh().to_dict()
 
     assert client.requested_batches == [
         ["SH.600900"],
@@ -544,11 +554,18 @@ def test_quote_service_keeps_cn_quotes_when_us_snapshot_batch_fails(
     assert result["status"] == "partial"
     assert result["quote_count"] == 1
     assert result["missing_count"] == 2
-    assert result["quotes"]["SH.600900"]["last_price"] == "30"
+    assert result["stale"] is False
+    assert result["quotes"]["SH.600900"]["last_price"] == "31"
     assert result["quotes"]["US.AAPL"]["status"] == "missing_quote"
+    assert result["quotes"]["US.AAPL"]["stale"] is False
     assert result["quotes"]["US.MSFT"]["status"] == "missing_quote"
+    assert result["quotes"]["US.MSFT"]["stale"] is False
     assert result["us_session_status"] == "unknown"
     assert result["diagnostic"]["market"] == "US"
+    assert result["diagnostic"]["error_type"] == "us_snapshot_failed"
+    assert "无权限获取美股行情" in result["diagnostic"]["message"]
+    assert result["last_success_at"] == first_result["last_success_at"]
+    assert service.last_quotes == cached_quotes
 
 
 def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> None:

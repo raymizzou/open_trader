@@ -87,9 +87,9 @@ class DashboardQuoteService:
         items_by_symbol = _items_by_sorted_symbol(universe.items)
         requested_symbols = list(items_by_symbol)
         us_symbols = [symbol for symbol in requested_symbols if symbol.startswith("US.")]
-        symbols_by_market: dict[str, list[str]] = {}
+        symbols_by_prefix: dict[str, list[str]] = {}
         for symbol in items_by_symbol:
-            symbols_by_market.setdefault(symbol.split(".", 1)[0], []).append(symbol)
+            symbols_by_prefix.setdefault(symbol.split(".", 1)[0], []).append(symbol)
         client: DashboardQuoteClient | None = None
         market_states: dict[str, str] = {}
         snapshot_errors: list[tuple[str, FutuQuoteError]] = []
@@ -99,15 +99,15 @@ class DashboardQuoteService:
             snapshots: dict[str, DashboardQuoteSnapshot] = {}
             if requested_symbols:
                 client = self._new_client()
-                for market, symbols in symbols_by_market.items():
+                for prefix, symbols in symbols_by_prefix.items():
                     try:
                         snapshots.update(client.get_dashboard_snapshots(symbols))
                     except FutuQuoteError as exc:
-                        snapshot_errors.append((market, exc))
-                if len(snapshot_errors) == len(symbols_by_market):
+                        snapshot_errors.append((prefix, exc))
+                if len(snapshot_errors) == len(symbols_by_prefix):
                     raise snapshot_errors[0][1]
                 if us_symbols and not any(
-                    market == "US" for market, _ in snapshot_errors
+                    prefix == "US" for prefix, _ in snapshot_errors
                 ):
                     try:
                         market_states = client.get_market_states(us_symbols)
@@ -129,7 +129,10 @@ class DashboardQuoteService:
             if client is not None and hasattr(client, "close"):
                 client.close()
 
-        if state_error is None and any(
+        us_snapshots_succeeded = not any(
+            prefix == "US" for prefix, _ in snapshot_errors
+        )
+        if us_snapshots_succeeded and state_error is None and any(
             symbol not in market_states for symbol in us_symbols
         ):
             state_error = FutuQuoteError(
@@ -153,7 +156,7 @@ class DashboardQuoteService:
         }
         reused_us_quotes = (
             _last_good_us_quotes(self.last_quotes, us_symbols)
-            if state_error is not None
+            if us_snapshots_succeeded and state_error is not None
             else {}
         )
         if reused_us_quotes:
@@ -364,8 +367,8 @@ def _partial_diagnostic(
 ) -> dict[str, Any]:
     messages: list[str] = []
     if snapshot_errors:
-        market, error = snapshot_errors[0]
-        messages.append(f"{market} 行情获取失败：{error}")
+        prefix, error = snapshot_errors[0]
+        messages.append(f"{prefix} 行情获取失败：{error}")
     if missing_count:
         messages.append(f"缺失 {missing_count} 个标的行情。")
     if fallback_count:
