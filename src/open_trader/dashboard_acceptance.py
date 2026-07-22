@@ -2489,6 +2489,11 @@ def _check_trend_controller_status(
                     f"{broker} 控制器最近成功 {fact_label} 与 API 不一致"
                 )
             continue
+        if key == "last_success" and value is None:
+            assert rendered_facts.get(label) == "—", (
+                f"{broker} 控制器尚无首次成功时展示无效"
+            )
+            continue
         if value not in (None, ""):
             assert str(value) in text, f"{broker} 控制器状态卡 {label} 与 API 不一致"
     mode = controller.get("effective_mode")
@@ -2504,6 +2509,10 @@ def _check_trend_controller_status(
         assert health == "healthy" and controller.get("blocking") is False, (
             f"{broker} 控制器不可用或阻塞"
         )
+        assert (
+            controller.get("last_success") is not None
+            or _controller_allows_missing_first_success(controller)
+        ), f"{broker} 控制器尚无首次成功状态"
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
     if width <= 760:
         boxes = card.evaluate_all(
@@ -3087,6 +3096,17 @@ def _controller_log_errors(
     return errors
 
 
+def _controller_allows_missing_first_success(
+    controller: Mapping[str, Any],
+) -> bool:
+    return (
+        controller.get("health") == "healthy"
+        and controller.get("blocking") is False
+        and controller.get("blocker") in (None, "")
+        and controller.get("phase") in {"reconciling", "recovering_report"}
+    )
+
+
 def _trend_controller_errors(
     payload: Mapping[str, Any],
     *,
@@ -3113,7 +3133,10 @@ def _trend_controller_errors(
             or controller.get("blocker") not in (None, "")
         ):
             errors.append(f"{broker} 控制器不可用或阻塞")
-        if controller.get("last_success") is None:
+        if (
+            controller.get("last_success") is None
+            and not _controller_allows_missing_first_success(controller)
+        ):
             errors.append(f"{broker} 控制器尚无首次成功状态")
 
         pid = controller.get("pid")

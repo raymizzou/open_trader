@@ -2600,6 +2600,43 @@ def test_acceptance_checks_readable_mapping_last_success_fields() -> None:
     )
 
 
+@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
+def test_acceptance_browser_allows_progress_before_first_success(
+    phase: str,
+) -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({"phase": phase, "last_success": None})  # type: ignore[union-attr]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+@pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
+def test_acceptance_browser_rejects_stable_phase_without_first_success(
+    phase: str,
+) -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({"phase": phase, "last_success": None})  # type: ignore[union-attr]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+
+    with pytest.raises(AssertionError, match="尚无首次成功"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            controller,
+        )
+
+
 def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
 ) -> None:
     payload = valid_payload()
@@ -5065,6 +5102,7 @@ def test_acceptance_rejects_fresh_blocked_controller(
         "health": "unavailable",
         "blocking": True,
         "phase": phase,
+        "last_success": None,
         "blocker": "report generation failed",
     })
 
@@ -5089,6 +5127,30 @@ def test_acceptance_accepts_healthy_in_progress_controller(
     ) == []
 
 
+def test_acceptance_allows_progress_controllers_before_first_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controllers = payload["trend_controllers"]
+    controllers["phillips"].update({  # type: ignore[index,union-attr]
+        "phase": "recovering_report",
+        "last_success": None,
+    })
+    controllers["eastmoney"].update({  # type: ignore[index,union-attr]
+        "phase": "reconciling",
+        "last_success": None,
+    })
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert "phillips 控制器尚无首次成功状态" not in errors
+    assert "eastmoney 控制器尚无首次成功状态" not in errors
+    assert errors == []
+
+
 def test_acceptance_accepts_matching_controller_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5100,12 +5162,14 @@ def test_acceptance_accepts_matching_controller_runtime(
     ) == []
 
 
-def test_acceptance_rejects_controller_without_first_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
+def test_acceptance_rejects_stable_controller_without_first_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
     now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
     payload = _controller_runtime_payload(tmp_path, now=now)
-    payload["trend_controllers"]["tiger"]["last_success"] = None  # type: ignore[index]
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({"phase": phase, "last_success": None})  # type: ignore[union-attr]
 
     errors = _controller_runtime_errors(
         tmp_path, monkeypatch, now=now, payload=payload
