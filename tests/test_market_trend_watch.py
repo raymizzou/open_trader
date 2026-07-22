@@ -191,6 +191,43 @@ def test_once_market_watcher_reraises_failure_for_borrowed_quote(
     assert quote.closed is False
 
 
+def test_once_market_watcher_deduplicates_durable_interruption(
+    tmp_path: Path,
+) -> None:
+    error = watcher_error("calendar offline")
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingXiaoaiNotifier()
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            raise error
+
+    for quote in (Quote(), Quote()):
+        with pytest.raises(FutuQuoteError, match="calendar offline"):
+            watch_market_protection(
+                market="HK",
+                data_dir=tmp_path / "data",
+                portfolio_path=tmp_path / "unused.csv",
+                state_path=tmp_path / "state.json",
+                events_path=events_path,
+                report_lock_path=tmp_path / "report.lock",
+                quote_client=quote,
+                close_quote_client=False,
+                notifier=notifier,
+                poll_seconds=5,
+                reconnect_seconds=5,
+                once=True,
+                now_fn=lambda: now,
+            )
+
+    assert [title for title, _ in notifier.messages] == ["港股价格监控中断"]
+    assert [
+        json.loads(line)["event_type"]
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ] == ["monitor_interrupted"]
+
+
 def test_once_market_watcher_returns_abnormal_when_snapshot_fails(
     tmp_path: Path,
 ) -> None:

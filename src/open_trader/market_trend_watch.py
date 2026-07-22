@@ -10,6 +10,7 @@ from .a_share_trend_watch import (
     AShareWatchResult,
     _close,
     _load_active_lines,
+    _monitor_interrupted,
     _record_interruption,
     _record_recovery,
     _run_review_callback,
@@ -102,7 +103,7 @@ def watch_market_protection(
     market = _market(market)
     timezone = MARKET_TIMEZONES[market]
     client = quote_client
-    interrupted = False
+    interrupted = _monitor_interrupted(events_path)
     now = now_fn()
     while True:
         if client is None:

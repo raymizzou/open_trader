@@ -125,7 +125,7 @@ def watch_a_share_protection(
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
-    interrupted = False
+    interrupted = _monitor_interrupted(events_path)
     now = first_now
 
     def outcome(status: str, *, failed: bool = False) -> AShareWatchResult:
@@ -793,6 +793,14 @@ def _optional_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError, AttributeError):
         return None
     return result if result.is_finite() else None
+
+
+def _monitor_interrupted(events_path: Path) -> bool:
+    for event in reversed(load_watch_events(events_path)):
+        event_type = event.get("event_type")
+        if event_type in {"monitor_interrupted", "monitor_recovered"}:
+            return event_type == "monitor_interrupted"
+    return False
 
 
 def _record_interruption(

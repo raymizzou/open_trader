@@ -309,6 +309,48 @@ def test_once_watcher_does_not_close_borrowed_quote(tmp_path: Path) -> None:
     assert quote.closed is False
 
 
+def test_once_watcher_persists_interruption_until_recovery(tmp_path: Path) -> None:
+    portfolio_path = portfolio(tmp_path, symbol=None)
+    events_path = tmp_path / "events.jsonl"
+    notifier = RecordingNotifier()
+    now = datetime.fromisoformat("2026-07-22T09:31:00+08:00")
+
+    def watch(quote: SequenceQuote) -> object:
+        return watch_a_share_protection(
+            portfolio_path=portfolio_path,
+            state_path=tmp_path / "state.json",
+            events_path=events_path,
+            quote_client=quote,
+            close_quote_client=False,
+            notifier=notifier,
+            poll_seconds=5,
+            reconnect_seconds=5,
+            once=True,
+            now_fn=lambda: now,
+        )
+
+    failed = SequenceQuote([], trading_days=interrupted("OpenD unavailable"))
+    for _ in range(2):
+        with pytest.raises(FutuQuoteError, match="OpenD unavailable"):
+            watch(failed)
+
+    assert watch(SequenceQuote([], trading_days=["2026-07-22"])).status == "completed"
+
+    with pytest.raises(FutuQuoteError, match="OpenD unavailable"):
+        watch(SequenceQuote([], trading_days=interrupted("OpenD unavailable")))
+
+    assert [title for title, _ in notifier.messages] == [
+        "A股价格监控中断",
+        "A股价格监控恢复",
+        "A股价格监控中断",
+    ]
+    assert [event["event_type"] for event in read_events(events_path)] == [
+        "monitor_interrupted",
+        "monitor_recovered",
+        "monitor_interrupted",
+    ]
+
+
 def test_once_watcher_returns_abnormal_when_snapshot_fails(tmp_path: Path) -> None:
     quote = SequenceQuote([interrupted("snapshot offline")])
 
