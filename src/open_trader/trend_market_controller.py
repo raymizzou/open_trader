@@ -45,6 +45,12 @@ from .market_trend_watch import (
     market_session,
     watch_market_protection,
 )
+from .notification_policy import (
+    BROKER_LABELS,
+    MARKET_LABELS,
+    brief_zh_detail,
+    render_attention,
+)
 from .trend_review import (
     _canonical_json_bytes,
     _report_hash,
@@ -996,49 +1002,277 @@ def _load_report_for_as_of(
     return None
 
 
-def _notify_once(title: str, message: str, key: object) -> bool:
+def _notification_key(
+    key: object,
+) -> tuple[DailyPremarketConfig, str, str, str, str, str]:
     if not (
         isinstance(key, tuple)
         and len(key) == 6
         and isinstance(key[0], DailyPremarketConfig)
+        and all(isinstance(value, str) for value in key[1:])
     ):
         raise ValueError("invalid trend controller notification key")
     config, market, execution_date, action, reason, occurred_at = key
     assert isinstance(config, DailyPremarketConfig)
-    if not config.notifiers:
-        return False
-    identity = "|".join(map(str, (market, execution_date, action, reason)))
+    assert all(
+        isinstance(value, str)
+        for value in (market, execution_date, action, reason, occurred_at)
+    )
+    return config, market, execution_date, action, reason, occurred_at
+
+
+def _write_notification_state(path: Path, state: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_bytes(_canonical_json_bytes(state))
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _controller_feishu_payload(
+    title: str,
+    message: str,
+    *,
+    market: str,
+    execution_date: str,
+    action: str,
+) -> tuple[str, str]:
+    broker = BROKER_LABELS[market]
+    market_label = MARKET_LABELS[market]
+    if action == "revision_after_batch_lock":
+        return render_attention(
+            broker,
+            f"{market_label}趋势报告修订异常",
+            execution_date,
+            happened="执行批次锁定后报告发生修订",
+            impact="当日自动操作继续使用已锁定版本",
+            action="核对冻结报告与修订记录",
+            detail=brief_zh_detail(message),
+        )
+    if "复盘" in title:
+        return render_attention(
+            broker,
+            f"{market_label}趋势复盘待恢复",
+            execution_date,
+            happened="趋势复盘未完成",
+            impact="复盘数据暂未更新",
+            action="检查 OpenD 与复盘账本后等待自动恢复",
+            detail=brief_zh_detail(message),
+        )
+    return render_attention(
+        broker,
+        f"{market_label}趋势控制器阻塞",
+        execution_date,
+        happened="趋势控制器已进入阻塞状态",
+        impact=f"{market_label}自动趋势流程暂停",
+        action="检查 Dashboard 控制器状态与最近日志",
+        detail=brief_zh_detail(message),
+    )
+
+
+def _notify_channels_once(
+    key: object,
+    *,
+    non_feishu_payload: tuple[str, str] | None,
+    feishu_payload: tuple[str, str] | None,
+) -> bool:
+    config, market, execution_date, action, reason, occurred_at = (
+        _notification_key(key)
+    )
+    identity = "|".join((market, execution_date, action, reason))
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     path = (
-        _controller_root(config, str(market))
+        _controller_root(config, market)
         / "notifications"
-        / str(execution_date)
+        / execution_date
         / f"{digest}.json"
     )
     if path.exists():
-        return True
-    try:
-        attempts = send_notification_with_results(
-            build_notifier(config), title, message
-        )
-    except Exception:
-        return False
-    successes = [item.channel for item in attempts if item.success]
-    if not successes:
-        return False
-    _write_immutable(
-        path,
-        _canonical_json_bytes({
-            "schema_version": "open_trader.trend_controller.notification.v1",
+        state = _read_json(path, "trend controller notification")
+        if (
+            state.get("schema_version")
+            == "open_trader.trend_controller.notification.v1"
+        ):
+            return True
+    else:
+        state = {
+            "schema_version": "open_trader.trend_controller.notification.v2",
             "market": market,
             "execution_date": execution_date,
             "action": action,
             "reason": reason,
-            "notified_at": occurred_at,
-            "channels": successes,
-        }),
+            "occurred_at": occurred_at,
+            "non_feishu_attempted": False,
+            "feishu_attempts": 0,
+            "feishu_title": feishu_payload[0] if feishu_payload else "",
+            "feishu_message": feishu_payload[1] if feishu_payload else "",
+            "channels": [],
+        }
+    if (
+        state.get("schema_version")
+        != "open_trader.trend_controller.notification.v2"
+    ):
+        raise ValueError(f"invalid trend controller notification: {path}")
+
+    channels = [
+        channel
+        for channel in state.get("channels", [])
+        if isinstance(channel, str)
+    ]
+    if non_feishu_payload is not None and not state.get("non_feishu_attempted"):
+        try:
+            attempts = send_notification_with_results(
+                build_notifier(config),
+                *non_feishu_payload,
+                channels={"macos", "xiaoai"},
+            )
+        except Exception:
+            attempts = []
+        channels.extend(
+            attempt.channel
+            for attempt in attempts
+            if attempt.success and attempt.channel not in channels
+        )
+        state["non_feishu_attempted"] = True
+
+    feishu_delivered = any(
+        channel in {"feishu", "feishu_app"} for channel in channels
     )
-    return True
+    if (
+        feishu_payload is not None
+        and not feishu_delivered
+        and int(state.get("feishu_attempts", 0)) < 2
+    ):
+        try:
+            attempts = send_notification_with_results(
+                build_notifier(config),
+                str(state["feishu_title"]),
+                str(state["feishu_message"]),
+                channels={"feishu", "feishu_app"},
+            )
+        except Exception:
+            attempts = []
+        channels.extend(
+            attempt.channel
+            for attempt in attempts
+            if attempt.success and attempt.channel not in channels
+        )
+        state["feishu_attempts"] = int(state.get("feishu_attempts", 0)) + 1
+
+    state["channels"] = channels
+    _write_notification_state(path, state)
+    requested = []
+    if non_feishu_payload is not None:
+        requested.append(any(channel in {"macos", "xiaoai"} for channel in channels))
+    if feishu_payload is not None:
+        requested.append(
+            any(channel in {"feishu", "feishu_app"} for channel in channels)
+        )
+    return bool(requested) and all(requested)
+
+
+def _notify_once(title: str, message: str, key: object) -> bool:
+    _, market, execution_date, action, _, _ = _notification_key(key)
+    return _notify_channels_once(
+        key,
+        non_feishu_payload=(title, message),
+        feishu_payload=_controller_feishu_payload(
+            title,
+            message,
+            market=market,
+            execution_date=execution_date,
+            action=action,
+        ),
+    )
+
+
+def _notify_non_feishu_once(title: str, message: str, key: object) -> bool:
+    return _notify_channels_once(
+        key,
+        non_feishu_payload=(title, message),
+        feishu_payload=None,
+    )
+
+
+def _notify_feishu_once(title: str, message: str, key: object) -> bool:
+    return _notify_channels_once(
+        key,
+        non_feishu_payload=None,
+        feishu_payload=(title, message),
+    )
+
+
+def _retry_pending_feishu_notifications(config: DailyPremarketConfig) -> None:
+    for path in sorted(
+        (config.data_dir / "trend_controller").glob(
+            "*/notifications/**/*.json"
+        )
+    ):
+        try:
+            state = _read_json(path, "trend controller notification")
+        except ValueError:
+            continue
+        channels = [
+            channel
+            for channel in state.get("channels", [])
+            if isinstance(channel, str)
+        ]
+        if (
+            state.get("schema_version")
+            != "open_trader.trend_controller.notification.v2"
+            or state.get("feishu_attempts") != 1
+            or any(channel in {"feishu", "feishu_app"} for channel in channels)
+        ):
+            continue
+        try:
+            attempts = send_notification_with_results(
+                build_notifier(config),
+                str(state.get("feishu_title") or ""),
+                str(state.get("feishu_message") or ""),
+                channels={"feishu", "feishu_app"},
+            )
+        except Exception:
+            attempts = []
+        channels.extend(
+            attempt.channel
+            for attempt in attempts
+            if attempt.success and attempt.channel not in channels
+        )
+        state["feishu_attempts"] = 2
+        state["channels"] = channels
+        _write_notification_state(path, state)
+
+
+def _notify_protection_blocker(
+    config: DailyPremarketConfig,
+    market: str,
+    trading_date: str,
+    protection_error: str,
+    occurred_at: str,
+) -> bool:
+    title, message = render_attention(
+        BROKER_LABELS[market],
+        f"{MARKET_LABELS[market]}保护监控阻塞",
+        trading_date,
+        happened="保护检查整体异常，已禁止新买入",
+        impact=f"{MARKET_LABELS[market]}活动保护线无法完整检查",
+        action="查看 Dashboard 风险状态并人工核价",
+        detail=protection_error,
+    )
+    return _notify_feishu_once(
+        title,
+        message,
+        (
+            config,
+            market,
+            trading_date,
+            "protection_monitor_blocked",
+            "protection_pass_abnormal",
+            occurred_at,
+        ),
+    )
 
 
 def _revision_paths(
@@ -1887,6 +2121,7 @@ def run_trend_market_controller(
                 next_check_at=now + timedelta(seconds=5),
                 fixed_process_version=process_version,
             )
+            _retry_pending_feishu_notifications(config)
             local = now.astimezone(TIMEZONES[market])
             local_session = (
                 cn_session(local)
@@ -1909,6 +2144,14 @@ def run_trend_market_controller(
                     if isinstance(exc, FutuQuoteError):
                         reset_quote()
                     protection_error = f"protection pass failed: {exc}"
+            if protection_error is not None:
+                _notify_protection_blocker(
+                    config,
+                    market,
+                    local.date().isoformat(),
+                    protection_error,
+                    now.isoformat(timespec="seconds"),
+                )
             if cycle_retry_after is not None and now < cycle_retry_after:
                 status_payload = _record_status(
                     config,

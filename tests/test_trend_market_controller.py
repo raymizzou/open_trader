@@ -19,6 +19,11 @@ from open_trader import trend_market_controller as controller
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_symbols import to_futu_symbol
 from open_trader.kelly_order_execution import FutuOrderExecutionError
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
+)
 from open_trader.trend_market_controller import (
     ControllerCycle,
     load_trend_market_status,
@@ -57,6 +62,185 @@ def controller_config(tmp_path: Path) -> DailyPremarketConfig:
         portfolio=tmp_path / "data/latest/portfolio.csv",
         trend_executor_host="executor",
     )
+
+
+class FlakyFeishu(FeishuWebhookNotifier):
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.attempt_count = 0
+
+    def notify(self, title: str, message: str) -> None:
+        self.attempt_count += 1
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("Feishu unavailable")
+
+
+class RecordingMacOS(MacOSNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+def test_controller_notification_retries_only_feishu_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(controller_config(tmp_path), notifiers=("feishu", "macos"))
+    feishu = FlakyFeishu(failures=1)
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu, macos]),
+    )
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is False
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.trend_controller.notification.v2",
+        "market": "US",
+        "execution_date": "2026-07-22",
+        "action": "controller",
+        "reason": "snapshot_failed",
+        "occurred_at": "2026-07-22T10:00:00+08:00",
+        "non_feishu_attempted": True,
+        "feishu_attempts": 1,
+        "feishu_title": "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】",
+        "feishu_message": (
+            "发生：趋势控制器已进入阻塞状态\n"
+            "影响：美股自动趋势流程暂停\n"
+            "现在做：检查 Dashboard 控制器状态与最近日志\n"
+            "原因：详见控制器日志"
+        ),
+        "channels": ["macos"],
+    }
+
+    controller._retry_pending_feishu_notifications(config)
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is True
+
+    assert feishu.attempt_count == 2
+    assert len(macos.messages) == 1
+
+
+def test_controller_notification_stops_after_one_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    feishu = FlakyFeishu(failures=2)
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu]),
+    )
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is False
+    controller._retry_pending_feishu_notifications(config)
+    controller._retry_pending_feishu_notifications(config)
+
+    assert feishu.attempt_count == 2
+
+
+def test_legacy_controller_notification_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    feishu = FlakyFeishu(failures=0)
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu, macos]),
+    )
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v1",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "snapshot_failed",
+            "notified_at": "2026-07-22T09:00:00+08:00",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is True
+    assert feishu.attempt_count == 0
+    assert macos.messages == []
+
+
+def test_protection_blocker_notifies_feishu_once_per_market_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu]),
+    )
+
+    for occurred_at in (
+        "2026-07-22T09:31:00+08:00",
+        "2026-07-22T09:31:05+08:00",
+    ):
+        controller._notify_protection_blocker(
+            config,
+            "CN",
+            "2026-07-22",
+            "protection pass abnormal: unknown_quotes=2",
+            occurred_at,
+        )
+
+    assert feishu.attempt_count == 1
 
 
 def active_cn_cycle() -> ControllerCycle:
