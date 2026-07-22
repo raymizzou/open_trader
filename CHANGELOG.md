@@ -3,6 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-23
+
+- Fixed Dashboard manual refresh to invalidate and reload the active Tiger,
+  Phillips, or Eastmoney simulated-holdings view, so post-report additions do
+  not remain stale; verified `3026` tests, live Dashboard/API refreshes, and
+  the Dashboard acceptance gate (`PASS`) on deployed SHA `3ed7ec3`.
+
 ## 2026-07-22
 
 - Replaced separate trend report and watcher jobs with one resilient controller
