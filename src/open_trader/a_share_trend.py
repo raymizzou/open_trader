@@ -47,7 +47,7 @@ from .trend_animals import (
     TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
-from .trend_review import freeze_report_evidence
+from .trend_review import _floor_to_lot, freeze_report_evidence
 
 
 NO_ACTION_TEXT = "现金也是有效仓位，本日无需交易。"
@@ -94,6 +94,8 @@ PORTFOLIO_RISK_LIMIT = Decimal("0.04")
 ABNORMAL_LOSS_BUFFER = Decimal("0.01")
 NORMAL_COST_RATE = Decimal("0.001")
 NORMAL_COST_MODEL = "预计完整开平仓正常成本按名义金额计提"
+OVERHEAT_TRIM_FRACTION = Decimal("0.30")
+OVERHEAT_TRIM_SIGNALS = ("boiling", "champagne")
 RISK_BUDGET_DISCLAIMER = "5% 是风险预算目标，不是最大损失保证。"
 PORTFOLIO_REMAINING_RISK_NOTE = (
     "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
@@ -395,6 +397,12 @@ def trend_strategy_snapshot(
         "abnormal_loss_buffer": str(ABNORMAL_LOSS_BUFFER),
         "normal_cost_rate": str(normal_cost_rate),
         "normal_cost_model": NORMAL_COST_MODEL,
+        "overheat_trim_fraction": str(OVERHEAT_TRIM_FRACTION),
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": list(OVERHEAT_TRIM_SIGNALS),
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
         **KELLY_STRATEGY_PARAMETERS,
     }
     if market == "CN":
@@ -450,6 +458,12 @@ def trend_strategy_snapshot(
             ("仓位执行", "买入窗口", "下一交易日 09:30–10:00"),
             ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
             ("退出保护", "退出条件", "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"),
+            ("退出保护", "过热止盈比例", "沸腾或开香槟时减仓 30%"),
+            ("退出保护", "过热止盈信号", "沸腾、开香槟合并为一次机会"),
+            ("退出保护", "过热止盈次数", "每个完整持仓生命周期最多一次"),
+            ("退出保护", "过热止盈取整", "按市场最小交易单位向下取整"),
+            ("退出保护", "不足一手处理", "不下单并记为本生命周期终态"),
+            ("退出保护", "清仓优先级", "强制清仓优先于过热止盈"),
             ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
         ]
     else:
@@ -501,6 +515,12 @@ def trend_strategy_snapshot(
             ),
             ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
             ("退出保护", "退出条件", "危险信号、离开趋势右侧或触发保护线时全部卖出"),
+            ("退出保护", "过热止盈比例", "沸腾或开香槟时减仓 30%"),
+            ("退出保护", "过热止盈信号", "沸腾、开香槟合并为一次机会"),
+            ("退出保护", "过热止盈次数", "每个完整持仓生命周期最多一次"),
+            ("退出保护", "过热止盈取整", "按市场最小交易单位向下取整"),
+            ("退出保护", "不足一手处理", "不下单并记为本生命周期终态"),
+            ("退出保护", "清仓优先级", "强制清仓优先于过热止盈"),
             ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
         ]
 
@@ -755,6 +775,12 @@ class HoldingDecision:
     temperature_curr: str | None = None
     strength: Decimal | None = None
     entry_hints: tuple[str, ...] = ()
+    position_started_for: str | None = None
+    target_fraction: Decimal | None = None
+    estimated_shares: int | None = None
+    lot_size: int | None = None
+    overheat_signals: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1794,6 +1820,7 @@ def _holding_action(
     snapshot: HoldingSnapshot | None,
     triggered: set[str],
     market: str = "CN",
+    overheat_trim_terminal: bool = False,
 ) -> tuple[str, str]:
     if symbol in triggered:
         return "SELL_ALL", "protection_line_already_triggered"
@@ -1808,6 +1835,12 @@ def _holding_action(
         and snapshot.temperature_curr == "平"
     ):
         return "SELL_ALL", "temperature_changed_to_flat"
+    if (
+        snapshot is not None
+        and (snapshot.boiling is True or snapshot.champagne is True)
+        and not overheat_trim_terminal
+    ):
+        return "SELL_PARTIAL", "overheat_take_profit"
     if snapshot is None or any(
         signal is None
         for signal in (
@@ -1913,18 +1946,18 @@ def _post_sell_planned_risk(
         holding = holding_by_symbol.get(position.symbol)
         if (
             holding is None
-            or holding.close is None
-            or not holding.close.is_finite()
-            or holding.close <= 0
-        ):
-            return None, f"模拟持仓 {position.symbol} 价格缺失，暂停新开仓"
-        if (
-            holding.historical
+            or holding.historical
             or holding.active_line is None
             or not holding.active_line.is_finite()
             or holding.active_line < 0
         ):
             return None, f"模拟持仓 {position.symbol} 活动保护线缺失，暂停新开仓"
+        if (
+            holding.close is None
+            or not holding.close.is_finite()
+            or holding.close <= 0
+        ):
+            return None, f"模拟持仓 {position.symbol} 价格缺失，暂停新开仓"
         planned_risk += position.quantity * (
             max(Decimal("0"), holding.close - holding.active_line)
             * price_fx_to_account_currency
@@ -2024,20 +2057,31 @@ def build_report(
         )
         old = old_positions.get(symbol)
         old_state = old if isinstance(old, Mapping) else {}
+        state_started_for = old_state.get("position_started_for")
+        position_started_for = (
+            state_started_for
+            if isinstance(state_started_for, str) and state_started_for
+            else as_of_date
+        )
+        overheat_trim_terminal = (
+            state_started_for == position_started_for
+            and old_state.get("overheat_trim_status") in {"complete", "below_lot"}
+        )
         triggered = (
             {symbol}
             if _protection_was_triggered(symbol, old_state, watch_events)
             else set()
         )
         action, reason = _holding_action(
-            symbol=symbol, snapshot=snapshot, triggered=triggered, market=market
+            symbol=symbol,
+            snapshot=snapshot,
+            triggered=triggered,
+            market=market,
+            overheat_trim_terminal=overheat_trim_terminal,
         )
         initial_line = _state_decimal(old_state, "initial_line")
         active_line = _state_decimal(old_state, "active_line")
         old_atr = _state_decimal(old_state, "atr14")
-        position_started_for = old_state.get("position_started_for")
-        if not isinstance(position_started_for, str) or not position_started_for:
-            position_started_for = as_of_date
         tracking_active = old_state.get("tracking_active") is True
         if snapshot is not None and (
             snapshot.boiling is True or snapshot.champagne is True
@@ -2053,7 +2097,9 @@ def build_report(
             initial_line = active_line = (
                 close - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
             )
-        if active_line is not None and tracking_active and action == "HOLD":
+        if active_line is not None and tracking_active and action in {
+            "HOLD", "SELL_PARTIAL"
+        }:
             active_line = update_protection_line(
                 old_line=active_line,
                 boiling=True,
@@ -2063,6 +2109,61 @@ def build_report(
         if (active_line is None or stale_kline) and action == "HOLD":
             action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
         effective_atr = current_atr if current_atr is not None else old_atr
+        target_fraction: Decimal | None = None
+        estimated_shares: int | None = None
+        lot_size: int | None = None
+        overheat_signals: tuple[str, ...] = ()
+        warnings: tuple[str, ...] = ()
+        if action == "SELL_PARTIAL":
+            lot_size = (
+                100
+                if market == "CN"
+                else (lot_sizes or {}).get(symbol, 0)
+                if market == "HK"
+                else 1
+            )
+            if not isinstance(lot_size, int) or lot_size <= 0:
+                action, reason = "MANUAL_REVIEW", "holding_lot_size_unavailable"
+                lot_size = None
+            else:
+                target_fraction = OVERHEAT_TRIM_FRACTION
+                estimated_shares = _floor_to_lot(
+                    position.quantity * target_fraction, lot_size
+                )
+                overheat_signals = tuple(
+                    signal
+                    for signal in OVERHEAT_TRIM_SIGNALS
+                    if getattr(snapshot, signal) is True
+                )
+                signal_unknown = snapshot is None or any(
+                    signal is None
+                    for signal in (
+                        snapshot.right_side,
+                        snapshot.danger,
+                        snapshot.boiling,
+                        snapshot.champagne,
+                    )
+                ) or (
+                    market == "CN"
+                    and (
+                        snapshot.temperature_prev not in KNOWN_TEMPERATURES
+                        or snapshot.temperature_curr not in KNOWN_TEMPERATURES
+                    )
+                )
+                kline_unavailable = (
+                    not daily_bars
+                    or stale_kline
+                    or current_atr is None
+                    or close is None
+                )
+                warnings = tuple(
+                    warning
+                    for warning, present in (
+                        ("holding_signal_unknown", signal_unknown),
+                        ("holding_kline_unavailable", kline_unavailable),
+                    )
+                    if present
+                )
         industry = snapshot.industry if snapshot else ""
         if industry:
             industries[industry] += 1
@@ -2085,17 +2186,29 @@ def build_report(
                     _holding_entry_hints(snapshot) if market == "CN" else ()
                 ),
                 historical=historical,
+                position_started_for=(
+                    position_started_for if action == "SELL_PARTIAL" else None
+                ),
+                target_fraction=target_fraction,
+                estimated_shares=estimated_shares,
+                lot_size=lot_size,
+                overheat_signals=overheat_signals,
+                warnings=warnings,
             )
         )
+        new_state: dict[str, object] = {
+            "atr14": str(effective_atr) if effective_atr is not None else "",
+            "position_started_for": position_started_for,
+            "tracking_active": tracking_active,
+            "updated_for": as_of_date,
+        }
+        if initial_line is not None:
+            new_state["initial_line"] = str(initial_line)
         if active_line is not None:
-            new_positions[symbol] = {
-                "initial_line": str(initial_line),
-                "active_line": str(active_line),
-                "atr14": str(effective_atr) if effective_atr is not None else "",
-                "position_started_for": position_started_for,
-                "tracking_active": tracking_active,
-                "updated_for": as_of_date,
-            }
+            new_state["active_line"] = str(active_line)
+        if isinstance(old_state.get("overheat_trim_status"), str):
+            new_state["overheat_trim_status"] = old_state["overheat_trim_status"]
+        new_positions[symbol] = new_state
     sell_symbols = {
         holding.symbol for holding in holdings if holding.action == "SELL_ALL"
     }
@@ -2928,6 +3041,18 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     version = snapshot.get("strategy_version")
     if version not in {"v1", "v2", "v3", "v4"}:
         raise ValueError("strategy snapshot does not match report actions")
+    if (
+        "overheat_trim_fraction" in parameters
+        or any(item.action == "SELL_PARTIAL" for item in report.holdings)
+    ) and (
+        parameters.get("overheat_trim_fraction") != str(OVERHEAT_TRIM_FRACTION)
+        or parameters.get("overheat_trim_once_per_position") is not True
+        or parameters.get("overheat_trim_signals") != list(OVERHEAT_TRIM_SIGNALS)
+        or parameters.get("overheat_trim_rounding") != "floor_to_market_lot"
+        or parameters.get("overheat_trim_below_lot") != "no_order_terminal"
+        or parameters.get("full_exit_precedes_partial_exit") is not True
+    ):
+        raise ValueError("strategy snapshot does not match report actions")
     if version in {"v2", "v3", "v4"}:
         valid_contract = {
             "v2": valid_v2_risk_contract,
@@ -3047,7 +3172,7 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     formal_actions = [
         _json_value(asdict(item))
         for item in report.holdings
-        if item.action == "SELL_ALL"
+        if item.action in {"SELL_ALL", "SELL_PARTIAL"}
     ]
     for item in report.buy_actions:
         action = _json_value(asdict(item))
@@ -3125,10 +3250,14 @@ def _validate_protection_state(payload: object) -> dict[str, object]:
             raise ValueError("protection state symbol must be non-empty")
         if not isinstance(state, dict):
             raise ValueError(f"protection state for {symbol} must be an object")
-        if _optional_decimal(state.get("initial_line")) is None or _optional_decimal(
-            state.get("active_line")
-        ) is None:
-            raise ValueError(f"protection state for {symbol} has no active line")
+        initial_line = state.get("initial_line")
+        active_line = state.get("active_line")
+        if initial_line is not None or active_line is not None:
+            if (
+                _optional_decimal(initial_line) is None
+                or _optional_decimal(active_line) is None
+            ):
+                raise ValueError(f"protection state for {symbol} has no active line")
         _optional_decimal(state.get("atr14"))
         tracking_active = state.get("tracking_active")
         if tracking_active is not None and not isinstance(tracking_active, bool):

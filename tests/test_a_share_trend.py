@@ -497,6 +497,12 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         "abnormal_loss_buffer": "0.01",
         "normal_cost_rate": "0.001",
         "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
         "kelly_sample_minimum": 30,
         "kelly_rolling_window": 200,
         "kelly_fraction": "0.25",
@@ -1881,26 +1887,271 @@ def test_cn_holding_entry_failures_are_hints_not_sell_triggers() -> None:
     )
 
 
-def test_cn_boiling_and_champagne_never_create_trim_action() -> None:
+@pytest.mark.parametrize(
+    ("market", "lot_sizes", "quantity", "expected_lot", "expected_shares"),
+    [
+        ("CN", None, Decimal("1000"), 100, 300),
+        ("US", None, Decimal("7"), 1, 2),
+        ("HK", {"600001": 200}, Decimal("1000"), 200, 200),
+    ],
+)
+@pytest.mark.parametrize("boiling,champagne", [(True, False), (False, True), (True, True)])
+def test_explicit_overheat_creates_one_partial_action(
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    quantity: Decimal,
+    expected_lot: int,
+    expected_shares: int,
+    boiling: bool,
+    champagne: bool,
+) -> None:
+    held_account = account("600001")
+    held_account = replace(
+        held_account,
+        positions=(replace(held_account.positions[0], quantity=quantity),),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=held_account,
+        candidates=(),
+        holding_snapshots={
+            "600001": holding("600001", boiling=boiling, champagne=champagne)
+        },
+        bars_by_symbol={"600001": bars(close=12, low=11)},
+        market=market,
+        lot_sizes=lot_sizes,
+        prior_state={
+            "schema_version": 1,
+            "positions": {"600001": {
+                "initial_line": "8", "active_line": "9", "atr14": "1",
+                "tracking_active": False, "position_started_for": "2026-07-01",
+                "updated_for": "2026-07-13",
+            }},
+        },
+    )
+    action = built.holdings[0]
+    assert (action.action, action.reason) == (
+        "SELL_PARTIAL", "overheat_take_profit"
+    )
+    assert action.target_fraction == Decimal("0.30")
+    assert action.position_started_for == "2026-07-01"
+    assert action.lot_size == expected_lot
+    assert action.estimated_shares == expected_shares
+    assert action.overheat_signals == tuple(
+        signal
+        for signal, enabled in (("boiling", boiling), ("champagne", champagne))
+        if enabled
+    )
+    assert action.warnings == ()
+    assert built.holdings[0].active_line == Decimal("11")
+
+
+def test_full_exit_still_wins_over_overheat() -> None:
+    snapshot = replace(holding("600001"), danger=True, boiling=True)
+    assert trend_module._holding_action(
+        symbol="600001", snapshot=snapshot, triggered=set()
+    ) == ("SELL_ALL", "danger_signal")
+
+
+def test_explicit_overheat_wins_over_unknown_non_exit_fields() -> None:
+    snapshot = replace(
+        holding("600001"), danger=None, right_side=None, boiling=True, champagne=None
+    )
+    assert trend_module._holding_action(
+        symbol="600001", snapshot=snapshot, triggered=set()
+    ) == ("SELL_PARTIAL", "overheat_take_profit")
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "triggered", "market", "terminal", "expected"),
+    [
+        (
+            holding("600001", boiling=True),
+            {"600001"},
+            "CN",
+            False,
+            ("SELL_ALL", "protection_line_already_triggered"),
+        ),
+        (
+            holding("600001", boiling=True, right_side=False),
+            set(),
+            "CN",
+            False,
+            ("SELL_ALL", "left_trend_right_side"),
+        ),
+        (
+            holding("600001", boiling=True, temperature_curr="平"),
+            set(),
+            "CN",
+            False,
+            ("SELL_ALL", "temperature_changed_to_flat"),
+        ),
+        (
+            holding("600001", right_side=None),
+            set(),
+            "CN",
+            False,
+            ("MANUAL_REVIEW", "holding_signal_unknown"),
+        ),
+        (
+            holding("600001", boiling=True),
+            set(),
+            "CN",
+            True,
+            ("HOLD", "trend_intact"),
+        ),
+    ],
+)
+def test_holding_action_preserves_exit_priority_and_terminal_trim(
+    snapshot: HoldingSnapshot,
+    triggered: set[str],
+    market: str,
+    terminal: bool,
+    expected: tuple[str, str],
+) -> None:
+    assert trend_module._holding_action(
+        symbol="600001",
+        snapshot=snapshot,
+        triggered=triggered,
+        market=market,
+        overheat_trim_terminal=terminal,
+    ) == expected
+
+
+def test_position_zero_allows_a_later_overheat_trim_lifecycle() -> None:
+    terminal_state = {
+        "schema_version": 1,
+        "positions": {
+            "600001": {
+                "initial_line": "8",
+                "active_line": "9",
+                "atr14": "1",
+                "position_started_for": "2026-07-01",
+                "overheat_trim_status": "complete",
+                "updated_for": "2026-07-13",
+            }
+        },
+    }
+    terminal = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars()},
+        prior_state=terminal_state,
+    )
+    zeroed = build_report(
+        as_of_date="2026-07-15",
+        execution_date="2026-07-16",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=terminal.protection_state,
+    )
+    reentered = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={
+            "600001": replace(holding("600001", boiling=True), as_of_date="2026-07-16")
+        },
+        bars_by_symbol={"600001": bars(end_date="2026-07-16")},
+        prior_state=zeroed.protection_state,
+    )
+    assert terminal.holdings[0].action == "HOLD"
+    assert zeroed.protection_state == {"schema_version": 1, "positions": {}}
+    assert reentered.holdings[0].action == "SELL_PARTIAL"
+    assert reentered.holdings[0].position_started_for == "2026-07-16"
+
+
+@pytest.mark.parametrize("daily_bars", [None, bars(end_date="2026-07-13")])
+def test_explicit_overheat_survives_unavailable_kline_and_preserves_old_line(
+    daily_bars: list[DailyKlineBar] | None,
+) -> None:
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=account("600001"),
         candidates=(),
-        holding_snapshots={
-            "600001": holding("600001", boiling=True, champagne=True)
-        },
-        bars_by_symbol={"600001": bars(close=12, low=11)},
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": daily_bars},
         prior_state={
             "schema_version": 1,
-            "positions": {"600001": {
-                "initial_line": "8", "active_line": "9", "atr14": "1",
-                "tracking_active": False, "updated_for": "2026-07-13",
-            }},
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            },
         },
     )
-    assert built.holdings[0].action == "HOLD"
-    assert built.holdings[0].active_line == Decimal("11")
+    action = built.holdings[0]
+    assert (action.action, action.reason, action.active_line) == (
+        "SELL_PARTIAL", "overheat_take_profit", Decimal("8.5")
+    )
+    assert action.warnings == ("holding_kline_unavailable",)
+
+
+def test_explicit_overheat_without_line_persists_lifecycle_and_pauses_buys() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(candidate("600002"),),
+        holding_snapshots={
+            "600001": holding(
+                "600001", boiling=True, danger=None, right_side=None, champagne=None
+            )
+        },
+        bars_by_symbol={"600001": None},
+    )
+    action = built.holdings[0]
+    assert (action.action, action.reason, action.initial_line, action.active_line) == (
+        "SELL_PARTIAL", "overheat_take_profit", None, None
+    )
+    assert action.warnings == (
+        "holding_signal_unknown", "holding_kline_unavailable"
+    )
+    assert built.protection_state["positions"]["600001"]["position_started_for"] == "2026-07-14"
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert "活动保护线缺失" in str(built.risk_summary["pause_reason"])
+
+
+@pytest.mark.parametrize("lot_size", [None, 0])
+def test_hk_partial_without_a_valid_lot_size_requires_review(
+    lot_size: int | None,
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars()},
+        market="HK",
+        lot_sizes={} if lot_size is None else {"600001": lot_size},
+    )
+    action = built.holdings[0]
+    assert (action.action, action.reason) == (
+        "MANUAL_REVIEW", "holding_lot_size_unavailable"
+    )
+    assert (
+        action.position_started_for,
+        action.target_fraction,
+        action.estimated_shares,
+        action.lot_size,
+        action.overheat_signals,
+        action.warnings,
+    ) == (None, None, None, None, (), ())
+    assert "overheat_trim_status" not in built.protection_state["positions"]["600001"]
 
 
 @pytest.mark.parametrize(

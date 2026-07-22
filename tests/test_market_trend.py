@@ -171,6 +171,12 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "abnormal_loss_buffer": "0.01",
         "normal_cost_rate": "0.001",
         "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
         "kelly_sample_minimum": 30,
         "kelly_rolling_window": 200,
         "kelly_fraction": "0.25",
@@ -189,6 +195,19 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         set(row) == {"group", "name", "value"}
         for row in snapshot["parameter_rows"]
     )
+    live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
+    assert (live["strategy_id"], live["strategy_version"]) == (
+        f"trend_animals_warm_to_hot/{market}/v4", "v4"
+    )
+    assert live["parameters"]["overheat_trim_fraction"] == "0.30"
+    assert {row["name"] for row in live["parameter_rows"]} >= {
+        "过热止盈比例",
+        "过热止盈信号",
+        "过热止盈次数",
+        "过热止盈取整",
+        "不足一手处理",
+        "清仓优先级",
+    }
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -670,6 +689,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         }
 
     api_instances = 0
+    lot_requests: list[list[str]] = []
 
     class Api:
         ignored_stale_components = (
@@ -728,6 +748,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             ]
 
         def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            lot_requests.append(symbols)
             return {symbol: 100 for symbol in symbols}
 
         def close(self) -> None:
@@ -843,7 +864,8 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["market"] == "HK"
     assert evidence["query"]["component_pool_ids"] == [622494]
-    assert evidence["rebuild_inputs"]["lot_sizes"] == {"02800": 100}
+    assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
+    assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
 
 
 def test_actual_tiger_snapshots_do_not_change_us_simulation_report(

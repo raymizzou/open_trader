@@ -950,7 +950,10 @@ def _attempt_market_report(
 
         lot_sizes: dict[str, int] = {}
         if market == "HK":
-            symbols = [to_futu_symbol("HK", item.symbol) for item in candidates]
+            symbols = sorted({
+                *(to_futu_symbol("HK", item.symbol) for item in candidates),
+                *(to_futu_symbol("HK", item.symbol) for item in account.positions),
+            })
             wire_lots = quote.get_lot_sizes(symbols) if symbols else {}
             lot_sizes = {
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
