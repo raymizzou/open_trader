@@ -31,7 +31,7 @@ from .daily_premarket import (
     send_notification_with_results,
     trend_execution_mode,
 )
-from .futu_quote import FutuQuoteClient
+from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import (
     ExecutorGuardedOrderClient,
@@ -318,7 +318,11 @@ def load_trend_market_status(
 
 
 def _derive_cycle(
-    config: DailyPremarketConfig, market: str, now: datetime
+    config: DailyPremarketConfig,
+    market: str,
+    now: datetime,
+    *,
+    quote_client: object | None = None,
 ) -> ControllerCycle:
     market = _market(market)
     if now.tzinfo is None or now.utcoffset() is None:
@@ -326,7 +330,10 @@ def _derive_cycle(
     timezone = TIMEZONES[market]
     local = now.astimezone(timezone)
     today = local.date()
-    quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+    owns_quote = quote_client is None
+    quote = quote_client
+    if quote is None:
+        quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
     try:
         trading_days = sorted(
             date.fromisoformat(item)
@@ -337,7 +344,8 @@ def _derive_cycle(
             )
         )
     finally:
-        quote.close()
+        if owns_quote:
+            quote.close()
     if not trading_days:
         raise RuntimeError(f"Futu {market} calendar returned no trading days")
     session = cn_session(local) if market == "CN" else market_session(local, market)
@@ -677,23 +685,30 @@ def _run_stop(
 
 
 def _run_protection_pass(
-    config: DailyPremarketConfig, market: str, trading_date: str
+    config: DailyPremarketConfig,
+    market: str,
+    trading_date: str,
+    *,
+    quote_client: object | None = None,
+    account_loader: Callable[..., object] | None = None,
 ) -> object:
     require_trend_executor(config, hostname_fn=socket.gethostname)
-    account_id = require_trend_review_config(config, market)
     notifier = build_notifier(config)
 
-    def account_loader(
-        _path: Path, *, expected_date: str, timezone: ZoneInfo
-    ) -> object:
-        del timezone
-        return load_futu_simulate_trend_account(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=account_id,
-            market=market,
-            expected_date=expected_date,
-        )
+    if account_loader is None:
+        account_id = require_trend_review_config(config, market)
+
+        def account_loader(
+            _path: Path, *, expected_date: str, timezone: ZoneInfo
+        ) -> object:
+            del timezone
+            return load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=account_id,
+                market=market,
+                expected_date=expected_date,
+            )
 
     quote_factory = lambda: FutuQuoteClient(
         host=config.futu_host,
@@ -706,7 +721,8 @@ def _run_protection_pass(
             state_path=config.data_dir / "trend_a_share/protection_state.json",
             events_path=config.data_dir / "trend_a_share/watch_events.jsonl",
             report_lock_path=config.data_dir / "runs/.trend_a_share_report.lock",
-            quote_client=None,
+            quote_client=quote_client,
+            close_quote_client=quote_client is None,
             quote_client_factory=quote_factory,
             notifier=notifier,
             poll_seconds=5,
@@ -724,7 +740,8 @@ def _run_protection_pass(
         state_path=paths.state,
         events_path=paths.events,
         report_lock_path=paths.report_lock,
-        quote_client=None,
+        quote_client=quote_client,
+        close_quote_client=quote_client is None,
         quote_client_factory=quote_factory,
         notifier=notifier,
         poll_seconds=5,
@@ -1583,6 +1600,8 @@ def _cycle_to_reconcile(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
     now: datetime,
+    *,
+    quote_client: object | None = None,
 ) -> ControllerCycle:
     durable = _durable_report_cycles(config, cycle, now)
     completion: dict[str, bool] = {}
@@ -1623,6 +1642,7 @@ def _cycle_to_reconcile(
                 second=0,
                 microsecond=0,
             ),
+            quote_client=quote_client,
         )
 
     for _ in range(10):
@@ -1647,6 +1667,7 @@ def _cycle_to_reconcile(
                 second=0,
                 microsecond=0,
             ),
+            quote_client=quote_client,
         )
         if next_cycle.execution_date <= cursor.execution_date:
             raise RuntimeError("trend calendar catch-up did not advance")
@@ -1720,6 +1741,54 @@ def run_trend_market_controller(
     cycle_retry_after: datetime | None = None
     cycle_blocker: str | None = None
     last_success: object = None
+    quote_client: object | None = None
+    account_client: object | None = None
+
+    def close_client(client: object | None) -> None:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def shared_quote() -> object:
+        nonlocal quote_client
+        if quote_client is None:
+            quote_client = FutuQuoteClient(
+                host=config.futu_host, port=config.futu_port
+            )
+        return quote_client
+
+    def reset_quote() -> None:
+        nonlocal quote_client
+        close_client(quote_client)
+        quote_client = None
+
+    def load_account(
+        _path: Path, *, expected_date: str, timezone: ZoneInfo
+    ) -> object:
+        nonlocal account_client
+        del timezone
+        account_id = require_trend_review_config(config, market)
+        if account_client is None:
+            account_client = FutuSimulateOrderExecutionClient(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=account_id,
+                trd_market=market,
+            )
+        try:
+            return load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=account_id,
+                market=market,
+                expected_date=expected_date,
+                account_client=account_client,
+            )
+        except Exception:
+            close_client(account_client)
+            account_client = None
+            raise
+
     try:
         _record_status(
             config,
@@ -1754,10 +1823,16 @@ def run_trend_market_controller(
                 try:
                     protection_error = _protection_blocker(
                         _run_protection_pass(
-                            config, market, local.date().isoformat()
+                            config,
+                            market,
+                            local.date().isoformat(),
+                            quote_client=shared_quote(),
+                            account_loader=load_account,
                         )
                     )
                 except Exception as exc:
+                    if isinstance(exc, FutuQuoteError):
+                        reset_quote()
                     protection_error = f"protection pass failed: {exc}"
             if cycle_retry_after is not None and now < cycle_retry_after:
                 status_payload = _record_status(
@@ -1775,8 +1850,12 @@ def run_trend_market_controller(
                 sleep_fn(5)
                 continue
             try:
-                cycle = _derive_cycle(config, market, now)
+                cycle = _derive_cycle(
+                    config, market, now, quote_client=shared_quote()
+                )
             except Exception as exc:
+                if isinstance(exc, FutuQuoteError):
+                    reset_quote()
                 cycle_failures += 1
                 cycle_retry_after = _retry_at(now, cycle_failures)
                 cycle_blocker = str(exc)
@@ -1817,7 +1896,9 @@ def run_trend_market_controller(
             latest: tuple[Path, dict[str, object]] | None = None
             try:
                 if report_target is None:
-                    work_cycle = _cycle_to_reconcile(config, cycle, now)
+                    work_cycle = _cycle_to_reconcile(
+                        config, cycle, now, quote_client=shared_quote()
+                    )
                 request, completion = _revision_state(
                     config,
                     market,
@@ -2037,6 +2118,8 @@ def run_trend_market_controller(
                     if cycle.session == "closed":
                         phase = "closed"
             except Exception as exc:
+                if isinstance(exc, FutuQuoteError):
+                    reset_quote()
                 operation_failures += 1
                 operation_retry_after = _retry_at(now, operation_failures)
                 operation_blocker = str(exc)
@@ -2100,5 +2183,7 @@ def run_trend_market_controller(
                 return status_payload
             sleep_fn(5)
     finally:
+        close_client(account_client)
+        close_client(quote_client)
         pool.shutdown(wait=not once, cancel_futures=True)
         lock.__exit__(None, None, None)

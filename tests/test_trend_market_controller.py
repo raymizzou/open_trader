@@ -5,6 +5,7 @@ import hashlib
 import socket
 import sys
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import date, datetime, timedelta
@@ -137,6 +138,210 @@ def test_repeated_controller_and_watcher_calendar_queries_stay_below_futu_quota(
     assert len(requests) == 10
 
 
+def test_controller_reuses_quote_and_account_clients_across_loops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    quote_clients: list[object] = []
+    account_clients: list[object] = []
+
+    class Quote:
+        closed = False
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Account:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def quote_factory(**_kwargs: object) -> object:
+        quote = Quote()
+        quote_clients.append(quote)
+        return quote
+
+    def account_factory(**_kwargs: object) -> object:
+        account = Account()
+        account_clients.append(account)
+        return account
+
+    def protect(
+        _config: DailyPremarketConfig,
+        _market: str,
+        day: str,
+        *,
+        quote_client: object,
+        account_loader: Callable[..., object],
+    ) -> object:
+        assert quote_client is quote_clients[0]
+        account_loader(
+            config.portfolio,
+            expected_date=day,
+            timezone=controller.TIMEZONES["CN"],
+        )
+        return protection_success()
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", quote_factory)
+    monkeypatch.setattr(
+        controller, "FutuSimulateOrderExecutionClient", account_factory
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: SimpleNamespace(positions=())
+        if kwargs["account_client"] is account_clients[0]
+        else pytest.fail("controller did not borrow its account client"),
+    )
+    monkeypatch.setattr(controller, "_run_protection_pass", protect)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+    monkeypatch.setattr(
+        controller,
+        "_new_order_client",
+        lambda *_args: pytest.fail("idle loop opened order client"),
+    )
+
+    class StopLoop(RuntimeError):
+        pass
+
+    sleeps = 0
+
+    def stop_after_two_loops(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_two_loops,
+        )
+
+    assert len(quote_clients) == 1
+    assert len(account_clients) == 1
+    assert quote_clients[0].closed is True
+    assert account_clients[0].closed is True
+
+
+def test_controller_rebuilds_shared_clients_after_reader_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    quote_clients: list[object] = []
+    account_clients: list[object] = []
+
+    class Quote:
+        closed = False
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Account:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def quote_factory(**_kwargs: object) -> object:
+        quote = Quote()
+        quote_clients.append(quote)
+        return quote
+
+    def account_factory(**_kwargs: object) -> object:
+        account = Account()
+        account_clients.append(account)
+        return account
+
+    def protect(
+        *_args: object,
+        quote_client: object,
+        account_loader: Callable[..., object],
+        **_kwargs: object,
+    ) -> object:
+        if quote_client is quote_clients[0]:
+            raise controller.FutuQuoteError("quote failed")
+        account_loader(
+            config.portfolio,
+            expected_date=NOW.date().isoformat(),
+            timezone=controller.TIMEZONES["CN"],
+        )
+        return protection_success()
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", quote_factory)
+    monkeypatch.setattr(
+        controller, "FutuSimulateOrderExecutionClient", account_factory
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_futu_simulate_trend_account",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("account failed"))
+        if kwargs["account_client"] is account_clients[0]
+        else SimpleNamespace(positions=()),
+    )
+    monkeypatch.setattr(controller, "_run_protection_pass", protect)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_record_status", lambda *_args, **kwargs: kwargs
+    )
+
+    class StopLoop(RuntimeError):
+        pass
+
+    sleeps = 0
+
+    def stop_after_three_loops(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 3:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_three_loops,
+        )
+
+    assert len(quote_clients) == 2
+    assert all(quote.closed for quote in quote_clients)
+    assert len(account_clients) == 2
+    assert all(account.closed for account in account_clients)
+
+
 def valid_cn_report(
     *, as_of_date: str, execution_date: str, buy: bool = False
 ) -> dict[str, object]:
@@ -245,13 +450,26 @@ def write_report_delivery_receipt(
     return receipt_path
 
 
+def patch_controller_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        controller,
+        "FutuQuoteClient",
+        lambda **_kwargs: SimpleNamespace(close=lambda: None),
+    )
+
+
 def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None:
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     monkeypatch.setattr(
-        controller, "_derive_cycle", lambda _config, _market, _now: cycle
+        controller,
+        "_derive_cycle",
+        lambda _config, _market, _now, **_kwargs: cycle,
     )
     monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args: protection_success()
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
     )
 
     def capture(
@@ -276,6 +494,7 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     calls: list[tuple[str, str, object]] = []
     reports: list[tuple[Path, dict[str, object]]] = []
 
@@ -288,7 +507,7 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, _now: active_cn_cycle(),
+        lambda _config, _market, _now, **_kwargs: active_cn_cycle(),
     )
     monkeypatch.setattr(
         controller,
@@ -299,7 +518,9 @@ def test_start_after_original_trigger_generates_report_and_executes_inside_windo
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda _config, market, day: calls.append(("protect", market, day))
+        lambda _config, market, day, **_kwargs: calls.append(
+            ("protect", market, day)
+        )
         or protection_success(),
     )
     monkeypatch.setattr(
@@ -388,7 +609,9 @@ def test_report_failure_remains_visible_while_close_waits_for_report(
     cycle = replace(active_cn_cycle(), session="closed", market_open=False)
     patch_cycle(monkeypatch, cycle)
     monkeypatch.setattr(
-        controller, "_cycle_to_reconcile", lambda _config, _cycle, _now: cycle
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
     )
     monkeypatch.setattr(controller, "_load_cycle_report", lambda *_args: None)
     monkeypatch.setattr(
@@ -430,7 +653,9 @@ def test_report_blocker_remains_visible_when_close_capture_fails(
     cycle = replace(active_cn_cycle(), session="closed", market_open=False)
     patch_cycle(monkeypatch, cycle)
     monkeypatch.setattr(
-        controller, "_cycle_to_reconcile", lambda _config, _cycle, _now: cycle
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
     )
     monkeypatch.setattr(controller, "_load_cycle_report", lambda *_args: None)
     monkeypatch.setattr(
@@ -482,6 +707,7 @@ def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     active = active_cn_cycle()
     closed = ControllerCycle(
         market="CN",
@@ -498,7 +724,9 @@ def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: active if now < after_close else closed,
+        lambda _config, _market, now, **_kwargs: (
+            active if now < after_close else closed
+        ),
     )
     calls: list[str] = []
     failed = threading.Event()
@@ -521,7 +749,7 @@ def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda *_args: failed.wait(timeout=1),
+        lambda *_args, **_kwargs: failed.wait(timeout=1),
     )
     def capture_close(
         _config: DailyPremarketConfig, market: str, trading_date: str
@@ -662,7 +890,7 @@ def test_report_recovery_during_session_keeps_protection_ticks_running(
         assert release.wait(timeout=1)
         reports.append(write_report(config))
 
-    def protect(*_args: object) -> object:
+    def protect(*_args: object, **_kwargs: object) -> object:
         protected.set()
         release.set()
 
@@ -696,7 +924,7 @@ def test_heartbeat_is_written_before_slow_reconciliation_work(
         assert release.wait(timeout=1)
         write_report(config)
 
-    def protect(*_args: object) -> None:
+    def protect(*_args: object, **_kwargs: object) -> None:
         status_path = config.data_dir / "trend_controller/CN/status.json"
         assert json.loads(status_path.read_text(encoding="utf-8"))["phase"] == (
             "reconciling"
@@ -783,6 +1011,7 @@ def test_heartbeat_refreshes_before_each_calendar_call(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     report = write_report(config)
     calendar_blocked = threading.Event()
     release = threading.Event()
@@ -792,7 +1021,7 @@ def test_heartbeat_refreshes_before_each_calendar_call(
     derive_calls = 0
     sleep_calls = 0
 
-    def derive(*_args: object) -> ControllerCycle:
+    def derive(*_args: object, **_kwargs: object) -> ControllerCycle:
         nonlocal derive_calls
         derive_calls += 1
         if derive_calls == 2:
@@ -811,12 +1040,16 @@ def test_heartbeat_refreshes_before_each_calendar_call(
 
     monkeypatch.setattr(controller, "_derive_cycle", derive)
     monkeypatch.setattr(
-        controller, "_cycle_to_reconcile", lambda _config, cycle, _now: cycle
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, cycle, _now, **_kwargs: cycle,
     )
     monkeypatch.setattr(
         controller, "_load_latest_valid_report", lambda *_args: report
     )
-    monkeypatch.setattr(controller, "_run_protection_pass", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         controller,
         "_execute_locked_report",
@@ -890,6 +1123,7 @@ def test_report_future_keeps_its_execution_date_when_cycle_advances(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     active = ControllerCycle(
         **{
             **active_cn_cycle().__dict__,
@@ -911,7 +1145,9 @@ def test_report_future_keeps_its_execution_date_when_cycle_advances(
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: active if now < after_close else closed,
+        lambda _config, _market, now, **_kwargs: (
+            active if now < after_close else closed
+        ),
     )
     release = threading.Event()
     generated = threading.Event()
@@ -928,7 +1164,9 @@ def test_report_future_keeps_its_execution_date_when_cycle_advances(
         "_load_latest_valid_report",
         lambda _config, _market, execution_date: reports.get(execution_date),
     )
-    monkeypatch.setattr(controller, "_run_protection_pass", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
+    )
     executed: list[str] = []
     monkeypatch.setattr(
         controller,
@@ -1052,10 +1290,13 @@ def test_calendar_failure_writes_blocker_instead_of_exiting(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("calendar offline")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("calendar offline")
+        ),
     )
     for name in (
         "_load_latest_valid_report",
@@ -1072,7 +1313,7 @@ def test_calendar_failure_writes_blocker_instead_of_exiting(
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda _config, _market, day: protected.append(day)
+        lambda _config, _market, day, **_kwargs: protected.append(day)
         or protection_success(),
     )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
@@ -1249,7 +1490,7 @@ def test_broker_failure_uses_bounded_backoff_without_stopping_protection(
     monkeypatch.setattr(controller, "_load_latest_valid_report", lambda *_args: report)
     protected = 0
 
-    def protect(*_args: object) -> object:
+    def protect(*_args: object, **_kwargs: object) -> object:
         nonlocal protected
         protected += 1
         return protection_success()
@@ -1350,7 +1591,9 @@ def test_stable_closed_restart_records_successful_reconciliation(
     )
     patch_cycle(monkeypatch, cycle)
     monkeypatch.setattr(
-        controller, "_cycle_to_reconcile", lambda _config, _cycle, _now: cycle
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
     )
     report_path = config.reports_dir / "trend_a_share/2026-07-20.json"
     report_path.parent.mkdir(parents=True)
@@ -1385,6 +1628,7 @@ def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     prior = active_cn_cycle()
     current = ControllerCycle(
         market="CN",
@@ -1398,7 +1642,7 @@ def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: prior
+        lambda _config, _market, now, **_kwargs: prior
         if now.astimezone().hour < 15
         else current,
     )
@@ -1421,7 +1665,9 @@ def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle
         )
 
     monkeypatch.setattr(controller, "_load_latest_valid_report", load)
-    monkeypatch.setattr(controller, "_run_protection_pass", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(controller, "_capture_close", lambda *_args: None)
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
 
@@ -1491,6 +1737,7 @@ def test_restart_after_batch_lock_reconciles_prior_until_missed_fact(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     prior = active_cn_cycle()
     current = ControllerCycle(
         market="CN",
@@ -1504,7 +1751,7 @@ def test_restart_after_batch_lock_reconciles_prior_until_missed_fact(
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: prior
+        lambda _config, _market, now, **_kwargs: prior
         if now.date().isoformat() == prior.execution_date
         and now.hour < 15
         else current,
@@ -1579,7 +1826,9 @@ def test_restart_after_batch_lock_reconciles_prior_until_missed_fact(
 
     monkeypatch.setattr(controller, "_load_latest_valid_report", load)
     monkeypatch.setattr(controller, "_execute_locked_report", execute)
-    monkeypatch.setattr(controller, "_run_protection_pass", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(controller, "_capture_close", lambda *_args: None)
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
     after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
@@ -1595,6 +1844,7 @@ def test_next_morning_reconciles_unfinished_prior_batch(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     prior = active_cn_cycle()
     current = ControllerCycle(
         market="CN",
@@ -1608,7 +1858,7 @@ def test_next_morning_reconciles_unfinished_prior_batch(
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: prior
+        lambda _config, _market, now, **_kwargs: prior
         if now.date().isoformat() == prior.execution_date
         else current,
     )
@@ -1630,7 +1880,9 @@ def test_next_morning_reconciles_unfinished_prior_batch(
         )
         or {"status": "missed_window", "submitted_count": 0},
     )
-    monkeypatch.setattr(controller, "_run_protection_pass", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
+    )
     captured: list[str] = []
 
     def capture(
@@ -1662,6 +1914,7 @@ def test_weekend_reconciles_unfinished_prior_batch(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     prior = ControllerCycle(
         market="CN",
         as_of_date="2026-07-16",
@@ -1683,7 +1936,7 @@ def test_weekend_reconciles_unfinished_prior_batch(
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: prior
+        lambda _config, _market, now, **_kwargs: prior
         if now.date().isoformat() == prior.execution_date
         else current,
     )
@@ -1764,7 +2017,10 @@ def test_active_session_restart_recovers_prior_close_after_protection(
     calls: list[tuple[str, str]] = []
 
     def protect(
-        _config: DailyPremarketConfig, _market: str, execution_date: str
+        _config: DailyPremarketConfig,
+        _market: str,
+        execution_date: str,
+        **_kwargs: object,
     ) -> object:
         calls.append(("protect", execution_date))
         return protection_success()
@@ -1893,7 +2149,10 @@ def test_multi_session_outage_reconciles_oldest_unfinished_cycle_first(
     )
 
     def derive(
-        _config: DailyPremarketConfig, _market: str, now: datetime
+        _config: DailyPremarketConfig,
+        _market: str,
+        now: datetime,
+        **_kwargs: object,
     ) -> ControllerCycle:
         return {
             "2026-07-20": first_missing,
@@ -1990,7 +2249,9 @@ def test_missing_report_cutover_skips_exact_expired_cycle(
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda _config, _market, now: historical if now.hour == 9 else current,
+        lambda _config, _market, now, **_kwargs: (
+            historical if now.hour == 9 else current
+        ),
     )
 
     assert controller._cycle_to_reconcile(config, current, authorized_at) == (
@@ -2188,7 +2449,9 @@ def test_legacy_cutover_skips_only_exact_expired_unreplayable_cycle(
     authorized_at = datetime.fromisoformat("2026-07-21T18:00:00+08:00")
     controller._request_revision(config, historical, authorized_at)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: current)
+    monkeypatch.setattr(
+        controller, "_derive_cycle", lambda *_args, **_kwargs: current
+    )
 
     cutover = controller._record_legacy_cycle_cutover(
         config,
@@ -2296,6 +2559,7 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = controller_config(tmp_path)
+    patch_controller_quote(monkeypatch)
     historical = active_cn_cycle()
     current = ControllerCycle(
         market="CN",
@@ -2310,9 +2574,13 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
     invalid["schema_version"] = 999
     invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: current)
     monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args: protection_success()
+        controller, "_derive_cycle", lambda *_args, **_kwargs: current
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
     )
 
     blocked = run_trend_market_controller(
@@ -2443,7 +2711,9 @@ def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
         market_open=True,
         next_check_at=NOW,
     )
-    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: next_cycle)
+    monkeypatch.setattr(
+        controller, "_derive_cycle", lambda *_args, **_kwargs: next_cycle
+    )
     with pytest.raises(ValueError, match="execution has begun"):
         run_trend_market_controller(
             next_config, "CN", revision=True, once=True, now_fn=lambda: NOW
@@ -2569,7 +2839,9 @@ def test_malformed_expected_frozen_report_blocks_without_regeneration(
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda _config, _market, execution_date: protected.append(execution_date),
+        lambda _config, _market, execution_date, **_kwargs: protected.append(
+            execution_date
+        ),
     )
     monkeypatch.setattr(
         controller,
@@ -2621,6 +2893,7 @@ def test_controller_recovers_failed_delivery_for_valid_frozen_report(
         trend_animals_etf_tm_id=697199,
     )
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     report = valid_cn_report(
         as_of_date="2026-07-17", execution_date="2026-07-20"
     )
@@ -2632,9 +2905,15 @@ def test_controller_recovers_failed_delivery_for_valid_frozen_report(
         status="delivery_failed",
         markdown="# frozen",
     )
-    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args: active_cn_cycle())
     monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args: protection_success()
+        controller,
+        "_derive_cycle",
+        lambda *_args, **_kwargs: active_cn_cycle(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
     )
     def capture_delivery_close(
         _config: DailyPremarketConfig, market: str, trading_date: str
@@ -2944,17 +3223,20 @@ def test_protection_runs_before_calendar_failure(
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    patch_controller_quote(monkeypatch)
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda _config, market, day: calls.append((market, day))
+        lambda _config, market, day, **_kwargs: calls.append((market, day))
         or protection_success(),
     )
     monkeypatch.setattr(
         controller,
         "_derive_cycle",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("calendar offline")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("calendar offline")
+        ),
     )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
 
@@ -2998,7 +3280,7 @@ def test_abnormal_protection_result_disables_new_buys(
     monkeypatch.setattr(
         controller,
         "_run_protection_pass",
-        lambda *_args: SimpleNamespace(
+        lambda *_args, **_kwargs: SimpleNamespace(
             status="abnormal", exception_count=1, unknown_quote_count=0
         ),
     )
