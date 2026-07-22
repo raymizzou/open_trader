@@ -2809,6 +2809,17 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
     total = 0
     for broker in ACCOUNT_BROKERS:
         section = _select_account_tab(page, broker)
+        if broker in TREND_SIMULATE_MARKETS:
+            real_tab = section.locator('[data-account-view="real"]')
+            assert real_tab.count() == 1, f"{broker} 缺少真实持仓视图"
+            real_tab.click()
+            page.wait_for_function(
+                "broker => document.querySelector("
+                "`#account-${broker} [data-account-view=\"real\"]`)"
+                "?.getAttribute('aria-selected') === 'true'",
+                arg=broker,
+                timeout=10_000,
+            )
         rows = section.locator(".account-holding-row:visible")
         empty = section.locator(".account-empty:visible")
         count = rows.count()

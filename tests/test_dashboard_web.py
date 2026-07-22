@@ -4827,7 +4827,7 @@ const historical = renderTrendRiskSummary(null, {
 }, null, "2026-07-17");
 if (historical.includes("基准已自动建立") ||
     !historical.includes("回撤基准审计详情") ||
-    !historical.includes("100000") ||
+    !historical.includes("100,000") ||
     !historical.includes("2026-07-14")) throw new Error(historical);
 const drawdownOnly = renderTrendRiskSummary(null, {
   status:"paused",status_label:"暂停新开仓",drawdown_pct:null,
@@ -4845,6 +4845,27 @@ console.log("ok");
     assert ".trend-risk-summary" in css
     assert ".trend-risk-summary" in mobile
     assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
+
+
+def test_dashboard_formats_bootstrap_audit_equity_without_touching_identity() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendRiskSummary(null, {
+  status:"active",status_label:"纪律内",current_equity:"995953.447",
+  high_water_mark:"1000000",drawdown_pct:"0.004046553",
+  drawdown_limit_pct:"0.05",
+  bootstrap_event:{event_id:"audit-00001234",event_type:"automatic_bootstrap",
+    baseline_equity:"995953.447",source_date:"2026-07-21",accepted_git_sha:"abc123",
+    parameter_hash:"params456",actor:"acceptance",
+    occurred_at:"2026-07-22T08:00:00+08:00",entry_eligible_from:"2026-07-23"}
+}, null, "2026-07-22");
+console.log(JSON.stringify(html));
+''')
+    rendered = json.loads(output)
+
+    assert "基准净值 995,953.45" in rendered
+    assert "995953.447" not in rendered
+    assert "audit-00001234" in rendered
+    assert "2026-07-21" in rendered
 
 
 def test_dashboard_renders_api_trade_stats_inside_risk_summary() -> None:

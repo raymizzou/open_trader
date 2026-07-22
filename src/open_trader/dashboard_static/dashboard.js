@@ -2330,7 +2330,7 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate, si
   const bootstrapRows = bootstrap ? `${bootstrapNotice}
       <details class="trend-drawdown-bootstrap-audit"><summary>回撤基准审计详情</summary><dl>
         <div><dt>事件</dt><dd>${escapeHtml(formatPlain(bootstrap.event_id))}</dd></div>
-        <div><dt>基准净值</dt><dd>${escapeHtml(formatPlain(bootstrap.baseline_equity))}</dd></div>
+        <div><dt>基准净值</dt><dd>${escapeHtml(formatDisplayNumber(bootstrap.baseline_equity))}</dd></div>
         <div><dt>快照日期</dt><dd>${escapeHtml(formatPlain(bootstrap.source_date))}</dd></div>
         <div><dt>验收 Git SHA</dt><dd>${escapeHtml(formatPlain(bootstrap.accepted_git_sha))}</dd></div>
         <div><dt>参数哈希</dt><dd>${escapeHtml(formatPlain(bootstrap.parameter_hash))}</dd></div>

@@ -1768,6 +1768,15 @@ class TabbedAccountLocator:
             self.page.selected_brokers.append(self.page.selected)
             self.page._record_visible_sections()
             return
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            assert broker == self.page.selected
+            self.page.account_views[broker] = match.group(2)
+            return
         if self.selector == '[data-market="CN"]':
             self.page.market = "CN"
             return
@@ -1893,6 +1902,13 @@ class TabbedAccountLocator:
             return int(
                 self.page.trend_broker is None and self.page.selected == broker
             )
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            return int(broker != "futu" and self.page.selected == broker)
         match = re.fullmatch(
             r'#account-(\w+):visible \[data-statement-upload="(\w+)"\]:visible',
             self.selector,
@@ -2095,6 +2111,14 @@ class TabbedAccountLocator:
             broker = self._require_known_broker(match.group(1))
             assert name == "aria-selected"
             return str(broker == self.page.selected).lower()
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            assert name == "aria-selected"
+            return str(self.page.account_views[broker] == match.group(2)).lower()
         if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
             mobile = self.page.viewport_size["width"] <= 760
             return {
@@ -2450,6 +2474,7 @@ class TabbedAccountPage:
         self.market = "ALL"
         self.selected = "futu"
         self.tab_order = ["futu", "tiger", "phillips", "eastmoney"]
+        self.account_views = {broker: "real" for broker in self.tab_order}
         self.selected_brokers: list[str] = []
         self.visible_account_sections = 1
         self.max_visible_account_sections = 1
@@ -2481,6 +2506,8 @@ class TabbedAccountPage:
     def visible_rows(self, selector: str = "") -> int:
         match = re.search(r"#account-(\w+):visible", selector)
         broker = match.group(1) if match else self.selected
+        if self.account_views[broker] != "real":
+            return 0
         rows = self.cn_rows if self.market == "CN" else self.all_rows
         return rows[broker]
 
@@ -2511,6 +2538,14 @@ class TabbedAccountPage:
 
     def wait_for_timeout(self, milliseconds: int) -> None:
         assert milliseconds == 500
+
+    def wait_for_function(
+        self, expression: str, *, arg: object, timeout: int,
+    ) -> None:
+        assert '[data-account-view="real"]' in expression
+        assert timeout == 10_000
+        broker = str(arg)
+        assert self.account_views[broker] == "real"
 
 
 def tabbed_account_page(payload: dict[str, object]) -> TabbedAccountPage:
@@ -4219,6 +4254,20 @@ def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
+
+
+def test_cn_filter_restores_real_view_before_counting() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
+    })
+    page.account_views["eastmoney"] = "report"
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=1)
+
+    assert all(
+        page.account_views[broker] == "real"
+        for broker in ("tiger", "phillips", "eastmoney")
+    )
 
 
 def test_cn_filter_accepts_grouped_visible_count_for_large_account() -> None:
