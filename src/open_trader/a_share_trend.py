@@ -687,23 +687,38 @@ def live_trend_strategy_snapshot(
             "drawdown_unlock": "manual_same_version_rebase",
             "requires_atr14": False,
             "market_data_completion": "deferred_to_execution",
+            "position_limit": "unlimited",
         }
     )
+    parameter_rows = [
+        {
+            **row,
+            "value": (
+                "不设总数上限（受组合风险、现金和交易单位约束）"
+                if row["name"] == "持仓上限"
+                else str(row["value"]).replace(
+                    "ATR14 可计算", "行情与 ATR 可在执行时补全"
+                )
+            ),
+        }
+        for row in snapshot["parameter_rows"]
+    ]
+    parameter_rows = [
+        {
+            **row,
+            "value": "展示前 10；按风险、现金和交易单位产生买入动作",
+        }
+        if row["name"] == "候选数量"
+        else row
+        for row in parameter_rows
+    ]
     return {
         **snapshot,
         "strategy_id": f"trend_animals_warm_to_hot/{market}/v5",
         "strategy_version": "v5",
         "effective_from": "2026-07-23",
         "parameters": parameters,
-        "parameter_rows": [
-            {
-                **row,
-                "value": str(row["value"]).replace(
-                    "ATR14 可计算", "行情与 ATR 可在执行时补全"
-                ),
-            }
-            for row in snapshot["parameter_rows"]
-        ]
+        "parameter_rows": parameter_rows
         + [
             {
                 "group": "累计回撤",
@@ -1857,7 +1872,11 @@ def _plan_buy_actions(
         net_value * PORTFOLIO_RISK_LIMIT - known_existing_risk,
     )
     single_entry_limit = net_value * SINGLE_ENTRY_RISK_LIMIT
-    slots = max(0, POSITION_LIMIT - current_position_count)
+    slots = (
+        None
+        if allow_pending_market_data
+        else max(0, POSITION_LIMIT - current_position_count)
+    )
     actions: list[BuyAction] = []
     skips: list[dict[str, object]] = []
     for item in ranked:
@@ -1960,7 +1979,8 @@ def _plan_buy_actions(
                 )
             )
             remaining_cash -= pending_cash_required
-            slots -= 1
+            if slots is not None:
+                slots -= 1
             continue
         if lot_size is None or lot_size <= 0:
             skips.append(
@@ -2034,7 +2054,8 @@ def _plan_buy_actions(
         )
         remaining_cash -= sized.cash_required
         remaining_risk -= sized.planned_stop_risk
-        slots -= 1
+        if slots is not None:
+            slots -= 1
 
     new_planned_risk = sum(
         (

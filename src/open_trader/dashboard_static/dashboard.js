@@ -2587,7 +2587,7 @@ function renderCnTrendDisciplines() {
       <li>行业温度为热或沸，节气不晚于夏至</li>
       <li>市值不低于 100 亿元，日成交额不低于 2 亿元</li>
       <li>当前可交易、未持有、处于右侧、无危险信号，执行价与 ATR 可用</li>
-      <li>正式计划还须通过现金与最多 10 个持仓席位约束</li>
+      <li>正式计划还须通过现金、组合风险与交易单位约束，不设总持仓数量上限</li>
     </ol></details>
     <details class="trend-discipline"${open}><summary>卖出纪律</summary><ol>
       <li>活动保护线触发时全部卖出</li>

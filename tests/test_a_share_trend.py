@@ -1177,6 +1177,34 @@ def test_v5_missing_quote_and_atr_keeps_formal_buy_without_pausing_batch() -> No
     assert built.risk_summary["unknown_new_risk_symbols"] == ["600001"]
 
 
+def test_v5_does_not_cap_formal_buys_by_total_position_count() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    acct = account(*[f"60{index:04d}" for index in range(1, 12)])
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=acct,
+        candidates=[candidate("600020")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(acct.net_value)
+        ),
+    )
+
+    assert [item.symbol for item in built.buy_actions] == ["600020"]
+    assert built.risk_skips == ()
+    assert built.strategy_snapshot["parameters"]["position_limit"] == "unlimited"
+    assert any(
+        row["name"] == "持仓上限"
+        and row["value"] == "不设总数上限（受组合风险、现金和交易单位约束）"
+        for row in built.strategy_snapshot["parameter_rows"]
+    )
+
+
 def test_pending_v5_buy_renders_pending_instead_of_zero() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "v5sha", (622466, 697199)
