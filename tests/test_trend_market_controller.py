@@ -3413,6 +3413,158 @@ def test_corrected_report_rejects_late_buy_without_authorization(
         )
 
 
+def test_late_buy_authorization_retry_reuses_immutable_timestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(),
+        as_of_date="2026-07-22",
+        execution_date="2026-07-23",
+        report_run_date="2026-07-22",
+    )
+    report_path = config.reports_dir / "trend_a_share/2026-07-22-r1.json"
+    report = {"as_of_date": cycle.as_of_date, "execution_date": cycle.execution_date}
+    monkeypatch.setattr(controller.socket, "gethostname", lambda: "executor")
+    first = controller._authorize_late_buys(
+        config,
+        cycle,
+        report_path=report_path,
+        report=report,
+        actor="ray",
+        reason="ATR exclusion bug",
+        allow_late_buys=True,
+        now=datetime.fromisoformat("2026-07-23T10:30:00+08:00"),
+    )
+    second = controller._authorize_late_buys(
+        config,
+        cycle,
+        report_path=report_path,
+        report=report,
+        actor="ray",
+        reason="ATR exclusion bug",
+        allow_late_buys=True,
+        now=datetime.fromisoformat("2026-07-23T10:45:00+08:00"),
+    )
+    assert second == first
+    path = Path(str(first))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["scope"] = "tampered"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="late buy authorization"):
+        controller._authorize_late_buys(
+            config,
+            cycle,
+            report_path=report_path,
+            report=report,
+            actor="ray",
+            reason="ATR exclusion bug",
+            allow_late_buys=True,
+            now=datetime.fromisoformat("2026-07-23T10:50:00+08:00"),
+        )
+
+
+def test_corrected_report_rejects_unsupported_late_scope_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(),
+        market="HK",
+        as_of_date="2026-07-22",
+        execution_date="2026-07-23",
+        report_run_date="2026-07-22",
+    )
+    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args, **_kwargs: cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda *_args, **_kwargs: cycle
+    )
+    monkeypatch.setattr(controller.socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(
+        controller,
+        "_request_revision",
+        lambda *_args, **_kwargs: pytest.fail("late policy must be checked first"),
+    )
+    with pytest.raises(ValueError, match="outside buy window"):
+        run_corrected_trend_report(
+            config,
+            "HK",
+            actor="ray",
+            reason="unsupported late correction",
+            allow_late_buys=True,
+            now_fn=lambda: datetime.fromisoformat(
+                "2026-07-23T10:30:00+08:00"
+            ),
+        )
+
+
+def test_corrected_report_reuses_completed_revision_without_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(),
+        as_of_date="2026-07-22",
+        execution_date="2026-07-23",
+        report_run_date="2026-07-22",
+    )
+    request_path = config.data_dir / "revision-request.json"
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text("{}", encoding="utf-8")
+    report_path = config.reports_dir / "trend_a_share/2026-07-22-r1.json"
+    report = {"as_of_date": cycle.as_of_date, "execution_date": cycle.execution_date}
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    completion = {
+        "report_path": str(report_path),
+        "report_sha256": _report_hash(report),
+    }
+    generated: list[bool] = []
+    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args, **_kwargs: cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda *_args, **_kwargs: cycle
+    )
+    monkeypatch.setattr(controller.socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(
+        controller,
+        "_request_revision",
+        lambda *_args, **_kwargs: request_path,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_revision_state",
+        lambda *_args, **_kwargs: ({"request": True}, completion),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args, **_kwargs: generated.append(True),
+    )
+    monkeypatch.setattr(controller, "_complete_revision", lambda *_args: None)
+    monkeypatch.setattr(
+        controller,
+        "_locked_report",
+        lambda *_args, **_kwargs: (report_path, report),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
+    )
+
+    result = run_corrected_trend_report(
+        config,
+        "CN",
+        actor="ray",
+        reason="retry completed correction",
+        allow_late_buys=True,
+        now_fn=lambda: datetime.fromisoformat("2026-07-23T10:30:00+08:00"),
+    )
+
+    assert generated == []
+    assert result["report_path"] == str(report_path)
+
+
 def test_readonly_controller_returns_without_report_broker_or_notification_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4828,7 +4980,10 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
 
     def stop_after_reconcile(_seconds: float) -> None:
         if controller._batch_path(
-            config, historical.market, historical.execution_date
+            config,
+            historical.market,
+            historical.execution_date,
+            revision=3,
         ).exists():
             raise RuntimeError("historical cycle reconciled")
         assert generated_ready.wait(timeout=1)

@@ -1482,14 +1482,17 @@ def _project_broker_trend_report(
         revision_match = re.search(r"-r(\d+)$", selected[0].stem)
         selected_revision = int(revision_match.group(1)) if revision_match else 0
         batch_suffix = "" if selected_revision == 0 else f"-r{selected_revision}"
-        batch_path = (
+        batch_root = (
             data_dir
             / "trend_review"
             / "ledgers"
             / market
             / "batches"
-            / f"{selected[2].isoformat()}{batch_suffix}.json"
         )
+        batch_path = batch_root / f"{selected[2].isoformat()}{batch_suffix}.json"
+        if selected_revision and not batch_path.exists():
+            selected_revision = 0
+            batch_path = batch_root / f"{selected[2].isoformat()}.json"
         try:
             batch_text = batch_path.read_text(encoding="utf-8")
         except FileNotFoundError:

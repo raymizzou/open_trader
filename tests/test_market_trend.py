@@ -46,12 +46,16 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def unlock_live_drawdown(data_dir: Path, market: str) -> None:
+    pool_ids = {"HK": (622494,), "US": (622460,)}[market]
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market, "a" * 40, pool_ids
+    )
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
-        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
-        strategy_version="v4",
-        parameters={"drawdown_limit": "0.05"},
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version=str(snapshot["strategy_version"]),
+        parameters=snapshot["parameters"],
         baseline_equity=Decimal("100000"),
         source_date="2026-07-13",
         accepted_git_sha="a" * 40,
@@ -197,7 +201,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     )
     live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
     assert (live["strategy_id"], live["strategy_version"]) == (
-        f"trend_animals_warm_to_hot/{market}/v4", "v4"
+        f"trend_animals_warm_to_hot/{market}/v5", "v5"
     )
     assert live["parameters"]["overheat_trim_fraction"] == "0.30"
     assert {row["name"] for row in live["parameter_rows"]} >= {
@@ -844,7 +848,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -886,8 +890,8 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             "quantity": "1",
             "fee": "0",
             "costs_complete": True,
-            "strategy_id": "trend_animals_warm_to_hot/US/v4",
-            "strategy_version": "v4",
+            "strategy_id": "trend_animals_warm_to_hot/US/v5",
+            "strategy_version": "v5",
             "normal_cost_rate": "0.001",
             "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
             "report_sha256": "a" * 64,
@@ -919,8 +923,8 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
         strategy_versions=[
             {
                 "market": "US",
-                "strategy_id": "trend_animals_warm_to_hot/US/v4",
-                "strategy_version": "v4",
+                "strategy_id": "trend_animals_warm_to_hot/US/v5",
+                "strategy_version": "v5",
             }
         ],
         generated_at="2026-07-15T00:00:00+00:00",

@@ -1,6 +1,6 @@
 # Task 4 report: corrected trend-report revisions
 
-Status: DONE_WITH_CONCERNS (pending independent review)
+Status: PASS (independent review complete)
 
 ## Implemented
 
@@ -22,6 +22,19 @@ Status: DONE_WITH_CONCERNS (pending independent review)
 - Added focused regression coverage for revision-batch immutability, v5
   pending-report validation, CLI parsing, and late authorization rules.
 
+## Review fix wave
+
+- Late-buy authorization retries now reuse the original immutable timestamp and
+  reject extra/tampered fields instead of blocking a quote-recovery retry.
+- A completed correction is reused without generating a new `rN` report, and
+  unsupported late market/date combinations fail before writing any revision
+  artifacts.
+- Controller and Dashboard batch reads validate `report_revision`; legacy base
+  batches without that field remain compatible, while normal completed revisions
+  use their separate immutable `-rN` batch.
+- Added v5 updates to market-report fixtures so the full suite asserts the new
+  strategy identity and drawdown key rather than frozen v4 assumptions.
+
 ## Verification
 
 ```text
@@ -37,17 +50,21 @@ PYTHONPATH=src .venv/bin/python -m pytest \
 
 git diff --check
 passed
+
+PYTHONPATH=src .venv/bin/python -m pytest \
+  tests/test_trend_market_controller.py tests/test_dashboard_web.py \
+  tests/test_market_trend.py -q
+405 passed in 35.47s
 ```
 
-The historical-recovery regression was fixed by making the normal controller
-pass revision `0`, while the explicit corrected command passes the report's
-revision and `_execution_completed` falls back to the base batch until that
+The historical-recovery regression is covered by a revision-3 batch assertion;
+normal and explicit corrected executions now pass the selected report revision,
+while late dashboard projections still fall back to a valid base batch when no
 revision batch exists.
 
 ## Remaining integration work
 
-- Run the independent Task 4 review and address any Critical/Important
-  findings.
+- Independent Task 4 review: PASS; no Critical/Important findings remain.
 - The parent integration task still owns the full test suite, direct corrected
   report/simulated-buy workflow, process restart/log checks, and final
   `make acceptance` gate.

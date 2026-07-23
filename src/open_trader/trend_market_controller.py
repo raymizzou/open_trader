@@ -75,6 +75,7 @@ from .trend_review import (
     overheat_trim_progress,
     _preflight_open_actions,
     record_trend_review_missed_buys,
+    _validate_execution_batch,
 )
 
 
@@ -134,6 +135,11 @@ def _batch_path(
         / "batches"
         / f"{execution_date}{suffix}.json"
     )
+
+
+def _batch_revision(path: Path) -> int:
+    match = re.search(r"-r(?P<revision>\d+)\.json\Z", path.name)
+    return int(match.group("revision")) if match else 0
 
 
 def _close_path(config: DailyPremarketConfig, market: str, trading_date: str) -> Path:
@@ -926,6 +932,11 @@ def _execute_locked_report(
             locked_at=now,
             revision=revision,
         )
+        if (
+            batch.get("report_revision", 0) != revision
+            or batch.get("report_sha256") != _report_hash(report)
+        ):
+            raise ValueError("locked trend execution batch does not match selected report")
     locked_path = Path(str(batch["report_path"]))
     locked_report = _read_json(locked_path, "locked trend report")
     if (
@@ -2185,7 +2196,12 @@ def _locked_report(
         batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return latest
-    batch = _read_json(batch_path, "trend execution batch")
+    batch = _validate_execution_batch(
+        _read_json(batch_path, "trend execution batch"),
+        market=cycle.market,
+        execution_date=cycle.execution_date,
+        revision=_batch_revision(batch_path),
+    )
     path = Path(str(batch.get("report_path") or ""))
     report = _read_json(path, "locked trend report")
     if (
@@ -2222,6 +2238,38 @@ def _late_buy_authorization_path(
     )
 
 
+def _validate_late_buy_scope(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    *,
+    actor: str,
+    reason: str,
+    allow_late_buys: bool,
+    now: datetime,
+) -> bool:
+    local = now.astimezone(TIMEZONES[cycle.market])
+    outside_window = local.date() > date.fromisoformat(cycle.execution_date) or (
+        local.date() == date.fromisoformat(cycle.execution_date)
+        and local.time().replace(tzinfo=None) > BUY_WINDOWS[cycle.market][1]
+    )
+    if not outside_window:
+        return False
+    mode = trend_execution_mode(config, hostname_fn=socket.gethostname)
+    if not (
+        allow_late_buys
+        and cycle.market == "CN"
+        and cycle.as_of_date == "2026-07-22"
+        and cycle.execution_date == "2026-07-23"
+        and local.date().isoformat() == cycle.execution_date
+        and cn_session(local) in {"morning", "afternoon"}
+        and mode.mode == "execute"
+        and actor.strip()
+        and reason.strip()
+    ):
+        raise ValueError("outside buy window; explicit simulated authorization required")
+    return True
+
+
 def _authorize_late_buys(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
@@ -2233,29 +2281,18 @@ def _authorize_late_buys(
     allow_late_buys: bool,
     now: datetime,
 ) -> Path | None:
-    local = now.astimezone(TIMEZONES[cycle.market])
-    window_end = BUY_WINDOWS[cycle.market][1]
-    outside_window = local.date() > date.fromisoformat(cycle.execution_date) or (
-        local.date() == date.fromisoformat(cycle.execution_date)
-        and local.time().replace(tzinfo=None) > window_end
-    )
-    if not outside_window:
+    if not _validate_late_buy_scope(
+        config,
+        cycle,
+        actor=actor,
+        reason=reason,
+        allow_late_buys=allow_late_buys,
+        now=now,
+    ):
         return None
+    local = now.astimezone(TIMEZONES[cycle.market])
     actor = actor.strip()
     reason = reason.strip()
-    mode = trend_execution_mode(config, hostname_fn=socket.gethostname)
-    if not (
-        allow_late_buys
-        and cycle.market == "CN"
-        and cycle.as_of_date == "2026-07-22"
-        and cycle.execution_date == "2026-07-23"
-        and local.date().isoformat() == cycle.execution_date
-        and cn_session(local) in {"morning", "afternoon"}
-        and mode.mode == "execute"
-        and actor
-        and reason
-    ):
-        raise ValueError("outside buy window; explicit simulated authorization required")
     payload = {
         "schema_version": "open_trader.trend_controller.late_buy_authorization.v1",
         "market": cycle.market,
@@ -2272,8 +2309,31 @@ def _authorize_late_buys(
     )
     if path.exists():
         existing = _read_json(path, "late buy authorization")
-        if existing != payload:
+        fixed_fields = (
+            "schema_version",
+            "market",
+            "as_of_date",
+            "execution_date",
+            "report_path",
+            "report_sha256",
+            "actor",
+            "reason",
+        )
+        if set(existing) != set(payload) or any(
+            existing.get(field) != payload[field] for field in fixed_fields
+        ):
             raise ValueError("late buy authorization conflict")
+        try:
+            authorized_at = datetime.fromisoformat(str(existing["authorized_at"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid late buy authorization") from exc
+        if (
+            authorized_at.tzinfo is None
+            or authorized_at.utcoffset() is None
+            or existing.get("authorized_at")
+            != authorized_at.isoformat(timespec="seconds")
+        ):
+            raise ValueError("invalid late buy authorization")
         return path
     return _write_immutable(path, _canonical_json_bytes(payload))
 
@@ -2298,28 +2358,44 @@ def run_corrected_trend_report(
         local.date() == date.fromisoformat(cycle.execution_date)
         and local.time().replace(tzinfo=None) > BUY_WINDOWS[cycle.market][1]
     )
-    if late and not allow_late_buys:
-        raise ValueError("outside buy window; explicit simulated authorization required")
+    if late:
+        _validate_late_buy_scope(
+            config,
+            cycle,
+            actor=actor,
+            reason=reason,
+            allow_late_buys=allow_late_buys,
+            now=now,
+        )
     request = _request_revision(
         config, cycle, now, allow_locked_batch=True
     )
-    _generate_report(config, market, cycle.report_run_date, True)
     request_payload = (
         _read_json(request, "trend report revision request")
         if isinstance(request, Path)
         else {}
     )
-    pending = _pending_revision_report(config, cycle, request_payload)
-    if pending is None:
-        request_state, completion = _revision_state(
-            config, cycle.market, cycle.as_of_date, cycle.execution_date
-        )
-        if completion is None or request_state is None:
-            raise RuntimeError("corrected trend report was not delivered")
+    request_state, completion = _revision_state(
+        config, cycle.market, cycle.as_of_date, cycle.execution_date
+    )
+    if completion is not None:
         pending = (
             Path(str(completion["report_path"])),
             _read_json(Path(str(completion["report_path"])), "completed trend report revision"),
         )
+    else:
+        _generate_report(config, market, cycle.report_run_date, True)
+        pending = _pending_revision_report(config, cycle, request_payload)
+        if pending is None:
+            request_state, completion = _revision_state(
+                config, cycle.market, cycle.as_of_date, cycle.execution_date
+            )
+            if completion is None or request_state is None:
+                raise RuntimeError("corrected trend report was not delivered")
+            pending = (
+                Path(str(completion["report_path"])),
+                _read_json(Path(str(completion["report_path"])), "completed trend report revision"),
+            )
     _complete_revision(config, cycle, pending, now)
     selected = _locked_report(config, cycle, pending, now)
     authorization = _authorize_late_buys(
@@ -2370,16 +2446,16 @@ def _execution_completed(
     completed_revision = _completed_revision_batch(config, cycle)
     if completed_revision is not None:
         _, batch_path = completed_revision
-        if not batch_path.exists():
-            # The ordinary controller revision path still locks the legacy
-            # base batch.  An explicit corrected run creates the revision
-            # batch and will be selected above once it exists.
-            batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     else:
         batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return False
-    batch = _read_json(batch_path, "trend execution batch")
+    batch = _validate_execution_batch(
+        _read_json(batch_path, "trend execution batch"),
+        market=cycle.market,
+        execution_date=cycle.execution_date,
+        revision=_batch_revision(batch_path),
+    )
     report_path = Path(str(batch.get("report_path") or ""))
     report = _read_json(report_path, "locked trend report")
     report_sha = _report_hash(report)
@@ -3021,6 +3097,7 @@ def run_trend_market_controller(
                             selected[0],
                             selected[1],
                             allow_new_buys=False,
+                            revision=_report_order(selected[0])[1],
                             quote_client=shared_quote(),
                         )
                     else:
@@ -3030,6 +3107,7 @@ def run_trend_market_controller(
                             work_cycle.execution_date,
                             selected[0],
                             selected[1],
+                            revision=_report_order(selected[0])[1],
                             quote_client=shared_quote(),
                         )
                     last_success = execution
