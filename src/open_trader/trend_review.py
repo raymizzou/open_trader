@@ -2536,6 +2536,8 @@ def _preflight_open_actions(
                             )
                         )
                         or (atr is not None and atr <= 0)
+                        or action.get("market_data_status") == "pending"
+                        and not expected_pending_fields
                         or action.get("market_data_status") == "complete"
                         and pending_fields
                     ):

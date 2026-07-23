@@ -853,6 +853,11 @@ def test_v5_hk_buy_uses_live_lot_size(tmp_path: Path) -> None:
         {"close": "10"},
         {"market_data_status": "complete"},
         {"pending_fields": ["quote", "atr", "lot_size"]},
+        {
+            "close": "10",
+            "atr": "0.5",
+            "pending_fields": [],
+        },
     ],
 )
 def test_v5_pending_fields_must_match_missing_market_data(
