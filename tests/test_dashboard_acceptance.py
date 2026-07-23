@@ -121,6 +121,34 @@ def test_acceptance_browser_viewport_and_screenshot_matrix_is_exact() -> None:
     )
 
 
+def test_live_trend_review_screenshot_capture_uses_acceptance_matrix(
+    tmp_path: Path,
+) -> None:
+    screenshots: list[tuple[str, bool]] = []
+
+    class Page:
+        def __init__(self, width: int) -> None:
+            self.viewport_size = {"width": width}
+
+        def screenshot(self, *, path: str, full_page: bool) -> None:
+            screenshots.append((path, full_page))
+
+    dashboard_acceptance._capture_trend_review_screenshot(
+        Page(1440), "eastmoney", tmp_path
+    )
+    dashboard_acceptance._capture_trend_review_screenshot(
+        Page(375), "eastmoney", tmp_path
+    )
+    dashboard_acceptance._capture_trend_review_screenshot(
+        Page(760), "eastmoney", tmp_path
+    )
+
+    assert screenshots == [
+        (str(tmp_path / "1440-trend-review.png"), True),
+        (str(tmp_path / "375-trend-review.png"), True),
+    ]
+
+
 def test_tablet_trend_cards_use_the_actual_viewport_width() -> None:
     source = inspect.getsource(dashboard_acceptance._check_account_holdings)
 

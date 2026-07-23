@@ -1263,6 +1263,7 @@ def _check_trend_account_views(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势复盘视图出现横向滚动"
+        _capture_trend_review_screenshot(page, broker, screenshot_dir)
         section.locator('[data-account-view="real"]').click()
 
 
@@ -3278,11 +3279,7 @@ def _check_trend_review(
             "#return-to-portfolio:visible, "
             "#trend-report-workspace:visible button:visible",
         )
-    if broker == "eastmoney" and screenshot_dir is not None and width in {1440, 375}:
-        page.screenshot(
-            path=str(screenshot_dir / f"{width}-trend-review.png"),
-            full_page=True,
-        )
+    _capture_trend_review_screenshot(page, broker, screenshot_dir)
     close = workspace.locator("[data-close-trend-report]")
     assert close.count() == 1, f"{broker} 趋势复盘缺少返回按钮"
     close.click()
@@ -3292,6 +3289,17 @@ def _check_trend_review(
     assert trigger.evaluate("element => element === document.activeElement"), (
         f"{broker} 返回后焦点未恢复到复盘入口"
     )
+
+
+def _capture_trend_review_screenshot(
+    page: Any, broker: str, screenshot_dir: Path | None,
+) -> None:
+    width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+    if broker == "eastmoney" and screenshot_dir is not None and width in {1440, 375}:
+        page.screenshot(
+            path=str(screenshot_dir / f"{width}-trend-review.png"),
+            full_page=True,
+        )
 
 
 def _select_account_tab(page: Any, broker: str) -> Any:
