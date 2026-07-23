@@ -16,6 +16,7 @@ SNAPSHOT_SCHEMA_VERSION = "open_trader.strategy_drawdown_snapshot.v1"
 DECISION_SCHEMA_VERSION = "open_trader.strategy_drawdown.v1"
 DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
+POSITION_LIMIT_COMPATIBILITY_REVISION = "trend_position_limit_v1"
 OVERHEAT_TRIM_COMPATIBILITY_PARAMETERS = {
     "overheat_trim_fraction": "0.30",
     "overheat_trim_once_per_position": True,
@@ -288,7 +289,7 @@ def valid_strategy_parameter_audit_identity(
     bootstrap_event: object,
     parameter_compatibility_event: object,
 ) -> bool:
-    """Accept the frozen hash, or the single approved v4 trim transition."""
+    """Accept the frozen hash or one explicitly audited compatibility transition."""
     try:
         key = _strategy_key(market, strategy_id, strategy_version)
         current_hash = strategy_parameter_hash(parameters)
@@ -304,7 +305,8 @@ def valid_strategy_parameter_audit_identity(
             and _record_key(parameter_compatibility_event) == key
             and parameter_compatibility_event.get("old_parameter_hash") == old_hash
             and parameter_compatibility_event.get("new_parameter_hash") == current_hash
-            and _approved_overheat_trim_transition(key, parameters, old_hash)
+            and _approved_parameter_transition_revision(key, parameters, old_hash)
+            is not None
         )
     return old_hash == current_hash
 
@@ -381,14 +383,15 @@ def automatic_bootstrap_strategy_drawdown(
                     raise ValueError("strategy parameters changed without a version bump")
             elif event.get("parameter_hash") != parameter_hash:
                 old_hash = event.get("parameter_hash")
-                if not _approved_overheat_trim_transition(
+                compatibility_revision = _approved_parameter_transition_revision(
                     key, parameters, old_hash
-                ):
+                )
+                if compatibility_revision is None:
                     raise ValueError("strategy parameters changed without a version bump")
                 assert isinstance(old_hash, str)
                 events.append({
                     "event_id": _parameter_compatibility_event_id(
-                        key, old_hash, parameter_hash
+                        key, old_hash, parameter_hash, compatibility_revision
                     ),
                     "event_type": "parameter_compatibility",
                     "market": key[0],
@@ -398,7 +401,7 @@ def automatic_bootstrap_strategy_drawdown(
                     "occurred_at": occurred_at,
                     "old_parameter_hash": old_hash,
                     "new_parameter_hash": parameter_hash,
-                    "compatibility_revision": OVERHEAT_TRIM_COMPATIBILITY_REVISION,
+                    "compatibility_revision": compatibility_revision,
                     "accepted_git_sha": accepted_git_sha,
                 })
                 _write_state(path, payload)
@@ -913,13 +916,22 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
         return False
     old_hash = value["old_parameter_hash"]
     new_hash = value["new_parameter_hash"]
-    return (
-        value["event_type"] == "parameter_compatibility"
+    compatibility_revision = value["compatibility_revision"]
+    valid_key = (
+        compatibility_revision == OVERHEAT_TRIM_COMPATIBILITY_REVISION
         and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v4"
         and key[2] == "v4"
+    ) or (
+        compatibility_revision == POSITION_LIMIT_COMPATIBILITY_REVISION
+        and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v5"
+        and key[2] == "v5"
+    )
+    return (
+        value["event_type"] == "parameter_compatibility"
+        and valid_key
         and isinstance(value["event_id"], str)
         and value["event_id"] == _parameter_compatibility_event_id(
-            key, str(old_hash), str(new_hash)
+            key, str(old_hash), str(new_hash), str(compatibility_revision)
         )
         and isinstance(value["actor"], str)
         and bool(value["actor"].strip())
@@ -927,16 +939,16 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
         and _is_sha256(old_hash)
         and _is_sha256(new_hash)
         and old_hash != new_hash
-        and value["compatibility_revision"] == OVERHEAT_TRIM_COMPATIBILITY_REVISION
         and _is_sha1(value["accepted_git_sha"])
     )
 
 
 def _parameter_compatibility_event_id(
     key: tuple[str, str, str], old_hash: str, new_hash: str,
+    compatibility_revision: str = OVERHEAT_TRIM_COMPATIBILITY_REVISION,
 ) -> str:
     return "parameter-compatibility-" + hashlib.sha256(
-        "|".join((*key, old_hash, new_hash, OVERHEAT_TRIM_COMPATIBILITY_REVISION)).encode(
+        "|".join((*key, old_hash, new_hash, compatibility_revision)).encode(
             "utf-8"
         )
     ).hexdigest()
@@ -960,6 +972,35 @@ def _approved_overheat_trim_transition(
         if type(actual) is not type(expected) or actual != expected:
             return False
     return strategy_parameter_hash(previous_parameters) == old_hash
+
+
+def _approved_position_limit_transition(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> bool:
+    if (
+        not _is_sha256(old_hash)
+        or key[1] != f"trend_animals_warm_to_hot/{key[0]}/v5"
+        or key[2] != "v5"
+        or parameters.get("position_limit") != "unlimited"
+    ):
+        return False
+    previous_parameters = dict(parameters)
+    previous_parameters["position_limit"] = 10
+    return strategy_parameter_hash(previous_parameters) == old_hash
+
+
+def _approved_parameter_transition_revision(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> str | None:
+    if _approved_overheat_trim_transition(key, parameters, old_hash):
+        return OVERHEAT_TRIM_COMPATIBILITY_REVISION
+    if _approved_position_limit_transition(key, parameters, old_hash):
+        return POSITION_LIMIT_COMPATIBILITY_REVISION
+    return None
 
 
 def _valid_recovery_event(value: object) -> bool:

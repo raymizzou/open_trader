@@ -239,6 +239,51 @@ def test_v4_overheat_trim_compatibility_rejects_any_nonapproved_transition(
     assert state_path.read_bytes() == before
 
 
+def test_v5_position_limit_removal_is_audited_as_compatibility_transition(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    old_parameters = {
+        "drawdown_limit": "0.05",
+        "position_limit": 10,
+    }
+    request = {
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+        "strategy_version": "v5",
+        "parameters": old_parameters,
+        "baseline_equity": Decimal("100000"),
+        "source_date": "2026-07-17",
+        "accepted_git_sha": "a" * 40,
+        "actor": "deployment",
+        "occurred_at": "2026-07-20T08:00:00+08:00",
+        "reason": "first_activation",
+        "entry_eligible_from": "2026-07-20",
+    }
+    automatic_bootstrap_strategy_drawdown(data_dir, **request)
+    updated_parameters = {**old_parameters, "position_limit": "unlimited"}
+
+    decision = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **{
+            **request,
+            "parameters": updated_parameters,
+            "baseline_equity": None,
+            "source_date": None,
+            "accepted_git_sha": "b" * 40,
+            "occurred_at": "2026-07-21T08:00:00+08:00",
+            "entry_eligible_from": None,
+        },
+    )
+
+    compatibility = decision["parameter_compatibility_event"]
+    assert compatibility["compatibility_revision"] == "trend_position_limit_v1"
+    assert compatibility["old_parameter_hash"] == strategy_parameter_hash(old_parameters)
+    assert compatibility["new_parameter_hash"] == strategy_parameter_hash(
+        updated_parameters
+    )
+
+
 def test_v4_ordinary_parameter_drift_still_requires_a_version_bump(
     tmp_path: Path,
 ) -> None:
