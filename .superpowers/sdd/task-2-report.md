@@ -3,7 +3,8 @@
 ## Status
 
 PASS. Task 2 is implemented and committed in `a95c9b0`; the follow-up fixture
-correction is committed in `47f167b`.
+correction is committed in `47f167b`. The v5 validation hardening is committed
+in `8ee7282`.
 
 ## Scope completed
 
@@ -14,6 +15,8 @@ correction is committed in `47f167b`.
   formatting null risk values as zero.
 - Dashboard Python validation accepts only the v5 pending contract; v1-v4
   validation remains strict.
+- v5 validation accepts only its two unknown-risk symbol lists and rejects
+  malformed lot-size JSON without raising.
 - Dashboard buy cards and risk rows show `待补全` and pending market-data
   labels instead of placeholder zeros/dashes.
 - Candidate appendix output no longer renders a missing execution/filter price
@@ -27,7 +30,15 @@ Command:
 PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_dashboard.py tests/test_dashboard_web.py -q
 ```
 
-Result: `752 passed in 29.78s`.
+Result: `754 passed in 30.16s`.
+
+Fix-wave focused check:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard.py -k 'v5 or malformed_pending' -q
+```
+
+Result: `3 passed, 210 deselected`.
 
 `git diff --check` passed before both commits.
 
