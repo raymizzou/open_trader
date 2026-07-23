@@ -48,7 +48,8 @@
 
 v5 动作允许 `close`、`atr`、`lot_size`、`estimated_shares`、
 `estimated_initial_line`、`planned_stop_risk` 和 `planned_stop_risk_pct` 为
-`null`，并增加 `market_data_status`（`complete` 或 `pending`）和
+`null`；依赖执行价的 `normal_cost` 也可以为 `null`。动作增加
+`market_data_status`（`complete` 或 `pending`）和
 `pending_fields`（可含 `quote`、`atr`、`lot_size`）。这些可空字段只适用于 v5；
 旧版本继续按原契约校验。A 股交易单位固定为 100、美股固定为 1；港股每手股数
 缺失时动作保持正式，执行时再补取。
