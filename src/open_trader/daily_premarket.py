@@ -1470,7 +1470,12 @@ class DailyPremarketRunner:
         )
 
     def _notify(self, title: str, message: str, *, market: str, run_date: str) -> None:
-        attempts = send_notification_with_results(self.notifier, title, message)
+        attempts = send_notification_with_results(
+            self.notifier,
+            title,
+            message,
+            channels={"macos", "xiaoai"},
+        )
         for attempt in attempts:
             self._write_notification_log(
                 title=title,

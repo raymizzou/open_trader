@@ -143,6 +143,9 @@ def watch_market_protection(
                         trading_date=local_date,
                         now=now,
                         notifier=notifier,
+                        market=market,
+                        market_label=MARKET_LABELS[market],
+                        broker_label=BROKER_LABELS[market],
                     )
                     _notify_trend_review_deadline(
                         data_dir=data_dir,

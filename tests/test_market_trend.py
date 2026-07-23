@@ -608,10 +608,11 @@ def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None
     assert result.status == "failed"
     assert notifier.messages == [
         (
-            "【老虎｜美股趋势报告生成失败｜2026-07-15】",
-            "原因：趋势数据在截止时间前仍未更新\n"
-            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n\n"
-            "报告未生成，请勿依据旧报告交易。",
+            "【需处理｜老虎｜美股趋势报告生成失败｜2026-07-15】",
+            "发生：趋势报告未生成\n"
+            "影响：不能依据旧报告交易\n"
+            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n"
+            "原因：趋势数据在截止时间前仍未更新",
         )
     ]
     ledger = cfg.data_dir / "trend_us_tiger/daily_delivery/2026-07-15.json"
@@ -787,7 +788,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert len(notifier.messages) == 1
     assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
     title, message = notifier.messages[0]
-    assert title == "【辉立｜港股趋势报告｜2026-07-16】"
+    assert title == "【日报｜辉立｜港股趋势报告｜2026-07-16】"
     assert "账户状态：已更新" in message
     assert "今日动作：卖出 0｜买入 1｜持有 1｜复核 0" in message
     assert "\n买入\n" in message

@@ -9,7 +9,12 @@ from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.t_signal import TMarketFacts, apply_ai_interpretation
 from open_trader.t_signal_runner import run_t_signal_watch_once
 from open_trader.t_signal_store import load_t_signals_cache
-from open_trader.notifications import NullNotifier
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
+    NullNotifier,
+)
 
 
 def write_portfolio(path: Path) -> None:
@@ -133,7 +138,7 @@ class RejectingInterpreter:
         return apply_ai_interpretation(signal, "{}")
 
 
-class CapturingNotifier:
+class CapturingNotifier(MacOSNotifier):
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
 
@@ -141,9 +146,25 @@ class CapturingNotifier:
         self.messages.append((title, message))
 
 
-class FailingNotifier:
+class FailingNotifier(MacOSNotifier):
     def notify(self, title: str, message: str) -> None:
         raise RuntimeError("Feishu webhook failed")
+
+
+class RecordingFeishu(FeishuWebhookNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+class RecordingMacOS(MacOSNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
 
 
 def fixed_now() -> datetime:
@@ -187,6 +208,58 @@ def test_t_signal_runner_writes_artifact_and_sends_once(tmp_path: Path) -> None:
     assert record["notification"]["notified"] is True
     assert record["notification"]["should_notify"] is False
     assert record["timeline"][-1]["event_type"] == "notification_sent"
+
+
+def test_t_signal_runner_routes_signal_only_to_macos(tmp_path: Path) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=CompositeNotifier([feishu, macos]),
+        now_fn=fixed_now,
+    )
+
+    record = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")["records"][0]
+    assert feishu.messages == []
+    assert len(macos.messages) == 1
+    assert result.notified_count == 1
+    assert record["timeline"][-1]["event_type"] == "notification_sent"
+
+
+def test_t_signal_runner_records_feishu_only_signal_as_suppressed(tmp_path: Path) -> None:
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    write_portfolio(portfolio_path)
+    feishu = RecordingFeishu()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        data_dir=tmp_path / "data",
+        run_date="2026-07-02",
+        market="US",
+        session_phase="regular",
+        market_data_client=FakeMarketDataClient(),
+        interpreter=PassthroughInterpreter(),
+        notifier=feishu,
+        now_fn=fixed_now,
+    )
+
+    record = load_t_signals_cache(tmp_path / "data/latest/US/t_signals.json")["records"][0]
+    assert feishu.messages == []
+    assert result.notified_count == 0
+    assert record["action"] == "BUY_T"
+    assert record["status"] == "ok"
+    assert record["notification"]["should_notify"] is False
+    assert record["notification"]["last_attempted_dedupe_key"] == record["notification"]["dedupe_key"]
+    assert record["timeline"][-1]["event_type"] == "notification_suppressed"
 
 
 def test_t_signal_notification_uses_structured_chinese_template(tmp_path: Path) -> None:
