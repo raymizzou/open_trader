@@ -4,10 +4,11 @@ import argparse
 import json
 from getpass import getpass
 import re
+import socket
 import sys
 import time
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -16,17 +17,19 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
-from .a_share_trend import _process_version, run_a_share_trend_report
-from .a_share_trend_watch import watch_a_share_protection
-from .market_trend import market_paths, run_market_trend_report
-from .market_trend_watch import watch_market_protection
+from .a_share_trend import (
+    _process_version,
+    live_trend_strategy_snapshot,
+    load_futu_simulate_trend_account,
+)
 from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
-    RunLock,
+    _optional_positive_tm_id,
     _read_env_file,
     build_notifier,
     load_env_config,
+    require_trend_executor,
     require_trend_review_config,
     refresh_live_portfolio,
     send_notification_with_results,
@@ -103,6 +106,11 @@ from .tiger_account import (
     sync_tiger_portfolio,
 )
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
+from .trend_api_stats import (
+    FutuSimulateFillClient,
+    TigerActualFillClient,
+    sync_trend_api_stats,
+)
 from .trade_actions import generate_trade_actions
 from .tradingagents_summary import (
     LLMTradingAgentsSummaryExtractor,
@@ -116,354 +124,35 @@ from .trading_plan import (
 )
 from .watchlist import build_watchlist
 from .trend_review import (
-    TREND_V1_EFFECTIVE_FROM,
-    benchmark_fact,
-    build_trend_review_projection,
-    execute_trend_review_open,
-    execute_trend_review_stop,
-    freeze_actual_equity_fact,
-    freeze_actual_fill_batch,
-    freeze_benchmark_fact,
-    freeze_discipline_fact,
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
-    validate_trend_review_close_report,
+    resolve_trend_action,
+)
+from .trend_market_controller import (
+    load_trend_market_status,
+    run_trend_market_controller,
+)
+from .strategy_drawdown import (
+    manual_unlock_strategy_drawdown,
+    strategy_drawdown_state_status,
+)
+from .drawdown_preflight import (
+    DrawdownMarketInput,
+    frozen_missing_baseline,
+    market_preflight_dates,
+    run_drawdown_preflight,
 )
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
-TREND_REPORT_STEM_RE = re.compile(
-    r"(?P<date>\d{4}-\d{2}-\d{2})(?:-r(?P<revision>\d+))?\Z"
-)
 
 
-def _trend_report_path_order(path: Path) -> tuple[str, int]:
-    match = TREND_REPORT_STEM_RE.fullmatch(path.stem)
-    if match is None:
-        return "", -1
-    return match.group("date"), int(match.group("revision") or 0)
+def _drawdown_unlock_now(timezone: str) -> datetime:
+    return datetime.now(ZoneInfo(timezone))
 
 
-def _trend_review_date_from_report(result: object, fallback: str) -> str:
-    path = getattr(result, "json_path", None)
-    if path is None:
-        return fallback
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    as_of_date = payload.get("as_of_date") if isinstance(payload, dict) else None
-    if not isinstance(as_of_date, str) or DATE_RE.fullmatch(as_of_date) is None:
-        raise ValueError("trend report is missing a valid as_of_date")
-    return as_of_date
-
-
-def _run_trend_review_close_best_effort(
-    config: object, market: str, trading_date: str
-) -> None:
-    try:
-        run_trend_review_close(config, market, trading_date)
-    except Exception as exc:
-        print(f"trend review close failed: {exc}", file=sys.stderr)
-
-
-def _load_trend_review_report(
-    config: object,
-    market: str,
-    trading_date: str,
-    *,
-    date_field: str,
-) -> dict[str, object]:
-    report_dir = (
-        config.reports_dir / "trend_a_share"
-        if market == "CN"
-        else market_paths(config.data_dir, config.reports_dir, market).reports
-    )
-    for path in sorted(
-        report_dir.glob("*.json"), key=_trend_report_path_order, reverse=True
-    ):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if _valid_trend_review_report(
-            payload,
-            path=path,
-            market=market,
-            trading_date=trading_date,
-            date_field=date_field,
-        ):
-            return payload
-    raise FileNotFoundError(
-        f"no {market} trend report with {date_field}={trading_date}"
-    )
-
-
-def _valid_trend_review_report(
-    payload: object,
-    *,
-    path: Path,
-    market: str,
-    trading_date: str,
-    date_field: str,
-) -> bool:
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        return False
-    try:
-        execution_date = date.fromisoformat(payload["execution_date"])
-        as_of_date = date.fromisoformat(payload["as_of_date"])
-        generated_at = datetime.fromisoformat(payload["generated_at"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    metadata = payload.get("metadata")
-    judgments = payload.get("strategy_judgments")
-    actions = (
-        judgments.get("formal_actions") if isinstance(judgments, dict) else None
-    )
-    match = TREND_REPORT_STEM_RE.fullmatch(path.stem)
-    expected_broker = {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market]
-    if not (
-        generated_at.tzinfo is not None
-        and generated_at.utcoffset() is not None
-        and execution_date.isoformat() == payload["execution_date"]
-        and as_of_date.isoformat() == payload["as_of_date"]
-        and generated_at.isoformat() == payload["generated_at"]
-        and as_of_date <= execution_date
-        and payload.get(date_field) == trading_date
-        and match is not None
-        and match.group("date") == as_of_date.isoformat()
-        and isinstance(metadata, dict)
-        and str(metadata.get("market") or "").upper() == market
-        and str(metadata.get("broker") or "").lower() == expected_broker
-        and isinstance(actions, list)
-        and all(
-            isinstance(judgments.get(key), list)
-            for key in ("holding_decisions", "top10_candidates")
-        )
-    ):
-        return False
-    for action in actions:
-        if (
-            not isinstance(action, dict)
-            or action.get("action") not in {"BUY", "SELL_ALL"}
-            or not str(action.get("symbol") or "").strip()
-        ):
-            return False
-        if action["action"] == "BUY":
-            try:
-                if (
-                    Decimal(str(action.get("target_weight"))) <= 0
-                    or int(action.get("lot_size") or 0) <= 0
-                ):
-                    return False
-            except (InvalidOperation, TypeError, ValueError):
-                return False
-    return True
-
-
-def run_trend_review_open(
-    config: object, market: str, trading_date: str
-) -> dict[str, object]:
-    account_id = require_trend_review_config(config, market)
-    report = _load_trend_review_report(
-        config, market, trading_date, date_field="execution_date"
-    )
-    judgments = report.get("strategy_judgments")
-    actions = judgments.get("formal_actions") if isinstance(judgments, dict) else []
-    from .futu_symbols import to_futu_symbol
-
-    symbols = [
-        str(action.get("symbol"))
-        for action in actions
-        if isinstance(action, dict) and action.get("action") == "BUY"
-    ]
-    quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-    client = None
-    try:
-        client = FutuSimulateOrderExecutionClient(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=account_id,
-            trd_market=market,
-        )
-        snapshots = quote.get_snapshots(
-            [to_futu_symbol(market, symbol) for symbol in symbols]
-        ) if symbols else {}
-        prices = {
-            symbol: snapshots[to_futu_symbol(market, symbol)].last_price
-            for symbol in symbols
-            if to_futu_symbol(market, symbol) in snapshots
-        }
-        result = execute_trend_review_open(
-            data_dir=config.data_dir,
-            report=report,
-            client=client,
-            prices=prices,
-            market=market,
-            execution_date=trading_date,
-            now=datetime.now(ZoneInfo(config.timezone)).isoformat(timespec="seconds"),
-        )
-    finally:
-        quote.close()
-        if client is not None:
-            client.close()
-    paths = result.get("artifact_paths")
-    return {
-        **result,
-        "artifact_path": paths[0] if isinstance(paths, list) and paths else None,
-    }
-
-
-def run_trend_review_close(
-    config: object, market: str, trading_date: str
-) -> dict[str, object]:
-    report = _load_trend_review_report(
-        config, market, trading_date, date_field="as_of_date"
-    )
-    account, strategy_snapshot = validate_trend_review_close_report(
-        report, trading_date, market
-    )
-    errors: list[tuple[str, Exception]] = []
-    actual_equity_path = None
-    if account.get("fresh") is True and account.get("source_date") == trading_date:
-        opening_positions = (
-            account["positions"]
-            if trading_date == TREND_V1_EFFECTIVE_FROM[market]
-            else []
-        )
-        try:
-            actual_equity_path = freeze_actual_equity_fact(
-                config.data_dir,
-                market,
-                trading_date,
-                account["net_value"],
-                opening_positions,
-                strategy_snapshot,
-            )
-        except Exception as exc:
-            errors.append(("actual equity", exc))
-
-    benchmark_path = None
-    quote = None
-    try:
-        quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-        benchmark = benchmark_fact(quote, market, trading_date)
-        benchmark_path = freeze_benchmark_fact(
-            config.data_dir, market, trading_date, benchmark
-        )
-    except Exception as exc:
-        errors.append(("benchmark", exc))
-    finally:
-        if quote is not None:
-            try:
-                quote.close()
-            except Exception as exc:
-                errors.append(("benchmark client close", exc))
-
-    discipline_path = None
-    client = None
-    try:
-        account_id = require_trend_review_config(config, market)
-        client = FutuSimulateOrderExecutionClient(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=account_id,
-            trd_market=market,
-        )
-        snapshot = client.account_snapshot()
-        orders = client.list_orders()["orders"]
-        discipline_path = freeze_discipline_fact(
-            config.data_dir,
-            market,
-            trading_date,
-            snapshot["net_value"],
-            orders,
-            strategy_snapshot,
-        )
-    except Exception as exc:
-        errors.append(("discipline", exc))
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception as exc:
-                errors.append(("discipline client close", exc))
-
-    actual_fill_paths: list[Path] = []
-    if market == "US":
-        tiger_client = None
-        try:
-            tiger_config = load_tiger_account_config(
-                config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
-            )
-            tiger_client = TigerAccountClient(config=tiger_config)
-            actual_fill_paths = freeze_actual_fill_batch(
-                config.data_dir,
-                {"broker": "tiger", "account_alias": "tiger_main"},
-                tiger_client.fetch_actual_fills(
-                    TREND_V1_EFFECTIVE_FROM[market], trading_date
-                ),
-                trading_date,
-                coverage_start=TREND_V1_EFFECTIVE_FROM[market],
-            )
-        except Exception as exc:
-            errors.append(("actual fills", exc))
-        finally:
-            if tiger_client is not None:
-                try:
-                    tiger_client.close()
-                except Exception as exc:
-                    errors.append(("actual fill client close", exc))
-    projection = None
-    try:
-        projection = build_trend_review_projection(config.data_dir, market)
-    except Exception as exc:
-        errors.append(("projection", exc))
-    if errors:
-        details = "; ".join(f"{stream}: {exc}" for stream, exc in errors)
-        raise RuntimeError(f"trend review close failed: {details}") from errors[0][1]
-    assert discipline_path is not None
-    assert benchmark_path is not None
-    assert projection is not None
-    artifact_paths = {
-        "discipline": str(discipline_path),
-        "actual_equity": (
-            str(actual_equity_path) if actual_equity_path is not None else None
-        ),
-        "benchmark": str(benchmark_path),
-        "actual_fills": [str(path) for path in actual_fill_paths],
-    }
-    return {
-        "status": "captured",
-        "market": market,
-        "date": trading_date,
-        "artifact_path": str(discipline_path),
-        "artifact_paths": artifact_paths,
-        "sample_counts": projection["sample_counts"],
-    }
-
-
-def run_trend_review_stop(
-    config: object, market: str, event: object
-) -> dict[str, object]:
-    if not isinstance(event, dict):
-        raise ValueError("trend review protection event must be an object")
-    account_id = require_trend_review_config(config, market)
-    client = FutuSimulateOrderExecutionClient(
-        host=config.futu_host,
-        port=config.futu_port,
-        simulate_acc_id=account_id,
-        trd_market=market,
-    )
-    try:
-        return execute_trend_review_stop(
-            data_dir=config.data_dir,
-            market=market,
-            symbol=str(event.get("symbol") or ""),
-            trading_date=str(event.get("trading_date") or ""),
-            event_id=str(event.get("event_id") or ""),
-            client=client,
-            now=str(event.get("occurred_at") or ""),
-        )
-    finally:
-        client.close()
+def _drawdown_preflight_now() -> datetime:
+    return datetime.now().astimezone()
 
 
 def run_trend_review_replay(
@@ -823,53 +512,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override OPEN_TRADER_MAX_WORKERS for this daily run",
     )
 
-    trend_report = subparsers.add_parser(
-        "trend-a-share-report", help="Generate the Eastmoney A-share trend plan"
+    trend_market = subparsers.add_parser(
+        "trend-market", help="Run and inspect one trend market controller"
     )
-    trend_report.add_argument("--date", default="today")
-    trend_report.add_argument(
+    trend_market_commands = trend_market.add_subparsers(
+        dest="trend_market_command", required=True
+    )
+    trend_market_run = trend_market_commands.add_parser("run")
+    trend_market_run.add_argument(
+        "--market", choices=("CN", "HK", "US"), required=True
+    )
+    trend_market_run.add_argument("--revision", action="store_true")
+    trend_market_run.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    trend_report.add_argument("--revision", action="store_true")
+    trend_market_status = trend_market_commands.add_parser("status")
+    trend_market_status.add_argument(
+        "--market", choices=("CN", "HK", "US"), required=True
+    )
+    trend_market_status.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_market_resolve = trend_market_commands.add_parser("resolve")
+    trend_market_resolve.add_argument(
+        "--market", choices=("CN", "HK", "US"), required=True
+    )
+    trend_market_resolve.add_argument(
+        "--execution-date", type=canonical_date, required=True
+    )
+    trend_market_resolve.add_argument("--symbol", required=True)
+    trend_market_resolve.add_argument("--side", choices=("buy", "sell"), required=True)
+    trend_market_resolve.add_argument(
+        "--resolution",
+        choices=("confirm-submitted", "authorize-retry", "abandon"),
+        required=True,
+    )
+    trend_market_resolve.add_argument("--actor", required=True)
+    trend_market_resolve.add_argument("--reason", required=True)
+    trend_market_resolve.add_argument("--futu-order-id")
+    trend_market_resolve.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
 
-    trend_watch = subparsers.add_parser(
-        "watch-trend-a-share", help="Watch Eastmoney A-share protection lines"
+    drawdown_unlock = subparsers.add_parser(
+        "trend-drawdown-unlock",
+        help="Manually unlock and rebase one simulated trend strategy",
     )
-    trend_watch.add_argument(
+    drawdown_unlock.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    trend_watch.add_argument("--poll-seconds", type=positive_float, default=5.0)
-    trend_watch.add_argument(
-        "--reconnect-seconds", type=positive_float, default=60.0
+    drawdown_unlock.add_argument(
+        "--market", choices=("CN", "US", "HK"), required=True
     )
-    trend_watch.add_argument("--once", action="store_true")
+    drawdown_unlock.add_argument("--event-id", required=True)
+    drawdown_unlock.add_argument("--actor", required=True)
 
-    market_trend_report = subparsers.add_parser(
-        "trend-market-report",
-        help="Generate a Tiger US or Phillips HK trend plan",
-        description="Generate a Tiger US or Phillips HK trend plan",
+    drawdown_preflight = subparsers.add_parser(
+        "trend-drawdown-preflight",
+        help="Initialize or recover audited trend drawdown baselines",
     )
-    market_trend_report.add_argument("--market", choices=("US", "HK"), required=True)
-    market_trend_report.add_argument("--date", default="today")
-    market_trend_report.add_argument(
+    drawdown_preflight.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    market_trend_report.add_argument("--revision", action="store_true")
-
-    market_trend_watch = subparsers.add_parser(
-        "watch-trend-market",
-        help="Watch Tiger US or Phillips HK trend protection lines",
-        description="Watch Tiger US or Phillips HK trend protection lines",
-    )
-    market_trend_watch.add_argument("--market", choices=("US", "HK"), required=True)
-    market_trend_watch.add_argument(
-        "--config", type=Path, default=Path("config/daily_premarket.env")
-    )
-    market_trend_watch.add_argument("--poll-seconds", type=positive_float, default=5.0)
-    market_trend_watch.add_argument(
-        "--reconnect-seconds", type=positive_float, default=60.0
-    )
-    market_trend_watch.add_argument("--once", action="store_true")
+    drawdown_preflight.add_argument("--repo", type=Path, default=Path.cwd())
+    drawdown_preflight.add_argument("--actor", default="deployment")
 
     trend_review_parser = subparsers.add_parser(
         "trend-review", help="Run or replay one market trend review workflow"
@@ -877,22 +583,21 @@ def build_parser() -> argparse.ArgumentParser:
     trend_review_commands = trend_review_parser.add_subparsers(
         dest="trend_review_command", required=True
     )
-    for command in ("open", "close"):
-        command_parser = trend_review_commands.add_parser(command)
-        command_parser.add_argument(
-            "--market", choices=("CN", "US", "HK"), required=True
-        )
-        command_parser.add_argument("--date", type=canonical_date, required=True)
-        command_parser.add_argument(
-            "--config",
-            type=Path,
-            default=Path("config/daily_premarket.env"),
-        )
     replay_parser = trend_review_commands.add_parser("replay")
     replay_parser.add_argument("--evidence", type=Path, required=True)
     replay_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
+    sync_stats_parser = trend_review_commands.add_parser("sync-stats")
+    sync_stats_parser.add_argument("--start", type=canonical_date, required=True)
+    sync_stats_parser.add_argument("--end", type=canonical_date, required=True)
+    sync_stats_parser.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    sync_stats_parser.add_argument(
+        "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
+    )
+    sync_stats_parser.add_argument("--tiger-account")
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -1580,18 +1285,254 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "trend-review":
+    if args.command == "trend-market":
+        if args.trend_market_command == "resolve":
+            order_id = str(args.futu_order_id or "").strip()
+            if args.resolution == "confirm-submitted" and not order_id:
+                print("confirm-submitted requires --futu-order-id", file=sys.stderr)
+                return 2
+            if args.resolution != "confirm-submitted" and order_id:
+                print(
+                    f"{args.resolution} does not accept --futu-order-id",
+                    file=sys.stderr,
+                )
+                return 2
         try:
             config = load_env_config(args.config, dry_run=False)
-            if args.trend_review_command == "open":
-                result = run_trend_review_open(config, args.market, args.date)
-            elif args.trend_review_command == "close":
-                result = run_trend_review_close(config, args.market, args.date)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if args.trend_market_command in {"run", "resolve"}:
+            try:
+                require_trend_executor(config, hostname_fn=socket.gethostname)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+        try:
+            if args.trend_market_command == "run":
+                config = replace(
+                    config,
+                    repo=Path.cwd().resolve(),
+                    python=Path(sys.executable).resolve(),
+                )
+                result = run_trend_market_controller(
+                    config, args.market, revision=args.revision
+                )
+            elif args.trend_market_command == "status":
+                result = load_trend_market_status(config, args.market)
             else:
+                artifact = resolve_trend_action(
+                    config.data_dir,
+                    market=args.market,
+                    execution_date=args.execution_date,
+                    symbol=args.symbol,
+                    side=args.side,
+                    resolution=args.resolution,
+                    actor=args.actor,
+                    reason=args.reason,
+                    resolved_at=datetime.now(ZoneInfo(config.timezone)).isoformat(
+                        timespec="seconds"
+                    ),
+                    futu_order_id=order_id or None,
+                )
+                result = {
+                    "status": "resolved",
+                    "market": args.market,
+                    "execution_date": args.execution_date,
+                    "symbol": args.symbol,
+                    "side": args.side,
+                    "resolution": args.resolution,
+                    "artifact_path": str(artifact),
+                }
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            ZoneInfoNotFoundError,
+        ) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "trend-drawdown-preflight":
+        quote = None
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            accepted_git_sha = _process_version(args.repo)
+            now = _drawdown_preflight_now()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("drawdown preflight clock must be timezone-aware")
+            occurred_at = now.isoformat(timespec="seconds")
+            drawdown_state_status = strategy_drawdown_state_status(config.data_dir)
+            quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+            inputs: dict[str, DrawdownMarketInput] = {}
+            for market in ("CN", "HK", "US"):
+                pool_ids = {
+                    "CN": (
+                        config.trend_animals_a_share_tm_id,
+                        config.trend_animals_etf_tm_id,
+                    ),
+                    "HK": config.trend_animals_hk_tm_ids,
+                    "US": config.trend_animals_us_tm_ids,
+                }[market]
+                strategy = live_trend_strategy_snapshot(
+                    market, accepted_git_sha, pool_ids
+                )
+                try:
+                    today = now.date()
+                    trading_days = quote.get_trading_days(
+                        market=market,
+                        start=(today - timedelta(days=14)).isoformat(),
+                        end=(today + timedelta(days=21)).isoformat(),
+                    )
+                    source_date, entry_eligible_from = market_preflight_dates(
+                        market, now=now, trading_days=trading_days
+                    )
+                    baseline = frozen_missing_baseline(
+                        config.reports_dir,
+                        market=market,
+                        strategy_id=str(strategy["strategy_id"]),
+                        strategy_version=str(strategy["strategy_version"]),
+                        source_date=source_date,
+                    )
+                    if baseline is None and drawdown_state_status != "ok":
+                        raise ValueError(
+                            f"{market} completed-date frozen Futu baseline "
+                            f"is unavailable for {source_date}"
+                        )
+                    inputs[market] = DrawdownMarketInput(
+                        market=market,
+                        strategy_snapshot=strategy,
+                        baseline_equity=baseline,
+                        source_date=source_date,
+                        entry_eligible_from=entry_eligible_from,
+                    )
+                except Exception as exc:
+                    inputs[market] = DrawdownMarketInput(
+                        market=market,
+                        strategy_snapshot=strategy,
+                        baseline_equity=None,
+                        source_date=None,
+                        entry_eligible_from=None,
+                        error=str(exc),
+                    )
+            result = run_drawdown_preflight(
+                data_dir=config.data_dir,
+                reports_dir=config.reports_dir,
+                market_inputs=inputs,
+                accepted_git_sha=accepted_git_sha,
+                actor=args.actor,
+                occurred_at=occurred_at,
+                notifier=build_notifier(config),
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        finally:
+            if quote is not None:
+                quote.close()
+        print(json.dumps(result, ensure_ascii=False))
+        return {"ready": 0, "failed": 1, "unavailable": 2}[str(result["status"])]
+
+    if args.command == "trend-drawdown-unlock":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            configured_timezone = ZoneInfo(config.timezone)
+            now = _drawdown_unlock_now(config.timezone)
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("drawdown unlock clock must be timezone-aware")
+            now = now.astimezone(configured_timezone)
+            occurred_at = now.isoformat(timespec="seconds")
+            expected_date = now.date().isoformat()
+            account = load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=require_trend_review_config(config, args.market),
+                market=args.market,
+                expected_date=expected_date,
+            )
+            pool_ids = {
+                "CN": (
+                    config.trend_animals_a_share_tm_id,
+                    config.trend_animals_etf_tm_id,
+                ),
+                "US": config.trend_animals_us_tm_ids,
+                "HK": config.trend_animals_hk_tm_ids,
+            }[args.market]
+            strategy = live_trend_strategy_snapshot(
+                args.market,
+                _process_version(config.repo),
+                pool_ids,
+            )
+            result = manual_unlock_strategy_drawdown(
+                config.data_dir,
+                market=args.market,
+                strategy_id=strategy["strategy_id"],
+                strategy_version=strategy["strategy_version"],
+                current_equity=account.net_value,
+                occurred_at=occurred_at,
+                event_id=args.event_id,
+                actor=args.actor,
+            )
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            ZoneInfoNotFoundError,
+        ) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "trend-review":
+        stats_clients: list[object] = []
+        try:
+            config = load_env_config(args.config, dry_run=False)
+            if args.trend_review_command == "replay":
                 result = run_trend_review_replay(config, args.evidence)
+            else:
+                futu_clients = {}
+                for market in ("CN", "HK", "US"):
+                    client = FutuSimulateFillClient(
+                        host=config.futu_host,
+                        port=config.futu_port,
+                        simulate_acc_id=require_trend_review_config(config, market),
+                        trd_market=market,
+                    )
+                    futu_clients[market] = client
+                    stats_clients.append(client)
+                tiger_config = load_tiger_account_config(
+                    config_dir=args.tiger_config_dir,
+                    account=args.tiger_account,
+                    sandbox=False,
+                )
+                tiger_client = TigerActualFillClient(config=tiger_config)
+                stats_clients.append(tiger_client)
+                timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                result = sync_trend_api_stats(
+                    data_dir=config.data_dir,
+                    reports_dir=config.reports_dir,
+                    futu_clients=futu_clients,
+                    tiger_client=tiger_client,
+                    start=args.start,
+                    end=args.end,
+                    generated_at=timestamp,
+                    statistics_cutoff_at=timestamp,
+                )
         except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        finally:
+            for client in stats_clients:
+                client.close()
+        if args.trend_review_command == "sync-stats":
+            print(f"fills: {len(result['fills'])}")
+            print(f"rounds: {len(result['rounds'])}")
+            print(f"stats: {len(result['stats'])}")
+            print(f"latest: {config.data_dir / 'latest' / 'trend_api_stats.json'}")
+            return 0
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
@@ -1686,219 +1627,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"advice_csv: {result.advice_path}")
         print(f"actions_csv: {result.actions_path}")
         print(f"report: {result.report_path}")
-        return 0
-
-    if args.command == "trend-market-report":
-        try:
-            config = load_env_config(args.config, dry_run=False)
-            pool_ids = (
-                config.trend_animals_us_tm_ids
-                if args.market == "US"
-                else config.trend_animals_hk_tm_ids
-            )
-            missing = []
-            if not config.trend_animals_api_key.strip():
-                missing.append("TREND_ANIMALS_API_KEY")
-            if not pool_ids:
-                missing.append(f"TREND_ANIMALS_WARM_TO_HOT_{args.market}_TM_IDS")
-            if missing:
-                raise ValueError(f"missing config value(s): {', '.join(missing)}")
-            run_date = (
-                datetime.now(ZoneInfo(config.timezone)).date().isoformat()
-                if args.date == "today"
-                else canonical_date(args.date)
-            )
-            notifier = build_notifier(config)
-        except (
-            FileNotFoundError,
-            ValueError,
-            argparse.ArgumentTypeError,
-            ZoneInfoNotFoundError,
-        ) as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        try:
-            result = run_market_trend_report(
-                config=config,
-                market=args.market,
-                run_date=run_date,
-                revision=args.revision,
-                notifier=notifier,
-            )
-        except (FileNotFoundError, ValueError, RuntimeError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        if result.status in {"generated", "existing"}:
-            try:
-                review_date = _trend_review_date_from_report(result, run_date)
-            except Exception as exc:
-                print(f"trend review close failed: {exc}", file=sys.stderr)
-            else:
-                _run_trend_review_close_best_effort(
-                    config, args.market, review_date
-                )
-        print(json.dumps({
-            "status": result.status,
-            "report_path": str(result.report_path) if result.report_path else None,
-            "json_path": str(result.json_path) if result.json_path else None,
-        }, ensure_ascii=False))
-        return 0 if result.status in {"generated", "existing", "holiday"} else 1
-
-    if args.command == "watch-trend-market":
-        try:
-            config = load_env_config(args.config, dry_run=False)
-            notifier = build_notifier(config)
-            paths = market_paths(config.data_dir, config.reports_dir, args.market)
-        except (FileNotFoundError, ValueError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-
-        def market_quote_factory() -> FutuQuoteClient:
-            return FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-
-        try:
-            with RunLock(paths.watch_lock):
-                result = watch_market_protection(
-                    market=args.market,
-                    data_dir=config.data_dir,
-                    portfolio_path=config.portfolio,
-                    state_path=paths.state,
-                    events_path=paths.events,
-                    report_lock_path=paths.report_lock,
-                    quote_client=None,
-                    quote_client_factory=market_quote_factory,
-                    notifier=notifier,
-                    poll_seconds=args.poll_seconds,
-                    reconnect_seconds=args.reconnect_seconds,
-                    once=args.once,
-                    on_session_open=lambda trading_date: run_trend_review_open(
-                        config, args.market, trading_date
-                    ),
-                    on_protection_trigger=lambda event: run_trend_review_stop(
-                        config, args.market, event
-                    ),
-                )
-        except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        print(json.dumps({
-            "status": result.status,
-            "watched_symbol_count": result.watched_symbol_count,
-            "trigger_count": result.trigger_count,
-            "exception_count": result.exception_count,
-            "unknown_quote_count": result.unknown_quote_count,
-            "events_path": str(result.events_path),
-        }, ensure_ascii=False))
-        return 0
-
-    if args.command == "trend-a-share-report":
-        try:
-            config = load_env_config(args.config, dry_run=False)
-            missing = []
-            if not config.trend_animals_api_key.strip():
-                missing.append("TREND_ANIMALS_API_KEY")
-            if config.trend_animals_a_share_tm_id != 622466:
-                missing.append("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID")
-            if config.trend_animals_etf_tm_id != 697199:
-                missing.append("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID")
-            if missing:
-                raise ValueError(f"missing config value(s): {', '.join(missing)}")
-            run_date = (
-                datetime.now(ZoneInfo(config.timezone)).date().isoformat()
-                if args.date == "today"
-                else canonical_date(args.date)
-            )
-            notifier = build_notifier(config)
-        except (
-            FileNotFoundError,
-            ValueError,
-            argparse.ArgumentTypeError,
-            ZoneInfoNotFoundError,
-        ) as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        try:
-            result = run_a_share_trend_report(
-                config=config,
-                run_date=run_date,
-                revision=args.revision,
-                notifier=notifier,
-            )
-        except (
-            FileNotFoundError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        if result.status in {"generated", "existing"}:
-            try:
-                review_date = _trend_review_date_from_report(result, run_date)
-            except Exception as exc:
-                print(f"trend review close failed: {exc}", file=sys.stderr)
-            else:
-                _run_trend_review_close_best_effort(config, "CN", review_date)
-        print(
-            json.dumps(
-                {
-                    "status": result.status,
-                    "report_path": str(result.report_path) if result.report_path else None,
-                    "json_path": str(result.json_path) if result.json_path else None,
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 0 if result.status in {"generated", "existing", "holiday"} else 1
-
-    if args.command == "watch-trend-a-share":
-        try:
-            config = load_env_config(args.config, dry_run=False)
-            notifier = build_notifier(config)
-        except (FileNotFoundError, ValueError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-
-        def quote_factory() -> FutuQuoteClient:
-            return FutuQuoteClient(host=config.futu_host, port=config.futu_port)
-
-        try:
-            with RunLock(config.data_dir / "runs/.trend_a_share_watch.lock"):
-                result = watch_a_share_protection(
-                    portfolio_path=config.portfolio,
-                    state_path=config.data_dir
-                    / "trend_a_share/protection_state.json",
-                    events_path=config.data_dir / "trend_a_share/watch_events.jsonl",
-                    report_lock_path=config.data_dir
-                    / "runs/.trend_a_share_report.lock",
-                    quote_client=None,
-                    quote_client_factory=quote_factory,
-                    notifier=notifier,
-                    poll_seconds=args.poll_seconds,
-                    reconnect_seconds=args.reconnect_seconds,
-                    once=args.once,
-                    on_session_open=lambda trading_date: run_trend_review_open(
-                        config, "CN", trading_date
-                    ),
-                    on_protection_trigger=lambda event: run_trend_review_stop(
-                        config, "CN", event
-                    ),
-                )
-        except (FileNotFoundError, FutuQuoteError, RuntimeError, ValueError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        print(
-            json.dumps(
-                {
-                    "status": result.status,
-                    "watched_symbol_count": result.watched_symbol_count,
-                    "trigger_count": result.trigger_count,
-                    "exception_count": result.exception_count,
-                    "unknown_quote_count": result.unknown_quote_count,
-                    "events_path": str(result.events_path),
-                },
-                ensure_ascii=False,
-            )
-        )
         return 0
 
     if args.command == "test-notification":
@@ -2729,6 +2457,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "dashboard":
         config_values = _load_optional_env_values(args.config)
+        try:
+            simulate_account_ids = {
+                market: _optional_positive_tm_id(
+                    config_values,
+                    f"OPEN_TRADER_TREND_REVIEW_{market}_SIMULATE_ACC_ID",
+                )
+                for market in ("CN", "US", "HK")
+            }
+            populated_account_ids = [
+                value for value in simulate_account_ids.values() if value > 0
+            ]
+            if len(populated_account_ids) != len(set(populated_account_ids)):
+                raise ValueError(
+                    "trend review simulate account IDs must be distinct"
+                )
+        except ValueError as exc:
+            parser.error(str(exc))
         config = DashboardConfig(
             portfolio_path=args.portfolio,
             data_dir=args.data_dir,
@@ -2736,6 +2481,12 @@ def main(argv: list[str] | None = None) -> int:
             poll_seconds=args.poll_seconds,
             futu_host=args.futu_host,
             futu_port=args.futu_port,
+            trend_review_cn_simulate_acc_id=simulate_account_ids["CN"],
+            trend_review_us_simulate_acc_id=simulate_account_ids["US"],
+            trend_review_hk_simulate_acc_id=simulate_account_ids["HK"],
+            trend_executor_host=config_values.get(
+                "OPEN_TRADER_TREND_EXECUTOR_HOST", ""
+            ).strip(),
         )
         serve_dashboard(
             config,
@@ -2749,7 +2500,3 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

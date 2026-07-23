@@ -1257,10 +1257,59 @@ table {
 .account-section-header {
   align-items: flex-start;
   border-left: 3px solid var(--broker-accent);
-  display: flex;
+  display: grid;
   gap: 16px;
-  justify-content: space-between;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr) minmax(0, 1fr) auto;
   padding: 12px;
+}
+
+.account-view-tabs {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  grid-column: 1 / -1;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.account-view-tab {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 10px;
+  position: relative;
+}
+
+.account-view-tab[aria-selected="true"] {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.account-view-tab[aria-selected="true"]::after {
+  background: var(--broker-accent);
+  bottom: -1px;
+  content: "";
+  height: 2px;
+  inset-inline: 8px;
+  position: absolute;
+}
+
+.account-view-tab:focus-visible {
+  outline-offset: -3px;
+}
+
+.account-view-panel {
+  min-width: 0;
+}
+
+.account-view-panel > .cn-trend-report,
+.account-view-panel > .trend-review,
+.trend-history-panel {
+  padding: 18px;
 }
 
 .account-cash-details {
@@ -1284,6 +1333,7 @@ table {
 }
 
 .account-section-actions {
+  grid-column: 4;
   margin-left: auto;
   text-align: right;
 }
@@ -1514,6 +1564,81 @@ table {
   cursor: not-allowed;
 }
 
+.trend-report-header .trend-history-button,
+.trend-history-button,
+.report-attribution-link {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-weight: 400;
+  min-height: 44px;
+  padding: 0 8px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.report-attribution-link {
+  display: block;
+  padding: 0;
+  text-align: left;
+}
+
+.trend-history-panel header {
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+}
+
+.trend-history-panel h1 {
+  font-size: 20px;
+  margin: 0;
+}
+
+.trend-history-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.trend-history-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.trend-history-list button,
+.trend-history-list li > span {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  display: flex;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 8px;
+  text-align: left;
+  width: 100%;
+}
+
+.trend-history-list button {
+  align-items: flex-start;
+  cursor: pointer;
+  flex-direction: column;
+}
+
+.trend-history-list button span {
+  color: var(--muted);
+}
+
+.trend-history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .trend-report-workspace {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -1662,6 +1787,60 @@ table {
   margin: 14px 0 0;
 }
 
+.trend-audit-summary,
+.trend-audit-reason-counts,
+.trend-audit-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.trend-audit-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.trend-audit-table th,
+.trend-audit-table td {
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  padding: 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.trend-audit-table th:nth-child(1) { width: 14%; }
+.trend-audit-table th:nth-child(2) { width: 13%; }
+.trend-audit-table th:nth-child(3) { width: 32%; }
+.trend-audit-table th:nth-child(4) { width: 25%; }
+.trend-audit-table th:nth-child(5) { width: 16%; }
+
+.trend-audit-reasons,
+.trend-audit-reason,
+.trend-audit-more dl {
+  display: grid;
+  gap: 6px;
+}
+
+.trend-audit-reason {
+  border-left: 3px solid var(--warning);
+  padding-left: 8px;
+}
+
+.trend-audit-reason-counts span,
+.trend-audit-summary span {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.trend-audit-status[data-status="passed"] { color: var(--ok); }
+.trend-audit-status[data-status="excluded"] { color: var(--danger); }
+.trend-audit-status[data-status="missing"],
+.trend-audit-status[data-status="review"] { color: var(--warning); }
+
 .trend-stage li,
 .trend-audit p {
   overflow-wrap: anywhere;
@@ -1687,6 +1866,190 @@ table {
   border-radius: 8px;
   padding: 12px;
   text-align: center;
+}
+
+.trend-controller-status {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.trend-controller-status.blocking {
+  border-left-color: var(--danger);
+}
+
+.trend-controller-status header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.trend-controller-status h2,
+.trend-controller-status dl,
+.trend-controller-status dd,
+.trend-controller-status dt {
+  margin: 0;
+}
+
+.trend-controller-status header strong,
+.trend-controller-status dd {
+  overflow-wrap: anywhere;
+}
+
+.trend-controller-status[data-health="unavailable"] header strong {
+  color: var(--danger);
+}
+
+.trend-controller-status dl {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.trend-controller-status dl div {
+  background: var(--surface-soft);
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.trend-controller-status dt {
+  color: var(--muted);
+}
+
+.trend-controller-status dd {
+  font-weight: 700;
+}
+
+.trend-revision-anomaly,
+.trend-execution-batch-error {
+  background: var(--surface-soft);
+  border-left: 3px solid var(--danger);
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding: 10px 14px;
+}
+
+.trend-risk-summary {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.trend-risk-summary[data-risk-status="paused"] {
+  border-left-color: var(--danger);
+}
+
+.trend-risk-summary header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.trend-risk-summary header span,
+.trend-risk-summary dt,
+.trend-risk-summary p {
+  color: var(--muted);
+}
+
+.trend-risk-summary dl {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.trend-risk-summary dl div {
+  background: var(--surface-soft);
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+}
+
+.trend-risk-summary dd,
+.trend-risk-summary dt,
+.trend-risk-summary p {
+  margin: 0;
+}
+
+.trend-risk-summary dd {
+  font-weight: 700;
+}
+
+.trend-risk-pause {
+  color: var(--danger) !important;
+  font-weight: 700;
+}
+
+.trend-actual-overlay {
+  border-top: 1px solid var(--line);
+  min-width: 0;
+  padding-top: 10px;
+}
+
+.trend-actual-overlay summary {
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 44px;
+  overflow-wrap: anywhere;
+}
+
+.trend-actual-rows,
+.trend-actual-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.trend-actual-row {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.trend-actual-row header,
+.trend-actual-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.trend-actual-row header span {
+  color: var(--muted);
+}
+
+.trend-actual-row header span[data-deviation="followed"] {
+  color: var(--ok);
+}
+
+.trend-actual-row header span[data-deviation="underbought"],
+.trend-actual-row header span[data-deviation="skipped"],
+.trend-actual-row header span[data-deviation="chased"],
+.trend-actual-row header span[data-deviation="not_held"],
+.trend-actual-row header span[data-deviation="reference_unavailable"],
+.trend-actual-row header span[data-deviation="review"] {
+  color: var(--accent-strong);
+}
+
+.trend-actual-row header span[data-deviation="missed_sell"],
+.trend-actual-row header span[data-deviation="overbought"],
+.trend-actual-row header span[data-deviation="outside_report_addition"] {
+  color: var(--danger);
+}
+
+.trend-actual-facts span {
+  background: var(--surface-soft);
+  overflow-wrap: anywhere;
+  padding: 4px 7px;
 }
 
 .cn-trend-stage {
@@ -1742,6 +2105,24 @@ table {
 .cn-trend-table th {
   color: var(--muted);
   font-size: 12px;
+}
+
+.cn-trend-execution td,
+.cn-trend-buy .cn-trend-execution td {
+  background: var(--surface-soft);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.cn-trend-execution span:first-child {
+  color: var(--text);
+  font-weight: 700;
 }
 
 .option-attention-workspace {
@@ -3964,7 +4345,16 @@ tbody tr.active-row,
 .action-card-metrics div,
 .action-card,
 .backtest-metric-card,
+.trend-controller-status dl div,
+.trend-revision-anomaly,
+.trend-execution-batch-error,
+.trend-risk-summary dl div,
+.trend-actual-facts span,
 .cn-trend-card td:nth-child(-n + 2),
+.cn-trend-execution td,
+.cn-trend-buy .cn-trend-execution td,
+.trend-audit-summary span,
+.trend-audit-reason-counts span,
 .option-attention-market th,
 .trend-review-comparison {
   --muted: var(--text);
@@ -4073,7 +4463,14 @@ table {
   }
 
   .trend-report-header,
-  .trend-report-header dl {
+  .trend-report-header dl,
+  .trend-controller-status dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-controller-status header {
+    align-items: stretch;
+    display: grid;
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -4168,6 +4565,14 @@ table {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .trend-risk-summary {
+    padding: 12px;
+  }
+
+  .trend-risk-summary dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .cn-trend-stage {
     padding: 12px;
   }
@@ -4226,6 +4631,64 @@ table {
     background: var(--surface-soft);
   }
 
+  .cn-trend-execution {
+    display: block;
+    margin-top: -12px;
+  }
+
+  .cn-trend-execution td {
+    box-sizing: border-box;
+    display: flex;
+    padding: 10px;
+    width: 100%;
+  }
+
+  .trend-audit-table {
+    display: block;
+    max-width: 100%;
+  }
+
+  .trend-audit-table thead {
+    display: none;
+  }
+
+  .trend-audit-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .trend-audit-row {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: grid;
+    overflow: hidden;
+  }
+
+  .trend-audit-row td {
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+    padding: 10px;
+  }
+
+  .trend-audit-row td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .trend-audit-reason {
+    min-width: 0;
+  }
+
+  .trend-audit-more summary {
+    align-items: center;
+    display: flex;
+    min-height: 44px;
+  }
+
   .trend-discipline summary,
   .trend-audit summary {
     min-height: 44px;
@@ -4256,13 +4719,27 @@ table {
     grid-template-columns: 1fr;
   }
 
+  .account-view-tabs {
+    grid-column: 1;
+    overflow-x: auto;
+  }
+
+  .account-section-actions {
+    grid-column: 1;
+  }
+
+  .account-view-panel > .cn-trend-report,
+  .account-view-panel > .trend-review,
+  .trend-history-panel {
+    padding: 12px;
+  }
+
   .statement-upload {
     display: none;
   }
 
   .account-holdings-table {
     display: block;
-    overflow-x: hidden;
   }
 
   .account-holdings-table thead {

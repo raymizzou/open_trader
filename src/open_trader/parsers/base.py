@@ -11,6 +11,7 @@ from open_trader.models import (
     CashBalance,
     Market,
     Position,
+    StatementTrade,
     TradeFill,
     WarningRecord,
 )
@@ -26,6 +27,7 @@ class ParseResult:
     fills_complete: bool = False
     fills_coverage_start: str | None = None
     fills_coverage_end: str | None = None
+    trades: list[StatementTrade] = field(default_factory=list)
     warnings: list[WarningRecord] = field(default_factory=list)
     page_count: int = 0
 

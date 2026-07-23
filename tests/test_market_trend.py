@@ -15,6 +15,7 @@ from open_trader.a_share_trend import (
     AShareTrendRunResult,
     CandidateInput,
     build_report,
+    write_protection_state,
 )
 from open_trader.daily_premarket import DailyPremarketConfig
 from open_trader.market_trend import (
@@ -32,12 +33,80 @@ from open_trader.notifications import (
     NotificationError,
     NullNotifier,
 )
-from open_trader.tiger_account import TigerAccountError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
+from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def unlock_live_drawdown(data_dir: Path, market: str) -> None:
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
+        strategy_version="v4",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-13",
+        accepted_git_sha="a" * 40,
+        occurred_at="2026-07-14T08:00:00+08:00",
+        actor="pytest",
+        reason="first_activation",
+        entry_eligible_from="2026-07-14",
+    )
+
+
+class DefaultSimAccountClient:
+    def __init__(self, **kwargs: object) -> None:
+        self.acc_id = int(kwargs["simulate_acc_id"])
+
+    def account_snapshot(self) -> dict[str, object]:
+        return {
+            "acc_id": self.acc_id,
+            "net_value": "100000",
+            "cash": "100000",
+            "positions": [],
+        }
+
+    def close(self) -> None:
+        pass
+
+
+def simulation_account_with_positions(
+    *codes: str,
+) -> type[DefaultSimAccountClient]:
+    class SimAccountClient(DefaultSimAccountClient):
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "positions": [
+                    {
+                        "code": code,
+                        "stock_name": code.split(".", 1)[-1],
+                        "qty": "100",
+                        "cost_price": "10",
+                        "market_val": "1000",
+                    }
+                    for code in codes
+                ],
+            }
+
+    return SimAccountClient
+
+
+@pytest.fixture(autouse=True)
+def default_simulation_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        market_trend,
+        "FutuSimulateOrderExecutionClient",
+        DefaultSimAccountClient,
+    )
 
 
 class RecordingFeishu(FeishuWebhookNotifier):
@@ -82,7 +151,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     snapshot = trend_module.trend_strategy_snapshot(market, "abc123", pool_ids)
 
     assert snapshot["strategy_name"] == name
-    assert snapshot["strategy_version"] == "v1"
+    assert snapshot["strategy_version"] == "v3"
     assert snapshot["parameters"] == {
         "candidate_pool_ids": list(pool_ids),
         "min_strength_exclusive": "90",
@@ -97,8 +166,23 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": 10,
         "position_limit": 10,
-        "use_available_cash": True,
-        "trailing_activation_signals": ["boiling", "champagne"],
+        "single_entry_risk_limit": "0.004",
+        "portfolio_risk_limit": "0.04",
+        "abnormal_loss_buffer": "0.01",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+        "kelly_sample_minimum": 30,
+        "kelly_rolling_window": 200,
+        "kelly_fraction": "0.25",
+        "kelly_optimizer": "mean_log_growth_derivative_bisection_96_floor_1e-6",
+        "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+        "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
         "target_weight": "0.04",
         **market_parameters,
         "initial_protection_atr_multiple": "2",
@@ -116,6 +200,19 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     assert rows["过热跟踪"] == (
         "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降"
     )
+    live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
+    assert (live["strategy_id"], live["strategy_version"]) == (
+        f"trend_animals_warm_to_hot/{market}/v4", "v4"
+    )
+    assert live["parameters"]["overheat_trim_fraction"] == "0.30"
+    assert {row["name"] for row in live["parameter_rows"]} >= {
+        "过热止盈比例",
+        "过热止盈信号",
+        "过热止盈次数",
+        "过热止盈取整",
+        "不足一手处理",
+        "清仓优先级",
+    }
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -135,6 +232,9 @@ def config(tmp_path: Path) -> DailyPremarketConfig:
         trend_animals_hk_tm_ids=(622494,),
         trend_us_symbols=("VIXY",),
         trend_hk_symbols=("00700",),
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
     )
 
 
@@ -382,46 +482,6 @@ def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(
     assert account.available_cash == Decimal("0")
 
 
-def test_us_account_refreshes_directly_from_tiger_before_reporting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cfg = config(tmp_path)
-    calls: list[object] = []
-
-    class Client:
-        def __init__(self, *, config: object) -> None:
-            calls.append(("connect", config))
-
-        def fetch_snapshot(self) -> object:
-            calls.append("fetch")
-            return "snapshot"
-
-        def close(self) -> None:
-            calls.append("close")
-
-    def sync(**kwargs: object) -> None:
-        calls.append(("sync", kwargs))
-
-    monkeypatch.setattr(
-        "open_trader.market_trend.load_tiger_account_config",
-        lambda **kwargs: calls.append(("config", kwargs)) or "tiger-config",
-    )
-    monkeypatch.setattr("open_trader.market_trend.TigerAccountClient", Client)
-    monkeypatch.setattr("open_trader.market_trend.sync_tiger_portfolio", sync)
-
-    market_trend._refresh_tiger_account(cfg, "2026-07-15")
-
-    assert calls[:3] == [
-        ("config", {"config_dir": Path("~/.tigeropen/"), "account": None, "sandbox": False}),
-        ("connect", "tiger-config"),
-        "fetch",
-    ]
-    assert calls[3][0] == "sync"
-    assert calls[3][1]["snapshot"] == "snapshot"
-    assert calls[3][1]["update_latest"] is True
-    assert calls[4] == "close"
-
-
 def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
     tmp_path: Path,
 ) -> None:
@@ -572,20 +632,36 @@ def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None
     assert result.status == "failed"
     assert notifier.messages == [
         (
-            "【老虎｜美股趋势报告生成失败｜2026-07-15】",
-            "原因：趋势数据在截止时间前仍未更新\n"
-            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n\n"
-            "报告未生成，请勿依据旧报告交易。",
+            "【需处理｜老虎｜美股趋势报告生成失败｜2026-07-15】",
+            "发生：趋势报告未生成\n"
+            "影响：不能依据旧报告交易\n"
+            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n"
+            "原因：趋势数据在截止时间前仍未更新",
         )
     ]
     ledger = cfg.data_dir / "trend_us_tiger/daily_delivery/2026-07-15.json"
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
-def test_hk_report_keeps_buys_when_statement_is_stale(
+def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "HK")
+    write_protection_state(
+        market_paths(cfg.data_dir, cfg.reports_dir, "HK").state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "00700": {
+                    "initial_line": "9.6",
+                    "active_line": "9.6",
+                    "atr14": "0.2",
+                    "updated_for": "2026-07-14",
+                }
+            },
+        },
+    )
     write_details(
         cfg.data_dir,
         "2026-06",
@@ -619,6 +695,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         }
 
     api_instances = 0
+    lot_requests: list[list[str]] = []
 
     class Api:
         ignored_stale_components = (
@@ -669,14 +746,15 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
 
         def get_daily_kline(self, *args: object, **kwargs: object) -> list[DailyKlineBar]:
             return [
-                DailyKlineBar(
-                    date=f"2026-07-{index + 1:02d}", open=10, high=11,
-                    low=9, close=10, volume=100,
+                    DailyKlineBar(
+                        date=f"2026-07-{index + 1:02d}", open=10, high=10.1,
+                        low=9.9, close=10, volume=100,
                 )
                 for index in range(15)
             ]
 
         def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            lot_requests.append(symbols)
             return {symbol: 100 for symbol in symbols}
 
         def close(self) -> None:
@@ -703,6 +781,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
+        account_factory=simulation_account_with_positions("HK.00700"),
         now_fn=lambda: datetime(2026, 7, 15, 16, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
     )
@@ -726,6 +805,7 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
+        account_factory=simulation_account_with_positions("HK.00700"),
     )
 
     assert result.status == recovered.status == revised.status == "generated"
@@ -734,8 +814,8 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert len(notifier.messages) == 1
     assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
     title, message = notifier.messages[0]
-    assert title == "【辉立｜港股趋势报告｜2026-07-16】"
-    assert "账户状态：账户数据非实时，执行前核对现金与持仓" in message
+    assert title == "【日报｜辉立｜港股趋势报告｜2026-07-16】"
+    assert "账户状态：已更新" in message
     assert "今日动作：卖出 0｜买入 1｜持有 1｜复核 0" in message
     assert "\n买入\n" in message
     assert "02800 盈富基金" in message
@@ -765,9 +845,14 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     assert actions[0]["symbol"] == "02800"
     assert actions[0]["target_amount"] == "4000.00"
     assert actions[0]["estimated_shares"] == 400
-    assert payload["account"]["fresh"] is False
+    assert payload["account"]["fresh"] is True
+    assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["risk_summary"]["kelly_phase"] == "cold_start"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
+    assert payload["risk_summary"]["kelly_cap"] is None
     assert payload["estimated_api_cost"] == "0.142"
     assert payload["signal_snapshots"]["holdings"]["00700"] | {
         "gain_since_entry": "0.048",
@@ -785,44 +870,83 @@ def test_hk_report_keeps_buys_when_statement_is_stale(
     evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["market"] == "HK"
     assert evidence["query"]["component_pool_ids"] == [622494]
-    assert evidence["rebuild_inputs"]["lot_sizes"] == {"02800": 100}
+    assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
+    assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
 
 
-@pytest.mark.parametrize(
-    ("refresh_error", "expected_refresh_error", "forbidden_values"),
-    [
-        (
-            TigerAccountError(
-                "Tiger refresh failed token=TIGER-TOKEN account=123456789",
-                error_type="account_query_failed",
-            ),
-            "account_query_failed",
-            ("TIGER-TOKEN", "123456789"),
-        ),
-        (
-            TigerAccountError(
-                "Tiger refresh failed token=UNKNOWN-MESSAGE-SECRET",
-                error_type="unknown_type_UNKNOWN-TYPE-SECRET",
-            ),
-            "tiger_account_error",
-            ("UNKNOWN-MESSAGE-SECRET", "unknown_type_UNKNOWN-TYPE-SECRET"),
-        ),
-        (
-            RuntimeError(
-                "Tiger refresh failed token=TIGER-TOKEN account=123456789"
-            ),
-            "Tiger account refresh failed",
-            ("TIGER-TOKEN", "123456789"),
-        ),
-    ],
-)
-def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
+def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
-    refresh_error: Exception,
-    expected_refresh_error: str,
-    forbidden_values: tuple[str, ...],
 ) -> None:
     cfg = config(tmp_path)
+    fills = []
+    for index in range(30):
+        common = {
+            "source": "simulation",
+            "source_id": "simulation:futu:102",
+            "broker": "futu",
+            "account_id": "102",
+            "market": "US",
+            "symbol": f"ROUND{index:03d}",
+            "currency": "USD",
+            "quantity": "1",
+            "fee": "0",
+            "costs_complete": True,
+            "strategy_id": "trend_animals_warm_to_hot/US/v4",
+            "strategy_version": "v4",
+            "normal_cost_rate": "0.001",
+            "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+            "report_sha256": "a" * 64,
+            "attribution_status": "attributed",
+            "exclusion_reason": "",
+        }
+        fills.extend(
+            [
+                {
+                    **common,
+                    "fill_id": f"buy-{index:03d}",
+                    "order_id": f"buy-order-{index:03d}",
+                    "side": "buy",
+                    "price": "100",
+                    "filled_at": f"2026-06-{index + 1:02d}T10:00:00+00:00",
+                },
+                {
+                    **common,
+                    "fill_id": f"sell-{index:03d}",
+                    "order_id": f"sell-order-{index:03d}",
+                    "side": "sell",
+                    "price": "110.11" if index < 15 else "90.09",
+                    "filled_at": f"2026-06-{index + 1:02d}T11:00:00+00:00",
+                },
+            ]
+        )
+    stats_payload = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[
+            {
+                "market": "US",
+                "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                "strategy_version": "v4",
+            }
+        ],
+        generated_at="2026-07-15T00:00:00+00:00",
+        statistics_cutoff_at="2026-07-14T23:59:59+00:00",
+    )
+    write_trend_api_stats(cfg.data_dir, stats_payload)
+    unlock_live_drawdown(cfg.data_dir, "US")
+    write_protection_state(
+        market_paths(cfg.data_dir, cfg.reports_dir, "US").state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "VIXY": {
+                    "initial_line": "9.6",
+                    "active_line": "9.6",
+                    "atr14": "0.2",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
     write_tiger_snapshot(
         cfg.data_dir,
         "2026-07-14",
@@ -912,7 +1036,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
                     date=(end - timedelta(days=14 - index))
                     .date()
                     .isoformat(),
-                    open=10, high=11, low=9, close=10, volume=100,
+                    open=10, high=10.1, low=9.9, close=10, volume=100,
                 )
                 for index in range(15)
             ]
@@ -928,9 +1052,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         notifier=notifier,
         api_factory=Api,
         quote_factory=Quote,
-        account_refresher=lambda *args: (_ for _ in ()).throw(
-            refresh_error
-        ),
+        account_factory=simulation_account_with_positions("US.VIXY"),
     )
 
     assert result.json_path is not None
@@ -941,11 +1063,17 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         "cache=client-managed"
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
-    assert payload["account"]["fresh"] is False
+    assert payload["account"]["fresh"] is True
+    assert payload["metadata"]["simulate_acc_id"] == 102
     assert payload["account"]["source_date"] == "2026-07-14"
     assert payload["strategy_judgments"]["formal_actions"] == []
-    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "MANUAL_REVIEW"
-    assert payload["strategy_judgments"]["holding_decisions"][0]["reason"] == "stale_tiger_account"
+    assert payload["risk_summary"]["kelly_phase"] == "active_all_samples"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 30
+    assert payload["risk_summary"]["kelly_cap"] == "0.000000"
+    assert payload["risk_summary"]["pause_reason"] == (
+        "Kelly 上限为 0，仅暂停未来新开仓"
+    )
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "HOLD"
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     replayed = trend_review.rebuild_trend_report_from_evidence(evidence)
@@ -957,15 +1085,36 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
         "strategy_snapshot",
     ):
         assert replayed[key] == payload[key]
-    assert replayed["strategy_judgments"]["formal_actions"] == []
-    assert replayed["strategy_judgments"]["holding_decisions"][0] | {
-        "action": "MANUAL_REVIEW",
-        "reason": "stale_tiger_account",
-    } == replayed["strategy_judgments"]["holding_decisions"][0]
-    assert payload["metadata"]["account_currency"] == "HKD"
-    assert payload["metadata"]["price_fx_to_hkd"] == "7.85"
-    assert payload["metadata"]["account_refresh_error"] == expected_refresh_error
-    assert "账户状态：账户数据非实时，禁止新增买入；持仓需复核" in notifier.messages[0][1]
+    assert replayed["strategy_judgments"] == payload["strategy_judgments"]
+    tampered_evidence = json.loads(json.dumps(evidence))
+    tampered_evidence["rebuild_inputs"]["kelly_rounds"][-1][
+        "net_return"
+    ] = "0.10"
+    tampered = trend_review.rebuild_trend_report_from_evidence(tampered_evidence)
+    assert tampered["risk_summary"]["kelly_cap"] != "0.000000"
+    assert tampered["strategy_judgments"]["formal_actions"] != []
+    shortened_evidence = json.loads(json.dumps(evidence))
+    shortened_evidence["rebuild_inputs"]["kelly_rounds"].pop()
+    shortened = trend_review.rebuild_trend_report_from_evidence(shortened_evidence)
+    assert shortened["risk_summary"]["kelly_phase"] == "cold_start"
+    assert shortened["risk_summary"]["kelly_eligible_sample_count"] == 29
+    assert shortened["risk_summary"]["kelly_cap"] is None
+    invalid_evidence = json.loads(json.dumps(evidence))
+    invalid_evidence["rebuild_inputs"]["kelly_rounds"][0][
+        "costs_complete"
+    ] = 1
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="invalid original input: kelly_rounds",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(invalid_evidence)
+    assert payload["metadata"]["account_currency"] == "USD"
+    assert payload["metadata"]["price_fx_to_account_currency"] == "1"
+    assert "price_fx_to_hkd" not in payload["metadata"]
+    assert evidence["rebuild_inputs"]["price_fx_to_account_currency"] == "1"
+    assert len(evidence["rebuild_inputs"]["kelly_rounds"]) == 30
+    assert "account_refresh_error" not in payload["metadata"]
+    assert "账户状态：已更新" in notifier.messages[0][1]
     output = "\n".join(
         (
             result.json_path.read_text(encoding="utf-8"),
@@ -976,8 +1125,7 @@ def test_stale_us_tiger_account_blocks_buys_and_marks_holdings_for_review(
             *(f"{title}\n{message}" for title, message in notifier.messages),
         )
     )
-    for value in forbidden_values:
-        assert value not in output
+    assert "200000" not in output
 
 
 def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
@@ -1051,7 +1199,6 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
         sleep_fn=lambda seconds: None,
         api_factory=Api,
         quote_factory=Quote,
-        account_refresher=lambda *args: None,
     )
 
     assert result.status == "failed"

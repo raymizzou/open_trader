@@ -9,6 +9,11 @@ from open_trader.decision_plan_watch import (
     run_decision_plan_watch,
 )
 from open_trader.futu_watch import QuoteSnapshot
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
+)
 from open_trader.plan_events import load_plan_events
 
 
@@ -66,12 +71,64 @@ class QuoteClient:
         self.closed = True
 
 
-class FailingNotifier:
+class FailingNotifier(MacOSNotifier):
     def notify(self, title: str, message: str) -> None:
         assert "US.DRAM" in title
         assert "目标总仓位：300" in message
         assert "decision_tab=final" in message
         raise RuntimeError("offline")
+
+
+class RecordingFeishu(FeishuWebhookNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+class RecordingMacOS(MacOSNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+def test_runner_routes_trigger_only_to_macos(tmp_path: Path) -> None:
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+    events_path = tmp_path / "plan_events.jsonl"
+
+    result = run_decision_plan_watch(
+        plans=[price_plan()], events_path=events_path, quote_client=QuoteClient("66"),
+        notifier=CompositeNotifier([feishu, macos]), poll_seconds=1, once=True,
+        now_fn=lambda: at("10:00"), sleep_fn=lambda _: None,
+    )
+
+    events = load_plan_events(events_path)
+    assert feishu.messages == []
+    assert len(macos.messages) == 1
+    assert events[-1].event_type == "notification_sent"
+    assert result.notification_sent_count == 1
+
+
+def test_runner_records_feishu_only_trigger_as_suppressed(tmp_path: Path) -> None:
+    feishu = RecordingFeishu()
+    events_path = tmp_path / "plan_events.jsonl"
+
+    result = run_decision_plan_watch(
+        plans=[price_plan()], events_path=events_path, quote_client=QuoteClient("66"),
+        notifier=feishu, poll_seconds=1, once=True,
+        now_fn=lambda: at("10:00"), sleep_fn=lambda _: None,
+    )
+
+    events = load_plan_events(events_path)
+    assert feishu.messages == []
+    assert events[-1].event_type == "notification_suppressed"
+    assert events[-1].payload == {"reason": "feishu_disabled_by_policy"}
+    assert result.notification_sent_count == 0
+    assert result.notification_failed_count == 0
 
 
 def test_runner_records_notification_failure_without_losing_trigger(tmp_path: Path) -> None:

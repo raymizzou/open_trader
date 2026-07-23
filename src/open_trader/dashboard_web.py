@@ -2,22 +2,27 @@ from __future__ import annotations
 
 import json
 import ipaddress
+import os
+import subprocess
 import threading
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
 from .dashboard import (
+    DETAIL_FX_TO_HKD,
     DashboardConfig,
     _backtest_holding_detail,
     _latest_backtests_by_holding,
+    load_historical_trend_report,
     load_dashboard_state,
+    load_trend_report_history,
 )
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
@@ -31,6 +36,7 @@ from .strategy_backtest import (
     validate_standard_backtest_request,
 )
 from .trading_plan import load_trading_plan_rows
+from .trend_simulate_positions import TrendSimulatePositionService
 
 
 STATIC_DIR = Path(__file__).with_name("dashboard_static")
@@ -282,12 +288,14 @@ def create_dashboard_server(
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
     statement_import_service: StatementImportService | None = None,
+    trend_simulate_position_service: TrendSimulatePositionService | None = None,
     eastmoney_password: str = "",
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
     import_service = statement_import_service or StatementImportService(
         data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
         portfolio_path=config.portfolio_path,
         eastmoney_password=eastmoney_password,
     )
@@ -334,6 +342,48 @@ def create_dashboard_server(
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
+            trend_reports_prefix = "/api/trend-reports/"
+            if path.startswith(trend_reports_prefix):
+                route = path.removeprefix(trend_reports_prefix).split("/", 2)
+                try:
+                    if len(route) == 2 and route[1] == "history":
+                        self._send_json(
+                            load_trend_report_history(
+                                config.reports_dir, broker=route[0]
+                            )
+                        )
+                        return
+                    if len(route) == 3 and route[1] == "history":
+                        try:
+                            report = load_historical_trend_report(
+                                config.data_dir,
+                                config.reports_dir,
+                                broker=route[0],
+                                artifact=unquote(route[2]),
+                            )
+                        except FileNotFoundError as exc:
+                            self._send_error_json(exc, HTTPStatus.NOT_FOUND)
+                            return
+                        self._send_json(report)
+                        return
+                except Exception as exc:
+                    self._send_error_json(exc)
+                    return
+            trend_simulate_prefix = "/api/trend-simulate-positions/"
+            if path.startswith(trend_simulate_prefix):
+                broker = path.removeprefix(trend_simulate_prefix)
+                if broker and "/" not in broker:
+                    try:
+                        if trend_simulate_position_service is None:
+                            raise RuntimeError(
+                                "trend simulate position service is unavailable"
+                            )
+                        self._send_json(
+                            trend_simulate_position_service.load(broker)
+                        )
+                    except Exception as exc:
+                        self._send_error_json(exc)
+                    return
             session_id = self._research_chat_session_id(path)
             if session_id is not None:
                 try:
@@ -469,7 +519,7 @@ def create_dashboard_server(
 
         def _send_json(
             self,
-            payload: dict[str, Any],
+            payload: Any,
             status: HTTPStatus = HTTPStatus.OK,
         ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -482,16 +532,19 @@ def create_dashboard_server(
             except (BrokenPipeError, ConnectionResetError):
                 return
 
-        def _send_error_json(self, error: Exception) -> None:
-            status = HTTPStatus.INTERNAL_SERVER_ERROR
-            if isinstance(error, RequestBodyTooLargeError):
-                status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
-            elif isinstance(error, PermissionError):
-                status = HTTPStatus.FORBIDDEN
-            elif isinstance(error, ValueError):
-                status = HTTPStatus.BAD_REQUEST
-            elif isinstance(error, StandardBacktestExecutionError):
-                status = HTTPStatus.BAD_GATEWAY
+        def _send_error_json(
+            self, error: Exception, status: HTTPStatus | None = None
+        ) -> None:
+            if status is None:
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+                if isinstance(error, RequestBodyTooLargeError):
+                    status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+                elif isinstance(error, PermissionError):
+                    status = HTTPStatus.FORBIDDEN
+                elif isinstance(error, ValueError):
+                    status = HTTPStatus.BAD_REQUEST
+                elif isinstance(error, StandardBacktestExecutionError):
+                    status = HTTPStatus.BAD_GATEWAY
             self._send_json(
                 {
                     "status": "error",
@@ -531,6 +584,31 @@ def _is_loopback_address(value: str) -> bool:
     return address.is_loopback
 
 
+def _dashboard_runtime_metadata() -> dict[str, object]:
+    cwd = Path.cwd().resolve()
+    try:
+        git_sha = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
+        ).strip()
+        source_status = subprocess.check_output(
+            [
+                "git", "-C", str(cwd), "status", "--porcelain",
+                "--untracked-files=all", "--", "src/open_trader",
+            ],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_sha = ""
+        source_status = "unavailable"
+    return {
+        "pid": os.getpid(),
+        "started_at": datetime.now().astimezone().isoformat(),
+        "cwd": str(cwd),
+        "git_sha": git_sha,
+        "source_state": "clean" if not source_status else "dirty",
+    }
+
+
 def serve_dashboard(
     config: DashboardConfig,
     *,
@@ -539,16 +617,33 @@ def serve_dashboard(
     eastmoney_password: str = "",
 ) -> None:
     account_sync_service = DashboardAccountSyncService(config=config)
+    trend_simulate_position_service = TrendSimulatePositionService(
+        host=config.futu_host,
+        port=config.futu_port,
+        account_ids={
+            "eastmoney": config.trend_review_cn_simulate_acc_id,
+            "tiger": config.trend_review_us_simulate_acc_id,
+            "phillips": config.trend_review_hk_simulate_acc_id,
+        },
+        fx_to_hkd=DETAIL_FX_TO_HKD,
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+    )
     server = create_dashboard_server(
         config=config,
         host=host,
         port=port,
         account_sync_service=account_sync_service,
+        trend_simulate_position_service=trend_simulate_position_service,
         eastmoney_password=eastmoney_password,
     )
     _, actual_port = server.server_address
     try:
-        print(f"dashboard_url: http://{host}:{actual_port}")
+        print(
+            f"dashboard_runtime: {json.dumps(_dashboard_runtime_metadata())}",
+            flush=True,
+        )
+        print(f"dashboard_url: http://{host}:{actual_port}", flush=True)
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")

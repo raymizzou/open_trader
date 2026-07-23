@@ -3,6 +3,62 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-23
+
+- Reworked the A-share trend candidate audit into a desktop comparison table
+  and mobile cards that show each reported exclusion's actual value against the
+  frozen strategy requirement, retain historical ATR explanations, and expose
+  unknown rule codes without changing candidate selection or execution.
+
+- Unified CN/HK/US Trend Animals `boiling`/`champagne` exits: the first signal
+  per full position lifecycle trims 30% in SIMULATE (market-lot rounded), while
+  protection, danger, right-side exit, and CN temperature-flat still sell all;
+  real accounts remain manual. Verified the Dashboard acceptance gate (`PASS`)
+  on deployed SHA `b6b94ce` and `3166` tests after merging to `main`.
+- Fixed Dashboard manual refresh to invalidate and reload the active Tiger,
+  Phillips, or Eastmoney simulated-holdings view, so post-report additions do
+  not remain stale; verified `3026` tests, live Dashboard/API refreshes, and
+  the Dashboard acceptance gate (`PASS`) on deployed SHA `3ed7ec3`.
+- Consolidated Feishu trend notifications: retained A/B1/C routing, grouped
+  actionable order failures by market, side, and status, and merged OpenD
+  connectivity/rate-limit incidents across CN, HK, and US while preserving
+  per-market order types.
+- Added persisted one-retry Feishu delivery, legacy-safe A7 review routing,
+  frozen deadline-group retry, and bounded local-channel delivery; verified
+  `3085` automated tests on merged `main`.
+
+## 2026-07-22
+
+- Replaced separate trend report and watcher jobs with one resilient controller
+  per market: only the designated executor host can generate reports or submit
+  orders, failed reports retry, incomplete actions reconcile by stable broker
+  identity, and duplicate orders are rejected before submission.
+- Retired the TradingAgents daily-report dependency, added state-change/cooldown
+  alert suppression, isolated quote failures by market, and made Dashboard
+  simulation-versus-real-account comparisons and numeric precision truthful.
+- Verified `3025` tests, live controller and Dashboard processes, desktop/mobile
+  flows, and the Dashboard acceptance gate (`PASS`) on deployed SHA `2f51376`.
+
+## 2026-07-20
+
+- Added fixed-risk and conservative Kelly sizing to frozen CN/HK/US trend
+  reports, with 0.4% entry risk, a 4% portfolio budget, a 1% abnormal-loss
+  buffer, a 5% drawdown limit, and Kelly restricted to reducing new-entry risk.
+- Added rolling simulation/actual win-rate and payoff statistics, statement/API
+  updates, read-only real-account comparison, and truthful execution-day status;
+  verified `2695` tests, live account/API refreshes, desktop/mobile flows, and
+  the Dashboard acceptance gate (`PASS`) on the deployed Git SHA.
+
+## 2026-07-18
+
+- Closed the CN/HK/US trend-simulation execution loop with idempotent Futu
+  market orders, buy/sell recovery, partial-fill and failure status, and
+  pre-close incomplete-execution alerts linked back to each frozen report.
+- Added same-level real holdings, simulated holdings, trend report, and review
+  views with attributed simulated positions and persistent immutable report
+  history; verified `2486` tests, live account/API refreshes, desktop/mobile
+  flows, and the Dashboard acceptance gate (`PASS`) on the deployed Git SHA.
+
 ## 2026-07-16
 
 - Added desktop-only, right-aligned Phillips and Eastmoney statement uploads

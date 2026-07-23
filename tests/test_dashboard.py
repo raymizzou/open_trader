@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import json
 from datetime import UTC, date, datetime
@@ -29,6 +30,10 @@ from open_trader.decision_facts import (
 )
 from open_trader.decision_plan import build_decision_plan, publish_decision_plans
 from open_trader.kelly_strategy_stats import build_kelly_strategy_stats_payload
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
 from open_trader.plan_events import PlanEvent, append_plan_event
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
@@ -156,7 +161,13 @@ def write_csv(path: Path, fieldnames: list[str] | tuple[str, ...], rows: list[di
         writer.writerows(rows)
 
 
-def dashboard_config(tmp_path: Path) -> DashboardConfig:
+def dashboard_config(
+    tmp_path: Path,
+    *,
+    trend_review_cn_simulate_acc_id: int = 0,
+    trend_review_us_simulate_acc_id: int = 0,
+    trend_review_hk_simulate_acc_id: int = 0,
+) -> DashboardConfig:
     return DashboardConfig(
         portfolio_path=tmp_path / "data" / "latest" / "portfolio.csv",
         data_dir=tmp_path / "data",
@@ -164,7 +175,18 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
         poll_seconds=1.5,
         futu_host="127.0.0.1",
         futu_port=11111,
+        trend_review_cn_simulate_acc_id=trend_review_cn_simulate_acc_id,
+        trend_review_us_simulate_acc_id=trend_review_us_simulate_acc_id,
+        trend_review_hk_simulate_acc_id=trend_review_hk_simulate_acc_id,
     )
+
+
+def test_dashboard_config_defaults_simulate_account_ids_to_zero(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+
+    assert config.trend_review_cn_simulate_acc_id == 0
+    assert config.trend_review_us_simulate_acc_id == 0
+    assert config.trend_review_hk_simulate_acc_id == 0
 
 
 def test_dashboard_ignores_zero_quantity_closed_positions(tmp_path: Path) -> None:
@@ -226,6 +248,287 @@ def serialized_trend_position() -> dict[str, object]:
     }
 
 
+def write_trend_history_report(
+    reports_dir: Path,
+    artifact: str,
+    *,
+    execution_date: str,
+    generated_at: str,
+    market: str = "US",
+    broker: str = "tiger",
+    symbol: str = "VIXY",
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "execution_date": execution_date,
+        "as_of_date": "2026-07-17",
+        "generated_at": generated_at,
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": market, "broker": broker},
+        "strategy_snapshot": {"strategy_version": "v1"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": symbol}],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "option_attention": [],
+    }
+    path = reports_dir / "trend_us_tiger" / artifact
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def test_trend_report_history_uses_payload_date_and_keeps_revisions(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_trend_report_history
+
+    write_trend_history_report(
+        tmp_path,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    write_trend_history_report(
+        tmp_path,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    write_trend_history_report(
+        tmp_path,
+        "2026-07-16.json",
+        execution_date="2026-07-17",
+        generated_at="2026-07-17T09:00:00+08:00",
+    )
+
+    history = load_trend_report_history(tmp_path, broker="tiger")
+
+    assert [row["execution_date"] for row in history[:2]] == [
+        "2026-07-20",
+        "2026-07-20",
+    ]
+    assert {row["artifact"] for row in history[:2]} == {
+        "2026-07-17.json",
+        "2026-07-17-r1.json",
+    }
+    assert history[0] == {
+        "available": True,
+        "artifact": "2026-07-17-r1.json",
+        "execution_date": "2026-07-20",
+        "data_date": "2026-07-17",
+        "generated_at": "2026-07-18T09:30:00+08:00",
+        "strategy_version": "v1",
+        "revision": 1,
+        "execution_counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
+    }
+
+
+def test_trend_report_history_marks_corrupt_artifact_without_hiding_siblings(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_trend_report_history
+
+    write_trend_history_report(
+        tmp_path,
+        "valid.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    (tmp_path / "trend_us_tiger" / "broken.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+
+    history = load_trend_report_history(tmp_path, broker="tiger")
+
+    assert history[0]["artifact"] == "valid.json"
+    assert history[-1] == {
+        "available": False,
+        "artifact": "broken.json",
+        "status_text": "报告不可读取",
+    }
+
+
+def test_trend_report_history_marks_symlink_escape_unreadable(tmp_path: Path) -> None:
+    from open_trader.dashboard import load_trend_report_history
+
+    outside = tmp_path / "outside"
+    write_trend_history_report(
+        outside,
+        "external.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    reports_dir = tmp_path / "reports"
+    linked = reports_dir / "trend_us_tiger" / "linked.json"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside / "trend_us_tiger" / "external.json")
+
+    history = load_trend_report_history(reports_dir, broker="tiger")
+
+    assert history == [{
+        "available": False,
+        "artifact": "linked.json",
+        "status_text": "报告不可读取",
+    }]
+
+
+def test_exact_historical_report_includes_its_immutable_execution(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+    from open_trader.trend_review import _report_hash
+
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-16.json",
+        execution_date="2026-07-17",
+        generated_at="2026-07-17T09:00:00+08:00",
+    )
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-17/action-key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(
+        json.dumps({
+            "report_sha256": _report_hash(payload),
+            "symbol": "VIXY",
+            "side": "buy",
+            "status": "missed",
+            "recorded_at": "2026-07-17T16:00:00-04:00",
+            "reason": "buy_window_closed",
+        }),
+        encoding="utf-8",
+    )
+
+    report = load_historical_trend_report(
+        config.data_dir,
+        config.reports_dir,
+        broker="tiger",
+        artifact="2026-07-16.json",
+    )
+
+    assert report["report_date"] == "2026-07-17"
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+    assert report["audit"]["artifact"] == "2026-07-16.json"
+    assert report["report_sha256"] == _report_hash(payload)
+    assert report["strategy_version"] == "v1"
+
+
+@pytest.mark.parametrize("artifact", ["../secret.json", "/tmp/secret.json"])
+def test_historical_report_rejects_unsafe_artifact_paths(
+    tmp_path: Path, artifact: str,
+) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+
+    config = dashboard_config(tmp_path)
+    with pytest.raises(ValueError, match="unsafe trend report artifact"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact=artifact,
+        )
+
+
+def test_historical_report_rejects_artifact_resolving_outside_broker_directory(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+
+    config = dashboard_config(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    linked = config.reports_dir / "trend_us_tiger" / "linked.json"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="unsafe trend report artifact"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact="linked.json",
+        )
+
+
+def test_historical_report_rejects_wrong_report_market(tmp_path: Path) -> None:
+    from open_trader.dashboard import load_historical_trend_report
+
+    config = dashboard_config(tmp_path)
+    write_trend_history_report(
+        config.reports_dir,
+        "wrong-market.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+        market="HK",
+    )
+
+    with pytest.raises(ValueError, match="trend report artifact is unreadable"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact="wrong-market.json",
+        )
+
+
+def test_trend_report_history_and_exact_loading_reject_missing_strategy_version(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import (
+        load_historical_trend_report,
+        load_trend_report_history,
+    )
+
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "missing-version.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    payload.pop("strategy_snapshot")
+    artifact = config.reports_dir / "trend_us_tiger" / "missing-version.json"
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_trend_report_history(config.reports_dir, broker="tiger") == [{
+        "available": False,
+        "artifact": "missing-version.json",
+        "status_text": "报告不可读取",
+    }]
+    with pytest.raises(ValueError, match="trend report artifact is unreadable"):
+        load_historical_trend_report(
+            config.data_dir,
+            config.reports_dir,
+            broker="tiger",
+            artifact="missing-version.json",
+        )
+
+
+@pytest.mark.parametrize("loader", ["history", "artifact"])
+def test_trend_report_loaders_reject_unknown_broker(
+    tmp_path: Path, loader: str,
+) -> None:
+    from open_trader.dashboard import (
+        load_historical_trend_report,
+        load_trend_report_history,
+    )
+
+    with pytest.raises(ValueError, match="unsupported trend report broker"):
+        if loader == "history":
+            load_trend_report_history(tmp_path, broker="unknown")
+        else:
+            load_historical_trend_report(
+                tmp_path / "data",
+                tmp_path / "reports",
+                broker="unknown",
+                artifact="report.json",
+            )
+
+
 def trend_review_projection(market: str, broker: str) -> dict[str, object]:
     effective_from = {"CN": "2026-07-16", "US": "2026-07-17", "HK": "2026-07-17"}[
         market
@@ -278,6 +581,21 @@ def trend_review_projection(market: str, broker: str) -> dict[str, object]:
             )
         },
     }
+
+
+def trend_review_projection_v2(market: str, broker: str) -> dict[str, object]:
+    payload = trend_review_projection(market, broker)
+    effective_from = {"CN": "2026-07-16", "US": "2026-07-17", "HK": "2026-07-17"}[
+        market
+    ]
+    payload.update({
+        "schema_version": "open_trader.trend_review.projection.v2",
+        "sample_counts": {"discipline": 31, "actual": 29, "required": 30},
+        "common_cutoff": "2026-07-17",
+        "interval": {"start": effective_from, "end": "2026-07-17"},
+    })
+    payload["strategy_snapshot"]["effective_from"] = effective_from  # type: ignore[index]
+    return payload
 
 
 def test_dashboard_loads_only_strict_market_matched_trend_reviews(
@@ -354,6 +672,19 @@ def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
 
     assert review["available"] is False
+
+
+def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> None:
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v2("US", "tiger")), encoding="utf-8"
+    )
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is True
+    assert review["metrics"]["calmar"]["actual"]["value"] == "9.4"
 
 
 @pytest.mark.parametrize(
@@ -467,11 +798,15 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from open_trader.trend_review import _report_hash
+
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
 
     monkeypatch.setattr(
-        dashboard_module, "_shanghai_date", lambda: date(2026, 7, 15)
+        dashboard_module,
+        "_trend_market_date",
+        lambda _market, *, now=None: date(2026, 7, 15),
     )
     for directory, account_source_date, data_sources in [
         (
@@ -566,6 +901,36 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     log.write_text(json.dumps({
         "event": "failed", "run_date": "2026-07-15",
     }) + "\n", encoding="utf-8")
+    execution = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-15/action-key"
+        / "2026-07-15T10-00-00-04-00-event.json"
+    )
+    execution.parent.mkdir(parents=True)
+    execution.write_text(
+        json.dumps(
+            {
+                "market": "US",
+                "date": "2026-07-15",
+                "report_sha256": _report_hash(json.loads(
+                    (
+                        config.reports_dir
+                        / "trend_us_tiger/2026-07-15-b.json"
+                    ).read_text(encoding="utf-8")
+                )),
+                "symbol": "VIXY",
+                "side": "buy",
+                "status": "partially_filled",
+                "filled_qty": "20",
+                "target_qty": "40",
+                "avg_fill_price": "50.25",
+                "order_ids": ["SIM-1"],
+                "recorded_at": "2026-07-15T10:00:00-04:00",
+                "reason": "",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     state = load_dashboard_state(config).to_dict()
     reports = state["trend_reports"]
@@ -577,6 +942,15 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     assert reports["tiger"]["data_status"] == "current"
     assert reports["tiger"]["generated_at"] == "2026-07-15T11:30:36+08:00"
     assert reports["tiger"]["sell_actions"][0]["symbol"] == "AAPL"
+    assert reports["tiger"]["buy_actions"][0]["execution"] == {
+        "status": "partially_filled",
+        "filled_qty": "20",
+        "target_qty": "40",
+        "avg_fill_price": "50.25",
+        "order_ids": ["SIM-1"],
+        "updated_at": "2026-07-15T10:00:00-04:00",
+        "reason": "",
+    }
     assert reports["tiger"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
     assert reports["tiger"]["run_status"] == "failed"
     assert reports["tiger"]["recent_protection_alert"] == (
@@ -584,6 +958,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     )
     assert reports["tiger"]["audit"] == {
         "candidates": [{"symbol": "VIXY", "strength": "95"}],
+        "strategy_parameters": {},
         "excluded": {"QQQ": ["already_held"]},
         "industry_concentration": [["科技", 1, "0.25"]],
         "data_sources": ["Trend Animals", "Tiger US daily K-line"],
@@ -784,7 +1159,39 @@ def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
     assert report["option_attention"] == current_attention
 
 
-def test_dashboard_hk_friday_report_is_current_then_stale_over_weekend(
+def test_dashboard_uses_market_local_date_for_current_us_report(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    (reports_dir / "2026-07-20.json").write_text(json.dumps({
+        "execution_date": "2026-07-21",
+        "as_of_date": "2026-07-20",
+        "generated_at": "2026-07-21T22:44:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "option_attention": [option_attention("QQQ")],
+    }), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        now=datetime(
+            2026, 7, 22, 1, 0, tzinfo=dashboard_module.SHANGHAI
+        ),
+    )["tiger"]
+
+    assert report["data_status"] == "current"
+    assert report["report_date"] == "2026-07-21"
+
+
+def test_dashboard_hk_friday_report_is_current_then_stale_then_current_for_execution(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -830,11 +1237,20 @@ def test_dashboard_hk_friday_report_is_current_then_stale_over_weekend(
     saturday = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 18)
     )["phillips"]
+    monday_reports = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 20)
+    )
+    monday = monday_reports["phillips"]
 
     assert friday["data_status"] == "current"
     assert friday["report_date"] == "2026-07-20"
     assert friday["option_attention"] == current_attention
     assert saturday["data_status"] == "stale"
+    assert monday["data_status"] == "current"
+    assert monday["status_text"] == "今日执行（数据截至 2026-07-17）"
+    assert monday_reports["futu"]["attention_markets"][1]["status_text"] == (
+        "今日执行（数据截至 2026-07-17）"
+    )
 
 
 def test_dashboard_legacy_hk_friday_report_uses_generated_date_for_freshness(
@@ -915,6 +1331,7 @@ def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
                 "market_label": "美股",
                 "data_status": "stale",
                 "data_date": "2026-07-14",
+                "status_text": "数据截至 2026-07-14；今日未更新",
                 "items": stale_us,
             },
             {
@@ -922,10 +1339,1045 @@ def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
                 "market_label": "港股",
                 "data_status": "current",
                 "data_date": "2026-07-15",
+                "status_text": "今日已更新",
                 "items": current_hk,
             },
         ],
     }
+
+
+def _valid_v2_dashboard_trend_payload() -> dict[str, object]:
+    risk_summary = {
+        "status": "active",
+        "status_label": "风险预算内",
+        "pause_reason": "",
+        "existing_planned_risk": "0",
+        "new_planned_risk": "303",
+        "portfolio_planned_risk": "303",
+        "portfolio_planned_risk_pct": "0.00303",
+        "portfolio_risk_limit": "4000",
+        "portfolio_risk_limit_pct": "0.04",
+        "portfolio_remaining_risk": "3697",
+        "portfolio_remaining_risk_pct": "0.03697",
+        "single_entry_risk_limit": "400",
+        "single_entry_risk_limit_pct": "0.004",
+        "abnormal_loss_buffer": "1000",
+        "abnormal_loss_buffer_pct": "0.01",
+        "total_risk_budget_target_pct": "0.05",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+        "portfolio_remaining_risk_note": (
+            "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
+        ),
+    }
+    risk_skips = [{
+        "symbol": "600002",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 0,
+        "reason": "最小交易单位 100 股超过组合剩余风险",
+        "decisive_constraint": "组合剩余风险",
+    }]
+    return {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T20:00:00+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v2",
+            "strategy_version": "v2",
+            "parameters": {
+                "single_entry_risk_limit": "0.004",
+                "portfolio_risk_limit": "0.04",
+                "abnormal_loss_buffer": "0.01",
+                "normal_cost_rate": "0.001",
+                "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+            },
+        },
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "target_amount": "4000",
+                "estimated_shares": 300,
+                "lot_size": 100,
+                "close": "10",
+                "planned_stop_risk": "303",
+                "planned_stop_risk_pct": "0.00303",
+                "normal_cost": "3",
+                "decisive_constraint": "单笔风险上限",
+            }],
+            "holding_decisions": [],
+            "top10_candidates": [],
+            "risk_skips": risk_skips,
+        },
+        "risk_summary": risk_summary,
+        "option_attention": [],
+    }
+
+
+def _valid_v3_dashboard_trend_payload() -> dict[str, object]:
+    payload = copy.deepcopy(_valid_v2_dashboard_trend_payload())
+    snapshot = payload["strategy_snapshot"]
+    summary = payload["risk_summary"]
+    assert isinstance(snapshot, dict) and isinstance(summary, dict)
+    snapshot["strategy_version"] = "v3"
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update(
+        {
+            "kelly_sample_minimum": 30,
+            "kelly_rolling_window": 200,
+            "kelly_fraction": "0.25",
+            "kelly_optimizer": "mean_log_growth_derivative_bisection_96_floor_1e-6",
+            "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+            "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
+        }
+    )
+    summary.update(
+        {
+            "kelly_phase": "cold_start",
+            "kelly_eligible_sample_count": 0,
+            "kelly_selected_sample_count": 0,
+            "kelly_cap": None,
+            "kelly_reason": "Kelly 冷启动：0/30 个合格模拟闭环；继续使用固定风险仓位",
+            "kelly_last_closed_at": "",
+            "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+        }
+    )
+    return payload
+
+
+def test_dashboard_enforces_issue_4_and_kelly_contract_for_v3(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v3_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary["normal_cost_rate"] = "0.009"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+
+
+def test_dashboard_accepts_exact_v3_zero_kelly_pause(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v3_dashboard_trend_payload()
+    judgments = payload["strategy_judgments"]
+    summary = payload["risk_summary"]
+    assert isinstance(judgments, dict) and isinstance(summary, dict)
+    judgments["formal_actions"] = []
+    judgments["risk_skips"][0].update(
+        {
+            "target_weight": "0",
+            "target_amount": "0",
+            "reason": "Kelly 上限为 0，仅暂停未来新开仓",
+            "decisive_constraint": "Kelly 上限",
+        }
+    )
+    summary.update(
+        {
+            "status": "paused",
+            "status_label": "暂停新开仓",
+            "pause_reason": "Kelly 上限为 0，仅暂停未来新开仓",
+            "new_planned_risk": "0",
+            "portfolio_planned_risk": "0",
+            "portfolio_planned_risk_pct": "0",
+            "portfolio_remaining_risk": "4000",
+            "portfolio_remaining_risk_pct": "0.04",
+            "kelly_phase": "active_all_samples",
+            "kelly_eligible_sample_count": 30,
+            "kelly_selected_sample_count": 30,
+            "kelly_cap": "0.000000",
+            "kelly_reason": "Kelly 上限为 0，仅暂停未来新开仓",
+            "kelly_last_closed_at": "2026-07-14T16:00:00+00:00",
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["risk_summary"]["kelly_cap"] == "0.000000"
+
+
+def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert {
+        key: value
+        for key, value in report["risk_summary"].items()
+        if key != "trade_stats"
+    } == payload["risk_summary"]
+    assert report["risk_summary"]["trade_stats"] == {
+        "available": False,
+        "status_text": "交易统计暂不可用",
+    }
+    assert report["risk_skips"] == payload["strategy_judgments"]["risk_skips"]
+
+
+def test_dashboard_projects_frozen_strategy_parameters_into_cn_audit(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update({
+        "max_filter_price": "200",
+        "min_strength": "95",
+        "allowed_industry_temperatures": ["热", "沸"],
+        "allowed_phases": ["谷雨", "立夏", "夏至"],
+        "min_market_cap_100m": "100",
+        "min_amount_100m": "2",
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["audit"]["strategy_parameters"] == parameters
+    assert report["audit"]["strategy_parameters"] is not parameters
+
+
+@pytest.mark.parametrize("parameters", ["missing", ["legacy"]])
+def test_dashboard_projects_legacy_strategy_parameters_as_empty_dict(
+    tmp_path: Path, parameters: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    if parameters == "missing":
+        snapshot.pop("parameters")
+    else:
+        snapshot["parameters"] = parameters
+
+    report = dashboard_module._project_broker_trend_report(
+        selected=(
+            path,
+            payload,
+            date(2026, 7, 15),
+            date(2026, 7, 14),
+            date(2026, 7, 15),
+            datetime.fromisoformat("2026-07-15T20:00:00+08:00"),
+        ),
+        data_dir=config.data_dir,
+        reports_dir=path.parent,
+        broker="eastmoney",
+        market="CN",
+        market_label="A股",
+        broker_label="东方财富",
+        buy_window="09:30–10:00",
+        report_date="2026-07-15",
+    )
+
+    assert report["available"] is True
+    assert report["audit"]["strategy_parameters"] == {}
+
+
+def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
+    payload = copy.deepcopy(_valid_v3_dashboard_trend_payload())
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+    })
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update({
+        "drawdown_limit": "0.05",
+        "drawdown_equity_source": "Futu SIMULATE strategy NAV",
+        "drawdown_unlock": "manual_same_version_rebase",
+    })
+    payload["drawdown_summary"] = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v4|v4",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "100000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-15T20:00:00+08:00",
+        "bootstrap_event": {
+            "event_id": "automatic-bootstrap-" + "1" * 64,
+            "event_type": "automatic_bootstrap",
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+            "strategy_version": "v4",
+            "actor": "acceptance",
+            "occurred_at": "2026-07-15T08:00:00+08:00",
+            "baseline_equity": "100000",
+            "source_date": "2026-07-14",
+            "accepted_git_sha": "a" * 40,
+            "parameter_hash": "b" * 64,
+            "reason": "first_activation",
+            "entry_eligible_from": "2026-07-15",
+        },
+        "recovery_event": None,
+    }
+    return payload
+
+
+def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v4_dashboard_trend_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert {
+        key: value
+        for key, value in report["risk_summary"].items()
+        if key != "trade_stats"
+    } == payload["risk_summary"]
+    assert report["drawdown_summary"] == payload["drawdown_summary"]
+
+
+def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
+    monkeypatch.setattr(
+        dashboard_module, "_shanghai_date", lambda: date(2026, 7, 15)
+    )
+    report_path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    payload = _valid_v4_dashboard_trend_payload()
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    buy = judgments["formal_actions"][0]
+    assert isinstance(buy, dict)
+    buy["name"] = "测试"
+    buy["estimated_initial_line"] = "9"
+    sell = {
+        "action": "SELL_ALL",
+        "symbol": "600003",
+        "name": "待卖",
+        "reason": "danger_signal",
+        "close": "20",
+        "active_line": "18",
+    }
+    hold = {
+        "action": "HOLD",
+        "symbol": "600004",
+        "name": "持有",
+        "reason": "trend_intact",
+        "close": "30",
+        "active_line": "29",
+    }
+    judgments["formal_actions"].insert(0, sell)
+    judgments["holding_decisions"] = [sell, hold]
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    frozen_bytes = report_path.read_bytes()
+    frozen_hash = _report_hash(payload)
+
+    detail_dir = config.data_dir / "runs/2026-07-15"
+    positions = [
+        ("600001", "200", "10", "2000"),
+        ("600002", "100", "10", "1000"),
+        ("600003", "50", "20", "1000"),
+        ("600004", "100", "30", "3000"),
+        ("600099", "10", "50", "500"),
+    ]
+
+    def write_actual_rows(buy_quantity: str) -> None:
+        rows = []
+        for symbol, quantity, last_price, market_value in positions:
+            if symbol == "600001":
+                quantity, market_value = buy_quantity, str(Decimal(buy_quantity) * 10)
+            rows.append({
+                "statement_id": "2026-07-eastmoney",
+                "broker": "eastmoney",
+                "account_alias": "eastmoney_main",
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": symbol,
+                "name": symbol,
+                "currency": "CNY",
+                "quantity": quantity,
+                "last_price": last_price,
+                "market_value": market_value,
+            })
+        write_csv(detail_dir / "extracted_positions.csv", POSITION_FIELDNAMES, rows)
+        invested = sum(Decimal(row["market_value"]) for row in rows)
+        write_csv(
+            detail_dir / "extracted_cash.csv",
+            CASH_FIELDNAMES,
+            [{
+                "statement_id": "2026-07-eastmoney",
+                "broker": "eastmoney",
+                "account_alias": "eastmoney_main",
+                "currency": "CNY",
+                "cash_balance": str(Decimal("100000") - invested),
+                "available_balance": str(Decimal("100000") - invested),
+            }],
+        )
+
+    write_actual_rows("200")
+    first = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
+    write_actual_rows("500")
+    second = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
+    write_actual_rows("0")
+    third = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
+
+    assert report_path.read_bytes() == frozen_bytes
+    assert (
+        first["report_sha256"]
+        == second["report_sha256"]
+        == third["report_sha256"]
+        == frozen_hash
+    )
+    for key in ("buy_actions", "sell_actions", "hold_actions", "risk_skips"):
+        assert first[key] == second[key] == third[key]
+    assert {
+        key: value
+        for key, value in first["risk_summary"].items()
+        if key != "trade_stats"
+    } == payload["risk_summary"]
+    assert first["risk_summary"] == second["risk_summary"] == third["risk_summary"]
+
+    first_overlay = first["actual_overlay"]
+    assert first_overlay["available"] is True
+    assert first_overlay["broker_label"] == "东方财富"
+    assert first_overlay["account_nav_hkd"] == "108000.00"
+    assert first_overlay["status_text"] == "结单数据，非实时"
+    first_by_symbol = {
+        item["symbol"]: item for item in first_overlay["items"]
+    }
+    assert first_by_symbol["600001"] == {
+        "symbol": "600001",
+        "name": "测试",
+        "frozen_action": "BUY",
+        "frozen_action_label": "正式买入",
+        "target_weight": "0.04",
+        "simulation_quantity": "300",
+        "actual_reference_quantity": "400",
+        "actual_quantity": "200",
+        "actual_market_value": "2000",
+        "currency": "CNY",
+        "deviation": "underbought",
+        "deviation_label": "少买",
+        "frozen_reference_price": "10",
+        "protection_line": "9",
+        "protection_line_label": "预计保护线",
+        "estimated_exit_loss": "200.00",
+        "risk_note": "若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）",
+    }
+    assert first_by_symbol["600002"]["deviation_label"] == "追买"
+    assert first_by_symbol["600003"]["deviation_label"] == "漏卖"
+    assert first_by_symbol["600004"]["deviation_label"] == "已跟随"
+    assert first_by_symbol["600004"]["risk_note"] == (
+        "若按策略保护线退出，预计损失 CNY 100.00（按冻结参考价估算，不代表实时风险上限）"
+    )
+    assert first_overlay["outside_positions"] == [{
+        "symbol": "600099",
+        "name": "600099",
+        "actual_quantity": "10",
+        "actual_market_value": "500",
+        "currency": "CNY",
+        "deviation": "outside_report_addition",
+        "deviation_label": "报告外加仓",
+        "attribution_status": "unconfirmed",
+        "risk_note": "风险未纳入估算",
+    }]
+    assert second["actual_overlay"]["items"][1]["deviation_label"] == "超买"
+    assert third["actual_overlay"]["items"][1]["deviation_label"] == "跳过"
+    assert "真实最大风险" not in json.dumps(first_overlay, ensure_ascii=False)
+    assert "已挂" not in json.dumps(first_overlay, ensure_ascii=False)
+
+
+def test_dashboard_projects_partial_sell_goal_and_manual_real_account_guidance(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload = {
+        "strategy_judgments": {
+            "formal_actions": [
+                {
+                    "action": "SELL_PARTIAL",
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "reason": "overheat_take_profit",
+                    "estimated_shares": 3,
+                    "lot_size": 1,
+                    "target_fraction": "0.30",
+                    "position_started_for": "2026-07-01",
+                    "overheat_signals": ["boiling"],
+                },
+                {"action": "SELL_ALL", "symbol": "MSFT", "reason": "danger_signal"},
+            ],
+            "holding_decisions": [],
+        },
+    }
+    report_sha256 = _report_hash(payload)
+    event_path = (
+        tmp_path
+        / "trend_review/ledgers/US/actions/2026-07-15/partial/event.json"
+    )
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text(json.dumps({
+        "report_sha256": report_sha256,
+        "symbol": "AAPL",
+        "side": "sell",
+        "status": "partially_filled",
+        "sell_goal": "partial_30",
+        "lifecycle_target_qty": "3",
+        "target_qty": "3",
+        "filled_qty": "1",
+        "recorded_at": "2026-07-15T10:00:00-04:00",
+    }), encoding="utf-8")
+
+    executions = dashboard_module._trend_action_executions(
+        tmp_path,
+        market="US",
+        execution_date="2026-07-15",
+        report_sha256=report_sha256,
+    )
+    sells, *_ = dashboard_module._project_trend_actions(payload, executions)
+    partial = sells[0]
+    actual = dashboard_module._project_trend_actual_item(
+        partial,
+        None,
+        nav_hkd=None,
+        market="US",
+        price_fx_to_hkd=None,
+        price_fx_note="",
+        risk_skip=False,
+    )
+
+    assert [item["action"] for item in sells] == ["SELL_PARTIAL", "SELL_ALL"]
+    assert partial["execution"] == {
+        "status": "partially_filled",
+        "sell_goal": "partial_30",
+        "lifecycle_target_qty": "3",
+        "target_qty": "3",
+        "filled_qty": "1",
+        "remaining_qty": "2",
+        "avg_fill_price": "",
+        "order_ids": [],
+        "updated_at": "2026-07-15T10:00:00-04:00",
+        "reason": "",
+    }
+    assert actual["frozen_action_label"] == "止盈减仓 30%"
+    assert actual["manual_execution_guidance"] == "按实盘下单时持仓的 30% 向下取整"
+    assert actual["actual_reference_quantity"] == ""
+    below_lot = dashboard_module._project_trend_actual_item(
+        {**partial, "estimated_shares": 0},
+        None,
+        nav_hkd=None,
+        market="US",
+        price_fx_to_hkd=None,
+        price_fx_note="",
+        risk_skip=False,
+    )
+    assert below_lot["simulation_quantity"] == "0"
+
+
+def test_dashboard_projects_only_strict_partial_sells_and_full_exit_wins() -> None:
+    valid_partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "SH.600001",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 300,
+        "lot_size": 100,
+        "overheat_signals": ["boiling"],
+    }
+    invalid_partial = {
+        **valid_partial,
+        "symbol": "600002",
+        "estimated_shares": 301,
+    }
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "formal_actions": [
+                valid_partial,
+                {"action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"},
+                invalid_partial,
+            ],
+            "holding_decisions": [],
+        },
+    }
+
+    sells, _, _, reviews = dashboard_module._project_trend_actions(payload, {})
+
+    assert [item["action"] for item in sells] == ["SELL_ALL"]
+    assert reviews == [invalid_partial]
+
+
+@pytest.mark.parametrize(
+    (
+        "market",
+        "broker",
+        "directory",
+        "currency",
+        "fx",
+        "expected_fx",
+        "price",
+        "lot",
+        "cash_balance",
+        "expected_quantity",
+        "live",
+        "label",
+    ),
+    [
+        (
+            "US", "tiger", "trend_us_tiger", "USD", "8", "8", "100",
+            1, "248000", "100", True, "老虎",
+        ),
+        (
+            "HK", "phillips", "trend_hk_phillips", "HKD", "", "1", "20",
+            100, "98000", "200", False, "辉立",
+        ),
+    ],
+)
+def test_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
+    tmp_path: Path,
+    market: str,
+    broker: str,
+    directory: str,
+    currency: str,
+    fx: str,
+    expected_fx: str,
+    price: str,
+    lot: int,
+    cash_balance: str,
+    expected_quantity: str,
+    live: bool,
+    label: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    report_path = config.reports_dir / directory / "2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps({
+            "execution_date": "2026-07-15",
+            "as_of_date": "2026-07-14",
+            "generated_at": "2026-07-15T08:00:00+08:00",
+            "account": serialized_trend_account(fresh=True),
+            "metadata": {"market": market, "broker": broker},
+            "strategy_snapshot": {"strategy_version": "v1"},
+            "strategy_judgments": {
+                "formal_actions": [{
+                    "action": "BUY",
+                    "symbol": "TARGET",
+                    "name": "Target",
+                    "target_weight": "0.04",
+                    "estimated_shares": 3,
+                    "close": price,
+                    "lot_size": lot,
+                    "estimated_initial_line": str(Decimal(price) * Decimal("0.9")),
+                }],
+                "holding_decisions": [],
+                "top10_candidates": [],
+            },
+            "option_attention": [],
+        }),
+        encoding="utf-8",
+    )
+    statement_id = f"2026-07-15-{broker}-live" if live else f"2026-07-{broker}"
+    positions = [{
+        "statement_id": statement_id,
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "market": market,
+        "asset_class": "stock",
+        "symbol": "TARGET",
+        "name": "Target",
+        "currency": currency,
+        "quantity": str(Decimal("2000") / Decimal(price)),
+        "last_price": price,
+        "market_value": "2000",
+        "fx_to_hkd": fx,
+    }]
+    cash = [{
+        "statement_id": statement_id,
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "currency": currency,
+        "cash_balance": cash_balance,
+        "available_balance": "1000",
+        "fx_to_hkd": fx,
+    }]
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+        broker_positions=positions,
+        cash_details=cash,
+    )[broker]
+
+    overlay = report["actual_overlay"]
+    assert overlay["broker_label"] == label
+    assert overlay["account_nav_hkd"] == str(
+        (
+            (Decimal("2000") + Decimal(cash_balance))
+            * Decimal(expected_fx)
+        ).quantize(Decimal("0.01"))
+    )
+    assert overlay["items"][0]["actual_reference_quantity"] == expected_quantity
+    assert overlay["items"][0]["frozen_reference_price"] == price
+    assert overlay["status_text"] == (
+        "账户实时同步" if live else "结单数据，非实时"
+    )
+
+
+@pytest.mark.parametrize(
+    ("position_fx", "cash_currency", "cash_fx", "expected_note"),
+    [
+        ("", "USD", "", "实盘汇率缺失，暂无法换算"),
+        ("", "HKD", "1", "实盘汇率缺失，暂无法换算"),
+        ("8", "USD", "7.9", "实盘汇率冲突，暂无法换算"),
+    ],
+)
+def test_dashboard_actual_overlay_fails_closed_for_unusable_tiger_live_fx(
+    position_fx: str,
+    cash_currency: str,
+    cash_fx: str,
+    expected_note: str,
+) -> None:
+    positions = [{
+        "statement_id": "2026-07-15-tiger-live",
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "market": "US",
+        "asset_class": "stock",
+        "symbol": "TARGET",
+        "name": "Target",
+        "currency": "USD",
+        "quantity": "20",
+        "last_price": "100",
+        "market_value": "" if not position_fx else "2000",
+        "fx_to_hkd": position_fx,
+    }]
+    cash = [{
+        "statement_id": "2026-07-15-tiger-live",
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "currency": cash_currency,
+        "cash_balance": "780000" if cash_currency == "HKD" else "98000",
+        "available_balance": "1000",
+        "fx_to_hkd": cash_fx,
+    }]
+
+    overlay = dashboard_module._project_trend_actual_overlay(
+        broker="tiger",
+        market="US",
+        sell_actions=[],
+        buy_actions=[{
+            "action": "BUY",
+            "symbol": "TARGET",
+            "name": "Target",
+            "target_weight": "0.04",
+            "estimated_shares": 3,
+            "close": "100",
+            "lot_size": 1,
+            "estimated_initial_line": "90",
+        }],
+        hold_actions=[],
+        review_actions=[],
+        risk_skips=[],
+        broker_positions=positions,
+        cash_details=cash,
+    )
+
+    item = overlay["items"][0]
+    assert overlay["available"] is True
+    if not position_fx and not cash_fx:
+        assert overlay["account_nav_hkd"] == ""
+    assert item["actual_reference_quantity"] == ""
+    assert item["deviation"] == "reference_unavailable"
+    assert item["deviation_label"] == "暂无法换算"
+    assert item["reference_note"] == expected_note
+
+
+@pytest.mark.parametrize("missing_section", ["risk_summary", "drawdown_summary"])
+def test_dashboard_v4_missing_risk_contract_fails_closed(
+    tmp_path: Path, missing_section: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v4_dashboard_trend_payload()
+    del payload[missing_section]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+
+
+def test_dashboard_projects_exact_version_api_stats_into_risk_summary(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    stats = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v2",
+            "strategy_version": "v2",
+        }],
+        generated_at="2026-07-20T12:00:00+08:00",
+        statistics_cutoff_at="2026-07-20T11:59:59+08:00",
+    )
+    stats["sources"] = [{
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-07-17T23:59:59+08:00",
+        "status": "available",
+    }]
+    write_trend_api_stats(config.data_dir, stats)
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    trade_stats = report["risk_summary"]["trade_stats"]
+    assert trade_stats["available"] is True
+    assert trade_stats["strategy_id"] == "trend_animals_warm_to_hot/CN/v2"
+    assert trade_stats["opening_strategy_version"] == "v2"
+    assert trade_stats["statistics_cutoff_at"] == "2026-07-17T23:59:59+08:00"
+    assert trade_stats["actual_broker"] == "eastmoney"
+    assert trade_stats["actual_broker_label"] == "东方财富"
+    assert trade_stats["simulation"]["eligible_sample_count"] == 0
+    assert trade_stats["actual"]["eligible_sample_count"] == 0
+
+
+def test_dashboard_api_stats_projection_fails_closed_for_malformed_artifact(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    report_path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(_valid_v2_dashboard_trend_payload()), encoding="utf-8"
+    )
+    stats_path = config.data_dir / "latest/trend_api_stats.json"
+    stats_path.parent.mkdir(parents=True)
+    stats_path.write_text('{"schema_version":"wrong"}', encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["risk_summary"]["trade_stats"] == {
+        "available": False,
+        "status_text": "交易统计暂不可用",
+    }
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("summary", "portfolio_remaining_risk", "-999"),
+        ("summary", "single_entry_risk_limit_pct", "0.4"),
+        ("summary", "abnormal_loss_buffer_pct", "10"),
+        ("summary", "existing_planned_risk", "NaN"),
+        ("summary", "portfolio_remaining_risk_pct", None),
+        ("summary", "normal_cost_model", "bogus"),
+        ("summary", "disclaimer", "guaranteed max loss"),
+        ("parameters", "normal_cost_rate", "0.009"),
+        ("risk_skip", "reason", ""),
+        ("risk_skip", "estimated_shares", 1),
+        ("buy", "planned_stop_risk", None),
+        ("buy", "planned_stop_risk_pct", "0.4"),
+    ],
+)
+def test_dashboard_v2_risk_contract_fails_closed(
+    tmp_path: Path, section: str, key: str, value: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = copy.deepcopy(_valid_v2_dashboard_trend_payload())
+    if section == "summary":
+        target = payload["risk_summary"]
+    elif section == "parameters":
+        target = payload["strategy_snapshot"]["parameters"]
+    elif section == "risk_skip":
+        target = payload["strategy_judgments"]["risk_skips"][0]
+    else:
+        target = payload["strategy_judgments"]["formal_actions"][0]
+    assert isinstance(target, dict)
+    target[key] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
+
+
+def test_dashboard_accepts_v2_paused_unknown_risk_amounts(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["formal_actions"] = []
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary.update({
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "pause_reason": "模拟持仓风险事实缺失，暂停新开仓",
+        "existing_planned_risk": None,
+        "new_planned_risk": "0",
+        "portfolio_planned_risk": None,
+        "portfolio_planned_risk_pct": None,
+        "portfolio_remaining_risk": None,
+        "portfolio_remaining_risk_pct": None,
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "paused_with_buy",
+        "active_over_limit",
+        "amount_scale_drift",
+        "buy_zero_risk",
+        "buy_partial_lot",
+    ],
+)
+def test_dashboard_v2_risk_state_invariants_fail_closed(
+    tmp_path: Path, state: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    if state == "paused_with_buy":
+        summary.update({
+            "status": "paused",
+            "status_label": "暂停新开仓",
+            "pause_reason": "测试暂停",
+        })
+    elif state == "active_over_limit":
+        summary.update({
+            "existing_planned_risk": "4001",
+            "new_planned_risk": "303",
+            "portfolio_planned_risk": "4304",
+            "portfolio_planned_risk_pct": "0.04304",
+            "portfolio_remaining_risk": "0",
+            "portfolio_remaining_risk_pct": "0",
+        })
+    elif state == "amount_scale_drift":
+        judgments = payload["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        judgments["formal_actions"] = []
+        summary.update({
+            "new_planned_risk": "0",
+            "portfolio_planned_risk": "0",
+            "portfolio_planned_risk_pct": "0",
+            "portfolio_risk_limit": "8000",
+            "portfolio_remaining_risk": "8000",
+            "portfolio_remaining_risk_pct": "0.04",
+            "single_entry_risk_limit": "800",
+            "abnormal_loss_buffer": "2000",
+        })
+    else:
+        judgments = payload["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        buy = judgments["formal_actions"][0]
+        assert isinstance(buy, dict)
+        if state == "buy_zero_risk":
+            buy.update({
+                "planned_stop_risk": "0",
+                "planned_stop_risk_pct": "0",
+                "normal_cost": "0",
+            })
+            summary.update({
+                "new_planned_risk": "0",
+                "portfolio_planned_risk": "0",
+                "portfolio_planned_risk_pct": "0",
+                "portfolio_remaining_risk": "4000",
+                "portfolio_remaining_risk_pct": "0.04",
+            })
+        else:
+            buy.update({"estimated_shares": 350, "lot_size": 100})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is False
 
 
 def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
@@ -946,6 +2398,7 @@ def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
             "market_label": "美股",
             "data_status": "unavailable",
             "data_date": "",
+            "status_text": "暂时不可用",
             "items": [],
         },
         {
@@ -953,6 +2406,7 @@ def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
             "market_label": "港股",
             "data_status": "unavailable",
             "data_date": "",
+            "status_text": "暂时不可用",
             "items": [],
         },
     ]

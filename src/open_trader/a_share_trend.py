@@ -18,12 +18,30 @@ from zoneinfo import ZoneInfo
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
+    require_trend_review_config,
     send_notification_with_results,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
+from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
+from .notification_policy import render_attention, render_daily_title
+from .portfolio_risk import size_entry_by_risk
+from .strategy_drawdown import (
+    DRAWDOWN_LIMIT,
+    observe_strategy_equity,
+    valid_drawdown_decision,
+)
+from .trend_kelly import (
+    KELLY_MINIMUM_SAMPLES,
+    KELLY_OPTIMIZER,
+    KELLY_ROLLING_SAMPLES,
+    TrendKellyRound,
+    TrendKellyState,
+    calculate_trend_kelly,
+    load_trend_kelly_rounds,
+)
 from .trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
@@ -31,9 +49,11 @@ from .trend_animals import (
 )
 from .trend_delivery import deliver_daily_trend_text
 from .trend_review import (
-    TREND_V1_EFFECTIVE_FROM,
+    _floor_to_lot,
     freeze_report_evidence,
     normalize_trend_strategy_snapshot,
+    rebuild_overheat_trim_projection,
+    TREND_V1_EFFECTIVE_FROM,
 )
 
 
@@ -76,21 +96,297 @@ POSITION_LIMIT = 10
 CANDIDATE_LIMIT = 10
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 DEFAULT_TARGET_WEIGHT = Decimal("0.04")
+SINGLE_ENTRY_RISK_LIMIT = Decimal("0.004")
+PORTFOLIO_RISK_LIMIT = Decimal("0.04")
+ABNORMAL_LOSS_BUFFER = Decimal("0.01")
+NORMAL_COST_RATE = Decimal("0.001")
+NORMAL_COST_MODEL = "预计完整开平仓正常成本按名义金额计提"
+OVERHEAT_TRIM_FRACTION = Decimal("0.30")
+OVERHEAT_TRIM_SIGNALS = ("boiling", "champagne")
+RISK_BUDGET_DISCLAIMER = "5% 是风险预算目标，不是最大损失保证。"
+PORTFOLIO_REMAINING_RISK_NOTE = (
+    "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
+)
+KELLY_STRATEGY_PARAMETERS = {
+    "kelly_sample_minimum": KELLY_MINIMUM_SAMPLES,
+    "kelly_rolling_window": KELLY_ROLLING_SAMPLES,
+    "kelly_fraction": "0.25",
+    "kelly_optimizer": KELLY_OPTIMIZER,
+    "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+    "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
+}
 INITIAL_PROTECTION_ATR_MULTIPLE = Decimal("2")
 TRAILING_LOW_DAYS = 5
 ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
 HOT_TEMPERATURES = {"热", "沸"}
 KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
 
+V2_RISK_NUMERIC_FIELDS = (
+    "existing_planned_risk",
+    "new_planned_risk",
+    "portfolio_planned_risk",
+    "portfolio_planned_risk_pct",
+    "portfolio_risk_limit",
+    "portfolio_risk_limit_pct",
+    "portfolio_remaining_risk",
+    "portfolio_remaining_risk_pct",
+    "single_entry_risk_limit",
+    "single_entry_risk_limit_pct",
+    "abnormal_loss_buffer",
+    "abnormal_loss_buffer_pct",
+    "total_risk_budget_target_pct",
+    "normal_cost_rate",
+)
+
+
+def _nonnegative_risk_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def valid_v2_risk_contract(
+    parameters: object,
+    summary: object,
+    *,
+    expected_nav: object,
+) -> bool:
+    if not isinstance(parameters, Mapping) or not isinstance(summary, Mapping):
+        return False
+    fixed_parameters = {
+        "single_entry_risk_limit": SINGLE_ENTRY_RISK_LIMIT,
+        "portfolio_risk_limit": PORTFOLIO_RISK_LIMIT,
+        "abnormal_loss_buffer": ABNORMAL_LOSS_BUFFER,
+        "normal_cost_rate": NORMAL_COST_RATE,
+    }
+    if any(
+        _nonnegative_risk_decimal(parameters.get(key)) != expected
+        for key, expected in fixed_parameters.items()
+    ) or parameters.get("normal_cost_model") != NORMAL_COST_MODEL:
+        return False
+    fixed_summary = {
+        "single_entry_risk_limit_pct": SINGLE_ENTRY_RISK_LIMIT,
+        "portfolio_risk_limit_pct": PORTFOLIO_RISK_LIMIT,
+        "abnormal_loss_buffer_pct": ABNORMAL_LOSS_BUFFER,
+        "total_risk_budget_target_pct": (
+            PORTFOLIO_RISK_LIMIT + ABNORMAL_LOSS_BUFFER
+        ),
+        "normal_cost_rate": NORMAL_COST_RATE,
+    }
+    if any(
+        _nonnegative_risk_decimal(summary.get(key)) != expected
+        for key, expected in fixed_summary.items()
+    ) or (
+        summary.get("normal_cost_model") != NORMAL_COST_MODEL
+        or summary.get("disclaimer") != RISK_BUDGET_DISCLAIMER
+        or summary.get("portfolio_remaining_risk_note")
+        != PORTFOLIO_REMAINING_RISK_NOTE
+    ):
+        return False
+
+    values: dict[str, Decimal | None] = {}
+    for key in V2_RISK_NUMERIC_FIELDS:
+        if key not in summary:
+            return False
+        raw = summary[key]
+        value = _nonnegative_risk_decimal(raw)
+        if raw is not None and value is None:
+            return False
+        values[key] = value
+
+    status = summary.get("status")
+    pause_reason = summary.get("pause_reason")
+    if status == "active":
+        if (
+            summary.get("status_label") != "风险预算内"
+            or pause_reason != ""
+            or any(values[key] is None for key in V2_RISK_NUMERIC_FIELDS)
+        ):
+            return False
+    elif status == "paused":
+        if (
+            summary.get("status_label") not in {"暂停新开仓", "组合风险已满"}
+            or not isinstance(pause_reason, str)
+            or not pause_reason
+            or values["new_planned_risk"] is None
+            or values["new_planned_risk"] != 0
+        ):
+            return False
+    else:
+        return False
+
+    existing = values["existing_planned_risk"]
+    new = values["new_planned_risk"]
+    planned = values["portfolio_planned_risk"]
+    planned_pct = values["portfolio_planned_risk_pct"]
+    remaining = values["portfolio_remaining_risk"]
+    remaining_pct = values["portfolio_remaining_risk_pct"]
+    portfolio_limit = values["portfolio_risk_limit"]
+    single_limit = values["single_entry_risk_limit"]
+    buffer = values["abnormal_loss_buffer"]
+    assert new is not None
+
+    if existing is None:
+        if any(
+            value is not None
+            for value in (planned, planned_pct, remaining, remaining_pct)
+        ):
+            return False
+    elif planned is None or planned != existing + new:
+        return False
+
+    account_nav = _nonnegative_risk_decimal(expected_nav)
+    if account_nav is None or account_nav <= 0:
+        return (
+            status == "paused"
+            and portfolio_limit is None
+            and single_limit is None
+            and buffer is None
+            and planned is None
+        )
+    if (
+        portfolio_limit != account_nav * PORTFOLIO_RISK_LIMIT
+        or single_limit is None
+        or buffer is None
+    ):
+        return False
+    nav = account_nav
+    if (
+        single_limit != nav * SINGLE_ENTRY_RISK_LIMIT
+        or buffer != nav * ABNORMAL_LOSS_BUFFER
+    ):
+        return False
+    if planned is None:
+        return planned_pct is None and remaining is None and remaining_pct is None
+    if status == "active" and planned > portfolio_limit:
+        return False
+    expected_remaining = max(Decimal("0"), portfolio_limit - planned)
+    return (
+        planned_pct == planned / nav
+        and remaining == expected_remaining
+        and remaining_pct == expected_remaining / nav
+    )
+
+
+def valid_v3_risk_contract(
+    parameters: object,
+    summary: object,
+    *,
+    expected_nav: object,
+) -> bool:
+    if not valid_v2_risk_contract(
+        parameters, summary, expected_nav=expected_nav
+    ) or not isinstance(parameters, Mapping) or not isinstance(summary, Mapping):
+        return False
+    if {
+        key: parameters.get(key) for key in KELLY_STRATEGY_PARAMETERS
+    } != KELLY_STRATEGY_PARAMETERS:
+        return False
+    count = summary.get("kelly_eligible_sample_count")
+    selected = summary.get("kelly_selected_sample_count")
+    phase = summary.get("kelly_phase")
+    cap_raw = summary.get("kelly_cap")
+    cap = _nonnegative_risk_decimal(cap_raw)
+    reason = summary.get("kelly_reason")
+    last_closed_at = summary.get("kelly_last_closed_at")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or isinstance(selected, bool)
+        or not isinstance(selected, int)
+        or not isinstance(reason, str)
+        or not isinstance(last_closed_at, str)
+        or summary.get("kelly_source")
+        != "合格的富途模拟闭环；实盘结果不参与计算"
+    ):
+        return False
+    if count:
+        try:
+            closed = datetime.fromisoformat(last_closed_at)
+        except ValueError:
+            return False
+        if (
+            closed.tzinfo is None
+            or closed.utcoffset() is None
+            or closed.isoformat() != last_closed_at
+        ):
+            return False
+    elif last_closed_at:
+        return False
+    if phase == "cold_start":
+        return (
+            0 <= count < KELLY_MINIMUM_SAMPLES
+            and selected == count
+            and cap_raw is None
+            and reason
+            == f"Kelly 冷启动：{count}/{KELLY_MINIMUM_SAMPLES} 个合格模拟闭环；"
+            "继续使用固定风险仓位"
+        )
+    if phase == "unavailable":
+        return (
+            count == 0
+            and selected == 0
+            and cap_raw is None
+            and bool(reason)
+            and summary.get("status") == "paused"
+            and not last_closed_at
+        )
+    if cap is None or cap > Decimal("0.25"):
+        return False
+    if phase == "active_all_samples":
+        phase_valid = (
+            KELLY_MINIMUM_SAMPLES <= count < KELLY_ROLLING_SAMPLES
+            and selected == count
+        )
+    elif phase == "active_rolling_200":
+        phase_valid = (
+            count >= KELLY_ROLLING_SAMPLES
+            and selected == KELLY_ROLLING_SAMPLES
+        )
+    else:
+        return False
+    if cap == 0:
+        return (
+            phase_valid
+            and reason == "Kelly 上限为 0，仅暂停未来新开仓"
+            and summary.get("status") == "paused"
+            and summary.get("pause_reason") == reason
+        )
+    return phase_valid and reason == ""
+
+
+def valid_v4_risk_contract(
+    parameters: object,
+    summary: object,
+    *,
+    expected_nav: object,
+) -> bool:
+    return (
+        valid_v3_risk_contract(parameters, summary, expected_nav=expected_nav)
+        and isinstance(parameters, Mapping)
+        and parameters.get("drawdown_limit") == str(DRAWDOWN_LIMIT)
+        and parameters.get("drawdown_equity_source")
+        == "Futu SIMULATE strategy NAV"
+        and parameters.get("drawdown_unlock") == "manual_same_version_rebase"
+    )
+
 
 def trend_strategy_snapshot(
     market: str,
     process_version: str,
     candidate_pool_ids: Sequence[int],
+    *,
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
 ) -> dict[str, object]:
     market = market.upper()
     if market not in {"CN", "US", "HK"}:
         raise ValueError(f"unsupported trend review market: {market}")
+    if normal_cost_rate != NORMAL_COST_RATE:
+        raise ValueError("v2 normal cost rate must remain 0.001")
 
     common = {
         "candidate_pool_ids": list(candidate_pool_ids),
@@ -103,8 +399,18 @@ def trend_strategy_snapshot(
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": CANDIDATE_LIMIT,
         "position_limit": POSITION_LIMIT,
-        "use_available_cash": True,
-        "trailing_activation_signals": ["boiling", "champagne"],
+        "single_entry_risk_limit": str(SINGLE_ENTRY_RISK_LIMIT),
+        "portfolio_risk_limit": str(PORTFOLIO_RISK_LIMIT),
+        "abnormal_loss_buffer": str(ABNORMAL_LOSS_BUFFER),
+        "normal_cost_rate": str(normal_cost_rate),
+        "normal_cost_model": NORMAL_COST_MODEL,
+        "overheat_trim_fraction": str(OVERHEAT_TRIM_FRACTION),
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": list(OVERHEAT_TRIM_SIGNALS),
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+        **KELLY_STRATEGY_PARAMETERS,
     }
     if market == "CN":
         parameters: dict[str, object] = {
@@ -150,12 +456,21 @@ def trend_strategy_snapshot(
             ("候选排序", "排序顺序", "趋势强度降序、右侧天数升序、成交额降序、股票代码升序"),
             ("候选排序", "候选数量", "展示前 10；按剩余持仓席位产生买入动作"),
             ("仓位执行", "持仓上限", "10 笔"),
+            ("仓位执行", "单笔计划止损风险上限", "账户净值的 0.40%"),
+            ("仓位执行", "组合正常计划风险上限", "账户净值的 4%"),
+            ("仓位执行", "异常损失缓冲", "账户净值的 1%，不得用于开仓"),
             ("仓位执行", "热状态仓位", "账户净值的 4%"),
             ("仓位执行", "沸状态仓位", "账户净值的 2%"),
             ("仓位执行", "买入数量", "使用已有现金，按 100 股整数倍向下取整"),
             ("仓位执行", "买入窗口", "下一交易日 09:30–10:00"),
             ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
             ("退出保护", "退出条件", "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"),
+            ("退出保护", "过热止盈比例", "沸腾或开香槟时减仓 30%"),
+            ("退出保护", "过热止盈信号", "沸腾、开香槟合并为一次机会"),
+            ("退出保护", "过热止盈次数", "每个完整持仓生命周期最多一次"),
+            ("退出保护", "过热止盈取整", "按市场最小交易单位向下取整"),
+            ("退出保护", "不足一手处理", "不下单并记为本生命周期终态"),
+            ("退出保护", "清仓优先级", "强制清仓优先于过热止盈"),
             (
                 "退出保护",
                 "过热跟踪",
@@ -195,6 +510,9 @@ def trend_strategy_snapshot(
             ("候选排序", "排序顺序", "趋势强度降序、右侧天数升序、成交额降序、股票代码升序"),
             ("候选排序", "候选数量", "展示前 10；按剩余持仓席位产生买入动作"),
             ("仓位执行", "持仓上限", "10 笔"),
+            ("仓位执行", "单笔计划止损风险上限", "账户净值的 0.40%"),
+            ("仓位执行", "组合正常计划风险上限", "账户净值的 4%"),
+            ("仓位执行", "异常损失缓冲", "账户净值的 1%，不得用于开仓"),
             ("仓位执行", "目标仓位", "账户净值的 4%"),
             (
                 "仓位执行",
@@ -210,6 +528,12 @@ def trend_strategy_snapshot(
             ),
             ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
             ("退出保护", "退出条件", "危险信号、离开趋势右侧或触发保护线时全部卖出"),
+            ("退出保护", "过热止盈比例", "沸腾或开香槟时减仓 30%"),
+            ("退出保护", "过热止盈信号", "沸腾、开香槟合并为一次机会"),
+            ("退出保护", "过热止盈次数", "每个完整持仓生命周期最多一次"),
+            ("退出保护", "过热止盈取整", "按市场最小交易单位向下取整"),
+            ("退出保护", "不足一手处理", "不下单并记为本生命周期终态"),
+            ("退出保护", "清仓优先级", "强制清仓优先于过热止盈"),
             (
                 "退出保护",
                 "过热跟踪",
@@ -218,11 +542,11 @@ def trend_strategy_snapshot(
         ]
 
     return {
-        "strategy_id": f"trend_animals_warm_to_hot/{market}/v1",
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v3",
         "strategy_name": name,
-        "strategy_version": "v1",
+        "strategy_version": "v3",
         "market": market,
-        "effective_from": TREND_V1_EFFECTIVE_FROM[market],
+        "effective_from": "2026-07-20",
         "process_version": process_version,
         "parameters": parameters,
         "parameter_rows": [
@@ -230,6 +554,92 @@ def trend_strategy_snapshot(
             for group, label, value in rows
         ],
     }
+
+
+def live_trend_strategy_snapshot(
+    market: str,
+    process_version: str,
+    candidate_pool_ids: Sequence[int],
+    *,
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
+) -> dict[str, object]:
+    snapshot = trend_strategy_snapshot(
+        market,
+        process_version,
+        candidate_pool_ids,
+        normal_cost_rate=normal_cost_rate,
+    )
+    market = market.upper()
+    parameters = dict(snapshot["parameters"])
+    parameters.update(
+        {
+            "drawdown_limit": str(DRAWDOWN_LIMIT),
+            "drawdown_equity_source": "Futu SIMULATE strategy NAV",
+            "drawdown_unlock": "manual_same_version_rebase",
+        }
+    )
+    return {
+        **snapshot,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+        "strategy_version": "v4",
+        "effective_from": "2026-07-20",
+        "parameters": parameters,
+        "parameter_rows": [
+            *snapshot["parameter_rows"],
+            {
+                "group": "累计回撤",
+                "name": "策略累计回撤暂停",
+                "value": "纪律模拟策略净值从高点回撤达到 5% 时暂停新开仓，人工解锁后重设基准",
+            },
+        ],
+    }
+
+
+def _expected_report_strategy_snapshot(
+    market: str,
+    process_version: str,
+    candidate_pool_ids: Sequence[int],
+    supplied: Mapping[str, object] | None,
+) -> dict[str, object]:
+    requested_version = (
+        str(supplied.get("strategy_version") or "")
+        if supplied is not None
+        else ""
+    )
+    if requested_version == "v4":
+        return live_trend_strategy_snapshot(
+            market, process_version, candidate_pool_ids
+        )
+    snapshot = trend_strategy_snapshot(market, process_version, candidate_pool_ids)
+    if requested_version == "v2":
+        snapshot = {
+            **snapshot,
+            "strategy_id": f"trend_animals_warm_to_hot/{market.upper()}/v2",
+            "strategy_version": "v2",
+        }
+    return snapshot
+
+
+def _preserve_v1_replay_snapshot(snapshot: Mapping[str, object]) -> bool:
+    """Keep the main-branch nominal v1 shape intact during replay."""
+    if snapshot.get("strategy_version") != "v1":
+        return False
+    parameters = snapshot.get("parameters")
+    rows = snapshot.get("parameter_rows")
+    if not isinstance(parameters, Mapping) or not isinstance(rows, list):
+        return False
+    row_names = {
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping)
+    }
+    return (
+        "single_entry_risk_limit" not in parameters
+        and "portfolio_risk_limit" not in parameters
+        and "normal_cost_rate" not in parameters
+        and "单笔计划止损风险上限" in row_names
+        and "过热止盈比例" in row_names
+    )
 
 
 @dataclass(frozen=True)
@@ -375,6 +785,10 @@ class BuyAction:
     amount: Decimal | None
     atr: Decimal
     estimated_initial_line: Decimal
+    planned_stop_risk: Decimal
+    planned_stop_risk_pct: Decimal
+    normal_cost: Decimal
+    decisive_constraint: str
 
 
 @dataclass(frozen=True)
@@ -425,6 +839,12 @@ class HoldingDecision:
     temperature_curr: str | None = None
     strength: Decimal | None = None
     entry_hints: tuple[str, ...] = ()
+    position_started_for: str | None = None
+    target_fraction: Decimal | None = None
+    estimated_shares: int | None = None
+    lot_size: int | None = None
+    overheat_signals: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -439,6 +859,8 @@ class TrendReport:
     candidates: tuple[CandidateInput, ...]
     excluded: dict[str, list[str]]
     buy_actions: tuple[BuyAction, ...]
+    risk_skips: tuple[dict[str, object], ...]
+    risk_summary: dict[str, object]
     industry_concentration: tuple[tuple[str, int, Decimal], ...]
     data_sources: tuple[str, ...]
     estimated_api_cost: Decimal | None
@@ -447,6 +869,7 @@ class TrendReport:
     signal_snapshots: dict[str, object]
     metadata: dict[str, object]
     strategy_snapshot: dict[str, object]
+    drawdown_summary: dict[str, object] | None = None
     replay_evidence: dict[str, str] | None = None
 
 
@@ -562,6 +985,116 @@ def load_eastmoney_account(
         available_cash=cash,
         positions=positions,
         exceptions=tuple(_account_exceptions(eastmoney)),
+        position_count=len(positions),
+    )
+
+
+def load_futu_simulate_trend_account(
+    *,
+    host: str,
+    port: int,
+    simulate_acc_id: int,
+    market: str,
+    expected_date: str,
+    account_client: object | None = None,
+    account_factory: Callable[..., object] = FutuSimulateOrderExecutionClient,
+) -> AccountSnapshot:
+    market = market.strip().upper()
+    if market not in {"CN", "HK", "US"}:
+        raise ValueError(f"unsupported trend review market: {market}")
+    owns_client = account_client is None
+    client = account_client
+    if client is None:
+        client = account_factory(
+            host=host,
+            port=port,
+            simulate_acc_id=simulate_acc_id,
+            trd_market=market,
+        )
+    try:
+        snapshot = client.account_snapshot()
+    finally:
+        close = getattr(client, "close", None)
+        if owns_client and callable(close):
+            close()
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("Futu simulation account snapshot must be an object")
+    try:
+        account_id = int(snapshot.get("acc_id"))
+    except (TypeError, ValueError):
+        raise ValueError("Futu simulation account snapshot ID is invalid") from None
+    if account_id != simulate_acc_id:
+        raise ValueError("Futu simulation account snapshot ID does not match config")
+    try:
+        net_value = _decimal(snapshot.get("net_value"))
+    except ValueError:
+        raise ValueError("Futu simulation account net value is invalid") from None
+    if net_value <= 0:
+        raise ValueError("Futu simulation account net value must be positive")
+    try:
+        cash = _decimal(snapshot.get("cash"))
+    except ValueError:
+        raise ValueError("Futu simulation account cash is invalid") from None
+    if cash < 0:
+        raise ValueError("Futu simulation account cash must be nonnegative")
+    rows = snapshot.get("positions")
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+        raise ValueError("Futu simulation account positions are invalid")
+    prefixes = {"CN": {"SH", "SZ", "BJ"}, "HK": {"HK"}, "US": {"US"}}[market]
+    positions: list[AccountPosition] = []
+    for row in rows:
+        try:
+            quantity = _decimal(row.get("qty", row.get("quantity")))
+        except ValueError:
+            raise ValueError(
+                "Futu simulation account position quantity is invalid"
+            ) from None
+        if quantity < 0:
+            raise ValueError(
+                "Futu simulation account position quantity must be nonnegative"
+            )
+        if quantity == 0:
+            continue
+        code = str(row.get("code") or row.get("futu_code") or "").strip().upper()
+        prefix, separator, symbol = code.partition(".")
+        if not separator or not prefix or not symbol:
+            raise ValueError("Futu simulation account position code is invalid")
+        if prefix not in prefixes:
+            raise ValueError(
+                f"Futu simulation account position market does not match {market}"
+            )
+        try:
+            market_value = _decimal(
+                row.get("market_val", row.get("market_value"))
+            )
+        except ValueError:
+            raise ValueError(
+                "Futu simulation account position market value is invalid"
+            ) from None
+        if market_value < 0:
+            raise ValueError(
+                "Futu simulation account position market value must be nonnegative"
+            )
+        stock_type = str(row.get("stock_type") or "").strip().upper()
+        positions.append(
+            AccountPosition(
+                symbol=symbol,
+                name=str(row.get("stock_name") or row.get("name") or symbol).strip(),
+                asset_class="etf" if "ETF" in stock_type else "stock",
+                quantity=quantity,
+                avg_cost_price=_optional_decimal(
+                    row.get("cost_price", row.get("avg_cost_price"))
+                ),
+                market_value=market_value,
+            )
+        )
+    return AccountSnapshot(
+        source_date=expected_date,
+        fresh=True,
+        net_value=net_value,
+        available_cash=cash,
+        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
+        exceptions=(),
         position_count=len(positions),
     )
 
@@ -878,7 +1411,36 @@ def estimate_buy_actions(
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
     price_fx_to_account_currency: Decimal = Decimal("1"),
+    portfolio_planned_risk: Decimal = Decimal("0"),
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
 ) -> list[BuyAction]:
+    actions, _, _ = _plan_buy_actions(
+        ranked=ranked,
+        net_value=net_value,
+        available_cash=available_cash,
+        current_position_count=current_position_count,
+        position_weight=position_weight,
+        market=market,
+        lot_sizes=lot_sizes,
+        price_fx_to_account_currency=price_fx_to_account_currency,
+        portfolio_planned_risk=portfolio_planned_risk,
+        normal_cost_rate=normal_cost_rate,
+    )
+    return actions
+
+
+def _estimate_buy_actions_v1(
+    *,
+    ranked: Sequence[CandidateInput],
+    net_value: Decimal,
+    available_cash: Decimal,
+    current_position_count: int,
+    position_weight: Decimal,
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    price_fx_to_account_currency: Decimal,
+) -> list[BuyAction]:
+    """Preserve the frozen v1 nominal/cash/slot sizing for evidence replay."""
     slots = max(0, POSITION_LIMIT - current_position_count)
     if slots == 0:
         return []
@@ -898,12 +1460,13 @@ def estimate_buy_actions(
             continue
         target = (net_value * weight).quantize(Decimal("0.01"))
         amount = min(target, remaining_cash)
-        if market == "CN":
-            lot_size = 100
-        elif market == "HK":
-            lot_size = (lot_sizes or {}).get(item.symbol, 0)
-        else:
-            lot_size = 1
+        lot_size = (
+            100
+            if market == "CN"
+            else (lot_sizes or {}).get(item.symbol, 0)
+            if market == "HK"
+            else 1
+        )
         share_price = item.close * price_fx_to_account_currency
         shares = int(amount / share_price / lot_size) * lot_size if lot_size > 0 else 0
         if shares <= 0:
@@ -931,11 +1494,365 @@ def estimate_buy_actions(
                 estimated_initial_line=(
                     item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
                 ),
+                planned_stop_risk=Decimal("0"),
+                planned_stop_risk_pct=Decimal("0"),
+                normal_cost=Decimal("0"),
+                decisive_constraint="",
             )
         )
         remaining_cash -= amount
         slots -= 1
     return actions
+
+
+def _risk_skip(
+    item: CandidateInput,
+    *,
+    weight: Decimal | None,
+    target_amount: Decimal | None,
+    reason: str,
+    decisive_constraint: str,
+) -> dict[str, object]:
+    return {
+        **asdict(item),
+        "target_weight": weight,
+        "target_amount": target_amount,
+        "estimated_shares": 0,
+        "reason": reason,
+        "decisive_constraint": decisive_constraint,
+    }
+
+
+def _risk_summary(
+    *,
+    net_value: Decimal,
+    existing_planned_risk: Decimal | None,
+    new_planned_risk: Decimal,
+    normal_cost_rate: Decimal,
+    pause_reason: str = "",
+    kelly_state: TrendKellyState | None = None,
+) -> dict[str, object]:
+    valid_nav = net_value.is_finite() and net_value > 0
+    portfolio_limit = net_value * PORTFOLIO_RISK_LIMIT if valid_nav else None
+    planned_risk = (
+        existing_planned_risk + new_planned_risk
+        if existing_planned_risk is not None
+        else None
+    )
+    remaining_risk = (
+        max(Decimal("0"), portfolio_limit - planned_risk)
+        if portfolio_limit is not None and planned_risk is not None
+        else None
+    )
+    summary = {
+        "status": "paused" if pause_reason else "active",
+        "status_label": (
+            "组合风险已满"
+            if pause_reason == "组合正常计划风险已达到净值 4%"
+            else "暂停新开仓"
+            if pause_reason
+            else "风险预算内"
+        ),
+        "pause_reason": pause_reason,
+        "existing_planned_risk": existing_planned_risk,
+        "new_planned_risk": new_planned_risk,
+        "portfolio_planned_risk": planned_risk,
+        "portfolio_planned_risk_pct": (
+            planned_risk / net_value
+            if valid_nav and planned_risk is not None
+            else None
+        ),
+        "portfolio_risk_limit": portfolio_limit,
+        "portfolio_risk_limit_pct": PORTFOLIO_RISK_LIMIT,
+        "portfolio_remaining_risk": remaining_risk,
+        "portfolio_remaining_risk_pct": (
+            remaining_risk / net_value
+            if valid_nav and remaining_risk is not None
+            else None
+        ),
+        "single_entry_risk_limit": (
+            net_value * SINGLE_ENTRY_RISK_LIMIT if valid_nav else None
+        ),
+        "single_entry_risk_limit_pct": SINGLE_ENTRY_RISK_LIMIT,
+        "abnormal_loss_buffer": (
+            net_value * ABNORMAL_LOSS_BUFFER if valid_nav else None
+        ),
+        "abnormal_loss_buffer_pct": ABNORMAL_LOSS_BUFFER,
+        "total_risk_budget_target_pct": PORTFOLIO_RISK_LIMIT + ABNORMAL_LOSS_BUFFER,
+        "normal_cost_rate": normal_cost_rate,
+        "normal_cost_model": NORMAL_COST_MODEL,
+        "disclaimer": RISK_BUDGET_DISCLAIMER,
+        "portfolio_remaining_risk_note": PORTFOLIO_REMAINING_RISK_NOTE,
+    }
+    if kelly_state is not None:
+        reason = (
+            kelly_state.reason
+            if kelly_state.phase == "unavailable"
+            else (
+                f"Kelly 冷启动：{kelly_state.eligible_sample_count}/"
+                f"{KELLY_MINIMUM_SAMPLES} 个合格模拟闭环；"
+                "继续使用固定风险仓位"
+            )
+            if not kelly_state.enabled
+            else "Kelly 上限为 0，仅暂停未来新开仓"
+            if kelly_state.quarter_kelly_cap == 0
+            else ""
+        )
+        summary.update(
+            {
+                "kelly_phase": kelly_state.phase,
+                "kelly_eligible_sample_count": kelly_state.eligible_sample_count,
+                "kelly_selected_sample_count": kelly_state.selected_sample_count,
+                "kelly_cap": kelly_state.quarter_kelly_cap,
+                "kelly_reason": reason,
+                "kelly_last_closed_at": kelly_state.last_closed_at,
+                "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+            }
+        )
+    return summary
+
+
+def _plan_buy_actions(
+    *,
+    ranked: Sequence[CandidateInput],
+    net_value: Decimal,
+    available_cash: Decimal,
+    current_position_count: int,
+    position_weight: Decimal,
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    price_fx_to_account_currency: Decimal,
+    portfolio_planned_risk: Decimal | None,
+    normal_cost_rate: Decimal,
+    critical_data_reason: str = "",
+    kelly_state: TrendKellyState | None = None,
+) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
+    def entry_weight(item: CandidateInput) -> Decimal | None:
+        nominal = (
+            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            if market == "CN"
+            else position_weight
+        )
+        if (
+            nominal is not None
+            and kelly_state is not None
+            and kelly_state.enabled
+            and kelly_state.quarter_kelly_cap is not None
+        ):
+            return min(nominal, kelly_state.quarter_kelly_cap)
+        return nominal
+
+    if not critical_data_reason:
+        if not net_value.is_finite() or net_value <= 0:
+            critical_data_reason = "模拟盘净值缺失，暂停新开仓"
+        elif not available_cash.is_finite() or available_cash < 0:
+            critical_data_reason = "模拟盘现金缺失，暂停新开仓"
+        elif (
+            not price_fx_to_account_currency.is_finite()
+            or price_fx_to_account_currency <= 0
+        ):
+            critical_data_reason = "汇率缺失，暂停新开仓"
+        elif portfolio_planned_risk is None:
+            critical_data_reason = "模拟持仓风险事实缺失，暂停新开仓"
+        elif any(
+            item.close is None
+            or not item.close.is_finite()
+            or item.close <= 0
+            or item.atr is None
+            or not item.atr.is_finite()
+            or item.atr <= 0
+            for item in ranked
+        ):
+            critical_data_reason = "候选价格或活动保护线缺失，暂停新开仓"
+
+    if critical_data_reason:
+        skips = [
+            _risk_skip(
+                item,
+                weight=entry_weight(item),
+                target_amount=None,
+                reason=critical_data_reason,
+                decisive_constraint="关键风险数据",
+            )
+            for item in ranked
+        ]
+        return [], skips, _risk_summary(
+            net_value=net_value,
+            existing_planned_risk=portfolio_planned_risk,
+            new_planned_risk=Decimal("0"),
+            normal_cost_rate=normal_cost_rate,
+            pause_reason=critical_data_reason,
+            kelly_state=kelly_state,
+        )
+
+    assert portfolio_planned_risk is not None
+    if (
+        kelly_state is not None
+        and kelly_state.enabled
+        and kelly_state.quarter_kelly_cap == 0
+    ):
+        pause_reason = "Kelly 上限为 0，仅暂停未来新开仓"
+        skips = [
+            _risk_skip(
+                item,
+                weight=Decimal("0"),
+                target_amount=Decimal("0"),
+                reason=pause_reason,
+                decisive_constraint="Kelly 上限",
+            )
+            for item in ranked
+        ]
+        return [], skips, _risk_summary(
+            net_value=net_value,
+            existing_planned_risk=portfolio_planned_risk,
+            new_planned_risk=Decimal("0"),
+            normal_cost_rate=normal_cost_rate,
+            pause_reason=pause_reason,
+            kelly_state=kelly_state,
+        )
+    if portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT:
+        pause_reason = "组合正常计划风险已达到净值 4%"
+        skips = [
+            _risk_skip(
+                item,
+                weight=entry_weight(item),
+                target_amount=None,
+                reason=pause_reason,
+                decisive_constraint="组合剩余风险",
+            )
+            for item in ranked
+        ]
+        return [], skips, _risk_summary(
+            net_value=net_value,
+            existing_planned_risk=portfolio_planned_risk,
+            new_planned_risk=Decimal("0"),
+            normal_cost_rate=normal_cost_rate,
+            pause_reason=pause_reason,
+            kelly_state=kelly_state,
+        )
+    remaining_cash = available_cash
+    remaining_risk = max(
+        Decimal("0"),
+        net_value * PORTFOLIO_RISK_LIMIT - portfolio_planned_risk,
+    )
+    single_entry_limit = net_value * SINGLE_ENTRY_RISK_LIMIT
+    slots = max(0, POSITION_LIMIT - current_position_count)
+    actions: list[BuyAction] = []
+    skips: list[dict[str, object]] = []
+    for item in ranked:
+        nominal_weight = (
+            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            if market == "CN"
+            else position_weight
+        )
+        weight = entry_weight(item)
+        if weight is None:
+            continue
+        target_amount = min(net_value * weight, remaining_cash).quantize(
+            Decimal("0.01")
+        )
+        if slots == 0:
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=weight,
+                    target_amount=target_amount,
+                    reason="10 个持仓席位已满",
+                    decisive_constraint="持仓席位",
+                )
+            )
+            continue
+        lot_size = (
+            100
+            if market == "CN"
+            else (lot_sizes or {}).get(item.symbol, 0)
+            if market == "HK"
+            else 1
+        )
+        if lot_size <= 0:
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=weight,
+                    target_amount=target_amount,
+                    reason="缺少实际每手股数",
+                    decisive_constraint="交易单位",
+                )
+            )
+            continue
+        assert item.close is not None and item.atr is not None
+        protection_line = item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
+        sized = size_entry_by_risk(
+            entry_price=item.close,
+            protection_line=protection_line,
+            fx_to_account_currency=price_fx_to_account_currency,
+            portfolio_nav=net_value,
+            nominal_weight_limit=weight,
+            single_entry_risk_limit=single_entry_limit,
+            portfolio_remaining_risk=remaining_risk,
+            available_cash=remaining_cash,
+            lot_size=Decimal(lot_size),
+            normal_cost_rate=normal_cost_rate,
+        )
+        if sized.final_quantity <= 0:
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=weight,
+                    target_amount=target_amount,
+                    reason=sized.reason,
+                    decisive_constraint=sized.decisive_constraint,
+                )
+            )
+            continue
+        quantity = int(sized.final_quantity)
+        actions.append(
+            BuyAction(
+                symbol=item.symbol,
+                name=item.name,
+                industry=item.industry,
+                target_weight=weight,
+                target_amount=target_amount,
+                estimated_shares=quantity,
+                lot_size=lot_size,
+                filter_price=item.filter_price,
+                close=item.close,
+                market_cap=item.market_cap,
+                industry_tm_id=item.industry_tm_id,
+                industry_temperature=item.industry_temperature,
+                temperature_prev=item.temperature_prev,
+                temperature_curr=item.temperature_curr,
+                phase=item.phase,
+                strength=item.strength,
+                amount=item.amount,
+                atr=item.atr,
+                estimated_initial_line=protection_line,
+                planned_stop_risk=sized.planned_stop_risk,
+                planned_stop_risk_pct=sized.planned_stop_risk / net_value,
+                normal_cost=sized.normal_cost,
+                decisive_constraint=(
+                    "Kelly 上限"
+                    if nominal_weight is not None
+                    and weight < nominal_weight
+                    and sized.decisive_constraint == "名义仓位上限"
+                    else sized.decisive_constraint
+                ),
+            )
+        )
+        remaining_cash -= sized.cash_required
+        remaining_risk -= sized.planned_stop_risk
+        slots -= 1
+
+    new_planned_risk = sum(
+        (item.planned_stop_risk for item in actions), Decimal("0")
+    )
+    return actions, skips, _risk_summary(
+        net_value=net_value,
+        existing_planned_risk=portfolio_planned_risk,
+        new_planned_risk=new_planned_risk,
+        normal_cost_rate=normal_cost_rate,
+        kelly_state=kelly_state,
+    )
 
 
 def update_protection_line(
@@ -967,6 +1884,7 @@ def _holding_action(
     snapshot: HoldingSnapshot | None,
     triggered: set[str],
     market: str = "CN",
+    overheat_trim_terminal: bool = False,
 ) -> tuple[str, str]:
     if symbol in triggered:
         return "SELL_ALL", "protection_line_already_triggered"
@@ -981,6 +1899,12 @@ def _holding_action(
         and snapshot.temperature_curr == "平"
     ):
         return "SELL_ALL", "temperature_changed_to_flat"
+    if (
+        snapshot is not None
+        and (snapshot.boiling is True or snapshot.champagne is True)
+        and not overheat_trim_terminal
+    ):
+        return "SELL_PARTIAL", "overheat_take_profit"
     if snapshot is None or any(
         signal is None
         for signal in (
@@ -1056,6 +1980,56 @@ def _protection_was_triggered(
     return False
 
 
+def _post_sell_planned_risk(
+    *,
+    account: AccountSnapshot,
+    holdings: Sequence[HoldingDecision],
+    sell_symbols: set[str],
+    price_fx_to_account_currency: Decimal,
+    normal_cost_rate: Decimal,
+) -> tuple[Decimal | None, str]:
+    if not account.net_value.is_finite() or account.net_value <= 0:
+        return None, "模拟盘净值缺失，暂停新开仓"
+    if not account.available_cash.is_finite() or account.available_cash < 0:
+        return None, "模拟盘现金缺失，暂停新开仓"
+    if (
+        not price_fx_to_account_currency.is_finite()
+        or price_fx_to_account_currency <= 0
+    ):
+        return None, "汇率缺失，暂停新开仓"
+    if not normal_cost_rate.is_finite() or normal_cost_rate < 0:
+        return None, "正常成本模型缺失，暂停新开仓"
+
+    holding_by_symbol = {item.symbol: item for item in holdings}
+    planned_risk = Decimal("0")
+    for position in account.positions:
+        if position.symbol in sell_symbols:
+            continue
+        if not position.quantity.is_finite() or position.quantity <= 0:
+            return None, f"模拟持仓 {position.symbol} 数量缺失，暂停新开仓"
+        holding = holding_by_symbol.get(position.symbol)
+        if (
+            holding is None
+            or holding.historical
+            or holding.active_line is None
+            or not holding.active_line.is_finite()
+            or holding.active_line < 0
+        ):
+            return None, f"模拟持仓 {position.symbol} 活动保护线缺失，暂停新开仓"
+        if (
+            holding.close is None
+            or not holding.close.is_finite()
+            or holding.close <= 0
+        ):
+            return None, f"模拟持仓 {position.symbol} 价格缺失，暂停新开仓"
+        planned_risk += position.quantity * (
+            max(Decimal("0"), holding.close - holding.active_line)
+            * price_fx_to_account_currency
+            + holding.close * price_fx_to_account_currency * normal_cost_rate
+        )
+    return planned_risk, ""
+
+
 def build_report(
     *,
     as_of_date: str,
@@ -1077,24 +2051,75 @@ def build_report(
     position_weight: Decimal = DEFAULT_TARGET_WEIGHT,
     position_weight_source: str = "fallback_4pct",
     price_fx_to_account_currency: Decimal = Decimal("1"),
+    normal_cost_rate: Decimal = NORMAL_COST_RATE,
     process_version: str = "",
     candidate_pool_ids: Sequence[int] = (),
     strategy_snapshot: Mapping[str, object] | None = None,
+    kelly_rounds: Sequence[TrendKellyRound] = (),
+    kelly_data_reason: str = "",
+    drawdown_summary: Mapping[str, object] | None = None,
 ) -> TrendReport:
     resolved_process_version = process_version or str(
-        (metadata or {}).get("process_version") or ""
+        (metadata or {}).get("process_version")
+        or (strategy_snapshot or {}).get("process_version")
+        or ""
     )
-    canonical_strategy_snapshot = trend_strategy_snapshot(
-        market, resolved_process_version, candidate_pool_ids
+    resolved_candidate_pool_ids: Sequence[int] = candidate_pool_ids
+    if not resolved_candidate_pool_ids and strategy_snapshot is not None:
+        supplied_parameters = strategy_snapshot.get("parameters")
+        supplied_pool_ids = (
+            supplied_parameters.get("candidate_pool_ids")
+            if isinstance(supplied_parameters, Mapping)
+            else None
+        )
+        if isinstance(supplied_pool_ids, list) and all(
+            isinstance(item, int) and not isinstance(item, bool)
+            for item in supplied_pool_ids
+        ):
+            resolved_candidate_pool_ids = tuple(supplied_pool_ids)
+    canonical_strategy_snapshot = _expected_report_strategy_snapshot(
+        market,
+        resolved_process_version,
+        resolved_candidate_pool_ids,
+        strategy_snapshot,
     )
-    resolved_strategy_snapshot = (
-        normalize_trend_strategy_snapshot(
+    if strategy_snapshot is None:
+        resolved_strategy_snapshot = canonical_strategy_snapshot
+    else:
+        normalized_strategy_snapshot = normalize_trend_strategy_snapshot(
             strategy_snapshot,
             market,
             expected_snapshot=canonical_strategy_snapshot,
         )
-        if strategy_snapshot is not None
-        else canonical_strategy_snapshot
+        # v1 reports must replay with their original nominal-sizing contract;
+        # normalization is validation here, not an upgrade of historical facts.
+        resolved_strategy_snapshot = (
+            {**dict(strategy_snapshot), "process_version": resolved_process_version}
+            if _preserve_v1_replay_snapshot(strategy_snapshot)
+            else normalized_strategy_snapshot
+        )
+    snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
+    kelly_state = (
+        TrendKellyState(
+            phase="unavailable",
+            eligible_sample_count=0,
+            selected_sample_count=0,
+            enabled=False,
+            full_kelly=None,
+            quarter_kelly_cap=None,
+            reason=kelly_data_reason,
+            last_closed_at="",
+            selected_round_ids=(),
+        )
+        if snapshot_version in {"v3", "v4"} and kelly_data_reason
+        else calculate_trend_kelly(
+            kelly_rounds,
+            market=market,
+            strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
+            opening_strategy_version=snapshot_version,
+        )
+        if snapshot_version in {"v3", "v4"}
+        else None
     )
     held_symbols = {position.symbol for position in account.positions}
     candidate_decision = build_candidate_list(
@@ -1104,20 +2129,6 @@ def build_report(
         market=market,
     )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
-    buy_actions = estimate_buy_actions(
-        ranked=candidate_decision.eligible,
-        net_value=account.net_value,
-        available_cash=account.available_cash,
-        current_position_count=(
-            account.position_count
-            if account.position_count is not None
-            else len(account.positions)
-        ),
-        position_weight=position_weight,
-        market=market,
-        lot_sizes=lot_sizes,
-        price_fx_to_account_currency=price_fx_to_account_currency,
-    )
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
     new_positions: dict[str, object] = {}
@@ -1134,20 +2145,31 @@ def build_report(
         )
         old = old_positions.get(symbol)
         old_state = old if isinstance(old, Mapping) else {}
+        state_started_for = old_state.get("position_started_for")
+        position_started_for = (
+            state_started_for
+            if isinstance(state_started_for, str) and state_started_for
+            else as_of_date
+        )
+        overheat_trim_terminal = (
+            state_started_for == position_started_for
+            and old_state.get("overheat_trim_status") in {"complete", "below_lot"}
+        )
         triggered = (
             {symbol}
             if _protection_was_triggered(symbol, old_state, watch_events)
             else set()
         )
         action, reason = _holding_action(
-            symbol=symbol, snapshot=snapshot, triggered=triggered, market=market
+            symbol=symbol,
+            snapshot=snapshot,
+            triggered=triggered,
+            market=market,
+            overheat_trim_terminal=overheat_trim_terminal,
         )
         initial_line = _state_decimal(old_state, "initial_line")
         active_line = _state_decimal(old_state, "active_line")
         old_atr = _state_decimal(old_state, "atr14")
-        position_started_for = old_state.get("position_started_for")
-        if not isinstance(position_started_for, str) or not position_started_for:
-            position_started_for = as_of_date
         tracking_active = old_state.get("tracking_active") is True
         if snapshot is not None and (
             snapshot.boiling is True or snapshot.champagne is True
@@ -1163,7 +2185,9 @@ def build_report(
             initial_line = active_line = (
                 close - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
             )
-        if active_line is not None and tracking_active and action == "HOLD":
+        if active_line is not None and tracking_active and action in {
+            "HOLD", "SELL_PARTIAL"
+        }:
             active_line = update_protection_line(
                 old_line=active_line,
                 boiling=True,
@@ -1173,6 +2197,61 @@ def build_report(
         if (active_line is None or stale_kline) and action == "HOLD":
             action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
         effective_atr = current_atr if current_atr is not None else old_atr
+        target_fraction: Decimal | None = None
+        estimated_shares: int | None = None
+        lot_size: int | None = None
+        overheat_signals: tuple[str, ...] = ()
+        warnings: tuple[str, ...] = ()
+        if action == "SELL_PARTIAL":
+            lot_size = (
+                100
+                if market == "CN"
+                else (lot_sizes or {}).get(symbol, 0)
+                if market == "HK"
+                else 1
+            )
+            if not isinstance(lot_size, int) or lot_size <= 0:
+                action, reason = "MANUAL_REVIEW", "holding_lot_size_unavailable"
+                lot_size = None
+            else:
+                target_fraction = OVERHEAT_TRIM_FRACTION
+                estimated_shares = _floor_to_lot(
+                    position.quantity * target_fraction, lot_size
+                )
+                overheat_signals = tuple(
+                    signal
+                    for signal in OVERHEAT_TRIM_SIGNALS
+                    if getattr(snapshot, signal) is True
+                )
+                signal_unknown = snapshot is None or any(
+                    signal is None
+                    for signal in (
+                        snapshot.right_side,
+                        snapshot.danger,
+                        snapshot.boiling,
+                        snapshot.champagne,
+                    )
+                ) or (
+                    market == "CN"
+                    and (
+                        snapshot.temperature_prev not in KNOWN_TEMPERATURES
+                        or snapshot.temperature_curr not in KNOWN_TEMPERATURES
+                    )
+                )
+                kline_unavailable = (
+                    not daily_bars
+                    or stale_kline
+                    or current_atr is None
+                    or close is None
+                )
+                warnings = tuple(
+                    warning
+                    for warning, present in (
+                        ("holding_signal_unknown", signal_unknown),
+                        ("holding_kline_unavailable", kline_unavailable),
+                    )
+                    if present
+                )
         industry = snapshot.industry if snapshot else ""
         if industry:
             industries[industry] += 1
@@ -1195,24 +2274,140 @@ def build_report(
                     _holding_entry_hints(snapshot) if market == "CN" else ()
                 ),
                 historical=historical,
+                position_started_for=(
+                    position_started_for if action == "SELL_PARTIAL" else None
+                ),
+                target_fraction=target_fraction,
+                estimated_shares=estimated_shares,
+                lot_size=lot_size,
+                overheat_signals=overheat_signals,
+                warnings=warnings,
             )
         )
+        new_state: dict[str, object] = {
+            "atr14": str(effective_atr) if effective_atr is not None else "",
+            "position_started_for": position_started_for,
+            "tracking_active": tracking_active,
+            "updated_for": as_of_date,
+        }
+        if initial_line is not None:
+            new_state["initial_line"] = str(initial_line)
         if active_line is not None:
-            new_positions[symbol] = {
-                "initial_line": str(initial_line),
-                "active_line": str(active_line),
-                "atr14": str(effective_atr) if effective_atr is not None else "",
-                "position_started_for": position_started_for,
-                "tracking_active": tracking_active,
-                "updated_for": as_of_date,
-            }
+            new_state["active_line"] = str(active_line)
+        for key in (
+            "overheat_trim_status",
+            "overheat_trim_target_qty",
+            "overheat_trim_filled_qty",
+            "overheat_trim_started_for",
+        ):
+            if isinstance(old_state.get(key), str):
+                new_state[key] = old_state[key]
+        new_positions[symbol] = new_state
+    sell_symbols = {
+        holding.symbol for holding in holdings if holding.action == "SELL_ALL"
+    }
+    post_sell_cash = account.available_cash + sum(
+        (
+            position.market_value
+            for position in account.positions
+            if position.symbol in sell_symbols
+        ),
+        Decimal("0"),
+    )
+    post_sell_position_count = max(
+        0,
+        (
+            account.position_count
+            if account.position_count is not None
+            else len(account.positions)
+        )
+        - len(sell_symbols),
+    )
+    if snapshot_version == "v1":
+        buy_actions = _estimate_buy_actions_v1(
+            ranked=candidate_decision.eligible,
+            net_value=account.net_value,
+            available_cash=post_sell_cash,
+            current_position_count=post_sell_position_count,
+            position_weight=position_weight,
+            market=market,
+            lot_sizes=lot_sizes,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+        )
+        risk_skips: list[dict[str, object]] = []
+        risk_summary: dict[str, object] = {}
+    else:
+        existing_planned_risk, critical_data_reason = _post_sell_planned_risk(
+            account=account,
+            holdings=holdings,
+            sell_symbols=sell_symbols,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+            normal_cost_rate=normal_cost_rate,
+        )
+        critical_data_reason = critical_data_reason or kelly_data_reason
+        buy_actions, risk_skips, risk_summary = _plan_buy_actions(
+            ranked=candidate_decision.eligible,
+            net_value=account.net_value,
+            available_cash=post_sell_cash,
+            current_position_count=post_sell_position_count,
+            position_weight=position_weight,
+            market=market,
+            lot_sizes=lot_sizes,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+            portfolio_planned_risk=existing_planned_risk,
+            normal_cost_rate=normal_cost_rate,
+            critical_data_reason=critical_data_reason,
+            kelly_state=kelly_state,
+        )
+        if snapshot_version == "v4" and (
+            not valid_drawdown_decision(
+                drawdown_summary,
+                expected_market=market,
+                expected_strategy_id=str(
+                    resolved_strategy_snapshot.get("strategy_id") or ""
+                ),
+                expected_strategy_version=snapshot_version,
+                expected_equity=account.net_value,
+                expected_entry_date=execution_date,
+            )
+            or drawdown_summary.get("entry_allowed") is not True
+        ):
+            valid_summary = isinstance(drawdown_summary, Mapping)
+            pause_reason = (
+                str(drawdown_summary.get("pause_reason") or "")
+                if valid_summary
+                else ""
+            ) or "策略累计回撤状态无效，暂停新开仓"
+            risk_skips = [
+                _risk_skip(
+                    item,
+                    weight=(
+                        CN_TARGET_WEIGHTS.get(item.temperature_curr)
+                        if market == "CN"
+                        else position_weight
+                    ),
+                    target_amount=None,
+                    reason=pause_reason,
+                    decisive_constraint="策略累计回撤",
+                )
+                for item in candidate_decision.eligible
+            ]
+            buy_actions = []
+            if risk_summary.get("status") == "active":
+                risk_summary = _risk_summary(
+                    net_value=account.net_value,
+                    existing_planned_risk=existing_planned_risk,
+                    new_planned_risk=Decimal("0"),
+                    normal_cost_rate=normal_cost_rate,
+                    kelly_state=kelly_state,
+                )
     industry_concentration = tuple(
         (
             industry,
             count,
             (
                 industry_values[industry] * Decimal("100") / account.net_value
-                if account.net_value > 0
+                if account.net_value.is_finite() and account.net_value > 0
                 else Decimal("0")
             ),
         )
@@ -1263,6 +2458,8 @@ def build_report(
         candidates=displayed_candidates,
         excluded=candidate_decision.excluded,
         buy_actions=tuple(buy_actions),
+        risk_skips=tuple(risk_skips),
+        risk_summary=risk_summary,
         industry_concentration=industry_concentration,
         data_sources=tuple(data_sources),
         estimated_api_cost=estimated_api_cost,
@@ -1279,6 +2476,9 @@ def build_report(
             "position_weight_source": position_weight_source,
         },
         strategy_snapshot=resolved_strategy_snapshot,
+        drawdown_summary=(
+            dict(drawdown_summary) if drawdown_summary is not None else None
+        ),
         replay_evidence=None,
     )
 
@@ -1389,8 +2589,14 @@ def _money(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01')):.2f}"
 
 
+def _risk_percent(value: object) -> str:
+    parsed = _nonnegative_risk_decimal(value)
+    return "未知" if parsed is None else f"{_money(parsed * Decimal('100'))}%"
+
+
 ACTION_LABELS = {
     "SELL_ALL": "全部卖出",
+    "SELL_PARTIAL": "止盈减仓 30%",
     "HOLD": "继续持有",
     "MANUAL_REVIEW": "人工复核",
 }
@@ -1401,9 +2607,11 @@ REASON_LABELS = {
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
+    "holding_lot_size_unavailable": "持仓整手信息不可用",
     "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
+    "overheat_take_profit": "沸腾/开香槟过热止盈",
     "a_share_only": "仅限 A 股股票",
     "temperature_missing": "个股趋势温度缺失",
     "temperature_transition_not_entry": "不是温转热或温转沸",
@@ -1533,6 +2741,31 @@ def _append_feishu_action_sections(
         lines.extend(["", "卖出"])
         for index, item in enumerate(sells, 1):
             line = f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            if item.get("action") == "SELL_PARTIAL":
+                signals = {
+                    "boiling": "沸腾",
+                    "champagne": "开香槟",
+                }
+                line += f"｜{_action_label('SELL_PARTIAL')}"
+                line += f"｜模拟预计数量 {item.get('estimated_shares', '-')} 股"
+                if item.get("lot_size") not in {None, ""}:
+                    line += f"｜每手 {item['lot_size']} 股"
+                triggered = [
+                    signals[value]
+                    for value in item.get("overheat_signals", [])
+                    if value in signals
+                ]
+                if triggered:
+                    line += f"｜触发信号 {'、'.join(triggered)}"
+                warnings = [
+                    _reason_label(value)
+                    for value in item.get("warnings", [])
+                    if value in REASON_LABELS
+                ]
+                if warnings:
+                    line += f"｜提示 {'、'.join(warnings)}"
+            elif item.get("action") == "SELL_ALL":
+                line += f"｜{_action_label('SELL_ALL')}"
             if item.get("active_line") not in {None, ""}:
                 line += f"｜保护线 {_feishu_money(item['active_line'])}"
             lines.append(line)
@@ -1625,8 +2858,16 @@ def render_trend_feishu_text(
     sells = [
         item
         for item in formal
-        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        and not _trend_action_needs_review(item)
     ]
+    sells.extend(
+        item
+        for item in holdings
+        if item.get("action") == "SELL_PARTIAL"
+        and not _trend_action_needs_review(item)
+        and item not in sells
+    )
     buys = [
         item
         for item in formal
@@ -1642,7 +2883,7 @@ def render_trend_feishu_text(
     for item in formal + holdings:
         if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
-    title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
+    title = render_daily_title(broker_label, market_label, execution_date)
     status = (
         "已更新"
         if fresh
@@ -1687,9 +2928,14 @@ def render_trend_failure_text(
     reason: str,
     recovery_action: str,
 ) -> tuple[str, str]:
-    return (
-        f"【{broker_label}｜{market_label}趋势报告生成失败｜{report_date}】",
-        f"原因：{reason}\n现在做：{recovery_action}\n\n报告未生成，请勿依据旧报告交易。",
+    return render_attention(
+        broker_label,
+        f"{market_label}趋势报告生成失败",
+        report_date,
+        happened="趋势报告未生成",
+        impact="不能依据旧报告交易",
+        action=recovery_action,
+        detail=reason,
     )
 
 
@@ -1708,7 +2954,13 @@ def render_markdown(report: TrendReport) -> str:
         if report.metadata.get("broker") == "tiger"
         else NON_REALTIME_ACCOUNT_WARNING
     )
-    sells = [item for item in report.holdings if item.action == "SELL_ALL"]
+    sells = [
+        item
+        for item in report.holdings
+        if item.action in {"SELL_ALL", "SELL_PARTIAL"}
+    ]
+    full_sells = [item for item in sells if item.action == "SELL_ALL"]
+    partial_sells = [item for item in sells if item.action == "SELL_PARTIAL"]
     holds = [item for item in report.holdings if item.action == "HOLD"]
     reviews = [item for item in report.holdings if item.action == "MANUAL_REVIEW"]
     others = [item for item in report.holdings if item.action not in ACTION_LABELS]
@@ -1722,15 +2974,86 @@ def render_markdown(report: TrendReport) -> str:
         "## 操作摘要",
         "",
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
-        f"全部卖出 {len(sells)}｜允许买入 {len(report.buy_actions)}｜"
+        f"全部卖出 {len(full_sells)}｜止盈减仓 30% {len(partial_sells)}｜"
+        f"允许买入 {len(report.buy_actions)}｜"
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
-        "",
-        "## 开盘前：确认卖出",
-        "",
     ]
+    if report.strategy_snapshot.get("strategy_version") in {"v3", "v4"}:
+        phase = {
+            "cold_start": "冷启动",
+            "active_all_samples": "全样本启用",
+            "active_rolling_200": "最近 200 个样本启用",
+        }.get(str(report.risk_summary.get("kelly_phase") or ""), "未知")
+        count = report.risk_summary.get("kelly_eligible_sample_count", 0)
+        cap = report.risk_summary.get("kelly_cap")
+        cap_text = (
+            "禁用（固定风险仓位）"
+            if cap is None
+            else f"{format((Decimal(str(cap)) * Decimal('100')).normalize(), 'f')}%"
+        )
+        lines.extend(
+            [
+                f"Kelly 阶段：{phase}（{count} 个合格模拟闭环）｜"
+                f"当前 Kelly 上限：{cap_text}",
+                f"Kelly 说明：{report.risk_summary.get('kelly_reason') or '仅向下约束未来新仓'}；"
+                "实盘结果不参与计算",
+            ]
+        )
+    if report.risk_summary:
+        lines.extend([
+            "",
+            "## 组合计划风险",
+            "",
+            "- 正常计划风险："
+            f"{_risk_percent(report.risk_summary['portfolio_planned_risk_pct'])}"
+            f" / {_risk_percent(report.risk_summary['portfolio_risk_limit_pct'])}",
+            "- 异常损失缓冲："
+            f"{_risk_percent(report.risk_summary['abnormal_loss_buffer_pct'])}（不得用于开仓）",
+            "",
+        ])
+    if report.drawdown_summary is not None:
+        drawdown = report.drawdown_summary.get("drawdown_pct")
+        drawdown_text = _risk_percent(drawdown)
+        lines.extend([
+            "## 策略累计回撤",
+            "",
+            f"- 当前累计回撤：{drawdown_text}｜暂停阈值 5%｜{report.drawdown_summary.get('status_label', '未知')}",
+            *(
+                [f"- {report.drawdown_summary['pause_reason']}"]
+                if report.drawdown_summary.get("pause_reason")
+                else []
+            ),
+            "",
+        ])
+    lines.extend(["## 开盘前：确认卖出", ""])
     if sells:
         for item in sells:
-            line = f"- {item.symbol} {item.name}｜{_reason_label(item.reason)}"
+            line = (
+                f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
+                f"{_reason_label(item.reason)}"
+            )
+            if item.action == "SELL_PARTIAL":
+                signals = {
+                    "boiling": "沸腾",
+                    "champagne": "开香槟",
+                }
+                line += f"｜模拟预计数量 {item.estimated_shares} 股"
+                if item.lot_size is not None:
+                    line += f"｜每手 {item.lot_size} 股"
+                triggered = [
+                    signals[value]
+                    for value in item.overheat_signals
+                    if value in signals
+                ]
+                if triggered:
+                    line += f"｜触发信号 {'、'.join(triggered)}"
+                warnings = [
+                    _reason_label(value)
+                    for value in item.warnings
+                    if value in REASON_LABELS
+                ]
+                if warnings:
+                    line += f"｜提示 {'、'.join(warnings)}"
             if item.active_line is not None:
                 line += f"｜活动保护线 {_money(item.active_line)}"
             lines.append(line)
@@ -1884,8 +3207,14 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         isinstance(item, bool) or not isinstance(item, int) for item in pool_ids
     ):
         raise ValueError("strategy snapshot does not match report actions")
-    expected_snapshot = trend_strategy_snapshot(
-        market, str(snapshot.get("process_version") or ""), pool_ids
+    version = snapshot.get("strategy_version")
+    if version not in {"v1", "v2", "v3", "v4"}:
+        raise ValueError("strategy snapshot does not match report actions")
+    expected_snapshot = _expected_report_strategy_snapshot(
+        market,
+        str(snapshot.get("process_version") or ""),
+        pool_ids,
+        snapshot,
     )
     try:
         normalize_trend_strategy_snapshot(
@@ -1899,9 +3228,95 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")
     if (
-        parameters.get("use_available_cash") is not True
-        or parameters.get("trailing_activation_signals")
-        != ["boiling", "champagne"]
+        "overheat_trim_fraction" in parameters
+        or any(item.action == "SELL_PARTIAL" for item in report.holdings)
+    ) and (
+        parameters.get("overheat_trim_fraction") != str(OVERHEAT_TRIM_FRACTION)
+        or parameters.get("overheat_trim_once_per_position") is not True
+        or parameters.get("overheat_trim_signals") != list(OVERHEAT_TRIM_SIGNALS)
+        or parameters.get("overheat_trim_rounding") != "floor_to_market_lot"
+        or parameters.get("overheat_trim_below_lot") != "no_order_terminal"
+        or parameters.get("full_exit_precedes_partial_exit") is not True
+    ):
+        raise ValueError("strategy snapshot does not match report actions")
+    if version in {"v2", "v3", "v4"}:
+        valid_contract = {
+            "v2": valid_v2_risk_contract,
+            "v3": valid_v3_risk_contract,
+            "v4": valid_v4_risk_contract,
+        }[version]
+        if not valid_contract(
+            parameters,
+            report.risk_summary,
+            expected_nav=report.account.net_value,
+        ):
+            raise ValueError("strategy snapshot does not match report actions")
+        if report.risk_summary.get("status") == "paused" and report.buy_actions:
+            raise ValueError("strategy snapshot does not match report actions")
+        portfolio_limit = _nonnegative_risk_decimal(
+            report.risk_summary.get("portfolio_risk_limit")
+        )
+        new_planned_risk = Decimal("0")
+        if portfolio_limit is None:
+            if report.buy_actions:
+                raise ValueError("strategy snapshot does not match report actions")
+            nav = None
+        elif portfolio_limit > 0:
+            nav = portfolio_limit / PORTFOLIO_RISK_LIMIT
+        else:
+            raise ValueError("strategy snapshot does not match report actions")
+        for action in report.buy_actions:
+            assert nav is not None
+            if (
+                action.estimated_shares <= 0
+                or action.lot_size <= 0
+                or action.estimated_shares % action.lot_size != 0
+                or not action.planned_stop_risk.is_finite()
+                or action.planned_stop_risk <= 0
+                or not action.planned_stop_risk_pct.is_finite()
+                or action.planned_stop_risk_pct <= 0
+                or action.planned_stop_risk_pct
+                != action.planned_stop_risk / nav
+                or action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
+                or not action.normal_cost.is_finite()
+                or action.normal_cost <= 0
+                or action.normal_cost > action.planned_stop_risk
+                or action.decisive_constraint
+                not in {
+                    "名义仓位上限",
+                    "Kelly 上限",
+                    "单笔风险上限",
+                    "组合剩余风险",
+                    "现金",
+                }
+            ):
+                raise ValueError("strategy snapshot does not match report actions")
+            new_planned_risk += action.planned_stop_risk
+        if _nonnegative_risk_decimal(
+            report.risk_summary.get("new_planned_risk")
+        ) != new_planned_risk:
+            raise ValueError("strategy snapshot does not match report actions")
+    if version == "v4":
+        if (
+            not valid_drawdown_decision(
+                report.drawdown_summary,
+                expected_market=market,
+                expected_strategy_id=str(snapshot.get("strategy_id") or ""),
+                expected_strategy_version="v4",
+                expected_equity=report.account.net_value,
+                expected_entry_date=report.execution_date,
+            )
+            or report.drawdown_summary.get("entry_allowed") is not True
+            and report.buy_actions
+        ):
+            raise ValueError("strategy snapshot does not match report actions")
+    if (
+        "use_available_cash" in parameters
+        and (
+            parameters.get("use_available_cash") is not True
+            or parameters.get("trailing_activation_signals")
+            != ["boiling", "champagne"]
+        )
     ):
         raise ValueError("strategy snapshot does not match report actions")
     try:
@@ -1910,14 +3325,20 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         raise ValueError("strategy snapshot does not match report actions") from None
     for action in report.buy_actions:
         target = parameters.get("target_weight")
-        expected_weight = (
+        nominal_weight = (
             target.get(action.temperature_curr)
             if isinstance(target, Mapping)
             else target
         )
+        expected_weight = Decimal(str(nominal_weight))
+        if version in {"v3", "v4"} and report.risk_summary.get("kelly_phase") != "cold_start":
+            cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
+            if cap is None:
+                raise ValueError("strategy snapshot does not match report actions")
+            expected_weight = min(expected_weight, cap)
         expected_lot = parameters.get("lot_size")
         if (
-            str(action.target_weight) != str(expected_weight)
+            action.target_weight != expected_weight
             or (expected_lot is not None and action.lot_size != expected_lot)
             or action.lot_size <= 0
             or action.estimated_initial_line
@@ -1929,6 +3350,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
 def _report_payload(report: TrendReport) -> dict[str, object]:
     validate_report_strategy_snapshot(report)
     market = str(report.metadata.get("market") or "CN").upper()
+    legacy_v1 = report.strategy_snapshot.get("strategy_version") == "v1"
     buy_window = (
         f"{report.execution_date} 09:30–10:00"
         if market in {"CN", "HK"}
@@ -1945,16 +3367,29 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     formal_actions = [
         _json_value(asdict(item))
         for item in report.holdings
-        if item.action == "SELL_ALL"
+        if item.action in {"SELL_ALL", "SELL_PARTIAL"}
     ]
-    formal_actions.extend(
-        {
-            **_json_value(asdict(item)),  # type: ignore[arg-type]
-            "action": "BUY",
-            "valid_window": buy_window,
-        }
-        for item in report.buy_actions
-    )
+    for item in report.buy_actions:
+        action = _json_value(asdict(item))
+        assert isinstance(action, dict)
+        if legacy_v1:
+            for key in (
+                "planned_stop_risk",
+                "planned_stop_risk_pct",
+                "normal_cost",
+                "decisive_constraint",
+            ):
+                action.pop(key)
+        formal_actions.append(
+            {**action, "action": "BUY", "valid_window": buy_window}
+        )
+    strategy_judgments = {
+        "holding_decisions": holding_decisions,
+        "top10_candidates": top10_candidates,
+        "formal_actions": formal_actions,
+    }
+    if not legacy_v1:
+        strategy_judgments["risk_skips"] = _json_value(report.risk_skips)
     payload = {
         "schema_version": report.schema_version,
         "generated_at": report.generated_at,
@@ -1962,11 +3397,7 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "execution_date": report.execution_date,
         "account": _json_value(asdict(report.account)),
         "api_facts": list(report.api_facts),
-        "strategy_judgments": {
-            "holding_decisions": holding_decisions,
-            "top10_candidates": top10_candidates,
-            "formal_actions": formal_actions,
-        },
+        "strategy_judgments": strategy_judgments,
         "industry_concentration": _json_value(report.industry_concentration),
         "excluded": report.excluded,
         "data_sources": list(report.data_sources),
@@ -1978,6 +3409,10 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "strategy_snapshot": _json_value(report.strategy_snapshot),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    if report.drawdown_summary is not None:
+        payload["drawdown_summary"] = _json_value(report.drawdown_summary)
+    if not legacy_v1:
+        payload["risk_summary"] = _json_value(report.risk_summary)
     if report.replay_evidence is not None:
         payload["replay_evidence"] = dict(report.replay_evidence)
     for key in ("delivery_status", "process_version"):
@@ -2010,10 +3445,14 @@ def _validate_protection_state(payload: object) -> dict[str, object]:
             raise ValueError("protection state symbol must be non-empty")
         if not isinstance(state, dict):
             raise ValueError(f"protection state for {symbol} must be an object")
-        if _optional_decimal(state.get("initial_line")) is None or _optional_decimal(
-            state.get("active_line")
-        ) is None:
-            raise ValueError(f"protection state for {symbol} has no active line")
+        initial_line = state.get("initial_line")
+        active_line = state.get("active_line")
+        if initial_line is not None or active_line is not None:
+            if (
+                _optional_decimal(initial_line) is None
+                or _optional_decimal(active_line) is None
+            ):
+                raise ValueError(f"protection state for {symbol} has no active line")
         _optional_decimal(state.get("atr14"))
         tracking_active = state.get("tracking_active")
         if tracking_active is not None and not isinstance(tracking_active, bool):
@@ -2021,6 +3460,20 @@ def _validate_protection_state(payload: object) -> dict[str, object]:
         position_started_for = state.get("position_started_for")
         if position_started_for is not None and not isinstance(position_started_for, str):
             raise ValueError(f"protection state for {symbol} has invalid start date")
+        trim_status = state.get("overheat_trim_status")
+        if trim_status is not None and trim_status not in {
+            "pending", "complete", "below_lot"
+        }:
+            raise ValueError(f"protection state for {symbol} has invalid trim status")
+        for key in ("overheat_trim_target_qty", "overheat_trim_filled_qty"):
+            value = state.get(key)
+            if value is not None and (
+                _optional_decimal(value) is None or _decimal(value) < 0
+            ):
+                raise ValueError(f"protection state for {symbol} has invalid trim quantity")
+        trim_started_for = state.get("overheat_trim_started_for")
+        if trim_started_for is not None and not isinstance(trim_started_for, str):
+            raise ValueError(f"protection state for {symbol} has invalid trim start date")
         if not isinstance(state.get("updated_for"), str):
             raise ValueError(f"protection state for {symbol} has no update date")
     return payload
@@ -2235,7 +3688,7 @@ def _write_delivery_receipt(
     return payload
 
 
-def _read_delivery_receipt(
+def read_delivery_receipt(
     path: Path,
     *,
     artifact_stem: str,
@@ -2287,6 +3740,9 @@ def _read_delivery_receipt(
         )
     if not isinstance(protection_state, dict):
         raise ValueError("delivery receipt has no embedded protection state")
+    if protection_state != report_payload.get("protection_state"):
+        raise ValueError("delivery receipt protection state mismatch")
+    _validate_protection_state(protection_state)
     hashes = _payload_hashes(markdown, report_json, protection_state)
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")
@@ -2391,7 +3847,7 @@ def _artifact_stem(
         ):
             number += 1
             continue
-        receipt = _read_delivery_receipt(receipt_path, artifact_stem=stem)
+        receipt = read_delivery_receipt(receipt_path, artifact_stem=stem)
         if receipt is not None:
             if receipt["status"] != "sent" or not _final_pair_matches(
                 receipt, markdown_path, json_path
@@ -2501,7 +3957,7 @@ def _recover_receipt_report(
     notifier: Notifier,
 ) -> AShareTrendRunResult | None:
     receipt_path = _receipt_path(config.data_dir, artifact_stem)
-    receipt = _read_delivery_receipt(
+    receipt = read_delivery_receipt(
         receipt_path,
         artifact_stem=artifact_stem,
     )
@@ -2709,6 +4165,7 @@ def _attempt_report(
     process_version: str,
     api_factory: Callable[..., object],
     quote_factory: Callable[..., object],
+    account_factory: Callable[..., object],
     notifier: Notifier,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
@@ -2746,10 +4203,14 @@ def _attempt_report(
                 component_pools[_row_tm_id(row)].add(str(tm_id))
         component_ids = {_row_tm_id(row) for row in component_rows}
 
-        account = load_eastmoney_account(
-            config.portfolio,
+        simulate_acc_id = require_trend_review_config(config, "CN")
+        account = load_futu_simulate_trend_account(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=simulate_acc_id,
+            market="CN",
             expected_date=run_date,
-            timezone=ZoneInfo(config.timezone),
+            account_factory=account_factory,
         )
         holding_ids: dict[str, int] = {}
         for position in account.positions:
@@ -2899,11 +4360,37 @@ def _attempt_report(
             "misses": sum(event.get("cache") == "miss" for event in cache_events),
             "events": [dict(event) for event in cache_events],
         }
-        prior_state = load_protection_state(
-            config.data_dir / "trend_a_share/protection_state.json"
+        prior_state = rebuild_overheat_trim_projection(
+            config.data_dir,
+            market="CN",
+            state_path=config.data_dir / "trend_a_share/protection_state.json",
         )
         watch_events = load_watch_events(
             config.data_dir / "trend_a_share/watch_events.jsonl"
+        )
+        try:
+            kelly_rounds = load_trend_kelly_rounds(config.data_dir)
+            kelly_data_reason = ""
+        except ValueError as exc:
+            kelly_rounds = ()
+            kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
+        generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
+        strategy_snapshot = live_trend_strategy_snapshot(
+            "CN",
+            process_version,
+            (
+                config.trend_animals_a_share_tm_id,
+                config.trend_animals_etf_tm_id,
+            ),
+        )
+        drawdown_summary = observe_strategy_equity(
+            config.data_dir,
+            market="CN",
+            strategy_id=str(strategy_snapshot["strategy_id"]),
+            strategy_version=str(strategy_snapshot["strategy_version"]),
+            current_equity=account.net_value,
+            observed_at=generated_at,
+            entry_date=execution_date,
         )
         report = build_report(
             as_of_date=run_date,
@@ -2920,9 +4407,14 @@ def _attempt_report(
                 f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
                 f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
             ),
-            data_sources=("Trend Animals", "Futu CN calendar/QFQ daily K-line", str(config.portfolio)),
+            data_sources=(
+                "Trend Animals",
+                "Futu CN calendar/QFQ daily K-line",
+                "Futu CN SIMULATE account",
+            ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
+            generated_at=generated_at,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
             process_version=process_version,
@@ -2930,12 +4422,17 @@ def _attempt_report(
                 config.trend_animals_a_share_tm_id,
                 config.trend_animals_etf_tm_id,
             ),
+            strategy_snapshot=strategy_snapshot,
+            drawdown_summary=drawdown_summary,
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
+                "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "paid_response_cache": cache_metadata,
             },
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,
@@ -2975,6 +4472,8 @@ def _attempt_report(
             price_fx_to_account_currency=Decimal("1"),
             previous_attention_rows=(),
             option_attention_broker_label=None,
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,
@@ -3055,6 +4554,7 @@ def run_a_share_trend_report(
     sleep_fn: Callable[[float], None] = sleep,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
+    account_factory: Callable[..., object] | None = None,
     notifier: Notifier | None = None,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
@@ -3081,7 +4581,7 @@ def run_a_share_trend_report(
         ):
             return AShareTrendRunResult("existing", base_markdown, base_json)
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
-        receipt = _read_delivery_receipt(
+        receipt = read_delivery_receipt(
             receipt_path,
             artifact_stem=artifact_stem,
         )
@@ -3121,6 +4621,9 @@ def run_a_share_trend_report(
                     process_version=version,
                     api_factory=api_factory,
                     quote_factory=quote_factory,
+                    account_factory=(
+                        account_factory or FutuSimulateOrderExecutionClient
+                    ),
                     notifier=notifier,
                 )
                 if attempt.status in {"generated", "existing", "holiday"}:

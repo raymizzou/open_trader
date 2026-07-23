@@ -26,7 +26,7 @@ from .a_share_trend import (
     _holding_snapshot,
     _is_systemic_futu_error,
     _process_version,
-    _read_delivery_receipt,
+    read_delivery_receipt,
     _redact_api_key,
     _report_payload,
     _row_tm_id,
@@ -36,7 +36,8 @@ from .a_share_trend import (
     _freeze_receipt_report,
     build_report,
     evaluate_candidate,
-    load_protection_state,
+    load_futu_simulate_trend_account,
+    live_trend_strategy_snapshot,
     load_watch_events,
     render_trend_failure_text,
     render_trend_feishu_text,
@@ -46,21 +47,19 @@ from .a_share_trend import (
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
+    require_trend_review_config,
     send_notification_with_results,
 )
+from .kelly_order_execution import FutuSimulateOrderExecutionClient
+from .trend_kelly import load_trend_kelly_rounds
 from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
-from .tiger_account import (
-    TigerAccountClient,
-    TigerAccountError,
-    load_tiger_account_config,
-    sync_tiger_portfolio,
-)
 from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
-from .trend_review import freeze_report_evidence
+from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
+from .strategy_drawdown import observe_strategy_equity
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -73,17 +72,6 @@ MARKET_NOTIFICATION_LABELS = {
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
 USD_TO_HKD = Decimal("7.85")
-TIGER_REFRESH_ERROR_TYPES = {
-    "account_query_failed",
-    "asset_query_failed",
-    "blocking_data_error",
-    "config_invalid",
-    "config_missing",
-    "mixed_tiger_broker_row",
-    "no_matching_accounts",
-    "position_query_failed",
-    "tigeropen_missing",
-}
 SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 ATTENTION_CHANGE_FIELDS = (
     "right_side",
@@ -697,24 +685,6 @@ def _attention_actions(payload: Mapping[str, object]) -> dict[str, str]:
     return actions
 
 
-def _refresh_tiger_account(config: DailyPremarketConfig, run_date: str) -> None:
-    tiger_config = load_tiger_account_config(
-        config_dir=Path("~/.tigeropen/"), account=None, sandbox=False
-    )
-    client = TigerAccountClient(config=tiger_config)
-    try:
-        sync_tiger_portfolio(
-            snapshot=client.fetch_snapshot(),
-            portfolio_path=config.portfolio,
-            data_dir=config.data_dir,
-            reports_dir=config.reports_dir,
-            run_date=run_date,
-            update_latest=True,
-        )
-    finally:
-        client.close()
-
-
 def _market_receipt_path(paths: MarketTrendPaths, artifact_stem: str) -> Path:
     return paths.root / "delivery" / f"{artifact_stem}.json"
 
@@ -729,7 +699,7 @@ def _market_artifact_stem(
         stem = f"{as_of_date}-r{number}"
         markdown_path = paths.reports / f"{stem}.md"
         json_path = paths.reports / f"{stem}.json"
-        receipt = _read_delivery_receipt(
+        receipt = read_delivery_receipt(
             _market_receipt_path(paths, stem), artifact_stem=stem
         )
         if receipt is not None and (
@@ -771,7 +741,7 @@ def _recover_market_receipt(
     notifier: Notifier,
 ) -> AShareTrendRunResult | None:
     receipt_path = _market_receipt_path(paths, artifact_stem)
-    receipt = _read_delivery_receipt(receipt_path, artifact_stem=artifact_stem)
+    receipt = read_delivery_receipt(receipt_path, artifact_stem=artifact_stem)
     if receipt is None:
         return None
     markdown_path = paths.reports / f"{artifact_stem}.md"
@@ -825,7 +795,7 @@ def _attempt_market_report(
     notifier: Notifier,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
-    account_refresher: Callable[[DailyPremarketConfig, str], None] = _refresh_tiger_account,
+    account_factory: Callable[..., object] | None = None,
 ) -> AShareTrendRunResult:
     market = _market(market)
     settings = MARKET_SETTINGS[market]
@@ -869,31 +839,21 @@ def _attempt_market_report(
         if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
             return AShareTrendRunResult("waiting", None, None)
 
-        account_refresh_error: str | None = None
-        if market == "US":
-            try:
-                account_refresher(config, run_date)
-            except TigerAccountError as exc:
-                account_refresh_error = (
-                    exc.error_type
-                    if exc.error_type in TIGER_REFRESH_ERROR_TYPES
-                    else "tiger_account_error"
-                )
-            except Exception:
-                account_refresh_error = "Tiger account refresh failed"
-        prior_state = load_protection_state(paths.state)
+        prior_state = rebuild_overheat_trim_projection(
+            config.data_dir, market=market, state_path=paths.state
+        )
         configured = (
             config.trend_us_symbols if market == "US" else config.trend_hk_symbols
         )
         managed = _managed_symbols(prior_state, configured, market)
-        account = load_trend_account(
-            data_dir=config.data_dir,
+        simulate_acc_id = require_trend_review_config(config, market)
+        account = load_futu_simulate_trend_account(
+            host=config.futu_host,
+            port=config.futu_port,
+            simulate_acc_id=simulate_acc_id,
             market=market,
-            expected_date=run_date if market == "US" else as_of_date,
-            managed_symbols=managed,
-            snapshot_before=(
-                run_date if market == "US" and account_refresh_error is not None else None
-            ),
+            expected_date=as_of_date,
+            account_factory=account_factory or FutuSimulateOrderExecutionClient,
         )
 
         balance_before = _balance(api.get_account_balance())
@@ -991,7 +951,10 @@ def _attempt_market_report(
 
         lot_sizes: dict[str, int] = {}
         if market == "HK":
-            symbols = [to_futu_symbol("HK", item.symbol) for item in candidates]
+            symbols = sorted({
+                *(to_futu_symbol("HK", item.symbol) for item in candidates),
+                *(to_futu_symbol("HK", item.symbol) for item in account.positions),
+            })
             wire_lots = quote.get_lot_sizes(symbols) if symbols else {}
             lot_sizes = {
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
@@ -999,6 +962,26 @@ def _attempt_market_report(
         estimated_cost = unified_unit_cost * len(requested_ids)
         actual_cost = balance_before - balance_after
         watch_events = load_watch_events(paths.events)
+        try:
+            kelly_rounds = load_trend_kelly_rounds(config.data_dir)
+            kelly_data_reason = ""
+        except ValueError as exc:
+            kelly_rounds = ()
+            kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
+        process_version = _process_version(config.repo)
+        generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
+        strategy_snapshot = live_trend_strategy_snapshot(
+            market, process_version, pool_ids
+        )
+        drawdown_summary = observe_strategy_equity(
+            config.data_dir,
+            market=market,
+            strategy_id=str(strategy_snapshot["strategy_id"]),
+            strategy_version=str(strategy_snapshot["strategy_version"]),
+            current_equity=account.net_value,
+            observed_at=generated_at,
+            entry_date=execution_date,
+        )
         report = build_report(
             as_of_date=as_of_date,
             execution_date=execution_date,
@@ -1016,37 +999,37 @@ def _attempt_market_report(
             data_sources=(
                 "Trend Animals",
                 f"Futu {market} calendar/QFQ daily K-line",
-                "Tiger live account" if market == "US" else "Phillips daily statement",
+                f"Futu {market} SIMULATE account",
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
+            generated_at=generated_at,
             market=market,
             lot_sizes=lot_sizes,
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
-            price_fx_to_account_currency=(USD_TO_HKD if market == "US" else Decimal("1")),
-            process_version=_process_version(config.repo),
+            price_fx_to_account_currency=Decimal("1"),
+            process_version=process_version,
             candidate_pool_ids=pool_ids,
+            strategy_snapshot=strategy_snapshot,
+            drawdown_summary=drawdown_summary,
             metadata={
                 "market": market,
                 "broker": settings["broker"],
-                "account_check_required": market == "HK",
+                "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
-                "process_version": _process_version(config.repo),
+                "process_version": process_version,
                 **(
                     {
-                        "account_currency": "HKD",
-                        "price_fx_to_hkd": str(USD_TO_HKD),
+                        "account_currency": "USD",
+                        "price_fx_to_account_currency": "1",
                     }
                     if market == "US"
                     else {}
                 ),
-                **(
-                    {"account_refresh_error": account_refresh_error}
-                    if account_refresh_error is not None
-                    else {}
-                ),
             },
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         previous_attention_rows = _previous_attention_rows(
@@ -1072,11 +1055,11 @@ def _attempt_market_report(
             },
             candidate_pool_ids=pool_ids,
             lot_sizes=lot_sizes,
-            price_fx_to_account_currency=(
-                USD_TO_HKD if market == "US" else Decimal("1")
-            ),
+            price_fx_to_account_currency=Decimal("1"),
             previous_attention_rows=previous_attention_rows,
             option_attention_broker_label=option_attention_broker_label,
+            kelly_rounds=kelly_rounds,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,

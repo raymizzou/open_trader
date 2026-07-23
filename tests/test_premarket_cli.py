@@ -2,33 +2,91 @@ from __future__ import annotations
 
 import csv
 import json
-import subprocess
-import sys
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
 import open_trader.cli as cli
-from open_trader.a_share_trend import trend_strategy_snapshot
 from open_trader.advice.premarket import PremarketResult
 from open_trader.cli import build_parser
 from open_trader.daily_premarket import DailyPremarketConfig, NotificationAttempt
 from open_trader.notifications import CompositeNotifier
 
 
-def test_cli_module_invocation_runs_main() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "open_trader.cli", "--help"],
-        cwd=Path(__file__).parents[1],
-        text=True,
-        capture_output=True,
-        check=False,
+def test_dashboard_cli_reads_three_distinct_simulate_account_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli,
+        "serve_dashboard",
+        lambda config, **_: captured.setdefault("config", config),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_optional_env_values",
+        lambda _: {
+            "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID": "101",
+            "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID": "102",
+            "OPEN_TRADER_TREND_REVIEW_HK_SIMULATE_ACC_ID": "103",
+        },
     )
 
-    assert result.returncode == 0
-    assert "usage: open-trader" in result.stdout
+    assert cli.main(["dashboard"]) == 0
+    config = captured["config"]
+    assert getattr(config, "trend_review_cn_simulate_acc_id") == 101
+    assert getattr(config, "trend_review_us_simulate_acc_id") == 102
+    assert getattr(config, "trend_review_hk_simulate_acc_id") == 103
+
+
+@pytest.mark.parametrize("value", ["not-an-integer", "-1"])
+def test_dashboard_cli_rejects_invalid_simulate_account_id(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "serve_dashboard", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "_load_optional_env_values",
+        lambda _: {"OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID": value},
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["dashboard"])
+
+    assert exc_info.value.code == 2
+    assert (
+        "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID must be a positive integer"
+        in capsys.readouterr().err
+    )
+
+
+def test_dashboard_cli_rejects_duplicate_positive_simulate_account_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "serve_dashboard", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "_load_optional_env_values",
+        lambda _: {
+            "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID": "101",
+            "OPEN_TRADER_TREND_REVIEW_US_SIMULATE_ACC_ID": "101",
+        },
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["dashboard"])
+
+    assert exc_info.value.code == 2
+    assert (
+        "trend review simulate account IDs must be distinct"
+        in capsys.readouterr().err
+    )
 
 
 @pytest.mark.parametrize("value", [None, "", "   ", " , , "])
@@ -294,784 +352,6 @@ def test_run_daily_premarket_help_includes_expected_options(
     assert "--max-workers" in output
 
 
-def test_trend_a_share_report_parser_has_expected_defaults() -> None:
-    args = build_parser().parse_args(["trend-a-share-report"])
-
-    assert args.date == "today"
-    assert args.config == Path("config/daily_premarket.env")
-    assert args.revision is False
-
-
-@pytest.mark.parametrize(
-    ("status", "expected"),
-    [("generated", 0), ("existing", 0), ("holiday", 0), ("failed", 1)],
-)
-def test_trend_a_share_report_main_dispatches_and_returns_status(
-    status: str,
-    expected: int,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    captured: dict[str, object] = {}
-    review_calls: list[tuple[object, str, str]] = []
-    config = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        trend_animals_api_key="secret",
-        trend_animals_a_share_tm_id=622466,
-        trend_animals_etf_tm_id=697199,
-    )
-
-    def fake_runner(**kwargs: object) -> object:
-        captured.update(kwargs)
-        json_path = tmp_path / "report.json"
-        json_path.write_text(
-            json.dumps({"as_of_date": "2026-07-14"}), encoding="utf-8"
-        )
-        return SimpleNamespace(
-            status=status,
-            report_path=tmp_path / "report.md" if status == "generated" else None,
-            json_path=json_path if status == "generated" else None,
-        )
-
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
-    monkeypatch.setattr(cli, "run_a_share_trend_report", fake_runner)
-    monkeypatch.setattr(
-        cli,
-        "run_trend_review_close",
-        lambda *args: (
-            review_calls.append(args),
-            (_ for _ in ()).throw(RuntimeError("review failed")),
-        )[1],
-    )
-
-    result = cli.main([
-        "trend-a-share-report", "--date", "2026-07-14",
-        "--config", str(tmp_path / "daily.env"), "--revision",
-    ])
-
-    assert result == expected
-    assert captured == {
-        "config": config,
-        "run_date": "2026-07-14",
-        "revision": True,
-        "notifier": "notifier",
-    }
-    output = capsys.readouterr()
-    assert json.loads(output.out)["status"] == status
-    assert review_calls == (
-        [(config, "CN", "2026-07-14")]
-        if status in {"generated", "existing"}
-        else []
-    )
-    assert ("trend review close failed: review failed" in output.err) is bool(
-        review_calls
-    )
-
-
-def test_trend_review_loader_prefers_latest_numeric_revision(tmp_path: Path) -> None:
-    report_dir = tmp_path / "reports/trend_a_share"
-    report_dir.mkdir(parents=True)
-    valid = {
-        "schema_version": 1,
-        "execution_date": "2026-07-16",
-        "as_of_date": "2026-07-16",
-        "generated_at": "2026-07-16T18:00:00+08:00",
-        "metadata": {"market": "CN", "broker": "eastmoney"},
-        "strategy_judgments": {
-            "formal_actions": [], "holding_decisions": [], "top10_candidates": [],
-        },
-    }
-    for filename, version in (
-        ("2026-07-16.json", "base"),
-        ("2026-07-16-r9.json", "r9"),
-        ("2026-07-16-r10.json", "r10"),
-    ):
-        (report_dir / filename).write_text(
-            json.dumps({**valid, "version": version}),
-            encoding="utf-8",
-        )
-    invalid_reports = [
-        {**valid, "schema_version": 2},
-        {**valid, "metadata": {"market": "US", "broker": "tiger"}},
-        {**valid, "as_of_date": "2026-07-17"},
-        {**valid, "strategy_judgments": {**valid["strategy_judgments"], "formal_actions": [{"action": "WAIT", "symbol": "600001"}]}},
-    ]
-    for revision, payload in enumerate(invalid_reports, 11):
-        (report_dir / f"2026-07-16-r{revision}.json").write_text(
-            json.dumps(payload), encoding="utf-8"
-        )
-    config = SimpleNamespace(
-        reports_dir=tmp_path / "reports",
-        data_dir=tmp_path / "data",
-    )
-
-    report = cli._load_trend_review_report(
-        config,
-        "CN",
-        "2026-07-16",
-        date_field="as_of_date",
-    )
-
-    assert report["version"] == "r10"
-
-
-def test_trend_review_loader_accepts_report_named_for_as_of_date(
-    tmp_path: Path,
-) -> None:
-    report_dir = tmp_path / "reports/trend_us_tiger"
-    report_dir.mkdir(parents=True)
-    report = {
-        "schema_version": 1,
-        "execution_date": "2026-07-17",
-        "as_of_date": "2026-07-16",
-        "generated_at": "2026-07-17T09:00:00+08:00",
-        "metadata": {"market": "US", "broker": "tiger"},
-        "strategy_judgments": {
-            "formal_actions": [], "holding_decisions": [], "top10_candidates": [],
-        },
-    }
-    (report_dir / "2026-07-16.json").write_text(
-        json.dumps(report), encoding="utf-8"
-    )
-    config = SimpleNamespace(
-        reports_dir=tmp_path / "reports",
-        data_dir=tmp_path / "data",
-    )
-
-    assert cli._load_trend_review_report(
-        config, "US", "2026-07-16", date_field="as_of_date"
-    ) == report
-
-
-def test_trend_a_share_report_invalid_private_config_returns_two(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    config = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        trend_animals_api_key="",
-        trend_animals_a_share_tm_id=0,
-        trend_animals_etf_tm_id=0,
-    )
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-
-    assert cli.main(["trend-a-share-report"]) == 2
-    assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
-
-
-def test_trend_a_share_report_whitespace_api_key_returns_two(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    config = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        trend_animals_api_key="   ",
-        trend_animals_a_share_tm_id=622466,
-        trend_animals_etf_tm_id=697199,
-    )
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-
-    assert cli.main(["trend-a-share-report"]) == 2
-    assert "TREND_ANIMALS_API_KEY" in capsys.readouterr().err
-
-
-def test_trend_a_share_report_wrong_positive_pool_id_returns_two(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    config = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        trend_animals_api_key="secret",
-        trend_animals_a_share_tm_id=1,
-        trend_animals_etf_tm_id=697199,
-    )
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-    monkeypatch.setattr(
-        cli,
-        "run_a_share_trend_report",
-        lambda **kwargs: pytest.fail("invalid config must not run"),
-    )
-
-    assert cli.main(["trend-a-share-report"]) == 2
-    assert "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID" in capsys.readouterr().err
-
-
-def test_watch_trend_a_share_parser_has_safe_defaults() -> None:
-    args = build_parser().parse_args(["watch-trend-a-share"])
-
-    assert args.config == Path("config/daily_premarket.env")
-    assert args.poll_seconds == 5.0
-    assert args.reconnect_seconds == 60.0
-    assert args.once is False
-
-
-@pytest.mark.parametrize("value", ["0", "-1"])
-@pytest.mark.parametrize("option", ["--poll-seconds", "--reconnect-seconds"])
-def test_watch_trend_a_share_rejects_non_positive_intervals(
-    option: str, value: str
-) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        build_parser().parse_args(["watch-trend-a-share", option, value])
-
-    assert exc_info.value.code == 2
-
-
-def test_watch_trend_a_share_main_uses_independent_lock_and_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    captured: dict[str, object] = {}
-    config = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        data_dir=tmp_path / "data",
-        portfolio=tmp_path / "portfolio.csv",
-        futu_host="127.0.0.1",
-        futu_port=11111,
-    )
-    quote = object()
-
-    class RecordingLock:
-        def __init__(self, path: Path) -> None:
-            captured["lock_path"] = path
-
-        def __enter__(self) -> object:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-    def fake_watcher(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return SimpleNamespace(
-            status="completed",
-            watched_symbol_count=1,
-            trigger_count=0,
-            exception_count=0,
-            unknown_quote_count=0,
-            events_path=tmp_path / "data/trend_a_share/watch_events.jsonl",
-        )
-
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
-    monkeypatch.setattr(cli, "FutuQuoteClient", lambda **kwargs: quote)
-    monkeypatch.setattr(cli, "RunLock", RecordingLock)
-    monkeypatch.setattr(cli, "watch_a_share_protection", fake_watcher)
-    monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
-    monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)
-
-    assert cli.main(
-        [
-            "watch-trend-a-share",
-            "--config",
-            str(tmp_path / "daily.env"),
-            "--poll-seconds",
-            "2.5",
-            "--reconnect-seconds",
-            "30",
-            "--once",
-        ]
-    ) == 0
-
-    assert captured["lock_path"] == tmp_path / "data/runs/.trend_a_share_watch.lock"
-    assert captured["portfolio_path"] == config.portfolio
-    assert captured["state_path"] == tmp_path / "data/trend_a_share/protection_state.json"
-    assert captured["events_path"] == tmp_path / "data/trend_a_share/watch_events.jsonl"
-    assert captured["report_lock_path"] == tmp_path / "data/runs/.trend_a_share_report.lock"
-    assert captured["quote_client"] is None
-    assert callable(captured["quote_client_factory"])
-    assert captured["quote_client_factory"]() is quote
-    assert captured["notifier"] == "notifier"
-    assert captured["poll_seconds"] == 2.5
-    assert captured["reconnect_seconds"] == 30.0
-    assert captured["once"] is True
-    assert callable(captured["on_session_open"])
-    assert callable(captured["on_protection_trigger"])
-    assert json.loads(capsys.readouterr().out)["status"] == "completed"
-
-
-def test_trend_market_parsers_have_safe_defaults() -> None:
-    report = build_parser().parse_args(["trend-market-report", "--market", "US"])
-    watch = build_parser().parse_args(["watch-trend-market", "--market", "HK"])
-
-    assert report.market == "US"
-    assert report.date == "today"
-    assert report.revision is False
-    assert watch.market == "HK"
-    assert watch.poll_seconds == 5.0
-    assert watch.reconnect_seconds == 60.0
-    assert watch.once is False
-
-
-def test_trend_market_help_names_tiger_us(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        build_parser().parse_args(["trend-market-report", "--help"])
-
-    assert exc_info.value.code == 0
-    help_text = capsys.readouterr().out
-    assert "Tiger US or Phillips HK" in help_text
-    assert "Futu US" not in help_text
-
-
-def test_trend_review_parsers_keep_markets_separate() -> None:
-    parser = build_parser()
-    opened = parser.parse_args(
-        ["trend-review", "open", "--market", "CN", "--date", "2026-07-17"]
-    )
-    closed = parser.parse_args(
-        ["trend-review", "close", "--market", "US", "--date", "2026-07-17"]
-    )
-    replayed = parser.parse_args(
-        ["trend-review", "replay", "--evidence", "evidence.json"]
-    )
-
-    assert (opened.trend_review_command, opened.market) == ("open", "CN")
-    assert (closed.trend_review_command, closed.market) == ("close", "US")
-    assert replayed.evidence == Path("evidence.json")
-    assert opened.config == closed.config == replayed.config == Path(
-        "config/daily_premarket.env"
-    )
-
-
-def _trend_review_close_config(tmp_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(
-        data_dir=tmp_path,
-        reports_dir=tmp_path / "reports",
-        futu_host="127.0.0.1",
-        futu_port=11111,
-        trend_review_cn_simulate_acc_id=101,
-        trend_review_us_simulate_acc_id=102,
-        trend_review_hk_simulate_acc_id=103,
-    )
-
-
-def _trend_review_close_report(
-    market: str, trading_date: str, *, fresh: bool = True
-) -> dict[str, object]:
-    return {
-        "account": {
-            "fresh": fresh,
-            "source_date": trading_date,
-            "net_value": "123456.78",
-            "positions": [{"symbol": "600000", "quantity": "100"}],
-        },
-        "strategy_snapshot": trend_strategy_snapshot(market, "test", ()),
-    }
-
-
-def _stub_close_clients(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    report: dict[str, object],
-) -> None:
-    class Quote:
-        def __init__(self, **kwargs: object) -> None:
-            self.closed = False
-
-        def close(self) -> None:
-            self.closed = True
-
-    class Simulate:
-        def __init__(self, **kwargs: object) -> None:
-            self.closed = False
-
-        def account_snapshot(self) -> dict[str, object]:
-            return {"acc_id": 101, "net_value": "100000", "positions": []}
-
-        def list_orders(self) -> dict[str, object]:
-            return {"orders": []}
-
-        def close(self) -> None:
-            self.closed = True
-
-    monkeypatch.setattr(cli, "_load_trend_review_report", lambda *args, **kwargs: report)
-    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
-    monkeypatch.setattr(cli, "FutuSimulateOrderExecutionClient", Simulate)
-    monkeypatch.setattr(
-        cli,
-        "benchmark_fact",
-        lambda quote, market, trading_date: {
-            "date": trading_date,
-            "close": "1000",
-            "source_id": {
-                "CN": "CSI_ALL_SHARE_PRICE",
-                "US": "SPY_QFQ",
-                "HK": "HSCI_PRICE",
-            }[market],
-            "futu_symbol": {"CN": "SH.000985", "US": "US.SPY", "HK": "HK.800701"}[market],
-        },
-    )
-
-
-def test_trend_review_close_writes_separate_facts_despite_legacy_daily(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-17")
-    _stub_close_clients(monkeypatch, report=report)
-    legacy = tmp_path / "trend_review/daily/CN/2026-07-17.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_bytes(b"legacy daily fact\n")
-    monkeypatch.setattr(
-        cli,
-        "build_trend_review_projection",
-        lambda data_dir, market: {
-            "sample_counts": {"discipline": 0, "actual": 0, "required": 30}
-        },
-    )
-
-    first = cli.run_trend_review_close(
-        _trend_review_close_config(tmp_path), "CN", "2026-07-17"
-    )
-    facts = {
-        stream: tmp_path / f"trend_review/facts/{stream}/CN/2026-07-17.json"
-        for stream in ("discipline", "actual_equity", "benchmark")
-    }
-    first_bytes = {stream: path.read_bytes() for stream, path in facts.items()}
-
-    second = cli.run_trend_review_close(
-        _trend_review_close_config(tmp_path), "CN", "2026-07-17"
-    )
-
-    assert all(path.exists() for path in facts.values())
-    assert {stream: path.read_bytes() for stream, path in facts.items()} == first_bytes
-    assert legacy.read_bytes() == b"legacy daily fact\n"
-    assert first["artifact_paths"] == second["artifact_paths"]
-    actual = json.loads(facts["actual_equity"].read_text(encoding="utf-8"))
-    assert actual["opening_positions"] == []
-    assert first["sample_counts"] == {
-        "discipline": 0,
-        "actual": 0,
-        "required": 30,
-    }
-
-
-def test_effective_date_actual_equity_uses_frozen_report_positions(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-16")
-    _stub_close_clients(monkeypatch, report=report)
-    legacy = tmp_path / "trend_review/daily/CN/2026-07-16.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_bytes(b"legacy daily fact\n")
-    monkeypatch.setattr(
-        cli,
-        "build_trend_review_projection",
-        lambda data_dir, market: {"sample_counts": {}},
-    )
-
-    cli.run_trend_review_close(
-        _trend_review_close_config(tmp_path), "CN", "2026-07-16"
-    )
-
-    actual_path = (
-        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-16.json"
-    )
-    actual = json.loads(actual_path.read_text(encoding="utf-8"))
-    assert actual["opening_positions"] == report["account"]["positions"]
-    assert legacy.read_bytes() == b"legacy daily fact\n"
-
-
-def test_trend_review_close_skips_stale_actual_equity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("HK", "2026-07-17", fresh=False)
-    _stub_close_clients(monkeypatch, report=report)
-    monkeypatch.setattr(
-        cli,
-        "build_trend_review_projection",
-        lambda data_dir, market: {"sample_counts": {}},
-    )
-
-    cli.run_trend_review_close(
-        _trend_review_close_config(tmp_path), "HK", "2026-07-17"
-    )
-
-    assert not (
-        tmp_path / "trend_review/facts/actual_equity/HK/2026-07-17.json"
-    ).exists()
-    assert (
-        tmp_path / "trend_review/facts/discipline/HK/2026-07-17.json"
-    ).exists()
-    assert (tmp_path / "trend_review/facts/benchmark/HK/2026-07-17.json").exists()
-
-
-@pytest.mark.parametrize(
-    "snapshot",
-    [
-        {},
-        {
-            "strategy_id": "trend/CN/v1",
-            "strategy_version": "v1",
-            "process_version": "test",
-            "parameters": [],
-            "parameter_rows": [{"name": "test"}],
-        },
-        {
-            "strategy_id": "trend/CN/v1",
-            "strategy_version": "v1",
-            "process_version": "test",
-            "parameters": {},
-            "parameter_rows": [],
-        },
-    ],
-)
-def test_trend_review_close_rejects_malformed_snapshot_before_any_fact(
-    snapshot: dict[str, object],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-17")
-    report["strategy_snapshot"] = snapshot
-    _stub_close_clients(monkeypatch, report=report)
-
-    with pytest.raises(ValueError, match="strategy snapshot is unavailable"):
-        cli.run_trend_review_close(
-            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
-        )
-
-    assert not (tmp_path / "trend_review/facts").exists()
-
-
-def test_trend_review_close_rejects_fresh_missing_nav_before_any_fact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-17")
-    del report["account"]["net_value"]
-    _stub_close_clients(monkeypatch, report=report)
-
-    with pytest.raises(ValueError, match="actual net value"):
-        cli.run_trend_review_close(
-            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
-        )
-
-    assert not (tmp_path / "trend_review/facts").exists()
-
-
-def test_trend_review_close_benchmark_failure_still_freezes_other_streams(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-17")
-    _stub_close_clients(monkeypatch, report=report)
-    monkeypatch.setattr(
-        cli,
-        "benchmark_fact",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("benchmark unavailable")),
-    )
-    monkeypatch.setattr(
-        cli,
-        "build_trend_review_projection",
-        lambda data_dir, market: {"sample_counts": {}},
-    )
-
-    with pytest.raises(RuntimeError, match="benchmark unavailable"):
-        cli.run_trend_review_close(
-            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
-        )
-
-    assert (
-        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-17.json"
-    ).exists()
-    assert (
-        tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
-    ).exists()
-    assert not (tmp_path / "trend_review/facts/benchmark/CN/2026-07-17.json").exists()
-
-
-def test_trend_review_close_simulate_failure_still_freezes_available_streams(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-17")
-    _stub_close_clients(monkeypatch, report=report)
-    closed: list[bool] = []
-
-    class FailingSimulate:
-        def __init__(self, **kwargs: object) -> None:
-            pass
-
-        def account_snapshot(self) -> dict[str, object]:
-            raise RuntimeError("simulate unavailable")
-
-        def close(self) -> None:
-            closed.append(True)
-
-    monkeypatch.setattr(cli, "FutuSimulateOrderExecutionClient", FailingSimulate)
-    monkeypatch.setattr(
-        cli,
-        "build_trend_review_projection",
-        lambda data_dir, market: {"sample_counts": {}},
-    )
-
-    with pytest.raises(RuntimeError, match="simulate unavailable"):
-        cli.run_trend_review_close(
-            _trend_review_close_config(tmp_path), "CN", "2026-07-17"
-        )
-
-    assert closed == [True]
-    assert (
-        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-17.json"
-    ).exists()
-    assert (tmp_path / "trend_review/facts/benchmark/CN/2026-07-17.json").exists()
-    assert not (
-        tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
-    ).exists()
-
-
-def test_trend_review_close_simulate_config_failure_is_stream_local(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("CN", "2026-07-17")
-    _stub_close_clients(monkeypatch, report=report)
-    config = _trend_review_close_config(tmp_path)
-    config.trend_review_cn_simulate_acc_id = 0
-    monkeypatch.setattr(
-        cli,
-        "build_trend_review_projection",
-        lambda data_dir, market: {"sample_counts": {}},
-    )
-
-    with pytest.raises(RuntimeError, match="trend review config is incomplete"):
-        cli.run_trend_review_close(config, "CN", "2026-07-17")
-
-    assert (
-        tmp_path / "trend_review/facts/actual_equity/CN/2026-07-17.json"
-    ).exists()
-    assert (tmp_path / "trend_review/facts/benchmark/CN/2026-07-17.json").exists()
-    assert not (
-        tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json"
-    ).exists()
-
-
-def test_tiger_close_freezes_empty_completeness_before_projection_and_closes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("US", "2026-07-17")
-    _stub_close_clients(monkeypatch, report=report)
-    events: list[str] = []
-
-    class Tiger:
-        def __init__(self, *, config: object) -> None:
-            events.append("created")
-
-        def fetch_actual_fills(self, start_date: str, end_date: str) -> list[object]:
-            assert (start_date, end_date) == ("2026-07-17", "2026-07-17")
-            events.append("fetched")
-            return []
-
-        def close(self) -> None:
-            events.append("closed")
-
-    monkeypatch.setattr(cli, "load_tiger_account_config", lambda **kwargs: "tiger-config")
-    monkeypatch.setattr(cli, "TigerAccountClient", Tiger)
-
-    def project(data_dir: Path, market: str) -> dict[str, object]:
-        paths = list(
-            (data_dir / "trend_review/facts/actual_fill_completeness/US").glob("*.json")
-        )
-        assert paths
-        completeness = json.loads(paths[0].read_text(encoding="utf-8"))
-        assert completeness["coverage_start"] == "2026-07-17"
-        assert completeness["coverage_end"] == "2026-07-17"
-        events.append("projected")
-        return {"sample_counts": {"discipline": 0, "actual": 0, "required": 30}}
-
-    monkeypatch.setattr(cli, "build_trend_review_projection", project)
-
-    cli.run_trend_review_close(
-        _trend_review_close_config(tmp_path), "US", "2026-07-17"
-    )
-
-    assert events == ["created", "fetched", "closed", "projected"]
-
-
-def test_tiger_fill_failure_keeps_other_facts_and_closes_client(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report = _trend_review_close_report("US", "2026-07-17")
-    _stub_close_clients(monkeypatch, report=report)
-    closed: list[bool] = []
-
-    class Tiger:
-        def __init__(self, *, config: object) -> None:
-            pass
-
-        def fetch_actual_fills(self, start_date: str, end_date: str) -> list[object]:
-            raise RuntimeError("Tiger transactions unavailable")
-
-        def close(self) -> None:
-            closed.append(True)
-
-    monkeypatch.setattr(cli, "load_tiger_account_config", lambda **kwargs: "tiger-config")
-    monkeypatch.setattr(cli, "TigerAccountClient", Tiger)
-
-    with pytest.raises(RuntimeError, match="Tiger transactions unavailable"):
-        cli.run_trend_review_close(
-            _trend_review_close_config(tmp_path), "US", "2026-07-17"
-        )
-
-    assert closed == [True]
-    assert (
-        tmp_path / "trend_review/facts/discipline/US/2026-07-17.json"
-    ).exists()
-    assert (
-        tmp_path / "trend_review/facts/actual_equity/US/2026-07-17.json"
-    ).exists()
-    assert (tmp_path / "trend_review/facts/benchmark/US/2026-07-17.json").exists()
-    assert not (
-        tmp_path / "trend_review/facts/actual_fill_completeness/US"
-    ).exists()
-
-
-@pytest.mark.parametrize("command", ["open", "close"])
-def test_trend_review_command_dispatches_and_prints_json(
-    command: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    config = SimpleNamespace(data_dir=tmp_path / "data")
-    calls: list[tuple[object, str, str]] = []
-
-    def run(loaded: object, market: str, trading_date: str) -> dict[str, object]:
-        calls.append((loaded, market, trading_date))
-        return {
-            "status": "submitted" if command == "open" else "captured",
-            "market": market,
-            "date": trading_date,
-            "artifact_path": str(tmp_path / "artifact.json"),
-        }
-
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-    monkeypatch.setattr(cli, f"run_trend_review_{command}", run, raising=False)
-
-    result = cli.main(
-        [
-            "trend-review",
-            command,
-            "--market",
-            "CN",
-            "--date",
-            "2026-07-17",
-            "--config",
-            str(tmp_path / "daily.env"),
-        ]
-    )
-
-    assert result == 0
-    assert calls == [(config, "CN", "2026-07-17")]
-    assert json.loads(capsys.readouterr().out)["market"] == "CN"
-
-
 def test_trend_review_replay_dispatches_without_live_clients(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1098,112 +378,6 @@ def test_trend_review_replay_dispatches_without_live_clients(
     ) == 0
     assert calls == [(config, evidence)]
     assert json.loads(capsys.readouterr().out)["status"] == "corrected"
-
-
-def test_trend_market_report_dispatches_generic_runner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    captured: dict[str, object] = {}
-    review_calls: list[tuple[object, str, str]] = []
-    config = SimpleNamespace(
-        timezone="Asia/Shanghai", trend_animals_api_key="secret",
-        trend_animals_us_tm_ids=(622460,), trend_animals_hk_tm_ids=(622494,),
-        trend_review_us_simulate_acc_id=0,
-    )
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
-
-    report_json = tmp_path / "us.json"
-    report_json.write_text(
-        json.dumps({"as_of_date": "2026-07-14"}),
-        encoding="utf-8",
-    )
-
-    def runner(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return SimpleNamespace(
-            status="generated", report_path=tmp_path / "us.md",
-            json_path=report_json,
-        )
-
-    monkeypatch.setattr(cli, "run_market_trend_report", runner)
-    monkeypatch.setattr(
-        cli,
-        "run_trend_review_close",
-        lambda *args: (
-            review_calls.append(args),
-            (_ for _ in ()).throw(RuntimeError("review failed")),
-        )[1],
-    )
-
-    assert cli.main([
-        "trend-market-report", "--market", "US", "--date", "2026-07-15",
-        "--revision", "--config", str(tmp_path / "daily.env"),
-    ]) == 0
-    assert captured == {
-        "config": config, "market": "US", "run_date": "2026-07-15",
-        "revision": True, "notifier": "notifier",
-    }
-    output = capsys.readouterr()
-    assert json.loads(output.out)["status"] == "generated"
-    assert review_calls == [(config, "US", "2026-07-14")]
-    assert "trend review close failed: review failed" in output.err
-
-
-def test_watch_trend_market_uses_separate_market_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    captured: dict[str, object] = {}
-    config = SimpleNamespace(
-        data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
-        portfolio=tmp_path / "portfolio.csv", futu_host="127.0.0.1", futu_port=11111,
-        trend_review_hk_simulate_acc_id=0,
-    )
-
-    class Lock:
-        def __init__(self, path: Path) -> None:
-            captured["watch_lock"] = path
-
-        def __enter__(self) -> object:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-    def watcher(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return SimpleNamespace(
-            status="completed", watched_symbol_count=1, trigger_count=0,
-            exception_count=0, unknown_quote_count=0,
-            events_path=kwargs["events_path"],
-        )
-
-    monkeypatch.setattr(cli, "load_env_config", lambda path, *, dry_run: config)
-    monkeypatch.setattr(cli, "build_notifier", lambda loaded: "notifier")
-    monkeypatch.setattr(cli, "RunLock", Lock)
-    monkeypatch.setattr(cli, "watch_market_protection", watcher)
-    monkeypatch.setattr(cli, "run_trend_review_open", lambda *args: None)
-    monkeypatch.setattr(cli, "run_trend_review_stop", lambda *args: None, raising=False)
-
-    assert cli.main([
-        "watch-trend-market", "--market", "HK", "--once",
-        "--config", str(tmp_path / "daily.env"),
-    ]) == 0
-
-    assert captured["watch_lock"] == tmp_path / "data/runs/.trend_hk_phillips_watch.lock"
-    assert captured["state_path"] == tmp_path / "data/trend_hk_phillips/protection_state.json"
-    assert captured["events_path"] == tmp_path / "data/trend_hk_phillips/watch_events.jsonl"
-    assert captured["report_lock_path"] == tmp_path / "data/runs/.trend_hk_phillips_report.lock"
-    assert captured["market"] == "HK"
-    assert captured["quote_client"] is None
-    assert callable(captured["quote_client_factory"])
-    assert callable(captured["on_session_open"])
-    assert callable(captured["on_protection_trigger"])
-    assert json.loads(capsys.readouterr().out)["status"] == "completed"
 
 
 def test_run_daily_premarket_requires_market() -> None:

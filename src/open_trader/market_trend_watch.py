@@ -10,12 +10,14 @@ from .a_share_trend_watch import (
     AShareWatchResult,
     _close,
     _load_active_lines,
+    _monitor_interrupted,
     _record_interruption,
-    _record_recovery,
+    _run_review_callback,
+    _notify_trend_review_deadline,
     watch_a_share_protection,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
-from .market_trend import _market, load_trend_account
+from .market_trend import _market
 from .notifications import Notifier
 
 
@@ -25,6 +27,17 @@ MARKET_TIMEZONES = {
 }
 MARKET_LABELS = {"HK": "港股", "US": "美股"}
 BROKER_LABELS = {"HK": "辉立", "US": "老虎"}
+
+
+def _abnormal_result(events_path: Path) -> AShareWatchResult:
+    return AShareWatchResult(
+        status="abnormal",
+        watched_symbol_count=0,
+        trigger_count=0,
+        exception_count=1,
+        unknown_quote_count=0,
+        events_path=events_path,
+    )
 
 
 def market_session(now: datetime, market: str) -> str:
@@ -70,10 +83,12 @@ def watch_market_protection(
     market: str,
     data_dir: Path,
     portfolio_path: Path,
+    account_loader: Callable[..., object],
     state_path: Path,
     events_path: Path,
     report_lock_path: Path,
     quote_client: object | None,
+    close_quote_client: bool = True,
     notifier: Notifier,
     poll_seconds: float,
     reconnect_seconds: float,
@@ -87,7 +102,7 @@ def watch_market_protection(
     market = _market(market)
     timezone = MARKET_TIMEZONES[market]
     client = quote_client
-    interrupted = False
+    interrupted = _monitor_interrupted(events_path)
     now = now_fn()
     while True:
         if client is None:
@@ -107,10 +122,39 @@ def watch_market_protection(
                         broker_label=BROKER_LABELS[market],
                     )
                     interrupted = True
+                if once:
+                    return _abnormal_result(events_path)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
         try:
+            local_date = now.astimezone(timezone).date().isoformat()
+            if market_session(now, market) == "closed":
+                current_days = client.get_trading_days(
+                    market=market,
+                    start=local_date,
+                    end=local_date,
+                )
+                if local_date in current_days and on_session_open is not None:
+                    _run_review_callback(
+                        on_session_open,
+                        local_date,
+                        events_path=events_path,
+                        trading_date=local_date,
+                        now=now,
+                        notifier=notifier,
+                        market=market,
+                        market_label=MARKET_LABELS[market],
+                        broker_label=BROKER_LABELS[market],
+                    )
+                    _notify_trend_review_deadline(
+                        data_dir=data_dir,
+                        market=market,
+                        trading_date=local_date,
+                        now=now,
+                        events_path=events_path,
+                        notifier=notifier,
+                    )
             opening = next_market_open(client, market=market, now=now)
         except FutuQuoteError as exc:
             if not interrupted:
@@ -124,48 +168,47 @@ def watch_market_protection(
                     broker_label=BROKER_LABELS[market],
                 )
                 interrupted = True
-            _close(client)
+            if once and not close_quote_client:
+                raise
+            failed_client = client
             client = None
+            try:
+                _close(failed_client)
+            except Exception:
+                if not once:
+                    raise
+            if once:
+                return _abnormal_result(events_path)
             sleep_fn(reconnect_seconds)
             now = now_fn()
             continue
-        if interrupted:
-            _record_recovery(
-                events_path,
-                notifier,
-                opening.date().isoformat(),
-                now,
-                market_label=MARKET_LABELS[market],
-            )
         break
 
-    active_lines = _load_active_lines(state_path)
-    load_trend_account(
-        data_dir=data_dir,
-        market=market,
-        expected_date=opening.date().isoformat(),
-        managed_symbols=set(active_lines),
-    )
+    try:
+        account_loader(
+            portfolio_path,
+            expected_date=opening.date().isoformat(),
+            timezone=timezone,
+        )
+    except Exception:
+        if not once:
+            raise
+        if close_quote_client:
+            try:
+                _close(client)
+            except Exception:
+                pass
+        return _abnormal_result(events_path)
     local_now = now.astimezone(timezone)
     if opening > local_now:
         sleep_fn((opening - local_now).total_seconds())
-
-    def account_loader(
-        path: Path, *, expected_date: str, timezone: ZoneInfo
-    ):
-        del path, timezone
-        return load_trend_account(
-            data_dir=data_dir,
-            market=market,
-            expected_date=expected_date,
-            managed_symbols=set(_load_active_lines(state_path)),
-        )
 
     return watch_a_share_protection(
         portfolio_path=portfolio_path,
         state_path=state_path,
         events_path=events_path,
         quote_client=client,
+        close_quote_client=close_quote_client,
         notifier=notifier,
         poll_seconds=poll_seconds,
         reconnect_seconds=reconnect_seconds,

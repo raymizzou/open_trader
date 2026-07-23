@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+from dataclasses import replace
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -11,12 +14,13 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
 from open_trader.dashboard_quotes import QuoteRefreshResult
+from open_trader import dashboard_acceptance
 from open_trader.dashboard_web import STATIC_DIR
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
@@ -25,7 +29,421 @@ from tests.test_dashboard import (
     dashboard_config,
     portfolio_rows,
     write_csv,
+    write_trend_history_report,
 )
+
+
+def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.trend_controller.status.v1",
+        "effective_mode": "execute",
+        "executor_host": "ray-mac",
+        "local_host": "ray-mac",
+        "pid": 4242,
+        "working_directory": "/srv/open_trader",
+        "git_sha": "abc1234",
+        "phase": "monitoring",
+        "heartbeat_at": heartbeat_at,
+        "last_success": "report_locked",
+        "blocker": None,
+        "next_check_at": "2026-07-21T09:31:05+08:00",
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "executor_host", "local_host", "health", "blocking"),
+    [
+        ("healthy", "ray-mac", "ray-mac", "healthy", False),
+        ("missing", "ray-mac", "ray-mac", "unavailable", True),
+        ("stale", "ray-mac", "ray-mac", "unavailable", True),
+        ("future-stale", "ray-mac", "ray-mac", "unavailable", True),
+        ("future-skew", "ray-mac", "ray-mac", "healthy", False),
+        ("malformed", "ray-mac", "ray-mac", "unavailable", True),
+        ("wrong-host", "ray-mac", "ray-mac", "unavailable", True),
+        ("missing", "ray-mac", "readonly-copy", "readonly", False),
+        ("missing", "", "readonly-copy", "readonly", False),
+    ],
+)
+def test_dashboard_projects_strict_controller_health(
+    tmp_path: Path,
+    status: str,
+    executor_host: str,
+    local_host: str,
+    health: str,
+    blocking: bool,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    if status != "missing":
+        path.parent.mkdir(parents=True)
+        if status == "malformed":
+            path.write_text('{"phase":"monitoring"}', encoding="utf-8")
+        else:
+            heartbeat = (
+                now - timedelta(minutes=3)
+                if status == "stale"
+                else now + timedelta(seconds=121)
+                if status == "future-stale"
+                else now + timedelta(seconds=30)
+                if status == "future-skew"
+                else now
+            )
+            payload = _controller_status(heartbeat_at=heartbeat.isoformat())
+            if status == "wrong-host":
+                payload["local_host"] = "retired-host"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controllers = _load_trend_controllers(
+        tmp_path,
+        executor_host=executor_host,
+        now=now,
+        hostname_fn=lambda: local_host,
+    )
+
+    assert set(controllers) == {"eastmoney", "phillips", "tiger"}
+    controller = controllers["tiger"]
+    assert controller["effective_mode"] == (
+        "execute" if executor_host and executor_host == local_host else "readonly"
+    )
+    assert controller["executor_host"] == executor_host
+    assert controller["local_host"] == local_host
+    assert controller["health"] == health
+    assert controller["blocking"] is blocking
+    if health == "healthy":
+        assert controller["pid"] == 4242
+        assert controller["git_sha"] == "abc1234"
+        assert controller["phase"] == "monitoring"
+    if status in {"stale", "future-stale"}:
+        assert controller["blocker"] == "controller heartbeat is stale"
+    if health == "readonly":
+        assert "OPEN_TRADER_TREND_EXECUTOR_HOST" in controller["reason"]
+
+
+@pytest.mark.parametrize(
+    "phase", ["reconciling", "recovering_report", "recovering_review"]
+)
+def test_dashboard_projects_fresh_controller_blocker_as_unavailable(
+    tmp_path: Path, phase: str,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    path.parent.mkdir(parents=True)
+    payload = _controller_status(heartbeat_at=now.isoformat())
+    payload.update({
+        "phase": phase,
+        "last_success": None,
+        "blocker": "report generation failed: upstream unavailable",
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controller = _load_trend_controllers(
+        tmp_path,
+        executor_host="ray-mac",
+        now=now,
+        hostname_fn=lambda: "ray-mac",
+    )["tiger"]
+
+    assert controller["health"] == "unavailable"
+    assert controller["blocking"] is True
+    assert controller["reason"] == payload["blocker"]
+
+
+@pytest.mark.parametrize(
+    "phase", ["reconciling", "recovering_report", "recovering_review"]
+)
+def test_dashboard_projects_unblocked_progress_phase_as_healthy(
+    tmp_path: Path, phase: str,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    path.parent.mkdir(parents=True)
+    payload = _controller_status(heartbeat_at=now.isoformat())
+    payload.update({"phase": phase, "blocker": None})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controller = _load_trend_controllers(
+        tmp_path,
+        executor_host="ray-mac",
+        now=now,
+        hostname_fn=lambda: "ray-mac",
+    )["tiger"]
+
+    assert controller["health"] == "healthy"
+    assert controller["blocking"] is False
+    assert controller["reason"] == ""
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["starting", "blocked", "uncertain", "conflict", "missed"],
+)
+def test_dashboard_projects_unhealthy_controller_phase_as_unavailable(
+    tmp_path: Path, phase: str,
+) -> None:
+    from open_trader.dashboard import _load_trend_controllers
+
+    now = datetime(2026, 7, 21, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+    path = tmp_path / "trend_controller/US/status.json"
+    path.parent.mkdir(parents=True)
+    payload = _controller_status(heartbeat_at=now.isoformat())
+    payload.update({"phase": phase, "blocker": None})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    controller = _load_trend_controllers(
+        tmp_path,
+        executor_host="ray-mac",
+        now=now,
+        hostname_fn=lambda: "ray-mac",
+    )["tiger"]
+
+    assert controller["health"] == "unavailable"
+    assert controller["blocking"] is True
+
+
+@pytest.mark.parametrize("status", ["uncertain", "conflict", "missed"])
+def test_dashboard_preserves_terminal_trend_action_status(
+    tmp_path: Path, status: str,
+) -> None:
+    from open_trader.dashboard import _trend_action_executions
+
+    event = tmp_path / "trend_review/ledgers/US/actions/2026-07-20/key/event.json"
+    event.parent.mkdir(parents=True)
+    event.write_text(json.dumps({
+        "report_sha256": "a" * 64,
+        "symbol": "TRV",
+        "side": "buy",
+        "status": status,
+        "recorded_at": "2026-07-20T09:31:00-04:00",
+    }), encoding="utf-8")
+
+    executions = _trend_action_executions(
+        tmp_path, market="US", execution_date="2026-07-20",
+        report_sha256="a" * 64,
+    )
+
+    assert executions[("TRV", "buy")]["status"] == status
+
+
+def test_dashboard_uses_latest_action_event_across_timezone_offsets(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _trend_action_executions
+
+    root = tmp_path / "trend_review/ledgers/US/actions/2026-07-20/key"
+    root.mkdir(parents=True)
+    common = {
+        "report_sha256": "a" * 64,
+        "symbol": "TRV",
+        "side": "buy",
+    }
+    (root / "later-by-name.json").write_text(json.dumps({
+        **common,
+        "status": "missed",
+        "recorded_at": "2026-07-21T09:01:01+08:00",
+    }), encoding="utf-8")
+    (root / "earlier-by-name.json").write_text(json.dumps({
+        **common,
+        "status": "filled",
+        "recorded_at": "2026-07-21T07:36:30-04:00",
+    }), encoding="utf-8")
+
+    executions = _trend_action_executions(
+        tmp_path, market="US", execution_date="2026-07-20",
+        report_sha256="a" * 64,
+    )
+
+    assert executions[("TRV", "buy")]["status"] == "filled"
+
+
+def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import (
+        load_dashboard_state,
+        load_historical_trend_report,
+    )
+    from open_trader.trend_review import _report_hash
+
+    config = replace(dashboard_config(tmp_path), trend_executor_host="")
+    base = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    revised = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    revised["strategy_judgments"]["formal_actions"][0]["symbol"] = "REVISION"
+    revision_path = config.reports_dir / "trend_us_tiger/2026-07-17-r1.json"
+    revision_path.write_text(json.dumps(revised), encoding="utf-8")
+    base_path = config.reports_dir / "trend_us_tiger/2026-07-17.json"
+    batch = config.data_dir / "trend_review/ledgers/US/batches/2026-07-20.json"
+    batch.parent.mkdir(parents=True)
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1",
+        "market": "US",
+        "execution_date": "2026-07-20",
+        "report_path": str(base_path),
+        "report_sha256": _report_hash(base),
+        "locked_at": "2026-07-20T09:30:00-04:00",
+    }), encoding="utf-8")
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-20/key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(json.dumps({
+        "report_sha256": _report_hash(base),
+        "symbol": "VIXY",
+        "side": "buy",
+        "status": "missed",
+        "recorded_at": "2026-07-20T16:00:00-04:00",
+    }), encoding="utf-8")
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["artifact"] == "2026-07-17.json"
+    assert report["report_sha256"] == _report_hash(base)
+    assert report["execution_batch"]["report_sha256"] == _report_hash(base)
+    assert report["latest_report_sha256"] == _report_hash(revised)
+    assert report["revision_anomaly"] is True
+    assert report["buy_actions"][0]["symbol"] == "VIXY"
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+
+    invalid_batch = json.loads(batch.read_text(encoding="utf-8"))
+    invalid_batch["locked_at"] = "2026-07-20T09:30:00"
+    batch.write_text(json.dumps(invalid_batch), encoding="utf-8")
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["available"] is False
+    assert report["data_status"] == "unavailable"
+    assert report["execution_batch"] is None
+    assert report["execution_batch_blocking"] is True
+    assert report["execution_batch_error"] == "执行批次无效，已阻止操作投影"
+    assert report["status_text"] == report["execution_batch_error"]
+    assert report["artifact"] == ""
+    assert report["report_sha256"] == ""
+    assert report["latest_report_sha256"] == ""
+    assert report["risk_skips"] == []
+    assert report["risk_summary"] == {}
+    assert report["drawdown_summary"] == {}
+    assert report["actual_overlay"] == {}
+    assert report["audit"] == {}
+    assert report["counts"] == {"sell": 0, "buy": 0, "hold": 0, "review": 0}
+    assert all(
+        report[key] == []
+        for key in ("sell_actions", "buy_actions", "hold_actions", "review_actions")
+    )
+
+    historical = load_historical_trend_report(
+        config.data_dir,
+        config.reports_dir,
+        broker="tiger",
+        artifact="2026-07-17-r1.json",
+    )
+
+    assert historical["available"] is True
+    assert historical["artifact"] == "2026-07-17-r1.json"
+    assert historical["execution_batch_blocking"] is False
+    assert historical["buy_actions"][0]["symbol"] == "REVISION"
+
+    batch.unlink()
+    current_without_batch = load_dashboard_state(config).to_dict()["trend_reports"][
+        "tiger"
+    ]
+
+    assert current_without_batch["available"] is True
+    assert current_without_batch["artifact"] == "2026-07-17-r1.json"
+    assert current_without_batch["execution_batch_blocking"] is False
+    assert current_without_batch["buy_actions"][0]["symbol"] == "REVISION"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["bad-json", "wrong-sha", "missing-artifact", "invalid-report"],
+)
+def test_dashboard_fails_closed_when_existing_execution_batch_is_invalid(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    from open_trader.dashboard import load_dashboard_state
+    from open_trader.trend_review import _report_hash
+
+    config = replace(dashboard_config(tmp_path), trend_executor_host="")
+    locked = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    revised = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    revised["strategy_judgments"]["formal_actions"][0]["symbol"] = "REVISION"
+    revised_path = config.reports_dir / "trend_us_tiger/2026-07-17-r1.json"
+    revised_path.write_text(json.dumps(revised), encoding="utf-8")
+    locked_path = config.reports_dir / "trend_us_tiger/2026-07-17.json"
+    batch_path = (
+        config.data_dir / "trend_review/ledgers/US/batches/2026-07-20.json"
+    )
+    batch_path.parent.mkdir(parents=True)
+    batch_payload = {
+        "schema_version": "open_trader.trend_review.batch.v1",
+        "market": "US",
+        "execution_date": "2026-07-20",
+        "report_path": str(locked_path),
+        "report_sha256": _report_hash(locked),
+        "locked_at": "2026-07-20T09:30:00-04:00",
+    }
+    if corruption == "bad-json":
+        batch_path.write_text("{broken", encoding="utf-8")
+    else:
+        if corruption == "wrong-sha":
+            batch_payload["report_sha256"] = "f" * 64
+        elif corruption == "missing-artifact":
+            batch_payload["report_path"] = str(locked_path.with_name("missing.json"))
+        else:
+            invalid_path = locked_path.with_name("invalid.json")
+            invalid_payload: dict[str, object] = {}
+            invalid_path.write_text(json.dumps(invalid_payload), encoding="utf-8")
+            batch_payload["report_path"] = str(invalid_path)
+            batch_payload["report_sha256"] = _report_hash(invalid_payload)
+        batch_path.write_text(json.dumps(batch_payload), encoding="utf-8")
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["available"] is False
+    assert report["data_status"] == "unavailable"
+    assert report["execution_batch"] is None
+    assert report["execution_batch_blocking"] is True
+    assert report["execution_batch_error"] == "执行批次无效，已阻止操作投影"
+    assert report["artifact"] == ""
+    assert report["report_sha256"] == ""
+    assert report["latest_report_sha256"] == ""
+    assert report["risk_skips"] == []
+    assert report["risk_summary"] == {}
+    assert report["drawdown_summary"] == {}
+    assert report["actual_overlay"] == {}
+    assert report["audit"] == {}
+    assert report["counts"] == {"sell": 0, "buy": 0, "hold": 0, "review": 0}
+    assert all(
+        report[key] == []
+        for key in ("sell_actions", "buy_actions", "hold_actions", "review_actions")
+    )
+    assert "REVISION" not in json.dumps(report, ensure_ascii=False)
 
 
 def relative_luminance(color: str) -> float:
@@ -394,6 +812,35 @@ console.log(JSON.stringify({fetches,messages}));
     assert json.loads(output) == {
         "fetches": 0,
         "messages": ["请选择 PDF 文件", "PDF 不能超过 20 MiB"],
+    }
+
+
+def test_failed_statement_upload_keeps_rendered_stats_cutoff_and_shows_reason() -> None:
+    output = run_dashboard_js(r'''
+const tradeStats={available:true,statistics_cutoff_at:"2026-07-12T23:59:59+08:00",
+  actual_label:"辉立实盘交易统计",
+  simulation:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0},
+  actual:{win_rate:"1",payoff_ratio:null,payoff_ratio_status:"no_losses",eligible_sample_count:1}};
+const base={status:"active",status_label:"风险预算内",portfolio_planned_risk:"0",
+  portfolio_planned_risk_pct:"0",portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"4000",
+  portfolio_remaining_risk_pct:"0.04",single_entry_risk_limit:"400",single_entry_risk_limit_pct:"0.004",
+  abnormal_loss_buffer:"1000",abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",
+  portfolio_remaining_risk_note:"说明",trade_stats:tradeStats};
+const before=renderTrendRiskSummary(base);
+let reloads=0; loadDashboard=async()=>{reloads+=1;};
+globalThis.fetch=async()=>({ok:false,status:400,json:async()=>({status:"error",message:"辉立成交表格式无法识别"})});
+let reason="";
+try { await uploadStatement("phillips", {name:"statement.pdf",size:100}); }
+catch (error) { reason=error.message; }
+const after=renderTrendRiskSummary(base);
+console.log(JSON.stringify({reason,reloads,same:before===after,kept:after.includes("统计截至 2026-07-12T23:59:59+08:00")}));
+''')
+
+    assert json.loads(output) == {
+        "reason": "辉立成交表格式无法识别",
+        "reloads": 0,
+        "same": True,
+        "kept": True,
     }
 
 
@@ -1050,6 +1497,15 @@ class RaisingQuoteService:
         raise RuntimeError("boom")
 
 
+class FakeTrendSimulatePositionService:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def load(self, broker: str) -> dict[str, Any]:
+        self.calls.append(broker)
+        return {"broker": broker, "positions": []}
+
+
 class FakeAccountSyncService:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
@@ -1306,7 +1762,7 @@ const sandbox = { document: { addEventListener() {} }, console, URLSearchParams 
     return result.stdout
 
 
-def test_dashboard_display_number_preserves_precision_and_identifiers() -> None:
+def test_dashboard_display_number_formats_numeric_text_only() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({
   money: formatDisplayNumber("3064187.62"),
@@ -1314,7 +1770,7 @@ console.log(JSON.stringify({
   trailing: formatDisplayNumber("2932.00"),
   signed: formatDisplayNumber("+1234567.50"),
   symbol: formatPlain("02840"),
-  percent: formatPlain("21.13%"),
+  percent: formatDisplayNumber("21.13%"),
   input: "100000",
   profit: pnlClass("12.50%"),
   loss: pnlClass("-12.50%"),
@@ -1323,14 +1779,99 @@ console.log(JSON.stringify({
     assert json.loads(output) == {
         "money": "3,064,187.62",
         "integer": "10,000",
-        "trailing": "2,932.00",
-        "signed": "+1,234,567.50",
+        "trailing": "2,932",
+        "signed": "+1,234,567.5",
         "symbol": "02840",
         "percent": "21.13%",
         "input": "100000",
         "profit": "pnl-profit",
         "loss": "pnl-loss",
     }
+
+
+def test_dashboard_numbers_never_show_more_than_two_decimal_places() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify([
+  formatDisplayNumber("485.0"),
+  formatDisplayNumber("1296"),
+  formatDisplayNumber("30.594999999999995"),
+  formatDisplayNumber("23.428857142857142857"),
+]));
+''')
+    assert json.loads(output) == ["485", "1,296", "30.59", "23.43"]
+
+
+def test_dashboard_trend_stages_format_only_numeric_fields_losslessly() -> None:
+    output = run_dashboard_js(r'''
+const cn = [
+  renderCnSellOrHoldStage("卖出", [{
+    symbol:"02840",name:"SPDR 金",close:"24.545714285714",strength:"99.876",
+    temperature_prev:"温",temperature_curr:"热",reason:"left_trend_right_side",
+    active_line:"9007199254740993",entry_hints:["编号 00001234"],
+    execution:{status:"partially_filled",filled_qty:"13.129",target_qty:"23.428",
+      avg_fill_price:"207.185",order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
+  }], "sell"),
+  renderCnBuyStage({buy_window:"09:30–10:00",buy_actions:[{
+    symbol:"600001",name:"测试",filter_price:"1234567.505",close:"24.545714285714",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99.876",
+    industry:"科技",industry_temperature:"热",market_cap:"12345.678",amount:"2.345",
+    target_weight:"0.04123456",target_amount:"39970.419",estimated_shares:"9007199254740993",
+    estimated_initial_line:"23.428857142857",
+  }],risk_skips:[{symbol:"600002",name:"跳过",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"科技",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04123456",target_amount:"8888.888"}]}),
+].join("");
+const us = [
+  renderMarketSellOrHoldStage("持有", [{
+    symbol:"00001234",name:"编号测试",close:"30.594999999999995",strength:"90.444",
+    reason:"trend_intact",active_line:"28.305071428571",
+  }], "hold"),
+  renderMarketBuyStage({buy_window:"常规时段",buy_actions:[{
+    symbol:"EA",name:"艺电",close:"207.185",strength:"99.876",industry:"通讯服务",
+    target_weight:"0.04123456",target_amount:"4941.499",estimated_shares:"9007199254740993",
+    estimated_initial_line:"205.46930",execution:{status:"partially_filled",
+      filled_qty:"13.129",target_qty:"23.428",avg_fill_price:"207.185",
+      order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
+  }],risk_skips:[]}),
+].join("");
+console.log(JSON.stringify({cn,us}));
+''')
+    rendered = json.loads(output)
+    combined = rendered["cn"] + rendered["us"]
+    for expected in (
+        "1,234,567.51", "24.55", "99.88", "12,345.68", "2.35",
+        "39,970.42", "8,888.89", "9,007,199,254,740,993 股", "23.43", "30.59",
+        "90.44", "28.31", "4,941.5", "205.47", "成交 13.13 / 23.43",
+        "均价 207.19", "目标仓位 4.12%",
+    ):
+        assert expected in combined
+    for preserved in (
+        "02840 SPDR 金", "600001 测试", "00001234 编号测试",
+        "订单 00001234", "2026-07-22T09:30:00+08:00", "编号 00001234",
+    ):
+        assert preserved in combined
+    for raw in (
+        "24.545714285714", "99.876", "12345.678", "2.345", "39970.419",
+        "30.594999999999995", "90.444", "28.305071428571", "4941.499", "8888.888",
+        "13.129", "23.428", "207.185",
+    ):
+        assert raw not in combined
+
+
+def test_dashboard_display_number_preserves_lossless_integer_semantics() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify([
+  formatDisplayNumber("9007199254740993"),
+  formatDisplayNumber("+1234567.50"),
+  formatDisplayNumber("00001234"),
+]));
+''')
+    assert json.loads(output) == [
+        "9,007,199,254,740,993",
+        "+1,234,567.5",
+        "00,001,234",
+    ]
 
 
 def test_dashboard_account_table_formats_values_but_not_symbol() -> None:
@@ -1342,8 +1883,8 @@ console.log(renderAccountTable([{key:"futu:HK:02840:0",holding:{},display:{
 }}]));
 ''')
     assert "10,000" in output
-    assert "2,932.00" in output
-    assert "HKD 31,845,000.00" in output
+    assert "2,932" in output
+    assert "HKD 31,845,000" in output
     assert ">02840<" in output
     assert 'class="number-cell account-holding-pnl pnl-loss"' in output
 
@@ -1394,22 +1935,22 @@ const decision = Object.fromEntries(decisionMetricCells({
 console.log(JSON.stringify({quote,kelly,backtest,trend,decision,input:state.standardBacktest.initialCash}));
 ''')
     rendered = json.loads(output)
-    assert rendered["quote"] == "1,234,567.50"
+    assert rendered["quote"] == "1,234,567.5"
     for expected in (
-        "USD 1,234,567.50", "USD +2,932.00", "<dt>订单</dt>",
-        "<dd>10,000</dd>", "HK.02840", "00001234", "1,234,567.50",
-        "29,320,000.00",
+        "USD 1,234,567.5", "USD +2,932", "<dt>订单</dt>",
+        "<dd>10,000</dd>", "HK.02840", "00001234", "1,234,567.5",
+        "29,320,000",
     ):
         assert expected in rendered["kelly"]
     for expected in (
-        "10,000", "21.13%", "2026-07-16", "2,932.00", "1,234.50",
+        "10,000", "21.13%", "2026-07-16", "2,932", "1,234.5",
         "100,000", "1,000 基点", "00001234",
     ):
         assert expected in rendered["backtest"]
     assert "全部卖出 10,000" in rendered["trend"]
     assert "正式买入 2,932" in rendered["trend"]
     assert "2026-07-16" in rendered["trend"]
-    assert rendered["decision"]["目标价"] == ">= 1,234,567.50"
+    assert rendered["decision"]["目标价"] == ">= 1,234,567.5"
     assert rendered["input"] == "100000"
 
 
@@ -1445,15 +1986,15 @@ console.log(JSON.stringify({kelly,trend,grouped,omitted}));
 ''')
     rendered = json.loads(output)
     for expected in (
-        "10,000 个实验", "HKD 29,320,000.00", "10,000 赢 / 2,932 亏",
-        "1,234.50", "21.13%", "2026-07-16 09:30",
+        "10,000 个实验", "HKD 29,320,000", "10,000 赢 / 2,932 亏",
+        "1,234.5", "21.13%", "2026-07-16 09:30",
     ):
         assert expected in rendered["kelly"]
     assert ">02840 SPDR 金<" in rendered["trend"]
     for expected in (
-        "10,000 股", "金额上限", "29,320,000.00", "预计保护线", "1,234,567.50",
-        "活动保护线", "强度 10,000", "科技｜10,000｜2,932.00",
-        "API 成本：1,234.50",
+        "10,000 股", "金额上限", "29,320,000", "预计保护线", "1,234,567.5",
+        "活动保护线", "强度 10,000", "科技｜10,000｜2,932",
+        "API 成本：1,234.5",
     ):
         assert expected in rendered["trend"]
     assert "×10,000" in rendered["grouped"]
@@ -1479,9 +2020,9 @@ renderSummary();
 console.log(JSON.stringify({header,summary:{cash:elements["summary-cash-note"].textContent,brokers:elements["summary-brokers"].textContent,weight:elements["summary-holding-weight"].textContent}}));
 ''')
     rendered = json.loads(output)
-    assert rendered["header"]["cash"] == "现金类资产 HKD 10,000.00 · 持仓 10,000"
+    assert rendered["header"]["cash"] == "现金类资产 HKD 10,000 · 持仓 10,000"
     assert rendered["header"]["weight"] == "21.13%"
-    assert rendered["summary"]["cash"] == "现金类资产 HKD 10,000.00 · 3.28% · 持仓 10,000"
+    assert rendered["summary"]["cash"] == "现金类资产 HKD 10,000 · 3.28% · 持仓 10,000"
     assert rendered["summary"]["brokers"] == "2,932 个"
     assert rendered["summary"]["weight"] == "21.13%"
 
@@ -1522,7 +2063,7 @@ console.log(JSON.stringify({
 }));
 ''')
     rendered = json.loads(output)
-    assert "现金 HKD 451,097.00" in rendered["tiger"]
+    assert "现金 HKD 451,097" in rendered["tiger"]
     assert "可交易额度 HKD 488,032.24" in rendered["tiger"]
     assert "现金构成" in rendered["tiger"]
     assert "USD 现金" in rendered["tiger"]
@@ -1604,12 +2145,12 @@ console.log(renderBrokerDetailSection([
 ''')
     assert "<td>00001234</td>" in output
     assert '<td class="number-cell">10,000</td>' in output
-    assert '<td class="number-cell">2,932.00</td>' in output
-    assert '<td class="number-cell">1,234,567.50</td>' in output
-    assert '<td class="number-cell">29,320,000.00</td>' in output
-    assert '<td class="number-cell pnl-profit">+1,234.50</td>' in output
-    assert '<td class="number-cell pnl-loss">-12.50%</td>' in output
-    assert '<td class="number-cell">0.00%</td>' in output
+    assert '<td class="number-cell">2,932</td>' in output
+    assert '<td class="number-cell">1,234,567.5</td>' in output
+    assert '<td class="number-cell">29,320,000</td>' in output
+    assert '<td class="number-cell pnl-profit">+1,234.5</td>' in output
+    assert '<td class="number-cell pnl-loss">-12.5%</td>' in output
+    assert '<td class="number-cell">0%</td>' in output
 
 
 def test_dashboard_action_card_formats_price_and_quantity_fields_only() -> None:
@@ -1620,9 +2161,9 @@ console.log(renderActionCard({
 }));
 ''')
     assert "<strong>HK.02840</strong>" in output
-    assert "<div><span>限价</span><strong>1,234,567.50</strong></div>" in output
+    assert "<div><span>限价</span><strong>1,234,567.5</strong></div>" in output
     assert "<div><span>数量</span><strong>10,000</strong></div>" in output
-    assert "<div><span>金额</span><strong>HKD 29,320,000.00</strong></div>" in output
+    assert "<div><span>金额</span><strong>HKD 29,320,000</strong></div>" in output
 
 
 def test_dashboard_kelly_realized_pnl_classes_cover_all_polarities() -> None:
@@ -1635,9 +2176,9 @@ console.log(JSON.stringify({profit:render("+1234.50"),loss:render("-1234.50"),ze
 ''')
     rendered = json.loads(output)
     assert '<div class="primary">\n            <dt>可用资金</dt>\n            <dd>USD 1</dd>' in rendered["profit"]
-    assert '<div class="pnl-profit">\n            <dt>已实现盈亏</dt>\n            <dd>USD +1,234.50</dd>' in rendered["profit"]
-    assert '<div class="pnl-loss">\n            <dt>已实现盈亏</dt>\n            <dd>USD -1,234.50</dd>' in rendered["loss"]
-    assert '<div>\n            <dt>已实现盈亏</dt>\n            <dd>USD 0.00</dd>' in rendered["zero"]
+    assert '<div class="pnl-profit">\n            <dt>已实现盈亏</dt>\n            <dd>USD +1,234.5</dd>' in rendered["profit"]
+    assert '<div class="pnl-loss">\n            <dt>已实现盈亏</dt>\n            <dd>USD -1,234.5</dd>' in rendered["loss"]
+    assert '<div>\n            <dt>已实现盈亏</dt>\n            <dd>USD 0</dd>' in rendered["zero"]
     assert "pnl-profit" not in rendered["zero"]
     assert "pnl-loss" not in rendered["zero"]
 
@@ -1664,15 +2205,15 @@ console.log(JSON.stringify({
 ''')
     rendered = json.loads(output)
     assert rendered["values"] == [
-        "+1,234,567.50", "+1,234,567.50", "-1,234,567.50", "0.00", "+12.50%",
+        "+1,234,567.5", "+1,234,567.5", "-1,234,567.5", "0", "+12.5%",
     ]
     assert rendered["drawdowns"] == ["-8.25%", "-8.25%", "0%"]
     assert ">+16.67%</td>" in rendered["account"]
     assert ">12.50%</td>" in rendered["account"]  # generic account weight stays unsigned
-    assert '<strong class="pnl-profit">+12.50%</strong>' in rendered["backtest"]
+    assert '<strong class="pnl-profit">+12.5%</strong>' in rendered["backtest"]
     assert '<span>最大回撤</span><strong class="pnl-loss">-8.25%</strong>' in rendered["backtest"]
     assert ">60.00%</strong>" in rendered["backtest"]
-    assert ">+12.50%</dd>" in rendered["plan"]
+    assert ">+12.5%</dd>" in rendered["plan"]
     assert '<dt>最大回撤</dt><dd class="pnl-loss">-8.25%</dd>' in rendered["plan"]
 
 
@@ -1681,7 +2222,7 @@ def test_dashboard_signed_pnl_covers_kelly_sample_pnl() -> None:
 const kelly=renderKellyParameterDerivation({sample_stage:"sufficient",avg_net_win_pct:"12.50%",avg_net_loss_pct:"-8.25%"});
 console.log(kelly);
 ''')
-    assert "+12.50% / -8.25%" in output
+    assert "+12.5% / -8.25%" in output
 
 
 def test_dashboard_remaining_numeric_leaves_group_only_numeric_values() -> None:
@@ -1719,15 +2260,15 @@ console.log(JSON.stringify({condition,facts,keywords,bollinger,technical,action,
     assert 'data-plan-condition="00001234"' in rendered["condition"]
     assert "25,142.16" in rendered["facts"] and "21.13%" in rendered["facts"]
     assert ">00001234</span>" in rendered["keywords"] and ">5,000</em>" in rendered["keywords"]
-    for expected in ("1,234,567.50", "2,000,000.00", "3,000,000.00"):
+    for expected in ("1,234,567.5", "2,000,000", "3,000,000"):
         assert expected in rendered["bollinger"]
     assert "21.13%" in rendered["bollinger"]
     assert "2026-07-16 当前价" in rendered["technical"]
-    assert "1,234,567.50" in rendered["technical"]
+    assert "1,234,567.5" in rendered["technical"]
     assert "21.13%" in rendered["technical"] and "等待确认" in rendered["technical"]
-    for expected in ("MACD 1,234,567.50", "Signal 2,000,000.00", "Hist 3,000,000.00", "MA20 1,234,567.50"):
+    for expected in ("MACD 1,234,567.5", "Signal 2,000,000", "Hist 3,000,000", "MA20 1,234,567.5"):
         assert expected in rendered["technical"]
-    for expected in ("1,234,567.50", "25,142.16", "HKD 29,320,000.00", "2,000,000.00"):
+    for expected in ("1,234,567.5", "25,142.16", "HKD 29,320,000", "2,000,000"):
         assert expected in rendered["action"]
     assert "上期复盘 · 2026-07-16" in rendered["review"]
     assert "条件触发 <strong>5,000 次</strong>" in rendered["review"]
@@ -1744,8 +2285,8 @@ const action={
 console.log(JSON.stringify({band:renderTradeDecisionBand(action,{}),card:renderActionCard(action)}));
 ''')
     rendered = json.loads(output)
-    assert "USD 29,320,000.00" in rendered["band"]
-    assert "USD 29,320,000.00" in rendered["card"]
+    assert "USD 29,320,000" in rendered["band"]
+    assert "USD 29,320,000" in rendered["card"]
 
 
 def test_dashboard_t_signal_formats_only_price_numeric_leaves() -> None:
@@ -1760,7 +2301,7 @@ console.log(JSON.stringify({details:renderTSignalDetails(signal),timeline:render
 ''')
     rendered = json.loads(output)
     for expected in (
-        "1,234,567.50", "2,000,000.00", "1,234,567.50 / 3,000,000.00",
+        "1,234,567.5", "2,000,000", "1,234,567.5 / 3,000,000",
     ):
         assert expected in rendered["details"]
     assert "21.13%" in rendered["details"]
@@ -1780,8 +2321,8 @@ console.log(JSON.stringify({
 }));
 ''')
     assert json.loads(output) == {
-        "lower": ">= 1,234,567.50",
-        "range": "1,234,567.50 - 2,000,000.00",
+        "lower": ">= 1,234,567.5",
+        "range": "1,234,567.5 - 2,000,000",
         "date": "2026-07-16",
         "identifier": "编号 00001234",
         "numericId": "00001234-56",
@@ -2184,8 +2725,8 @@ const active = renderQuotePrice({market:"US", asset_class:"stock"}, {
   last_price:"61.50", price_session:"overnight",
   price_time:"2026-07-15 03:03:01.150", current_session_quote:true,
 });
-if(!active.includes("夜盘") || !active.includes("61.50") || !active.includes("03:03 ET"))throw new Error(active);
-if((active.match(/61\.50/g)||[]).length!==1)throw new Error("price repeated: "+active);
+if(!active.includes("夜盘") || !active.includes("61.5") || !active.includes("03:03 ET"))throw new Error(active);
+if((active.match(/61\.5/g)||[]).length!==1)throw new Error("price repeated: "+active);
 const fallback = renderQuotePrice({market:"US", asset_class:"option"}, {
   last_price:"0.59", price_session:"regular", price_time:"",
   current_session_quote:false,
@@ -2792,9 +3333,9 @@ console.log(JSON.stringify({first,second,market,cards:renderBrokerSummaryCards()
     assert result["second"]["broker"] == "tiger"
     assert 'id="account-tiger"' in result["second"]["html"]
     assert "老虎" in result["second"]["label"]
-    assert result["first"]["value"] == "HKD 4,000.00"
-    assert result["second"]["value"] == "HKD 4,000.00"
-    assert result["market"]["value"] == "HKD 4,000.00"
+    assert result["first"]["value"] == "HKD 4,000"
+    assert result["second"]["value"] == "HKD 4,000"
+    assert result["market"]["value"] == "HKD 4,000"
     assert "HK · 老虎 · 0 条" in result["market"]["label"]
     assert 'data-broker="tiger"' in result["cards"]
     assert 'href="#account-tiger"' not in result["cards"]
@@ -2975,9 +3516,12 @@ state.dashboard={trend_reports:{
 }};
 const group=(broker)=>({broker,profile:ACCOUNT_STRATEGY_PROFILES[broker],rows:[],summary:{broker,display_name:broker,portfolio_value_hkd:"1000",holding_value_hkd:"700",cash_like_value_hkd:"300",holding_count:"1"}});
 const html=["futu","tiger","phillips","eastmoney"].map((broker)=>renderAccountSection(group(broker))).join("");
-if((html.match(/当天趋势报告/g)||[]).length!==3)throw new Error(html);
+if((html.match(/当天趋势报告/g)||[]).length!==0)throw new Error(html);
 if((html.match(/期权关注/g)||[]).length<1)throw new Error(html);
-for(const broker of ["futu","tiger","phillips","eastmoney"]){if(!html.includes(`data-trend-report="${broker}"`))throw new Error(html);}
+if(!html.includes('data-trend-report="futu"'))throw new Error(html);
+for(const broker of ["tiger","phillips","eastmoney"]){
+  if(html.includes(`data-trend-report="${broker}"`)||!html.includes(`data-account-broker="${broker}" data-account-view="report"`))throw new Error(html);
+}
 for(const broker of ["tiger","phillips","eastmoney"]){
   const entry=renderTrendReportEntry(broker);
   for(const text of ['data-trend-report="'+broker+'"',"数据截至 2026-07-14；今日未更新","报告日期 2026-07-15","数据截至 2026-07-14"]){
@@ -3017,6 +3561,1089 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_controller_facts_and_terminal_action_labels() -> None:
+    output = run_dashboard_js(r'''
+const report={
+  available:true,market:"US",broker:"tiger",broker_label:"老虎",market_label:"美股",
+  report_date:"2026-07-21",data_date:"2026-07-20",generated_at:"2026-07-21T08:00:00+08:00",
+  account_status:"已更新",buy_window:"美股常规交易时段",counts:{buy:3},sell_actions:[],
+  buy_actions:[
+    {symbol:"TRV",execution:{status:"uncertain"}},
+    {symbol:"ADM",execution:{status:"conflict"}},
+    {symbol:"PM",execution:{status:"missed"}},
+  ],hold_actions:[],review_actions:[],audit:{},revision_anomaly:true,
+  execution_batch:{report_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  latest_report_sha256:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+};
+const healthy={effective_mode:"execute",executor_host:"ray-mac",local_host:"ray-mac",
+  health:"healthy",blocking:false,pid:4242,working_directory:"/srv/open_trader",
+  git_sha:"abc1234",phase:"monitoring",heartbeat_at:"2026-07-21T09:31:00+08:00",
+  last_success:{status:"<script>alert(1)</script>",market:"US",date:"2026-07-20",
+    submitted_count:0,artifact_paths:[]},
+  blocker:null,next_check_at:"2026-07-21T09:31:05+08:00"};
+state.dashboard={trend_controllers:{tiger:healthy}};
+const normal=renderTrendReportWorkspace(report);
+for(const text of ["策略控制器","执行模式","execute","执行主机","ray-mac","本地主机",
+  "PID","4242","Git SHA","abc1234","当前阶段","monitoring","心跳",
+  "最近成功","状态 &lt;script&gt;alert(1)&lt;/script&gt;","市场 US","日期 2026-07-20",
+  "提交数 0","产物 无","当前阻塞","下次检查",
+  "状态不确定，禁止自动重试","订单事实冲突，禁止提交","已错过策略窗口",
+  "发现后续报告版本，执行仍锁定原批次","aaaaaaaaaaaa","bbbbbbbbbbbb"]){
+  if(!normal.includes(text))throw new Error(text+"\n"+normal);
+}
+if(normal.includes("[object Object]") || normal.includes("<script>"))throw new Error(normal);
+state.dashboard.trend_controllers.tiger={...healthy,last_success:"report_locked"};
+if(!renderTrendReportWorkspace(report).includes("report_locked"))throw new Error("string last_success");
+state.dashboard.trend_controllers.tiger={...healthy,last_success:null};
+if(!renderTrendReportWorkspace(report).includes("<dt>最近成功</dt><dd>—</dd>"))throw new Error("null last_success");
+state.dashboard.trend_controllers.tiger=healthy;
+state.dashboard.trend_reports={tiger:{available:false,data_status:"unavailable",
+  broker:"tiger",execution_batch:null,execution_batch_blocking:true,
+  execution_batch_error:"执行批次无效，已阻止操作投影",
+  status_text:"执行批次无效，已阻止操作投影",counts:{buy:0},
+  sell_actions:[],buy_actions:[],hold_actions:[],review_actions:[]}};
+const batchBlocked=renderEmbeddedTrendReport("tiger");
+if(!batchBlocked.includes('class="trend-execution-batch-error"') ||
+   !batchBlocked.includes("执行批次无效，已阻止操作投影") ||
+   !batchBlocked.includes('class="trend-controller-status"') ||
+   batchBlocked.includes("TRV"))throw new Error(batchBlocked);
+state.dashboard.trend_controllers.tiger={...healthy,health:"unavailable",blocking:true,
+  phase:"unavailable",blocker:"controller heartbeat is stale",reason:"controller heartbeat is stale"};
+const blocked=renderTrendReportWorkspace(report);
+if(!blocked.includes('class="trend-controller-status blocking"') ||
+   !blocked.includes('data-health="unavailable"') ||
+   !blocked.includes("控制器不可用"))throw new Error(blocked);
+state.dashboard.trend_controllers.tiger={...healthy,effective_mode:"readonly",health:"readonly",
+  blocking:false,phase:"readonly",pid:null,reason:"local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST",
+  blocker:"local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"};
+const readonly=renderTrendReportWorkspace(report);
+if(!readonly.includes("只读部署，不运行本机控制器") || readonly.includes('class="trend-controller-status blocking"')){
+  throw new Error(readonly);
+}
+state.dashboard.trend_reports={tiger:{available:false,status_text:"报告生成中"}};
+const missingReport=renderEmbeddedTrendReport("tiger");
+if(!missingReport.includes('class="trend-controller-status"') || !missingReport.includes("报告生成中")){
+  throw new Error(missingReport);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_controller_card_is_responsive_at_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    rendered = json.loads(run_dashboard_js(r'''
+state.dashboard={trend_controllers:{tiger:{effective_mode:"execute",executor_host:"ray-mac",
+  local_host:"ray-mac",health:"unavailable",blocking:true,pid:4242,
+  working_directory:"/a/very/long/path/to/the/exact/accepted/dashboard/checkout",
+  git_sha:"1234567890abcdef1234567890abcdef12345678",phase:"report_generation_blocked",
+  heartbeat_at:"2026-07-21T09:31:00+08:00",last_success:{status:"missed_window",
+    market:"US",date:"2026-07-20",submitted_count:0,
+    artifact_paths:["/a/very/long/path/to/an/execution/artifact.json"]},
+  blocker:"controller heartbeat is stale after an intentionally long diagnostic message",
+  next_check_at:"2026-07-21T09:31:05+08:00",reason:"controller heartbeat is stale"}}};
+console.log(JSON.stringify(renderTrendReportWorkspace({available:true,market:"US",broker:"tiger",
+  broker_label:"老虎",market_label:"美股",counts:{},audit:{},sell_actions:[],buy_actions:[],
+  hold_actions:[],review_actions:[]})));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    errors: list[str] = []
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(f"<style>{css}</style>{rendered}")
+
+        assert errors == []
+        assert page.locator(".trend-controller-status").count() == 1
+        assert "状态 missed_window" in page.locator(
+            ".trend-controller-status"
+        ).inner_text()
+        assert "[object Object]" not in page.locator(
+            ".trend-controller-status"
+        ).inner_text()
+        assert page.locator(".trend-controller-status dl").evaluate(
+            "node => getComputedStyle(node).gridTemplateColumns.split(' ').length"
+        ) == 1
+        assert page.locator(".trend-controller-status").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        browser.close()
+
+
+def test_dashboard_account_view_tabs_keep_exact_order_and_futu_unchanged() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard={
+  trend_reports:{
+    futu:{available:true,status_text:"期权关注"},
+    tiger:{available:true,broker:"tiger",broker_label:"老虎",market_label:"美股"},
+  },
+  trend_reviews:{tiger:{available:true,market_label:"美股"}},
+};
+const group=(broker)=>({broker,profile:ACCOUNT_STRATEGY_PROFILES[broker],rows:[],summary:{
+  broker,display_name:broker,portfolio_value_hkd:"1000",holding_value_hkd:"700",
+  cash_like_value_hkd:"300",holding_count:"0",
+}});
+const tiger=renderAccountSection(group("tiger"));
+const futu=renderAccountSection(group("futu"));
+const labels=[...tiger.matchAll(/data-account-view="[^"]+"[^>]*>([^<]+)/g)].map((match)=>match[1].trim());
+console.log(JSON.stringify({tiger,futu,labels}));
+''')
+    rendered = json.loads(output)
+    assert rendered["labels"] == ["真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"]
+    assert rendered["tiger"].count('role="tab"') == 4
+    assert 'data-account-view="real" aria-selected="true" tabindex="0"' in rendered["tiger"]
+    assert 'role="tabpanel"' in rendered["tiger"]
+    assert "trend-report-entry" not in rendered["tiger"]
+    assert 'data-trend-report="futu"' in rendered["futu"]
+    assert "data-account-view" not in rendered["futu"]
+
+
+def test_dashboard_simulate_positions_load_once_and_render_all_states() -> None:
+    output = run_dashboard_js(r'''
+function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{add(){},remove(){}},
+  setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
+  querySelector(){return null;}};}
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+const tabs=["real","simulate","report","review"].map((view)=>({dataset:{accountBroker:"tiger",accountView:view},
+  tabIndex:-1,setAttribute(){}}));
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-tiger-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>tabs;
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true}},trend_reviews:{tiger:{available:true,market_label:"美股"}}};
+state.brokerFilter="tiger";
+const linked={available:true,broker:"tiger",positions:[{
+  broker:"tiger",market:"US",symbol:"AAPL",name:"Apple",currency:"USD",quantity:"2",
+  cost_price:"180",last_price:"190",market_value:"380",market_value_hkd:"2964",
+  account_weight:"38.00%",portfolio_weight:"38.00%",unrealized_pnl_pct:"5.56%",
+  attribution_status:"linked",report:{artifact:"2026-07-17.json",execution_date:"2026-07-20",strategy_version:"v1"},
+}]};
+let calls=[];
+let responsePayload=linked;
+globalThis.fetch=async(url)=>{calls.push(url);return {ok:true,json:async()=>responsePayload};};
+await setAccountView("tiger","simulate");
+const loaded=panel.innerHTML;
+const initialPanelRenders=panelRenders;
+await setAccountView("tiger","simulate");
+const linkedCalls=[...calls];
+delete state.trendSimulatePositions.tiger;
+responsePayload={available:true,broker:"tiger",positions:[]};
+await setAccountView("tiger","real");
+await setAccountView("tiger","simulate");
+const empty=panel.innerHTML;
+delete state.trendSimulatePositions.tiger;
+responsePayload={available:false,broker:"tiger",positions:[],error:"OpenD 模拟账户不可用"};
+await setAccountView("tiger","real");
+await setAccountView("tiger","simulate");
+const unavailable=panel.innerHTML;
+state.trendSimulatePositions.tiger={...linked,positions:[linked.positions[0],
+  {...linked.positions[0],symbol:"MSFT",attribution_status:"unlinked",report:null},
+  {...linked.positions[0],symbol:"NVDA",attribution_status:"conflict",report:null}]};
+renderAccountViewPanelOnly("tiger");
+const attributionStates=panel.innerHTML;
+console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:calls,empty,unavailable,attributionStates}));
+''')
+    rendered = json.loads(output)
+    assert rendered["initialPanelRenders"] == 2
+    assert rendered["linkedCalls"] == ["/api/trend-simulate-positions/tiger"]
+    assert rendered["allCalls"] == ["/api/trend-simulate-positions/tiger"] * 3
+    for label in (
+        "明细", "市场", "标的", "数量", "成本价", "实时价", "美元市值",
+        "港元市值", "账户权重", "组合权重", "盈亏",
+    ):
+        assert label in rendered["loaded"]
+    assert "报告 2026-07-20 · v1" in rendered["loaded"]
+    assert 'data-history-artifact="2026-07-17.json"' in rendered["loaded"]
+    assert "交易决策" not in rendered["loaded"]
+    assert "做T" not in rendered["loaded"]
+    assert "当前无模拟盘持仓" in rendered["empty"]
+    assert "OpenD 模拟账户不可用" in rendered["unavailable"]
+    assert "当前筛选下没有持仓" not in rendered["unavailable"]
+    assert rendered["attributionStates"].count("报告 2026-07-20 · v1") == 1
+    assert rendered["attributionStates"].count("未关联历史报告") == 1
+    assert rendered["attributionStates"].count("报告关联冲突") == 1
+
+
+def test_dashboard_manual_refresh_reloads_active_simulated_positions() -> None:
+    output = run_dashboard_js(r'''
+elements["refresh-quotes"]={disabled:false,textContent:""};
+renderQuoteStatus=()=>{};
+renderHoldings=()=>{};
+state.brokerFilter="tiger";
+state.accountViews.tiger="simulate";
+state.trendSimulatePositions={tiger:{available:true,positions:[
+  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
+]}};
+const refreshed={available:true,positions:[
+  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
+  {symbol:"HST",quantity:"1633"},
+]};
+const requests=[];
+globalThis.fetch=async(url)=>{
+  requests.push(url);
+  return {ok:true,json:async()=>url==="/api/quotes"
+    ? {quotes:{},account_sync:{status:"skipped"}}
+    : refreshed};
+};
+await refreshQuotes({refreshSimulation:true});
+console.log(JSON.stringify({
+  requests,
+  symbols:state.trendSimulatePositions.tiger.positions.map((position)=>position.symbol),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["requests"] == [
+        "/api/quotes",
+        "/api/trend-simulate-positions/tiger",
+    ]
+    assert rendered["symbols"] == ["GPN", "TOST", "HST"]
+
+
+def test_dashboard_report_loads_simulation_and_keeps_real_comparison() -> None:
+    output = run_dashboard_js(r'''
+function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{add(){},remove(){}},
+  setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
+  querySelector(){return null;}};}
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-tiger-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>[];
+state.dashboard={
+  summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reviews:{tiger:{available:true,market_label:"美股"}},
+  trend_reports:{tiger:{
+    available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",
+    risk_summary:{},drawdown_summary:{},actual_overlay:{available:true,
+      broker_label:"老虎",status_text:"账户实时同步",notice:"只读对照，不影响模拟建议与自动执行",
+      items:[],outside_positions:[]},
+    sell_actions:[],buy_actions:[{action:"BUY",symbol:"HST",name:"HOST酒店及度假村",
+      estimated_shares:"1635",close:"24.44",estimated_initial_line:"23.428857142857"}],
+    hold_actions:[{action:"HOLD",symbol:"GPN",name:"环汇有限公司",close:"80.07",active_line:"74.3550"},
+      {action:"HOLD",symbol:"TOST",name:"Toast",close:"30.37",active_line:"28.305071428571"}],
+    review_actions:[],risk_skips:[],counts:{},audit:{},
+  }},
+};
+state.brokerFilter="tiger";
+const urls=[];
+globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>({available:true,broker:"tiger",positions:[
+  {symbol:"GPN",name:"环汇有限公司",quantity:"485.0",cost_price:"80.99",last_price:"80.07"},
+  {symbol:"TOST",name:"Toast",quantity:"1296.0",cost_price:"30.594999999999995",last_price:"30.37"},
+]})};};
+await setAccountView("tiger","report");
+console.log(JSON.stringify({urls,html:panel.innerHTML}));
+''')
+    rendered = json.loads(output)
+    html = rendered["html"]
+    assert rendered["urls"] == ["/api/trend-simulate-positions/tiger"]
+    for text in (
+        "模拟盘执行状态", "富途", "实盘执行辅助", "老虎", "GPN",
+        "模拟持仓 485", "TOST", "模拟持仓 1,296",
+    ):
+        assert text in html
+    assert html.count('data-deviation="followed"') == 2
+    assert html.count("一致") == 2
+    assert 'data-deviation="pending">待执行' in html
+    assert "未持有" not in html
+
+
+def test_dashboard_historical_report_omits_simulation_reconciliation() -> None:
+    output = run_dashboard_js(r'''
+const report={
+  available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",
+  report_date:"2026-07-17",data_date:"2026-07-16",counts:{},audit:{},
+  risk_summary:{},drawdown_summary:{},
+  sell_actions:[{action:"SELL_ALL",symbol:"EXIT",name:"Exit",close:"10",active_line:"9"}],
+  buy_actions:[{action:"BUY",symbol:"MISSED",name:"Missed",execution:{status:"missed"}}],
+  hold_actions:[],review_actions:[],risk_skips:[],
+};
+state.trendSimulatePositions.tiger={available:true,broker:"tiger",positions:[
+  {symbol:"EXTRA",name:"Outside",quantity:"12",cost_price:"8",last_price:"9"},
+]};
+const current=renderTrendReportWorkspace(report,true,false);
+const historical=renderTrendReportWorkspace(report,true,true);
+const loading=renderTrendSimulationOverlay(report,{loading:true});
+const unavailable=renderTrendSimulationOverlay(report,{available:false,error:"OpenD 模拟账户不可用"});
+console.log(JSON.stringify({current,historical,loading,unavailable}));
+''')
+    rendered = json.loads(output)
+    current = rendered["current"]
+    historical = rendered["historical"]
+    assert 'class="trend-simulation-overlay"' in current
+    assert "模拟盘执行状态" in current
+    assert re.search(
+        r'data-simulation-symbol="EXIT".*?data-deviation="followed">一致',
+        current,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'data-simulation-symbol="EXTRA".*?data-deviation="outside_report_addition">报告外持仓',
+        current,
+        re.DOTALL,
+    )
+    assert 'class="trend-simulation-overlay"' not in historical
+    assert "模拟盘执行状态" not in historical
+    assert "EXIT" in historical
+    assert "已错过策略窗口" in historical
+    for state_html in (rendered["loading"], rendered["unavailable"]):
+        assert "data-simulation-symbol" not in state_html
+        assert "未持有" not in state_html
+    assert "模拟盘持仓加载中" in rendered["loading"]
+    assert "OpenD 模拟账户不可用" in rendered["unavailable"]
+
+
+def test_dashboard_simulation_overlay_escapes_every_hostile_rendered_fact() -> None:
+    output = run_dashboard_js(r'''
+const attack='"><img src=x onerror=alert(1)>';
+const html=renderTrendSimulationOverlay({
+  sell_actions:[],hold_actions:[],review_actions:[],risk_skips:[],
+  buy_actions:[{action:"BUY",symbol:attack,name:attack,estimated_shares:attack,
+    close:attack,estimated_initial_line:attack}],
+},{available:true,positions:[{symbol:attack,name:attack,quantity:attack,
+  cost_price:attack,last_price:attack}]});
+const unavailable=renderTrendSimulationOverlay({}, {available:false,error:attack});
+console.log(JSON.stringify({html,unavailable}));
+''')
+    rendered = json.loads(output)
+    assert "<img" not in rendered["html"]
+    assert '<img' not in rendered["unavailable"]
+    assert 'data-simulation-symbol="&quot;&gt;&lt;IMG' in rendered["html"]
+    assert "&lt;img src=x onerror=alert(1)&gt;" in rendered["html"]
+    assert "报告数量 &quot;&gt;&lt;img" in rendered["html"]
+    assert "模拟持仓 &quot;&gt;&lt;img" in rendered["html"]
+    assert "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;" in rendered["unavailable"]
+
+
+def test_dashboard_report_history_is_inline_exact_and_restores_scroll() -> None:
+    output = run_dashboard_js(r'''
+function mount(){const classes=new Set();return {innerHTML:"",textContent:"",attributes:{},classList:{
+  add(...names){names.forEach((name)=>classes.add(name));},remove(...names){names.forEach((name)=>classes.delete(name));},
+  contains(name){return classes.has(name);}},setAttribute(name,value){this.attributes[name]=value;},
+  removeAttribute(name){delete this.attributes[name];},querySelector(){return null;}};}
+for(const id of ["account-tabs","account-holdings","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]=mount();}
+const panel=mount();
+elements["account-holdings"].querySelector=(selector)=>selector==="#account-tiger-view-panel"?panel:null;
+elements["account-holdings"].querySelectorAll=()=>[];
+let restored=-1;
+globalThis.window={scrollY:321,scrollTo(_x,y){restored=y;},location:{search:""}};
+const current={available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",
+  report_date:"2026-07-20",data_date:"2026-07-17",counts:{},audit:{}};
+const historical={...current,report_date:"2026-07-17",buy_actions:[{symbol:"AAPL",execution:{status:"missed"}}]};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:current},trend_reviews:{tiger:{available:true,market_label:"美股"}}};
+state.brokerFilter="tiger";
+const urls=[];
+globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>url.includes("trend-simulate-positions")
+  ? {available:true,broker:"tiger",positions:[]}
+  : url.endsWith("2026-07-16.json") ? historical
+  : [{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",strategy_version:"v1"}]};};
+await setAccountView("tiger","report");
+const currentHtml=panel.innerHTML;
+await openTrendReportHistory("tiger");
+const historyHtml=panel.innerHTML;
+await loadHistoricalTrendReport("tiger","2026-07-16.json");
+const historicalHtml=panel.innerHTML;
+showCurrentTrendReport("tiger");
+const restoredHtml=panel.innerHTML;
+const historyRestored=restored;
+delete state.trendReportHistories.tiger;
+window.scrollY=456;
+await loadHistoricalTrendReport("tiger","2026-07-16.json");
+showCurrentTrendReport("tiger");
+const directRestored=restored;
+console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restoredHtml,historyRestored,directRestored,
+  view:state.accountViews.tiger,workspaceHidden:elements["workspace-grid"].classList.contains("hidden")}));
+''')
+    rendered = json.loads(output)
+    assert rendered["urls"] == [
+        "/api/trend-simulate-positions/tiger",
+        "/api/trend-reports/tiger/history",
+        "/api/trend-reports/tiger/history/2026-07-16.json",
+        "/api/trend-reports/tiger/history/2026-07-16.json",
+    ]
+    assert "当天趋势报告" in rendered["currentHtml"]
+    assert "历史报告" in rendered["currentHtml"]
+    assert "返回持仓看板" not in rendered["currentHtml"]
+    assert "2026-07-16.json" in rendered["historyHtml"]
+    assert "错过" in rendered["historicalHtml"]
+    assert "返回当前报告" in rendered["historicalHtml"]
+    assert "当天趋势报告" in rendered["restoredHtml"]
+    assert rendered["historyRestored"] == 321
+    assert rendered["directRestored"] == 456
+    assert rendered["view"] == "report"
+    assert rendered["workspaceHidden"] is False
+
+
+def test_dashboard_quote_refresh_does_not_replace_active_report_view() -> None:
+    output = run_dashboard_js(r'''
+elements["refresh-quotes"]={disabled:false,textContent:""};
+state.brokerFilter="tiger";
+state.accountViews.tiger="report";
+state.trendReportHistories.tiger={open:true};
+state.dashboard={marker:"before"};
+let failDashboard=false;
+globalThis.fetch=async(url)=>url==="/api/quotes"
+  ? {ok:true,json:async()=>({quotes:{},account_sync:{status:"ok"}})}
+  : failDashboard
+    ? {ok:false,status:500}
+    : {ok:true,json:async()=>({poll_seconds:0,marker:"after"})};
+renderQuoteStatus=()=>{};
+let holdingRenders=0;
+const frozenPanel={id:"frozen"};
+let currentPanel=frozenPanel;
+const replacementPanel={replaceWith(panel){currentPanel=panel;}};
+elements["account-holdings"]={querySelector(){return currentPanel;}};
+renderDashboard=()=>renderDashboardViews();
+renderHeaderSummary=()=>{};
+renderAccountHoldings=()=>{holdingRenders+=1;currentPanel=replacementPanel;};
+await refreshQuotes();
+const dashboardAfterSuccess=state.dashboard;
+failDashboard=true;
+await refreshQuotes();
+console.log(JSON.stringify({holdingRenders,panelPreserved:currentPanel===frozenPanel,
+  currentReportRefreshed:dashboardAfterSuccess.marker==="after",
+  failedReloadPreserved:state.dashboard===dashboardAfterSuccess}));
+''')
+    assert json.loads(output) == {
+        "holdingRenders": 1,
+        "panelPreserved": True,
+        "currentReportRefreshed": True,
+        "failedReloadPreserved": True,
+    }
+
+
+def test_dashboard_account_view_keyboard_and_mobile_acceptance_css() -> None:
+    output = run_dashboard_js(r'''
+let focused="";
+elements["account-holdings"]={innerHTML:"",classList:{add(){},remove(){}},setAttribute(){},removeAttribute(){},
+  querySelector(selector){return {innerHTML:"",setAttribute(){},focus(){focused=selector;}};}};
+state.accountViews={tiger:"real",phillips:"real",eastmoney:"real"};
+state.trendSimulatePositions={tiger:{available:true,positions:[]}};
+state.dashboard={summary:{portfolio_value_hkd:"0"},broker_summaries:[],cash_rows:[],holdings:[],
+  trend_reports:{tiger:{available:false}},trend_reviews:{tiger:{available:false}}};
+state.brokerFilter="tiger";
+for(const id of ["account-tabs","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]={innerHTML:"",textContent:"",
+  classList:{add(){},remove(){}},setAttribute(){},removeAttribute(){}};}
+const press=(view,key)=>{let prevented=false;handleAccountViewTabKeydown({key,target:{closest(){return {dataset:{accountBroker:"tiger",accountView:view}};}},preventDefault(){prevented=true;}});return {view:state.accountViews.tiger,focused,prevented};};
+console.log(JSON.stringify({left:press("real","ArrowLeft"),right:press("real","ArrowRight"),home:press("review","Home"),end:press("real","End")}));
+''')
+    rendered = json.loads(output)
+    assert rendered["left"] == {"view": "review", "focused": '[data-account-view="review"]', "prevented": True}
+    assert rendered["right"] == {"view": "simulate", "focused": '[data-account-view="simulate"]', "prevented": True}
+    assert rendered["home"] == {"view": "real", "focused": '[data-account-view="real"]', "prevented": True}
+    assert rendered["end"] == {"view": "review", "focused": '[data-account-view="review"]', "prevented": True}
+
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    tabs = css.split(".account-view-tabs {", 1)[1].split("}", 1)[0]
+    tab = css.split(".account-view-tab {", 1)[1].split("}", 1)[0]
+    selected = css.split('.account-view-tab[aria-selected="true"] {', 1)[1].split("}", 1)[0]
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+    assert "overflow-x: auto;" in tabs
+    assert "min-height: 44px;" in tab
+    assert "border: 0;" in tab
+    assert "font-weight: 700;" in selected
+    assert ".account-view-tabs" in mobile
+    assert "body {\n    overflow-x: hidden;" not in mobile
+
+
+def test_dashboard_history_completion_does_not_reopen_after_back() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",broker_label:"老虎",market_label:"美股",counts:{},audit:{}}},trend_reviews:{}};
+state.brokerFilter="tiger";
+state.accountViews.tiger="report";
+const scrolls=[];
+globalThis.window={scrollY:111,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+let resolveHistory;
+let resolveRows;
+globalThis.fetch=()=>new Promise((resolve)=>{resolveHistory=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const request=openTrendReportHistory("tiger");
+resolveHistory({ok:true,json:()=>new Promise((resolve)=>{resolveRows=resolve;})});
+while(!resolveRows) await Promise.resolve();
+showCurrentTrendReport("tiger");
+const currentHtml=panel.innerHTML;
+panelRenders=0;
+scrolls.length=0;
+resolveRows([{available:true,artifact:"2026-07-16.json"}]);
+await request;
+console.log(JSON.stringify({history:state.trendReportHistories.tiger,currentHtml,panelHtml:panel.innerHTML,panelRenders,scrolls}));
+''')
+    rendered = json.loads(output)
+    assert rendered["history"]["open"] is False
+    assert rendered["history"]["loading"] is False
+    assert rendered["history"]["rows"] == [
+        {"available": True, "artifact": "2026-07-16.json"},
+    ]
+    assert "当天趋势报告" in rendered["currentHtml"]
+    assert rendered["panelHtml"] == rendered["currentHtml"]
+    assert rendered["panelRenders"] == 0
+    assert rendered["scrolls"] == []
+
+
+def test_dashboard_history_error_does_not_render_in_inactive_account_view() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},
+  trend_reviews:{tiger:{available:true,market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}}}};
+state.brokerFilter="tiger";
+state.trendSimulatePositions.tiger={available:true,positions:[]};
+const scrolls=[];
+globalThis.window={scrollY:222,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+let resolveHistory;
+globalThis.fetch=()=>new Promise((resolve)=>{resolveHistory=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const results=[];
+for(const view of ["real","simulate","review"]){
+  state.accountViews.tiger="report";
+  delete state.trendReportHistories.tiger;
+  const request=openTrendReportHistory("tiger");
+  await setAccountView("tiger",view);
+  panelRenders=0;
+  scrolls.length=0;
+  resolveHistory({ok:false,status:500,json:async()=>({})});
+  await request;
+  results.push({view:state.accountViews.tiger,history:state.trendReportHistories.tiger,panelRenders,scrolls:[...scrolls]});
+}
+console.log(JSON.stringify(results));
+''')
+    rendered = json.loads(output)
+    assert [entry["view"] for entry in rendered] == ["real", "simulate", "review"]
+    for entry in rendered:
+        assert entry["history"]["open"] is True
+        assert entry["history"]["loading"] is False
+        assert entry["history"]["rows"] == []
+        assert entry["history"]["error"] == "report history 500"
+        assert entry["panelRenders"] == 0
+        assert entry["scrolls"] == []
+
+
+def test_dashboard_exact_report_completion_does_not_render_in_inactive_account_view() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},
+  trend_reviews:{tiger:{available:true,market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}}}};
+state.brokerFilter="tiger";
+state.trendSimulatePositions.tiger={available:true,positions:[]};
+const scrolls=[];
+globalThis.window={scrollY:333,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+let resolveExact;
+globalThis.fetch=()=>new Promise((resolve)=>{resolveExact=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const results=[];
+for(const [view,ok] of [["real",true],["simulate",false],["review",true]]){
+  state.accountViews.tiger="report";
+  state.trendReportHistories.tiger={open:true,scrollY:100};
+  delete state.trendHistoricalReports.tiger;
+  const request=loadHistoricalTrendReport("tiger",`${view}.json`);
+  await setAccountView("tiger",view);
+  panelRenders=0;
+  scrolls.length=0;
+  resolveExact({ok,status:500,json:async()=>({available:true,artifact:`${view}.json`})});
+  await request;
+  results.push({view:state.accountViews.tiger,exact:state.trendHistoricalReports.tiger,panelRenders,scrolls:[...scrolls]});
+}
+console.log(JSON.stringify(results));
+''')
+    rendered = json.loads(output)
+    assert [entry["view"] for entry in rendered] == ["real", "simulate", "review"]
+    assert rendered[0]["exact"]["report"]["artifact"] == "real.json"
+    assert rendered[1]["exact"]["error"] == "historical report 500"
+    assert rendered[2]["exact"]["report"]["artifact"] == "review.json"
+    for entry in rendered:
+        assert entry["panelRenders"] == 0
+        assert entry["scrolls"] == []
+
+
+def test_dashboard_direct_exact_report_refreshes_scroll_and_ignores_stale_artifact() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},trend_reviews:{}};
+state.brokerFilter="tiger";
+state.accountViews.tiger="simulate";
+state.trendReportHistories.tiger={open:false,rows:[],scrollY:12};
+const scrolls=[];
+globalThis.window={scrollY:444,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+const pending={};
+globalThis.fetch=(url)=>new Promise((resolve)=>{pending[url]=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const firstRequest=loadHistoricalTrendReport("tiger","first.json");
+const firstScroll=state.trendReportHistories.tiger.scrollY;
+window.scrollY=555;
+const secondRequest=loadHistoricalTrendReport("tiger","second.json");
+const secondScroll=state.trendReportHistories.tiger.scrollY;
+panelRenders=0;
+scrolls.length=0;
+pending["/api/trend-reports/tiger/history/first.json"]({ok:true,json:async()=>({artifact:"first.json"})});
+await firstRequest;
+const afterFirst={exact:{...state.trendHistoricalReports.tiger},panelRenders,scrolls:[...scrolls]};
+panelRenders=0;
+scrolls.length=0;
+pending["/api/trend-reports/tiger/history/second.json"]({ok:true,json:async()=>({artifact:"second.json"})});
+await secondRequest;
+console.log(JSON.stringify({firstScroll,secondScroll,history:state.trendReportHistories.tiger,afterFirst,
+  exact:state.trendHistoricalReports.tiger,panelRenders,scrolls}));
+''')
+    rendered = json.loads(output)
+    assert rendered["firstScroll"] == 444
+    assert rendered["secondScroll"] == 555
+    assert rendered["history"]["open"] is True
+    assert rendered["afterFirst"] == {
+        "exact": {"artifact": "second.json", "loading": True},
+        "panelRenders": 0,
+        "scrolls": [],
+    }
+    assert rendered["exact"]["artifact"] == "second.json"
+    assert rendered["exact"]["report"]["artifact"] == "second.json"
+    assert rendered["panelRenders"] == 1
+    assert rendered["scrolls"] == [555]
+
+
+def test_dashboard_simulate_completion_does_not_render_after_view_switch() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},
+  trend_reviews:{tiger:{available:true,market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}}}};
+state.brokerFilter="tiger";
+globalThis.window={location:{search:""}};
+let resolveSimulate;
+globalThis.fetch=()=>new Promise((resolve)=>{resolveSimulate=resolve;});
+const renderPanel=renderAccountViewPanelOnly;
+let panelRenders=0;
+renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
+const results=[];
+for(const [view,ok] of [["real",true],["review",false]]){
+  state.accountViews.tiger="real";
+  delete state.trendSimulatePositions.tiger;
+  const request=setAccountView("tiger","simulate");
+  await setAccountView("tiger",view);
+  panelRenders=0;
+  resolveSimulate({ok,status:500,json:async()=>({available:true,positions:[{symbol:"AAPL"}]})});
+  await request;
+  results.push({view:state.accountViews.tiger,payload:state.trendSimulatePositions.tiger,panelRenders});
+}
+console.log(JSON.stringify(results));
+''')
+    rendered = json.loads(output)
+    assert rendered[0] == {
+        "view": "real",
+        "payload": {"available": True, "positions": [{"symbol": "AAPL"}]},
+        "panelRenders": 0,
+    }
+    assert rendered[1]["view"] == "review"
+    assert rendered[1]["payload"]["available"] is False
+    assert rendered[1]["payload"]["positions"] == []
+    assert rendered[1]["payload"]["error"] == "simulate positions 500"
+    assert rendered[1]["panelRenders"] == 0
+
+
+def test_dashboard_inactive_account_requests_do_not_render_or_restore_scroll() -> None:
+    output = run_dashboard_js(r'''
+const panel={innerHTML:"",setAttribute(){}};
+elements["account-holdings"]={querySelector(){return panel;},querySelectorAll(){return [];}};
+elements["visible-count"]={textContent:""};
+state.dashboard={summary:{portfolio_value_hkd:"1000"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"1000"}],
+  cash_rows:[],holdings:[],trend_reports:{tiger:{available:true,broker:"tiger",counts:{},audit:{}}},trend_reviews:{}};
+state.brokerFilter="tiger";
+state.accountViews.tiger="report";
+const scrolls=[];
+globalThis.window={scrollY:111,scrollTo(_x,y){scrolls.push(y);},location:{search:""}};
+const pending=[];
+globalThis.fetch=(url)=>new Promise((resolve)=>pending.push((payload)=>resolve({ok:true,json:async()=>payload})));
+let fullRenders=0;
+renderAccountHoldings=()=>{fullRenders+=1;};
+const historyRequest=openTrendReportHistory("tiger");
+state.brokerFilter="phillips";
+pending.shift()([{available:true,artifact:"2026-07-16.json"}]);
+await historyRequest;
+state.brokerFilter="tiger";
+delete state.trendReportHistories.tiger;
+const exactRequest=loadHistoricalTrendReport("tiger","2026-07-16.json");
+state.brokerFilter="phillips";
+window.scrollY=999;
+pending.shift()({available:true,broker:"tiger",counts:{},audit:{}});
+await exactRequest;
+console.log(JSON.stringify({fullRenders,scrolls,broker:state.brokerFilter}));
+''')
+    assert json.loads(output) == {
+        "fullRenders": 0,
+        "scrolls": [],
+        "broker": "phillips",
+    }
+
+
+def test_dashboard_embedded_account_views_do_not_nest_main_landmarks() -> None:
+    output = run_dashboard_js(r'''
+const report={available:true,broker:"tiger",broker_label:"老虎",market:"US",market_label:"美股",counts:{},audit:{}};
+const review={available:true,broker:"tiger",broker_label:"老虎",market_label:"美股",strategy_snapshot:{parameter_rows:[]},metrics:{}};
+console.log(JSON.stringify({
+  standaloneReport:renderTrendReportWorkspace(report),
+  embeddedReport:renderTrendReportWorkspace(report,true),
+  standaloneReview:renderTrendReviewWorkspace(review),
+  embeddedReview:renderTrendReviewWorkspace(review,true),
+}));
+''')
+    rendered = json.loads(output)
+    assert rendered["standaloneReport"].startswith('<main class="cn-trend-report">')
+    assert rendered["standaloneReview"].startswith('<main class="trend-review">')
+    assert rendered["embeddedReport"].startswith('<div class="cn-trend-report">')
+    assert rendered["embeddedReview"].startswith('<div class="trend-review">')
+    assert "<main" not in rendered["embeddedReport"]
+    assert "<main" not in rendered["embeddedReview"]
+
+
+def test_dashboard_account_view_dom_at_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    report = {
+        "available": True, "broker": "tiger", "broker_label": "老虎",
+        "market": "US", "market_label": "美股", "report_date": "2026-07-20",
+        "data_date": "2026-07-17", "generated_at": "2026-07-18T09:00:00+08:00",
+        "account_status": "已更新", "counts": {}, "audit": {},
+        "artifact": "current.json", "report_sha256": "c" * 64,
+        "strategy_version": "v-current",
+    }
+    review = {
+        "available": True, "broker": "tiger", "broker_label": "老虎",
+        "market": "US", "market_label": "美股",
+        "strategy_snapshot": {"strategy_name": "美股趋势", "strategy_version": "v1", "parameter_rows": []},
+        "metrics": {},
+    }
+    dashboard = {
+        "summary": {"portfolio_value_hkd": "1000", "holding_value_hkd": "700", "cash_like_value_hkd": "300"},
+        "broker_summaries": [
+            {"broker": broker, "portfolio_value_hkd": "1000", "holding_value_hkd": "700", "cash_like_value_hkd": "300", "holding_count": "0",
+             **({"cash_components": [{"label": "现金", "value_hkd": "300"}]} if broker == "tiger" else {})}
+            for broker in ("futu", "tiger", "phillips", "eastmoney")
+        ],
+        "cash_rows": [], "holdings": [], "source_statuses": [], "poll_seconds": 0,
+        "trend_reports": {
+            "futu": {"available": False, "status_text": "今日暂无趋势报告"},
+            "tiger": report,
+            "phillips": {**report, "broker": "phillips", "broker_label": "辉立", "market": "HK", "market_label": "港股"},
+            "eastmoney": {**report, "broker": "eastmoney", "broker_label": "东方财富", "market": "CN", "market_label": "A股"},
+        },
+        "trend_reviews": {
+            "tiger": review,
+            "phillips": {**review, "broker": "phillips", "market": "HK", "market_label": "港股"},
+            "eastmoney": {**review, "broker": "eastmoney", "market": "CN", "market_label": "A股"},
+        },
+    }
+    simulated = {
+        "available": True, "broker": "tiger", "positions": [{
+            "broker": "tiger", "market": "US", "symbol": "AAPL", "name": "Apple",
+            "currency": "USD", "quantity": "2", "cost_price": "180", "last_price": "190",
+            "market_value": "380", "market_value_hkd": "2964", "account_weight": "38%",
+            "portfolio_weight": "38%", "unrealized_pnl_pct": "5.56%",
+            "attribution_status": "linked",
+            "report": {"artifact": "2026-07-16.json", "execution_date": "2026-07-20", "strategy_version": "v1", "report_sha256": "a" * 64},
+        }],
+    }
+    bootstrap = f'''<script>
+window.__requests=[];
+window.__resolveSimulate=null;
+const dashboardPayload={json.dumps(dashboard, ensure_ascii=False)};
+const simulatedPayload={json.dumps(simulated, ensure_ascii=False)};
+window.fetch=async (input)=>{{
+  const url=String(input); window.__requests.push(url);
+  if(url==="/api/trend-simulate-positions/tiger") return new Promise((resolve)=>{{
+    window.__resolveSimulate=()=>resolve({{ok:true,status:200,json:async()=>structuredClone(simulatedPayload)}});
+  }});
+  const payload=url==="/api/dashboard"?dashboardPayload
+    :url==="/api/quotes"?{{status:"ok",quotes:{{}},account_sync:{{status:"skipped"}}}}
+    :url==="/api/trend-reports/tiger/history"?[{{available:true,artifact:"2026-07-16.json",execution_date:"2026-07-17",data_date:"2026-07-16",generated_at:"2026-07-18T09:30:00+08:00",strategy_version:"v1",execution_counts:{{sell:1,buy:2,hold:3,review:4}}}}]
+    :url.endsWith("/2026-07-16.json")?{{...dashboardPayload.trend_reports.tiger,artifact:"2026-07-16.json",report_sha256:"{'a' * 64}",strategy_version:"v1",report_date:"2026-07-20",buy_actions:[{{symbol:"AAPL",execution:{{status:"missed"}}}}]}}
+    :{{available:false}};
+  return {{ok:true,status:200,json:async()=>structuredClone(payload)}};
+}};
+</script>'''
+    page_html = html.replace(
+        '<link rel="stylesheet" href="/static/dashboard.css">', f"<style>{css}</style>",
+    ).replace(
+        '<script src="/static/dashboard.js" defer></script>', f"{bootstrap}<script>{js}</script>",
+    )
+    errors: list[str] = []
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.route(
+            "http://dashboard.test/",
+            lambda route: route.fulfill(status=200, content_type="text/html", body=page_html),
+        )
+        page.goto("http://dashboard.test/", wait_until="load")
+        page.locator("#account-tab-tiger").click()
+        assert errors == []
+        section = page.locator("#account-tiger")
+        dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        tabs = section.locator('[role="tab"][data-account-view]')
+        tabs.first.wait_for(timeout=5000)
+
+        original_label = tabs.first.inner_text()
+        try:
+            tabs.first.evaluate("node => { node.textContent = '错误标签'; }")
+            with pytest.raises(AssertionError, match="Tab 顺序"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            tabs.first.evaluate(
+                "(node, label) => { node.textContent = label; }", original_label
+            )
+
+        tabs.nth(1).evaluate("node => { node.parentElement.prepend(node); }")
+        try:
+            with pytest.raises(AssertionError, match="Tab 顺序"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            page.evaluate("renderAccountHoldings()")
+            section = page.locator("#account-tiger")
+            tabs = section.locator('[role="tab"][data-account-view]')
+
+        tabs.first.evaluate("node => node.setAttribute('aria-selected', 'false')")
+        tabs.nth(1).evaluate("node => node.setAttribute('aria-selected', 'true')")
+        try:
+            with pytest.raises(AssertionError, match="默认视图"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            tabs.first.evaluate("node => node.setAttribute('aria-selected', 'true')")
+            tabs.nth(1).evaluate("node => node.setAttribute('aria-selected', 'false')")
+
+        original_tab_style = tabs.first.get_attribute("style")
+        try:
+            tabs.first.evaluate("node => { node.style.border = '1px solid red'; }")
+            with pytest.raises(AssertionError, match="描边"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            tabs.first.evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_tab_style,
+            )
+
+        page.locator("head").evaluate("""head => {
+          const style = document.createElement('style');
+          style.id = 'acceptance-broken-tab-indicator';
+          style.textContent = '[role="tab"][data-account-view][aria-selected="true"]::after { content: none !important; height: 0 !important; background: transparent !important; }';
+          head.appendChild(style);
+        }""")
+        try:
+            with pytest.raises(AssertionError, match="下划线"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            page.locator("#acceptance-broken-tab-indicator").evaluate(
+                "node => node.remove()"
+            )
+
+        original_document_style = page.locator("html").get_attribute("style")
+        try:
+            page.locator("html").evaluate(
+                "node => { node.style.minWidth = '2000px'; }"
+            )
+            with pytest.raises(AssertionError, match="横向滚动"):
+                dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        finally:
+            page.locator("html").evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_document_style,
+            )
+
+        dashboard_acceptance._check_account_view_contract(page, section, "tiger")
+        assert [label.strip() for label in tabs.all_text_contents()] == [
+            "真实持仓", "模拟盘持仓", "趋势报告", "美股复盘",
+        ]
+        assert all((tab.bounding_box() or {})["height"] >= 44 for tab in tabs.all())
+        assert section.locator('[aria-selected="true"]').inner_text().strip() == "真实持仓"
+        header = section.locator(".account-section-header")
+        header.evaluate("node => { node.dataset.viewStable = 'yes'; }")
+        tabs.first.focus()
+        tabs.first.press("End")
+        assert section.locator('[aria-selected="true"]').inner_text().strip() == "美股复盘"
+        assert header.get_attribute("data-view-stable") == "yes"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "review"
+        assert "卡玛比率" in section.inner_text()
+        assert "夏普比率" in section.inner_text()
+        assert page.locator(".workspace-grid").is_visible()
+        section.locator('[data-account-view="simulate"]').click()
+        section.get_by_text("模拟盘持仓加载中", exact=True).wait_for()
+        assert header.get_attribute("data-view-stable") == "yes"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
+        page.evaluate("window.__resolveSimulate()")
+        assert section.locator(".report-attribution-link").inner_text().strip() == "报告 2026-07-20 · v1"
+        assert header.get_attribute("data-view-stable") == "yes"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
+        page.evaluate("renderHoldings()")
+        assert page.evaluate("document.activeElement.dataset.accountView") == "simulate"
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        section.locator(".report-attribution-link").click()
+        return_current = section.locator("[data-current-trend-report]")
+        return_current.wait_for()
+        assert page.evaluate("window.__requests.at(-1)") == (
+            "/api/trend-reports/tiger/history/2026-07-16.json"
+        )
+        dashboard_acceptance._check_loaded_report_identity(
+            section, simulated["positions"][0]["report"], "tiger"
+        )
+        report_root = section.locator(".cn-trend-report")
+        report_root.evaluate(
+            "node => { node.dataset.reportArtifact = 'same-date-wrong.json'; }"
+        )
+        with pytest.raises(AssertionError, match="报告身份"):
+            dashboard_acceptance._check_loaded_report_identity(
+                section, simulated["positions"][0]["report"], "tiger"
+            )
+        report_root.evaluate(
+            "node => { node.dataset.reportArtifact = '2026-07-16.json'; }"
+        )
+        section.locator(".cn-trend-report").evaluate(
+            "node => { node.dataset.reportSha256 = 'wrong'; }"
+        )
+        with pytest.raises(AssertionError, match="报告身份"):
+            dashboard_acceptance._check_loaded_report_identity(
+                section, simulated["positions"][0]["report"], "tiger"
+            )
+        section.locator(".cn-trend-report").evaluate(
+            f"node => {{ node.dataset.reportSha256 = '{'a' * 64}'; }}"
+        )
+        report_root.evaluate(
+            "node => { node.dataset.strategyVersion = 'wrong-version'; }"
+        )
+        with pytest.raises(AssertionError, match="报告身份"):
+            dashboard_acceptance._check_loaded_report_identity(
+                section, simulated["positions"][0]["report"], "tiger"
+            )
+        report_root.evaluate(
+            "node => { node.dataset.strategyVersion = 'v1'; }"
+        )
+        dashboard_acceptance._check_history_control_contract(
+            return_current, "tiger 返回当前报告"
+        )
+
+        original_control_style = return_current.get_attribute("style")
+        try:
+            return_current.evaluate("node => { node.style.border = '1px solid red'; }")
+            with pytest.raises(AssertionError, match="低强调"):
+                dashboard_acceptance._check_history_control_contract(
+                    return_current, "tiger 返回当前报告"
+                )
+        finally:
+            return_current.evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_control_style,
+            )
+
+        dashboard_styles = page.locator("head style").first
+        try:
+            dashboard_styles.evaluate("node => { node.sheet.disabled = true; }")
+            assert return_current.evaluate(
+                "node => getComputedStyle(node).backgroundColor"
+            ) != "rgba(0, 0, 0, 0)"
+            with pytest.raises(AssertionError, match="低强调"):
+                dashboard_acceptance._check_history_control_contract(
+                    return_current, "tiger 返回当前报告"
+                )
+        finally:
+            dashboard_styles.evaluate("node => { node.sheet.disabled = false; }")
+            page.wait_for_function(
+                "getComputedStyle(document.querySelector('[data-current-trend-report]')).backgroundColor === 'rgba(0, 0, 0, 0)'",
+                timeout=1000,
+            )
+
+        original_control_style = return_current.get_attribute("style")
+        try:
+            return_current.evaluate(
+                "node => node.style.setProperty('font-weight', '700', 'important')"
+            )
+            with pytest.raises(AssertionError, match="低强调"):
+                dashboard_acceptance._check_history_control_contract(
+                    return_current, "tiger 返回当前报告"
+                )
+        finally:
+            return_current.evaluate(
+                "(node, style) => style === null ? node.removeAttribute('style') : node.setAttribute('style', style)",
+                original_control_style,
+            )
+
+        dashboard_acceptance._check_history_control_contract(
+            return_current, "tiger 返回当前报告"
+        )
+        assert "错过" in section.inner_text()
+        return_current.click()
+        history_button = section.locator("[data-report-history]")
+        assert history_button.evaluate("node => node === document.activeElement")
+        dashboard_acceptance._check_history_control_contract(
+            history_button, "tiger 历史报告"
+        )
+        cash_details = section.locator(".account-cash-details")
+        cash_details.evaluate("node => { node.open = true; node.dataset.historyStable = 'yes'; }")
+        section.locator("[data-report-history]").click()
+        history_row = section.locator('[data-history-artifact="2026-07-16.json"]')
+        history_row.wait_for()
+        for text in (
+            "数据截至 2026-07-16",
+            "生成时间 2026-07-18T09:30:00+08:00",
+            "策略版本 v1",
+            "执行摘要 卖出 1 · 买入 2 · 持有 3 · 复核 4",
+        ):
+            assert history_row.get_by_text(text, exact=True).count() == 1
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        assert page.evaluate(
+            "window.__requests.filter(url => url === '/api/trend-reports/tiger/history').length",
+        ) == 1
+        assert cash_details.get_attribute("data-history-stable") == "yes"
+        assert cash_details.evaluate("node => node.open") is True
+        section.locator('[data-history-artifact="2026-07-16.json"]').click()
+        section.locator("[data-current-trend-report]").wait_for()
+        assert "错过" in section.inner_text()
+        section.locator("[data-current-trend-report]").click()
+        assert section.locator("[data-report-history]").evaluate(
+            "node => node === document.activeElement"
+        )
+        assert cash_details.get_attribute("data-history-stable") == "yes"
+        assert cash_details.evaluate("node => node.open") is True
+        page.locator("#account-tab-futu").click()
+        assert page.locator("#account-futu .trend-report-entry").count() == 1
+        assert page.locator("#account-futu .account-view-tabs").count() == 0
+        browser.close()
+    assert errors == []
+
+
 def test_dashboard_trend_review_is_compact_exact_and_account_scoped() -> None:
     output = run_dashboard_js(r'''
 const review=(broker,brokerLabel,market,marketLabel)=>({
@@ -3049,8 +4676,8 @@ state.dashboard={trend_reports:{
 const group=(broker)=>({broker,profile:ACCOUNT_STRATEGY_PROFILES[broker],rows:[],summary:{broker,display_name:broker,portfolio_value_hkd:"1000",holding_value_hkd:"700",cash_like_value_hkd:"300",holding_count:"1"}});
 for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘"],["eastmoney","A股复盘"]]) {
   const account=renderAccountSection(group(broker));
-  if (!account.includes(`data-trend-review="${broker}"`) || !account.includes(label)) throw new Error(account);
-  if (account.indexOf("当天趋势报告") > account.indexOf(label)) throw new Error("entry order");
+  if (!account.includes(`data-account-broker="${broker}" data-account-view="review"`) || !account.includes(label)) throw new Error(account);
+  if (account.indexOf("趋势报告") > account.indexOf(label)) throw new Error("entry order");
 }
 if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");
 const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);
@@ -3114,9 +4741,12 @@ const cn = renderTrendReportWorkspace({
      active_line:"1450",entry_hints:["行业温度数据不可用"]},
   ],audit:{candidates:[
     {symbol:"AUDIT-ONLY",name:"仅审计",eligible:false,rank:null,
-     excluded_reasons:["strength_below_95"],filter_price:"9.8",close:"9.7",
+     excluded_reasons:["strength_below_95","market_cap_below_100","amount_below_2"],filter_price:"9.8",close:"9.7",
      temperature_prev:"温",temperature_curr:"温",phase:"立夏",strength:"94",
-     industry:"银行",industry_temperature:"热",market_cap:"120",amount:"3",atr:"0.4",danger:false},
+     industry:"银行",industry_temperature:"热",market_cap:"80",amount:"1",atr:"0.4",danger:false},
+    {symbol:"AUDIT-PASSED",name:"通过审计",eligible:true,rank:1,
+     excluded_reasons:[],temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99",danger:false},
+    {symbol:"AUDIT-MISSING",name:"缺失审计",eligible:false,excluded_reasons:[],danger:null},
   ],excluded:{"AUDIT-ONLY":["strength_below_95"]},industry_concentration:[],
     data_sources:["Trend Animals","Futu CN calendar/QFQ daily K-line"]},
 });
@@ -3127,6 +4757,17 @@ for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买�
   "趋势信号不完整","行业温度数据不可用","买入纪律","卖出纪律","审计详情"]) {
   if (!cn.includes(text)) throw new Error(text + "\n" + cn);
 }
+for (const text of ["为什么没有进入买入名单", "候选 3", "通过 1", "排除 2",
+  "标的", "结论", "未通过项目", "已通过的关键事实", "审计",
+  "已排除 · 3 项未通过", "通过纪律", "查看全部字段"]) {
+  if (!cn.includes(text)) throw new Error(text + "\n" + cn);
+}
+if ((cn.match(/class="trend-audit-row"/g) || []).length !== 3 ||
+    !cn.includes('class="trend-audit-table"') ||
+    !cn.includes('class="trend-audit-reason"') ||
+    cn.includes("<h3>排除项</h3>")) throw new Error(cn);
+const empty = renderCnTrendAudit({candidates:{}}, {});
+if (!empty.includes("无候选审计数据")) throw new Error(empty);
 const stageOrder=["优先处理 · 卖出触发","需要确认 · 人工复核",
   "09:30–10:00 · 正式买入计划","盘中持续 · 已有持仓"].map((text)=>cn.indexOf(`<h2>${text}</h2>`));
 if(stageOrder.some((index)=>index<0)||!stageOrder.every((index,i)=>i===0||stageOrder[i-1]<index))throw new Error(cn);
@@ -3150,7 +4791,10 @@ const us = renderTrendReportWorkspace({
   counts:{sell:0,buy:1,hold:0,review:1},sell_actions:[],hold_actions:[],
   buy_actions:[{symbol:"EA",name:"艺电",close:"207.27",strength:"99.8",
     industry:"通讯服务",target_weight:"0.04",target_amount:"4941.49",
-    estimated_shares:23,estimated_initial_line:"205.46930"}],
+    estimated_shares:23,estimated_initial_line:"205.46930",
+    execution:{status:"partially_filled",filled_qty:"13",target_qty:"23",
+      avg_fill_price:"207.18",order_ids:["SIM-123"],
+      updated_at:"2026-07-17T10:01:00-04:00",reason:""}}],
   review_actions:[{symbol:"BOTZ",name:"Global X Robotics ETF",
     reason:"holding_signal_unknown",close:null,strength:null,active_line:null}],
   audit:{account_exceptions:["现金类资产不参与趋势判断"]},
@@ -3159,7 +4803,8 @@ for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核
   "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓",
   "正式买入 1","全部卖出 0","继续持有 0","人工复核 1",
   "EA 艺电","207.27","99.8","通讯服务","4%","4,941.49","23 股",
-  "205.46930","BOTZ Global X Robotics ETF","趋势信号不完整",
+  "205.47","BOTZ Global X Robotics ETF","趋势信号不完整",
+  "部分成交","成交 13 / 23","均价 207.18","订单 SIM-123","2026-07-17T10:01:00-04:00",
   "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
   if (!us.includes(text)) throw new Error(text + "\n" + us);
 }
@@ -3173,10 +4818,315 @@ if (!us.includes('class="cn-trend-report"') ||
     !us.includes('class="cn-trend-card"') ||
     us.includes("今日执行检查") || us.includes("筛选价（Trend Animals）") ||
     us.includes('class="trend-discipline"')) throw new Error(us);
+if (!us.includes('class="cn-trend-execution"') ||
+    us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
 console.log("ok");
 ''')
 
     assert "ok" in output
+
+
+def test_dashboard_renders_frozen_risk_summary_and_candidate_detail_rows() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"富途模拟",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",
+  counts:{sell:1,buy:1,hold:0,review:0},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit:"4000",portfolio_risk_limit_pct:"0.04",
+    portfolio_remaining_risk:"3697",portfolio_remaining_risk_pct:"0.03697",
+    single_entry_risk_limit:"400",single_entry_risk_limit_pct:"0.004",
+    abnormal_loss_buffer:"1000",abnormal_loss_buffer_pct:"0.01",
+    total_risk_budget_target_pct:"0.05",
+    kelly_phase:"active_all_samples",kelly_eligible_sample_count:30,
+    kelly_selected_sample_count:30,kelly_cap:"0.012626",kelly_reason:"",
+    kelly_source:"合格的富途模拟闭环；实盘结果不参与计算",
+    disclaimer:"5% 是风险预算目标，不是最大损失保证。",
+    portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"},
+  drawdown_summary:{status:"paused",status_label:"暂停新开仓",
+    current_equity:"95000",high_water_mark:"100000",drawdown_pct:"0.05",
+    drawdown_limit_pct:"0.05",pause_reason:"策略累计回撤已达到 5%，需人工解锁",
+    bootstrap_event:{event_id:"automatic-bootstrap-audit",event_type:"automatic_bootstrap",
+      baseline_equity:"100000",source_date:"2026-07-14",accepted_git_sha:"abc123",
+      parameter_hash:"params456",actor:"acceptance",reason:"first_activation",
+      occurred_at:"2026-07-16T08:00:00+08:00",entry_eligible_from:"2026-07-15"},
+    recovery_event:{event_id:"snapshot-recovery-audit",event_type:"snapshot_recovery",
+      snapshot:"state-snapshot.json",state_sha256:"statehash789",actor:"acceptance",
+      occurred_at:"2026-07-16T08:30:00+08:00"}},
+  sell_actions:[{symbol:"600000",name:"浦发银行",reason:"danger_signal"}],
+  buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"电力",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04",target_amount:"4000",estimated_shares:300,
+    estimated_initial_line:"9",planned_stop_risk:"303",
+    planned_stop_risk_pct:"0.00303",normal_cost:"3",
+    decisive_constraint:"单笔风险上限"}],
+  risk_skips:[{symbol:"600002",name:"第二候选",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"电力",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04",target_amount:"4000",estimated_shares:0,
+    reason:"最小交易单位 100 股超过组合剩余风险",
+    decisive_constraint:"组合剩余风险"}],
+  hold_actions:[],review_actions:[],audit:{},
+});
+for (const text of ["组合计划风险","风险预算内",
+  "Kelly 阶段","全样本启用 · 30 个合格模拟闭环","当前 Kelly 上限","1.26%",
+  "合格的富途模拟闭环；实盘结果不参与计算",
+  "策略累计回撤",
+  "暂停新开仓","策略累计回撤已达到 5%，需人工解锁",
+  "基准已自动建立","基准净值 100,000","快照日期 2026-07-14",
+  "automatic-bootstrap-audit","abc123","params456","acceptance",
+  "状态恢复审计详情","snapshot-recovery-audit","state-snapshot.json","statehash789",
+  "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
+  "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
+  "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
+  "允许 · 建议 300 股","计划止损风险 303","正常成本 3",
+  "决定性约束 单笔风险上限","跳过 · 建议 0 股","第二候选",
+  "最小交易单位 100 股超过组合剩余风险"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+if (html.includes("本次可用风险") || html.includes("<th scope=\"col\">目标仓位</th>")) {
+  throw new Error(html);
+}
+if (html.includes("组合正常计划风险")) throw new Error(html);
+const counts = html.indexOf('class="trend-report-metrics cn-trend-counts"');
+const risk = html.indexOf('class="trend-risk-summary"');
+const sell = html.indexOf("优先处理 · 卖出触发");
+if (!(counts >= 0 && counts < risk && risk < sell)) throw new Error(html);
+if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
+    (html.match(/class="cn-trend-execution cn-trend-risk-detail"/g) || []).length !== 2) {
+  throw new Error(html);
+}
+const historical = renderTrendRiskSummary(null, {
+  status:"active",status_label:"纪律内",current_equity:"100000",
+  high_water_mark:"100000",drawdown_pct:"0",drawdown_limit_pct:"0.05",
+  bootstrap_event:{event_id:"automatic-bootstrap-audit",event_type:"automatic_bootstrap",
+    baseline_equity:"100000",source_date:"2026-07-14",accepted_git_sha:"abc123",
+    parameter_hash:"params456",actor:"acceptance",
+    occurred_at:"2026-07-16T08:00:00+08:00",entry_eligible_from:"2026-07-15"}
+}, null, "2026-07-17");
+if (historical.includes("基准已自动建立") ||
+    !historical.includes("回撤基准审计详情") ||
+    !historical.includes("100,000") ||
+    !historical.includes("2026-07-14")) throw new Error(historical);
+const drawdownOnly = renderTrendRiskSummary(null, {
+  status:"paused",status_label:"暂停新开仓",drawdown_pct:null,
+  drawdown_limit_pct:"0.05",current_equity:"95000",high_water_mark:null,
+  pause_reason:"策略累计回撤状态缺失，暂停新开仓"
+});
+if (!drawdownOnly.includes("策略累计回撤") ||
+    !drawdownOnly.includes('data-risk-status="paused"')) throw new Error(drawdownOnly);
+console.log("ok");
+''')
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    assert "ok" in output
+    assert ".trend-risk-summary" in css
+    assert ".trend-risk-summary" in mobile
+    assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
+
+
+def test_dashboard_formats_bootstrap_audit_equity_without_touching_identity() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendRiskSummary(null, {
+  status:"active",status_label:"纪律内",current_equity:"995953.447",
+  high_water_mark:"1000000",drawdown_pct:"0.004046553",
+  drawdown_limit_pct:"0.05",
+  bootstrap_event:{event_id:"audit-00001234",event_type:"automatic_bootstrap",
+    baseline_equity:"995953.447",source_date:"2026-07-21",accepted_git_sha:"abc123",
+    parameter_hash:"params456",actor:"acceptance",
+    occurred_at:"2026-07-22T08:00:00+08:00",entry_eligible_from:"2026-07-23"}
+}, null, "2026-07-22");
+console.log(JSON.stringify(html));
+''')
+    rendered = json.loads(output)
+
+    assert "基准净值 995,953.45" in rendered
+    assert "995953.447" not in rendered
+    assert "audit-00001234" in rendered
+    assert "2026-07-21" in rendered
+
+
+def test_dashboard_renders_api_trade_stats_inside_risk_summary() -> None:
+    output = run_dashboard_js(r'''
+const base={status:"active",status_label:"风险预算内",
+  portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+  portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+  portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+  single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+  abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"};
+const available=renderTrendRiskSummary({...base,trade_stats:{available:true,
+  statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+  actual_broker_label:"东方财富",
+  simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
+  actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}});
+for (const text of ["富途模拟盘交易统计","胜率 50% · 盈亏比 1.25 · 样本 4",
+  "东方财富实盘交易统计","胜率 — · 盈亏比 无盈利样本 · 样本 0",
+  "统计截至 2026-07-20T11:59:59+08:00"]) {
+  if (!available.includes(text)) throw new Error(text + "\n" + available);
+}
+const unavailable=renderTrendRiskSummary({...base,trade_stats:{available:false,status_text:"交易统计暂不可用"}});
+if (!unavailable.includes("交易统计暂不可用")) throw new Error(unavailable);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_renders_read_only_actual_execution_overlay() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",counts:{},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+    portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+    single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+    abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"},
+  actual_overlay:{available:true,broker_label:"东方财富",account_nav_hkd:"108000.00",
+    status_text:"结单数据，非实时",
+    notice:"只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；系统不会自动交易真实账户。",
+    items:[
+      {symbol:"600001",name:"测试",frozen_action_label:"正式买入",target_weight:"0.04",
+       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"200",
+       actual_market_value:"2000",currency:"CNY",deviation:"underbought",deviation_label:"少买",frozen_reference_price:"10",protection_line:"9",
+       risk_note:"若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）"},
+      {symbol:"600002",name:"跳过",frozen_action_label:"正式买入",target_weight:"0.04",
+       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"0",
+       actual_market_value:"0",currency:"CNY",deviation:"skipped",deviation_label:"跳过",protection_line:"9",
+       risk_note:"暂无策略保护线，风险未纳入估算"},
+      {symbol:"600003",name:"待卖",frozen_action_label:"全部卖出",target_weight:"",
+       simulation_quantity:"",actual_reference_quantity:"0",actual_quantity:"50",
+       actual_market_value:"1000",currency:"CNY",deviation:"missed_sell",deviation_label:"漏卖",protection_line:"18",
+       risk_note:"若按策略保护线退出，预计损失 CNY 100.00"},
+      {symbol:"600004",name:"追买",frozen_action_label:"跳过",target_weight:"0.04",
+       simulation_quantity:"0",actual_reference_quantity:"0",actual_quantity:"100",
+       actual_market_value:"1000",currency:"CNY",deviation:"chased",deviation_label:"追买",protection_line:"",
+       risk_note:"暂无策略保护线，风险未纳入估算"},
+      {symbol:"600005",name:"超买",frozen_action_label:"正式买入",target_weight:"0.04",
+       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"500",
+       actual_market_value:"5000",currency:"CNY",deviation:"overbought",deviation_label:"超买",protection_line:"9",
+       risk_note:"若按策略保护线退出，预计损失 CNY 500.00"}
+    ],
+    outside_positions:[{symbol:"600099",name:"报告外",actual_quantity:"10",
+      actual_market_value:"500",currency:"CNY",deviation:"outside_report_addition",deviation_label:"报告外加仓",
+      attribution_status:"unconfirmed",risk_note:"风险未纳入估算"}]},
+  sell_actions:[],buy_actions:[],risk_skips:[],hold_actions:[],review_actions:[],audit:{},
+});
+for (const text of ["实盘执行辅助","东方财富","偏差 6","真实账户净值 HKD 108,000",
+  "结单数据，非实时","模拟数量 300","实盘参考数量 400","真实持仓 200",
+  "冻结参考价 CNY 10","按冻结参考价估算，不代表实时风险上限",
+  "少买","跳过","漏卖","追买","超买","报告外加仓",
+  "若按策略保护线退出，预计损失 CNY 200.00","风险未纳入估算",
+  "不会改写模拟建议、Kelly、模拟统计或报告哈希","不会自动交易真实账户"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+for (const forbidden of ["真实最大风险","券商端已挂止损","已挂止损"]) {
+  if (html.includes(forbidden)) throw new Error(forbidden + "\n" + html);
+}
+if ((html.match(/class="trend-actual-row"/g) || []).length !== 6 ||
+    !html.includes('class="trend-actual-overlay" open')) throw new Error(html);
+const followed = renderTrendActualOverlay({available:true,broker_label:"老虎",status_text:"账户实时同步",account_nav_hkd:"100",
+  notice:"只读",items:[{symbol:"AAPL",name:"Apple",deviation:"followed",deviation_label:"已跟随",
+    frozen_action_label:"继续持有",actual_quantity:"1",actual_market_value:"10",currency:"USD",
+    risk_note:"若按策略保护线退出，预计损失 USD 1.00"}],outside_positions:[]});
+if (!followed.includes("偏差 0") || followed.includes('class="trend-actual-overlay" open') ||
+    !followed.includes('data-deviation="followed"')) throw new Error(followed);
+const missingFx = renderTrendActualOverlay({available:true,broker_label:"老虎",status_text:"账户实时同步",account_nav_hkd:"780000",
+  notice:"只读",items:[{symbol:"AAPL",name:"Apple",deviation:"reference_unavailable",deviation_label:"暂无法换算",
+    frozen_action_label:"正式买入",actual_reference_quantity:"",actual_quantity:"1",actual_market_value:"",currency:"USD",
+    reference_note:"实盘汇率缺失，暂无法换算",risk_note:"暂无策略保护线，风险未纳入估算"}],outside_positions:[]});
+if (!missingFx.includes("实盘汇率缺失，暂无法换算")) throw new Error(missingFx);
+console.log("ok");
+''')
+
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    assert "ok" in output
+    assert '.trend-actual-row header span[data-deviation="followed"]' in css
+    assert 'color: var(--ok);' in css
+    assert '.trend-actual-row header span[data-deviation="overbought"]' in css
+
+
+def test_dashboard_risk_summary_and_candidate_cards_fit_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    rendered = json.loads(run_dashboard_js(r'''
+console.log(JSON.stringify(renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"富途模拟",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",counts:{sell:0,buy:1,hold:0,review:0},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+    portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+    single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+    abnormal_loss_buffer_pct:"0.01",disclaimer:"5% 是风险预算目标，不是最大损失保证。",
+    portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
+    trade_stats:{available:true,statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+      actual_broker_label:"东方财富",
+      simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
+      actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}},
+  actual_overlay:{available:true,broker_label:"东方财富",account_nav_hkd:"108000",
+    status_text:"结单数据，非实时",notice:"只读执行辅助；系统不会自动交易真实账户。",
+    items:[{symbol:"600001",name:"一个名称很长但仍然必须在三百七十五像素宽度内换行的标的",
+      frozen_action_label:"正式买入",target_weight:"0.04",simulation_quantity:"300",
+      actual_reference_quantity:"400",actual_quantity:"200",actual_market_value:"2000",
+      currency:"CNY",deviation:"underbought",deviation_label:"少买",frozen_reference_price:"10",protection_line:"9",
+      risk_note:"若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）"}],
+    outside_positions:[{symbol:"600099",name:"报告外加仓",actual_quantity:"10",
+      actual_market_value:"500",currency:"CNY",deviation_label:"报告外加仓",
+      deviation:"outside_report_addition",
+      risk_note:"风险未纳入估算"}]},
+  sell_actions:[],buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",industry:"电力",
+    industry_temperature:"热",market_cap:"100",amount:"2",target_weight:"0.04",
+    target_amount:"4000",estimated_shares:300,estimated_initial_line:"9",
+    planned_stop_risk:"303",planned_stop_risk_pct:"0.00303",normal_cost:"3",
+    decisive_constraint:"单笔风险上限"}],
+  risk_skips:[{symbol:"600002",name:"第二候选",close:"10",target_weight:"0.04",
+    target_amount:"4000",estimated_shares:0,reason:"最小交易单位 100 股超过组合剩余风险",
+    decisive_constraint:"组合剩余风险"}],hold_actions:[],review_actions:[],audit:{},
+})));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    errors: list[str] = []
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(f"<style>{css}</style>{rendered}")
+
+        assert errors == []
+        risk_text = page.locator(".trend-risk-summary").inner_text()
+        assert "组合计划风险" in risk_text
+        assert "风险预算内" in risk_text
+        assert "富途模拟盘交易统计" in risk_text
+        assert "东方财富实盘交易统计" in risk_text
+        assert "实盘执行辅助" in risk_text
+        assert "冻结参考价 CNY 10" in risk_text
+        assert page.locator(".trend-actual-overlay").get_attribute("open") is not None
+        assert page.locator(".cn-trend-card").count() == 2
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        assert page.locator(".cn-trend-buy").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        assert page.locator(".trend-actual-overlay").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        assert page.locator(".trend-actual-row").evaluate_all(
+            "nodes => nodes.every(node => node.scrollWidth <= node.clientWidth)"
+        )
+        browser.close()
 
 
 def test_dashboard_cn_trend_report_escapes_every_rendered_fact() -> None:
@@ -3196,14 +5146,86 @@ const html=renderTrendReportWorkspace({
   hold_actions:[],review_actions:[{symbol:attack,name:attack,close:attack,
     temperature_prev:attack,temperature_curr:attack,strength:attack,
     reason:"holding_kline_unavailable",active_line:attack,entry_hints:[attack]}],
-  audit:{candidates:[{symbol:attack,name:attack,
-    excluded_reasons:[attack],filter_price:attack,close:attack}],excluded:{[attack]:[attack]},
+  actual_overlay:{available:true,broker_label:attack,account_nav_hkd:attack,
+    status_text:attack,notice:attack,items:[{symbol:attack,name:attack,
+      frozen_action_label:attack,target_weight:attack,simulation_quantity:attack,
+      actual_reference_quantity:attack,actual_quantity:attack,actual_market_value:attack,
+      currency:attack,deviation_label:attack,frozen_reference_price:attack,
+      protection_line:attack,risk_note:attack}],outside_positions:[]},
+  audit:{strategy_parameters:{max_filter_price:attack,allowed_industry_temperatures:[attack]},
+    candidates:[{symbol:attack,name:attack,
+    excluded_reasons:["industry_temperature_not_hot",attack],filter_price:attack,close:attack}],excluded:{[attack]:["filter_price_missing",attack]},
     industry_concentration:[[attack]],data_sources:[attack],actual_api_cost:attack},
 });
 if (html.includes(attack) || !html.includes("&lt;img") ||
     !html.includes('class="cn-trend-report"') ||
     !html.includes("筛选价（Trend Animals）") ||
     !html.includes("执行参考价（Futu 前复权）")) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cn_audit_explains_reported_reasons_with_frozen_requirements() -> None:
+    output = run_dashboard_js(r'''
+const html = renderCnTrendAudit({
+  strategy_parameters:{
+    max_filter_price:"200", min_strength:"95",
+    allowed_industry_temperatures:["热","沸"],
+    allowed_phases:["谷雨","立夏","夏至"],
+    min_market_cap_100m:"100", min_amount_100m:"2"
+  },
+  candidates:[
+    {symbol:"600671",name:"天目药业",eligible:false,rank:null,
+     excluded_reasons:["industry_temperature_not_hot","market_cap_below_100","amount_below_2"],
+     industry_temperature:"平",market_cap:"20",amount:"1",danger:false},
+    {symbol:"600236",name:"桂冠电力",eligible:false,
+     excluded_reasons:["filter_price_missing","future_rule_<script>"]},
+    {symbol:"600001",name:"通过样本",eligible:true,rank:1,
+     excluded_reasons:[],temperature_prev:"温",temperature_curr:"热",
+     strength:"99",phase:"立夏",danger:false}
+  ],
+  industry_concentration:[], data_sources:["Trend Animals"]
+}, {data_date:"2026-07-22"});
+for (const text of [
+  "行业温度","平","要求：热或沸", "总市值","20 亿元","要求：至少 100 亿元",
+  "日成交额","1 亿元","要求：至少 2 亿元", "筛选价","数据未提供",
+  "要求：筛选价必须存在", "未识别规则：future_rule_&lt;script&gt;","请核对冻结报告", "未触发",
+  "rank", "未进入候选排名"
+]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+for (const forbidden of ["未知原因", ">null<", ">false<"]) {
+  if (html.includes(forbidden)) throw new Error(forbidden + "\n" + html);
+}
+const historical = renderCnTrendAudit({candidates:[{symbol:"600001",eligible:false,
+  excluded_reasons:["atr_unavailable","data_date_mismatch","strength_below_95"],
+  atr:null,as_of_date:"2026-07-21",strength:"94"}]}, {data_date:"2026-07-22"});
+for (const text of ["ATR14","数据未提供","该历史策略版本要求 ATR14","数据日期","2026-07-21",
+  "要求：与报告数据日 2026-07-22 一致"]) {
+  if (!historical.includes(text)) throw new Error(text + "\n" + historical);
+}
+if (!historical.includes("冻结策略参数未提供")) throw new Error(historical);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cn_audit_unknown_prototype_reason_codes_use_safe_fallback() -> None:
+    output = run_dashboard_js(r'''
+const html = renderCnTrendAudit({candidates:[{
+  symbol:"600001", name:"测试", eligible:false,
+  excluded_reasons:["constructor","__proto__","toString"]
+}]});
+for (const text of [
+  "未识别规则：constructor", "未识别规则：__proto__", "未识别规则：toString",
+  "请核对冻结报告"
+]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+if (html.includes("未知原因") || html.includes("function")) throw new Error(html);
 console.log("ok");
 ''')
 
@@ -3223,6 +5245,33 @@ if (mobile.includes('<details class="trend-discipline" open>') ||
     (mobile.match(/<details class="trend-discipline">/g) || []).length !== 2) {
   throw new Error(mobile);
 }
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_renders_partial_sell_with_simulation_target_at_desktop_and_mobile() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  market:"CN", broker_label:"东方财富", market_label:"A股", report_date:"2026-07-15",
+  data_date:"2026-07-14", generated_at:"now", account_status:"已更新", buy_window:"09:30–10:00",
+  counts:{sell:2}, buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+  sell_actions:[
+    {action:"SELL_PARTIAL",symbol:"600001",name:"过热",close:"10",temperature_prev:"热",temperature_curr:"沸",strength:"99",reason:"overheat_take_profit",active_line:"9",estimated_shares:300,lot_size:100,overheat_signals:["boiling"],execution:{status:"partially_filled",target_qty:"300",filled_qty:"100"}},
+    {action:"SELL_ALL",symbol:"600002",name:"危险",close:"8",temperature_prev:"热",temperature_curr:"平",strength:"80",reason:"danger_signal",active_line:"7"},
+  ],
+  actual_overlay:{available:true,broker_label:"东方财富",status_text:"结单数据，非实时",notice:"不会自动交易真实账户",items:[{symbol:"600001",name:"过热",frozen_action:"SELL_PARTIAL",frozen_action_label:"止盈减仓 30%",simulation_quantity:"0",actual_reference_quantity:"",actual_quantity:"1000",actual_market_value:"10000",currency:"CNY",deviation:"review",deviation_label:"待人工复核",manual_execution_guidance:"按实盘下单时持仓的 30% 向下取整",risk_note:"保护线仍有效"}],outside_positions:[]},
+};
+for (const mobile of [false, true]) {
+  window = {matchMedia: () => ({matches: mobile})};
+  const html = renderTrendReportWorkspace(report);
+  for (const text of ["止盈减仓 30%", "全部卖出", "模拟目标数量 300", "模拟已成交 100", "模拟剩余数量 200", "模拟预计数量 0", "按实盘下单时持仓的 30% 向下取整"]) {
+    if (!html.includes(text)) throw new Error(text + "\n" + html);
+  }
+}
+if (optionAttentionAction("SELL_PARTIAL") !== "止盈减仓 30%") throw new Error("partial option attention action");
+if (!renderCnTrendDisciplines().includes("Trend Animals API 未提供波动率放大字段；本地不推断")) throw new Error("missing volatility discipline");
 console.log("ok");
 ''')
 
@@ -3314,6 +5363,11 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert "overflow-x: hidden;" in mobile
     assert ".trend-discipline summary" in mobile
     assert "min-height: 44px;" in mobile
+    assert ".trend-audit-table {" in css
+    assert ".trend-audit-row" in mobile
+    assert ".trend-audit-table thead" in mobile
+    assert "display: none;" in mobile
+    assert ".trend-audit-reason" in mobile
 
 
 def test_dashboard_renders_fixed_order_futu_option_attention_list() -> None:
@@ -3513,7 +5567,7 @@ elements["visible-count"] = mount();
 elements["workspace-grid"] = mount();
 elements["symbol-detail-panel"] = mount();
 elements["account-tabs"] = mount();
-renderSymbolDetail = (holding) => `DETAIL:${holding.symbol}`;
+renderTSignalDetail = (holding) => `TDETAIL:${holding.symbol}`;
 state.dashboard = {
   summary: {portfolio_value_hkd: "3000"},
   broker_summaries: [
@@ -3533,7 +5587,7 @@ renderAccountHoldings();
 const html = elements["account-holdings"].innerHTML;
 if ((html.match(/active-row/g) || []).length !== 1) throw new Error("expected one active broker row: " + html);
 if ((html.match(/inline-symbol-detail/g) || []).length !== 1) throw new Error("expected one inline detail: " + html);
-if (html.includes('id="account-futu"') || !html.includes('id="account-tiger"') || !html.includes("DETAIL:QQQ")) {
+if (html.includes('id="account-futu"') || !html.includes('id="account-tiger"') || !html.includes("TDETAIL:QQQ")) {
   throw new Error("selected Tiger QQQ should not activate Futu QQQ: " + html);
 }
 ''')
@@ -3960,7 +6014,7 @@ for (const required of [
   "HK.02840",
   "SIM-10002",
   "卖出",
-  "218.80",
+  "218.8",
   "100",
   "0",
   "待成交",
@@ -4073,7 +6127,7 @@ if (!secondHtml.includes("突破 10D Mock 第一批") || trendNameCount !== 1) {
 if (!secondHtml.includes("价格放量突破近 10 个交易日高点，成交量不低于 1.5 倍均量。") || !secondHtml.includes("US.MSFT") || !secondHtml.includes("US.TSM") || !secondHtml.includes("HK.06951")) {
   throw new Error("kelly lab second tab content missing: " + secondHtml);
 }
-for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。", "US.MSFT", "SIM-20001", "买入", "505.10", "20", "拒单"]) {
+for (const required of ["订单同步", "同步失败", "模拟盘订单同步失败：OpenD 不可用。", "本轮不下单，保留现有订单状态。", "US.MSFT", "SIM-20001", "买入", "505.1", "20", "拒单"]) {
   if (!secondHtml.includes(required)) {
     throw new Error("kelly second tab order sync missing " + required + ": " + secondHtml);
   }
@@ -5688,9 +7742,9 @@ for (const required of [
   "日线布林带",
   "中性区间",
   "当前价格位于日线布林带区间内",
-  "下轨 380.00",
-  "中轨 405.00",
-  "上轨 430.00"
+  "下轨 380",
+  "中轨 405",
+  "上轨 430"
 ]) {
   if (!card.includes(required)) {
     throw new Error("missing K-line bollinger fact " + required + ": " + card);
@@ -6578,11 +8632,14 @@ renderHoldings();
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
 }
-if (!elements["holdings-body"].innerHTML.includes("交易决策") || !elements["holdings-body"].innerHTML.includes(">做T<") || elements["holdings-body"].innerHTML.includes(">凯利<") || elements["holdings-body"].innerHTML.includes(">详情<")) {
-  throw new Error("holdings row should expose trading decision entry: " + elements["holdings-body"].innerHTML);
+const initialHoldingHtml = elements["holdings-body"].innerHTML;
+if (!initialHoldingHtml.includes(">做T<") || initialHoldingHtml.includes(">凯利<") || initialHoldingHtml.includes(">详情<")) {
+  throw new Error("holdings row should expose only the T-signal entry: " + initialHoldingHtml);
 }
-if (!elements["holdings-body"].innerHTML.includes('data-detail-market="US"') || !elements["holdings-body"].innerHTML.includes('data-detail-symbol="VIXY"')) {
-  throw new Error("trading decision entry should expose exact holding identity: " + elements["holdings-body"].innerHTML);
+for (const retired of ['data-detail-mode="decision"', "TradingAgents", "交易决策"]) {
+  if (initialHoldingHtml.includes(retired)) {
+    throw new Error("retired AI decision UI remains " + retired + ": " + initialHoldingHtml);
+  }
 }
 if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
   throw new Error("active BUY_T/SELL_T signals should pulse the t signal button: " + elements["holdings-body"].innerHTML);
@@ -6611,7 +8668,7 @@ renderHoldings();
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
 }
-for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1,940.00", "HKD 15,132.00", "期权关注", "今日暂无趋势报告"]) {
+for (const required of ["成本价", "美元市值", "港元市值", "账户权重", "组合权重", "USD 1,940", "HKD 15,132", "期权关注", "今日暂无趋势报告"]) {
   if (!renderedHoldings.includes(required)) {
     throw new Error("account holdings missing " + required + ": " + renderedHoldings);
   }
@@ -6628,21 +8685,6 @@ for (const unexpected of ["<td>futu;tiger</td>", "<td>phillips</td>", "<td>futu<
 if (renderedHoldings.includes("观察 ·") || renderedHoldings.includes("人工复核 ·")) {
   throw new Error("main holdings table should not render action badges: " + renderedHoldings);
 }
-if (!elements["holdings-body"].innerHTML.includes("decision-detail-row") || !elements["holdings-body"].innerHTML.includes("inline-symbol-detail")) {
-  throw new Error("trading decision should render directly below selected holding row: " + elements["holdings-body"].innerHTML);
-}
-for (const required of ["交易决策 ·", "最终决策", "趋势 / K 线", "新闻 / 舆论", "富途异动", "数据未生成"]) {
-  if (!elements["holdings-body"].innerHTML.includes(required)) {
-    throw new Error("trading decision detail missing " + required + ": " + elements["holdings-body"].innerHTML);
-  }
-}
-for (const unexpected of ["插件管理", "策略阈值"]) {
-  if (elements["holdings-body"].innerHTML.includes(unexpected)) {
-    throw new Error("trading decision detail should not render extra panel " + unexpected);
-  }
-}
-state.selectedHoldingDetail = "t_signal";
-renderHoldings();
 for (const required of ["做T信号 ·", "买入做T", "确定比例", "15%", "信号依据", "价格低于 VWAP 后回收", "前置条件", "t-signal-checkmark", "交易时段", "详细信息", "消息 timeline", "已发送 BUY_T 通知。", "已发起提醒 · 2026-07-02T22:32:00+08:00"]) {
   if (!elements["holdings-body"].innerHTML.includes(required)) {
     throw new Error("t signal detail missing " + required + ": " + elements["holdings-body"].innerHTML);
@@ -6653,7 +8695,6 @@ for (const unexpected of ["小T", "大T", "状态机", ">session_phase<", "已�
     throw new Error("t signal detail should not render ambiguous wording " + unexpected);
   }
 }
-state.selectedHoldingDetail = "decision";
 state.dashboard.holdings.push({
   market: "JP",
   symbol: "7203",
@@ -6670,7 +8711,7 @@ state.dashboard.holdings.push({
 state.selectedHoldingKey = "";
 selectBroker("phillips");
 const renderedWithOther = elements["holdings-body"].innerHTML;
-if (!renderedWithOther.includes(">JP<") || !renderedWithOther.includes(">Toyota<") || !renderedWithOther.includes("HKD 300.00")) {
+if (!renderedWithOther.includes(">JP<") || !renderedWithOther.includes(">Toyota<") || !renderedWithOther.includes("HKD 300")) {
   throw new Error("non-standard markets should remain ordinary account rows: " + renderedWithOther);
 }
 `, sandbox);
@@ -7561,6 +9602,260 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     assert account_sync.refresh_count == 1
 
 
+def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    calls: list[str] = []
+    server = create_dashboard_server(
+        config,
+        "127.0.0.1",
+        0,
+        quote_service=FakeQuoteService(quote_result()),
+        trend_simulate_position_service=FakeTrendSimulatePositionService(calls),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        read_json(f"http://{host}:{port}/api/dashboard")
+        read_json(f"http://{host}:{port}/api/quotes")
+        assert calls == []
+        status, _, _ = read_text_error(
+            f"http://{host}:{port}/api/trend-simulate-positions/tiger/positions"
+        )
+        assert status == 404
+        assert calls == []
+
+        payload = read_json(
+            f"http://{host}:{port}/api/trend-simulate-positions/tiger"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert calls == ["tiger"]
+    assert payload["broker"] == "tiger"
+
+
+def test_dashboard_http_serves_report_history_and_exact_artifact(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+    from open_trader.trend_review import _report_hash
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-16.json",
+        execution_date="2026-07-17",
+        generated_at="2026-07-17T09:00:00+08:00",
+    )
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-17/action-key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(
+        json.dumps({
+            "report_sha256": _report_hash(payload),
+            "symbol": "VIXY",
+            "side": "buy",
+            "status": "missed",
+        }),
+        encoding="utf-8",
+    )
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        history = read_json(
+            f"http://{host}:{port}/api/trend-reports/tiger/history"
+        )
+        report = read_json(
+            f"http://{host}:{port}/api/trend-reports/tiger/history/2026-07-16.json"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert [row["artifact"] for row in history] == ["2026-07-16.json"]
+    assert report["report_date"] == "2026-07-17"
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+
+
+def test_dashboard_http_report_history_enforces_read_only_route_errors(
+    tmp_path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    write_trend_history_report(
+        config.reports_dir,
+        "wrong-market.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+        market="HK",
+    )
+    (config.reports_dir / "trend_us_tiger" / "broken.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+    server = create_dashboard_server(
+        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    root = f"http://{host}:{port}/api/trend-reports"
+    try:
+        assert read_error_json(f"{root}/unknown/history")[0] == 400
+        assert read_error_json(
+            f"{root}/tiger/history/..%2Fsecret.json"
+        )[0] == 400
+        assert read_error_json(f"{root}/tiger/history/missing.json")[0] == 404
+        assert read_error_json(
+            f"{root}/tiger/history/wrong-market.json"
+        )[0] == 400
+        history = read_json(f"{root}/tiger/history")
+        method_statuses = []
+        for method in ("POST", "PUT", "DELETE"):
+            request = urllib.request.Request(
+                f"{root}/tiger/history", data=b"{}", method=method
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            method_statuses.append(error.value.code)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert history == [
+        {
+            "available": False,
+            "artifact": "wrong-market.json",
+            "status_text": "报告不可读取",
+        },
+        {
+            "available": False,
+            "artifact": "broken.json",
+            "status_text": "报告不可读取",
+        },
+    ]
+    assert all(status != 200 for status in method_statuses)
+
+
+def test_dashboard_http_rejects_unknown_simulated_broker(tmp_path) -> None:
+    from open_trader.dashboard import DETAIL_FX_TO_HKD
+    from open_trader.dashboard_web import create_dashboard_server
+    from open_trader.trend_simulate_positions import TrendSimulatePositionService
+
+    config = dashboard_config(tmp_path)
+    server = create_dashboard_server(
+        config,
+        "127.0.0.1",
+        0,
+        quote_service=FakeQuoteService(quote_result()),
+        trend_simulate_position_service=TrendSimulatePositionService(
+            host=config.futu_host,
+            port=config.futu_port,
+            account_ids={},
+            fx_to_hkd=DETAIL_FX_TO_HKD,
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        status, _, payload = read_error_json(
+            f"http://{host}:{port}/api/trend-simulate-positions/futu"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert status == 400
+    assert payload["message"] == "unsupported trend simulate broker: futu"
+
+
+def test_serve_dashboard_configures_simulate_accounts_once(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+    from open_trader.dashboard import DETAIL_FX_TO_HKD
+
+    created: list[dict[str, object]] = []
+    server_kwargs: dict[str, object] = {}
+
+    class FakeTrendSimulatePositionServiceFactory:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            return None
+
+    def fake_create_dashboard_server(**kwargs: object) -> FakeServer:
+        server_kwargs.update(kwargs)
+        return FakeServer()
+
+    monkeypatch.setattr(
+        dashboard_web,
+        "TrendSimulatePositionService",
+        FakeTrendSimulatePositionServiceFactory,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dashboard_web,
+        "DashboardAccountSyncService",
+        lambda **_: type("FakeAccountSync", (), {"interval_seconds": 60})(),
+    )
+    monkeypatch.setattr(
+        dashboard_web, "create_dashboard_server", fake_create_dashboard_server
+    )
+    config = dashboard_config(
+        tmp_path,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
+    )
+
+    dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+
+    sha = subprocess.check_output(
+        ["git", "-C", str(Path.cwd()), "rev-parse", "HEAD"], text=True
+    ).strip()
+    output = capsys.readouterr().out
+    assert f'"pid": {os.getpid()}' in output
+    assert f'"git_sha": "{sha}"' in output
+    assert len(created) == 1
+    assert created[0]["account_ids"] == {
+        "eastmoney": 101,
+        "tiger": 102,
+        "phillips": 103,
+    }
+    assert created[0]["fx_to_hkd"] == DETAIL_FX_TO_HKD
+    assert server_kwargs["trend_simulate_position_service"].__class__ is (
+        FakeTrendSimulatePositionServiceFactory
+    )
+
+
 def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
@@ -7589,6 +9884,37 @@ def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
 
     assert payload["statement_date"] == "2026-07-10"
     assert importer.calls == [("phillips", b"%PDF-1.7\nstatement")]
+
+
+def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FailingStatementImportService:
+        def import_pdf(self, broker: str, body: bytes) -> dict[str, Any]:
+            raise ValueError("辉立成交表格式无法识别")
+
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        statement_import_service=FailingStatementImportService(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        status, payload = post_pdf_error(
+            f"http://{host}:{port}/api/statements/phillips",
+            b"%PDF-1.7\nbroken",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 400
+    assert payload["message"] == "辉立成交表格式无法识别"
 
 
 @pytest.mark.parametrize(
@@ -7963,6 +10289,48 @@ def test_dashboard_server_returns_json_500_when_dashboard_payload_raises(
         "status": "error",
         "error_type": "RuntimeError",
         "message": "dashboard boom",
+    }
+
+
+def test_dashboard_server_keeps_unrelated_file_not_found_as_json_500(
+    tmp_path, monkeypatch,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    def raise_file_not_found(config, **kwargs: Any) -> dict[str, Any]:
+        raise FileNotFoundError("dashboard source missing")
+
+    monkeypatch.setattr(
+        dashboard_web,
+        "build_dashboard_payload",
+        raise_file_not_found,
+    )
+    config = dashboard_config(tmp_path)
+    server = dashboard_web.create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address
+        status, content_type, payload = read_error_json(
+            f"http://{host}:{port}/api/dashboard"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 500
+    assert content_type == "application/json; charset=utf-8"
+    assert payload == {
+        "status": "error",
+        "error_type": "FileNotFoundError",
+        "message": "dashboard source missing",
     }
 
 

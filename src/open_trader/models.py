@@ -52,6 +52,25 @@ class Position:
 
 
 @dataclass(frozen=True)
+class StatementTrade:
+    statement_id: str
+    broker: str
+    account_alias: str
+    market: Market
+    symbol: str
+    currency: str
+    side: Literal["buy", "sell"]
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
+    costs_complete: bool
+    traded_at: str
+    reference: str
+    execution_granularity: Literal["statement_trade_date"]
+    statement_sequence: int
+
+
+@dataclass(frozen=True)
 class CashBalance:
     statement_id: str
     broker: str

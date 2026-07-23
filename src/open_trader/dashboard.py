@@ -4,21 +4,28 @@ import csv
 import copy
 import json
 import re
+import socket
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
     ACTION_LABELS,
     NON_REALTIME_ACCOUNT_WARNING,
+    PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
+    SINGLE_ENTRY_RISK_LIMIT,
     valid_serialized_account,
+    valid_v2_risk_contract,
+    valid_v3_risk_contract,
+    valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
+from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
     KLINE_FIELDS,
@@ -63,6 +70,10 @@ from .technical_facts import (
     technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
 )
+from .trend_review import _report_hash, _validate_execution_batch
+from .trend_market_controller import _valid_status
+from .strategy_drawdown import valid_drawdown_decision
+from .trend_api_stats import load_trend_api_stats
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
     load_tradingagents_summary_cache,
@@ -92,10 +103,14 @@ DETAIL_FX_TO_HKD = {
     "USD": Decimal("7.8"),
     "CNY": Decimal("1.08"),
 }
+TREND_MARKET_CURRENCIES = {"CN": "CNY", "HK": "HKD", "US": "USD"}
 TREND_REPORT_SOURCES = {
     "tiger": ("US", "美股", "老虎", "trend_us_tiger", "美股常规交易时段"),
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
+}
+TREND_ACTUAL_BROKERS = {
+    market: broker for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
 }
 OPTION_ATTENTION_KEYS = {
     "market",
@@ -142,6 +157,11 @@ TREND_REVIEW_METRICS = {
 TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
 ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+TREND_MARKET_TIMEZONES = {
+    "CN": SHANGHAI,
+    "HK": ZoneInfo("Asia/Hong_Kong"),
+    "US": ZoneInfo("America/New_York"),
+}
 
 
 @dataclass(frozen=True)
@@ -152,6 +172,10 @@ class DashboardConfig:
     poll_seconds: float
     futu_host: str
     futu_port: int
+    trend_review_cn_simulate_acc_id: int = 0
+    trend_review_us_simulate_acc_id: int = 0
+    trend_review_hk_simulate_acc_id: int = 0
+    trend_executor_host: str = ""
 
 
 @dataclass(frozen=True)
@@ -171,6 +195,7 @@ class DashboardState:
     backtest_universe: dict[str, list[dict[str, str]]]
     trend_reports: dict[str, dict[str, Any]]
     trend_reviews: dict[str, dict[str, Any]]
+    trend_controllers: dict[str, dict[str, object]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +219,7 @@ class DashboardState:
             "backtest_universe": self.backtest_universe,
             "trend_reports": self.trend_reports,
             "trend_reviews": self.trend_reviews,
+            "trend_controllers": self.trend_controllers,
         }
 
 
@@ -312,10 +338,125 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         kelly_lab=kelly_lab,
         backtest_universe=backtest_universe,
         trend_reports=_load_trend_reports(
-            config.data_dir, config.reports_dir
+            config.data_dir,
+            config.reports_dir,
+            broker_positions=broker_positions,
+            cash_details=raw_cash_details,
         ),
         trend_reviews=_load_trend_reviews(config.data_dir),
+        trend_controllers=_load_trend_controllers(
+            config.data_dir,
+            executor_host=config.trend_executor_host,
+        ),
     )
+
+
+def _load_trend_controllers(
+    data_dir: Path,
+    *,
+    executor_host: str,
+    now: datetime | None = None,
+    hostname_fn: Callable[[], str] = socket.gethostname,
+) -> dict[str, dict[str, object]]:
+    local_host = hostname_fn().strip()
+    executor_host = executor_host.strip()
+    current = now or datetime.now(SHANGHAI)
+    effective_mode = (
+        "execute" if executor_host and executor_host == local_host else "readonly"
+    )
+
+    def base(
+        market: str, health: str, blocking: bool, reason: str
+    ) -> dict[str, object]:
+        return {
+            "market": market,
+            "effective_mode": effective_mode,
+            "executor_host": executor_host,
+            "local_host": local_host,
+            "health": health,
+            "blocking": blocking,
+            "reason": reason,
+            "pid": None,
+            "working_directory": "",
+            "git_sha": "",
+            "phase": "readonly" if health == "readonly" else "unavailable",
+            "heartbeat_at": "",
+            "last_success": None,
+            "blocker": reason or None,
+            "next_check_at": "",
+        }
+
+    def load(market: str) -> dict[str, object]:
+        if not executor_host or executor_host != local_host:
+            reason = (
+                "OPEN_TRADER_TREND_EXECUTOR_HOST is not configured"
+                if not executor_host
+                else "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST"
+            )
+            return base(market, "readonly", False, reason)
+        path = data_dir / "trend_controller" / market / "status.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return base(
+                market, "unavailable", True, "controller status file is missing"
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return base(
+                market, "unavailable", True, "controller status is malformed"
+            )
+        if not isinstance(payload, dict) or not _valid_status(payload):
+            return base(
+                market, "unavailable", True, "controller status is malformed"
+            )
+        if (
+            payload["effective_mode"] != "execute"
+            or payload["executor_host"] != executor_host
+            or payload["local_host"] != local_host
+        ):
+            return base(
+                market, "unavailable", True, "controller hostname does not match"
+            )
+        heartbeat = datetime.fromisoformat(str(payload["heartbeat_at"]))
+        if abs(current - heartbeat) > timedelta(minutes=2):
+            return {
+                **base(market, "unavailable", True, "controller heartbeat is stale"),
+                **payload,
+                "health": "unavailable",
+                "blocking": True,
+                "reason": "controller heartbeat is stale",
+                "blocker": "controller heartbeat is stale",
+            }
+        unhealthy_phase = payload["phase"] in {
+            "starting",
+            "blocked",
+            "uncertain",
+            "conflict",
+            "missed",
+        }
+        if payload["blocker"] not in (None, "") or unhealthy_phase:
+            reason = str(
+                payload["blocker"] or f"controller phase is {payload['phase']}"
+            )
+            return {
+                **payload,
+                "market": market,
+                "health": "unavailable",
+                "blocking": True,
+                "reason": reason,
+            }
+        return {
+            **payload,
+            "market": market,
+            "health": "healthy",
+            "blocking": False,
+            "reason": "",
+        }
+
+    return {
+        broker: load(market)
+        for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
+    }
 
 
 def _trend_review_unavailable(
@@ -346,7 +487,7 @@ def _valid_trend_review_metric_cell(value: object) -> bool:
 
 
 def _valid_iso_date(value: object) -> bool:
-    if not isinstance(value, str) or not ISO_DATE.fullmatch(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return False
     try:
         date.fromisoformat(value)
@@ -365,8 +506,12 @@ def _valid_trend_review_projection(
     common_cutoff = payload.get("common_cutoff")
     interval = payload.get("interval")
     metrics = payload.get("metrics")
+    schema_version = payload.get("schema_version")
     if (
-        payload.get("schema_version") != "open_trader.trend_review.projection.v2"
+        schema_version not in {
+            "open_trader.trend_review.projection.v1",
+            "open_trader.trend_review.projection.v2",
+        }
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
@@ -395,6 +540,33 @@ def _valid_trend_review_projection(
         or set(metrics) != TREND_REVIEW_METRICS
     ):
         return False
+    if schema_version == "open_trader.trend_review.projection.v2":
+        sample_counts = payload.get("sample_counts")
+        common_cutoff = payload.get("common_cutoff")
+        interval = payload.get("interval")
+        if (
+            not isinstance(sample_counts, dict)
+            or set(sample_counts) != {"discipline", "actual", "required"}
+            or any(
+                type(sample_counts[key]) is not int or sample_counts[key] < 0
+                for key in ("discipline", "actual")
+            )
+            or type(sample_counts["required"]) is not int
+            or sample_counts["required"] != 30
+            or not isinstance(interval, dict)
+            or set(interval) != {"start", "end"}
+            or not _valid_iso_date(interval["start"])
+            or snapshot.get("effective_from") != interval["start"]
+            or interval["end"] != common_cutoff
+            or (
+                common_cutoff is not None
+                and (
+                    not _valid_iso_date(common_cutoff)
+                    or common_cutoff < interval["start"]
+                )
+            )
+        ):
+            return False
     for key in (
         "strategy_id",
         "strategy_name",
@@ -465,9 +637,16 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def _load_trend_reports(
-    data_dir: Path, reports_dir: Path, *, today: date | None = None
+    data_dir: Path,
+    reports_dir: Path,
+    *,
+    today: date | None = None,
+    now: datetime | None = None,
+    broker_positions: list[dict[str, str]] | None = None,
+    cash_details: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    report_date = (today or _shanghai_date()).isoformat()
+    if broker_positions is None or cash_details is None:
+        broker_positions, cash_details = _latest_broker_details(data_dir)
     reports = {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
@@ -477,7 +656,11 @@ def _load_trend_reports(
             market_label=market_label,
             broker_label=broker_label,
             buy_window=buy_window,
-            report_date=report_date,
+            report_date=(
+                today or _trend_market_date(market, now=now)
+            ).isoformat(),
+            broker_positions=broker_positions,
+            cash_details=cash_details,
         )
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
@@ -486,6 +669,156 @@ def _load_trend_reports(
         reports["tiger"], reports["phillips"]
     )
     return reports
+
+
+def _validated_trend_report_artifact(
+    reports_dir: Path, *, artifact: str, market: str, broker: str
+) -> tuple[Path, dict[str, Any], date, date, date, datetime, str] | None:
+    artifact_path = Path(artifact)
+    if artifact_path.name != artifact or artifact_path.suffix != ".json":
+        raise ValueError("unsafe trend report artifact")
+    reports_dir = reports_dir.resolve()
+    path = (reports_dir / artifact).resolve()
+    if path.parent != reports_dir:
+        raise ValueError("unsafe trend report artifact")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    chronology = _valid_trend_report_payload(
+        payload, market=market, broker=broker
+    )
+    snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        str(snapshot.get("strategy_version") or "").strip()
+        if isinstance(snapshot, dict)
+        else ""
+    )
+    if chronology is None or not strategy_version:
+        return None
+    return path, payload, *chronology, strategy_version
+
+
+def load_trend_report_history(
+    reports_dir: Path, *, broker: str
+) -> list[dict[str, Any]]:
+    """Return strict, newest-first summaries for one trend broker."""
+    try:
+        market, _, _, directory, _ = TREND_REPORT_SOURCES[broker]
+    except KeyError:
+        raise ValueError(f"unsupported trend report broker: {broker}") from None
+    rows: list[tuple[date, datetime, int, str, dict[str, Any]]] = []
+    invalid: list[dict[str, Any]] = []
+
+    def mark_unreadable(path: Path) -> None:
+        invalid.append({
+            "available": False,
+            "artifact": path.name,
+            "status_text": "报告不可读取",
+        })
+
+    broker_dir = reports_dir / directory
+    for path in broker_dir.glob("*.json"):
+        try:
+            selected = _validated_trend_report_artifact(
+                broker_dir,
+                artifact=path.name,
+                market=market,
+                broker=broker,
+            )
+        except (FileNotFoundError, ValueError):
+            selected = None
+        if selected is None:
+            mark_unreadable(path)
+            continue
+        (
+            _,
+            payload,
+            execution_date,
+            as_of_date,
+            _,
+            generated_at,
+            strategy_version,
+        ) = selected
+        sell_actions, buy_actions, hold_actions, review_actions = (
+            _project_trend_actions(payload, executions={})
+        )
+        revision_match = re.search(r"-r(\d+)\.json\Z", path.name)
+        revision = int(revision_match.group(1)) if revision_match else 0
+        summary = {
+            "available": True,
+            "artifact": path.name,
+            "execution_date": execution_date.isoformat(),
+            "data_date": as_of_date.isoformat(),
+            "generated_at": generated_at.isoformat(),
+            "strategy_version": strategy_version,
+            "revision": revision,
+            "execution_counts": {
+                "sell": len(sell_actions),
+                "buy": len(buy_actions),
+                "hold": len(hold_actions),
+                "review": len(review_actions),
+            },
+        }
+        rows.append((execution_date, generated_at, revision, path.name, summary))
+    rows.sort(key=lambda row: row[:4], reverse=True)
+    invalid.sort(key=lambda row: row["artifact"], reverse=True)
+    return [row[-1] for row in rows] + invalid
+
+
+def load_historical_trend_report(
+    data_dir: Path, reports_dir: Path, *, broker: str, artifact: str
+) -> dict[str, Any]:
+    """Return the same report projection used by the current-report UI."""
+    try:
+        market, market_label, broker_label, directory, buy_window = (
+            TREND_REPORT_SOURCES[broker]
+        )
+    except KeyError:
+        raise ValueError(f"unsupported trend report broker: {broker}") from None
+    broker_dir = reports_dir / directory
+    selected = _validated_trend_report_artifact(
+        broker_dir,
+        artifact=artifact,
+        market=market,
+        broker=broker,
+    )
+    if selected is None:
+        raise ValueError("trend report artifact is unreadable")
+    (
+        path,
+        payload,
+        execution_date,
+        as_of_date,
+        freshness_date,
+        generated_at,
+        _,
+    ) = selected
+    broker_positions, cash_details = _latest_broker_details(data_dir)
+    return _project_broker_trend_report(
+        selected=(
+            path,
+            payload,
+            execution_date,
+            as_of_date,
+            freshness_date,
+            generated_at,
+        ),
+        data_dir=data_dir,
+        reports_dir=broker_dir.resolve(),
+        broker=broker,
+        market=market,
+        market_label=market_label,
+        broker_label=broker_label,
+        buy_window=buy_window,
+        report_date=_shanghai_date().isoformat(),
+        broker_positions=broker_positions,
+        cash_details=cash_details,
+    )
 
 
 def _project_futu_attention(
@@ -497,6 +830,7 @@ def _project_futu_attention(
             "market_label": source["market_label"],
             "data_status": source["data_status"],
             "data_date": source.get("data_date", ""),
+            "status_text": source["status_text"],
             "items": source.get("option_attention", [])
             if source["available"]
             else [],
@@ -515,6 +849,11 @@ def _project_futu_attention(
 
 def _shanghai_date(now: datetime | None = None) -> date:
     return (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI).date()
+
+
+def _trend_market_date(market: str, *, now: datetime | None = None) -> date:
+    reference_now = now or datetime.now(SHANGHAI)
+    return reference_now.astimezone(TREND_MARKET_TIMEZONES[market]).date()
 
 
 def _latest_valid_report_payload(
@@ -561,17 +900,134 @@ def _latest_valid_report_payload(
     return path, payload, execution_date, as_of_date, freshness_date, generated_at
 
 
+def _valid_partial_trend_action(item: dict[str, Any]) -> bool:
+    try:
+        target_fraction = Decimal(str(item.get("target_fraction")))
+        lot = Decimal(str(item.get("lot_size")))
+        if isinstance(item.get("lot_size"), bool):
+            return False
+        lot_size = int(item.get("lot_size"))
+        estimate = Decimal(str(item.get("estimated_shares")))
+        position_started_for = item.get("position_started_for")
+        started = date.fromisoformat(str(position_started_for)).isoformat()
+        signals = item.get("overheat_signals")
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not all(value.is_finite() for value in (target_fraction, lot, estimate)):
+        return False
+    valid_signals = (
+        isinstance(signals, list)
+        and bool(signals)
+        and all(
+            isinstance(signal, str) and signal in {"boiling", "champagne"}
+            for signal in signals
+        )
+        and len(signals) == len(set(signals))
+    )
+    return (
+        item.get("reason") == "overheat_take_profit"
+        and target_fraction == Decimal("0.30")
+        and lot > 0
+        and lot == lot.to_integral_value()
+        and lot == Decimal(lot_size)
+        and estimate >= 0
+        and estimate == estimate.to_integral_value()
+        and estimate % lot == 0
+        and isinstance(position_started_for, str)
+        and position_started_for == started
+        and valid_signals
+    )
+
+
 def _trend_action_needs_review(item: dict[str, Any]) -> bool:
     action = item.get("action")
     reason = item.get("reason")
     known_reason = isinstance(reason, str) and reason in REASON_LABELS
     if action == "BUY":
         return reason not in (None, "") and not known_reason
+    if action == "SELL_PARTIAL":
+        return not _valid_partial_trend_action(item)
     return (
         action == "MANUAL_REVIEW"
         or action not in ACTION_LABELS
         or action in {"SELL_ALL", "HOLD"} and not known_reason
     )
+
+
+def _canonical_trend_sell_symbol(item: dict[str, Any], market: str) -> str:
+    try:
+        return to_futu_symbol(market, str(item.get("symbol") or ""))
+    except ValueError:
+        return ""
+
+
+def _project_trend_actions(
+    payload: dict[str, Any],
+    executions: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    judgments = payload["strategy_judgments"]
+    formal = [
+        {
+            **item,
+            **(
+                {"execution": executions[key]}
+                if (key := (
+                    str(item.get("symbol") or "").strip(),
+                    {"BUY": "buy", "SELL_ALL": "sell", "SELL_PARTIAL": "sell"}.get(
+                        item.get("action"), ""
+                    ),
+                )) in executions
+                else {}
+            ),
+        }
+        for item in judgments["formal_actions"]
+    ]
+    holdings = judgments["holding_decisions"]
+    metadata = payload.get("metadata")
+    market = (
+        str(metadata.get("market") or "CN").upper()
+        if isinstance(metadata, dict)
+        else "CN"
+    )
+    full_exit_symbols = {
+        symbol
+        for item in formal
+        if item.get("action") == "SELL_ALL"
+        and not _trend_action_needs_review(item)
+        if (symbol := _canonical_trend_sell_symbol(item, market))
+    }
+    sell_actions = [
+        item
+        for item in formal
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        and not _trend_action_needs_review(item)
+        and not (
+            item.get("action") == "SELL_PARTIAL"
+            and _canonical_trend_sell_symbol(item, market) in full_exit_symbols
+        )
+    ]
+    buy_actions = [
+        item
+        for item in formal
+        if item.get("action") == "BUY"
+        and not _trend_action_needs_review(item)
+    ]
+    hold_actions = [
+        item
+        for item in holdings
+        if item.get("action") == "HOLD"
+        and not _trend_action_needs_review(item)
+    ]
+    review_actions: list[dict[str, Any]] = []
+    for item in formal + holdings:
+        if _trend_action_needs_review(item) and item not in review_actions:
+            review_actions.append(item)
+    return sell_actions, buy_actions, hold_actions, review_actions
 
 
 def _valid_trend_collections(
@@ -580,6 +1036,11 @@ def _valid_trend_collections(
     if any(
         not all(isinstance(item, dict) for item in judgments[key])
         for key in ("formal_actions", "holding_decisions", "top10_candidates")
+    ):
+        return False
+    risk_skips = judgments.get("risk_skips", [])
+    if not isinstance(risk_skips, list) or not all(
+        isinstance(item, dict) for item in risk_skips
     ):
         return False
     snapshots = payload.get("signal_snapshots")
@@ -616,6 +1077,199 @@ def _valid_trend_collections(
             payload.get("api_facts", []),
         )
     )
+
+
+def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
+    snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        str(snapshot.get("strategy_version") or "")
+        if isinstance(snapshot, dict)
+        else ""
+    )
+    summary = payload.get("risk_summary")
+    if summary is None:
+        return strategy_version not in {"v2", "v3", "v4"}
+    if not isinstance(summary, dict) or any(
+        isinstance(value, (dict, list)) for value in summary.values()
+    ):
+        return False
+    if strategy_version not in {"v2", "v3", "v4"}:
+        return summary.get("status") in {"active", "paused"}
+    judgments = payload.get("strategy_judgments")
+    parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
+    account = payload.get("account")
+    expected_nav = account.get("net_value") if isinstance(account, dict) else None
+    risk_valid = (
+        isinstance(judgments, dict)
+        and "risk_skips" in judgments
+        and {
+            "v2": valid_v2_risk_contract,
+            "v3": valid_v3_risk_contract,
+            "v4": valid_v4_risk_contract,
+        }[strategy_version](
+            parameters, summary, expected_nav=expected_nav
+        )
+        and _valid_v2_risk_items(
+            payload, judgments, summary, strategy_version=strategy_version
+        )
+    )
+    if strategy_version in {"v2", "v3"}:
+        return risk_valid
+    metadata = payload.get("metadata")
+    market = metadata.get("market") if isinstance(metadata, dict) else ""
+    strategy_id = snapshot.get("strategy_id") if isinstance(snapshot, dict) else ""
+    formal_actions = judgments.get("formal_actions") if isinstance(judgments, dict) else None
+    drawdown = payload.get("drawdown_summary")
+    return (
+        risk_valid
+        and valid_drawdown_decision(
+            drawdown,
+            expected_market=str(market),
+            expected_strategy_id=str(strategy_id),
+            expected_strategy_version="v4",
+            expected_equity=expected_nav,
+            expected_entry_date=str(payload.get("execution_date") or ""),
+        )
+        and (
+            drawdown.get("entry_allowed") is True
+            or isinstance(formal_actions, list)
+            and not any(
+                isinstance(action, dict) and action.get("action") == "BUY"
+                for action in formal_actions
+            )
+        )
+    )
+
+
+def _dashboard_risk_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def _valid_v2_risk_items(
+    payload: dict[str, Any],
+    judgments: dict[str, Any],
+    summary: dict[str, Any],
+    *,
+    strategy_version: str = "v2",
+) -> bool:
+    portfolio_limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
+    nav = (
+        portfolio_limit / PORTFOLIO_RISK_LIMIT
+        if portfolio_limit is not None and portfolio_limit > 0
+        else None
+    )
+    buys = [
+        item
+        for item in judgments["formal_actions"]
+        if item.get("action") == "BUY"
+    ]
+    if (nav is None or summary.get("status") == "paused") and buys:
+        return False
+    new_planned_risk = Decimal("0")
+    allowed_buy_constraints = {
+        "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
+    }
+    if strategy_version in {"v3", "v4"}:
+        allowed_buy_constraints.add("Kelly 上限")
+    for item in buys:
+        shares = item.get("estimated_shares")
+        lot_size = item.get("lot_size")
+        planned_risk = _dashboard_risk_decimal(item.get("planned_stop_risk"))
+        planned_pct = _dashboard_risk_decimal(item.get("planned_stop_risk_pct"))
+        normal_cost = _dashboard_risk_decimal(item.get("normal_cost"))
+        target_weight = _dashboard_risk_decimal(item.get("target_weight"))
+        target_amount = _dashboard_risk_decimal(item.get("target_amount"))
+        close = _dashboard_risk_decimal(item.get("close"))
+        if (
+            not isinstance(item.get("symbol"), str)
+            or not item["symbol"].strip()
+            or isinstance(shares, bool)
+            or not isinstance(shares, int)
+            or shares <= 0
+            or isinstance(lot_size, bool)
+            or not isinstance(lot_size, int)
+            or lot_size <= 0
+            or shares % lot_size != 0
+            or planned_risk is None
+            or planned_risk <= 0
+            or planned_pct is None
+            or planned_pct <= 0
+            or normal_cost is None
+            or normal_cost <= 0
+            or target_weight is None
+            or target_weight <= 0
+            or target_weight > PORTFOLIO_RISK_LIMIT
+            or strategy_version in {"v3", "v4"}
+            and summary.get("kelly_phase") != "cold_start"
+            and target_weight
+            > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
+            or target_amount is None
+            or close is None
+            or close <= 0
+            or normal_cost > planned_risk
+            or nav is None
+            or planned_pct != planned_risk / nav
+            or planned_pct > SINGLE_ENTRY_RISK_LIMIT
+            or item.get("decisive_constraint") not in allowed_buy_constraints
+        ):
+            return False
+        new_planned_risk += planned_risk
+
+    summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
+    if summary_new_risk != new_planned_risk:
+        return False
+    allowed_constraints = {
+        "名义仓位上限",
+        "单笔风险上限",
+        "组合剩余风险",
+        "现金",
+        "持仓席位",
+        "交易单位",
+        "关键风险数据",
+    }
+    if strategy_version in {"v3", "v4"}:
+        allowed_constraints.add("Kelly 上限")
+    if strategy_version == "v4":
+        allowed_constraints.add("策略累计回撤")
+    for item in judgments["risk_skips"]:
+        shares = item.get("estimated_shares")
+        target_weight = _dashboard_risk_decimal(item.get("target_weight"))
+        target_amount_raw = item.get("target_amount")
+        target_amount = _dashboard_risk_decimal(target_amount_raw)
+        zero_kelly_skip = (
+            strategy_version in {"v3", "v4"}
+            and summary.get("status") == "paused"
+            and summary.get("kelly_cap") in {"0", "0.000000", 0}
+            and summary.get("pause_reason") == "Kelly 上限为 0，仅暂停未来新开仓"
+            and item.get("reason") == summary.get("pause_reason")
+            and item.get("decisive_constraint") == "Kelly 上限"
+            and target_weight == 0
+            and target_amount == 0
+        )
+        if (
+            not isinstance(item.get("symbol"), str)
+            or not item["symbol"].strip()
+            or isinstance(shares, bool)
+            or not isinstance(shares, int)
+            or shares != 0
+            or target_weight is None
+            or target_weight <= 0
+            and not zero_kelly_skip
+            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_amount_raw is not None
+            and target_amount is None
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"].strip()
+            or item.get("decisive_constraint") not in allowed_constraints
+        ):
+            return False
+    return True
 
 
 def _valid_option_attention(payload: dict[str, Any], *, market: str) -> bool:
@@ -708,6 +1362,7 @@ def _valid_trend_report_payload(
         and str(metadata.get("market") or "").upper() == market
         and str(metadata.get("broker") or "").lower() == broker
         and _valid_trend_collections(payload, judgments)
+        and _valid_trend_risk_summary(payload)
         and _valid_option_attention(payload, market=market)
         and as_of_date <= freshness_date <= execution_date
     ):
@@ -725,6 +1380,8 @@ def _load_broker_trend_report(
     broker_label: str,
     buy_window: str,
     report_date: str,
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
 ) -> dict[str, Any]:
     unavailable = {
         "available": False,
@@ -740,44 +1397,210 @@ def _load_broker_trend_report(
     )
     if selected is None:
         return unavailable
+    return _project_broker_trend_report(
+        selected=selected,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        broker=broker,
+        market=market,
+        market_label=market_label,
+        broker_label=broker_label,
+        buy_window=buy_window,
+        report_date=report_date,
+        broker_positions=broker_positions,
+        cash_details=cash_details,
+        use_execution_batch=True,
+    )
+
+
+def _project_broker_trend_report(
+    *,
+    selected: tuple[Path, dict[str, Any], date, date, date, datetime],
+    data_dir: Path,
+    reports_dir: Path,
+    broker: str,
+    market: str,
+    market_label: str,
+    broker_label: str,
+    buy_window: str,
+    report_date: str,
+    broker_positions: list[dict[str, str]] | None = None,
+    cash_details: list[dict[str, str]] | None = None,
+    use_execution_batch: bool = False,
+) -> dict[str, Any]:
+    _, latest_payload, *_ = selected
+    latest_report_sha256 = _report_hash(latest_payload)
+    execution_batch: dict[str, object] | None = None
+    execution_batch_error = ""
+    revision_anomaly = False
+    if use_execution_batch:
+        batch_path = (
+            data_dir
+            / "trend_review"
+            / "ledgers"
+            / market
+            / "batches"
+            / f"{selected[2].isoformat()}.json"
+        )
+        try:
+            batch_text = batch_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            execution_batch_error = "执行批次无效，已阻止操作投影"
+        else:
+            try:
+                batch = json.loads(batch_text)
+                batch = _validate_execution_batch(
+                    batch,
+                    market=market,
+                    execution_date=selected[2].isoformat(),
+                )
+                locked_path = Path(str(batch["report_path"])).resolve()
+                if locked_path.parent != reports_dir.resolve():
+                    raise ValueError
+                locked = _validated_trend_report_artifact(
+                    reports_dir,
+                    artifact=locked_path.name,
+                    market=market,
+                    broker=broker,
+                )
+                if (
+                    locked is None
+                    or locked[0].resolve() != locked_path
+                    or locked[2] != selected[2]
+                    or _report_hash(locked[1]) != batch.get("report_sha256")
+                ):
+                    raise ValueError
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                ValueError,
+            ):
+                execution_batch_error = "执行批次无效，已阻止操作投影"
+            else:
+                (
+                    path,
+                    payload,
+                    execution_date,
+                    as_of_date,
+                    freshness_date,
+                    generated_at,
+                    _,
+                ) = locked
+                selected = (
+                    path,
+                    payload,
+                    execution_date,
+                    as_of_date,
+                    freshness_date,
+                    generated_at,
+                )
+                execution_batch = batch
+                revision_anomaly = batch["report_sha256"] != latest_report_sha256
+    if execution_batch_error:
+        return {
+            "available": False,
+            "data_status": "unavailable",
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "status_text": execution_batch_error,
+            "execution_batch": None,
+            "execution_batch_blocking": True,
+            "execution_batch_error": execution_batch_error,
+            "artifact": "",
+            "report_sha256": "",
+            "latest_report_sha256": "",
+            "revision_anomaly": False,
+            "strategy_version": "",
+            "report_date": "",
+            "data_date": "",
+            "generated_at": "",
+            "option_attention": [],
+            "account_source_date": "",
+            "account_fresh": False,
+            "account_status": "",
+            "buy_window": buy_window,
+            "run_status": "",
+            "sell_actions": [],
+            "buy_actions": [],
+            "hold_actions": [],
+            "review_actions": [],
+            "risk_skips": [],
+            "risk_summary": {},
+            "drawdown_summary": {},
+            "actual_overlay": {},
+            "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+            "recent_protection_alert": None,
+            "audit": {},
+        }
     path, payload, execution_date, as_of_date, freshness_date, generated_at = selected
-    judgments = payload["strategy_judgments"]
     account = payload["account"]
     metadata = payload["metadata"]
-    formal = judgments["formal_actions"]
-    holdings = judgments["holding_decisions"]
+    report_sha256 = _report_hash(payload)
+    executions = _trend_action_executions(
+        data_dir,
+        market=market,
+        execution_date=execution_date.isoformat(),
+        report_sha256=report_sha256,
+    )
+    sell_actions, buy_actions, hold_actions, review_actions = (
+        _project_trend_actions(payload, executions)
+    )
     account_fresh = account.get("fresh") is True
-    sell_actions = [
-        item
-        for item in formal
-        if item.get("action") == "SELL_ALL"
-        and not _trend_action_needs_review(item)
-    ]
-    buy_actions = [
-        item
-        for item in formal
-        if item.get("action") == "BUY"
-        and not _trend_action_needs_review(item)
-    ]
-    hold_actions = [
-        item
-        for item in holdings
-        if item.get("action") == "HOLD"
-        and not _trend_action_needs_review(item)
-    ]
-    review_actions: list[dict[str, Any]] = []
-    for item in formal + holdings:
-        if _trend_action_needs_review(item) and item not in review_actions:
-            review_actions.append(item)
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})
-    audit_candidates = judgments["top10_candidates"]
+    audit_candidates = payload["strategy_judgments"]["top10_candidates"]
     if market == "CN" and isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
-    current = freshness_date.isoformat() == report_date
+    updated_today = freshness_date.isoformat() == report_date
+    execution_today = execution_date.isoformat() == report_date
+    current = updated_today or execution_today
     data_date = as_of_date.isoformat()
+    risk_summary = dict(payload.get("risk_summary", {}))
+    risk_summary["trade_stats"] = _project_trend_trade_stats(
+        data_dir,
+        market=market,
+        strategy_snapshot=payload.get("strategy_snapshot"),
+    )
+    strategy_snapshot = payload.get("strategy_snapshot")
+    raw_strategy_parameters = (
+        strategy_snapshot.get("parameters")
+        if isinstance(strategy_snapshot, dict)
+        else None
+    )
+    strategy_parameters = (
+        dict(raw_strategy_parameters)
+        if isinstance(raw_strategy_parameters, dict)
+        else {}
+    )
+    actual_overlay = _project_trend_actual_overlay(
+        broker=broker,
+        market=market,
+        sell_actions=sell_actions,
+        buy_actions=buy_actions,
+        hold_actions=hold_actions,
+        review_actions=review_actions,
+        risk_skips=payload["strategy_judgments"].get("risk_skips", []),
+        broker_positions=broker_positions or [],
+        cash_details=cash_details or [],
+    )
     return {
         "available": True,
+        "artifact": path.name,
+        "report_sha256": report_sha256,
+        "execution_batch": execution_batch,
+        "execution_batch_blocking": bool(execution_batch_error),
+        "execution_batch_error": execution_batch_error,
+        "latest_report_sha256": latest_report_sha256,
+        "revision_anomaly": revision_anomaly,
+        "strategy_version": str(
+            (payload.get("strategy_snapshot") or {}).get("strategy_version") or ""
+        ),
         "data_status": "current" if current else "stale",
         "broker": broker,
         "broker_label": broker_label,
@@ -787,7 +1610,11 @@ def _load_broker_trend_report(
         "data_date": data_date,
         "generated_at": generated_at.isoformat(),
         "status_text": (
-            "今日已更新" if current else f"数据截至 {data_date}；今日未更新"
+            "今日已更新"
+            if updated_today
+            else f"今日执行（数据截至 {data_date}）"
+            if execution_today
+            else f"数据截至 {data_date}；今日未更新"
         ),
         "option_attention": payload.get("option_attention", []),
         "account_source_date": str(account.get("source_date") or ""),
@@ -800,6 +1627,10 @@ def _load_broker_trend_report(
         ),
         "sell_actions": sell_actions,
         "buy_actions": buy_actions,
+        "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
+        "risk_summary": risk_summary,
+        "drawdown_summary": payload.get("drawdown_summary", {}),
+        "actual_overlay": actual_overlay,
         "hold_actions": hold_actions,
         "review_actions": review_actions,
         "counts": {
@@ -813,6 +1644,7 @@ def _load_broker_trend_report(
         ),
         "audit": {
             "candidates": audit_candidates,
+            "strategy_parameters": strategy_parameters,
             "excluded": payload.get("excluded", {}),
             "account_exceptions": account.get("exceptions", []),
             "industry_concentration": payload.get("industry_concentration", []),
@@ -822,6 +1654,495 @@ def _load_broker_trend_report(
             "artifact": path.name,
         },
     }
+
+
+def _project_trend_actual_overlay(
+    *,
+    broker: str,
+    market: str,
+    sell_actions: list[dict[str, Any]],
+    buy_actions: list[dict[str, Any]],
+    hold_actions: list[dict[str, Any]],
+    review_actions: list[dict[str, Any]],
+    risk_skips: list[dict[str, Any]],
+    broker_positions: list[dict[str, str]],
+    cash_details: list[dict[str, str]],
+) -> dict[str, Any]:
+    positions = [
+        row
+        for row in broker_positions
+        if _broker_key(row.get("broker", "")) == broker
+        and str(row.get("market") or "").strip().upper() == market
+        and not _is_cash_like_row(row)
+    ]
+    broker_cash = [
+        row
+        for row in cash_details
+        if _broker_key(row.get("broker", "")) == broker
+    ]
+    broker_rows = [
+        row
+        for row in broker_positions
+        if _broker_key(row.get("broker", "")) == broker
+    ]
+    if not broker_rows and not broker_cash:
+        return {
+            "available": False,
+            "broker": broker,
+            "broker_label": BROKER_LABELS[broker],
+            "market": market,
+            "status_text": "实盘账户数据暂不可用",
+            "items": [],
+            "outside_positions": [],
+        }
+
+    summary = _build_broker_summary(
+        broker, [], broker_positions, cash_details, {}
+    )
+    nav_hkd = _optional_decimal(summary.get("portfolio_value_hkd", ""))
+    actual_rows = [*broker_rows, *broker_cash]
+    price_fx_to_hkd, price_fx_note = _trend_actual_price_fx_to_hkd(
+        actual_rows,
+        broker=broker,
+        market=market,
+    )
+    position_by_symbol = _aggregate_trend_actual_positions(positions)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for action in [
+        *sell_actions,
+        *buy_actions,
+        *hold_actions,
+        *review_actions,
+        *risk_skips,
+    ]:
+        symbol = str(action.get("symbol") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        rows.append(
+            _project_trend_actual_item(
+                action,
+                position_by_symbol.get(symbol),
+                nav_hkd=nav_hkd,
+                market=market,
+                price_fx_to_hkd=price_fx_to_hkd,
+                price_fx_note=price_fx_note,
+                risk_skip=action in risk_skips,
+            )
+        )
+
+    outside = [
+        {
+            "symbol": position["symbol"],
+            "name": position["name"],
+            "actual_quantity": _decimal_text(position["quantity"]),
+            "actual_market_value": (
+                _decimal_text(position["market_value"])
+                if position["market_value"] is not None
+                else ""
+            ),
+            "currency": position["currency"],
+            "deviation": "outside_report_addition",
+            "deviation_label": "报告外加仓",
+            "attribution_status": "unconfirmed",
+            "risk_note": "风险未纳入估算",
+        }
+        for symbol, position in sorted(position_by_symbol.items())
+        if symbol not in seen
+    ]
+    live = _has_live_statement_row(actual_rows, broker)
+    return {
+        "available": True,
+        "broker": broker,
+        "broker_label": BROKER_LABELS[broker],
+        "market": market,
+        "account_nav_hkd": _money_text(nav_hkd) if nav_hkd is not None else "",
+        "account_nav_basis": "完整账户净值（持仓+现金）",
+        "status_text": "账户实时同步" if live else "结单数据，非实时",
+        "notice": (
+            "只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；"
+            "系统不会自动交易真实账户。"
+        ),
+        "items": rows,
+        "outside_positions": outside,
+    }
+
+
+def _trend_actual_price_fx_to_hkd(
+    rows: list[dict[str, str]],
+    *,
+    broker: str,
+    market: str,
+) -> tuple[Decimal | None, str]:
+    currency = TREND_MARKET_CURRENCIES.get(market, "")
+    matching_rows = [
+        row
+        for row in rows
+        if _broker_key(row.get("broker", "")) == broker
+        and str(row.get("currency") or "").strip().upper() == currency
+    ]
+    if _has_live_statement_row(rows, broker):
+        live_suffix = f"-{broker}-live"
+        live_rows = [
+            row
+            for row in matching_rows
+            if row.get("statement_id", "").strip().lower().endswith(live_suffix)
+        ]
+        rates: list[Decimal] = []
+        for row in live_rows:
+            rate = _optional_decimal(row.get("fx_to_hkd", ""))
+            if rate is None or rate <= 0:
+                return None, "实盘汇率缺失，暂无法换算"
+            rates.append(rate)
+        if not rates:
+            return None, "实盘汇率缺失，暂无法换算"
+        if any(rate != rates[0] for rate in rates[1:]):
+            return None, "实盘汇率冲突，暂无法换算"
+        return rates[0], ""
+
+    return (
+        next(
+            (
+                rate
+                for row in matching_rows
+                if (rate := _detail_fx_to_hkd(row)) is not None
+            ),
+            DETAIL_FX_TO_HKD.get(currency),
+        ),
+        "",
+    )
+
+
+def _aggregate_trend_actual_positions(
+    positions: list[dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    aggregated: dict[str, dict[str, Any]] = {}
+    for row in positions:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        quantity = _optional_decimal(row.get("quantity", ""))
+        market_value = _optional_decimal(row.get("market_value", ""))
+        if not symbol or quantity is None or quantity <= 0:
+            continue
+        current = aggregated.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "name": str(row.get("name") or symbol).strip() or symbol,
+                "currency": str(row.get("currency") or "").strip().upper(),
+                "quantity": Decimal("0"),
+                "market_value": Decimal("0"),
+            },
+        )
+        current["quantity"] += quantity
+        if market_value is None:
+            current["market_value"] = None
+        elif current["market_value"] is not None:
+            current["market_value"] += market_value
+    return aggregated
+
+
+def _project_trend_actual_item(
+    action: dict[str, Any],
+    position: dict[str, Any] | None,
+    *,
+    nav_hkd: Decimal | None,
+    market: str,
+    price_fx_to_hkd: Decimal | None,
+    price_fx_note: str,
+    risk_skip: bool,
+) -> dict[str, Any]:
+    symbol = str(action.get("symbol") or "").strip().upper()
+    frozen_action = "SKIP" if risk_skip else str(action.get("action") or "")
+    actual_quantity = position["quantity"] if position else Decimal("0")
+    currency = (
+        str(position.get("currency") or "").strip().upper()
+        if position
+        else TREND_MARKET_CURRENCIES.get(market, "")
+    )
+    reference_quantity = (
+        _trend_actual_reference_quantity(
+            action,
+            nav_hkd=nav_hkd,
+            price_fx_to_hkd=price_fx_to_hkd,
+        )
+        if frozen_action == "BUY"
+        else Decimal("0")
+        if frozen_action in {"SELL_ALL", "SKIP"}
+        else None
+    )
+    deviation, deviation_label = _trend_actual_deviation(
+        frozen_action,
+        actual_quantity=actual_quantity,
+        reference_quantity=reference_quantity,
+    )
+    line = _optional_decimal(
+        str(action.get("active_line") or action.get("estimated_initial_line") or "")
+    )
+    close = _optional_decimal(str(action.get("close") or ""))
+    estimated_loss = (
+        max(Decimal("0"), close - line) * actual_quantity
+        if line is not None and close is not None
+        else None
+    )
+    item = {
+        "symbol": symbol,
+        "name": str(action.get("name") or symbol),
+        "frozen_action": frozen_action,
+        "frozen_action_label": {
+            "BUY": "正式买入",
+            "SELL_ALL": "全部卖出",
+            "SELL_PARTIAL": "止盈减仓 30%",
+            "HOLD": "继续持有",
+            "SKIP": "跳过",
+            "MANUAL_REVIEW": "人工复核",
+        }.get(frozen_action, "人工复核"),
+        "target_weight": str(action.get("target_weight") or ""),
+        "simulation_quantity": (
+            str(action["estimated_shares"])
+            if action.get("estimated_shares") is not None
+            else ""
+        ),
+        "actual_reference_quantity": (
+            _decimal_text(reference_quantity)
+            if reference_quantity is not None
+            else ""
+        ),
+        "actual_quantity": _decimal_text(actual_quantity),
+        "actual_market_value": (
+            _decimal_text(position["market_value"])
+            if position and position["market_value"] is not None
+            else "0"
+            if position is None
+            else ""
+        ),
+        "currency": currency,
+        "deviation": deviation,
+        "deviation_label": deviation_label,
+        "frozen_reference_price": _decimal_text(close) if close is not None else "",
+        "protection_line": _decimal_text(line) if line is not None else "",
+        "protection_line_label": (
+            "活动保护线"
+            if action.get("active_line") not in {None, ""}
+            else "预计保护线"
+            if action.get("estimated_initial_line") not in {None, ""}
+            else ""
+        ),
+        "estimated_exit_loss": (
+            _money_text(estimated_loss) if estimated_loss is not None else ""
+        ),
+        "risk_note": (
+            f"若按策略保护线退出，预计损失 {currency} {_money_text(estimated_loss)}"
+            "（按冻结参考价估算，不代表实时风险上限）"
+            if estimated_loss is not None
+            else "暂无策略保护线，风险未纳入估算"
+        ),
+    }
+    if frozen_action == "SELL_PARTIAL":
+        item["manual_execution_guidance"] = "按实盘下单时持仓的 30% 向下取整"
+    if frozen_action == "BUY" and price_fx_note:
+        item["reference_note"] = price_fx_note
+    return item
+
+
+def _trend_actual_reference_quantity(
+    action: dict[str, Any],
+    *,
+    nav_hkd: Decimal | None,
+    price_fx_to_hkd: Decimal | None,
+) -> Decimal | None:
+    weight = _optional_decimal(str(action.get("target_weight") or ""))
+    price = _optional_decimal(str(action.get("close") or ""))
+    lot = _optional_decimal(str(action.get("lot_size") or ""))
+    if (
+        nav_hkd is None
+        or weight is None
+        or weight < 0
+        or price is None
+        or price <= 0
+        or lot is None
+        or lot <= 0
+        or price_fx_to_hkd is None
+    ):
+        return None
+    return Decimal(
+        int(nav_hkd * weight / price / price_fx_to_hkd / lot)
+    ) * lot
+
+
+def _trend_actual_deviation(
+    frozen_action: str,
+    *,
+    actual_quantity: Decimal,
+    reference_quantity: Decimal | None,
+) -> tuple[str, str]:
+    if frozen_action == "BUY":
+        if reference_quantity is None:
+            return "reference_unavailable", "暂无法换算"
+        if actual_quantity == 0:
+            return "skipped", "跳过"
+        if actual_quantity < reference_quantity:
+            return "underbought", "少买"
+        if actual_quantity > reference_quantity:
+            return "overbought", "超买"
+        return "followed", "已跟随"
+    if frozen_action == "SELL_ALL":
+        return (
+            ("missed_sell", "漏卖")
+            if actual_quantity > 0
+            else ("followed", "已跟随")
+        )
+    if frozen_action == "SKIP":
+        return (
+            ("chased", "追买")
+            if actual_quantity > 0
+            else ("followed", "跳过")
+        )
+    if frozen_action == "HOLD":
+        return (
+            ("followed", "已跟随")
+            if actual_quantity > 0
+            else ("not_held", "未持有")
+        )
+    return "review", "待人工复核"
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _project_trend_trade_stats(
+    data_dir: Path,
+    *,
+    market: str,
+    strategy_snapshot: object,
+) -> dict[str, Any]:
+    unavailable = {
+        "available": False,
+        "status_text": "交易统计暂不可用",
+    }
+    if not isinstance(strategy_snapshot, dict):
+        return unavailable
+    strategy_id = str(strategy_snapshot.get("strategy_id") or "").strip()
+    version = str(strategy_snapshot.get("strategy_version") or "").strip()
+    if not strategy_id or not version:
+        return unavailable
+    try:
+        payload = load_trend_api_stats(data_dir)
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+        return unavailable
+    matching = [
+        stat for stat in payload["stats"]
+        if stat["market"] == market
+        and stat["strategy_id"] == strategy_id
+        and stat["opening_strategy_version"] == version
+    ]
+    by_source = {str(stat["source"]): stat for stat in matching}
+    if len(matching) != 2 or set(by_source) != {"simulation", "actual"}:
+        return unavailable
+    actual_sources = [
+        source
+        for source in payload["sources"]
+        if source["source"] == "actual" and source["market"] == market
+    ]
+    actual_broker = (
+        str(actual_sources[0]["broker"])
+        if len(actual_sources) == 1
+        else {"CN": "eastmoney", "HK": "phillips", "US": "tiger"}[market]
+    )
+    def compact(source: str) -> dict[str, Any]:
+        stat = by_source[source]
+        return {
+            "win_rate": stat["win_rate"],
+            "payoff_ratio": stat["payoff_ratio"],
+            "payoff_ratio_status": stat["payoff_ratio_status"],
+            "eligible_sample_count": stat["eligible_sample_count"],
+        }
+
+    return {
+        "available": True,
+        "strategy_id": strategy_id,
+        "opening_strategy_version": version,
+        "statistics_cutoff_at": (
+            actual_sources[0]["statistics_cutoff_at"]
+            if len(actual_sources) == 1
+            else payload["statistics_cutoff_at"]
+        ),
+        "actual_broker": actual_broker,
+        "actual_broker_label": BROKER_LABELS[actual_broker],
+        "simulation": compact("simulation"),
+        "actual": compact("actual"),
+    }
+
+
+def _trend_action_executions(
+    data_dir: Path, *, market: str, execution_date: str, report_sha256: str
+) -> dict[tuple[str, str], dict[str, Any]]:
+    executions: dict[tuple[str, str], dict[str, Any]] = {}
+    root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+    )
+    ordered_events: list[tuple[int, float, str, dict[str, Any]]] = []
+    for path in root.glob("*/*.json"):
+        try:
+            event = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        try:
+            recorded_at = datetime.fromisoformat(str(event.get("recorded_at") or ""))
+        except ValueError:
+            recorded_at = None
+        if (
+            recorded_at is None
+            or recorded_at.tzinfo is None
+            or recorded_at.utcoffset() is None
+        ):
+            ordered_events.append((0, 0.0, str(path), event))
+        else:
+            ordered_events.append((1, recorded_at.timestamp(), str(path), event))
+    for _, _, _, event in sorted(ordered_events):
+        if event.get("report_sha256") != report_sha256:
+            continue
+        symbol = str(event.get("symbol") or "").strip()
+        side = str(event.get("side") or "").strip().lower()
+        status = str(event.get("status") or "").strip()
+        if not symbol or side not in {"buy", "sell"} or not status:
+            continue
+        executions[(symbol, side)] = {
+            "status": status,
+            "filled_qty": str(event.get("filled_qty") or ""),
+            "target_qty": str(event.get("target_qty") or ""),
+            "avg_fill_price": str(event.get("avg_fill_price") or ""),
+            "order_ids": event.get("order_ids")
+            if isinstance(event.get("order_ids"), list)
+            else [],
+            "updated_at": str(event.get("recorded_at") or ""),
+            "reason": str(event.get("reason") or ""),
+        }
+        if event.get("sell_goal") == "partial_30":
+            execution = executions[(symbol, side)]
+            execution["sell_goal"] = "partial_30"
+            execution["lifecycle_target_qty"] = str(
+                event.get("lifecycle_target_qty") or ""
+            )
+            try:
+                lifecycle_target = Decimal(execution["lifecycle_target_qty"])
+                filled = Decimal(execution["filled_qty"])
+            except (InvalidOperation, ValueError):
+                pass
+            else:
+                if lifecycle_target.is_finite() and filled.is_finite():
+                    execution["remaining_qty"] = _decimal_text(
+                        max(Decimal("0"), lifecycle_target - filled)
+                    )
+    return executions
 
 
 def _recent_trend_protection_alert(path: Path) -> str:

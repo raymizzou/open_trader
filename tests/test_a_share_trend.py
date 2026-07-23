@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import json
@@ -31,6 +32,7 @@ from open_trader.a_share_trend import (
     estimate_buy_actions,
     evaluate_candidate,
     load_eastmoney_account,
+    load_futu_simulate_trend_account,
     load_protection_state,
     load_watch_events,
     render_trend_failure_text,
@@ -46,10 +48,179 @@ from open_trader.futu_quote import FutuQuoteError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
 from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
+from open_trader.trend_kelly import TrendKellyRound
+from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MISSING_FRESH = object()
+
+
+class DefaultSimAccountClient:
+    def __init__(self, **kwargs: object) -> None:
+        self.acc_id = int(kwargs["simulate_acc_id"])
+
+    def account_snapshot(self) -> dict[str, object]:
+        return {
+            "acc_id": self.acc_id,
+            "net_value": "100000",
+            "cash": "100000",
+            "positions": [],
+        }
+
+    def close(self) -> None:
+        pass
+
+
+def simulation_account_with_positions(
+    *codes: str,
+) -> type[DefaultSimAccountClient]:
+    class SimAccountClient(DefaultSimAccountClient):
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "positions": [
+                    {
+                        "code": code,
+                        "stock_name": code.split(".", 1)[-1],
+                        "qty": "100",
+                        "cost_price": "9.5",
+                        "market_val": "1000",
+                    }
+                    for code in codes
+                ],
+            }
+
+    return SimAccountClient
+
+
+@pytest.fixture(autouse=True)
+def default_simulation_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        trend_module,
+        "FutuSimulateOrderExecutionClient",
+        DefaultSimAccountClient,
+    )
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "message"),
+    [
+        (
+            {"acc_id": 101, "net_value": "0", "cash": "100", "positions": []},
+            "net value must be positive",
+        ),
+        (
+            {"acc_id": 101, "net_value": "100", "cash": "-1", "positions": []},
+            "cash must be nonnegative",
+        ),
+        (
+            {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [
+                    {"code": "US.AAPL", "qty": "1", "market_val": "10"}
+                ],
+            },
+            "position market does not match CN",
+        ),
+        (
+            {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [{"code": "SH.600001", "qty": "-1", "market_val": "10"}],
+            },
+            "position quantity must be nonnegative",
+        ),
+        (
+            {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [{"code": "SH.600001", "qty": "1"}],
+            },
+            "position market value is invalid",
+        ),
+    ],
+)
+def test_futu_simulation_account_rejects_invalid_boundary_rows(
+    snapshot: dict[str, object], message: str
+) -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def close(self) -> None:
+            pass
+
+    with pytest.raises(ValueError, match=message):
+        load_futu_simulate_trend_account(
+            host="127.0.0.1",
+            port=11111,
+            simulate_acc_id=101,
+            market="CN",
+            expected_date="2026-07-17",
+            account_factory=lambda **kwargs: Client(),
+        )
+
+
+def test_futu_simulation_account_borrows_existing_client() -> None:
+    class Client:
+        closed = False
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = Client()
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-22",
+        account_client=client,
+        account_factory=lambda **_kwargs: pytest.fail(
+            "borrowed account opened another context"
+        ),
+    )
+
+    assert account.net_value == Decimal("100")
+    assert client.closed is False
+
+
+def test_futu_simulation_account_ignores_explicit_zero_quantity_rows() -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "100",
+                "positions": [{"code": "US.AAPL", "qty": "0"}],
+            }
+
+        def close(self) -> None:
+            pass
+
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-17",
+        account_factory=lambda **kwargs: Client(),
+    )
+
+    assert account.positions == ()
 
 
 def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
@@ -232,6 +403,25 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
     )
 
 
+def unlock_live_drawdown(
+    data_dir: Path, *, market: str = "CN", equity: str = "100000"
+) -> None:
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
+        strategy_version="v4",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal(equity),
+        source_date="2026-07-13",
+        accepted_git_sha="a" * 40,
+        occurred_at="2026-07-14T08:00:00+08:00",
+        actor="pytest",
+        reason="first_activation",
+        entry_eligible_from="2026-07-14",
+    )
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     fieldnames = sorted({key for row in rows for key in row})
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -274,11 +464,11 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
             "process_version",
         )
     } == {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v3",
         "strategy_name": "A 股短线右侧趋势",
-        "strategy_version": "v1",
+        "strategy_version": "v3",
         "market": "CN",
-        "effective_from": "2026-07-16",
+        "effective_from": "2026-07-20",
         "process_version": "abc123",
     }
     assert snapshot["parameters"] == {
@@ -302,8 +492,23 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         "sort": ["strength_desc", "days_asc", "amount_desc", "symbol_asc"],
         "candidate_limit": 10,
         "position_limit": 10,
-        "use_available_cash": True,
-        "trailing_activation_signals": ["boiling", "champagne"],
+        "single_entry_risk_limit": "0.004",
+        "portfolio_risk_limit": "0.04",
+        "abnormal_loss_buffer": "0.01",
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+        "kelly_sample_minimum": 30,
+        "kelly_rolling_window": 200,
+        "kelly_fraction": "0.25",
+        "kelly_optimizer": "mean_log_growth_derivative_bisection_96_floor_1e-6",
+        "kelly_sample_scope": "market+strategy_id+opening_strategy_version",
+        "kelly_source": "cost_complete_attributed_simulation_closed_rounds",
         "target_weight": {"热": "0.04", "沸": "0.02"},
         "lot_size": 100,
         "buy_window": "09:30-10:00",
@@ -340,15 +545,12 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
 
 
 @pytest.mark.parametrize(
-    ("market", "effective_from"),
-    [("CN", "2026-07-16"), ("US", "2026-07-17"), ("HK", "2026-07-17")],
+    "market", ["CN", "US", "HK"],
 )
-def test_trend_v1_effective_dates_are_market_specific(
-    market: str, effective_from: str
-) -> None:
+def test_trend_v3_effective_date_is_shared_across_markets(market: str) -> None:
     assert trend_module.trend_strategy_snapshot(
         market, "abc123", (622466,)
-    )["effective_from"] == effective_from
+    )["effective_from"] == "2026-07-20"
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
@@ -943,7 +1145,7 @@ def test_buy_actions_respect_four_percent_cash_slots_and_round_lots() -> None:
 
     assert [
         (item.symbol, item.target_amount, item.estimated_shares) for item in actions
-    ] == [("600001", Decimal("7000"), 700)]
+    ] == [("600001", Decimal("7000"), 600)]
 
 
 def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
@@ -963,6 +1165,44 @@ def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
     )
 
 
+def test_report_plans_buys_after_all_sell_all_actions_release_cash_and_slots() -> None:
+    discipline_account = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("0"),
+        positions=(
+            AccountPosition(
+                "600001",
+                "退出标的",
+                "stock",
+                Decimal("400"),
+                Decimal("10"),
+                Decimal("4000"),
+            ),
+        ),
+        exceptions=(),
+        position_count=10,
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=discipline_account,
+        candidates=[candidate("600002")],
+        holding_snapshots={"600001": holding("600001", danger=True)},
+        bars_by_symbol={"600001": bars()},
+    )
+
+    assert [(item.symbol, item.action) for item in built.holdings] == [
+        ("600001", "SELL_ALL")
+    ]
+    assert [
+        (item.symbol, item.target_amount, item.estimated_shares)
+        for item in built.buy_actions
+    ] == [("600002", Decimal("4000.00"), 300)]
+
+
 def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
     actions = estimate_buy_actions(
         ranked=[candidate("600001")],
@@ -975,7 +1215,7 @@ def test_buy_actions_use_four_percent_even_when_account_is_stale() -> None:
     assert [
         (item.symbol, item.target_amount, item.estimated_shares)
         for item in actions
-    ] == [("600001", Decimal("4000.00"), 400)]
+    ] == [("600001", Decimal("4000.00"), 300)]
 
 
 def test_cn_buy_weight_follows_current_temperature() -> None:
@@ -993,9 +1233,531 @@ def test_cn_buy_weight_follows_current_temperature() -> None:
         (item.symbol, item.target_weight, item.target_amount, item.estimated_shares)
         for item in actions
     ] == [
-        ("600001", Decimal("0.04"), Decimal("4000.00"), 400),
+        ("600001", Decimal("0.04"), Decimal("4000.00"), 300),
         ("600002", Decimal("0.02"), Decimal("2000.00"), 200),
     ]
+
+
+@pytest.mark.parametrize(
+    ("market", "exchange", "lot_sizes", "expected_quantity"),
+    [
+        ("CN", "SH", None, 300),
+        ("HK", "HK", {"600001": 100}, 300),
+        ("US", "US", None, 396),
+    ],
+)
+def test_fixed_risk_sizing_includes_normal_costs_and_market_rounding(
+    market: str,
+    exchange: str,
+    lot_sizes: dict[str, int] | None,
+    expected_quantity: int,
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange=exchange)],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market=market,
+        lot_sizes=lot_sizes,
+        metadata={"market": market, "broker": "futu"},
+    )
+
+    action = built.buy_actions[0]
+    assert action.estimated_shares == expected_quantity
+    assert action.normal_cost > 0
+    assert action.planned_stop_risk == (
+        Decimal(expected_quantity) * Decimal("1.01")
+    )
+    assert action.planned_stop_risk <= Decimal("400")
+    assert action.decisive_constraint == "单笔风险上限"
+    assert built.risk_summary["single_entry_risk_limit_pct"] == Decimal("0.004")
+    assert built.risk_summary["portfolio_risk_limit_pct"] == Decimal("0.04")
+    assert built.risk_summary["abnormal_loss_buffer_pct"] == Decimal("0.01")
+
+
+def test_boiling_nominal_limit_stays_two_percent_below_risk_capacity() -> None:
+    built = report(candidates=(candidate("600001", temperature_curr="沸"),))
+
+    action = built.buy_actions[0]
+    assert action.target_weight == Decimal("0.02")
+    assert action.estimated_shares == 1300
+    assert action.decisive_constraint == "名义仓位上限"
+
+
+def _trend_kelly_rounds(*returns: str, market: str = "US") -> tuple[TrendKellyRound, ...]:
+    return tuple(
+        TrendKellyRound(
+            round_id=f"round-{index:03d}",
+            source="simulation",
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/v3",
+            opening_strategy_version="v3",
+            closed_at=f"2026-07-{index // 24 + 1:02d}T{index % 24:02d}:00:00+00:00",
+            net_return=Decimal(net_return),
+            costs_complete=True,
+            attribution_status="attributed",
+            kelly_eligible=True,
+        )
+        for index, net_return in enumerate(returns)
+    )
+
+
+def _us_kelly_report(rounds: tuple[TrendKellyRound, ...]) -> TrendReport:
+    return build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_rounds=rounds,
+    )
+
+
+def test_v3_kelly_cold_start_keeps_issue_4_nominal_sizing() -> None:
+    built = _us_kelly_report(_trend_kelly_rounds(*(["0.10"] * 29)))
+
+    assert built.strategy_snapshot["strategy_version"] == "v3"
+    assert built.buy_actions[0].target_weight == Decimal("0.04")
+    assert built.risk_summary["kelly_phase"] == "cold_start"
+    assert built.risk_summary["kelly_eligible_sample_count"] == 29
+    assert built.risk_summary["kelly_selected_sample_count"] == 29
+    assert built.risk_summary["kelly_cap"] is None
+    assert built.risk_summary["kelly_reason"] == (
+        "Kelly 冷启动：29/30 个合格模拟闭环；继续使用固定风险仓位"
+    )
+    assert built.risk_summary["status"] == "active"
+
+
+def test_v3_kelly_only_reduces_nominal_before_fixed_risk_constraints() -> None:
+    rounds = _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))
+
+    built = _us_kelly_report(rounds)
+
+    action = built.buy_actions[0]
+    assert action.target_weight == Decimal("0.012626")
+    assert action.target_amount == Decimal("1262.60")
+    assert action.estimated_shares == 12
+    assert action.target_weight < Decimal("0.04")
+    assert action.planned_stop_risk <= Decimal("400")
+    assert built.risk_summary["kelly_phase"] == "active_all_samples"
+    assert built.risk_summary["kelly_eligible_sample_count"] == 30
+    assert built.risk_summary["kelly_cap"] == Decimal("0.012626")
+    assert built.risk_summary["kelly_reason"] == ""
+
+
+def test_v3_zero_kelly_pauses_only_future_entries_and_keeps_sell_decision() -> None:
+    zero_rounds = _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.10"] * 15))
+    existing = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("99000"),
+        positions=(
+            AccountPosition(
+                "OLD", "旧持仓", "stock", Decimal("10"), Decimal("90"), Decimal("1000")
+            ),
+        ),
+        exceptions=(),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=existing,
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={
+            "OLD": HoldingSnapshot(
+                tm_id=1,
+                symbol="OLD",
+                exchange="US",
+                name="旧持仓",
+                as_of_date="2026-07-14",
+                right_side=True,
+                danger=True,
+                boiling=False,
+                champagne=False,
+            )
+        },
+        bars_by_symbol={"OLD": bars(close=100, low=99)},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_rounds=zero_rounds,
+    )
+
+    assert [(item.symbol, item.action) for item in built.holdings] == [("OLD", "SELL_ALL")]
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["kelly_cap"] == Decimal("0")
+    assert built.risk_summary["pause_reason"] == "Kelly 上限为 0，仅暂停未来新开仓"
+    assert built.risk_skips[0]["decisive_constraint"] == "Kelly 上限"
+
+
+def test_frozen_v2_snapshot_does_not_enable_kelly() -> None:
+    snapshot = trend_module.trend_strategy_snapshot("US", "abc123", (622460,))
+    snapshot["strategy_id"] = "trend_animals_warm_to_hot/US/v2"
+    snapshot["strategy_version"] = "v2"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=snapshot,
+        kelly_rounds=_trend_kelly_rounds(*(["-0.10"] * 30)),
+    )
+
+    assert built.buy_actions[0].target_weight == Decimal("0.04")
+    assert "kelly_phase" not in built.risk_summary
+
+
+def test_v3_payload_and_compact_report_freeze_kelly_facts() -> None:
+    built = _us_kelly_report(
+        _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))
+    )
+
+    payload = trend_module._report_payload(built)
+    markdown = render_markdown(built)
+
+    assert payload["strategy_snapshot"]["strategy_version"] == "v3"
+    assert payload["risk_summary"]["kelly_phase"] == "active_all_samples"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 30
+    assert payload["risk_summary"]["kelly_cap"] == "0.012626"
+    assert "Kelly 阶段：全样本启用（30 个合格模拟闭环）" in markdown
+    assert "当前 Kelly 上限：1.2626%" in markdown
+    assert "实盘结果不参与计算" in markdown
+
+
+def test_v3_payload_rejects_kelly_cap_action_mismatch() -> None:
+    built = _us_kelly_report(
+        _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.099"] * 15))
+    )
+    summary = {**built.risk_summary, "kelly_cap": Decimal("0.02")}
+
+    with pytest.raises(
+        ValueError,
+        match="^strategy snapshot does not match report actions$",
+    ):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_v3_corrupt_stats_reason_pauses_entries_visibly() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US", close=Decimal("100"))],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_data_reason=(
+            "Kelly 模拟闭环统计不可用，暂停新开仓："
+            "trend_api_stats.json schema_version must be 'open_trader.trend_api_stats.v1'"
+        ),
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["kelly_phase"] == "unavailable"
+    assert built.risk_summary["kelly_cap"] is None
+    assert built.risk_summary["kelly_reason"] == built.risk_summary["pause_reason"]
+    assert "trend_api_stats.json schema_version" in render_markdown(built)
+
+
+def test_v3_corrupt_stats_remain_visible_when_fixed_risk_also_pauses() -> None:
+    kelly_reason = "Kelly 模拟闭环统计不可用，暂停新开仓：invalid stats"
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("0"),
+            available_cash=Decimal("0"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[replace(candidate("600001"), exchange="US")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_data_reason=kelly_reason,
+    )
+
+    payload = trend_module._report_payload(built)
+
+    assert payload["risk_summary"]["pause_reason"] == "模拟盘净值缺失，暂停新开仓"
+    assert payload["risk_summary"]["kelly_reason"] == kelly_reason
+
+
+def test_sell_all_releases_cash_slot_and_planned_risk_before_new_entries() -> None:
+    discipline_account = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("62000"),
+        positions=(
+            AccountPosition(
+                "600001", "退出标的", "stock", Decimal("3800"),
+                Decimal("9.5"), Decimal("38000"),
+            ),
+        ),
+        exceptions=(),
+        position_count=1,
+    )
+    common = {
+        "as_of_date": "2026-07-14",
+        "execution_date": "2026-07-15",
+        "account": discipline_account,
+        "candidates": [candidate("600002")],
+        "bars_by_symbol": {"600001": bars()},
+        "prior_state": {
+            "positions": {
+                "600001": {
+                    "initial_line": "9", "active_line": "9", "atr14": "0.5",
+                    "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+                }
+            }
+        },
+    }
+
+    held = build_report(
+        **common,
+        holding_snapshots={"600001": holding("600001")},
+    )
+    sold = build_report(
+        **common,
+        holding_snapshots={"600001": holding("600001", danger=True)},
+    )
+
+    assert held.risk_summary["existing_planned_risk"] == Decimal("3838.000")
+    assert held.buy_actions[0].estimated_shares == 100
+    assert held.buy_actions[0].decisive_constraint == "组合剩余风险"
+    assert sold.risk_summary["existing_planned_risk"] == Decimal("0")
+    assert sold.buy_actions[0].estimated_shares == 300
+    assert sold.buy_actions[0].decisive_constraint == "单笔风险上限"
+
+
+def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("60000"),
+            positions=(
+                AccountPosition(
+                    "600001", "持仓", "stock", Decimal("4000"),
+                    Decimal("9.5"), Decimal("40000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("600002")],
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": bars()},
+        prior_state={
+            "positions": {
+                "600001": {
+                    "initial_line": "9", "active_line": "9", "atr14": "0.5",
+                    "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+                }
+            }
+        },
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["status_label"] == "组合风险已满"
+    assert built.risk_summary["portfolio_remaining_risk"] == Decimal("0")
+    assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
+
+
+def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
+    strategy_snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "drawdown123", (622466, 697199)
+    )
+    drawdown_summary = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": strategy_snapshot["strategy_id"],
+        "strategy_version": "v4",
+        "kelly_sample_key": (
+            "CN|trend_animals_warm_to_hot/CN/v4|v4"
+        ),
+        "state_status": "ok",
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "entry_allowed": False,
+        "current_equity": "95000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0.05",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "策略累计回撤已达到 5%，需人工解锁",
+        "paused_at": "2026-07-14T18:00:00+08:00",
+        "observed_at": "2026-07-14T18:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("95000"),
+            available_cash=Decimal("98000"),
+            positions=(
+                AccountPosition(
+                    "600001", "卖出", "stock", Decimal("100"),
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+                AccountPosition(
+                    "600002", "持有", "stock", Decimal("100"),
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+            ),
+            exceptions=(),
+            position_count=2,
+        ),
+        candidates=[candidate("600003")],
+        holding_snapshots={
+            "600001": holding("600001", danger=True),
+            "600002": holding("600002"),
+        },
+        bars_by_symbol={"600001": bars(), "600002": bars()},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "9",
+                    "active_line": "9",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+                for symbol in ("600001", "600002")
+            }
+        },
+        process_version="drawdown123",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=strategy_snapshot,
+        drawdown_summary=drawdown_summary,
+    )
+
+    assert [(item.symbol, item.action) for item in built.holdings] == [
+        ("600001", "SELL_ALL"),
+        ("600002", "HOLD"),
+    ]
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["new_planned_risk"] == Decimal("0")
+    assert built.risk_skips[0]["reason"] == drawdown_summary["pause_reason"]
+    assert built.risk_skips[0]["decisive_constraint"] == "策略累计回撤"
+    payload = trend_module._report_payload(built)
+    assert payload["drawdown_summary"] == drawdown_summary
+    markdown = render_markdown(built)
+    assert "组合计划风险" in markdown
+    assert "策略累计回撤" in markdown
+
+
+def test_minimum_lot_skip_keeps_plain_integer_reason() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("100000"),
+            positions=(), exceptions=(),
+        ),
+        candidates=[candidate("600001", atr="2")],
+        holding_snapshots={},
+        bars_by_symbol={},
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_skips[0]["reason"] == "最小交易单位 100 股超过单笔风险上限"
+
+
+@pytest.mark.parametrize("unknown", ["nav", "quantity", "price", "fx", "line"])
+def test_unknown_critical_simulation_fact_pauses_the_whole_entry_batch(
+    unknown: str,
+) -> None:
+    quantity = Decimal("NaN") if unknown == "quantity" else Decimal("100")
+    nav = Decimal("NaN") if unknown == "nav" else Decimal("100000")
+    prior_positions = {} if unknown == "line" else {
+        "600001": {
+            "initial_line": "9", "active_line": "9", "atr14": "0.5",
+            "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+        }
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=nav,
+            available_cash=Decimal("50000"),
+            positions=(
+                AccountPosition(
+                    "600001", "持仓", "stock", quantity,
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("600002"), candidate("600003")],
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={} if unknown == "price" else {"600001": bars()},
+        prior_state={"positions": prior_positions},
+        price_fx_to_account_currency=(
+            Decimal("NaN") if unknown == "fx" else Decimal("1")
+        ),
+    )
+
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["pause_reason"]
+    assert [item["symbol"] for item in built.risk_skips] == ["600002", "600003"]
+    assert all(item["reason"] == built.risk_summary["pause_reason"] for item in built.risk_skips)
 
 
 def test_cn_buy_action_serializes_candidate_industry(tmp_path: Path) -> None:
@@ -1049,7 +1811,7 @@ def test_us_buy_actions_convert_usd_share_price_to_hkd() -> None:
     )
 
     assert actions[0].target_amount == Decimal("31400.00")
-    assert actions[0].estimated_shares == 40
+    assert actions[0].estimated_shares == 39
 
 
 def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
@@ -1091,7 +1853,7 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
     actions = estimate_buy_actions(
         ranked=[
             candidate("600001", close="20"),
-            candidate("600002", close="1"),
+            candidate("600002", close="1", atr="0.01"),
         ],
         net_value=Decimal("10000"),
         available_cash=Decimal("600"),
@@ -1105,7 +1867,7 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
 
 def test_unaffordable_top_ten_promotes_later_affordable_candidate() -> None:
     ranked = [candidate(f"6000{index:02d}", close="100") for index in range(1, 11)]
-    ranked.append(candidate("600011", close="1"))
+    ranked.append(candidate("600011", close="1", atr="0.01"))
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -1223,26 +1985,280 @@ def test_cn_holding_entry_failures_are_hints_not_sell_triggers() -> None:
     )
 
 
-def test_cn_boiling_and_champagne_never_create_trim_action() -> None:
+@pytest.mark.parametrize(
+    ("market", "lot_sizes", "quantity", "expected_lot", "expected_shares"),
+    [
+        ("CN", None, Decimal("1000"), 100, 300),
+        ("US", None, Decimal("7"), 1, 2),
+        ("HK", {"600001": 200}, Decimal("1000"), 200, 200),
+    ],
+)
+@pytest.mark.parametrize("boiling,champagne", [(True, False), (False, True), (True, True)])
+def test_explicit_overheat_creates_one_partial_action(
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    quantity: Decimal,
+    expected_lot: int,
+    expected_shares: int,
+    boiling: bool,
+    champagne: bool,
+) -> None:
+    held_account = account("600001")
+    held_account = replace(
+        held_account,
+        positions=(replace(held_account.positions[0], quantity=quantity),),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=held_account,
+        candidates=(),
+        holding_snapshots={
+            "600001": holding("600001", boiling=boiling, champagne=champagne)
+        },
+        bars_by_symbol={"600001": bars(close=12, low=11)},
+        market=market,
+        lot_sizes=lot_sizes,
+        prior_state={
+            "schema_version": 1,
+            "positions": {"600001": {
+                "initial_line": "8", "active_line": "9", "atr14": "1",
+                "tracking_active": False, "position_started_for": "2026-07-01",
+                "updated_for": "2026-07-13",
+            }},
+        },
+    )
+    action = built.holdings[0]
+    assert (action.action, action.reason) == (
+        "SELL_PARTIAL", "overheat_take_profit"
+    )
+    assert action.target_fraction == Decimal("0.30")
+    assert action.position_started_for == "2026-07-01"
+    assert action.lot_size == expected_lot
+    assert action.estimated_shares == expected_shares
+    assert action.overheat_signals == tuple(
+        signal
+        for signal, enabled in (("boiling", boiling), ("champagne", champagne))
+        if enabled
+    )
+    assert action.warnings == ()
+    assert built.holdings[0].active_line == Decimal("11")
+
+
+def test_full_exit_still_wins_over_overheat() -> None:
+    snapshot = replace(holding("600001"), danger=True, boiling=True)
+    assert trend_module._holding_action(
+        symbol="600001", snapshot=snapshot, triggered=set()
+    ) == ("SELL_ALL", "danger_signal")
+
+
+def test_explicit_overheat_wins_over_unknown_non_exit_fields() -> None:
+    snapshot = replace(
+        holding("600001"), danger=None, right_side=None, boiling=True, champagne=None
+    )
+    assert trend_module._holding_action(
+        symbol="600001", snapshot=snapshot, triggered=set()
+    ) == ("SELL_PARTIAL", "overheat_take_profit")
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "triggered", "market", "terminal", "expected"),
+    [
+        (
+            holding("600001", boiling=True),
+            {"600001"},
+            "CN",
+            False,
+            ("SELL_ALL", "protection_line_already_triggered"),
+        ),
+        (
+            holding("600001", boiling=True, right_side=False),
+            set(),
+            "CN",
+            False,
+            ("SELL_ALL", "left_trend_right_side"),
+        ),
+        (
+            holding("600001", boiling=True, temperature_curr="平"),
+            set(),
+            "CN",
+            False,
+            ("SELL_ALL", "temperature_changed_to_flat"),
+        ),
+        (
+            holding("600001", right_side=None),
+            set(),
+            "CN",
+            False,
+            ("MANUAL_REVIEW", "holding_signal_unknown"),
+        ),
+        (
+            holding("600001", boiling=True),
+            set(),
+            "CN",
+            True,
+            ("HOLD", "trend_intact"),
+        ),
+    ],
+)
+def test_holding_action_preserves_exit_priority_and_terminal_trim(
+    snapshot: HoldingSnapshot,
+    triggered: set[str],
+    market: str,
+    terminal: bool,
+    expected: tuple[str, str],
+) -> None:
+    assert trend_module._holding_action(
+        symbol="600001",
+        snapshot=snapshot,
+        triggered=triggered,
+        market=market,
+        overheat_trim_terminal=terminal,
+    ) == expected
+
+
+def test_position_zero_allows_a_later_overheat_trim_lifecycle() -> None:
+    terminal_state = {
+        "schema_version": 1,
+        "positions": {
+            "600001": {
+                "initial_line": "8",
+                "active_line": "9",
+                "atr14": "1",
+                "position_started_for": "2026-07-01",
+                "overheat_trim_status": "complete",
+                "overheat_trim_target_qty": "300",
+                "overheat_trim_filled_qty": "300",
+                "overheat_trim_started_for": "2026-07-01",
+                "updated_for": "2026-07-13",
+            }
+        },
+    }
+    terminal = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars()},
+        prior_state=terminal_state,
+    )
+    zeroed = build_report(
+        as_of_date="2026-07-15",
+        execution_date="2026-07-16",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=terminal.protection_state,
+    )
+    reentered = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={
+            "600001": replace(holding("600001", boiling=True), as_of_date="2026-07-16")
+        },
+        bars_by_symbol={"600001": bars(end_date="2026-07-16")},
+        prior_state=zeroed.protection_state,
+    )
+    assert terminal.holdings[0].action == "HOLD"
+    assert terminal.protection_state["positions"]["600001"] | {
+        "overheat_trim_status": "complete",
+        "overheat_trim_target_qty": "300",
+        "overheat_trim_filled_qty": "300",
+        "overheat_trim_started_for": "2026-07-01",
+    } == terminal.protection_state["positions"]["600001"]
+    assert zeroed.protection_state == {"schema_version": 1, "positions": {}}
+    assert reentered.holdings[0].action == "SELL_PARTIAL"
+    assert reentered.holdings[0].position_started_for == "2026-07-16"
+
+
+@pytest.mark.parametrize("daily_bars", [None, bars(end_date="2026-07-13")])
+def test_explicit_overheat_survives_unavailable_kline_and_preserves_old_line(
+    daily_bars: list[DailyKlineBar] | None,
+) -> None:
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=account("600001"),
         candidates=(),
-        holding_snapshots={
-            "600001": holding("600001", boiling=True, champagne=True)
-        },
-        bars_by_symbol={"600001": bars(close=12, low=11)},
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": daily_bars},
         prior_state={
             "schema_version": 1,
-            "positions": {"600001": {
-                "initial_line": "8", "active_line": "9", "atr14": "1",
-                "tracking_active": False, "updated_for": "2026-07-13",
-            }},
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            },
         },
     )
-    assert built.holdings[0].action == "HOLD"
-    assert built.holdings[0].active_line == Decimal("11")
+    action = built.holdings[0]
+    assert (action.action, action.reason, action.active_line) == (
+        "SELL_PARTIAL", "overheat_take_profit", Decimal("8.5")
+    )
+    assert action.warnings == ("holding_kline_unavailable",)
+
+
+def test_explicit_overheat_without_line_persists_lifecycle_and_pauses_buys() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(candidate("600002"),),
+        holding_snapshots={
+            "600001": holding(
+                "600001", boiling=True, danger=None, right_side=None, champagne=None
+            )
+        },
+        bars_by_symbol={"600001": None},
+    )
+    action = built.holdings[0]
+    assert (action.action, action.reason, action.initial_line, action.active_line) == (
+        "SELL_PARTIAL", "overheat_take_profit", None, None
+    )
+    assert action.warnings == (
+        "holding_signal_unknown", "holding_kline_unavailable"
+    )
+    assert built.protection_state["positions"]["600001"]["position_started_for"] == "2026-07-14"
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert "活动保护线缺失" in str(built.risk_summary["pause_reason"])
+
+
+@pytest.mark.parametrize("lot_size", [None, 0])
+def test_hk_partial_without_a_valid_lot_size_requires_review(
+    lot_size: int | None,
+) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars()},
+        market="HK",
+        lot_sizes={} if lot_size is None else {"600001": lot_size},
+    )
+    action = built.holdings[0]
+    assert (action.action, action.reason) == (
+        "MANUAL_REVIEW", "holding_lot_size_unavailable"
+    )
+    assert (
+        action.position_started_for,
+        action.target_fraction,
+        action.estimated_shares,
+        action.lot_size,
+        action.overheat_signals,
+        action.warnings,
+    ) == (None, None, None, None, (), ())
+    assert "overheat_trim_status" not in built.protection_state["positions"]["600001"]
 
 
 @pytest.mark.parametrize(
@@ -1874,7 +2890,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
         payload, broker_label="富途", market_label="美股"
     )
 
-    assert title == "【富途｜美股趋势报告｜2026-07-15】"
+    assert title == "【日报｜富途｜美股趋势报告｜2026-07-15】"
     assert message == "\n".join(
         [
             "数据截至：2026-07-14",
@@ -1882,7 +2898,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
             "今日动作：卖出 1｜买入 1｜持有 1｜复核 2",
             "",
             "卖出",
-            "1. AAPL 苹果｜右侧趋势已结束｜保护线 190",
+            "1. AAPL 苹果｜右侧趋势已结束｜全部卖出｜保护线 190",
             "",
             "买入",
             "1. CRWD CrowdStrike｜美股常规交易时段｜约 2 股｜金额上限 500｜保护线 198",
@@ -1896,6 +2912,71 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
     )
     assert "MSFT" not in message
     assert "http" not in message.lower()
+
+
+def test_partial_action_is_a_formal_trim_in_feishu_and_markdown() -> None:
+    held_account = account("600001")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=replace(
+            held_account,
+            positions=(replace(held_account.positions[0], quantity=Decimal("1000")),),
+        ),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars()},
+    )
+
+    payload = trend_module._report_payload(built)
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+    markdown = render_markdown(built)
+
+    assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "SELL_PARTIAL"
+    assert payload["strategy_judgments"]["formal_actions"] == [
+        payload["strategy_judgments"]["holding_decisions"][0]
+    ]
+    assert "今日动作：卖出 1｜买入 0｜持有 0｜复核 0" in message
+    assert "沸腾/开香槟过热止盈｜止盈减仓 30%｜模拟预计数量 300 股" in message
+    assert "今日无买卖动作" not in message
+    assert "止盈减仓 30%" in markdown
+    assert "全部卖出 0｜止盈减仓 30% 1" in markdown
+    assert "模拟预计数量 300 股" in markdown
+    assert "无需卖出" not in markdown
+
+
+def test_partial_action_labels_simulated_target_signals_and_warnings() -> None:
+    held_account = account("600001")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=replace(
+            held_account,
+            positions=(replace(held_account.positions[0], quantity=Decimal("1000")),),
+        ),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": None},
+    )
+
+    payload = trend_module._report_payload(built)
+    _, message = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+    markdown = render_markdown(built)
+
+    for text in (
+        "止盈减仓 30%",
+        "模拟预计数量 300 股",
+        "每手 100 股",
+        "触发信号 沸腾",
+        "持仓日线数据不可用",
+    ):
+        assert text in message
+        assert text in markdown
+    assert trend_module.REASON_LABELS["holding_lot_size_unavailable"] == "持仓整手信息不可用"
 
 
 def test_trend_feishu_text_uses_short_no_trade_template() -> None:
@@ -1914,7 +2995,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     title, message = render_trend_feishu_text(
         payload, broker_label="辉立", market_label="港股"
     )
-    assert title == "【辉立｜港股趋势报告｜2026-07-15】"
+    assert title == "【日报｜辉立｜港股趋势报告｜2026-07-15】"
     assert message == (
         "数据截至：2026-07-14\n"
         "账户状态：账户数据非实时，执行前核对现金与持仓\n"
@@ -2213,11 +3294,12 @@ def test_trend_failure_text_is_plain_and_actionable() -> None:
         reason="趋势数据在截止时间前仍未更新",
         recovery_action="确认 Trend Animals 数据状态后手动重跑东方财富报告",
     )
-    assert title == "【东方财富｜A股趋势报告生成失败｜2026-07-15】"
+    assert title == "【需处理｜东方财富｜A股趋势报告生成失败｜2026-07-15】"
     assert message == (
-        "原因：趋势数据在截止时间前仍未更新\n"
-        "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
-        "报告未生成，请勿依据旧报告交易。"
+        "发生：趋势报告未生成\n"
+        "影响：不能依据旧报告交易\n"
+        "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n"
+        "原因：趋势数据在截止时间前仍未更新"
     )
 
 
@@ -2465,7 +3547,7 @@ def test_no_action_report_uses_exact_cash_sentence() -> None:
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
     assert "09:30–10:00" in markdown
-    assert "约 2700 股" in markdown
+    assert "约 2600 股" in markdown
     assert "金额上限 27061.98 元" in markdown
     assert "预计保护线 9.00" in markdown
     assert "按富途数据日前复权日线收盘价向下取整为 100 股整数倍" in markdown
@@ -2585,7 +3667,125 @@ def test_frozen_json_has_explicit_no_action_strategy_contract(tmp_path: Path) ->
         "holding_decisions": [],
         "top10_candidates": [],
         "formal_actions": [],
+        "risk_skips": [],
     }
+    assert payload["risk_summary"]["portfolio_risk_limit_pct"] == "0.04"
+    assert payload["risk_summary"]["abnormal_loss_buffer_pct"] == "0.01"
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("parameters", "single_entry_risk_limit", "0.04"),
+        ("parameters", "portfolio_risk_limit", "0.4"),
+        ("parameters", "abnormal_loss_buffer", "0.1"),
+        ("parameters", "normal_cost_rate", "0.009"),
+        ("parameters", "normal_cost_model", "按心情估算"),
+        ("summary", "single_entry_risk_limit_pct", Decimal("0.4")),
+        ("summary", "normal_cost_rate", Decimal("0.009")),
+        ("summary", "normal_cost_model", "按心情估算"),
+        ("summary", "total_risk_budget_target_pct", Decimal("0.5")),
+        ("summary", "disclaimer", "5% 保证最大损失"),
+    ],
+)
+def test_v2_report_rejects_frozen_risk_contract_drift(
+    section: str, key: str, value: object,
+) -> None:
+    built = report(candidates=(candidate("600001"),))
+    snapshot = copy.deepcopy(built.strategy_snapshot)
+    summary = copy.deepcopy(built.risk_summary)
+    target = snapshot["parameters"] if section == "parameters" else summary
+    assert isinstance(target, dict)
+    target[key] = value
+    tampered = replace(built, strategy_snapshot=snapshot, risk_summary=summary)
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(tampered)
+
+
+def test_v2_report_freezes_shared_remaining_risk_semantics() -> None:
+    built = report(candidates=(candidate("600001"),))
+
+    assert built.risk_summary["portfolio_remaining_risk_note"] == (
+        "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
+    )
+
+
+def test_v2_report_rejects_paused_state_with_new_buy_risk() -> None:
+    built = report(candidates=(candidate("600001"),))
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "pause_reason": "测试暂停",
+    })
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_v2_report_rejects_active_state_over_portfolio_risk_limit() -> None:
+    built = report()
+    summary = copy.deepcopy(built.risk_summary)
+    portfolio_limit = summary["portfolio_risk_limit"]
+    assert isinstance(portfolio_limit, Decimal)
+    nav = portfolio_limit / Decimal("0.04")
+    planned_risk = portfolio_limit + Decimal("1")
+    summary.update({
+        "existing_planned_risk": planned_risk,
+        "new_planned_risk": Decimal("0"),
+        "portfolio_planned_risk": planned_risk,
+        "portfolio_planned_risk_pct": planned_risk / nav,
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+    })
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_v2_report_rejects_risk_amounts_scaled_away_from_account_nav() -> None:
+    built = report()
+    summary = copy.deepcopy(built.risk_summary)
+    for key in (
+        "portfolio_risk_limit",
+        "portfolio_remaining_risk",
+        "single_entry_risk_limit",
+        "abnormal_loss_buffer",
+    ):
+        summary[key] *= 2
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+@pytest.mark.parametrize("malformed", ["zero_risk", "partial_lot"])
+def test_v2_report_rejects_impossible_buy_risk_facts(malformed: str) -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = built.buy_actions[0]
+    summary = copy.deepcopy(built.risk_summary)
+    if malformed == "zero_risk":
+        action = replace(
+            action,
+            planned_stop_risk=Decimal("0"),
+            planned_stop_risk_pct=Decimal("0"),
+            normal_cost=Decimal("0"),
+        )
+        summary.update({
+            "new_planned_risk": Decimal("0"),
+            "portfolio_planned_risk": Decimal("0"),
+            "portfolio_planned_risk_pct": Decimal("0"),
+            "portfolio_remaining_risk": summary["portfolio_risk_limit"],
+            "portfolio_remaining_risk_pct": Decimal("0.04"),
+        })
+    else:
+        action = replace(action, estimated_shares=350, lot_size=100)
+
+    tampered = replace(
+        built, buy_actions=(action,), risk_summary=summary
+    )
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(tampered)
 
 
 def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> None:
@@ -2847,6 +4047,9 @@ def trend_config(tmp_path: Path) -> DailyPremarketConfig:
         trend_animals_api_key="secret-value",
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_review_cn_simulate_acc_id=101,
+        trend_review_us_simulate_acc_id=102,
+        trend_review_hk_simulate_acc_id=103,
     )
 
 
@@ -3045,6 +4248,10 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["risk_summary"]["kelly_phase"] == "cold_start"
+    assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
+    assert payload["risk_summary"]["kelly_cap"] is None
     audit = payload["signal_snapshots"]["candidates"]
     assert audit[0]["industry_tm_id"] == 700001
     assert audit[0]["industry_temperature"] == "热"
@@ -3060,6 +4267,31 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["rebuild_inputs"]["candidates"]
 
 
+def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
+    tmp_path: Path,
+) -> None:
+    cfg = trend_config(tmp_path)
+    stats = cfg.data_dir / "latest/trend_api_stats.json"
+    stats.parent.mkdir(parents=True, exist_ok=True)
+    stats.write_text('{"schema_version":"broken","rounds":[]}', encoding="utf-8")
+
+    result = run_a_share_trend_report(
+        config=cfg,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert payload["risk_summary"]["kelly_phase"] == "unavailable"
+    assert payload["risk_summary"]["status"] == "paused"
+    assert "trend_api_stats.json" in payload["risk_summary"]["pause_reason"]
+    assert "schema_version" in payload["risk_summary"]["pause_reason"]
+
+
 def test_missing_industry_row_excludes_only_affected_candidate(
     tmp_path: Path,
 ) -> None:
@@ -3068,8 +4300,10 @@ def test_missing_industry_row_excludes_only_affected_candidate(
         missing_industry_ids={700001},
         industry_ids={1: 700001, 2: 700002},
     )
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
     result = run_a_share_trend_report(
-        config=trend_config(tmp_path), run_date="2026-07-14",
+        config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: api,
         quote_factory=lambda **kwargs: ReadyQuote([]),
         notifier=RecordingFeishu(),
@@ -3125,16 +4359,87 @@ class ReadyQuote:
         self.calls.append(f"futu.kline.{symbol}")
         if symbol in self.failed_klines:
             raise self.kline_error or FutuQuoteError("kline unavailable")
-        return bars()
+        return [replace(item, high=10.2, low=9.8) for item in bars()]
 
     def close(self) -> None:
         pass
 
 
-def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
+def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    config.portfolio.write_text("actual account changes are overlay-only", encoding="utf-8")
+    account_calls: list[dict[str, object]] = []
+
+    class SimAccountClient:
+        def __init__(self, **kwargs: object) -> None:
+            account_calls.append(dict(kwargs))
+            self.acc_id = int(kwargs["simulate_acc_id"])
+
+        def account_snapshot(self) -> dict[str, object]:
+            return DefaultSimAccountClient(
+                simulate_acc_id=self.acc_id
+            ).account_snapshot()
+
+        def close(self) -> None:
+            pass
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=SimAccountClient,
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    assert account_calls[0] | {
+        "simulate_acc_id": 101,
+        "trd_market": "CN",
+    } == account_calls[0]
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["account"]["positions"] == []
+    assert payload["metadata"]["simulate_acc_id"] == 101
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["drawdown_summary"]["state_status"] == "missing"
+    assert payload["drawdown_summary"]["entry_allowed"] is False
+    assert payload["strategy_judgments"]["formal_actions"] == []
+
+
+def test_generated_report_keeps_v4_identity_kelly_scope_and_drawdown_continuity(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
+    state_path = config.data_dir / "trend_drawdown/state.json"
+    before = json.loads(state_path.read_text(encoding="utf-8"))
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    snapshot = payload["strategy_snapshot"]
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v4"
+    assert snapshot["strategy_version"] == "v4"
+    assert snapshot["parameters"]["kelly_sample_scope"] == (
+        "market+strategy_id+opening_strategy_version"
+    )
+    after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert after["audit_events"] == before["audit_events"]
+
+
+def test_report_runner_sends_exact_broker_v4_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
     config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
     notifier = RecordingFeishu()
 
     def api_factory(**kwargs: object) -> ReadyApi:
@@ -3160,13 +4465,13 @@ def test_report_runner_sends_exact_broker_v1_text(tmp_path: Path) -> None:
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert notifier.messages == [
         (
-            "【东方财富｜A股趋势报告｜2026-07-15】",
+            "【日报｜东方财富｜A股趋势报告｜2026-07-15】",
             "数据截至：2026-07-14\n"
             "账户状态：已更新\n"
             "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
             "买入\n"
-            "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n"
-            "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 6\n\n"
+            "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n"
+            "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n\n"
             "请人工确认，不自动下单。",
         )
     ]
@@ -3246,10 +4551,11 @@ def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Pat
     assert [title for title, _ in macos.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
     assert feishu.messages == [
         (
-            "【东方财富｜A股趋势报告生成失败｜2026-07-14】",
-            "原因：趋势数据在截止时间前仍未更新\n"
-            "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
-            "报告未生成，请勿依据旧报告交易。",
+            "【需处理｜东方财富｜A股趋势报告生成失败｜2026-07-14】",
+            "发生：趋势报告未生成\n"
+            "影响：不能依据旧报告交易\n"
+            "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n"
+            "原因：趋势数据在截止时间前仍未更新",
         )
     ]
     ledger = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
@@ -3667,7 +4973,10 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
         generated_at="2026-07-14T17:00:00+08:00",
         artifact_stem="2026-07-14",
         markdown="old report",
-        report_json='{\n  "delivery_status": "delivery_failed"\n}\n',
+        report_json=(
+            '{\n  "delivery_status": "delivery_failed",\n'
+            '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+        ),
         protection_state={"schema_version": 1, "positions": {}},
     )
     old_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -3686,17 +4995,23 @@ def test_atomic_receipt_preserves_old_embedded_payload_if_replace_fails(
             generated_at="2026-07-14T17:00:00+08:00",
             artifact_stem="2026-07-14",
             markdown="new report",
-            report_json='{\n  "delivery_status": "sent"\n}\n',
+            report_json=(
+                '{\n  "delivery_status": "sent",\n'
+                '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+            ),
             protection_state={"schema_version": 1, "positions": {}},
         )
 
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == old_receipt
-    recovered = trend_module._read_delivery_receipt(
+    recovered = trend_module.read_delivery_receipt(
         receipt_path, artifact_stem="2026-07-14"
     )
     assert recovered is not None
     assert recovered["markdown"] == "old report"
-    assert recovered["report_json"] == '{\n  "delivery_status": "delivery_failed"\n}\n'
+    assert recovered["report_json"] == (
+        '{\n  "delivery_status": "delivery_failed",\n'
+        '  "protection_state": {"positions": {}, "schema_version": 1}\n}\n'
+    )
 
 
 def test_sent_receipt_prevents_duplicate_delivery_after_final_freeze_failure(
@@ -4232,7 +5547,7 @@ def test_report_runner_sends_v1_text_only_to_feishu_and_short_status_to_macos(tm
     )
     assert result.status == "generated"
     assert len(feishu.messages) == len(macos.messages) == 1
-    assert feishu.messages[0][0] == "【东方财富｜A股趋势报告｜2026-07-15】"
+    assert feishu.messages[0][0] == "【日报｜东方财富｜A股趋势报告｜2026-07-15】"
     assert "# A股趋势操作计划" not in feishu.messages[0][1]
     assert "# A股趋势操作计划" not in macos.messages[0][1]
 
@@ -4271,6 +5586,7 @@ def test_report_runner_degrades_holding_kline_without_blocking_report(
         config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: ReadyApi(calls),
         quote_factory=lambda **kwargs: ReadyQuote(calls, failed_klines={"SH.600009"}),
+        account_factory=simulation_account_with_positions("SH.600009"),
         notifier=RecordingFeishu(),
     )
     decision = json.loads(result.json_path.read_text(encoding="utf-8"))[
@@ -4311,6 +5627,7 @@ def test_report_runner_degrades_beijing_holding_kline_value_error(
         run_date="2026-07-14",
         api_factory=lambda **kwargs: BeijingApi([]),
         quote_factory=lambda **kwargs: RejectingBeijingQuote([]),
+        account_factory=simulation_account_with_positions("BJ.920000"),
         notifier=RecordingFeishu(),
     )
 
@@ -4447,7 +5764,9 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: ReadyApi(calls, holding_error=TrendAnimalsLookupError("missing")),
-        quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=RecordingFeishu(),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingFeishu(),
     )
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     decision = payload["strategy_judgments"]["holding_decisions"][0]
@@ -4460,7 +5779,9 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
         config=blocked, run_date="2026-07-14",
         now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], holding_error=TrendAnimalsError("transport")),
-        quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingMacOS(),
     )
     assert blocked_result.status == "failed"
 

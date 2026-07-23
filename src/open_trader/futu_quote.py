@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 import math
-from time import sleep
+from time import monotonic, sleep
 from typing import Any
 
 from .futu_watch import QuoteSnapshot
@@ -26,6 +26,14 @@ QUOTE_INTERRUPTED_NEXT_STEP = (
 SNAPSHOT_FAILED_NEXT_STEP = (
     "请检查 OpenD 行情服务状态和网络连接，然后重新运行每日盘前流程。"
 )
+_TRADING_DAYS_CACHE_SECONDS = 300.0
+_TRADING_DAYS_CACHE: dict[
+    tuple[object, str, int, str, str, str], tuple[float, tuple[str, ...]]
+] = {}
+
+
+def _clear_trading_days_cache() -> None:
+    _TRADING_DAYS_CACHE.clear()
 
 
 @dataclass(frozen=True)
@@ -80,7 +88,13 @@ def _default_context_factory(*, host: str, port: int) -> Any:
             context_ok=False,
             snapshot_ok=False,
         ) from exc
-    return OpenQuoteContext(host=host, port=port)
+    context = OpenQuoteContext(
+        host=host,
+        port=port,
+        is_async_connect=True,
+    )
+    context.set_sync_query_connect_timeout(3.0)
+    return context
 
 
 def _can_connect_to_opend(host: str, port: int) -> bool:
@@ -100,6 +114,7 @@ class FutuQuoteClient:
         context_factory: Callable[..., Any] = _default_context_factory,
         connectivity_checker: Callable[[str, int], bool] = _can_connect_to_opend,
         sleep_fn: Callable[[float], None] = sleep,
+        monotonic_fn: Callable[[], float] = monotonic,
     ) -> None:
         if not connectivity_checker(host, port):
             raise FutuQuoteError(
@@ -127,6 +142,8 @@ class FutuQuoteClient:
         self.host = host
         self.port = port
         self._sleep_fn = sleep_fn
+        self._monotonic_fn = monotonic_fn
+        self._calendar_cache_scope = context_factory
 
     def get_snapshots(self, futu_symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
         requested = set(futu_symbols)
@@ -188,13 +205,40 @@ class FutuQuoteClient:
             snapshot_ok=error_type == "market_state_failed",
         )
 
-    def get_cn_trading_days(self, *, start: str, end: str) -> list[str]:
-        return self.get_trading_days(market="CN", start=start, end=end)
+    def get_cn_trading_days(
+        self, *, start: str, end: str, use_cache: bool = True
+    ) -> list[str]:
+        return self.get_trading_days(
+            market="CN", start=start, end=end, use_cache=use_cache
+        )
 
-    def get_trading_days(self, *, market: str, start: str, end: str) -> list[str]:
+    def get_trading_days(
+        self,
+        *,
+        market: str,
+        start: str,
+        end: str,
+        use_cache: bool = True,
+    ) -> list[str]:
         normalized_market = market.strip().upper()
         if normalized_market not in {"CN", "HK", "US"}:
             raise ValueError(f"unsupported Futu market: {market}")
+        cache_key = (
+            self._calendar_cache_scope,
+            self.host,
+            self.port,
+            normalized_market,
+            start,
+            end,
+        )
+        now = self._monotonic_fn()
+        if use_cache:
+            cached = _TRADING_DAYS_CACHE.get(cache_key)
+            if cached is not None:
+                expires_at, trading_days = cached
+                if expires_at > now:
+                    return list(trading_days)
+                del _TRADING_DAYS_CACHE[cache_key]
         try:
             from futu import TradeDateMarket
 
@@ -240,6 +284,10 @@ class FutuQuoteClient:
                 context_ok=True,
                 snapshot_ok=False,
             ) from exc
+        _TRADING_DAYS_CACHE[cache_key] = (
+            self._monotonic_fn() + _TRADING_DAYS_CACHE_SECONDS,
+            tuple(trading_days),
+        )
         return trading_days
 
     def get_lot_sizes(self, futu_symbols: Sequence[str]) -> dict[str, int]:

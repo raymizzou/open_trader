@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time as time_module
 from collections.abc import Callable, Mapping
@@ -11,10 +12,18 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .a_share_trend import AccountSnapshot, load_eastmoney_account, load_watch_events
+from .a_share_trend import AccountSnapshot, load_watch_events
 from .daily_premarket import RunLock, send_notification_with_results
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
+from .notification_policy import (
+    BROKER_LABELS,
+    brief_zh_detail,
+    group_order_alerts,
+    render_attention,
+    render_order_alert,
+    render_protection_alert,
+)
 from .notifications import (
     CompositeNotifier,
     Notifier,
@@ -59,6 +68,11 @@ def append_watch_event(
     active_line: Decimal | None,
     market: str = "",
     reason: str = "",
+    channel: str = "",
+    group_id: str = "",
+    notification_title: str = "",
+    notification_message: str = "",
+    group_symbols: list[str] | None = None,
 ) -> dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
@@ -74,6 +88,16 @@ def append_watch_event(
         event["market"] = market
     if reason:
         event["reason"] = reason
+    if channel:
+        event["channel"] = channel
+    if group_id:
+        event["group_id"] = group_id
+    if notification_title:
+        event["notification_title"] = notification_title
+    if notification_message:
+        event["notification_message"] = notification_message
+    if group_symbols is not None:
+        event["group_symbols"] = group_symbols
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     return event
@@ -85,6 +109,7 @@ def watch_a_share_protection(
     state_path: Path,
     events_path: Path,
     quote_client: object | None,
+    close_quote_client: bool = True,
     notifier: Notifier,
     poll_seconds: float,
     reconnect_seconds: float,
@@ -98,7 +123,7 @@ def watch_a_share_protection(
     broker_label: str = "东方财富",
     session_timezone: ZoneInfo = SHANGHAI,
     session_fn: Callable[[datetime], str] = cn_session,
-    account_loader: Callable[..., AccountSnapshot] = load_eastmoney_account,
+    account_loader: Callable[..., AccountSnapshot],
     on_session_open: Callable[[str], None] | None = None,
     on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
 ) -> AShareWatchResult:
@@ -124,22 +149,51 @@ def watch_a_share_protection(
 
     trigger_count = exception_count = unknown_quote_count = 0
     calendar_checked = False
-    session_open_called = False
-    interrupted = False
+    interrupted = _monitor_interrupted(events_path)
     now = first_now
-    try:
-        while True:
-            session = session_fn(now)
-            if session == "closed":
-                return _result(
-                    "closed",
+
+    def outcome(status: str, *, failed: bool = False) -> AShareWatchResult:
+        nonlocal client
+        result = _result(
+            status,
+            positions,
+            trigger_count,
+            exception_count + int(failed),
+            unknown_quote_count,
+            events_path,
+        )
+        if client is None or not close_quote_client:
+            return result
+        closing_client = client
+        client = None
+        try:
+            _close(closing_client)
+        except Exception:
+            if not once:
+                raise
+            if status != "abnormal":
+                result = _result(
+                    "abnormal",
                     positions,
                     trigger_count,
-                    exception_count,
+                    exception_count + 1,
                     unknown_quote_count,
                     events_path,
                 )
+        return result
 
+    def recover_monitor() -> None:
+        nonlocal interrupted
+        if interrupted:
+            _record_recovery(
+                events_path, notifier, trading_date, now,
+                market_label=market_label,
+            )
+            interrupted = False
+
+    try:
+        while True:
+            session = session_fn(now)
             if client is None:
                 if quote_client_factory is None:
                     raise RuntimeError("quote client factory is required after interruption")
@@ -152,6 +206,10 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
+                    if once and not close_quote_client:
+                        raise
+                    if once:
+                        return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
@@ -172,28 +230,56 @@ def watch_a_share_protection(
                             market_label=market_label, broker_label=broker_label,
                         )
                         interrupted = True
-                    _close(client)
+                    if once and not close_quote_client:
+                        raise
+                    failed_client = client
                     client = None
+                    try:
+                        _close(failed_client)
+                    except Exception:
+                        if not once:
+                            raise
+                    if once:
+                        return outcome("abnormal", failed=True)
                     sleep_fn(reconnect_seconds)
                     now = now_fn()
                     continue
                 calendar_checked = True
-                if interrupted:
-                    _record_recovery(
-                        events_path, notifier, trading_date, now,
-                        market_label=market_label,
-                    )
-                    interrupted = False
                 if trading_date not in trading_days:
-                    return _result(
-                        "holiday",
-                        positions,
-                        trigger_count,
-                        exception_count,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    recover_monitor()
+                    return outcome("holiday")
 
+            _retry_pending_callback_feishu_groups(
+                events_path=events_path,
+                notifier=notifier,
+                trading_date=trading_date,
+                now=now,
+                market=market,
+            )
+            if on_session_open is not None:
+                exception_count += _run_review_callback(
+                    on_session_open,
+                    trading_date,
+                    events_path=events_path,
+                    trading_date=trading_date,
+                    now=now,
+                    notifier=notifier,
+                    market=market,
+                    market_label=market_label,
+                    broker_label=broker_label,
+                )
+                _notify_trend_review_deadline(
+                    data_dir=events_path.parents[1],
+                    market=market,
+                    trading_date=trading_date,
+                    now=now,
+                    events_path=events_path,
+                    notifier=notifier,
+                )
+
+            if session == "closed":
+                recover_monitor()
+                return outcome("closed")
             if session == "before":
                 opening = now.astimezone(session_timezone).replace(
                     hour=9, minute=30, second=0, microsecond=0
@@ -208,17 +294,6 @@ def watch_a_share_protection(
                 sleep_fn((afternoon - now.astimezone(session_timezone)).total_seconds())
                 now = now_fn()
                 continue
-
-            if not session_open_called:
-                if on_session_open is not None:
-                    exception_count += _run_review_callback(
-                        on_session_open,
-                        trading_date,
-                        events_path=events_path,
-                        trading_date=trading_date,
-                        now=now,
-                    )
-                session_open_called = True
 
             try:
                 with (
@@ -264,33 +339,24 @@ def watch_a_share_protection(
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "protection_line_missing"
                     }
-                    delivered_lines = {
-                        str(event.get("symbol", ""))
-                        for event in prior_events
-                        if event.get("trading_date") == trading_date
-                        and event.get("event_type")
-                        == "protection_line_missing_notification_delivered"
-                    }
                     reported_quotes = {
                         str(event.get("symbol", ""))
                         for event in prior_events
                         if event.get("trading_date") == trading_date
                         and event.get("event_type") == "quote_unknown"
                     }
-                    delivered_quotes = {
-                        str(event.get("symbol", ""))
-                        for event in prior_events
-                        if event.get("trading_date") == trading_date
-                        and event.get("event_type")
-                        == "quote_unknown_notification_delivered"
-                    }
-            except RuntimeError as exc:
-                if str(exc) != "daily premarket run already active":
+            except Exception as exc:
+                if once:
+                    return outcome("abnormal", failed=True)
+                if not isinstance(exc, RuntimeError) or str(exc) != (
+                    "daily premarket run already active"
+                ):
                     raise
                 sleep_fn(poll_seconds)
                 now = now_fn()
                 continue
 
+            callback_failures: list[Mapping[str, object]] = []
             for symbol, event in sorted(trigger_events.items()):
                 if symbol not in positions:
                     continue
@@ -301,6 +367,11 @@ def watch_a_share_protection(
                         events_path=events_path,
                         trading_date=trading_date,
                         now=now,
+                        notifier=notifier,
+                        market=market,
+                        market_label=market_label,
+                        broker_label=broker_label,
+                        failures=callback_failures,
                     )
                 _deliver_trigger_notification(
                     events_path=events_path,
@@ -315,6 +386,7 @@ def watch_a_share_protection(
                     delivered_macos=delivered_alerts_macos,
                     replay=True,
                     market_label=market_label,
+                    broker_label=broker_label,
                 )
 
             comparable: dict[str, tuple[str, Decimal]] = {}
@@ -333,39 +405,22 @@ def watch_a_share_protection(
                         )
                         reported_lines.add(symbol)
                         exception_count += 1
-                    if symbol not in delivered_lines:
-                        attempts = send_notification_with_results(
-                            notifier,
-                            f"{market_label}保护线缺失 · {symbol}",
-                            "当前持仓缺少活动保护线，未进行价格比较；请立即人工检查。",
-                            channels={"feishu", "feishu_app"},
-                        )
-                        if any(attempt.success for attempt in attempts):
-                            append_watch_event(
-                                events_path,
-                                symbol=symbol,
-                                trading_date=trading_date,
-                                event_type=(
-                                    "protection_line_missing_notification_delivered"
-                                ),
-                                occurred_at=now.isoformat(timespec="seconds"),
-                                last_price=None,
-                                active_line=None,
-                            )
-                            delivered_lines.add(symbol)
                     continue
                 comparable[to_futu_symbol(market, symbol)] = (symbol, active_line)
 
             if not comparable:
+                _notify_review_callback_failure_groups(
+                    events_path=events_path,
+                    notifier=notifier,
+                    trading_date=trading_date,
+                    now=now,
+                    market=market,
+                    broker_label=broker_label,
+                    failures=callback_failures,
+                )
+                recover_monitor()
                 if once:
-                    return _result(
-                        "completed",
-                        positions,
-                        trigger_count,
-                        exception_count,
-                        unknown_quote_count,
-                        events_path,
-                    )
+                    return outcome("completed")
                 sleep_fn(poll_seconds)
                 now = now_fn()
                 continue
@@ -373,23 +428,38 @@ def watch_a_share_protection(
             try:
                 snapshots = client.get_snapshots(sorted(comparable))
             except FutuQuoteError as exc:
+                _notify_review_callback_failure_groups(
+                    events_path=events_path,
+                    notifier=notifier,
+                    trading_date=trading_date,
+                    now=now,
+                    market=market,
+                    broker_label=broker_label,
+                    failures=callback_failures,
+                )
                 if not interrupted:
                     _record_interruption(
                         events_path, notifier, trading_date, now, str(exc),
                         market_label=market_label, broker_label=broker_label,
                     )
                     interrupted = True
-                _close(client)
+                if once and not close_quote_client:
+                    raise
+                failed_client = client
                 client = None
+                try:
+                    _close(failed_client)
+                except Exception:
+                    if not once:
+                        raise
+                if once:
+                    return outcome("abnormal", failed=True)
                 sleep_fn(reconnect_seconds)
                 now = now_fn()
                 continue
-            if interrupted:
-                _record_recovery(
-                    events_path, notifier, trading_date, now,
-                    market_label=market_label,
-                )
-                interrupted = False
+            snapshots_complete = comparable.keys() <= snapshots.keys()
+            if snapshots_complete:
+                recover_monitor()
 
             for futu_symbol, (symbol, active_line) in comparable.items():
                 snapshot = snapshots.get(futu_symbol)
@@ -406,24 +476,6 @@ def watch_a_share_protection(
                         )
                         reported_quotes.add(symbol)
                         unknown_quote_count += 1
-                    if symbol not in delivered_quotes:
-                        attempts = send_notification_with_results(
-                            notifier,
-                            f"{market_label}实时价格未知 · {symbol}",
-                            f"未取得有效实时价格，活动保护线 {active_line} 的状态未知；请立即人工核价。",
-                            channels={"feishu", "feishu_app"},
-                        )
-                        if any(attempt.success for attempt in attempts):
-                            append_watch_event(
-                                events_path,
-                                symbol=symbol,
-                                trading_date=trading_date,
-                                event_type="quote_unknown_notification_delivered",
-                                occurred_at=now.isoformat(timespec="seconds"),
-                                last_price=None,
-                                active_line=active_line,
-                            )
-                            delivered_quotes.add(symbol)
                     continue
                 if snapshot.last_price > active_line:
                     continue
@@ -446,6 +498,11 @@ def watch_a_share_protection(
                             events_path=events_path,
                             trading_date=trading_date,
                             now=now,
+                            notifier=notifier,
+                            market=market,
+                            market_label=market_label,
+                            broker_label=broker_label,
+                            failures=callback_failures,
                         )
                     _deliver_trigger_notification(
                         events_path=events_path,
@@ -460,22 +517,161 @@ def watch_a_share_protection(
                         delivered_macos=delivered_alerts_macos,
                         replay=False,
                         market_label=market_label,
+                        broker_label=broker_label,
                     )
 
+            _notify_review_callback_failure_groups(
+                events_path=events_path,
+                notifier=notifier,
+                trading_date=trading_date,
+                now=now,
+                market=market,
+                broker_label=broker_label,
+                failures=callback_failures,
+            )
+
             if once:
-                return _result(
-                    "completed",
-                    positions,
-                    trigger_count,
-                    exception_count,
-                    unknown_quote_count,
-                    events_path,
-                )
+                return outcome("completed" if snapshots_complete else "abnormal")
             sleep_fn(poll_seconds)
             now = now_fn()
     finally:
-        if client is not None:
+        if client is not None and close_quote_client:
             _close(client)
+
+
+def _notify_trend_review_deadline(
+    *,
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    now: datetime,
+    events_path: Path,
+    notifier: Notifier,
+) -> None:
+    deadline = time(15, 30) if market == "US" else time(10)
+    timezone = ZoneInfo("America/New_York") if market == "US" else SHANGHAI
+    if now.astimezone(timezone).time().replace(tzinfo=None) < deadline:
+        return
+    prior = load_watch_events(events_path)
+    legacy_notified = {
+        str(event.get("symbol") or "")
+        for event in prior
+        if event.get("event_type") == "trend_review_deadline_notified"
+        and event.get("trading_date") == trading_date
+    }
+    labels = {
+        "pending": "待执行",
+        "submitted": "已提交",
+        "partially_filled": "部分成交",
+        "failed": "失败",
+        "blocked": "受阻",
+        "missed": "错过",
+        "incomplete": "未完成",
+    }
+    root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / trading_date
+    )
+    events: list[Mapping[str, object]] = []
+    for action_dir in sorted(root.glob("*")):
+        event = _latest_valid_action(action_dir)
+        if event is None:
+            continue
+        symbol = str(event.get("symbol") or "")
+        status = str(event.get("status") or "")
+        if not symbol or symbol in legacy_notified or status == "filled":
+            continue
+        events.append(event)
+
+    delivered_non_feishu = legacy_notified | {
+        str(event.get("symbol") or "")
+        for event in prior
+        if event.get("event_type")
+        == "trend_review_deadline_notification_delivered_non_feishu"
+        and event.get("trading_date") == trading_date
+    }
+    for event in events:
+        symbol = str(event.get("symbol") or "")
+        status = str(event.get("status") or "")
+        if symbol in delivered_non_feishu:
+            continue
+        attempts = send_notification_with_results(
+            notifier,
+            f"趋势模拟执行未完成 · {trading_date}",
+            f"{symbol} · {labels.get(status, '状态未知')}",
+            channels={"macos", "xiaoai"},
+        )
+        if any(attempt.success for attempt in attempts):
+            append_watch_event(
+                events_path,
+                symbol=symbol,
+                trading_date=trading_date,
+                event_type=(
+                    "trend_review_deadline_notification_delivered_non_feishu"
+                ),
+                occurred_at=now.isoformat(timespec="seconds"),
+                last_price=None,
+                active_line=None,
+                market=market,
+                reason=status,
+                channel="non_feishu",
+            )
+
+    for group in group_order_alerts(market, events):
+        symbols = [item.symbol for item in group.items]
+        group_id = _order_group_id(
+            trading_date, market, group.side, group.status, symbols
+        )
+        title, message = render_order_alert(
+            group,
+            broker_label=BROKER_LABELS[market],
+            trading_date=trading_date,
+        )
+        _send_persisted_feishu_group(
+            events_path=events_path,
+            notifier=notifier,
+            trading_date=trading_date,
+            now=now,
+            market=market,
+            status=group.status,
+            event_prefix="trend_review_deadline_notification",
+            group_id=group_id,
+            symbols=symbols,
+            title=title,
+            message=message,
+        )
+
+
+def _latest_valid_action(action_dir: Path) -> Mapping[str, object] | None:
+    for path in reversed(sorted(action_dir.glob("*.json"))):
+        try:
+            event = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(event, Mapping):
+            return event
+    return None
+
+
+def _order_group_id(
+    trading_date: str,
+    market: str,
+    side: str,
+    status: str,
+    symbols: list[str],
+) -> str:
+    identity = "|".join((
+        trading_date,
+        market,
+        side,
+        status,
+        ",".join(sorted(symbols)),
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _run_review_callback(
@@ -485,6 +681,11 @@ def _run_review_callback(
     events_path: Path,
     trading_date: str,
     now: datetime,
+    notifier: Notifier,
+    market: str = "CN",
+    market_label: str = "A股",
+    broker_label: str = "东方财富",
+    failures: list[Mapping[str, object]] | None = None,
 ) -> int:
     try:
         callback(value)
@@ -499,9 +700,296 @@ def _run_review_callback(
             occurred_at=now.isoformat(timespec="seconds"),
             last_price=_optional_decimal(event.get("last_price")),
             active_line=_optional_decimal(event.get("active_line")),
+            market=market,
             reason=str(exc),
         )
+        prior_events = load_watch_events(events_path)
+        already_notified = any(
+            event.get("event_type") == "trend_review_callback_failure_notified"
+            and event.get("trading_date") == trading_date
+            and event.get("reason") == str(exc)
+            for event in prior_events
+        )
+        if not already_notified:
+            attempts = send_notification_with_results(
+                notifier,
+                f"趋势模拟执行失败 · {trading_date}",
+                str(exc),
+                channels={"macos", "xiaoai"},
+            )
+            if any(attempt.success for attempt in attempts):
+                append_watch_event(
+                    events_path,
+                    symbol=str(event.get("symbol") or ""),
+                    trading_date=trading_date,
+                    event_type="trend_review_callback_failure_notified",
+                    occurred_at=now.isoformat(timespec="seconds"),
+                    last_price=_optional_decimal(event.get("last_price")),
+                    active_line=_optional_decimal(event.get("active_line")),
+                    market=market,
+                    reason=str(exc),
+                )
+        if failures is not None:
+            failures.append({
+                **event,
+                "side": "sell",
+                "status": "failed",
+                "reason": str(exc),
+            })
+        else:
+            _notify_review_callback_batch_failure(
+                events_path=events_path,
+                notifier=notifier,
+                trading_date=trading_date,
+                now=now,
+                market=market,
+                market_label=market_label,
+                broker_label=broker_label,
+                reason=str(exc),
+            )
         return 1
+
+
+def _notify_review_callback_batch_failure(
+    *,
+    events_path: Path,
+    notifier: Notifier,
+    trading_date: str,
+    now: datetime,
+    market: str,
+    market_label: str,
+    broker_label: str,
+    reason: str,
+) -> None:
+    group_id = hashlib.sha256(
+        f"{trading_date}|{market}|failed".encode("utf-8")
+    ).hexdigest()
+    title, message = render_attention(
+        broker_label,
+        f"{market_label}批次执行失败",
+        trading_date,
+        happened="趋势模拟批次执行失败",
+        impact="相关订单状态需要人工核对",
+        action="查看不可变动作账本与控制器日志",
+        detail=brief_zh_detail(reason),
+    )
+    _send_persisted_feishu_group(
+        events_path=events_path,
+        notifier=notifier,
+        trading_date=trading_date,
+        now=now,
+        market=market,
+        status="failed",
+        event_prefix="trend_review_callback_failure_notification",
+        group_id=group_id,
+        symbols=[],
+        title=title,
+        message=message,
+    )
+
+
+def _notify_review_callback_failure_groups(
+    *,
+    events_path: Path,
+    notifier: Notifier,
+    trading_date: str,
+    now: datetime,
+    market: str,
+    broker_label: str,
+    failures: list[Mapping[str, object]],
+) -> None:
+    for group in group_order_alerts(market, failures):
+        symbols = [item.symbol for item in group.items]
+        group_id = _order_group_id(
+            trading_date, market, group.side, group.status, symbols
+        )
+        title, message = render_order_alert(
+            group,
+            broker_label=broker_label,
+            trading_date=trading_date,
+        )
+        _send_persisted_feishu_group(
+            events_path=events_path,
+            notifier=notifier,
+            trading_date=trading_date,
+            now=now,
+            market=market,
+            status=group.status,
+            event_prefix="trend_review_callback_failure_notification",
+            group_id=group_id,
+            symbols=symbols,
+            title=title,
+            message=message,
+        )
+
+
+def _send_persisted_feishu_group(
+    *,
+    events_path: Path,
+    notifier: Notifier,
+    trading_date: str,
+    now: datetime,
+    market: str,
+    status: str,
+    event_prefix: str,
+    group_id: str,
+    symbols: list[str],
+    title: str,
+    message: str,
+) -> None:
+    prior = [
+        event
+        for event in load_watch_events(events_path)
+        if event.get("group_id") == group_id
+        and str(event.get("event_type") or "").startswith(event_prefix)
+    ]
+    if any(
+        event.get("event_type") in {
+            f"{event_prefix}_delivered_feishu",
+            f"{event_prefix}_exhausted_feishu",
+        }
+        for event in prior
+    ):
+        return
+    attempt_count = sum(
+        event.get("event_type") == f"{event_prefix}_attempted_feishu"
+        for event in prior
+    )
+    if attempt_count >= 2:
+        return
+    first_attempt = next(
+        (
+            event
+            for event in prior
+            if event.get("event_type")
+            == f"{event_prefix}_attempted_feishu"
+        ),
+        None,
+    )
+    if first_attempt is not None:
+        title = str(first_attempt.get("notification_title") or title)
+        message = str(first_attempt.get("notification_message") or message)
+        stored_symbols = first_attempt.get("group_symbols")
+        if isinstance(stored_symbols, list) and all(
+            isinstance(symbol, str) for symbol in stored_symbols
+        ):
+            symbols = stored_symbols
+    attempts = send_notification_with_results(
+        notifier,
+        title,
+        message,
+        channels={"feishu", "feishu_app"},
+    )
+    append_watch_event(
+        events_path,
+        symbol="",
+        trading_date=trading_date,
+        event_type=f"{event_prefix}_attempted_feishu",
+        occurred_at=now.isoformat(timespec="seconds"),
+        last_price=None,
+        active_line=None,
+        market=market,
+        reason=status,
+        channel="feishu",
+        group_id=group_id,
+        notification_title=title,
+        notification_message=message,
+        group_symbols=symbols,
+    )
+    if any(attempt.success for attempt in attempts):
+        for symbol in symbols or [""]:
+            append_watch_event(
+                events_path,
+                symbol=symbol,
+                trading_date=trading_date,
+                event_type=f"{event_prefix}_delivered_feishu",
+                occurred_at=now.isoformat(timespec="seconds"),
+                last_price=None,
+                active_line=None,
+                market=market,
+                reason=status,
+                channel="feishu",
+                group_id=group_id,
+            )
+    elif attempt_count == 1:
+        append_watch_event(
+            events_path,
+            symbol="",
+            trading_date=trading_date,
+            event_type=f"{event_prefix}_exhausted_feishu",
+            occurred_at=now.isoformat(timespec="seconds"),
+            last_price=None,
+            active_line=None,
+            market=market,
+            reason=status,
+            channel="feishu",
+            group_id=group_id,
+        )
+
+
+def _retry_pending_callback_feishu_groups(
+    *,
+    events_path: Path,
+    notifier: Notifier,
+    trading_date: str,
+    now: datetime,
+    market: str,
+) -> None:
+    for prefix in (
+        "trend_review_callback_failure_notification",
+        "trend_review_deadline_notification",
+    ):
+        events = [
+            event
+            for event in load_watch_events(events_path)
+            if event.get("trading_date") == trading_date
+            and event.get("market") == market
+            and str(event.get("event_type") or "").startswith(prefix)
+        ]
+        group_ids = {
+            str(event.get("group_id") or "") for event in events
+        } - {""}
+        for group_id in sorted(group_ids):
+            group_events = [
+                event for event in events if event.get("group_id") == group_id
+            ]
+            attempts = [
+                event
+                for event in group_events
+                if event.get("event_type") == f"{prefix}_attempted_feishu"
+            ]
+            if len(attempts) != 1 or any(
+                event.get("event_type") in {
+                    f"{prefix}_delivered_feishu",
+                    f"{prefix}_exhausted_feishu",
+                }
+                for event in group_events
+            ):
+                continue
+            attempt = attempts[0]
+            title = attempt.get("notification_title")
+            message = attempt.get("notification_message")
+            symbols = attempt.get("group_symbols")
+            if (
+                not isinstance(title, str)
+                or not isinstance(message, str)
+                or not isinstance(symbols, list)
+                or not all(isinstance(symbol, str) for symbol in symbols)
+            ):
+                continue
+            _send_persisted_feishu_group(
+                events_path=events_path,
+                notifier=notifier,
+                trading_date=trading_date,
+                now=now,
+                market=market,
+                status=str(attempt.get("reason") or "failed"),
+                event_prefix=prefix,
+                group_id=group_id,
+                symbols=symbols,
+                title=title,
+                message=message,
+            )
 
 
 def _deliver_trigger_notification(
@@ -518,6 +1006,7 @@ def _deliver_trigger_notification(
     delivered_macos: set[str],
     replay: bool,
     market_label: str = "A股",
+    broker_label: str = "东方财富",
 ) -> None:
     if replay:
         message = (
@@ -529,24 +1018,33 @@ def _deliver_trigger_notification(
             f"最新价 {last_price} <= 活动保护线 {active_line}\n"
             "建议动作：全部卖出（人工执行）"
         )
-    for channels, event_type, delivered in (
+    for channels, event_type, delivered, title, body in (
         (
             {"feishu", "feishu_app"},
             "protection_triggered_notification_delivered_feishu",
             delivered_feishu,
+            *render_protection_alert(
+                broker_label,
+                market_label,
+                symbol,
+                last_price=last_price,
+                active_line=active_line,
+            ),
         ),
         (
             {"macos"},
             "protection_triggered_notification_delivered_macos",
             delivered_macos,
+            f"{market_label}保护线触发 · {symbol}",
+            message,
         ),
     ):
         if symbol in delivered:
             continue
         attempts = send_notification_with_results(
             notifier,
-            f"{market_label}保护线触发 · {symbol}",
-            message,
+            title,
+            body,
             channels=channels,
         )
         if any(attempt.success for attempt in attempts):
@@ -610,22 +1108,6 @@ def _deliver_trigger_notification(
         market=market_label,
         reason=reason,
     )
-    if attempt.success:
-        return
-    send_notification_with_results(
-        notifier,
-        "Open Trader 语音播报失败",
-        "\n".join(
-            [
-                f"市场：{market_label}",
-                f"标的：{position_name or symbol}（{symbol}）",
-                "原事件：活动保护线触发",
-                f"失败原因：{reason}",
-                "处理：语音不重试，请按原保护线通知人工确认。",
-            ]
-        ),
-        channels={"feishu", "feishu_app"},
-    )
 
 
 def _has_xiaoai_notifier(notifier: Notifier) -> bool:
@@ -665,6 +1147,14 @@ def _optional_decimal(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _monitor_interrupted(events_path: Path) -> bool:
+    for event in reversed(load_watch_events(events_path)):
+        event_type = event.get("event_type")
+        if event_type in {"monitor_interrupted", "monitor_recovered"}:
+            return event_type == "monitor_interrupted"
+    return False
+
+
 def _record_interruption(
     events_path: Path,
     notifier: Notifier,
@@ -688,6 +1178,7 @@ def _record_interruption(
         notifier,
         f"{market_label}价格监控中断",
         f"Futu OpenD 实时价格不可用：{error}\n请立即在{broker_label}人工核价。",
+        channels={"macos", "xiaoai"},
     )
 
 
@@ -712,6 +1203,7 @@ def _record_recovery(
         notifier,
         f"{market_label}价格监控恢复",
         "Futu OpenD 实时价格已恢复，活动保护线监控继续运行。",
+        channels={"macos", "xiaoai"},
     )
 
 

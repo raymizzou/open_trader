@@ -246,6 +246,9 @@ def _run_import(
         )
 
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
+    uploaded_portfolio_rows = build_portfolio_rows(
+        month, uploaded_positions, uploaded_cash, fx_provider
+    )
     latest_portfolio_rows = portfolio_rows
 
     eastmoney_mode = {parser.broker for parser in parser_list} == {"eastmoney"}
@@ -265,12 +268,7 @@ def _run_import(
             with latest_path.open(newline="", encoding="utf-8") as handle:
                 latest_portfolio_rows = replace_broker_portfolio_rows(
                     list(csv.DictReader(handle)),
-                    build_portfolio_rows(
-                        month,
-                        uploaded_positions,
-                        uploaded_cash,
-                        fx_provider,
-                    ),
+                    uploaded_portfolio_rows,
                     replace_latest_broker,
                 )
     elif eastmoney_mode and latest_path.exists():

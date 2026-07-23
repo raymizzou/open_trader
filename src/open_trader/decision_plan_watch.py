@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from .daily_premarket import send_notification_with_results
 from .futu_watch import QuoteClientProtocol
 from .notifications import Notifier
 from .plan_events import PlanEvent, append_plan_event, load_plan_events
@@ -130,19 +131,28 @@ def run_decision_plan_watch(
                         continue
                     trigger_count += 1
                     condition = conditions[event.condition_id]
-                    try:
-                        notifier.notify(
-                            f"交易计划触发 · {plan['market']}.{plan['symbol']}",
-                            _notification_message(plan, condition, snapshot.last_price),
-                        )
-                    except Exception as exc:
+                    attempts = send_notification_with_results(
+                        notifier,
+                        f"交易计划触发 · {plan['market']}.{plan['symbol']}",
+                        _notification_message(plan, condition, snapshot.last_price),
+                        channels={"macos", "xiaoai"},
+                    )
+                    failures = [
+                        attempt
+                        for attempt in attempts
+                        if not attempt.success and not attempt.suppressed
+                    ]
+                    if failures:
                         failed_count += 1
                         notification_type = "notification_failed"
-                        payload = {"error": str(exc) or exc.__class__.__name__}
-                    else:
+                        payload = {"error": failures[0].error or failures[0].error_type}
+                    elif attempts:
                         sent_count += 1
                         notification_type = "notification_sent"
                         payload = {}
+                    else:
+                        notification_type = "notification_suppressed"
+                        payload = {"reason": "feishu_disabled_by_policy"}
                     append_plan_event(events_path, PlanEvent(
                         event_id=uuid4().hex, plan_id=plan_id,
                         event_type=notification_type,

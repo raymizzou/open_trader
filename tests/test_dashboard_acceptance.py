@@ -1,9 +1,13 @@
+from datetime import datetime, timedelta
 from decimal import Decimal
+from collections.abc import Mapping
+import copy
 import inspect
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -11,12 +15,15 @@ import pytest
 
 from open_trader import dashboard_acceptance
 from open_trader.dashboard_acceptance import (
-    REQUIRED_SOURCE_PATHS,
     _is_actionable_console_error,
     classify_result,
     dashboard_signature,
     validate_dashboard_payload,
     validate_quotes_payload,
+)
+from open_trader.strategy_drawdown import (
+    automatic_bootstrap_strategy_drawdown,
+    strategy_parameter_hash,
 )
 
 
@@ -50,14 +57,21 @@ def serialized_trend_position() -> dict[str, object]:
 
 
 def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
-    makefile = Path("Makefile").read_text(encoding="utf-8")
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
 
+    assert "WORKTREE_ROOT := $(CURDIR)" in makefile
+    assert "REPOSITORY_ROOT :=" in makefile
+    assert "PYTHONSAFEPATH=1" in makefile
+    assert 'PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src"' in makefile
+    assert '"$(WORKTREE_ROOT)/tests" -q' in makefile
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
-    assert 'EXPECTED_CN ?= 4' in makefile
+    assert "test:\n\t.venv/bin/python -m pytest -q" in makefile
+    assert "acceptance: test" not in makefile
+    assert "EXPECTED_CN" not in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
     assert '--log "$(DASHBOARD_LOG)"' in makefile
-    assert '--expected-cn "$(EXPECTED_CN)"' in makefile
+    assert "--expected-cn" not in makefile
     assert "WAIT_SECONDS" not in makefile
     assert "--wait-seconds" not in makefile
 
@@ -204,6 +218,7 @@ def _run_acceptance_main_with_reports(
     browser_log_text: str = "",
     log_is_directory: bool = False,
     log_read_error: OSError | None = None,
+    controller_errors: list[str] | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -214,7 +229,12 @@ def _run_acceptance_main_with_reports(
     if log_is_directory:
         log_path.mkdir()
     else:
-        log_path.write_text("", encoding="utf-8")
+        log_path.write_text(
+            'dashboard_runtime: {"pid": 123, "git_sha": "accepted-sha", '
+            '"cwd": "' + str(worktree.resolve()) + '", "source_state": "clean", '
+            '"started_at": "2026-07-18T12:00:01+08:00"}\n',
+            encoding="utf-8",
+        )
     if log_read_error is not None:
         original_read_text = Path.read_text
 
@@ -241,6 +261,19 @@ def _run_acceptance_main_with_reports(
         lambda *args, **kwargs: "accepted-sha\n",
     )
     monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_at",
+        lambda *_args: datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "_source_changes", lambda *_args: []
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_expected_cn_holdings",
+        lambda *_args: 2,
+    )
+    monkeypatch.setattr(
         dashboard_acceptance, "_fetch_payload", lambda url: next(payloads)
     )
     monkeypatch.setattr(
@@ -254,13 +287,42 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(
         dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
     )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "validate_integrated_candidate",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_trend_controller_errors",
+        lambda *args, **kwargs: list(controller_errors or []),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_configured_simulate_account_ids",
+        lambda *_args: {"tiger": 1, "phillips": 2, "eastmoney": 3},
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_simulated_accounts",
+        lambda *_args: ({}, [], None),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_history_endpoints",
+        lambda *_args: ({}, []),
+    )
     def browser_check(
         url: str, expected_cn: int, payload: dict[str, object],
         reports_dir: Path | None = None,
+        simulate_payloads: object = None,
+        history_expectations: object = None,
     ) -> tuple[list[str], None]:
+        del simulate_payloads, history_expectations
         browser_reports.append(reports_dir)
         if browser_log_text:
-            log_path.write_text(browser_log_text, encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(browser_log_text)
         return [], None
 
     monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
@@ -309,6 +371,29 @@ def test_acceptance_main_fails_when_reports_dir_changes_during_refresh(
     assert browser_reports == [second.resolve()]
 
 
+def test_acceptance_main_fails_when_actual_refresh_changes_frozen_advice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+    signatures = iter((("first",), ("second",)))
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "trend_advice_signature",
+        lambda _payload: next(signatures),
+    )
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch, capsys, tmp_path, [reports, reports]
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "实盘刷新改写了冻结建议、Kelly 或模拟统计" in result["errors"]
+
+
 def test_acceptance_main_fails_on_traceback_written_during_browser_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -328,6 +413,27 @@ def test_acceptance_main_fails_on_traceback_written_during_browser_check(
     assert status == 1
     assert result["status"] == "FAIL"
     assert "日志包含错误标记：Traceback (most recent call last)" in result["errors"]
+
+
+def test_acceptance_main_fails_on_controller_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "shared" / "reports"
+    reports.mkdir(parents=True)
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        controller_errors=["tiger 控制器不可用或阻塞"],
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert "tiger 控制器不可用或阻塞" in result["errors"]
 
 
 @pytest.mark.parametrize(
@@ -411,6 +517,91 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
         dashboard_acceptance._check_trend_artifact_projection(
             reports, "tiger", projected
         )
+
+
+def test_acceptance_recognizes_only_strict_partial_sell_actions() -> None:
+    partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "AAPL",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 3,
+        "lot_size": 1,
+        "overheat_signals": ["boiling"],
+    }
+
+    assert not dashboard_acceptance._trend_action_needs_review(partial)
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": []}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "estimated_shares": 301, "lot_size": 100}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": ["boiling", "boiling"]}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": [{"signal": "boiling"}]}
+    )
+
+
+def test_acceptance_suppresses_partial_when_same_symbol_has_full_exit(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "SH.600001",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 300,
+        "lot_size": 100,
+        "overheat_signals": ["boiling"],
+    }
+    full = {"action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"}
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [partial, full],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "available": True,
+        "broker": "eastmoney",
+        "market": "CN",
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "sell_actions": [full],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 1, "buy": 0, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": "2026-07-15.json",
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "eastmoney", projected
+    )
 
 
 def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
@@ -544,7 +735,20 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         "data_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "sell_actions": [],
-        "buy_actions": [buy],
+        "buy_actions": [
+            {
+                **buy,
+                "execution": {
+                    "status": "missed",
+                    "filled_qty": "",
+                    "target_qty": "",
+                    "avg_fill_price": "",
+                    "order_ids": [],
+                    "updated_at": "2026-07-15T16:00:00-04:00",
+                    "reason": "buy_window_closed",
+                },
+            }
+        ],
         "hold_actions": [],
         "review_actions": [],
         "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
@@ -655,11 +859,14 @@ def trend_reports() -> dict[str, dict[str, object]]:
             "attention_markets": [
                 {
                     "market": "US", "market_label": "美股", "data_status": "current",
-                    "data_date": "2026-07-15", "items": [{"symbol": "VIXY"}],
+                    "data_date": "2026-07-15", "status_text": "今日已更新",
+                    "items": [{"symbol": "VIXY"}],
                 },
                 {
                     "market": "HK", "market_label": "港股", "data_status": "stale",
-                    "data_date": "2026-07-14", "items": [{"symbol": "00700"}],
+                    "data_date": "2026-07-14",
+                    "status_text": "数据截至 2026-07-14；今日未更新",
+                    "items": [{"symbol": "00700"}],
                 },
             ],
         },
@@ -821,7 +1028,685 @@ def valid_payload() -> dict[str, object]:
         ]},
         "trend_reports": trend_reports(),
         "trend_reviews": trend_reviews(),
+        "trend_controllers": trend_controllers(),
     }
+
+
+def trend_controllers() -> dict[str, dict[str, object]]:
+    return {
+        broker: {
+            "market": market,
+            "effective_mode": "execute",
+            "executor_host": "ray-mac",
+            "local_host": "ray-mac",
+            "health": "healthy",
+            "blocking": False,
+            "reason": "",
+            "pid": 4242,
+            "working_directory": "/srv/open_trader",
+            "git_sha": "abc1234",
+            "phase": "monitoring",
+            "heartbeat_at": "2026-07-21T09:31:00+08:00",
+            "last_success": {
+                "status": "missed_window",
+                "market": market,
+                "date": "2026-07-20",
+                "submitted_count": 0,
+                "artifact_paths": [],
+            },
+            "blocker": None,
+            "next_check_at": "2026-07-21T09:31:05+08:00",
+        }
+        for broker, market in (
+            ("tiger", "US"),
+            ("phillips", "HK"),
+            ("eastmoney", "CN"),
+        )
+    }
+
+
+def integrated_v4_payload(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path, dict[str, int]]:
+    from open_trader.trend_review import _report_hash
+
+    reports_dir = tmp_path / "reports"
+    account_ids = {"tiger": 102, "phillips": 103, "eastmoney": 101}
+    payload = valid_payload()
+    payload["data_dir"] = str(tmp_path / "data")
+    payload["kelly_lab"] = {
+        "available": True,
+        "template_count": 1,
+        "templates": [{"strategy_id": "trend_pullback_20d"}],
+    }
+    (tmp_path / "data/latest").mkdir(parents=True)
+    (tmp_path / "data/latest/kelly_strategy_templates.json").write_text(
+        json.dumps({
+            "schema_version": "open_trader.kelly_strategy_templates.v1",
+            "templates": [{"strategy_id": "trend_pullback_20d"}],
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "data/latest/trend_api_stats.json").write_text(
+        json.dumps({
+            "sources": [
+                {
+                    "source": "actual",
+                    "broker": broker,
+                    "market": market,
+                    "statistics_cutoff_at": "2026-07-20T08:59:59+08:00",
+                }
+                for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items()
+            ],
+        }),
+        encoding="utf-8",
+    )
+    labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
+    directories = {
+        "tiger": "trend_us_tiger",
+        "phillips": "trend_hk_phillips",
+        "eastmoney": "trend_a_share",
+    }
+    for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
+        pending = market == "HK"
+        lot_size = 100 if market in {"CN", "HK"} else 1
+        risk_summary = {
+            "status": "active",
+            "status_label": "风险预算内",
+            "single_entry_risk_limit_pct": "0.004",
+            "portfolio_risk_limit_pct": "0.04",
+            "abnormal_loss_buffer_pct": "0.01",
+            "total_risk_budget_target_pct": "0.05",
+            "disclaimer": "5% 是风险预算目标，不是最大损失保证。",
+            "kelly_phase": "active_all_samples",
+            "kelly_eligible_sample_count": 30,
+            "kelly_selected_sample_count": 30,
+            "kelly_cap": "0.01",
+            "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+        }
+        buy = {
+            "action": "BUY",
+            "symbol": {"CN": "600001", "HK": "00700", "US": "AAPL"}[market],
+            "target_weight": "0.04",
+            "estimated_shares": lot_size * 3,
+            "lot_size": lot_size,
+        }
+        frozen = {
+            "execution_date": "2026-07-20",
+            "as_of_date": "2026-07-17",
+            "generated_at": "2026-07-20T09:00:00+08:00",
+            "metadata": {
+                "market": market,
+                "broker": broker,
+                "simulate_acc_id": account_ids[broker],
+            },
+            "account": serialized_trend_account(fresh=True),
+            "strategy_snapshot": {
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+                "strategy_version": "v4",
+                "process_version": "a" * 40,
+                "parameters": {
+                    "single_entry_risk_limit": "0.004",
+                    "portfolio_risk_limit": "0.04",
+                    "abnormal_loss_buffer": "0.01",
+                    "drawdown_limit": "0.05",
+                    **(
+                        {"lot_size_source": "Futu 每标的整手"}
+                        if market == "HK"
+                        else {"lot_size": lot_size}
+                    ),
+                    "target_weight": (
+                        {"热": "0.04", "沸": "0.02"}
+                        if market == "CN"
+                        else "0.04"
+                    ),
+                },
+            },
+            "strategy_judgments": {
+                "formal_actions": [] if pending else [buy],
+                "holding_decisions": [],
+                "top10_candidates": [],
+                "risk_skips": [],
+            },
+            "risk_summary": risk_summary,
+            "drawdown_summary": {
+                "state_status": "ok",
+                "status": "pending" if pending else "active",
+                "status_label": "等待下一交易日" if pending else "纪律内",
+                "entry_allowed": not pending,
+                "drawdown_pct": "0",
+                "drawdown_limit_pct": "0.05",
+                "pause_reason": (
+                    "回撤基准将在 2026-07-21 起允许新开仓" if pending else ""
+                ),
+                "bootstrap_event": {
+                    "event_id": "automatic-bootstrap-audit",
+                    "baseline_equity": "100000",
+                    "source_date": "2026-07-17",
+                    "accepted_git_sha": "a" * 40,
+                    "parameter_hash": "b" * 64,
+                    "actor": "acceptance",
+                    "occurred_at": "2026-07-20T08:00:00+08:00",
+                    "entry_eligible_from": "2026-07-21" if pending else "2026-07-20",
+                },
+            },
+            "data_sources": [f"Futu {market} SIMULATE account"],
+        }
+        frozen["drawdown_summary"]["bootstrap_event"][  # type: ignore[index]
+            "parameter_hash"
+        ] = strategy_parameter_hash(
+            frozen["strategy_snapshot"]["parameters"]  # type: ignore[index]
+        )
+        artifact = reports_dir / directories[broker] / "2026-07-20.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text(json.dumps(frozen), encoding="utf-8")
+        report = payload["trend_reports"][broker]  # type: ignore[index]
+        assert isinstance(report, dict)
+        report.update({
+            "available": True,
+            "data_status": "current",
+            "account_fresh": True,
+            "broker": broker,
+            "broker_label": labels[broker],
+            "market": market,
+            "artifact": artifact.name,
+            "report_sha256": _report_hash(frozen),
+            "strategy_version": "v4",
+            "buy_actions": [] if pending else [buy],
+            "sell_actions": [],
+            "hold_actions": [],
+            "review_actions": [],
+            "risk_skips": [],
+            "risk_summary": {
+                **risk_summary,
+                "trade_stats": {
+                    "available": True,
+                    "statistics_cutoff_at": "2026-07-20T08:59:59+08:00",
+                    "actual_broker": broker,
+                    "actual_broker_label": labels[broker],
+                    "simulation": {"eligible_sample_count": 30},
+                    "actual": {"eligible_sample_count": 2},
+                },
+            },
+            "drawdown_summary": frozen["drawdown_summary"],
+            "actual_overlay": {
+                "available": True,
+                "broker": broker,
+                "broker_label": labels[broker],
+                "market": market,
+                "notice": (
+                    "只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；"
+                    "系统不会自动交易真实账户。"
+                ),
+                "items": [{"deviation_label": "已跟随"}],
+                "outside_positions": [],
+            },
+            "audit": {"artifact": artifact.name},
+        })
+    return payload, reports_dir, account_ids
+
+
+def test_acceptance_validates_integrated_templates_and_three_market_reports(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("artifact", "expected"),
+    [
+        ("kelly_strategy_templates.json", "Kelly 模板"),
+        ("trend_api_stats.json", "交易统计来源"),
+    ],
+)
+def test_acceptance_reports_malformed_integrated_artifact_container(
+    tmp_path: Path, artifact: str, expected: str,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    (tmp_path / "data/latest" / artifact).write_text("[]", encoding="utf-8")
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any(expected in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("template", "Kelly 模板"),
+        ("account", "模拟账户"),
+        ("risk", "单笔风险"),
+        ("lot", "整手"),
+        ("stats", "实盘统计券商"),
+        ("cutoff", "来源截止时间"),
+        ("overlay", "实盘辅助"),
+        ("drawdown_missing", "回撤状态缺失"),
+    ],
+)
+def test_acceptance_rejects_integrated_contract_drift(
+    tmp_path: Path, mutation: str, expected: str,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    if mutation == "template":
+        payload["kelly_lab"]["templates"] = []  # type: ignore[index]
+    elif mutation == "account":
+        artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+        frozen = json.loads(artifact.read_text(encoding="utf-8"))
+        frozen["metadata"]["simulate_acc_id"] = 999
+        artifact.write_text(json.dumps(frozen), encoding="utf-8")
+        from open_trader.trend_review import _report_hash
+        report["report_sha256"] = _report_hash(frozen)
+    elif mutation == "risk":
+        report["risk_summary"]["single_entry_risk_limit_pct"] = "0.4"  # type: ignore[index]
+    elif mutation == "lot":
+        report["buy_actions"][0]["estimated_shares"] = 3.5  # type: ignore[index]
+    elif mutation == "stats":
+        report["risk_summary"]["trade_stats"]["actual_broker"] = "eastmoney"  # type: ignore[index]
+    elif mutation == "cutoff":
+        report["risk_summary"]["trade_stats"][  # type: ignore[index]
+            "statistics_cutoff_at"
+        ] = "2026-07-21T00:00:00+08:00"
+    elif mutation == "drawdown_missing":
+        report["drawdown_summary"]["state_status"] = "missing"  # type: ignore[index]
+    else:
+        report["actual_overlay"]["broker"] = "eastmoney"  # type: ignore[index]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any(expected in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("process", "冻结 Kelly/回撤 v4 策略身份"),
+        ("stale", "当前真实数据"),
+        ("account", "模拟账户快照不是最新"),
+    ],
+)
+def test_acceptance_rejects_noncandidate_or_stale_integrated_report(
+    tmp_path: Path, mutation: str, expected: str,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    if mutation == "process":
+        artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+        frozen = json.loads(artifact.read_text(encoding="utf-8"))
+        frozen["strategy_snapshot"]["process_version"] = "other-sha"
+        artifact.write_text(json.dumps(frozen), encoding="utf-8")
+        from open_trader.trend_review import _report_hash
+        report["report_sha256"] = _report_hash(frozen)
+    elif mutation == "stale":
+        report["data_status"] = "stale"
+    else:
+        report["account_fresh"] = False
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any(expected in error for error in errors)
+
+
+def test_acceptance_rejects_frozen_parameter_audit_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    frozen["drawdown_summary"]["bootstrap_event"]["parameter_hash"] = "c" * 64
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any("冻结策略参数与回撤审计身份" in error for error in errors)
+
+
+def test_acceptance_allows_only_the_audited_v4_overheat_trim_compatibility(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    parameters = frozen["strategy_snapshot"]["parameters"]
+    assert isinstance(parameters, dict)
+    old_parameters = dict(parameters)
+    updated_parameters = {
+        **old_parameters,
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+    }
+    decision = automatic_bootstrap_strategy_drawdown(
+        tmp_path / "state",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        parameters=old_parameters,
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    decision = automatic_bootstrap_strategy_drawdown(
+        tmp_path / "state",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        parameters=updated_parameters,
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha="b" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-21T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from=None,
+    )
+    frozen["strategy_snapshot"]["parameters"] = updated_parameters
+    frozen["drawdown_summary"]["bootstrap_event"]["parameter_hash"] = (
+        strategy_parameter_hash(old_parameters)
+    )
+    frozen["drawdown_summary"]["parameter_compatibility_event"] = decision[
+        "parameter_compatibility_event"
+    ]
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+    frozen["strategy_snapshot"]["parameters"] = old_parameters
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    rollback_errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+    assert any("冻结策略参数与回撤审计身份" in error for error in rollback_errors)
+
+    frozen["strategy_snapshot"]["parameters"] = updated_parameters
+    frozen["strategy_snapshot"]["parameters"]["overheat_trim_fraction"] = "0.31"
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+    assert any("冻结策略参数与回撤审计身份" in error for error in errors)
+
+
+def test_trend_advice_signature_allows_overlay_refresh_only(tmp_path: Path) -> None:
+    first, _reports_dir, _account_ids = integrated_v4_payload(tmp_path)
+    second = copy.deepcopy(first)
+    second_report = second["trend_reports"]["tiger"]  # type: ignore[index]
+    second_report["actual_overlay"]["items"] = [{"deviation_label": "超买"}]  # type: ignore[index]
+
+    assert dashboard_acceptance.trend_advice_signature(
+        first
+    ) == dashboard_acceptance.trend_advice_signature(second)
+
+    second_report["risk_summary"]["trade_stats"]["actual"] = {  # type: ignore[index]
+        "eligible_sample_count": 3,
+    }
+    assert dashboard_acceptance.trend_advice_signature(
+        first
+    ) != dashboard_acceptance.trend_advice_signature(second)
+
+    second = copy.deepcopy(first)
+    second_report = second["trend_reports"]["tiger"]  # type: ignore[index]
+    second_report["buy_actions"][0]["estimated_shares"] = 4  # type: ignore[index]
+    assert dashboard_acceptance.trend_advice_signature(
+        first
+    ) != dashboard_acceptance.trend_advice_signature(second)
+
+
+def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
+    report = {
+        "report_date": "2026-07-20",
+        "risk_summary": {
+            "status": "active", "status_label": "风险预算内",
+            "trade_stats": {"actual_broker_label": "东方财富"},
+        },
+        "drawdown_summary": {
+            "status_label": "纪律内",
+            "bootstrap_event": {
+                "event_id": "automatic-bootstrap-audit",
+                "baseline_equity": "100000",
+                "source_date": "2026-07-17",
+                "accepted_git_sha": "candidate-sha",
+                "parameter_hash": "parameter-hash",
+                "actor": "acceptance",
+                "occurred_at": "2026-07-20T08:00:00+08:00",
+                "entry_eligible_from": "2026-07-20",
+            },
+            "recovery_event": {
+                "event_id": "snapshot-recovery-audit",
+                "snapshot": "snapshot.json",
+                "state_sha256": "state-hash",
+                "actor": "acceptance",
+                "occurred_at": "2026-07-20T08:30:00+08:00",
+            },
+        },
+        "actual_overlay": {
+            "broker_label": "东方财富",
+            "items": [{"deviation_label": "超买"}],
+            "outside_positions": [{"deviation_label": "报告外加仓"}],
+        },
+    }
+    text = " ".join((
+        "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
+        "Kelly 阶段 当前 Kelly 上限 富途模拟盘交易统计 东方财富实盘交易统计",
+        "策略累计回撤 纪律内 实盘执行辅助 东方财富 超买 报告外加仓",
+        "基准已自动建立 回撤基准审计详情 100,000 2026-07-17 automatic-bootstrap-audit ",
+        "candidate-sha parameter-hash acceptance 2026-07-20T08:00:00+08:00 2026-07-20 ",
+        "状态恢复审计详情 snapshot-recovery-audit snapshot.json state-hash 2026-07-20T08:30:00+08:00",
+        "5% 是风险预算目标，不是最大损失保证。",
+        "不会改写模拟建议、Kelly、模拟统计或报告哈希 不会自动交易真实账户",
+    ))
+
+    clicked: list[str] = []
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self) -> str:
+            return text
+
+        def all_inner_texts(self) -> list[str]:
+            assert self.selector == ".trend-stage:visible"
+            return ["正式买入 30.59 保护线 23.43"]
+
+        def locator(self, selector: str) -> "Locator":
+            return Locator(f"{self.selector} {selector}")
+
+        def click(self) -> None:
+            clicked.append(self.selector)
+
+        def get_attribute(self, name: str) -> str | None:
+            assert name == "data-risk-status"
+            return "active"
+
+    class Root:
+        def inner_text(self) -> str:
+            return text
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    dashboard_acceptance._check_integrated_trend_ui(
+        Root(), report, "eastmoney"
+    )
+    assert ".trend-risk-summary .trend-drawdown-bootstrap-audit summary" in clicked
+    assert ".trend-risk-summary .trend-drawdown-recovery-audit summary" in clicked
+
+
+def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
+    dashboard_acceptance._check_visible_decimal_precision(
+        "模拟持仓 485 / 1,296 成本 30.59 保护线 23.43", "模拟盘"
+    )
+    with pytest.raises(AssertionError, match="超过两位小数"):
+        dashboard_acceptance._check_visible_decimal_precision(
+            "成本 30.594999", "模拟盘"
+        )
+
+
+def simulation_overlay_root(rendered_quantity: str) -> tuple[object, list[str]]:
+    checked: list[str] = []
+
+    class Locator:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self) -> str:
+            if self.name == "simulation":
+                return "模拟盘执行状态 · 富途"
+            assert self.name == "GPN"
+            return f"GPN 模拟持仓 {rendered_quantity}"
+
+        def all_inner_texts(self) -> list[str]:
+            assert self.name == "facts"
+            checked.append("facts")
+            return [f"模拟持仓 {rendered_quantity}"]
+
+        def locator(self, selector: str) -> "Locator":
+            if self.name == "simulation":
+                assert selector == '[data-simulation-symbol="GPN"]'
+                checked.append("row:GPN")
+                return Locator("GPN")
+            assert self.name == "GPN"
+            if selector == ".trend-actual-facts span":
+                return Locator("facts")
+            assert selector == "[data-deviation]"
+            return Locator("status")
+
+        def get_attribute(self, name: str) -> str | None:
+            assert self.name == "status" and name == "data-deviation"
+            checked.append(f"attribute:{self.name}")
+            return "followed"
+
+    class Root:
+        def locator(self, selector: str) -> Locator:
+            assert selector == ".trend-simulation-overlay"
+            return Locator("simulation")
+
+    return Root(), checked
+
+
+def test_acceptance_cross_checks_review_hold_simulation_overlay() -> None:
+    root, checked = simulation_overlay_root("485")
+
+    dashboard_acceptance._check_report_simulation_overlay(
+        root,
+        {
+            "hold_actions": [],
+            "review_actions": [{"action": "HOLD", "symbol": "GPN"}],
+        },
+        {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
+        "tiger",
+    )
+
+    assert "row:GPN" in checked
+    assert "facts" in checked
+    assert "attribute:status" in checked
+
+
+@pytest.mark.parametrize("rendered_quantity", ["485.1", "4850"])
+def test_acceptance_rejects_inexact_simulation_quantity(
+    rendered_quantity: str,
+) -> None:
+    root, _checked = simulation_overlay_root(rendered_quantity)
+
+    with pytest.raises(AssertionError, match="模拟盘数量未显示"):
+        dashboard_acceptance._check_report_simulation_overlay(
+            root,
+            {
+                "hold_actions": [{"action": "HOLD", "symbol": "GPN"}],
+                "review_actions": [],
+            },
+            {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
+            "tiger",
+        )
+
+
+def test_acceptance_formats_arbitrary_size_number_without_integer_conversion() -> None:
+    integer = "00" + "1" * 4_998
+    grouped = re.sub(r"\B(?=(\d{3})+(?!\d))", ",", integer)
+
+    assert dashboard_acceptance._display_number(f"+{integer}.005") == (
+        f"+{grouped}.01"
+    )
 
 
 def test_acceptance_checks_exact_trend_review_content() -> None:
@@ -1146,6 +2031,8 @@ def trend_workspace_text(
 
 
 def option_attention_market_status(market: dict[str, object]) -> str:
+    if market.get("status_text"):
+        return str(market["status_text"])
     status = market.get("data_status")
     if status == "current":
         return "今日已更新"
@@ -1210,8 +2097,9 @@ def trend_stage_texts(broker: str) -> list[str]:
 def trend_audit_text(broker: str) -> str:
     if broker == "eastmoney":
         return (
-            "审计详情 完整候选审计 600000 浦发银行 强度 94 "
-            "排除项 600000 趋势强度低于 95 行业集中度 无 "
+            "审计详情 为什么没有进入买入名单 候选 1 通过 0 排除 1 "
+            "600000 浦发银行 已排除 · 1 项未通过 趋势强度 94 → 要求：不低于 95 "
+            "查看全部字段 行业集中度 无 "
             "数据来源：Trend Animals、Futu CN calendar/QFQ daily K-line API 成本：2.00"
         )
     if broker == "phillips":
@@ -1225,8 +2113,9 @@ def trend_audit_text(broker: str) -> str:
 def trend_audit_sections(broker: str) -> list[str]:
     if broker == "eastmoney":
         return [
-            "完整候选审计 600000 浦发银行 强度 94",
-            "排除项 600000 趋势强度低于 95",
+            "为什么没有进入买入名单 候选 1 通过 0 排除 1 "
+            "600000 浦发银行 已排除 · 1 项未通过 趋势强度 94 → 要求：不低于 95 "
+            "查看全部字段",
             "行业集中度 无",
         ]
     if broker == "phillips":
@@ -1300,6 +2189,15 @@ class TabbedAccountLocator:
             self.page.selected_brokers.append(self.page.selected)
             self.page._record_visible_sections()
             return
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            assert broker == self.page.selected
+            self.page.account_views[broker] = match.group(2)
+            return
         if self.selector == '[data-market="CN"]':
             self.page.market = "CN"
             return
@@ -1328,6 +2226,14 @@ class TabbedAccountLocator:
             return
         if self.selector == "#trend-report-workspace:visible .trend-audit summary":
             self.page.active = self.selector
+            return
+        if self.selector == (
+            '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        ):
+            self.page.workspace_view = "detail"
+            return
+        if self.selector == "[data-back-to-holdings]:visible":
+            self.page.workspace_view = "portfolio"
             return
         if self.selector == "#open-kelly-lab":
             self.page.workspace_view = "kelly"
@@ -1379,6 +2285,12 @@ class TabbedAccountLocator:
             return 1
         if self.selector in VISUAL_CONTRACT_STYLES:
             return 1
+        if self.selector == (
+            '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        ):
+            return 1
+        if self.selector == "[data-back-to-holdings]:visible":
+            return int(self.page.workspace_view == "detail")
         if self.selector == "#open-kelly-lab":
             return 1
         if self.selector == ".kelly-lab-panel:visible":
@@ -1411,6 +2323,13 @@ class TabbedAccountLocator:
             return int(
                 self.page.trend_broker is None and self.page.selected == broker
             )
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            return int(broker != "futu" and self.page.selected == broker)
         match = re.fullmatch(
             r'#account-(\w+):visible \[data-statement-upload="(\w+)"\]:visible',
             self.selector,
@@ -1522,6 +2441,11 @@ class TabbedAccountLocator:
             return int(self.page.trend_broker is None)
         if self.selector == "#trend-report-workspace:visible .cn-trend-report":
             return int(self.page.trend_broker is not None)
+        if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            return int(
+                self.page.trend_broker is not None
+                and self.page.trend_broker != self.page.missing_controller_broker
+            )
         if self.selector == "#trend-report-workspace:visible .trend-discipline[open]":
             return int(self.page.trend_broker == "eastmoney") * (
                 0 if self.page.viewport_size["width"] <= 760 else 2
@@ -1530,6 +2454,15 @@ class TabbedAccountLocator:
             return 2 if self.page.trend_broker == "eastmoney" else 0
         if self.selector == "#trend-report-workspace:visible .cn-trend-table":
             return 4 if self.page.trend_broker is not None else 0
+        if self.selector in {
+            "#trend-report-workspace:visible .cn-trend-execution",
+            "#trend-report-workspace:visible .cn-trend-execution span:first-child",
+        }:
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            return sum(
+                len(actions) if isinstance(actions, list) else 0
+                for actions in (report.get("sell_actions"), report.get("buy_actions"))
+            )
         if self.selector == (
             "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card"
         ):
@@ -1594,6 +2527,9 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown count selector: {self.selector}")
 
     def get_attribute(self, name: str) -> str | None:
+        if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            assert name == "data-health"
+            return str(self.page.controllers[str(self.page.trend_broker)]["health"])
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.option-attention-table "
             r"tbody:nth\((\d+)\) \.option-attention-row:nth\((\d+)\) "
@@ -1617,6 +2553,14 @@ class TabbedAccountLocator:
             broker = self._require_known_broker(match.group(1))
             assert name == "aria-selected"
             return str(broker == self.page.selected).lower()
+        match = re.fullmatch(
+            r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            assert name == "aria-selected"
+            return str(self.page.account_views[broker] == match.group(2)).lower()
         if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
             mobile = self.page.viewport_size["width"] <= 760
             return {
@@ -1665,6 +2609,43 @@ class TabbedAccountLocator:
                 ])
             broker = str(self.page.trend_broker)
             return self.page.workspace_texts[broker]
+        if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            controller = self.page.controllers[str(self.page.trend_broker)]
+            headline = (
+                "只读部署，不运行本机控制器"
+                if controller["effective_mode"] == "readonly"
+                else "控制器不可用"
+                if controller["health"] == "unavailable"
+                else "执行主机控制器正常"
+            )
+            last_success = controller["last_success"]
+            if isinstance(last_success, Mapping):
+                artifacts = last_success.get("artifact_paths")
+                artifact_text = (
+                    "，".join(str(item) for item in artifacts)
+                    if isinstance(artifacts, list) and artifacts
+                    else "无"
+                )
+                last_success = " · ".join((
+                    f"状态 {last_success.get('status')}",
+                    f"市场 {last_success.get('market')}",
+                    f"日期 {last_success.get('date')}",
+                    f"提交数 {last_success.get('submitted_count')}",
+                    f"产物 {artifact_text}",
+                ))
+            return " ".join(str(value) for value in (
+                "策略控制器", headline,
+                "执行模式", controller["effective_mode"],
+                "执行主机", controller["executor_host"],
+                "本地主机", controller["local_host"],
+                "PID", controller["pid"] if controller["pid"] is not None else "—",
+                "Git SHA", controller["git_sha"],
+                "当前阶段", controller["phase"],
+                "心跳", controller["heartbeat_at"],
+                "最近成功", last_success,
+                "当前阻塞", controller["blocker"],
+                "下次检查", controller["next_check_at"],
+            ))
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.option-attention-table "
             r"tbody:nth\((\d+)\)",
@@ -1721,6 +2702,25 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown inner_text selector: {self.selector}")
 
     def all_inner_texts(self) -> list[str]:
+        if self.selector == (
+            "#trend-report-workspace:visible .trend-controller-status dl div"
+        ):
+            controller = self.page.controllers[str(self.page.trend_broker)]
+            return [
+                f"{label}\n{value if value not in (None, '') else '—'}"
+                for label, value in (
+                    ("执行模式", controller["effective_mode"]),
+                    ("执行主机", controller["executor_host"]),
+                    ("本地主机", controller["local_host"]),
+                    ("PID", controller["pid"]),
+                    ("Git SHA", controller["git_sha"]),
+                    ("当前阶段", controller["phase"]),
+                    ("心跳", controller["heartbeat_at"]),
+                    ("最近成功", controller["last_success"]),
+                    ("当前阻塞", controller["blocker"]),
+                    ("下次检查", controller["next_check_at"]),
+                )
+            ]
         if self.selector == (
             '#trend-report-workspace:visible .option-attention-table '
             'thead th[scope="col"]'
@@ -1813,6 +2813,31 @@ class TabbedAccountLocator:
             return trend_audit_sections(broker)
         if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
+        if self.selector == (
+            "#trend-report-workspace:visible .cn-trend-execution span:first-child"
+        ):
+            report = self.page.reports[broker]
+            actions = [
+                *report.get("sell_actions", []),
+                *report.get("buy_actions", []),
+            ]
+            labels = {
+                "pending": "待执行",
+                "submitted": "已提交",
+                "partially_filled": "部分成交",
+                "filled": "全部成交",
+                "failed": "失败",
+                "blocked": "受阻",
+                "uncertain": "状态不确定，禁止自动重试",
+                "conflict": "订单事实冲突，禁止提交",
+                "missed": "已错过策略窗口",
+                "incomplete": "未完成",
+                "early_revision_executed": "早期版本已执行",
+            }
+            return [
+                labels.get((action.get("execution") or {}).get("status"), "待执行")
+                for action in actions
+            ]
         match = re.fullmatch(
             r"#account-(\w+):visible \.account-holding-row:visible td:nth-child\(2\)",
             self.selector,
@@ -1898,8 +2923,10 @@ class TabbedAccountPage:
         *,
         cn_rows: dict[str, int] | None = None,
     ) -> None:
-        self.reports = (payload or valid_payload())["trend_reports"]  # type: ignore[assignment,index]
-        self.reviews = (payload or valid_payload())["trend_reviews"]  # type: ignore[assignment,index]
+        source = payload or valid_payload()
+        self.reports = source["trend_reports"]  # type: ignore[assignment]
+        self.reviews = source["trend_reviews"]  # type: ignore[assignment]
+        self.controllers = source.get("trend_controllers", trend_controllers())  # type: ignore[assignment]
         self.section_texts = dict(ACCOUNT_SECTION_TEXTS)
         self.entry_texts = {
             broker: (
@@ -1939,6 +2966,7 @@ class TabbedAccountPage:
         self.market = "ALL"
         self.selected = "futu"
         self.tab_order = ["futu", "tiger", "phillips", "eastmoney"]
+        self.account_views = {broker: "real" for broker in self.tab_order}
         self.selected_brokers: list[str] = []
         self.visible_account_sections = 1
         self.max_visible_account_sections = 1
@@ -1953,6 +2981,7 @@ class TabbedAccountPage:
         self.bounds_checks: list[str] = []
         self.undersized_target_selector = ""
         self.overflow_bounds_selector = ""
+        self.missing_controller_broker = ""
         self.document_overflow_broker = ""
         self.document_overflow_checks: list[str | None] = []
         self.review_style_checks: list[str | None] = []
@@ -1984,6 +3013,8 @@ class TabbedAccountPage:
     def visible_rows(self, selector: str = "") -> int:
         match = re.search(r"#account-(\w+):visible", selector)
         broker = match.group(1) if match else self.selected
+        if self.account_views[broker] != "real":
+            return 0
         rows = self.cn_rows if self.market == "CN" else self.all_rows
         return rows[broker]
 
@@ -1992,7 +3023,9 @@ class TabbedAccountPage:
 
     def evaluate(
         self, expression: str, argument: object | None = None,
-    ) -> bool | list[int] | dict[str, object] | int | None:
+    ) -> bool | list[int] | dict[str, object] | Mapping[str, object] | int | None:
+        if expression == "broker => state.dashboard?.trend_controllers?.[broker] ?? null":
+            return self.controllers.get(str(argument))
         if "openResearchChat" in expression:
             self.script_evaluations.append((expression, argument))
             self.research_open = True
@@ -2186,6 +3219,14 @@ class TabbedAccountPage:
     def wait_for_timeout(self, milliseconds: int) -> None:
         assert milliseconds == 500
 
+    def wait_for_function(
+        self, expression: str, *, arg: object, timeout: int,
+    ) -> None:
+        assert '[data-account-view="real"]' in expression
+        assert timeout == 10_000
+        broker = str(arg)
+        assert self.account_views[broker] == "real"
+
 
 def tabbed_account_page(payload: dict[str, object]) -> TabbedAccountPage:
     return TabbedAccountPage(payload)
@@ -2197,34 +3238,320 @@ def tabbed_cn_page() -> TabbedAccountPage:
     })
 
 
+def test_acceptance_rejects_missing_trend_controller_card() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.missing_controller_broker = "tiger"
+
+    with pytest.raises(AssertionError, match="控制器"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            payload["trend_controllers"]["tiger"],  # type: ignore[index]
+        )
+
+
+def test_acceptance_rejects_unavailable_executor_controller() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({  # type: ignore[union-attr]
+        "health": "unavailable",
+        "blocking": True,
+        "phase": "unavailable",
+        "blocker": "controller heartbeat is stale",
+        "reason": "controller heartbeat is stale",
+    })
+
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    with pytest.raises(AssertionError, match="控制器不可用"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            controller,
+        )
+
+
+def test_acceptance_allows_readonly_controller_without_heartbeat() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({  # type: ignore[union-attr]
+        "effective_mode": "readonly",
+        "health": "readonly",
+        "blocking": False,
+        "pid": None,
+        "phase": "readonly",
+        "heartbeat_at": "",
+        "last_success": None,
+        "blocker": "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST",
+        "reason": "local host does not match OPEN_TRADER_TREND_EXECUTOR_HOST",
+        "next_check_at": "",
+    })
+
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+def test_acceptance_checks_readable_mapping_last_success_fields() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+@pytest.mark.parametrize("phase", ["reconciling", "recovering_report"])
+def test_acceptance_browser_allows_progress_before_first_success(
+    phase: str,
+) -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({"phase": phase, "last_success": None})  # type: ignore[union-attr]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+@pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
+def test_acceptance_browser_rejects_stable_phase_without_first_success(
+    phase: str,
+) -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({"phase": phase, "last_success": None})  # type: ignore[union-attr]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+
+    with pytest.raises(AssertionError, match="尚无首次成功"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            controller,
+        )
+
+
+def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
+) -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["heartbeat_at"] = "2026-07-21T09:31:05+08:00"
+    page.controllers["tiger"]["next_check_at"] = "2026-07-21T09:31:10+08:00"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+def test_acceptance_uses_browser_snapshot_when_controller_phase_advances() -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["phase"] = "reconciling"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
+
+
+@pytest.mark.parametrize(
+    "rendered_heartbeat",
+    ["not-a-time", "2026-07-21T09:30:59+08:00", "2026-07-21T09:37:00+08:00"],
+)
+def test_acceptance_rejects_invalid_or_unbounded_rendered_controller_heartbeat(
+    rendered_heartbeat: str,
+) -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["heartbeat_at"] = rendered_heartbeat
+
+    with pytest.raises(AssertionError, match="心跳"):
+        dashboard_acceptance._check_trend_controller_status(
+            page,
+            page.locator("#trend-report-workspace:visible"),
+            "tiger",
+            controller,
+        )
+
+
+def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
+    payload = valid_payload()
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert controller["health"] == "healthy"  # type: ignore[index]
+    report.update({  # type: ignore[union-attr]
+        "available": False,
+        "data_status": "unavailable",
+        "execution_batch": None,
+        "execution_batch_blocking": True,
+        "execution_batch_error": "执行批次无效，已阻止操作投影",
+        "status_text": "执行批次无效，已阻止操作投影",
+        "artifact": "",
+        "report_sha256": "",
+        "sell_actions": [],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "risk_skips": [],
+        "risk_summary": {},
+        "audit": {},
+        "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+    })
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert errors == [
+        "tiger 当前趋势报告执行批次阻断：执行批次无效，已阻止操作投影"
+    ]
+    with pytest.raises(AssertionError, match="tiger.*执行批次无效"):
+        dashboard_acceptance._check_trend_account_views(
+            object(), payload, {}, {}
+        )
+
+
 def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     class Locator:
-        def __init__(self, selector: str = "audit") -> None:
+        def __init__(
+            self, selector: str = "audit", has_text: str | None = None,
+        ) -> None:
             self.selector = selector
+            self.has_text = has_text
 
         def count(self) -> int:
-            return 1
+            return {
+                "audit": 1,
+                "table": 1,
+                "header": 5,
+                "rows": 1,
+                "identity": 1,
+                "status": 1,
+                "reasons": 1,
+                "details": 1,
+                "detail-summary": 1,
+                "industry-section": 1,
+                "excluded-heading": 0,
+            }.get(self.selector, 1)
 
         def get_attribute(self, _name: str) -> None:
             return None
 
-        def locator(self, selector: str) -> "Locator":
-            return Locator(selector)
+        def locator(
+            self, selector: str, **kwargs: object,
+        ) -> "Locator":
+            if self.selector == "audit" and selector == ".trend-audit-table":
+                return Locator("table")
+            if self.selector == "audit" and selector == "section h3":
+                return Locator(
+                    "excluded-heading"
+                    if kwargs.get("has_text") == "排除项"
+                    else "section-heading",
+                    kwargs.get("has_text") if isinstance(
+                        kwargs.get("has_text"), str
+                    ) else None,
+                )
+            if self.selector == "audit" and selector == "section":
+                return Locator("industry-section", kwargs.get("has_text"))
+            if self.selector == "table" and selector == "thead th":
+                return Locator("header")
+            if self.selector == "table" and selector == ".trend-audit-row":
+                return Locator("rows")
+            if self.selector == "rows" and selector == 'td[data-label="标的"]':
+                return Locator("identity")
+            if self.selector == "rows" and selector == (
+                'td[data-label="结论"] .trend-audit-status'
+            ):
+                return Locator("status")
+            if self.selector == "rows" and selector == ".trend-audit-reason":
+                return Locator("reasons")
+            if self.selector == "rows" and selector == ".trend-audit-more":
+                return Locator("details")
+            if self.selector == "details" and selector == "summary":
+                return Locator("detail-summary")
+            return Locator(selector, kwargs.get("has_text"))
+
+        def nth(self, index: int) -> "Locator":
+            assert self.selector == "rows" and index == 0
+            return self
 
         def click(self) -> None:
             return None
 
         def all_inner_texts(self) -> list[str]:
-            assert self.selector == "section"
-            return ["候选榜 无", "排除项 无", "账户不参与项 无", "行业集中度 无"]
+            if self.selector == "header":
+                return ["标的", "结论", "未通过项目", "已通过的关键事实", "审计"]
+            if self.selector == "reasons":
+                return ["趋势强度\n94 → 要求：不低于 95"]
+            raise AssertionError(f"unexpected all_inner_texts: {self.selector}")
 
         def inner_text(self) -> str:
-            return "审计详情 API 成本：未知"
+            return {
+                "audit": "审计详情 为什么没有进入买入名单 候选 1 通过 0 排除 1 "
+                "趋势强度 1 行业集中度 无 API 成本：未知",
+                "identity": "600000 浦发银行",
+                "status": "已排除 · 1 项未通过",
+                "industry-section": "行业集中度 无",
+                "detail-summary": "查看全部字段",
+            }.get(self.selector, "")
+
+        def evaluate(self, expression: str) -> bool:
+            assert expression == "node => node.scrollWidth <= node.clientWidth"
+            return True
+
+        def evaluate_all(self, expression: str) -> list[dict[str, object]]:
+            assert self.selector == "detail-summary"
+            assert "getBoundingClientRect" in expression
+            return [{"height": 44, "label": "查看全部字段"}]
+
+    class MobilePage:
+        viewport_size = {"width": 375, "height": 844}
+
+        def locator(self, selector: str) -> Locator:
+            assert selector == ".trend-audit-more summary"
+            return Locator("detail-summary")
 
     report = {
         "audit": {
-            "candidates": [],
-            "excluded": {},
+            "strategy_parameters": {"min_strength": "95"},
+            "candidates": [{
+                "symbol": "600000",
+                "name": "浦发银行",
+                "eligible": False,
+                "strength": "94",
+                "excluded_reasons": ["strength_below_95"],
+            }],
+            "excluded": {"600000": ["strength_below_95"]},
             "industry_concentration": [],
             "data_sources": [],
             "actual_api_cost": None,
@@ -2232,51 +3559,19 @@ def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
         },
     }
 
-    dashboard_acceptance._check_trend_audit(Locator(), report, "futu")
-
-
-def nested_get(row: dict[str, object], path: tuple[str, ...]) -> dict[str, object]:
-    value: object = row
-    for key in path:
-        value = value[key]  # type: ignore[index]
-    return value  # type: ignore[return-value]
-
-
-@pytest.mark.parametrize("path", REQUIRED_SOURCE_PATHS)
-def test_validate_dashboard_payload_rejects_each_missing_current_source(
-    path: tuple[str, ...],
-) -> None:
-    payload = valid_payload()
-    source = nested_get(payload["holdings"][-1], path)  # type: ignore[index]
-    source["available"] = False
-    source["status"] = "stale_source_hash"
-
-    errors = validate_dashboard_payload(payload, expected_cn=5)
-
-    assert any("US.MSFT" in error and path[-1] in error for error in errors)
-
-
-def test_validate_dashboard_payload_ignores_missing_sources_without_current_advice() -> None:
-    payload = valid_payload()
-    payload["holdings"][0]["tradingagents_summary"] = {  # type: ignore[index]
-        "available": False,
-        "status": "stale_source_hash",
-    }
-
-    assert validate_dashboard_payload(payload, expected_cn=5) == []
-
-
-def test_validate_dashboard_payload_accepts_explicitly_unsupported_source() -> None:
-    payload = valid_payload()
-    source = payload["holdings"][-1]["futu_skill_facts"]["technical_anomaly"]  # type: ignore[index]
-    source.update(
-        available=False,
-        unsupported=True,
-        status="error",
-        summary="富途接口不支持技术异动：US.MSFT",
+    dashboard_acceptance._check_trend_audit(Locator(), report, "eastmoney")
+    dashboard_acceptance._check_trend_audit(
+        Locator(), report, "eastmoney", page=MobilePage()
     )
 
-    assert validate_dashboard_payload(payload, expected_cn=5) == []
+    class MissingReasonCountLocator(Locator):
+        def inner_text(self) -> str:
+            return super().inner_text().replace("趋势强度 1 ", "")
+
+    with pytest.raises(AssertionError, match="原因统计"):
+        dashboard_acceptance._check_trend_audit(
+            MissingReasonCountLocator(), report, "eastmoney"
+        )
 
 
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
@@ -2286,12 +3581,13 @@ def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
     ) == "US:MSFT::5"
 
 
-def test_first_in_scope_holding_rejects_payload_without_current_advice() -> None:
+def test_first_in_scope_holding_ignores_current_advice_availability() -> None:
     payload = valid_payload()
     payload["holdings"][-1]["agent_report"]["available"] = False  # type: ignore[index]
 
-    with pytest.raises(AssertionError, match="advice-backed holding"):
-        dashboard_acceptance._first_in_scope_holding(payload)
+    assert dashboard_acceptance._first_in_scope_holding(payload) == (
+        "US", "MSFT", "tiger",
+    )
 
 
 def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> None:
@@ -2299,6 +3595,11 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
         def __init__(self, page: "Page", selector: str) -> None:
             self.page = page
             self.selector = selector
+
+        @property
+        def first(self) -> "Locator":
+            self.page.first_uses.append(self.selector)
+            return self
 
         def count(self) -> int:
             target_selectors = {
@@ -2318,6 +3619,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             if self.selector in target_selectors:
                 return 1
             counts = {
+                '.account-holding-actions button[data-detail-mode="t_signal"]:visible': 1,
+                "[data-back-to-holdings]:visible": int(self.page.view == "detail"),
                 "#open-kelly-lab": 1,
                 ".kelly-lab-panel:visible": int(self.page.view == "kelly"),
                 "#return-to-portfolio:visible": int(self.page.view != "portfolio"),
@@ -2336,6 +3639,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             self.page.clicks.append(self.selector)
             if self.selector == "#open-kelly-lab":
                 self.page.view = "kelly"
+            elif self.selector == '.account-holding-actions button[data-detail-mode="t_signal"]:visible':
+                self.page.view = "detail"
+            elif self.selector == "[data-back-to-holdings]:visible":
+                self.page.view = "portfolio"
             elif self.selector == "#open-standard-backtest":
                 self.page.view = "backtest"
             elif self.selector == "#return-to-portfolio:visible":
@@ -2359,6 +3666,7 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             self.clicks: list[str] = []
             self.evaluations: list[tuple[str, object | None]] = []
             self.target_checks: list[str] = []
+            self.first_uses: list[str] = []
 
         def locator(self, selector: str) -> Locator:
             return Locator(self, selector)
@@ -2376,9 +3684,15 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     )
 
     assert page.clicks == [
+        '.account-holding-actions button[data-detail-mode="t_signal"]:visible',
+        "[data-back-to-holdings]:visible",
         "#open-kelly-lab", "#return-to-portfolio:visible",
         "#open-standard-backtest", "#return-to-portfolio:visible",
         "#research-chat-close:visible",
+    ]
+    assert page.first_uses == [
+        '.account-holding-actions button[data-detail-mode="t_signal"]:visible',
+        "[data-back-to-holdings]:visible",
     ]
     assert len(page.evaluations) == 1
     assert page.target_checks == [
@@ -2495,147 +3809,6 @@ def test_tabbed_acceptance_fake_rejects_unknown_broker_everywhere() -> None:
     with pytest.raises(AssertionError, match="unknown broker"):
         dashboard_acceptance._select_account_tab(page, "futtu")
     assert page.selected == original_broker
-
-
-def test_check_decision_tabs_uses_exact_holding_and_checks_every_panel() -> None:
-    selectors: list[str] = []
-    clicks: list[str] = []
-
-    class Locator:
-        def __init__(
-            self, kind: str, index: int = 0, visible: tuple[bool, ...] = (True,),
-        ) -> None:
-            self.kind = kind
-            self.index = index
-            self.visible = visible
-
-        def count(self) -> int:
-            return {
-                "button": len(self.visible), "tabs": 5, "failed": 0, "panel": 1,
-                "account-tab": 1, "account-section": 1, "account-sections": 1,
-            }[self.kind]
-
-        @property
-        def first(self) -> "Locator":
-            return Locator(self.kind, self.index, self.visible[:1])
-
-        def click(self) -> None:
-            if self.kind == "button":
-                assert self.visible[0], "clicked hidden duplicate"
-            clicks.append(self.kind)
-
-        def all_inner_texts(self) -> list[str]:
-            return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
-
-        def nth(self, index: int) -> "Locator":
-            return Locator("tab", index)
-
-        def get_attribute(self, name: str) -> str:
-            if self.kind == "account-tab":
-                assert name == "aria-selected"
-                return "true"
-            assert name == "aria-controls"
-            return f"decision-panel-{self.index}"
-
-        def inner_text(self) -> str:
-            if self.index == 0:
-                return "回测闸门 夏普比率 1.2 卡玛比率 0.8"
-            if self.index == 2:
-                return "当前价 710.55"
-            return "source data"
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            selectors.append(selector)
-            if selector == '#account-tabs [data-broker="tiger"]':
-                return Locator("account-tab")
-            if selector == "#account-tiger:visible":
-                return Locator("account-section")
-            if selector == ".account-section:visible":
-                return Locator("account-sections")
-            button_selector = (
-                'button[data-detail-mode="decision"]'
-                '[data-detail-market="US"]'
-                '[data-detail-symbol="MSFT"]'
-            )
-            if selector == button_selector:
-                return Locator("button", visible=(False, True))
-            if selector == f"{button_selector}:visible":
-                return Locator("button")
-            if selector == ".decision-tab-list [data-decision-tab]":
-                return Locator("tabs")
-            if selector == ".decision-tab-list .decision-tab-failed":
-                return Locator("failed")
-            match = re.search(r"decision-panel-(\d+)", selector)
-            return Locator("panel", int(match.group(1)) if match else 0)
-
-    dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT", "tiger")
-
-    assert selectors[0] == '#account-tabs [data-broker="tiger"]'
-    assert selectors[3] == (
-        'button[data-detail-mode="decision"]'
-        '[data-detail-market="US"]'
-        '[data-detail-symbol="MSFT"]:visible'
-    )
-    assert clicks == ["account-tab", "button", "tab", "tab", "tab", "tab", "tab"]
-
-
-def test_check_decision_tabs_rejects_stale_initial_panel_after_tab_click() -> None:
-    class Locator:
-        def __init__(self, kind: str, index: int = 0) -> None:
-            self.kind = kind
-            self.index = index
-
-        def count(self) -> int:
-            if self.kind in {"button", "initial-panel", "account-tab", "account-section", "account-sections"}:
-                return 1
-            if self.kind == "tabs":
-                return 5
-            return 0
-
-        @property
-        def first(self) -> "Locator":
-            return self
-
-        def click(self) -> None:
-            pass
-
-        def all_inner_texts(self) -> list[str]:
-            return ["最终决策", "TradingAgents", "趋势 / K 线", "新闻 / 舆论", "富途异动"]
-
-        def nth(self, index: int) -> "Locator":
-            return Locator("tab", index)
-
-        def get_attribute(self, name: str) -> str:
-            if self.kind == "account-tab":
-                assert name == "aria-selected"
-                return "true"
-            assert name == "aria-controls"
-            return f"decision-panel-{self.index}"
-
-        def inner_text(self) -> str:
-            return "source data 夏普比率 1.2 卡玛比率 0.8"
-
-    class Page:
-        def locator(self, selector: str) -> Locator:
-            if selector == '#account-tabs [data-broker="futu"]':
-                return Locator("account-tab")
-            if selector == "#account-futu:visible":
-                return Locator("account-section")
-            if selector == ".account-section:visible":
-                return Locator("account-sections")
-            if selector.startswith('button[data-detail-mode="decision"]'):
-                return Locator("button")
-            if selector == ".decision-tab-list [data-decision-tab]":
-                return Locator("tabs")
-            if selector == ".decision-tab-panel:visible":
-                return Locator("initial-panel")
-            if selector == "#decision-panel-0:visible":
-                return Locator("initial-panel")
-            return Locator("missing")
-
-    with pytest.raises(AssertionError, match="TradingAgents"):
-        dashboard_acceptance._check_decision_tabs(Page(), "US", "MSFT", "futu")
 
 
 def test_acceptance_formats_grouped_numeric_expectations_without_touching_text() -> None:
@@ -3113,13 +4286,30 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     module.sync_playwright = Context  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "playwright", ModuleType("playwright"))
     monkeypatch.setitem(sys.modules, "playwright.sync_api", module)
+    def check_trend_views(
+        page: Page,
+        _payload: object,
+        _simulate_payloads: object,
+        _history_expectations: object,
+        *,
+        screenshot_dir: Path,
+    ) -> None:
+        width = page.viewport_size["width"]
+        page.screenshot(
+            path=str(screenshot_dir / f"{width}-trend-report.png"),
+            full_page=True,
+        )
+        if width in {1440, 375}:
+            page.screenshot(
+                path=str(screenshot_dir / f"{width}-trend-review.png"),
+                full_page=True,
+            )
+
     monkeypatch.setattr(
-        dashboard_acceptance,
-        "_check_decision_tabs",
-        lambda *_args: None,
+        dashboard_acceptance, "_check_trend_account_views", check_trend_views
     )
     errors, blocker = dashboard_acceptance._browser_check(
-        "http://dashboard", 5, payload
+        "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
     assert errors == [
@@ -3144,22 +4334,11 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     visual_focus_evaluations.clear()
     geometry_evaluations.clear()
     buy_overflow_evaluations.clear()
-    monkeypatch.setattr(
-        dashboard_acceptance,
-        "_check_decision_tabs",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("decision failed")),
-    )
-
     errors, blocker = dashboard_acceptance._browser_check(
-        "http://dashboard", 5, payload
+        "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
-    assert errors == [
-        "wide_desktop：AssertionError: decision failed",
-        "desktop：AssertionError: decision failed",
-        "tablet：AssertionError: decision failed",
-        "mobile：AssertionError: decision failed",
-    ]
+    assert errors == []
     assert blocker is None
     for viewport in ("wide_desktop", "desktop", "tablet", "mobile"):
         assert (viewport, '#broker-summary-cards [data-broker="phillips"]') in selectors
@@ -3185,45 +4364,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             viewport,
             '#account-futu:visible .trend-report-entry [data-trend-report]',
         ) in clicks
-        assert (
-            viewport,
-            '#account-phillips:visible .trend-report-entry [data-trend-report]',
-        ) in clicks
-        assert (
-            viewport,
-            '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
-        ) in clicks
-        for broker in ("tiger", "phillips", "eastmoney"):
-            assert (
-                viewport,
-                f'#account-{broker}:visible [data-trend-review="{broker}"]',
-            ) in clicks
         assert (viewport, '#return-to-portfolio:visible') in clicks
-        assert (
-            viewport,
-            '#trend-report-workspace:visible [data-close-trend-report]',
-        ) in clicks
         assert (viewport, '#trend-report-workspace:visible') in selectors
-        assert selectors.count(
-            (viewport, '#trend-report-workspace:visible .cn-trend-report')
-        ) == 3
-        assert selectors.count(
-            (viewport, '#trend-report-workspace:visible .cn-trend-stage')
-        ) == 3
-        assert selectors.count(
-            (viewport, '#trend-report-workspace:visible .cn-trend-table')
-        ) == 3
-        buy_rows = '#trend-report-workspace:visible .cn-trend-buy .cn-trend-card'
-        assert (viewport, buy_rows) in selectors
-        for label in (
-            "行业", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
-        ):
-            assert (
-                viewport,
-                f'{buy_rows}:nth(0) td[data-label="{label}"]',
-            ) in selectors
-        assert (viewport, '#trend-report-workspace:visible .trend-discipline') in selectors
-        assert (viewport, '.workspace-grid:visible') in selectors
         assert (viewport, '.account-section:visible') in selectors
         assert (viewport, '#account-tiger:visible') in selectors
         assert (viewport, '#tiger-long-term-panel') in selectors
@@ -3239,10 +4381,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             "#trend-report-workspace:visible .option-attention-market, "
             "#trend-report-workspace:visible .option-attention-row",
         ) in selectors
-    assert evaluated == [
-        *(["wide_desktop"] * 7), *(["desktop"] * 7),
-        *(["tablet"] * 14), *(["mobile"] * 14),
-    ]
+    assert set(evaluated) == {"wide_desktop", "desktop", "tablet", "mobile"}
     assert visual_token_evaluations == [
         "wide_desktop", "desktop", "tablet", "mobile",
     ]
@@ -3254,11 +4393,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ] == list(VISUAL_CONTRACT_STYLES)
         assert (viewport, "#refresh-quotes") in visual_focus_calls
         assert (viewport, "#refresh-quotes") in visual_focus_evaluations
-    assert geometry_evaluations == ["wide_desktop"] * 3
-    assert buy_overflow_evaluations == [
-        *("wide_desktop" for _ in range(2)),
-        *("desktop" for _ in range(2)),
-    ]
+    assert geometry_evaluations == []
+    assert buy_overflow_evaluations == []
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
     assert screenshots == [
         ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
@@ -3306,25 +4442,13 @@ def test_check_account_holdings_visits_every_broker_tab(
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
-    assert page.opened_reports == ["futu", "tiger", "phillips", "eastmoney"]
-    assert page.opened_reviews == ["tiger", "phillips", "eastmoney"]
+    assert page.opened_reports == ["futu"]
+    assert page.opened_reviews == []
     assert page.disabled_reports == set()
     assert projections == ["tiger", "phillips", "eastmoney"]
     assert page.focus_checks == [
         "#return-to-portfolio:visible",
         '#account-futu:visible .trend-report-entry [data-trend-report]',
-        "#return-to-portfolio:visible",
-        "#trend-report-workspace:visible .cn-trend-buy",
-        '#account-tiger:visible .trend-report-entry [data-trend-report]',
-        '#account-tiger:visible [data-trend-review="tiger"]',
-        "#return-to-portfolio:visible",
-        "#trend-report-workspace:visible .cn-trend-buy",
-        '#account-phillips:visible .trend-report-entry [data-trend-report]',
-        '#account-phillips:visible [data-trend-review="phillips"]',
-        "#return-to-portfolio:visible",
-        "#trend-report-workspace:visible .cn-trend-buy",
-        '#account-eastmoney:visible .trend-report-entry [data-trend-report]',
-        '#account-eastmoney:visible [data-trend-review="eastmoney"]',
     ]
 
 
@@ -3382,6 +4506,22 @@ def test_option_attention_acceptance_checks_current_and_stale_status_text() -> N
     assert page.option_attention_row_labels == [
         [OPTION_ATTENTION_COLUMN_LABELS],
         [OPTION_ATTENTION_COLUMN_LABELS],
+    ]
+
+
+def test_option_attention_acceptance_checks_execution_day_status_text() -> None:
+    payload = valid_payload()
+    market = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
+    market.update(
+        data_date="2026-07-17",
+        status_text="今日执行（数据截至 2026-07-17）",
+    )
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.option_attention_header_spans[0] == [
+        "美股", "今日执行（数据截至 2026-07-17）",
     ]
 
 
@@ -3558,7 +4698,7 @@ def test_option_attention_acceptance_rejects_missing_market_status(
 def test_option_attention_acceptance_checks_unavailable_without_data_date() -> None:
     payload = valid_payload()
     unavailable = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
-    unavailable.update(data_status="unavailable")
+    unavailable.update(data_status="unavailable", status_text="暂时不可用")
     unavailable.pop("data_date")
     page = tabbed_account_page(payload)
 
@@ -3571,7 +4711,7 @@ def test_option_attention_acceptance_accepts_empty_unavailable_markets() -> None
     payload = valid_payload()
     markets = payload["trend_reports"]["futu"]["attention_markets"]  # type: ignore[index]
     for market in markets:
-        market.update(data_status="unavailable", items=[])
+        market.update(data_status="unavailable", status_text="暂时不可用", items=[])
         market.pop("data_date", None)
     page = tabbed_account_page(payload)
 
@@ -3583,7 +4723,7 @@ def test_option_attention_acceptance_accepts_empty_unavailable_markets() -> None
 def test_option_attention_acceptance_rejects_missing_unavailable_status() -> None:
     payload = valid_payload()
     unavailable = payload["trend_reports"]["futu"]["attention_markets"][0]  # type: ignore[index]
-    unavailable.update(data_status="unavailable")
+    unavailable.update(data_status="unavailable", status_text="暂时不可用")
     unavailable.pop("data_date")
     page = tabbed_account_page(payload)
     page.option_attention_header_spans[0][1] = "状态缺失"
@@ -3653,7 +4793,7 @@ def test_acceptance_rejects_unavailable_eastmoney_report_for_screenshot(
     report.update(available=False, status_text="今日报告不可用")
     page = tabbed_account_page(payload)
 
-    with pytest.raises(AssertionError, match="eastmoney.*不可用.*截图"):
+    with pytest.raises(AssertionError, match="eastmoney.*不可用"):
         dashboard_acceptance._check_account_holdings(
             page, payload, screenshot_dir=tmp_path
         )
@@ -3695,7 +4835,7 @@ def test_acceptance_rejects_unavailable_review_when_daily_report_is_unavailable(
     payload["trend_reviews"][broker]["available"] = False  # type: ignore[index]
     page = tabbed_account_page(payload)
 
-    with pytest.raises(AssertionError, match=f"{broker} 趋势复盘不可用"):
+    with pytest.raises(AssertionError, match=f"{broker} 当前趋势报告不可用"):
         dashboard_acceptance._check_account_holdings(page, payload)
 
 
@@ -3710,11 +4850,8 @@ def test_acceptance_validates_available_review_when_daily_report_is_unavailable(
     page = tabbed_account_page(payload)
     page.viewport_size = {"width": 375, "height": 844}
 
-    dashboard_acceptance._check_account_holdings(page, payload)
-
-    assert broker in page.opened_reviews
-    assert broker in page.review_style_checks
-    assert broker in page.review_geometry_checks
+    with pytest.raises(AssertionError, match=f"{broker} 当前趋势报告不可用"):
+        dashboard_acceptance._check_account_holdings(page, payload)
 
 
 def test_select_account_tab_rejects_multiple_visible_sections() -> None:
@@ -3951,6 +5088,20 @@ def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
     assert page.max_visible_account_sections == 1
 
 
+def test_cn_filter_restores_real_view_before_counting() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
+    })
+    page.account_views["eastmoney"] = "report"
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=1)
+
+    assert all(
+        page.account_views[broker] == "real"
+        for broker in ("tiger", "phillips", "eastmoney")
+    )
+
+
 def test_cn_filter_accepts_grouped_visible_count_for_large_account() -> None:
     page = TabbedAccountPage(cn_rows={
         "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5000,
@@ -3965,7 +5116,7 @@ def test_cn_filter_accepts_grouped_visible_count_for_large_account() -> None:
     "missing",
         (
             "富途", "老虎", "辉立", "东方财富", "期权增强", "跨市场期权关注",
-            "美股趋势交易", "港股趋势交易", "期权关注", "当天趋势报告", "报告日期", "数据截至",
+            "美股趋势交易", "港股趋势交易", "期权关注",
         ),
 )
 def test_check_account_holdings_rejects_missing_profile_or_metric(missing: str) -> None:
@@ -4085,6 +5236,21 @@ def test_classify_result_has_only_three_states() -> None:
     assert classify_result(["API failed"], browser_blocker="Chrome unavailable") == "FAIL"
 
 
+def test_dashboard_acceptance_does_not_require_daily_ai_sources() -> None:
+    payload = valid_payload()
+    for holding in payload["holdings"]:  # type: ignore[index]
+        holding["agent_report"] = {"available": True}
+        for key in (
+            "tradingagents_summary",
+            "technical_facts",
+            "decision_facts",
+            "futu_skill_facts",
+        ):
+            holding.pop(key, None)
+
+    assert validate_dashboard_payload(payload, expected_cn=5) == []
+
+
 def test_dashboard_signature_ignores_live_values_but_detects_structural_change() -> None:
     first = valid_payload()
     second = valid_payload()
@@ -4096,3 +5262,958 @@ def test_dashboard_signature_ignores_live_values_but_detects_structural_change()
 
     second["holdings"][0]["brokers"] = "changed"  # type: ignore[index]
     assert dashboard_signature(first) != dashboard_signature(second)
+
+
+def simulate_snapshot(
+    code: str = "US.NDAQ", quantity: str = "13", cost_price: str = "94.25",
+) -> dict[str, object]:
+    return {
+        "positions": [{
+            "code": code,
+            "qty": quantity,
+            "cost_price": cost_price,
+        }],
+    }
+
+
+def simulate_api_payload(
+    *,
+    symbol: str = "NDAQ",
+    quantity: str = "13",
+    cost_price: str = "94.25",
+    attribution_status: str = "unlinked",
+    report: dict[str, str] | None = None,
+) -> dict[str, object]:
+    return {
+        "available": True,
+        "broker": "tiger",
+        "market": "US",
+        "positions": [{
+            "market": "US",
+            "symbol": symbol,
+            "quantity": quantity,
+            "cost_price": cost_price,
+            "attribution_status": attribution_status,
+            "report": report,
+        }],
+        "error": "",
+    }
+
+
+def write_current_attribution(
+    root: Path,
+    *,
+    artifact: str = "old.json",
+    version: str = "v1",
+    recorded_at: str = "2026-07-20T10:00:00-04:00",
+) -> dict[str, str]:
+    from open_trader.trend_review import _report_hash
+
+    payload = {
+        "execution_date": "2026-07-17",
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_snapshot": {"strategy_version": version},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": "NDAQ"}],
+        },
+    }
+    report_sha256 = _report_hash(payload)
+    report_path = root / "reports" / "trend_us_tiger" / artifact
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    event_path = (
+        root / "data/trend_review/ledgers/US/actions/2026-07-17/action"
+        / f"{artifact}.json"
+    )
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text(json.dumps({
+        "date": "2026-07-17",
+        "market": "US",
+        "symbol": "NDAQ",
+        "side": "buy",
+        "status": "filled",
+        "filled_qty": "13",
+        "recorded_at": recorded_at,
+        "report_sha256": report_sha256,
+        "strategy_version": version,
+    }), encoding="utf-8")
+    return {
+        "artifact": artifact,
+        "execution_date": "2026-07-17",
+        "strategy_version": version,
+        "report_sha256": report_sha256,
+    }
+
+
+def write_current_terminal_sell(
+    root: Path,
+    report: dict[str, str],
+    *,
+    status: str,
+    reason: str | None,
+) -> None:
+    event = {
+        "date": "2026-07-17",
+        "market": "US",
+        "symbol": "NDAQ",
+        "side": "sell",
+        "status": status,
+        "filled_qty": "40",
+        "recorded_at": "2026-07-20T10:01:00-04:00",
+        "report_sha256": report["report_sha256"],
+        "strategy_version": report["strategy_version"],
+    }
+    if reason is not None:
+        event["reason"] = reason
+    path = root / "data/trend_review/ledgers/US/actions/2026-07-17/action/sell.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(event), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("symbol", "AAPL"), ("quantity", "12"), ("cost_price", "94.26")],
+)
+def test_acceptance_rejects_simulated_api_facts_that_differ_from_direct_futu(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    payload = simulate_api_payload(**{field: value})
+
+    with pytest.raises(AssertionError, match="模拟盘持仓.*不匹配"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            payload,
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+def test_acceptance_accepts_zero_simulated_positions(tmp_path: Path) -> None:
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger",
+        {"positions": []},
+        {**simulate_api_payload(), "positions": []},
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+
+def test_acceptance_classifies_unavailable_configured_futu_account_as_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_client(**_kwargs: object) -> object:
+        raise RuntimeError("OpenD unavailable")
+
+    monkeypatch.setattr(
+        dashboard_acceptance, "FutuSimulateOrderExecutionClient", unavailable_client
+    )
+    payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "127.0.0.1", "futu_port": 11111},
+        {"tiger": 1, "phillips": 2, "eastmoney": 3},
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+    assert payloads == {}
+    assert errors == []
+    assert "OpenD unavailable" in str(blocker)
+    assert classify_result(
+        [], browser_blocker=None, external_blocker=blocker
+    ) == "BLOCKED"
+
+
+def test_acceptance_treats_dashboard_simulate_fallback_as_fail_when_futu_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return simulate_snapshot()
+
+        def close(self) -> None:
+            pass
+
+    def fetcher(_url: str, path: str) -> dict[str, object]:
+        broker = path.rsplit("/", 1)[-1]
+        market = dashboard_acceptance.TREND_SIMULATE_MARKETS[broker]
+        return {
+            "available": False,
+            "broker": broker,
+            "market": market,
+            "positions": [],
+            "error": "using cached report plan",
+        }
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: Client(),
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetcher)
+    _payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "127.0.0.1", "futu_port": 11111},
+        {"tiger": 1, "phillips": 2, "eastmoney": 3},
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+    assert blocker is None
+    assert len(errors) == 3
+    assert all("Dashboard 模拟盘不可用" in error for error in errors)
+
+
+def test_acceptance_accepts_explicitly_unlinked_legacy_simulated_position(
+    tmp_path: Path,
+) -> None:
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger",
+        simulate_snapshot(),
+        simulate_api_payload(),
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+
+def test_acceptance_rejects_traceable_position_declared_unlinked(
+    tmp_path: Path,
+) -> None:
+    write_current_attribution(tmp_path)
+
+    with pytest.raises(AssertionError, match="报告归因"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            simulate_api_payload(),
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+def test_acceptance_rejects_hidden_current_attribution_conflict(
+    tmp_path: Path,
+) -> None:
+    write_current_attribution(tmp_path, artifact="v1.json", version="v1")
+    write_current_attribution(
+        tmp_path,
+        artifact="v2.json",
+        version="v2",
+        recorded_at="2026-07-20T10:01:00-04:00",
+    )
+
+    with pytest.raises(AssertionError, match="报告归因冲突"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            simulate_api_payload(),
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+@pytest.mark.parametrize(
+    ("event_status", "reason", "attribution_status"),
+    [
+        ("incomplete", "position_zero_confirmed", "unlinked"),
+        ("incomplete", None, "linked"),
+        ("failed", "position_zero_confirmed", "linked"),
+        ("submitted", "position_zero_confirmed", "linked"),
+        ("missed", "position_zero_confirmed", "linked"),
+    ],
+)
+def test_acceptance_clears_only_terminal_incomplete_sell(
+    tmp_path: Path,
+    event_status: str,
+    reason: str | None,
+    attribution_status: str,
+) -> None:
+    report = write_current_attribution(tmp_path)
+    write_current_terminal_sell(
+        tmp_path, report, status=event_status, reason=reason
+    )
+
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger",
+        simulate_snapshot(),
+        simulate_api_payload(
+            attribution_status=attribution_status,
+            report=report if attribution_status == "linked" else None,
+        ),
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+
+def test_acceptance_rejects_hidden_unlinked_simulated_position(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="模拟盘持仓.*不匹配"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            {**simulate_api_payload(), "positions": []},
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+def test_acceptance_rejects_unavailable_simulated_api_with_substitute_rows(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        **simulate_api_payload(),
+        "available": False,
+        "error": "OpenD unavailable",
+    }
+
+    with pytest.raises(AssertionError, match="不可用.*替代持仓"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            payload,
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+@pytest.mark.parametrize("wrong_field", ["report_sha256", "strategy_version"])
+def test_acceptance_rejects_linked_simulated_position_with_wrong_report_identity(
+    tmp_path: Path, wrong_field: str,
+) -> None:
+    report = write_current_attribution(tmp_path)
+    report[wrong_field] = "0" * 64 if wrong_field == "report_sha256" else "v2"
+
+    with pytest.raises(AssertionError, match="报告身份"):
+        dashboard_acceptance._validate_simulated_positions(
+            "tiger",
+            simulate_snapshot(),
+            simulate_api_payload(attribution_status="linked", report=report),
+            tmp_path / "data",
+            tmp_path / "reports",
+        )
+
+
+def _write_acceptance_history_artifact(
+    reports_dir: Path,
+    artifact: str,
+    *,
+    execution_date: str,
+    symbol: str,
+) -> tuple[dict[str, object], str]:
+    from open_trader.trend_review import _report_hash
+
+    payload: dict[str, object] = {
+        "execution_date": execution_date,
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_snapshot": {"strategy_version": "v1"},
+        "strategy_judgments": {
+            "formal_actions": [{"action": "BUY", "symbol": symbol}],
+        },
+    }
+    path = reports_dir / "trend_us_tiger" / artifact
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload, _report_hash(payload)
+
+
+def _write_acceptance_action(
+    data_dir: Path, *, report_sha256: str, symbol: str = "NDAQ",
+) -> dict[str, str]:
+    event = {
+        "date": "2026-07-17",
+        "market": "US",
+        "symbol": symbol,
+        "side": "buy",
+        "status": "missed",
+        "recorded_at": "2026-07-18T08:27:12+08:00",
+        "report_sha256": report_sha256,
+    }
+    path = (
+        data_dir / "trend_review/ledgers/US/actions/2026-07-17/action/event.json"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(event), encoding="utf-8")
+    return event
+
+
+def test_acceptance_rejects_history_that_drops_ledger_referenced_old_action(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, old_hash = _write_acceptance_history_artifact(
+        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+    )
+    _write_acceptance_history_artifact(
+        reports_dir, "new.json", execution_date="2026-07-20", symbol="AAPL"
+    )
+    _write_acceptance_action(tmp_path / "data", report_sha256=old_hash)
+    history = [{
+        "available": True,
+        "artifact": "new.json",
+        "execution_date": "2026-07-20",
+        "strategy_version": "v1",
+    }]
+
+    with pytest.raises(AssertionError, match="old.json.*历史报告"):
+        dashboard_acceptance._validate_history_projection(
+            tmp_path / "data", reports_dir, "tiger", history, {}
+        )
+
+
+def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, old_hash = _write_acceptance_history_artifact(
+        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+    )
+    _write_acceptance_history_artifact(
+        reports_dir, "new.json", execution_date="2026-07-20", symbol="AAPL"
+    )
+    event = _write_acceptance_action(tmp_path / "data", report_sha256=old_hash)
+    history = [
+        {
+            "available": True,
+            "artifact": artifact,
+            "execution_date": execution_date,
+            "strategy_version": "v1",
+        }
+        for artifact, execution_date in (
+            ("new.json", "2026-07-20"), ("old.json", "2026-07-17")
+        )
+    ]
+    exact = {
+        "old.json": {
+            "artifact": "old.json",
+            "report_sha256": old_hash,
+            "strategy_version": "v1",
+            "report_date": "2026-07-17",
+            "audit": {"artifact": "old.json"},
+            "buy_actions": [{
+                "symbol": "NDAQ",
+                "execution": {
+                    "status": "missed",
+                    "updated_at": event["recorded_at"],
+                },
+            }],
+        }
+    }
+
+    expectations = dashboard_acceptance._validate_history_projection(
+        tmp_path / "data", reports_dir, "tiger", history, exact
+    )
+
+    assert expectations[0]["artifact"] == "old.json"
+
+
+def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_hash = "a" * 64
+    local_report = {
+        "artifact": "latest.json",
+        "execution_date": "2026-07-17",
+        "strategy_version": "v1",
+        "report_sha256": local_hash,
+    }
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_reports_by_hash",
+        lambda *_args, **_kwargs: {local_hash: local_report},
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_action_events", lambda *_args: [])
+
+    def fetch(_url: str, path: str) -> object:
+        if path.endswith("/history"):
+            return [{
+                "available": True,
+                "artifact": "latest.json",
+                "execution_date": "2026-07-17",
+                "strategy_version": "v1",
+            }]
+        return {
+            "artifact": "latest.json",
+            "report_date": "2026-07-17",
+            "strategy_version": "v2",
+            "report_sha256": "b" * 64,
+        }
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetch)
+
+    expectations, errors = dashboard_acceptance._check_history_endpoints(
+        "http://dashboard.test", tmp_path / "data", tmp_path / "reports"
+    )
+
+    assert expectations == {}
+    assert len(errors) == 3
+    assert all("精确历史报告身份不匹配" in error for error in errors)
+
+
+def test_acceptance_rejects_dirty_dashboard_source(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src/open_trader").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "config").mkdir()
+    (tmp_path / ".gitignore").write_text(
+        ".venv/\n.superpowers/\nconfig/daily_premarket.env\n",
+        encoding="utf-8",
+    )
+    tracked_test = tmp_path / "tests/test_dashboard_acceptance.py"
+    tracked_test.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(tmp_path), "-c", "user.name=Codex",
+            "-c", "user.email=codex@example.invalid", "commit", "-qm", "baseline",
+        ],
+        check=True,
+    )
+
+    tracked_test.write_text("modified\n", encoding="utf-8")
+    (tmp_path / "src/open_trader/new_module.py").write_text("", encoding="utf-8")
+    for ignored in (
+        ".venv/cache",
+        ".superpowers/sdd/report.md",
+        "config/daily_premarket.env",
+    ):
+        path = tmp_path / ignored
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ignored\n", encoding="utf-8")
+
+    assert set(dashboard_acceptance._source_changes(tmp_path)) == {
+        "M tests/test_dashboard_acceptance.py",
+        "?? src/open_trader/new_module.py",
+    }
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        ({"pid": 122}, "PID"),
+        ({"git_sha": "old-sha"}, "Git SHA"),
+        ({"source_state": "dirty"}, "源码状态"),
+        ({"started_at": "2026-07-18T11:59:59+08:00"}, "启动时间"),
+    ],
+)
+def test_acceptance_rejects_log_not_bound_to_candidate_process(
+    tmp_path: Path, record: dict[str, object], message: str,
+) -> None:
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01+08:00",
+        **record,
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(f"dashboard_runtime: {json.dumps(runtime)}\n", encoding="utf-8")
+
+    assert any(message in error for error in dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+    ))
+
+
+def test_acceptance_rejects_timezone_naive_runtime_start_without_crashing(
+    tmp_path: Path,
+) -> None:
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01",
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(f"dashboard_runtime: {json.dumps(runtime)}\n", encoding="utf-8")
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+    )
+
+    assert any("启动时间无效" in error for error in errors)
+
+
+def test_simulated_position_wait_has_bounded_timeout() -> None:
+    calls: list[tuple[str, object, int | None]] = []
+
+    class Page:
+        def wait_for_function(
+            self, expression: str, *, arg: object, timeout: int | None = None,
+        ) -> None:
+            calls.append((expression, arg, timeout))
+
+    dashboard_acceptance._wait_for_simulate_positions(Page(), "tiger", 1)
+
+    assert calls == [(
+        dashboard_acceptance.SIMULATE_POSITIONS_READY_EXPRESSION,
+        {"broker": "tiger", "expected": 1},
+        10_000,
+    )]
+
+
+def test_acceptance_rejects_appended_stale_log_content(tmp_path: Path) -> None:
+    started = datetime.fromisoformat("2026-07-18T12:00:00+08:00")
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01+08:00",
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(
+        "stale clean log content\n"
+        f"dashboard_runtime: {json.dumps(runtime)}\n",
+        encoding="utf-8",
+    )
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=started,
+    )
+
+    assert any("新日志" in error for error in errors)
+
+
+def test_acceptance_rejects_log_older_than_candidate_process(tmp_path: Path) -> None:
+    started = datetime.fromisoformat("2026-07-18T12:00:00+08:00")
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-07-18T12:00:01+08:00",
+    }
+    log = tmp_path / "dashboard.log"
+    log.write_text(f"dashboard_runtime: {json.dumps(runtime)}\n", encoding="utf-8")
+    old = started.timestamp() - 1
+    os.utime(log, (old, old))
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=started,
+    )
+
+    assert any("修改时间" in error for error in errors)
+
+
+def _controller_runtime_payload(
+    tmp_path: Path,
+    *,
+    now: datetime,
+) -> dict[str, object]:
+    payload = valid_payload()
+    controllers = payload["trend_controllers"]
+    assert isinstance(controllers, dict)
+    for pid, (broker, controller) in enumerate(controllers.items(), start=4210):
+        assert isinstance(controller, dict)
+        controller.update({
+            "pid": pid,
+            "working_directory": str(tmp_path),
+            "git_sha": "accepted-sha",
+            "heartbeat_at": now.isoformat(),
+        })
+        market = str(controller["market"]).lower()
+        logs = tmp_path / "logs/daily_premarket"
+        logs.mkdir(parents=True, exist_ok=True)
+        runtime = {
+            "pid": pid,
+            "git_sha": "accepted-sha",
+            "cwd": str(tmp_path),
+            "verified_at": now.isoformat(),
+            "stderr_offset": 0,
+        }
+        (logs / f"launchd-trend-controller-{market}.out.log").write_text(
+            f"controller_runtime: {json.dumps(runtime)}\n", encoding="utf-8"
+        )
+        (logs / f"launchd-trend-controller-{market}.err.log").write_text(
+            "", encoding="utf-8"
+        )
+    return payload
+
+
+def _controller_runtime_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    now: datetime,
+    payload: dict[str, object],
+) -> list[str]:
+    monkeypatch.setattr(dashboard_acceptance.os, "kill", lambda *_args: None)
+    monkeypatch.setattr(
+        dashboard_acceptance, "_process_cwd", lambda _pid: tmp_path.resolve()
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_at",
+        lambda _pid: now - timedelta(seconds=1),
+    )
+    return dashboard_acceptance._trend_controller_errors(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="accepted-sha",
+        now=now,
+    )
+
+
+@pytest.mark.parametrize(
+    "phase", ["reconciling", "recovering_report", "recovering_review"]
+)
+def test_acceptance_rejects_fresh_blocked_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({  # type: ignore[union-attr]
+        "health": "unavailable",
+        "blocking": True,
+        "phase": phase,
+        "last_success": None,
+        "blocker": "report generation failed",
+    })
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "阻塞" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "phase", ["reconciling", "recovering_report", "recovering_review"]
+)
+def test_acceptance_accepts_healthy_in_progress_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller["phase"] = phase  # type: ignore[index]
+
+    assert _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    ) == []
+
+
+def test_acceptance_allows_progress_controllers_before_first_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controllers = payload["trend_controllers"]
+    controllers["phillips"].update({  # type: ignore[index,union-attr]
+        "phase": "recovering_report",
+        "last_success": None,
+    })
+    controllers["eastmoney"].update({  # type: ignore[index,union-attr]
+        "phase": "reconciling",
+        "last_success": None,
+    })
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert "phillips 控制器尚无首次成功状态" not in errors
+    assert "eastmoney 控制器尚无首次成功状态" not in errors
+    assert errors == []
+
+
+def test_acceptance_accepts_matching_controller_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+
+    assert _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    ) == []
+
+
+@pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
+def test_acceptance_rejects_stable_controller_without_first_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller.update({"phase": phase, "last_success": None})  # type: ignore[union-attr]
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "成功" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("working_directory", "/wrong/review", "工作目录"),
+        ("git_sha", "old-sha", "Git SHA"),
+        ("heartbeat_at", "2026-07-21T09:20:00+08:00", "心跳"),
+    ],
+)
+def test_acceptance_rejects_controller_status_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    payload["trend_controllers"]["tiger"][field] = value  # type: ignore[index]
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and message in error for error in errors)
+
+
+def test_acceptance_rejects_missing_controller_working_directory_from_expected_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    payload["trend_controllers"]["tiger"]["working_directory"] = ""  # type: ignore[index]
+    monkeypatch.chdir(tmp_path)
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "工作目录" in error for error in errors)
+
+
+def test_acceptance_rejects_missing_controller_log_cwd_from_expected_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    pid = payload["trend_controllers"]["tiger"]["pid"]  # type: ignore[index]
+    runtime = {
+        "pid": pid,
+        "git_sha": "accepted-sha",
+        "verified_at": now.isoformat(),
+        "stderr_offset": 0,
+    }
+    stdout = (
+        tmp_path
+        / "logs/daily_premarket/launchd-trend-controller-us.out.log"
+    )
+    stdout.write_text(
+        f"controller_runtime: {json.dumps(runtime)}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("US" in error and "工作目录" in error for error in errors)
+
+
+def test_acceptance_rejects_dead_controller_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    dead_pid = payload["trend_controllers"]["tiger"]["pid"]  # type: ignore[index]
+
+    def kill(pid: int, signal: int) -> None:
+        del signal
+        if pid == dead_pid:
+            raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(dashboard_acceptance.os, "kill", kill)
+    monkeypatch.setattr(
+        dashboard_acceptance, "_process_cwd", lambda _pid: tmp_path.resolve()
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_at",
+        lambda _pid: now - timedelta(seconds=1),
+    )
+
+    errors = dashboard_acceptance._trend_controller_errors(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="accepted-sha",
+        now=now,
+    )
+
+    assert any("tiger" in error and "PID" in error for error in errors)
+
+
+def test_acceptance_rejects_fresh_controller_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    stderr = (
+        tmp_path
+        / "logs/daily_premarket/launchd-trend-controller-us.err.log"
+    )
+    stderr.write_text("Traceback (most recent call last):\n", encoding="utf-8")
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("US" in error and "stderr" in error for error in errors)
+
+
+def test_acceptance_derives_cn_count_from_canonical_portfolio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = tmp_path / "data"
+    latest = data / "latest"
+    latest.mkdir(parents=True)
+    (latest / "portfolio.csv").write_text(
+        "market,asset_class,total_quantity\nCN,stock,10\nCN,stock,0\nUS,stock,2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_project_data_dir", lambda _root: data)
+
+    assert dashboard_acceptance._expected_cn_holdings(tmp_path) == 1
+
+
+def test_acceptance_local_missing_futu_configuration_is_fail(tmp_path: Path) -> None:
+    payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "", "futu_port": 0},
+        {"tiger": 0, "phillips": 0, "eastmoney": 0},
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+    assert payloads == {}
+    assert errors == ["Dashboard 缺少有效 Futu OpenD 配置"]
+    assert blocker is None
+    assert classify_result(errors, browser_blocker=None) == "FAIL"
+
+
+def test_acceptance_cli_has_no_test_only_config_or_expected_cn_options() -> None:
+    destinations = {action.dest for action in dashboard_acceptance.build_parser()._actions}
+
+    assert "config" not in destinations
+    assert "expected_cn" not in destinations
