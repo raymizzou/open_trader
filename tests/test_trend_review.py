@@ -30,7 +30,7 @@ from open_trader.strategy_drawdown import (
 from open_trader.models import Market, TradeFill
 
 
-def test_cn_v4_and_v5_snapshots_normalize_without_cross_version_rewrite() -> None:
+def test_cn_v4_and_v6_snapshots_normalize_without_cross_version_rewrite() -> None:
     old = live_trend_strategy_snapshot(
         "CN",
         "abc123",
@@ -4367,7 +4367,7 @@ def test_partial_buy_cash_below_one_lot_creates_no_attempt(tmp_path: Path) -> No
     assert len(client.requests) == 1
 
 
-@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v5"])
+@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v6"])
 def test_partial_buy_risk_cap_limits_retry_lots(
     tmp_path: Path, strategy_version: str
 ) -> None:

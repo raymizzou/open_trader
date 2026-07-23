@@ -1679,32 +1679,32 @@ def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
     return payload
 
 
-def _valid_v5_dashboard_trend_payload() -> dict[str, object]:
+def _valid_v6_dashboard_trend_payload() -> dict[str, object]:
     payload = copy.deepcopy(_valid_v4_dashboard_trend_payload())
     snapshot = payload["strategy_snapshot"]
     assert isinstance(snapshot, dict)
     snapshot.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
-        "strategy_version": "v5",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v6",
+        "strategy_version": "v6",
     })
     drawdown = payload["drawdown_summary"]
     assert isinstance(drawdown, dict)
     drawdown.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
-        "strategy_version": "v5",
-        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v5|v5",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v6",
+        "strategy_version": "v6",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v6|v6",
     })
     bootstrap = drawdown["bootstrap_event"]
     assert isinstance(bootstrap, dict)
     bootstrap.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
-        "strategy_version": "v5",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v6",
+        "strategy_version": "v6",
     })
     return payload
 
 
-def test_dashboard_accepts_cn_v5_risk_and_drawdown_contract() -> None:
-    payload = _valid_v5_dashboard_trend_payload()
+def test_dashboard_accepts_cn_v6_risk_and_drawdown_contract() -> None:
+    payload = _valid_v6_dashboard_trend_payload()
     assert dashboard_module._valid_trend_risk_summary(payload)
 
     snapshot = payload["strategy_snapshot"]

@@ -1136,7 +1136,7 @@ def integrated_v4_payload(
         "eastmoney": "trend_a_share",
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
-        strategy_version = "v5" if market == "CN" else "v4"
+        strategy_version = "v6" if market == "CN" else "v4"
         pending = market == "HK"
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {

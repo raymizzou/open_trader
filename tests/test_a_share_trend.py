@@ -408,7 +408,7 @@ def unlock_live_drawdown(
     *,
     market: str = "CN",
     equity: str = "100000",
-    strategy_version: str = "v5",
+    strategy_version: str = "v6",
 ) -> None:
     automatic_bootstrap_strategy_drawdown(
         data_dir,
@@ -557,13 +557,13 @@ def test_trend_v3_effective_date_is_shared_across_markets(market: str) -> None:
     )["effective_from"] == "2026-07-20"
 
 
-def test_live_cn_strategy_snapshot_is_v5_with_relaxed_entry_gates() -> None:
+def test_live_cn_strategy_snapshot_is_v6_with_relaxed_entry_gates() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199)
     )
 
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v5"
-    assert snapshot["strategy_version"] == "v5"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v6"
+    assert snapshot["strategy_version"] == "v6"
     assert snapshot["effective_from"] == "2026-07-24"
     assert snapshot["parameters"]["allowed_industry_temperatures"] == [
         "温", "热", "沸",
@@ -1639,7 +1639,7 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
     assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
 
 
-def test_v5_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
+def test_v6_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
     strategy_snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "drawdown123", (622466, 697199)
     )
@@ -1647,9 +1647,9 @@ def test_v5_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None
         "schema_version": "open_trader.strategy_drawdown.v1",
         "market": "CN",
         "strategy_id": strategy_snapshot["strategy_id"],
-        "strategy_version": "v5",
+        "strategy_version": "v6",
         "kelly_sample_key": (
-            "CN|trend_animals_warm_to_hot/CN/v5|v5"
+            "CN|trend_animals_warm_to_hot/CN/v6|v6"
         ),
         "state_status": "ok",
         "status": "paused",
@@ -4276,7 +4276,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v6"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -4430,13 +4430,13 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["account"]["positions"] == []
     assert payload["metadata"]["simulate_acc_id"] == 101
-    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v6"
     assert payload["drawdown_summary"]["state_status"] == "missing"
     assert payload["drawdown_summary"]["entry_allowed"] is False
     assert payload["strategy_judgments"]["formal_actions"] == []
 
 
-def test_generated_report_keeps_v5_identity_kelly_scope_and_drawdown_continuity(
+def test_generated_report_keeps_v6_identity_kelly_scope_and_drawdown_continuity(
     tmp_path: Path,
 ) -> None:
     config = trend_config(tmp_path)
@@ -4454,8 +4454,8 @@ def test_generated_report_keeps_v5_identity_kelly_scope_and_drawdown_continuity(
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     snapshot = payload["strategy_snapshot"]
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v5"
-    assert snapshot["strategy_version"] == "v5"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v6"
+    assert snapshot["strategy_version"] == "v6"
     assert snapshot["parameters"]["kelly_sample_scope"] == (
         "market+strategy_id+opening_strategy_version"
     )
@@ -4463,7 +4463,7 @@ def test_generated_report_keeps_v5_identity_kelly_scope_and_drawdown_continuity(
     assert after["audit_events"] == before["audit_events"]
 
 
-def test_report_runner_sends_exact_broker_v5_text(tmp_path: Path) -> None:
+def test_report_runner_sends_exact_broker_v6_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
     config = trend_config(tmp_path)
