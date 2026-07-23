@@ -1088,9 +1088,7 @@ def test_v5_missing_quote_and_atr_keeps_formal_buy_without_pausing_batch() -> No
         holding_snapshots={},
         bars_by_symbol={},
         strategy_snapshot=snapshot,
-        drawdown_summary=active_drawdown_summary(
-            snapshot, "2026-07-15", equity=str(account().net_value)
-        ),
+        drawdown_summary=active_drawdown_summary(snapshot, "2026-07-15"),
     )
 
     assert [item.symbol for item in built.buy_actions] == ["600001", "600002"]
@@ -1101,6 +1099,39 @@ def test_v5_missing_quote_and_atr_keeps_formal_buy_without_pausing_batch() -> No
     assert pending.planned_stop_risk is None
     assert built.risk_summary["status"] == "active_with_unknown_risk"
     assert built.risk_summary["unknown_new_risk_symbols"] == ["600001"]
+
+
+def test_pending_v5_buy_renders_pending_instead_of_zero() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=[replace(candidate("600001"), close=None, atr=None)],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(account().net_value)
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    markdown = render_markdown(built)
+    feishu = render_trend_feishu_text(
+        payload, broker_label="富途模拟", market_label="A股"
+    )[1]
+
+    action = payload["strategy_judgments"]["formal_actions"][0]
+    assert action["estimated_shares"] is None
+    assert action["estimated_initial_line"] is None
+    assert "待行情、ATR 补全" in markdown
+    assert "约 0 股" not in markdown
+    assert "执行参考价 待补全" in markdown
+    assert "None 元" not in markdown
+    assert "保护线 0" not in feishu
+    assert "正式动作仍有效" in feishu
 
 
 def test_v5_missing_atr_estimates_quantity_and_reserves_cash() -> None:

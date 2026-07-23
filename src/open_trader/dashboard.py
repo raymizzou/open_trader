@@ -23,6 +23,7 @@ from .a_share_trend import (
     valid_v2_risk_contract,
     valid_v3_risk_contract,
     valid_v4_risk_contract,
+    valid_v5_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
 from .futu_symbols import to_futu_symbol
@@ -1058,12 +1059,12 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     )
     summary = payload.get("risk_summary")
     if summary is None:
-        return strategy_version not in {"v2", "v3", "v4"}
+        return strategy_version not in {"v2", "v3", "v4", "v5"}
     if not isinstance(summary, dict) or any(
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
-    if strategy_version not in {"v2", "v3", "v4"}:
+    if strategy_version not in {"v2", "v3", "v4", "v5"}:
         return summary.get("status") in {"active", "paused"}
     judgments = payload.get("strategy_judgments")
     parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
@@ -1076,6 +1077,7 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
             "v2": valid_v2_risk_contract,
             "v3": valid_v3_risk_contract,
             "v4": valid_v4_risk_contract,
+            "v5": valid_v5_risk_contract,
         }[strategy_version](
             parameters, summary, expected_nav=expected_nav
         )
@@ -1096,7 +1098,7 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
             drawdown,
             expected_market=str(market),
             expected_strategy_id=str(strategy_id),
-            expected_strategy_version="v4",
+            expected_strategy_version=strategy_version,
             expected_equity=expected_nav,
             expected_entry_date=str(payload.get("execution_date") or ""),
         )
@@ -1145,17 +1147,65 @@ def _valid_v2_risk_items(
     allowed_buy_constraints = {
         "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
     }
-    if strategy_version in {"v3", "v4"}:
+    if strategy_version in {"v3", "v4", "v5"}:
         allowed_buy_constraints.add("Kelly 上限")
     for item in buys:
         shares = item.get("estimated_shares")
         lot_size = item.get("lot_size")
+        close = _dashboard_risk_decimal(item.get("close"))
+        atr = _dashboard_risk_decimal(item.get("atr"))
+        pending_fields = item.get("pending_fields")
+        missing_fields = tuple(
+            field
+            for field, missing in (
+                ("quote", close is None or close <= 0),
+                ("atr", atr is None or atr <= 0),
+                ("lot_size", lot_size is None or lot_size <= 0),
+            )
+            if missing
+        )
+        if strategy_version == "v5" and item.get("market_data_status") == "pending":
+            can_estimate = "quote" not in missing_fields and "lot_size" not in missing_fields
+            if (
+                not missing_fields
+                or not isinstance(pending_fields, list)
+                or tuple(pending_fields) != missing_fields
+                or isinstance(shares, bool)
+                or shares is not None
+                and (
+                    not isinstance(shares, int)
+                    or shares < 0
+                    or not can_estimate
+                    and shares != 0
+                    or can_estimate
+                    and isinstance(lot_size, int)
+                    and not isinstance(lot_size, bool)
+                    and shares % lot_size != 0
+                )
+                or item.get("estimated_initial_line") is not None
+                or item.get("planned_stop_risk") is not None
+                or item.get("planned_stop_risk_pct") is not None
+                or item.get("normal_cost") is not None
+                or not isinstance(item.get("symbol"), str)
+                or not item["symbol"].strip()
+            ):
+                return False
+            target_weight = _dashboard_risk_decimal(item.get("target_weight"))
+            target_amount = _dashboard_risk_decimal(item.get("target_amount"))
+            if (
+                target_weight is None
+                or target_weight <= 0
+                or target_weight > PORTFOLIO_RISK_LIMIT
+                or target_amount is None
+                or target_amount <= 0
+            ):
+                return False
+            continue
         planned_risk = _dashboard_risk_decimal(item.get("planned_stop_risk"))
         planned_pct = _dashboard_risk_decimal(item.get("planned_stop_risk_pct"))
         normal_cost = _dashboard_risk_decimal(item.get("normal_cost"))
         target_weight = _dashboard_risk_decimal(item.get("target_weight"))
         target_amount = _dashboard_risk_decimal(item.get("target_amount"))
-        close = _dashboard_risk_decimal(item.get("close"))
         if (
             not isinstance(item.get("symbol"), str)
             or not item["symbol"].strip()
@@ -1187,11 +1237,24 @@ def _valid_v2_risk_items(
             or planned_pct != planned_risk / nav
             or planned_pct > SINGLE_ENTRY_RISK_LIMIT
             or item.get("decisive_constraint") not in allowed_buy_constraints
+            or strategy_version == "v5"
+            and item.get("market_data_status") != "complete"
+            or strategy_version == "v5"
+            and pending_fields != []
         ):
             return False
         new_planned_risk += planned_risk
 
-    summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
+    summary_new_risk = _dashboard_risk_decimal(
+        summary.get("new_known_planned_risk")
+        if strategy_version == "v5"
+        and (
+            summary.get("status") == "active_with_unknown_risk"
+            or summary.get("unknown_existing_risk_symbols")
+            or summary.get("unknown_new_risk_symbols")
+        )
+        else summary.get("new_planned_risk")
+    )
     if summary_new_risk != new_planned_risk:
         return False
     allowed_constraints = {
@@ -1203,9 +1266,9 @@ def _valid_v2_risk_items(
         "交易单位",
         "关键风险数据",
     }
-    if strategy_version in {"v3", "v4"}:
+    if strategy_version in {"v3", "v4", "v5"}:
         allowed_constraints.add("Kelly 上限")
-    if strategy_version == "v4":
+    if strategy_version in {"v4", "v5"}:
         allowed_constraints.add("策略累计回撤")
     for item in judgments["risk_skips"]:
         shares = item.get("estimated_shares")
@@ -1213,7 +1276,7 @@ def _valid_v2_risk_items(
         target_amount_raw = item.get("target_amount")
         target_amount = _dashboard_risk_decimal(target_amount_raw)
         zero_kelly_skip = (
-            strategy_version in {"v3", "v4"}
+            strategy_version in {"v3", "v4", "v5"}
             and summary.get("status") == "paused"
             and summary.get("kelly_cap") in {"0", "0.000000", 0}
             and summary.get("pause_reason") == "Kelly 上限为 0，仅暂停未来新开仓"

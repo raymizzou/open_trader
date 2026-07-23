@@ -278,6 +278,43 @@ def write_trend_history_report(
     return payload
 
 
+def test_dashboard_accepts_pending_v5_buy_action_projection() -> None:
+    payload = {"strategy_snapshot": {"strategy_version": "v5"}}
+    judgments = {
+        "formal_actions": [
+            {
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "target_amount": "4000",
+                "close": None,
+                "atr": None,
+                "lot_size": 100,
+                "estimated_shares": None,
+                "estimated_initial_line": None,
+                "planned_stop_risk": None,
+                "planned_stop_risk_pct": None,
+                "normal_cost": None,
+                "market_data_status": "pending",
+                "pending_fields": ["quote", "atr"],
+                "decisive_constraint": "组合剩余风险",
+            }
+        ],
+        "risk_skips": [],
+    }
+    summary = {
+        "status": "active_with_unknown_risk",
+        "portfolio_risk_limit": "4000",
+        "new_known_planned_risk": "0",
+        "unknown_new_risk_symbols": ["600001"],
+        "unknown_existing_risk_symbols": [],
+    }
+
+    assert dashboard_module._valid_v2_risk_items(
+        payload, judgments, summary, strategy_version="v5"
+    )
+
+
 def test_trend_report_history_uses_payload_date_and_keeps_revisions(
     tmp_path: Path,
 ) -> None:

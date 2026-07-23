@@ -2927,6 +2927,24 @@ def _feishu_money(value: object) -> str:
     return _money(Decimal(str(value))).rstrip("0").rstrip(".")
 
 
+_PENDING_MARKET_DATA_LABELS = {
+    "quote": "行情",
+    "atr": "ATR",
+    "lot_size": "每手股数",
+}
+
+
+def _pending_market_data_text(fields: object) -> str:
+    if not isinstance(fields, (list, tuple)):
+        return ""
+    labels = [
+        _PENDING_MARKET_DATA_LABELS.get(str(field), str(field))
+        for field in fields
+        if str(field)
+    ]
+    return "、".join(labels)
+
+
 def _append_feishu_action_sections(
     lines: list[str],
     sells: Sequence[Mapping[str, object]],
@@ -2970,11 +2988,32 @@ def _append_feishu_action_sections(
     if buys:
         lines.extend(["", "买入"])
         for index, item in enumerate(buys, 1):
+            shares = (
+                f"{item['estimated_shares']} 股"
+                if item.get("estimated_shares")
+                else "股数待补全"
+            )
+            target_amount = (
+                _feishu_money(item["target_amount"])
+                if item.get("target_amount") not in {None, ""}
+                else "待补全"
+            )
+            initial_line = (
+                _feishu_money(item["estimated_initial_line"])
+                if item.get("estimated_initial_line") not in {None, ""}
+                else "待补全"
+            )
+            pending = _pending_market_data_text(item.get("pending_fields"))
             lines.append(
                 f"{index}. {_feishu_identity(item)}｜{TREND_BUY_WINDOWS[market]}｜"
-                f"约 {item.get('estimated_shares', '-')} 股｜"
-                f"金额上限 {_feishu_money(item.get('target_amount') or '0')}｜"
-                f"保护线 {_feishu_money(item.get('estimated_initial_line') or '0')}"
+                f"约 {shares}｜"
+                f"金额上限 {target_amount}｜"
+                f"保护线 {initial_line}"
+                + (
+                    f"｜正式动作仍有效｜待{pending}补全"
+                    if pending
+                    else ""
+                )
             )
     if reviews:
         lines.extend(["", "人工复核"])
@@ -3198,13 +3237,35 @@ def render_markdown(report: TrendReport) -> str:
             ]
         )
     if report.risk_summary:
+        unknown_symbols = [
+            str(symbol)
+            for key in ("unknown_existing_risk_symbols", "unknown_new_risk_symbols")
+            for symbol in report.risk_summary.get(key, [])
+            if symbol
+        ]
+        if unknown_symbols:
+            known_total = report.risk_summary.get("known_portfolio_planned_risk")
+            known_pct = (
+                _risk_percent(Decimal(str(known_total)) / report.account.net_value)
+                if known_total is not None and report.account.net_value > 0
+                else "待补全"
+            )
+            risk_lines = [
+                "- 已知计划风险："
+                f"{known_pct}｜未知标的：{'、'.join(dict.fromkeys(unknown_symbols))}",
+                "- 未知风险字段：待补全（行情、ATR 或每手股数恢复后重算）",
+            ]
+        else:
+            risk_lines = [
+                "- 正常计划风险："
+                f"{_risk_percent(report.risk_summary['portfolio_planned_risk_pct'])}"
+                f" / {_risk_percent(report.risk_summary['portfolio_risk_limit_pct'])}",
+            ]
         lines.extend([
             "",
             "## 组合计划风险",
             "",
-            "- 正常计划风险："
-            f"{_risk_percent(report.risk_summary['portfolio_planned_risk_pct'])}"
-            f" / {_risk_percent(report.risk_summary['portfolio_risk_limit_pct'])}",
+            *risk_lines,
             "- 异常损失缓冲："
             f"{_risk_percent(report.risk_summary['abnormal_loss_buffer_pct'])}（不得用于开仓）",
             "",
@@ -3262,24 +3323,39 @@ def render_markdown(report: TrendReport) -> str:
     lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
     if report.buy_actions:
         for index, item in enumerate(report.buy_actions, 1):
+            shares = (
+                f"{item.estimated_shares} 股"
+                if item.estimated_shares
+                else "股数待补全"
+            )
+            initial_line = (
+                _money(item.estimated_initial_line)
+                if item.estimated_initial_line is not None
+                else "待补全"
+            )
+            pending = _pending_market_data_text(item.pending_fields)
+            pending_suffix = f"｜市场数据 待{pending} 补全" if pending else ""
             if market == "CN":
                 lines.append(
                     f"- {index}. {item.symbol} {item.name}｜"
                     f"筛选价 {_money(item.filter_price)} 元（Trend Animals）｜"  # type: ignore[arg-type]
-                    f"执行参考价 {_money(item.close)} 元（富途前复权日线）｜"
+                    f"执行参考价 "
+                    f"{_money(item.close) + ' 元（富途前复权日线）' if item.close is not None else '待补全'}｜"
                     f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
                     f"节气 {item.phase or '未知'}｜强度 {item.strength}｜"
                     f"行业温度 {item.industry_temperature or '未知'}｜"
                     f"市值 {item.market_cap} 亿元｜成交额 {item.amount} 亿元｜"
                     f"目标仓位 {_money(item.target_weight * Decimal('100'))}%｜"
-                    f"金额上限 {_money(item.target_amount)} 元｜约 {item.estimated_shares} 股｜"
-                    f"预计保护线 {_money(item.estimated_initial_line)}"
+                    f"金额上限 {_money(item.target_amount)} 元｜约 {shares}｜"
+                    f"预计保护线 {initial_line}"
+                    f"{pending_suffix}"
                 )
             else:
                 lines.append(
-                    f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
+                    f"- {index}. {item.symbol} {item.name}｜约 {shares}｜"
                     f"金额上限 {_money(item.target_amount)} {currency}｜"
-                    f"预计保护线 {_money(item.estimated_initial_line)}"
+                    f"预计保护线 {initial_line}"
+                    f"{pending_suffix}"
                 )
         if market == "CN":
             quantity_rule = "按富途数据日前复权日线收盘价向下取整为 100 股整数倍"
@@ -3320,11 +3396,21 @@ def render_markdown(report: TrendReport) -> str:
             industry_count, industry_weight = industry_facts.get(
                 item.industry, (0, Decimal("0"))
             )
+            filter_price = (
+                f"{item.filter_price} 元"
+                if item.filter_price is not None
+                else "待补全"
+            )
+            execution_price = (
+                f"{item.close} 元"
+                if item.close is not None
+                else "待补全"
+            )
             lines.append(
                 f"- {index}. {item.symbol} {item.name}｜强度 {item.strength}｜"
                 f"右侧 {item.days} 天｜成交额 {item.amount} 亿元｜"
                 + (
-                    f"筛选价 {item.filter_price} 元｜执行参考价 {item.close} 元｜"
+                    f"筛选价 {filter_price}｜执行参考价 {execution_price}｜"
                     f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
                     f"节气 {item.phase or '未知'}｜行业 ID {item.industry_tm_id}｜"
                     f"行业温度 {item.industry_temperature or '未知'}｜市值 {item.market_cap} 亿元｜"

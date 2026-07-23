@@ -4630,6 +4630,20 @@ window.fetch=async (input)=>{{
     assert errors == []
 
 
+def test_dashboard_pending_market_data_uses_pending_label() -> None:
+    output = run_dashboard_js(r'''
+const html = renderCnBuyStage({buy_actions:[{
+  symbol:"600001", name:"示例", target_amount:"4000",
+  estimated_shares:null, estimated_initial_line:null,
+  market_data_status:"pending", pending_fields:["quote","atr"]
+}]});
+if (!html.includes("待补全")) throw new Error(html);
+if (html.includes(">0 股<")) throw new Error(html);
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_dashboard_trend_review_is_compact_exact_and_account_scoped() -> None:
     output = run_dashboard_js(r'''
 const review=(broker,brokerLabel,market,marketLabel)=>({
