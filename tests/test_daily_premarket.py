@@ -1237,7 +1237,7 @@ class RaisingCloseQuoteClient(FakeQuoteClient):
         raise RuntimeError("close failed")
 
 
-class CapturingNotifier:
+class CapturingNotifier(MacOSNotifier):
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
@@ -1348,7 +1348,7 @@ class FailingFutuFactsGenerator:
         raise RuntimeError("futu service unavailable")
 
 
-class FailingNotifier:
+class FailingNotifier(MacOSNotifier):
     def notify(self, title: str, message: str) -> None:
         raise RuntimeError("delivery failed")
 
@@ -1824,7 +1824,7 @@ def test_hk_daily_runner_uses_market_notification_titles(
     ]
     for row in rows:
         assert row["market"] == "HK"
-        assert row["channel"] == "CapturingNotifier"
+        assert row["channel"] == "macos"
         assert row["success"] == "true"
 
 
@@ -1852,8 +1852,41 @@ def test_daily_notify_logs_success(
     assert len(rows) == 1
     assert rows[0]["market"] == "US"
     assert rows[0]["title"] == "Open Trader 美股行动通知"
-    assert rows[0]["channel"] == "CapturingNotifier"
+    assert rows[0]["channel"] == "macos"
     assert rows[0]["success"] == "true"
+
+
+def test_daily_notify_routes_legacy_titles_only_to_macos(tmp_path: Path) -> None:
+    class RecordingFeishu(FeishuWebhookNotifier):
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, str]] = []
+
+        def notify(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+
+    class RecordingMacOS(MacOSNotifier):
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, str]] = []
+
+        def notify(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+
+    feishu = RecordingFeishu()
+    macos = RecordingMacOS()
+    runner = _daily_runner(
+        config=_daily_config(tmp_path),
+        notifier=CompositeNotifier([feishu, macos]),
+    )
+
+    runner._notify(
+        "Open Trader 美股行动通知",
+        "测试正文",
+        market="US",
+        run_date="2026-06-17",
+    )
+
+    assert feishu.messages == []
+    assert macos.messages == [("Open Trader 美股行动通知", "测试正文")]
 
 
 def test_daily_notify_logs_failure_without_raising(
@@ -1880,7 +1913,7 @@ def test_daily_notify_logs_failure_without_raising(
     assert len(rows) == 1
     assert rows[0]["market"] == "HK"
     assert rows[0]["title"] == "Open Trader 港股阻塞通知"
-    assert rows[0]["channel"] == "FailingNotifier"
+    assert rows[0]["channel"] == "macos"
     assert rows[0]["success"] == "false"
     assert rows[0]["error_type"] == "RuntimeError"
     assert rows[0]["error"] == "delivery failed"
@@ -1890,7 +1923,7 @@ def test_daily_notify_logs_composite_child_failure_without_raising(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class WorkingNotifier:
+    class WorkingNotifier(MacOSNotifier):
         def notify(self, title: str, message: str) -> None:
             pass
 

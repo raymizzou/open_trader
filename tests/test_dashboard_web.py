@@ -3761,6 +3761,42 @@ console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:call
     assert rendered["attributionStates"].count("报告关联冲突") == 1
 
 
+def test_dashboard_manual_refresh_reloads_active_simulated_positions() -> None:
+    output = run_dashboard_js(r'''
+elements["refresh-quotes"]={disabled:false,textContent:""};
+renderQuoteStatus=()=>{};
+renderHoldings=()=>{};
+state.brokerFilter="tiger";
+state.accountViews.tiger="simulate";
+state.trendSimulatePositions={tiger:{available:true,positions:[
+  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
+]}};
+const refreshed={available:true,positions:[
+  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
+  {symbol:"HST",quantity:"1633"},
+]};
+const requests=[];
+globalThis.fetch=async(url)=>{
+  requests.push(url);
+  return {ok:true,json:async()=>url==="/api/quotes"
+    ? {quotes:{},account_sync:{status:"skipped"}}
+    : refreshed};
+};
+await refreshQuotes({refreshSimulation:true});
+console.log(JSON.stringify({
+  requests,
+  symbols:state.trendSimulatePositions.tiger.positions.map((position)=>position.symbol),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["requests"] == [
+        "/api/quotes",
+        "/api/trend-simulate-positions/tiger",
+    ]
+    assert rendered["symbols"] == ["GPN", "TOST", "HST"]
+
+
 def test_dashboard_report_loads_simulation_and_keeps_real_comparison() -> None:
     output = run_dashboard_js(r'''
 function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{add(){},remove(){}},

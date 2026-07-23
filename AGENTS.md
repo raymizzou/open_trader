@@ -6,6 +6,12 @@ Start new isolated feature or fix work from the local `main` branch unless the
 user explicitly selects another baseline. Create a separate branch and worktree
 from `main`; do not derive the branch from an unrelated or dirty checkout.
 
+## Merge Log Gate
+
+Before merging any branch into `main`, update and commit its dated
+operator-facing entry in `CHANGELOG.md`. Do not merge first and add the log
+afterward.
+
 ## Verification Discipline
 
 For any behavior change, especially changes that affect notifications, background

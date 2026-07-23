@@ -228,7 +228,7 @@ function bindEvents() {
       syncCnTrendBuyAccessibility,
     );
   }
-  elements["refresh-quotes"].addEventListener("click", refreshQuotes);
+  elements["refresh-quotes"].addEventListener("click", () => refreshQuotes({refreshSimulation: true}));
   if (elements["kelly-lab-panel"]) {
     elements["kelly-lab-panel"].addEventListener("click", (event) => {
       const strategyTab = event.target.closest("[data-kelly-experiment]");
@@ -873,7 +873,7 @@ function scheduleQuotePolling(pollSeconds) {
   state.quoteIntervalId = window.setInterval(refreshQuotes, intervalMs);
 }
 
-async function refreshQuotes() {
+async function refreshQuotes({refreshSimulation = false} = {}) {
   if (state.refreshActive) {
     return;
   }
@@ -888,10 +888,17 @@ async function refreshQuotes() {
     const payload = await response.json();
     state.quotePayload = payload;
     state.quotes = payload.quotes || {};
+    const simulateBroker = refreshSimulation
+      && TREND_ACCOUNT_BROKERS.includes(state.brokerFilter)
+      && ["simulate", "report"].includes(state.accountViews[state.brokerFilter])
+      ? state.brokerFilter
+      : "";
+    if (refreshSimulation) state.trendSimulatePositions = {};
     if (accountSyncReloadNeeded(payload.account_sync)) {
       await loadDashboard({preserveOnError: true});
     }
     renderQuoteStatus(payload);
+    if (simulateBroker) await loadTrendSimulatePositions(simulateBroker);
   } catch (error) {
     state.quotePayload = {
       status: "failed",

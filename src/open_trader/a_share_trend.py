@@ -26,6 +26,7 @@ from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
+from .notification_policy import render_attention, render_daily_title
 from .portfolio_risk import size_entry_by_risk
 from .strategy_drawdown import (
     DRAWDOWN_LIMIT,
@@ -2799,7 +2800,7 @@ def render_trend_feishu_text(
     for item in formal + holdings:
         if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
-    title = f"【{broker_label}｜{market_label}趋势报告｜{execution_date}】"
+    title = render_daily_title(broker_label, market_label, execution_date)
     status = (
         "已更新"
         if fresh
@@ -2844,9 +2845,14 @@ def render_trend_failure_text(
     reason: str,
     recovery_action: str,
 ) -> tuple[str, str]:
-    return (
-        f"【{broker_label}｜{market_label}趋势报告生成失败｜{report_date}】",
-        f"原因：{reason}\n现在做：{recovery_action}\n\n报告未生成，请勿依据旧报告交易。",
+    return render_attention(
+        broker_label,
+        f"{market_label}趋势报告生成失败",
+        report_date,
+        happened="趋势报告未生成",
+        impact="不能依据旧报告交易",
+        action=recovery_action,
+        detail=reason,
     )
 
 

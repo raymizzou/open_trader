@@ -2792,7 +2792,7 @@ def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
         payload, broker_label="富途", market_label="美股"
     )
 
-    assert title == "【富途｜美股趋势报告｜2026-07-15】"
+    assert title == "【日报｜富途｜美股趋势报告｜2026-07-15】"
     assert message == "\n".join(
         [
             "数据截至：2026-07-14",
@@ -2897,7 +2897,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     title, message = render_trend_feishu_text(
         payload, broker_label="辉立", market_label="港股"
     )
-    assert title == "【辉立｜港股趋势报告｜2026-07-15】"
+    assert title == "【日报｜辉立｜港股趋势报告｜2026-07-15】"
     assert message == (
         "数据截至：2026-07-14\n"
         "账户状态：账户数据非实时，执行前核对现金与持仓\n"
@@ -3196,11 +3196,12 @@ def test_trend_failure_text_is_plain_and_actionable() -> None:
         reason="趋势数据在截止时间前仍未更新",
         recovery_action="确认 Trend Animals 数据状态后手动重跑东方财富报告",
     )
-    assert title == "【东方财富｜A股趋势报告生成失败｜2026-07-15】"
+    assert title == "【需处理｜东方财富｜A股趋势报告生成失败｜2026-07-15】"
     assert message == (
-        "原因：趋势数据在截止时间前仍未更新\n"
-        "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
-        "报告未生成，请勿依据旧报告交易。"
+        "发生：趋势报告未生成\n"
+        "影响：不能依据旧报告交易\n"
+        "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n"
+        "原因：趋势数据在截止时间前仍未更新"
     )
 
 
@@ -4366,7 +4367,7 @@ def test_report_runner_sends_exact_broker_v4_text(tmp_path: Path) -> None:
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert notifier.messages == [
         (
-            "【东方财富｜A股趋势报告｜2026-07-15】",
+            "【日报｜东方财富｜A股趋势报告｜2026-07-15】",
             "数据截至：2026-07-14\n"
             "账户状态：已更新\n"
             "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
@@ -4452,10 +4453,11 @@ def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Pat
     assert [title for title, _ in macos.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
     assert feishu.messages == [
         (
-            "【东方财富｜A股趋势报告生成失败｜2026-07-14】",
-            "原因：趋势数据在截止时间前仍未更新\n"
-            "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n\n"
-            "报告未生成，请勿依据旧报告交易。",
+            "【需处理｜东方财富｜A股趋势报告生成失败｜2026-07-14】",
+            "发生：趋势报告未生成\n"
+            "影响：不能依据旧报告交易\n"
+            "现在做：确认 Trend Animals 数据状态后手动重跑东方财富报告\n"
+            "原因：趋势数据在截止时间前仍未更新",
         )
     ]
     ledger = config.data_dir / "trend_a_share/daily_delivery/2026-07-14.json"
@@ -5447,7 +5449,7 @@ def test_report_runner_sends_v1_text_only_to_feishu_and_short_status_to_macos(tm
     )
     assert result.status == "generated"
     assert len(feishu.messages) == len(macos.messages) == 1
-    assert feishu.messages[0][0] == "【东方财富｜A股趋势报告｜2026-07-15】"
+    assert feishu.messages[0][0] == "【日报｜东方财富｜A股趋势报告｜2026-07-15】"
     assert "# A股趋势操作计划" not in feishu.messages[0][1]
     assert "# A股趋势操作计划" not in macos.messages[0][1]
 

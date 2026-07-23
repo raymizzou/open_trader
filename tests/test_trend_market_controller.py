@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import multiprocessing
 import socket
 import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
@@ -20,6 +22,11 @@ from open_trader import trend_market_controller as controller
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_symbols import to_futu_symbol
 from open_trader.kelly_order_execution import FutuOrderExecutionError
+from open_trader.notifications import (
+    CompositeNotifier,
+    FeishuWebhookNotifier,
+    MacOSNotifier,
+)
 from open_trader.trend_market_controller import (
     ControllerCycle,
     load_trend_market_status,
@@ -60,6 +67,874 @@ def controller_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+def write_controller_action(
+    config: DailyPremarketConfig,
+    key: str,
+    payload: dict[str, object],
+) -> None:
+    path = (
+        config.data_dir
+        / "trend_review/ledgers/CN/actions/2026-07-20"
+        / key
+        / "2026-07-20T09-31-00+08-00.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({**payload, "recorded_at": NOW.isoformat()}),
+        encoding="utf-8",
+    )
+
+
+class FlakyFeishu(FeishuWebhookNotifier):
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.attempt_count = 0
+
+    def notify(self, title: str, message: str) -> None:
+        self.attempt_count += 1
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("Feishu unavailable")
+
+
+class RecordingMacOS(MacOSNotifier):
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+def _retry_pending_feishu_notifications_in_process(
+    config: DailyPremarketConfig,
+    start: object,
+    finished: object,
+    attempts: object,
+    release: object,
+    entered: object | None = None,
+) -> None:
+    controller.build_notifier = lambda _config: CompositeNotifier([
+        BlockingProcessFeishu(attempts, release, entered)
+    ])
+    start.wait()
+    try:
+        controller._retry_pending_feishu_notifications(config)
+    finally:
+        with finished.get_lock():
+            finished.value += 1
+
+
+class BlockingProcessFeishu(FeishuWebhookNotifier):
+    def __init__(
+        self,
+        attempts: object,
+        release: object,
+        entered: object | None = None,
+    ) -> None:
+        self.attempts = attempts
+        self.release = release
+        self.entered = entered
+
+    def notify(self, title: str, message: str) -> None:
+        with self.attempts.get_lock():
+            self.attempts.value += 1
+        if self.entered is not None:
+            self.entered.set()
+        self.release.wait(timeout=5)
+
+
+def test_controller_notification_retries_only_feishu_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(controller_config(tmp_path), notifiers=("feishu", "macos"))
+    feishu = FlakyFeishu(failures=1)
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu, macos]),
+    )
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is False
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.trend_controller.notification.v2",
+        "market": "US",
+        "execution_date": "2026-07-22",
+        "action": "controller",
+        "reason": "snapshot_failed",
+        "occurred_at": "2026-07-22T10:00:00+08:00",
+        "non_feishu_attempted": True,
+        "feishu_attempts": 1,
+        "feishu_title": "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】",
+        "feishu_message": (
+            "发生：趋势控制器已进入阻塞状态\n"
+            "影响：美股自动趋势流程暂停\n"
+            "现在做：检查 Dashboard 控制器状态与最近日志\n"
+            "原因：详见控制器日志"
+        ),
+        "channels": ["macos"],
+    }
+
+    controller._retry_pending_feishu_notifications(config)
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is True
+
+    assert feishu.attempt_count == 2
+    assert len(macos.messages) == 1
+
+
+def test_controller_notification_stops_after_one_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    feishu = FlakyFeishu(failures=2)
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu]),
+    )
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is False
+    controller._retry_pending_feishu_notifications(config)
+    controller._retry_pending_feishu_notifications(config)
+
+    assert feishu.attempt_count == 2
+
+
+def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
+    config = controller_config(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    attempts = context.Value("i", 0)
+    finished = context.Value("i", 0)
+    release = context.Event()
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "snapshot_failed",
+            "occurred_at": "2026-07-22T10:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "retry title",
+            "feishu_message": "retry message",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    start = context.Event()
+    processes = [
+        context.Process(
+            target=_retry_pending_feishu_notifications_in_process,
+            args=(config, start, finished, attempts, release),
+        )
+        for _ in range(3)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    deadline = time.monotonic() + 5
+    try:
+        while (
+            attempts.value < 3
+            and finished.value < 2
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert attempts.value == 1
+        assert finished.value == 2
+    finally:
+        release.set()
+        for process in processes:
+            process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert attempts.value == 1
+
+
+def test_direct_notification_retry_and_scanner_send_feishu_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(controller_config(tmp_path), notifiers=("feishu",))
+    context = multiprocessing.get_context("spawn")
+    attempts = context.Value("i", 0)
+    finished = context.Value("i", 0)
+    release = context.Event()
+    entered = context.Event()
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "snapshot_failed",
+            "occurred_at": "2026-07-22T10:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "retry title",
+            "feishu_message": "retry message",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([
+            BlockingProcessFeishu(attempts, release)
+        ]),
+    )
+    start = context.Event()
+    scanner = context.Process(
+        target=_retry_pending_feishu_notifications_in_process,
+        args=(config, start, finished, attempts, release, entered),
+    )
+    scanner.start()
+    start.set()
+    assert entered.wait(timeout=5)
+    direct_finished = threading.Event()
+    direct_results: list[bool] = []
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:01+08:00",
+    )
+
+    def retry_directly() -> None:
+        direct_results.append(
+            controller._notify_once(
+                "US 趋势控制器阻塞", "retry unavailable", key
+            )
+        )
+        direct_finished.set()
+
+    direct = threading.Thread(target=retry_directly)
+    direct.start()
+    deadline = time.monotonic() + 5
+    try:
+        while (
+            attempts.value < 2
+            and not direct_finished.is_set()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert attempts.value == 1
+        assert direct_finished.wait(timeout=5)
+        assert direct_results == [False]
+    finally:
+        release.set()
+        direct.join(timeout=5)
+        scanner.join(timeout=5)
+
+    assert scanner.exitcode == 0
+    assert attempts.value == 1
+
+
+def test_concurrent_first_controller_notifications_send_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent: list[set[str]] = []
+    first_non_feishu = threading.Event()
+    second_non_feishu = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    local_attempts = 0
+    mutex = threading.Lock()
+
+    def send(
+        _notifier: object,
+        _title: str,
+        _message: str,
+        *,
+        channels: set[str],
+    ) -> list[SimpleNamespace]:
+        nonlocal local_attempts
+        if "feishu" not in channels:
+            with mutex:
+                local_attempts += 1
+                attempt = local_attempts
+            if attempt == 1:
+                first_non_feishu.set()
+                assert release_first.wait(timeout=2)
+            else:
+                second_non_feishu.set()
+                assert release_second.wait(timeout=2)
+        sent.append(channels)
+        channel = "feishu_app" if "feishu" in channels else "macos"
+        return [SimpleNamespace(channel=channel, success=True)]
+
+    monkeypatch.setattr(controller, "send_notification_with_results", send)
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            controller._notify_once,
+            "US 趋势控制器阻塞",
+            "snapshot unavailable",
+            key,
+        )
+        assert first_non_feishu.wait(timeout=2)
+        second = pool.submit(
+            controller._notify_once,
+            "US 趋势控制器阻塞",
+            "snapshot unavailable",
+            key,
+        )
+        if second_non_feishu.wait(timeout=1):
+            release_first.set()
+            assert first.result(timeout=2) is True
+            release_second.set()
+        else:
+            assert second.done()
+            release_first.set()
+            assert first.result(timeout=2) is True
+        second.result(timeout=2)
+
+    assert sent.count({"macos", "xiaoai"}) == 1
+    assert sent.count({"feishu", "feishu_app"}) == 1
+
+
+def test_legacy_controller_notification_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    feishu = FlakyFeishu(failures=0)
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu, macos]),
+    )
+    identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{digest}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v1",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "snapshot_failed",
+            "notified_at": "2026-07-22T09:00:00+08:00",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+    assert controller._notify_once(
+        "US 趋势控制器阻塞", "snapshot unavailable", key
+    ) is True
+    assert feishu.attempt_count == 0
+    assert macos.messages == []
+
+
+def test_ambiguous_legacy_v1_controller_notification_does_not_suppress_current_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v1",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "notified_at": "2026-07-22T09:00:00+08:00",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert [channels for _, _, channels in sent] == [
+        {"macos", "xiaoai"},
+        {"feishu", "feishu_app"},
+    ]
+    assert json.loads(review_path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.trend_controller.notification.v2",
+        "market": "US",
+        "execution_date": "2026-07-22",
+        "action": "review",
+        "reason": "RuntimeError",
+        "occurred_at": "2026-07-22T10:00:00+08:00",
+        "non_feishu_attempted": True,
+        "feishu_attempts": 1,
+        "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+        "feishu_message": (
+            "发生：趋势复盘未完成\n"
+            "影响：复盘数据暂未更新\n"
+            "现在做：检查 OpenD 与复盘账本后等待自动恢复\n"
+            "原因：详见控制器日志"
+        ),
+        "channels": ["macos", "feishu_app"],
+    }
+
+
+def test_delivered_legacy_v2_review_is_not_replayed_as_current_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "occurred_at": "2026-07-22T09:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+            "feishu_message": "review unavailable",
+            "channels": ["feishu_app"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert sent == []
+    assert not review_path.exists()
+
+
+def test_legacy_v2_controller_alert_does_not_suppress_current_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "occurred_at": "2026-07-22T09:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】",
+            "feishu_message": "controller unavailable",
+            "channels": ["feishu_app"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert [channels for _, _, channels in sent] == [
+        {"macos", "xiaoai"},
+        {"feishu", "feishu_app"},
+    ]
+    assert review_path.exists()
+
+
+def test_pending_legacy_v2_review_retries_only_its_feishu_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "occurred_at": "2026-07-22T09:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+            "feishu_message": "review unavailable",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert [channels for _, _, channels in sent] == [{"feishu", "feishu_app"}]
+    assert not review_path.exists()
+    assert json.loads(legacy_path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.trend_controller.notification.v2",
+        "market": "US",
+        "execution_date": "2026-07-22",
+        "action": "controller",
+        "reason": "RuntimeError",
+        "occurred_at": "2026-07-22T09:00:00+08:00",
+        "non_feishu_attempted": True,
+        "feishu_attempts": 2,
+        "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+        "feishu_message": "review unavailable",
+        "channels": ["macos", "feishu_app"],
+    }
+
+
+def test_protection_blocker_notifies_feishu_once_per_market_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    feishu = FlakyFeishu(failures=0)
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([feishu]),
+    )
+
+    for occurred_at in (
+        "2026-07-22T09:31:00+08:00",
+        "2026-07-22T09:31:05+08:00",
+    ):
+        controller._notify_protection_blocker(
+            config,
+            "CN",
+            "2026-07-22",
+            "protection pass abnormal: unknown_quotes=2",
+            occurred_at,
+        )
+
+    assert feishu.attempt_count == 1
+
+
+def _record_controller_notification_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, set[str]]]:
+    sent: list[tuple[str, str, set[str]]] = []
+
+    def send(
+        _notifier: object,
+        title: str,
+        message: str,
+        *,
+        channels: set[str],
+    ) -> list[SimpleNamespace]:
+        sent.append((title, message, channels))
+        channel = "feishu_app" if "feishu" in channels else "macos"
+        return [SimpleNamespace(channel=channel, success=True)]
+
+    monkeypatch.setattr(controller, "send_notification_with_results", send)
+    return sent
+
+
+def test_different_connectivity_errors_share_one_controller_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    controller._notify_controller_failure(
+        config,
+        "CN",
+        "2026-07-22",
+        "calendar",
+        RuntimeError("Connect timeout"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    )
+    controller._notify_controller_failure(
+        config,
+        "HK",
+        "2026-07-22",
+        "controller",
+        RuntimeError("protocol disconnected"),
+        datetime.fromisoformat("2026-07-22T10:00:01+08:00"),
+    )
+
+    feishu = [item for item in sent if "feishu" in item[2]]
+    assert len(feishu) == 1
+    assert feishu[0][0] == "【需处理｜系统｜OpenD 连接故障｜2026-07-22】"
+    assert "影响：CN、HK、US 行情与订单监控可能中断" in feishu[0][1]
+    state = json.loads(
+        (
+            config.data_dir
+            / "trend_controller/shared/incidents/opend-connectivity.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["affected_markets"] == ["CN", "HK"]
+
+
+def test_connectivity_and_rate_limit_are_separate_controller_incidents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    for error in (RuntimeError("network down"), RuntimeError("请求频率太高")):
+        controller._notify_controller_failure(
+            config,
+            "US",
+            "2026-07-22",
+            "controller",
+            error,
+            datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+        )
+
+    feishu_titles = [title for title, _, channels in sent if "feishu" in channels]
+    assert feishu_titles == [
+        "【需处理｜系统｜OpenD 连接故障｜2026-07-22】",
+        "【需处理｜系统｜OpenD 请求限频｜2026-07-22】",
+    ]
+    assert (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-connectivity.json"
+    ).exists()
+    assert (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-rate-limit.json"
+    ).exists()
+
+
+def test_shared_incident_state_failure_falls_back_to_per_market_feishu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    incident = (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-connectivity.json"
+    )
+    incident.parent.mkdir(parents=True, exist_ok=True)
+    incident.write_text("{}", encoding="utf-8")
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    controller._notify_controller_failure(
+        config,
+        "CN",
+        "2026-07-22",
+        "controller",
+        RuntimeError("Connect timeout"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    )
+
+    feishu = [item for item in sent if "feishu" in item[2]]
+    assert len(feishu) == 1
+    assert feishu[0][0] == "【需处理｜东方财富｜A股趋势控制器阻塞｜2026-07-22】"
+    assert len([item for item in sent if "feishu" not in item[2]]) == 1
+
+
+def test_unknown_controller_errors_stay_per_market(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        RuntimeError("unknown broker response"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    )
+
+    feishu = [item for item in sent if "feishu" in item[2]]
+    assert len(feishu) == 1
+    assert feishu[0][0] == "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】"
+    local = [item for item in sent if "feishu" not in item[2]]
+    assert local == [
+        (
+            "US 趋势控制器阻塞",
+            "unknown broker response",
+            {"macos", "xiaoai"},
+        )
+    ]
+    assert not (
+        config.data_dir / "trend_controller/shared/incidents"
+    ).exists()
+    states = list(
+        config.data_dir.glob(
+            "trend_controller/US/notifications/2026-07-22/*.json"
+        )
+    )
+    assert len(states) == 1
+    assert json.loads(states[0].read_text(encoding="utf-8"))["reason"] == (
+        "RuntimeError"
+    )
+
+
+def test_review_and_controller_failures_keep_distinct_notification_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    _record_controller_notification_attempts(monkeypatch)
+    occurred_at = datetime.fromisoformat("2026-07-22T10:00:00+08:00")
+
+    for action in ("review", "controller"):
+        controller._notify_controller_failure(
+            config,
+            "US",
+            "2026-07-22",
+            action,
+            RuntimeError("same exception"),
+            occurred_at,
+        )
+
+    states = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in config.data_dir.glob(
+            "trend_controller/US/notifications/2026-07-22/*.json"
+        )
+    ]
+    assert {state["action"] for state in states} == {"review", "controller"}
+
+
 def active_cn_cycle() -> ControllerCycle:
     return ControllerCycle(
         market="CN",
@@ -70,6 +945,43 @@ def active_cn_cycle() -> ControllerCycle:
         market_open=True,
         next_check_at=datetime.fromisoformat("2026-07-20T09:31:05+08:00"),
     )
+
+
+def test_successful_controller_cycle_records_opend_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    write_report(config)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    incident = (
+        config.data_dir
+        / "trend_controller/shared/incidents/opend-connectivity.json"
+    )
+    incident.parent.mkdir(parents=True, exist_ok=True)
+    incident.write_text(
+        json.dumps({
+            "schema_version": "open_trader.opend_incident.v1",
+            "category": "connectivity",
+            "active": True,
+            "first_detected_at": "2026-07-20T09:30:00+08:00",
+            "updated_at": "2026-07-20T09:30:00+08:00",
+            "affected_markets": ["CN"],
+            "reasons": {"CN": "连接超时"},
+            "healthy_markets": [],
+            "feishu_attempts": 1,
+            "feishu_delivered_at": "2026-07-20T09:30:00+08:00",
+            "channels": ["feishu_app"],
+        }),
+        encoding="utf-8",
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "monitoring"
+    assert json.loads(incident.read_text(encoding="utf-8"))["active"] is False
 
 
 def test_repeated_controller_and_watcher_calendar_queries_stay_below_futu_quota(
@@ -1361,7 +2273,7 @@ def test_close_review_failure_is_nonblocking_progress(
     }
     assert result["next_check_at"] == "2026-07-20T15:01:10+08:00"
     assert notifications[0][1] == reason
-    assert notifications[0][2][3:5] == ("controller", reason)
+    assert notifications[0][2][3:5] == ("review", "snapshot_failed")
 
 
 def test_review_backoff_does_not_delay_order_execution(
@@ -2009,6 +2921,160 @@ def test_report_finished_after_window_is_preserved_and_actions_become_missed(
     assert result["phase"] == "missed"
     assert report_path.exists()
     assert result["last_success"]["submitted_count"] == 0
+
+
+def test_controller_groups_uncertain_actions_by_side_for_feishu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        write_controller_action(config, "600001-buy", {
+            "symbol": "600001", "side": "buy", "status": "uncertain",
+        })
+        write_controller_action(config, "600002-buy", {
+            "symbol": "600002", "side": "buy", "status": "uncertain",
+        })
+        write_controller_action(config, "600003-sell", {
+            "symbol": "600003", "side": "sell", "status": "uncertain",
+        })
+        return {"status": "uncertain", "submitted_count": 0}
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    non_feishu: list[tuple[str, str]] = []
+    feishu: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_non_feishu_once",
+        lambda title, message, _key: non_feishu.append((title, message)) or True,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, message, _key: feishu.append((title, message)) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert [title for title, _ in non_feishu] == ["CN 趋势订单 uncertain"]
+    assert [title for title, _ in feishu] == [
+        "【需处理｜东方财富｜A股买入状态不确定｜2026-07-20】",
+        "【需处理｜东方财富｜A股卖出状态不确定｜2026-07-20】",
+    ]
+    assert "- 600001" in feishu[0][1]
+    assert "- 600002" in feishu[0][1]
+
+
+def test_controller_groups_missed_buys_for_feishu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        for symbol in ("600001", "600002"):
+            write_controller_action(config, f"{symbol}-buy", {
+                "symbol": symbol,
+                "side": "buy",
+                "status": "missed",
+                "reason": "buy_window_closed",
+            })
+        return {"status": "missed_window", "submitted_count": 0}
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    non_feishu: list[str] = []
+    feishu: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_non_feishu_once",
+        lambda title, _message, _key: non_feishu.append(title) or True,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, message, _key: feishu.append((title, message)) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert non_feishu == ["CN 趋势买入已错过窗口"]
+    assert [title for title, _ in feishu] == [
+        "【需处理｜东方财富｜A股买入错过窗口｜2026-07-20】"
+    ]
+    assert "- 600001" in feishu[0][1]
+    assert "- 600002" in feishu[0][1]
+
+
+def test_controller_submitted_actions_create_no_feishu_order_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        write_controller_action(config, "600001-buy", {
+            "symbol": "600001", "side": "buy", "status": "submitted",
+        })
+        return {"status": "submitted", "submitted_count": 1}
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    feishu: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, _message, _key: feishu.append(title) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert feishu == []
+
+
+def test_controller_directionless_abnormal_execution_uses_batch_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {
+            "status": "uncertain",
+            "submitted_count": 0,
+        },
+    )
+    feishu: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_non_feishu_once",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, _message, _key: feishu.append(title) or True,
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert feishu == ["【需处理｜东方财富｜A股批次执行失败｜2026-07-20】"]
 
 
 def test_report_future_keeps_its_execution_date_when_cycle_advances(
@@ -4192,7 +5258,7 @@ def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
 ) -> None:
     config = controller_config(tmp_path)
     expected = {"status": "uncertain", "submitted_count": 0}
-    notifications: list[tuple[str, str, object, object]] = []
+    notifications: list[tuple[str, str, object]] = []
 
     class Orders:
         closed = False
@@ -4207,10 +5273,9 @@ def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
     )
     monkeypatch.setattr(
         controller,
-        "_notify_once",
-        lambda title, message, key, **kwargs: notifications.append(
-            (title, message, key, kwargs.get("channels"))
-        ) or True,
+        "_notify_feishu_once",
+        lambda title, message, key: notifications.append((title, message, key))
+        or True,
     )
 
     assert controller._run_stop(
@@ -4226,7 +5291,6 @@ def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
     assert orders.closed is True
     assert len(notifications) == 1
     assert notifications[0][2][3:5] == ("protection_sell", "uncertain")
-    assert notifications[0][3] == {"feishu", "feishu_app"}
 
 
 def test_default_protection_loader_gates_each_new_account_context(
