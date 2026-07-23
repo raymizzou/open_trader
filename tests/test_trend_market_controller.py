@@ -496,7 +496,7 @@ def test_legacy_controller_notification_is_not_replayed(
     assert macos.messages == []
 
 
-def test_legacy_review_notification_is_not_replayed_as_current_review(
+def test_ambiguous_legacy_v1_controller_notification_does_not_suppress_current_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = controller_config(tmp_path)
@@ -538,8 +538,28 @@ def test_legacy_review_notification_is_not_replayed_as_current_review(
         datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
     ) is True
 
-    assert sent == []
-    assert not review_path.exists()
+    assert [channels for _, _, channels in sent] == [
+        {"macos", "xiaoai"},
+        {"feishu", "feishu_app"},
+    ]
+    assert json.loads(review_path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.trend_controller.notification.v2",
+        "market": "US",
+        "execution_date": "2026-07-22",
+        "action": "review",
+        "reason": "RuntimeError",
+        "occurred_at": "2026-07-22T10:00:00+08:00",
+        "non_feishu_attempted": True,
+        "feishu_attempts": 1,
+        "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+        "feishu_message": (
+            "发生：趋势复盘未完成\n"
+            "影响：复盘数据暂未更新\n"
+            "现在做：检查 OpenD 与复盘账本后等待自动恢复\n"
+            "原因：详见控制器日志"
+        ),
+        "channels": ["macos", "feishu_app"],
+    }
 
 
 def test_delivered_legacy_v2_review_is_not_replayed_as_current_review(

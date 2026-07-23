@@ -1126,10 +1126,6 @@ def _notify_channels_once(
                         legacy_state = _read_json(
                             legacy_path, "trend controller notification"
                         )
-                        if legacy_state.get("schema_version") == (
-                            "open_trader.trend_controller.notification.v1"
-                        ):
-                            return True
                         if (
                             legacy_state.get("schema_version")
                             == "open_trader.trend_controller.notification.v2"
