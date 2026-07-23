@@ -48,6 +48,11 @@ def test_trend_market_parser_exposes_run_status_and_resolve() -> None:
         "--actor", "ray", "--reason", "checked Futu history",
         "--futu-order-id", "SIM-42", "--config", "config/resolve.env",
     ])
+    correct = parser.parse_args([
+        "trend-market", "correct", "--market", "CN", "--actor", "ray",
+        "--reason", "ATR exclusion bug", "--allow-late-buys",
+        "--config", "config/correct.env",
+    ])
 
     assert (run.trend_market_command, run.market, run.revision) == (
         "run", "US", True,
@@ -66,6 +71,17 @@ def test_trend_market_parser_exposes_run_status_and_resolve() -> None:
         "reason": "checked Futu history",
         "futu_order_id": "SIM-42",
     } == vars(resolve)
+    assert (
+        correct.trend_market_command,
+        correct.market,
+        correct.actor,
+        correct.reason,
+        correct.allow_late_buys,
+        correct.config,
+    ) == (
+        "correct", "CN", "ray", "ATR exclusion bug", True,
+        Path("config/correct.env"),
+    )
 
 
 @pytest.mark.parametrize(

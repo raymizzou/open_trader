@@ -130,6 +130,7 @@ from .trend_review import (
 )
 from .trend_market_controller import (
     load_trend_market_status,
+    run_corrected_trend_report,
     run_trend_market_controller,
 )
 from .strategy_drawdown import (
@@ -524,6 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trend_market_run.add_argument("--revision", action="store_true")
     trend_market_run.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_market_correct = trend_market_commands.add_parser(
+        "correct", help="Generate and execute one corrected trend report"
+    )
+    trend_market_correct.add_argument(
+        "--market", choices=("CN", "HK", "US"), required=True
+    )
+    trend_market_correct.add_argument("--actor", required=True)
+    trend_market_correct.add_argument("--reason", required=True)
+    trend_market_correct.add_argument("--allow-late-buys", action="store_true")
+    trend_market_correct.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
     trend_market_status = trend_market_commands.add_parser("status")
@@ -1302,7 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        if args.trend_market_command in {"run", "resolve"}:
+        if args.trend_market_command in {"run", "resolve", "correct"}:
             try:
                 require_trend_executor(config, hostname_fn=socket.gethostname)
             except ValueError as exc:
@@ -1317,6 +1330,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 result = run_trend_market_controller(
                     config, args.market, revision=args.revision
+                )
+            elif args.trend_market_command == "correct":
+                config = replace(
+                    config,
+                    repo=Path.cwd().resolve(),
+                    python=Path(sys.executable).resolve(),
+                )
+                result = run_corrected_trend_report(
+                    config,
+                    args.market,
+                    actor=args.actor,
+                    reason=args.reason,
+                    allow_late_buys=args.allow_late_buys,
                 )
             elif args.trend_market_command == "status":
                 result = load_trend_market_status(config, args.market)

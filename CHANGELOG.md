@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-23
 
+- 趋势报告升级到 v5：行情、ATR14 和港股每手股数可在执行时补全；修订报告可在窗口内执行，并为 2026-07-23 A 股模拟盘提供一次性审计授权。
 - Unified CN/HK/US Trend Animals `boiling`/`champagne` exits: the first signal
   per full position lifecycle trims 30% in SIMULATE (market-lot rounded), while
   protection, danger, right-side exit, and CN temperature-flat still sell all;

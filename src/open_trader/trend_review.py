@@ -479,7 +479,11 @@ def trend_attempt_remark(
 
 
 def _validate_execution_batch(
-    payload: object, *, market: str, execution_date: str
+    payload: object,
+    *,
+    market: str,
+    execution_date: str,
+    revision: int = 0,
 ) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("trend execution batch must be a JSON object")
@@ -488,6 +492,7 @@ def _validate_execution_batch(
     except (KeyError, ValueError):
         raise ValueError("trend execution batch has an invalid locked_at") from None
     report_sha = payload.get("report_sha256")
+    report_revision = payload.get("report_revision", 0)
     if (
         payload.get("schema_version") != "open_trader.trend_review.batch.v1"
         or payload.get("market") != market
@@ -499,6 +504,10 @@ def _validate_execution_batch(
         or any(character not in "0123456789abcdef" for character in report_sha)
         or locked_at.tzinfo is None
         or locked_at.utcoffset() is None
+        or isinstance(report_revision, bool)
+        or not isinstance(report_revision, int)
+        or report_revision < 0
+        or report_revision != revision
     ):
         raise ValueError("trend execution batch is invalid")
     return payload
@@ -512,16 +521,20 @@ def lock_trend_execution_batch(
     report_path: Path,
     report: Mapping[str, object],
     locked_at: str,
+    revision: int = 0,
 ) -> dict[str, object]:
     market = _market(market)
     execution_date = date.fromisoformat(execution_date).isoformat()
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("trend execution batch revision must be a non-negative integer")
+    suffix = "" if revision == 0 else f"-r{revision}"
     path = (
         data_dir
         / "trend_review"
         / "ledgers"
         / market
         / "batches"
-        / f"{execution_date}.json"
+        / f"{execution_date}{suffix}.json"
     )
     if path.exists():
         try:
@@ -529,7 +542,10 @@ def lock_trend_execution_batch(
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid trend execution batch: {path}") from exc
         return _validate_execution_batch(
-            existing, market=market, execution_date=execution_date
+            existing,
+            market=market,
+            execution_date=execution_date,
+            revision=revision,
         )
     legacy_facts: list[tuple[datetime, str]] = []
     protection_facts = _protection_fact_identities(
@@ -543,7 +559,8 @@ def lock_trend_execution_batch(
         / "open"
         / execution_date
     )
-    for fact_path in _ledger_fact_paths(ledger_root):
+    legacy_facts_to_scan = _ledger_fact_paths(ledger_root) if revision == 0 else ()
+    for fact_path in legacy_facts_to_scan:
         try:
             fact = json.loads(fact_path.read_text(encoding="utf-8"))
             if not isinstance(fact, dict):
@@ -640,9 +657,11 @@ def lock_trend_execution_batch(
             "report_path": str(selected_path),
             "report_sha256": selected_sha,
             "locked_at": locked_at,
+            "report_revision": revision,
         },
         market=market,
         execution_date=execution_date,
+        revision=revision,
     )
     try:
         _write_immutable(path, _canonical_json_bytes(payload))
@@ -652,7 +671,10 @@ def lock_trend_execution_batch(
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid trend execution batch: {path}") from exc
         return _validate_execution_batch(
-            concurrent, market=market, execution_date=execution_date
+            concurrent,
+            market=market,
+            execution_date=execution_date,
+            revision=revision,
         )
     return payload
 

@@ -30,6 +30,7 @@ from open_trader.notifications import (
 from open_trader.trend_market_controller import (
     ControllerCycle,
     load_trend_market_status,
+    run_corrected_trend_report,
     run_trend_market_controller,
 )
 from open_trader.trend_review import (
@@ -3232,6 +3233,184 @@ def test_later_revision_does_not_change_locked_batch(
 
     assert executed == [base_path]
     assert len(notifications) == 1
+
+
+def test_completed_correction_selects_immutable_revision_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    base_path, base = write_report(config)
+    controller._request_revision(config, cycle, NOW)
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=base_path,
+        report=base,
+        locked_at=NOW.isoformat(),
+    )
+    revision_path, revision = write_report(config, revision=1, buy=True)
+    monkeypatch.setattr(
+        controller, "_recovery_revision_for_report", lambda *_args, **_kwargs: None
+    )
+    controller._complete_revision(config, cycle, (revision_path, revision), NOW)
+
+    selected = controller._locked_report(
+        config, cycle, (revision_path, revision), NOW
+    )
+    assert selected[0] == revision_path
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=selected[0],
+        report=selected[1],
+        locked_at=NOW.isoformat(),
+        revision=1,
+    )
+    assert controller._batch_path(
+        config, "CN", cycle.execution_date, revision=1
+    ).exists()
+
+
+def test_v5_pending_report_is_valid_for_controller(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-17-r1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report = valid_cn_report(as_of_date="2026-07-17", execution_date="2026-07-20")
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+        "strategy_version": "v5",
+        "process_version": "v5sha",
+        "parameters": {"buy_window": "09:30-10:00"},
+        "parameter_rows": [{
+            "group": "execution", "name": "buy_window", "value": "09:30-10:00"
+        }],
+    }
+    report.update({
+        "schema_version": 1,
+        "generated_at": "2026-07-17T18:00:00+08:00",
+        "as_of_date": "2026-07-17",
+        "execution_date": "2026-07-20",
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "protection_state": {"schema_version": 1, "positions": {}},
+        "account": {
+            "source_date": "2026-07-17",
+            "fresh": True,
+            "net_value": "100000",
+            "available_cash": "100000",
+            "positions": [],
+            "exceptions": [],
+            "position_count": 0,
+        },
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "target_amount": "4000",
+                "lot_size": None,
+                "estimated_shares": None,
+                "atr": None,
+                "market_data_status": "pending",
+                "pending_fields": ["quote", "atr", "lot_size"],
+            }],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+    })
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    assert controller._valid_report(config, "CN", "2026-07-20", path, report)
+
+
+def test_corrected_report_late_authorization_is_hash_bound_and_one_shot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    revision_path = config.reports_dir / "trend_a_share/2026-07-22-r1.json"
+    revision_path.parent.mkdir(parents=True, exist_ok=True)
+    revision = valid_cn_report(
+        as_of_date="2026-07-22", execution_date="2026-07-23", buy=True
+    )
+    revision["generated_at"] = "2026-07-23T10:30:00+08:00"
+    revision_path.write_text(json.dumps(revision), encoding="utf-8")
+    cycle = replace(
+        active_cn_cycle(),
+        as_of_date="2026-07-22",
+        execution_date="2026-07-23",
+        report_run_date="2026-07-22",
+    )
+    now = datetime.fromisoformat("2026-07-23T10:30:00+08:00")
+    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args, **_kwargs: cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda *_args, **_kwargs: cycle
+    )
+    monkeypatch.setattr(controller.socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_request_revision", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "_generate_report", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        controller,
+        "_pending_revision_report",
+        lambda *_args, **_kwargs: (revision_path, revision),
+    )
+    monkeypatch.setattr(controller, "_complete_revision", lambda *_args: None)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {"status": "submitted", "submitted_count": 1},
+    )
+
+    result = run_corrected_trend_report(
+        config,
+        "CN",
+        actor="ray",
+        reason="ATR exclusion bug",
+        allow_late_buys=True,
+        now_fn=lambda: now,
+    )
+
+    authorization_path = (
+        config.data_dir
+        / "trend_controller/CN/late_buy_authorizations/2026-07-23.json"
+    )
+    authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+    assert authorization["report_path"].endswith("2026-07-22-r1.json")
+    assert authorization["report_sha256"] == result["report_sha256"]
+    assert authorization["actor"] == "ray"
+    assert authorization["reason"] == "ATR exclusion bug"
+    assert result["execution_date"] == "2026-07-23"
+
+
+def test_corrected_report_rejects_late_buy_without_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(),
+        as_of_date="2026-07-22",
+        execution_date="2026-07-23",
+        report_run_date="2026-07-22",
+    )
+    monkeypatch.setattr(controller, "_derive_cycle", lambda *_args, **_kwargs: cycle)
+    monkeypatch.setattr(
+        controller, "_cycle_to_reconcile", lambda *_args, **_kwargs: cycle
+    )
+    monkeypatch.setattr(controller.socket, "gethostname", lambda: "executor")
+
+    with pytest.raises(ValueError, match="outside buy window"):
+        run_corrected_trend_report(
+            config,
+            "CN",
+            actor="ray",
+            reason="ATR exclusion bug",
+            now_fn=lambda: datetime.fromisoformat(
+                "2026-07-23T10:30:00+08:00"
+            ),
+        )
 
 
 def test_readonly_controller_returns_without_report_broker_or_notification_calls(

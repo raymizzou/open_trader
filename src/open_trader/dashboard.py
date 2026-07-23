@@ -1479,13 +1479,16 @@ def _project_broker_trend_report(
     execution_batch_error = ""
     revision_anomaly = False
     if use_execution_batch:
+        revision_match = re.search(r"-r(\d+)$", selected[0].stem)
+        selected_revision = int(revision_match.group(1)) if revision_match else 0
+        batch_suffix = "" if selected_revision == 0 else f"-r{selected_revision}"
         batch_path = (
             data_dir
             / "trend_review"
             / "ledgers"
             / market
             / "batches"
-            / f"{selected[2].isoformat()}.json"
+            / f"{selected[2].isoformat()}{batch_suffix}.json"
         )
         try:
             batch_text = batch_path.read_text(encoding="utf-8")
@@ -1500,6 +1503,7 @@ def _project_broker_trend_report(
                     batch,
                     market=market,
                     execution_date=selected[2].isoformat(),
+                    revision=selected_revision,
                 )
                 locked_path = Path(str(batch["report_path"])).resolve()
                 if locked_path.parent != reports_dir.resolve():

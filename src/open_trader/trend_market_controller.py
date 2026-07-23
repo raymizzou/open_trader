@@ -116,14 +116,23 @@ def _controller_root(config: DailyPremarketConfig, market: str) -> Path:
     return config.data_dir / "trend_controller" / market
 
 
-def _batch_path(config: DailyPremarketConfig, market: str, execution_date: str) -> Path:
+def _batch_path(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    *,
+    revision: int = 0,
+) -> Path:
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("trend execution batch revision must be a non-negative integer")
+    suffix = "" if revision == 0 else f"-r{revision}"
     return (
         config.data_dir
         / "trend_review"
         / "ledgers"
         / market
         / "batches"
-        / f"{execution_date}.json"
+        / f"{execution_date}{suffix}.json"
     )
 
 
@@ -483,24 +492,63 @@ def _valid_report(
             return False
         if action["action"] != "BUY":
             continue
-        try:
-            weight = Decimal(str(action.get("target_weight")))
-            quantity = Decimal(str(action.get("estimated_shares")))
-            amount = Decimal(str(action.get("target_amount")))
-            atr = Decimal(str(action.get("atr")))
-            lot = int(action.get("lot_size") or 0)
-        except (InvalidOperation, TypeError, ValueError):
-            return False
-        if (
-            not all(
-                item.is_finite() and item > 0
-                for item in (weight, quantity, amount, atr)
-            )
-            or lot <= 0
-            or quantity != quantity.to_integral_value()
-            or quantity % lot
-        ):
-            return False
+        strategy_version = str(snapshot.get("strategy_version") or "")
+        if strategy_version == "v5":
+            pending_fields = action.get("pending_fields")
+            if action.get("market_data_status") == "pending":
+                if not isinstance(pending_fields, list) or not pending_fields:
+                    return False
+                if any(field not in {"quote", "atr", "lot_size"} for field in pending_fields):
+                    return False
+            else:
+                pending_fields = []
+            try:
+                weight = Decimal(str(action.get("target_weight")))
+                amount = Decimal(str(action.get("target_amount")))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if not all(item.is_finite() and item > 0 for item in (weight, amount)):
+                return False
+            # v5 formal buys may defer quote, ATR, and lot-size completion.
+            for field, value in (
+                ("estimated_shares", action.get("estimated_shares")),
+                ("atr", action.get("atr")),
+            ):
+                if value is None:
+                    continue
+                try:
+                    decimal = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if not decimal.is_finite() or decimal <= 0:
+                    return False
+            raw_lot = action.get("lot_size")
+            if raw_lot is not None:
+                try:
+                    lot = int(raw_lot)
+                except (TypeError, ValueError):
+                    return False
+                if lot <= 0:
+                    return False
+        else:
+            try:
+                weight = Decimal(str(action.get("target_weight")))
+                quantity = Decimal(str(action.get("estimated_shares")))
+                amount = Decimal(str(action.get("target_amount")))
+                atr = Decimal(str(action.get("atr")))
+                lot = int(action.get("lot_size") or 0)
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if (
+                not all(
+                    item.is_finite() and item > 0
+                    for item in (weight, quantity, amount, atr)
+                )
+                or lot <= 0
+                or quantity != quantity.to_integral_value()
+                or quantity % lot
+            ):
+                return False
     return True
 
 
@@ -853,6 +901,8 @@ def _execute_locked_report(
     report: Mapping[str, object],
     *,
     allow_new_buys: bool = True,
+    allow_late_buys: bool = False,
+    revision: int = 0,
     quote_client: object | None = None,
 ) -> dict[str, object]:
     require_trend_executor(config, hostname_fn=socket.gethostname)
@@ -874,6 +924,7 @@ def _execute_locked_report(
             report_path=report_path,
             report=report,
             locked_at=now,
+            revision=revision,
         )
     locked_path = Path(str(batch["report_path"]))
     locked_report = _read_json(locked_path, "locked trend report")
@@ -904,6 +955,7 @@ def _execute_locked_report(
         market=market,
         execution_date=execution_date,
         now=now,
+        allow_late_buys=allow_late_buys,
     )
     sell_symbols = {
         to_futu_symbol(market, str(action.get("symbol") or ""))
@@ -980,6 +1032,7 @@ def _execute_locked_report(
             now=now,
             quote_prices=prices,
             quote_lot_sizes=lot_sizes,
+            allow_late_buys=allow_late_buys,
         )
         if allow_new_buys and quote_failure:
             raise RuntimeError("current quote unavailable for pending trend buy")
@@ -1685,15 +1738,13 @@ def _request_revision(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
     now: datetime,
+    *,
+    allow_locked_batch: bool = False,
 ) -> Path:
     try:
         with RunLock(
             _revision_gate_path(config, cycle.market, cycle.execution_date)
         ):
-            if _batch_path(config, cycle.market, cycle.execution_date).exists():
-                raise ValueError(
-                    "trend report revision rejected: execution has begun"
-                )
             request, _ = _revision_paths(config, cycle.market, cycle.as_of_date)
             if request.exists():
                 _revision_state(
@@ -1703,6 +1754,13 @@ def _request_revision(
                     cycle.execution_date,
                 )
                 return request
+            if (
+                not allow_locked_batch
+                and _batch_path(config, cycle.market, cycle.execution_date).exists()
+            ):
+                raise ValueError(
+                    "trend report revision rejected: execution has begun"
+                )
             with RunLock(_report_lock_path(config, cycle.market), wait=True):
                 baseline_path, baseline_sha, baseline_revision = _revision_baseline(
                     config, cycle
@@ -1728,6 +1786,26 @@ def _request_revision(
         raise ValueError(
             "trend report revision rejected: execution has begun"
         ) from exc
+
+
+def _completed_revision_batch(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+) -> tuple[int, Path] | None:
+    """Return the immutable batch for the completed report revision, if any."""
+    request, completion = _revision_state(
+        config, cycle.market, cycle.as_of_date, cycle.execution_date
+    )
+    del request
+    if completion is None:
+        return None
+    report_path = Path(str(completion.get("report_path") or ""))
+    revision = _report_order(report_path)[1]
+    if revision <= 0:
+        raise ValueError("invalid completed trend report revision")
+    return revision, _batch_path(
+        config, cycle.market, cycle.execution_date, revision=revision
+    )
 
 
 def _pending_revision_report(
@@ -2086,7 +2164,25 @@ def _locked_report(
     latest: tuple[Path, dict[str, object]],
     now: datetime,
 ) -> tuple[Path, dict[str, object]]:
-    batch_path = _batch_path(config, cycle.market, cycle.execution_date)
+    completed_revision = _completed_revision_batch(config, cycle)
+    if completed_revision is not None:
+        revision, revision_batch_path = completed_revision
+        request, completion = _revision_state(
+            config, cycle.market, cycle.as_of_date, cycle.execution_date
+        )
+        del request
+        if (
+            completion is not None
+            and completion.get("report_sha256") == _report_hash(latest[1])
+            and _report_order(latest[0])[1] == revision
+        ):
+            if not revision_batch_path.exists():
+                return latest
+            batch_path = revision_batch_path
+        else:
+            batch_path = _batch_path(config, cycle.market, cycle.execution_date)
+    else:
+        batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return latest
     batch = _read_json(batch_path, "trend execution batch")
@@ -2116,6 +2212,146 @@ def _locked_report(
     return path, report
 
 
+def _late_buy_authorization_path(
+    config: DailyPremarketConfig, market: str, execution_date: str
+) -> Path:
+    return (
+        _controller_root(config, market)
+        / "late_buy_authorizations"
+        / f"{execution_date}.json"
+    )
+
+
+def _authorize_late_buys(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    *,
+    report_path: Path,
+    report: Mapping[str, object],
+    actor: str,
+    reason: str,
+    allow_late_buys: bool,
+    now: datetime,
+) -> Path | None:
+    local = now.astimezone(TIMEZONES[cycle.market])
+    window_end = BUY_WINDOWS[cycle.market][1]
+    outside_window = local.date() > date.fromisoformat(cycle.execution_date) or (
+        local.date() == date.fromisoformat(cycle.execution_date)
+        and local.time().replace(tzinfo=None) > window_end
+    )
+    if not outside_window:
+        return None
+    actor = actor.strip()
+    reason = reason.strip()
+    mode = trend_execution_mode(config, hostname_fn=socket.gethostname)
+    if not (
+        allow_late_buys
+        and cycle.market == "CN"
+        and cycle.as_of_date == "2026-07-22"
+        and cycle.execution_date == "2026-07-23"
+        and local.date().isoformat() == cycle.execution_date
+        and cn_session(local) in {"morning", "afternoon"}
+        and mode.mode == "execute"
+        and actor
+        and reason
+    ):
+        raise ValueError("outside buy window; explicit simulated authorization required")
+    payload = {
+        "schema_version": "open_trader.trend_controller.late_buy_authorization.v1",
+        "market": cycle.market,
+        "as_of_date": cycle.as_of_date,
+        "execution_date": cycle.execution_date,
+        "report_path": str(report_path),
+        "report_sha256": _report_hash(report),
+        "actor": actor,
+        "reason": reason,
+        "authorized_at": now.isoformat(timespec="seconds"),
+    }
+    path = _late_buy_authorization_path(
+        config, cycle.market, cycle.execution_date
+    )
+    if path.exists():
+        existing = _read_json(path, "late buy authorization")
+        if existing != payload:
+            raise ValueError("late buy authorization conflict")
+        return path
+    return _write_immutable(path, _canonical_json_bytes(payload))
+
+
+def run_corrected_trend_report(
+    config: DailyPremarketConfig,
+    market: str,
+    *,
+    actor: str,
+    reason: str,
+    allow_late_buys: bool = False,
+    now_fn: Callable[[], datetime] = datetime.now,
+) -> dict[str, object]:
+    """Generate, complete, and execute one explicitly corrected report."""
+    market = _market(market)
+    now = _localized(now_fn(), config.timezone)
+    require_trend_executor(config, hostname_fn=socket.gethostname)
+    current_cycle = _derive_cycle(config, market, now)
+    cycle = _cycle_to_reconcile(config, current_cycle, now)
+    local = now.astimezone(TIMEZONES[cycle.market])
+    late = local.date() > date.fromisoformat(cycle.execution_date) or (
+        local.date() == date.fromisoformat(cycle.execution_date)
+        and local.time().replace(tzinfo=None) > BUY_WINDOWS[cycle.market][1]
+    )
+    if late and not allow_late_buys:
+        raise ValueError("outside buy window; explicit simulated authorization required")
+    request = _request_revision(
+        config, cycle, now, allow_locked_batch=True
+    )
+    _generate_report(config, market, cycle.report_run_date, True)
+    request_payload = (
+        _read_json(request, "trend report revision request")
+        if isinstance(request, Path)
+        else {}
+    )
+    pending = _pending_revision_report(config, cycle, request_payload)
+    if pending is None:
+        request_state, completion = _revision_state(
+            config, cycle.market, cycle.as_of_date, cycle.execution_date
+        )
+        if completion is None or request_state is None:
+            raise RuntimeError("corrected trend report was not delivered")
+        pending = (
+            Path(str(completion["report_path"])),
+            _read_json(Path(str(completion["report_path"])), "completed trend report revision"),
+        )
+    _complete_revision(config, cycle, pending, now)
+    selected = _locked_report(config, cycle, pending, now)
+    authorization = _authorize_late_buys(
+        config,
+        cycle,
+        report_path=selected[0],
+        report=selected[1],
+        actor=actor,
+        reason=reason,
+        allow_late_buys=allow_late_buys,
+        now=now,
+    )
+    execution = _execute_locked_report(
+        config,
+        market,
+        cycle.execution_date,
+        selected[0],
+        selected[1],
+        allow_late_buys=late,
+        revision=_report_order(selected[0])[1],
+    )
+    return {
+        **execution,
+        "market": market,
+        "execution_date": cycle.execution_date,
+        "report_path": str(selected[0]),
+        "report_sha256": _report_hash(selected[1]),
+        "report_revision": _report_order(selected[0])[1],
+        "late_buy_authorization": str(authorization) if authorization else None,
+    }
+
+
 def _execution_due(cycle: ControllerCycle, now: datetime) -> bool:
     local = now.astimezone(TIMEZONES[cycle.market])
     execution_date = date.fromisoformat(cycle.execution_date)
@@ -2131,7 +2367,16 @@ def _execution_completed(
 ) -> bool:
     if _legacy_cycle_cutover(config, cycle):
         return True
-    batch_path = _batch_path(config, cycle.market, cycle.execution_date)
+    completed_revision = _completed_revision_batch(config, cycle)
+    if completed_revision is not None:
+        _, batch_path = completed_revision
+        if not batch_path.exists():
+            # The ordinary controller revision path still locks the legacy
+            # base batch.  An explicit corrected run creates the revision
+            # batch and will be selected above once it exists.
+            batch_path = _batch_path(config, cycle.market, cycle.execution_date)
+    else:
+        batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return False
     batch = _read_json(batch_path, "trend execution batch")

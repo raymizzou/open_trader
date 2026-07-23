@@ -2004,6 +2004,35 @@ def test_execution_batch_keeps_first_report_sha(tmp_path: Path) -> None:
     assert repeated["report_sha256"] == trend_review._report_hash(first)
 
 
+def test_execution_batch_revision_is_immutable_and_separate(tmp_path: Path) -> None:
+    report = cn_buy_report()
+    path = tmp_path / "reports/2026-07-17-r1.json"
+    locked = trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=path,
+        report=report,
+        locked_at="2026-07-20T09:30:00+08:00",
+        revision=1,
+    )
+
+    assert locked["report_revision"] == 1
+    assert (
+        tmp_path / "trend_review/ledgers/CN/batches/2026-07-20-r1.json"
+    ).exists()
+    repeated = trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=tmp_path / "reports/other.json",
+        report={**report, "generated_at": "2026-07-20T09:31:00+08:00"},
+        locked_at="2026-07-20T09:31:00+08:00",
+        revision=1,
+    )
+    assert repeated == locked
+
+
 def test_execution_batch_recovers_report_selected_by_legacy_intent(
     tmp_path: Path,
 ) -> None:
