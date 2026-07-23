@@ -5213,6 +5213,21 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_cn_disciplines_show_relaxed_current_entry_rules() -> None:
+    output = run_dashboard_js(r'''
+const html = renderCnTrendDisciplines();
+for (const text of ["行业温度为温、热或沸", "强度不低于 95", "ATR 可用"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+for (const text of ["筛选价不高于 200 元", "行业温度为热或沸"]) {
+  if (html.includes(text)) throw new Error(text + "\n" + html);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_cn_audit_unknown_prototype_reason_codes_use_safe_fallback() -> None:
     output = run_dashboard_js(r'''
 const html = renderCnTrendAudit({candidates:[{

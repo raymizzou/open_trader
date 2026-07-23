@@ -1936,7 +1936,7 @@ const TREND_REASON_LABELS = {
   strength_below_95: "趋势强度低于 95",
   industry_id_missing: "行业 ID 缺失",
   industry_temperature_missing: "行业温度缺失",
-  industry_temperature_not_hot: "行业温度未达到热或沸",
+  industry_temperature_not_hot: "行业温度未达到要求",
   phase_missing: "趋势节气缺失",
   phase_after_summer_solstice: "趋势节气晚于夏至",
   market_cap_missing: "市值缺失",
@@ -2585,8 +2585,8 @@ function renderCnTrendDisciplines() {
     <details class="trend-discipline"${open}><summary>买入纪律</summary><ol>
       <li>仅限 A 股股票，排除基金、北交所、ST 与退市标的</li>
       <li>个股必须由温转热或温转沸；热目标仓位 4%，沸目标仓位 2%</li>
-      <li>筛选价不高于 200 元，强度不低于 95</li>
-      <li>行业温度为热或沸，节气不晚于夏至</li>
+      <li>趋势强度不低于 95</li>
+      <li>行业温度为温、热或沸，节气不晚于夏至</li>
       <li>市值不低于 100 亿元，日成交额不低于 2 亿元</li>
       <li>当前可交易、未持有、处于右侧、无危险信号，执行价与 ATR 可用</li>
       <li>正式计划还须通过现金与最多 10 个持仓席位约束</li>

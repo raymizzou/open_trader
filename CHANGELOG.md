@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-23
 
+- Relaxed the current CN trend entry gate to accept warm, hot, or boiling
+  industries and removed the static CNY 200 filter-price cap; retained
+  ATR14-based protection/risk sizing and historical snapshot rendering.
+
 - Reworked the A-share trend candidate audit into a desktop comparison table
   and mobile cards that show each reported exclusion's actual value against the
   frozen strategy requirement, retain historical ATR explanations, and expose
