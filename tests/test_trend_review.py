@@ -30,12 +30,18 @@ from open_trader.strategy_drawdown import (
 from open_trader.models import Market, TradeFill
 
 
-def test_cn_v4_and_v6_snapshots_normalize_without_cross_version_rewrite() -> None:
+def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> None:
     old = live_trend_strategy_snapshot(
         "CN",
         "abc123",
         (622466, 697199),
         strategy_version="v4",
+    )
+    historic_v6 = live_trend_strategy_snapshot(
+        "CN",
+        "abc123",
+        (622466, 697199),
+        strategy_version="v6",
     )
     current = live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199)
@@ -43,11 +49,19 @@ def test_cn_v4_and_v6_snapshots_normalize_without_cross_version_rewrite() -> Non
 
     assert trend_review.normalize_trend_strategy_snapshot(old, "CN") == old
     assert (
+        trend_review.normalize_trend_strategy_snapshot(historic_v6, "CN")
+        == historic_v6
+    )
+    assert (
         trend_review.normalize_trend_strategy_snapshot(current, "CN")
         == current
     )
     assert old["parameters"]["max_filter_price"] == "200"
+    assert "kelly_sample_inherits" not in historic_v6["parameters"]
     assert "max_filter_price" not in current["parameters"]
+    assert current["parameters"]["kelly_sample_inherits"][0][
+        "opening_strategy_version"
+    ] == "v4"
 
 
 def frozen_evidence() -> dict[str, object]:
@@ -4367,7 +4381,7 @@ def test_partial_buy_cash_below_one_lot_creates_no_attempt(tmp_path: Path) -> No
     assert len(client.requests) == 1
 
 
-@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v6"])
+@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v6", "v7"])
 def test_partial_buy_risk_cap_limits_retry_lots(
     tmp_path: Path, strategy_version: str
 ) -> None:

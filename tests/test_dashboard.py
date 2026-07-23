@@ -1715,6 +1715,37 @@ def test_dashboard_accepts_cn_v6_risk_and_drawdown_contract() -> None:
     assert not dashboard_module._valid_trend_risk_summary(payload)
 
 
+def test_dashboard_accepts_cn_v7_risk_and_drawdown_contract() -> None:
+    payload = _valid_v6_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    drawdown = payload["drawdown_summary"]
+    assert isinstance(snapshot, dict) and isinstance(drawdown, dict)
+    snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v7",
+        "strategy_version": "v7",
+    })
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["kelly_sample_inherits"] = [{
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "opening_strategy_version": "v4",
+    }]
+    drawdown.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v7",
+        "strategy_version": "v7",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v7|v7",
+    })
+    bootstrap = drawdown["bootstrap_event"]
+    assert isinstance(bootstrap, dict)
+    bootstrap.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v7",
+        "strategy_version": "v7",
+    })
+
+    assert dashboard_module._valid_trend_risk_summary(payload)
+
+
 def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
     tmp_path: Path,
 ) -> None:

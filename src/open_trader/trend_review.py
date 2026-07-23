@@ -2608,7 +2608,7 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if version in {"v2", "v3", "v4", "v6"}:
+    if version in {"v2", "v3", "v4", "v6", "v7"}:
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -4080,6 +4080,7 @@ def _legacy_strategy_snapshot_variants(
         "kelly_rolling_window",
         "kelly_fraction",
         "kelly_optimizer",
+        "kelly_sample_inherits",
         "kelly_sample_scope",
         "kelly_source",
     }
@@ -4199,7 +4200,7 @@ def normalize_trend_strategy_snapshot(
             trend_strategy_snapshot,
         )
 
-        if snapshot.get("strategy_version") in {"v4", "v6"}:
+        if snapshot.get("strategy_version") in {"v4", "v6", "v7"}:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
                 process_version,
@@ -5107,11 +5108,11 @@ def rebuild_trend_report_from_evidence(
         "metadata",
         "price_fx_to_account_currency",
     }
-    if strategy_version in {"v2", "v3", "v4", "v6"}:
+    if strategy_version in {"v2", "v3", "v4", "v6", "v7"}:
         required.add("normal_cost_rate")
-    if strategy_version in {"v3", "v4", "v6"}:
+    if strategy_version in {"v3", "v4", "v6", "v7"}:
         required.update({"kelly_rounds", "kelly_data_reason"})
-    if strategy_version in {"v4", "v6"}:
+    if strategy_version in {"v4", "v6", "v7"}:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
     if missing:
@@ -5244,7 +5245,7 @@ def rebuild_trend_report_from_evidence(
             "invalid original input: price_fx_to_account_currency"
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
-    if strategy_version in {"v2", "v3", "v4", "v6"} and (
+    if strategy_version in {"v2", "v3", "v4", "v6", "v7"} and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
         or normal_cost_rate < 0
@@ -5311,7 +5312,7 @@ def rebuild_trend_report_from_evidence(
         kelly_data_reason=kelly_data_reason,
         drawdown_summary=(
             inputs["drawdown_summary"]
-            if strategy_version in {"v4", "v6"}
+            if strategy_version in {"v4", "v6", "v7"}
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
         ),

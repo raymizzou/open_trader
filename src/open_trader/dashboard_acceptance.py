@@ -461,7 +461,7 @@ def validate_integrated_candidate(
     labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
     for broker, market in TREND_SIMULATE_MARKETS.items():
         try:
-            expected_version = "v6" if broker == "eastmoney" else "v4"
+            expected_version = "v7" if broker == "eastmoney" else "v4"
             report = reports.get(broker)
             assert isinstance(report, Mapping) and report.get("available") is True, (
                 f"{broker} {market} 趋势报告不可用"

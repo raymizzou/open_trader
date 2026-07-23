@@ -1088,12 +1088,12 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     )
     summary = payload.get("risk_summary")
     if summary is None:
-        return strategy_version not in {"v2", "v3", "v4", "v6"}
+        return strategy_version not in {"v2", "v3", "v4", "v6", "v7"}
     if not isinstance(summary, dict) or any(
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
-    if strategy_version not in {"v2", "v3", "v4", "v6"}:
+    if strategy_version not in {"v2", "v3", "v4", "v6", "v7"}:
         return summary.get("status") in {"active", "paused"}
     judgments = payload.get("strategy_judgments")
     parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
@@ -1107,6 +1107,7 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
             "v3": valid_v3_risk_contract,
             "v4": valid_v4_risk_contract,
             "v6": valid_v4_risk_contract,
+            "v7": valid_v4_risk_contract,
         }[strategy_version](
             parameters, summary, expected_nav=expected_nav
         )
@@ -1176,7 +1177,7 @@ def _valid_v2_risk_items(
     allowed_buy_constraints = {
         "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
     }
-    if strategy_version in {"v3", "v4", "v6"}:
+    if strategy_version in {"v3", "v4", "v6", "v7"}:
         allowed_buy_constraints.add("Kelly 上限")
     for item in buys:
         shares = item.get("estimated_shares")
@@ -1206,7 +1207,7 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             or target_weight > PORTFOLIO_RISK_LIMIT
-            or strategy_version in {"v3", "v4", "v6"}
+            or strategy_version in {"v3", "v4", "v6", "v7"}
             and summary.get("kelly_phase") != "cold_start"
             and target_weight
             > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
@@ -1234,9 +1235,9 @@ def _valid_v2_risk_items(
         "交易单位",
         "关键风险数据",
     }
-    if strategy_version in {"v3", "v4", "v6"}:
+    if strategy_version in {"v3", "v4", "v6", "v7"}:
         allowed_constraints.add("Kelly 上限")
-    if strategy_version in {"v4", "v6"}:
+    if strategy_version in {"v4", "v6", "v7"}:
         allowed_constraints.add("策略累计回撤")
     for item in judgments["risk_skips"]:
         shares = item.get("estimated_shares")
@@ -1244,7 +1245,7 @@ def _valid_v2_risk_items(
         target_amount_raw = item.get("target_amount")
         target_amount = _dashboard_risk_decimal(target_amount_raw)
         zero_kelly_skip = (
-            strategy_version in {"v3", "v4", "v6"}
+            strategy_version in {"v3", "v4", "v6", "v7"}
             and summary.get("status") == "paused"
             and summary.get("kelly_cap") in {"0", "0.000000", 0}
             and summary.get("pause_reason") == "Kelly 上限为 0，仅暂停未来新开仓"
