@@ -5,9 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-23
 
-- Added the current CN trend rules as v6: accept warm, hot, or boiling
-  industries and removed the static CNY 200 filter-price cap; retained
-  ATR14-based protection/risk sizing and historical snapshot rendering.
+- Added the current CN trend rules as v7: accept warm, hot, or boiling
+  industries, remove the static CNY 200 filter-price cap, and retain
+  ATR14-based protection/risk sizing. As a one-time exception, its Kelly
+  sample pool inherits only approved CN v4 samples and excludes v1, v5, and v6.
 
 - Reworked the A-share trend candidate audit into a desktop comparison table
   and mobile cards that show each reported exclusion's actual value against the
