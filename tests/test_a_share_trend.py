@@ -325,6 +325,36 @@ def account(*symbols: str, fresh: bool = True) -> AccountSnapshot:
     )
 
 
+def active_drawdown_summary(
+    snapshot: Mapping[str, object],
+    execution_date: str,
+    equity: str = "100000",
+) -> dict[str, object]:
+    market = str(snapshot["market"])
+    strategy_id = str(snapshot["strategy_id"])
+    version = str(snapshot["strategy_version"])
+    return {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": market,
+        "strategy_id": strategy_id,
+        "strategy_version": version,
+        "kelly_sample_key": f"{market}|{strategy_id}|{version}",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": equity,
+        "high_water_mark": equity,
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": f"{execution_date}T08:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+
+
 def serialized_account(*, fresh: object = MISSING_FRESH) -> dict[str, object]:
     payload: dict[str, object] = {
         "source_date": "2026-07-14",
@@ -409,8 +439,8 @@ def unlock_live_drawdown(
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
-        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
-        strategy_version="v4",
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v5",
+        strategy_version="v5",
         parameters={"drawdown_limit": "0.05"},
         baseline_equity=Decimal(equity),
         source_date="2026-07-13",
@@ -637,9 +667,16 @@ def test_stale_candidate_kline_is_unavailable_and_excluded() -> None:
     )
 
     assert (item.close, item.atr) == (None, None)
-    assert build_candidate_list(
-        [item], held_symbols=set(), expected_date="2026-07-14"
-    ).excluded["600001"] == ["atr_unavailable"]
+    assert item.close is None
+    assert item.atr is None
+    decision = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        expected_date=item.as_of_date,
+        require_atr=False,
+    )
+    assert decision.eligible == (item,)
+    assert item.symbol not in decision.excluded
 
 
 def test_candidate_infers_bj_exchange_without_suffix_for_exclusion() -> None:
@@ -991,9 +1028,13 @@ def test_candidate_kline_failure_is_an_atr_exclusion() -> None:
         industry_temperature="热",
     )
     assert item.atr is None
-    assert build_candidate_list([item], held_symbols=set()).excluded["600001"] == [
-        "atr_unavailable"
-    ]
+    assert item.close is None
+    assert item.atr is None
+    decision = build_candidate_list(
+        [item], held_symbols=set(), expected_date=item.as_of_date, require_atr=False
+    )
+    assert decision.eligible == (item,)
+    assert item.symbol not in decision.excluded
 
 
 def test_invalid_candidate_kline_is_an_atr_exclusion() -> None:
@@ -1024,9 +1065,88 @@ def test_invalid_candidate_kline_is_an_atr_exclusion() -> None:
         industry_temperature="热",
     )
     assert item.atr is None
-    assert build_candidate_list([item], held_symbols=set()).excluded["600001"] == [
-        "atr_unavailable"
-    ]
+    assert item.close is None
+    assert item.atr is None
+    decision = build_candidate_list(
+        [item], held_symbols=set(), expected_date=item.as_of_date, require_atr=False
+    )
+    assert decision.eligible == (item,)
+    assert item.symbol not in decision.excluded
+
+
+def test_v5_missing_quote_and_atr_keeps_formal_buy_without_pausing_batch() -> None:
+    missing = replace(candidate("600001"), close=None, atr=None)
+    complete = candidate("600002")
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=[missing, complete],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(account().net_value)
+        ),
+    )
+
+    assert [item.symbol for item in built.buy_actions] == ["600001", "600002"]
+    pending = built.buy_actions[0]
+    assert pending.market_data_status == "pending"
+    assert pending.pending_fields == ("quote", "atr")
+    assert pending.estimated_shares is None
+    assert pending.planned_stop_risk is None
+    assert built.risk_summary["status"] == "active_with_unknown_risk"
+    assert built.risk_summary["unknown_new_risk_symbols"] == ["600001"]
+
+
+def test_v5_hk_missing_lot_size_keeps_pending_formal_buy() -> None:
+    item = replace(candidate("600001"), symbol="00700", exchange="HK")
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "HK", "v5sha", (622460,)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=[item],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="HK",
+        lot_sizes={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(account().net_value)
+        ),
+    )
+    action = built.buy_actions[0]
+    assert action.lot_size is None
+    assert action.pending_fields == ("lot_size",)
+
+
+def test_v5_existing_unknown_risk_does_not_pause_known_buys() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=[candidate("600002")],
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(account("600001").net_value)
+        ),
+    )
+    assert [item.symbol for item in built.buy_actions] == ["600002"]
+    assert built.risk_summary["unknown_existing_risk_symbols"] == ["600001"]
+    assert built.risk_summary["status"] == "active_with_unknown_risk"
 
 
 def test_atr14_requires_fifteen_valid_bars() -> None:
@@ -1517,6 +1637,12 @@ def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None
     strategy_snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "drawdown123", (622466, 697199)
     )
+    strategy_snapshot = {
+        **strategy_snapshot,
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "effective_from": "2026-07-20",
+    }
     drawdown_summary = {
         "schema_version": "open_trader.strategy_drawdown.v1",
         "market": "CN",
@@ -4150,7 +4276,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -4304,7 +4430,7 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["account"]["positions"] == []
     assert payload["metadata"]["simulate_acc_id"] == 101
-    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
     assert payload["drawdown_summary"]["state_status"] == "missing"
     assert payload["drawdown_summary"]["entry_allowed"] is False
     assert payload["strategy_judgments"]["formal_actions"] == []
@@ -4328,8 +4454,8 @@ def test_generated_report_keeps_v4_identity_kelly_scope_and_drawdown_continuity(
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     snapshot = payload["strategy_snapshot"]
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v4"
-    assert snapshot["strategy_version"] == "v4"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v5"
+    assert snapshot["strategy_version"] == "v5"
     assert snapshot["parameters"]["kelly_sample_scope"] == (
         "market+strategy_id+opening_strategy_version"
     )
@@ -5456,15 +5582,26 @@ def test_report_runner_sends_v1_text_only_to_feishu_and_short_status_to_macos(tm
 
 def test_report_runner_excludes_only_candidate_with_failed_kline(tmp_path: Path) -> None:
     calls: list[str] = []
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
     result = run_a_share_trend_report(
-        config=trend_config(tmp_path), run_date="2026-07-14",
+        config=config, run_date="2026-07-14",
         api_factory=lambda **kwargs: ReadyApi(calls),
         quote_factory=lambda **kwargs: ReadyQuote(calls, failed_klines={"SH.000001"}),
         notifier=RecordingFeishu(),
     )
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
-    assert payload["excluded"]["000001"] == ["atr_unavailable"]
-    assert [item["symbol"] for item in payload["strategy_judgments"]["top10_candidates"]] == ["000002"]
+    assert "000001" not in payload["excluded"]
+    assert [
+        item["symbol"]
+        for item in payload["strategy_judgments"]["top10_candidates"]
+    ] == ["000001", "000002"]
+    pending = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["symbol"] == "000001"
+    )
+    assert pending["market_data_status"] == "pending"
 
 
 @pytest.mark.parametrize("with_prior", [False, True])

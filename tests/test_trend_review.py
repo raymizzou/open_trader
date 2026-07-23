@@ -149,6 +149,12 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
     snapshot = live_trend_strategy_snapshot(
         "CN", "oldsha", (622466, 697199)
     )
+    snapshot = {
+        **snapshot,
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "effective_from": "2026-07-20",
+    }
     drawdown = {
         "schema_version": "open_trader.strategy_drawdown.v1",
         "market": "CN",
@@ -247,6 +253,102 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
         match="missing original input: drawdown_summary",
     ):
         trend_review.rebuild_trend_report_from_evidence(missing)
+
+
+def test_v5_rebuild_preserves_pending_market_data_action(tmp_path: Path) -> None:
+    snapshot = live_trend_strategy_snapshot("CN", "oldsha", (622466, 697199))
+    account = AccountSnapshot(
+        source_date="2026-07-16",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+    )
+    item = CandidateInput(
+        tm_id=600001,
+        symbol="600001",
+        exchange="SH",
+        name="测试股票",
+        asset="A股",
+        industry="工业",
+        as_of_date="2026-07-16",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=None,
+        atr=None,
+        industry_tm_id=700001,
+        industry_temperature="热",
+        filter_price=Decimal("10"),
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+    )
+    drawdown = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": snapshot["strategy_id"],
+        "strategy_version": "v5",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v5|v5",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "100000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-16T17:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account,
+        candidates=[item],
+        holding_snapshots={},
+        bars_by_symbol={},
+        generated_at="2026-07-16T17:00:00+08:00",
+        metadata={"market": "CN", "broker": "eastmoney", "process_version": "oldsha"},
+        process_version="oldsha",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=snapshot,
+        drawdown_summary=drawdown,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=[item],
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=[],
+        query={"component_pool_ids": [622466, 697199]},
+        responses={},
+        candidate_pool_ids=(622466, 697199),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=[],
+        option_attention_broker_label=None,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    assert rebuilt == source
+    assert rebuilt["strategy_judgments"]["formal_actions"][0]["pending_fields"] == [
+        "quote",
+        "atr",
+    ]
 
 
 def test_v1_rebuild_keeps_legacy_nominal_sizing_without_v2_risk_fields() -> None:
