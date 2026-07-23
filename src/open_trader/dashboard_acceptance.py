@@ -583,34 +583,46 @@ def validate_integrated_candidate(
                 )
 
             drawdown = report.get("drawdown_summary")
+            formal_buys = report.get("buy_actions")
+            allow_v5_missing_drawdown = (
+                expected_strategy_version == "v5"
+                and isinstance(formal_buys, list)
+                and not formal_buys
+                and isinstance(drawdown, Mapping)
+                and drawdown.get("state_status") == "missing"
+            )
             assert (
                 isinstance(drawdown, Mapping)
-                and drawdown.get("state_status") == "ok"
+                and (
+                    drawdown.get("state_status") == "ok"
+                    or allow_v5_missing_drawdown
+                )
             ), f"{broker} 回撤状态缺失或损坏"
             bootstrap = drawdown.get("bootstrap_event")
-            assert (
-                isinstance(bootstrap, Mapping)
-                and re.fullmatch(
-                    r"[0-9a-f]{40}", str(bootstrap.get("accepted_git_sha") or "")
-                )
-                and re.fullmatch(
-                    r"[0-9a-f]{64}", str(bootstrap.get("parameter_hash") or "")
-                )
-                and bootstrap.get("baseline_equity")
-                and bootstrap.get("source_date")
-                and bootstrap.get("event_id")
-                and bootstrap.get("actor")
-            ), f"{broker} 自动回撤基准审计不完整"
-            assert valid_strategy_parameter_audit_identity(
-                market=market,
-                strategy_id=str(snapshot.get("strategy_id") or ""),
-                strategy_version=expected_strategy_version,
-                parameters=parameters,
-                bootstrap_event=bootstrap,
-                parameter_compatibility_event=drawdown.get(
-                    "parameter_compatibility_event"
-                ),
-            ), f"{broker} 冻结策略参数与回撤审计身份不一致"
+            if not allow_v5_missing_drawdown:
+                assert (
+                    isinstance(bootstrap, Mapping)
+                    and re.fullmatch(
+                        r"[0-9a-f]{40}", str(bootstrap.get("accepted_git_sha") or "")
+                    )
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}", str(bootstrap.get("parameter_hash") or "")
+                    )
+                    and bootstrap.get("baseline_equity")
+                    and bootstrap.get("source_date")
+                    and bootstrap.get("event_id")
+                    and bootstrap.get("actor")
+                ), f"{broker} 自动回撤基准审计不完整"
+                assert valid_strategy_parameter_audit_identity(
+                    market=market,
+                    strategy_id=str(snapshot.get("strategy_id") or ""),
+                    strategy_version=expected_strategy_version,
+                    parameters=parameters,
+                    bootstrap_event=bootstrap,
+                    parameter_compatibility_event=drawdown.get(
+                        "parameter_compatibility_event"
+                    ),
+                ), f"{broker} 冻结策略参数与回撤审计身份不一致"
             assert (
                 drawdown.get("entry_allowed") is True or not buys
             ), f"{broker} 回撤阻断状态仍包含正式买入"

@@ -1259,6 +1259,42 @@ def test_acceptance_validates_integrated_templates_and_three_market_reports(
     ) == []
 
 
+def test_acceptance_allows_v5_missing_drawdown_without_formal_buys(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["eastmoney"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_a_share/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    frozen["strategy_judgments"]["formal_actions"] = []
+    frozen["drawdown_summary"] = {
+        **frozen["drawdown_summary"],
+        "bootstrap_event": None,
+        "drawdown_pct": None,
+        "entry_allowed": False,
+        "high_water_mark": None,
+        "pause_reason": "策略累计回撤状态缺失，暂停新开仓",
+        "state_status": "missing",
+        "status": "paused",
+        "status_label": "暂停新开仓",
+    }
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report.update({
+        "report_sha256": dashboard_acceptance._report_hash(frozen),
+        "buy_actions": [],
+        "drawdown_summary": frozen["drawdown_summary"],
+    })
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+
 @pytest.mark.parametrize(
     ("artifact", "expected"),
     [
