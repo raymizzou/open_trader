@@ -16,6 +16,7 @@ from open_trader.trend_kelly import (
     calculate_trend_kelly,
     load_trend_kelly_rounds,
     maximize_average_log_growth,
+    trend_kelly_identity_matches,
     trend_kelly_rounds_from_payload,
 )
 
@@ -90,6 +91,90 @@ def test_kelly_sample_boundaries(
     assert state.selected_sample_count == selected
     assert state.enabled is enabled
     assert state.quarter_kelly_cap == (Decimal("0.25") if enabled else None)
+
+
+@pytest.mark.parametrize(
+    ("sample", "target", "expected"),
+    [
+        (
+            ("CN", "trend_animals_warm_to_hot/CN/v4", "v4"),
+            ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+            True,
+        ),
+        (
+            ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+            ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+            True,
+        ),
+        *[
+            (
+                ("CN", f"trend_animals_warm_to_hot/CN/{version}", version),
+                ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+                False,
+            )
+            for version in ("v1", "v5", "v6")
+        ],
+        (
+            ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+            ("CN", "trend_animals_warm_to_hot/CN/v4", "v4"),
+            False,
+        ),
+        (
+            ("HK", "trend_animals_warm_to_hot/HK/v4", "v4"),
+            ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+            False,
+        ),
+    ],
+)
+def test_cn_v7_sample_identity_compatibility_is_exact_and_one_way(
+    sample: tuple[str, str, str],
+    target: tuple[str, str, str],
+    expected: bool,
+) -> None:
+    assert trend_kelly_identity_matches(sample, target) is expected
+
+
+def test_cn_v7_kelly_inherits_v4_and_accumulates_v7_only() -> None:
+    rounds = [
+        _round(
+            1,
+            "0.10",
+            market="CN",
+            strategy_id="trend_animals_warm_to_hot/CN/v4",
+            version="v4",
+        ),
+        _round(
+            2,
+            "0.10",
+            market="CN",
+            strategy_id="trend_animals_warm_to_hot/CN/v7",
+            version="v7",
+        ),
+        _round(
+            3,
+            "0.10",
+            market="CN",
+            strategy_id="trend_animals_warm_to_hot/CN/v5",
+            version="v5",
+        ),
+        _round(
+            4,
+            "0.10",
+            market="CN",
+            strategy_id="trend_animals_warm_to_hot/CN/v6",
+            version="v6",
+        ),
+    ]
+
+    state = calculate_trend_kelly(
+        rounds,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v7",
+        opening_strategy_version="v7",
+    )
+
+    assert state.eligible_sample_count == 2
+    assert state.selected_round_ids == ("round-001", "round-002")
 
 
 def test_kelly_uses_latest_200_by_close_identity_not_input_order() -> None:

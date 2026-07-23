@@ -16,6 +16,17 @@ KELLY_BISECTION_ITERATIONS = 96
 KELLY_OPTIMIZER = (
     f"mean_log_growth_derivative_bisection_{KELLY_BISECTION_ITERATIONS}_floor_1e-6"
 )
+TrendKellyIdentity = tuple[str, str, str]
+CN_V4_KELLY_IDENTITY: TrendKellyIdentity = (
+    "CN", "trend_animals_warm_to_hot/CN/v4", "v4",
+)
+CN_V7_KELLY_IDENTITY: TrendKellyIdentity = (
+    "CN", "trend_animals_warm_to_hot/CN/v7", "v7",
+)
+CN_V7_KELLY_SAMPLE_IDENTITIES = frozenset({
+    CN_V4_KELLY_IDENTITY,
+    CN_V7_KELLY_IDENTITY,
+})
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,15 @@ class TrendKellyState:
     reason: str
     last_closed_at: str
     selected_round_ids: tuple[str, ...]
+
+
+def trend_kelly_identity_matches(
+    sample_identity: TrendKellyIdentity,
+    target_identity: TrendKellyIdentity,
+) -> bool:
+    if target_identity == CN_V7_KELLY_IDENTITY:
+        return sample_identity in CN_V7_KELLY_SAMPLE_IDENTITIES
+    return sample_identity == target_identity
 
 
 def load_trend_kelly_rounds(data_dir: Path) -> tuple[TrendKellyRound, ...]:
@@ -191,13 +211,15 @@ def calculate_trend_kelly(
     strategy_id: str,
     opening_strategy_version: str,
 ) -> TrendKellyState:
+    target_identity = (market, strategy_id, opening_strategy_version)
     matching = [
         item
         for item in rounds
         if item.source == "simulation"
-        and item.market == market
-        and item.strategy_id == strategy_id
-        and item.opening_strategy_version == opening_strategy_version
+        and trend_kelly_identity_matches(
+            (item.market, item.strategy_id, item.opening_strategy_version),
+            target_identity,
+        )
         and item.costs_complete
         and item.attribution_status == "attributed"
         and item.kelly_eligible
