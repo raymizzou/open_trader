@@ -1,4 +1,5 @@
 from open_trader.notification_policy import (
+    PROTECTION_STATUS_LABELS,
     brief_zh_detail,
     group_order_alerts,
     render_attention,
@@ -6,6 +7,13 @@ from open_trader.notification_policy import (
     render_order_alert,
     render_protection_alert,
 )
+
+
+def test_protection_status_labels_are_stable() -> None:
+    assert PROTECTION_STATUS_LABELS == {
+        "pending": ("已成交但保护线待补全", "每日趋势报告继续监控，等待 ATR 恢复"),
+        "active": ("保护线已恢复", "按新保护线继续自动监控"),
+    }
 
 
 def test_group_order_alerts_separates_direction_and_status() -> None:

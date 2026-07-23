@@ -433,6 +433,31 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
     )
 
 
+def test_pending_protection_recovers_from_fill_price_and_entry_day_atr() -> None:
+    daily_bars = bars()
+    entry_atr = atr14(daily_bars)
+    assert entry_atr is not None
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=[],
+        holding_snapshots={"600001": holding("600001")},
+        prior_state={"schema_version": 1, "positions": {"600001": {
+            "entry_fill_price": "10.2",
+            "protection_status": "pending",
+            "protection_pending_since": "2026-07-14T10:35:00+08:00",
+            "position_started_for": "2026-07-14",
+            "updated_for": "2026-07-14",
+        }}},
+        bars_by_symbol={"600001": daily_bars},
+    )
+    state = built.protection_state["positions"]["600001"]
+    assert Decimal(state["initial_line"]) == Decimal("10.2") - Decimal("2") * entry_atr
+    assert state["protection_status"] == "active"
+    assert state["protection_recovered_for"] == built.as_of_date
+
+
 def unlock_live_drawdown(
     data_dir: Path, *, market: str = "CN", equity: str = "100000"
 ) -> None:

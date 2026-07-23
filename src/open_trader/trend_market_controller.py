@@ -932,6 +932,8 @@ def _execute_locked_report(
     quote = quote_client
     owns_quote = False
     prices: dict[str, Decimal] = {}
+    lot_sizes: dict[str, int] = {}
+    quote_failure = False
     client = None
     try:
         if symbols:
@@ -941,12 +943,23 @@ def _execute_locked_report(
                         host=config.futu_host, port=config.futu_port
                     )
                     owns_quote = True
+                snapshots = quote.get_snapshots(symbols)
                 prices = {
                     symbol: snapshot.last_price
-                    for symbol, snapshot in quote.get_snapshots(symbols).items()
+                    for symbol, snapshot in snapshots.items()
+                    if snapshot.last_price is not None
                 }
+                try:
+                    lot_sizes = {
+                        symbol: int(lot_size)
+                        for symbol, lot_size in quote.get_lot_sizes(symbols).items()
+                        if int(lot_size) > 0
+                    }
+                except Exception:
+                    lot_sizes = {}
             except Exception:
                 prices = {}
+                quote_failure = True
         client = _new_order_client(
             config, market, quote_client if quote_client is not None else quote
         )
@@ -958,8 +971,9 @@ def _execute_locked_report(
             execution_date=execution_date,
             now=now,
             quote_prices=prices,
+            quote_lot_sizes=lot_sizes,
         )
-        if allow_new_buys and execution.get("status") == "quote_unavailable":
+        if allow_new_buys and quote_failure:
             raise RuntimeError("current quote unavailable for pending trend buy")
         return execution
     finally:

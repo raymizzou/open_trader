@@ -1188,6 +1188,17 @@ def atr14(bars: Sequence[DailyKlineBar]) -> Decimal | None:
     return sum(ranges, Decimal("0")) / Decimal("14")
 
 
+def _first_computable_atr(bars: Sequence[DailyKlineBar]) -> Decimal | None:
+    for end in range(15, len(bars) + 1):
+        try:
+            value = atr14(bars[:end])
+        except (TypeError, ValueError):
+            continue
+        if value is not None:
+            return value
+    return None
+
+
 def _kline_metrics(
     bars: Sequence[DailyKlineBar],
     *,
@@ -2352,6 +2363,28 @@ def build_report(
             daily_bars, before=as_of_date, expected_date=as_of_date
         )
         stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
+        entry_fill_price = _state_decimal(old_state, "entry_fill_price")
+        protection_status = old_state.get("protection_status")
+        protection_recovered_for = old_state.get("protection_recovered_for")
+        if active_line is None and entry_fill_price is not None:
+            entry_bars = tuple(
+                bar
+                for bar in daily_bars
+                if bar.date <= str(position_started_for)
+            )
+            recovery_atr = atr14(entry_bars)
+            if recovery_atr is None:
+                recovery_atr = current_atr or _first_computable_atr(
+                    tuple(bar for bar in daily_bars if bar.date <= as_of_date)
+                )
+            if recovery_atr is not None:
+                initial_line = active_line = (
+                    entry_fill_price
+                    - INITIAL_PROTECTION_ATR_MULTIPLE * recovery_atr
+                )
+                old_atr = recovery_atr
+                protection_status = "active"
+                protection_recovered_for = as_of_date
         if active_line is None and current_atr is not None and close is not None:
             initial_line = active_line = (
                 close - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
@@ -2461,6 +2494,23 @@ def build_report(
             "tracking_active": tracking_active,
             "updated_for": as_of_date,
         }
+        for key in (
+            "entry_fill_price",
+            "protection_status",
+            "protection_pending_since",
+            "protection_recovered_for",
+        ):
+            value = (
+                entry_fill_price
+                if key == "entry_fill_price"
+                else protection_status
+                if key == "protection_status"
+                else protection_recovered_for
+                if key == "protection_recovered_for"
+                else old_state.get(key)
+            )
+            if value is not None:
+                new_state[key] = str(value)
         if initial_line is not None:
             new_state["initial_line"] = str(initial_line)
         if active_line is not None:
@@ -3807,7 +3857,53 @@ def _validate_protection_state(payload: object) -> dict[str, object]:
                 or _optional_decimal(active_line) is None
             ):
                 raise ValueError(f"protection state for {symbol} has no active line")
-        _optional_decimal(state.get("atr14"))
+        atr14_value = state.get("atr14")
+        if atr14_value is not None and _optional_decimal(atr14_value) is None:
+            raise ValueError(f"protection state for {symbol} has invalid ATR")
+        entry_fill_price = state.get("entry_fill_price")
+        if entry_fill_price is not None and (
+            _optional_decimal(entry_fill_price) is None
+            or _decimal(entry_fill_price) <= 0
+        ):
+            raise ValueError(
+                f"protection state for {symbol} has invalid entry fill price"
+            )
+        protection_status = state.get("protection_status")
+        if protection_status is not None and protection_status not in {
+            "pending", "active"
+        }:
+            raise ValueError(
+                f"protection state for {symbol} has invalid protection status"
+            )
+        protection_pending_since = state.get("protection_pending_since")
+        if protection_pending_since is not None:
+            try:
+                pending_at = datetime.fromisoformat(str(protection_pending_since))
+            except ValueError:
+                pending_at = None
+            if (
+                not isinstance(protection_pending_since, str)
+                or pending_at is None
+                or pending_at.tzinfo is None
+                or pending_at.utcoffset() is None
+            ):
+                raise ValueError(
+                    f"protection state for {symbol} has invalid pending date"
+                )
+        protection_recovered_for = state.get("protection_recovered_for")
+        if protection_recovered_for is not None:
+            try:
+                recovered_date = date.fromisoformat(str(protection_recovered_for))
+            except ValueError:
+                recovered_date = None
+            if (
+                not isinstance(protection_recovered_for, str)
+                or recovered_date is None
+                or recovered_date.isoformat() != protection_recovered_for
+            ):
+                raise ValueError(
+                    f"protection state for {symbol} has invalid recovered date"
+                )
         tracking_active = state.get("tracking_active")
         if tracking_active is not None and not isinstance(tracking_active, bool):
             raise ValueError(f"protection state for {symbol} has invalid tracking state")

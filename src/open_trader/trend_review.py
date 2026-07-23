@@ -943,13 +943,14 @@ def record_trend_review_missed_buys(
     market: str,
     execution_date: str,
     now: str,
+    allow_late_buys: bool = False,
 ) -> int:
     market = _market(market)
     actions, strategy_version = _preflight_open_actions(report, market)
     current = datetime.fromisoformat(now).astimezone(MARKET_TIMEZONES[market])
     execution_day = date.fromisoformat(execution_date)
     window_end = time(16) if market == "US" else time(10)
-    if current.date() < execution_day or (
+    if allow_late_buys or current.date() < execution_day or (
         current.date() == execution_day
         and current.time().replace(tzinfo=None) <= window_end
     ):
@@ -2238,13 +2239,30 @@ def _remaining_buy_quantity(
     snapshot: Mapping[str, object],
     broker_orders: Sequence[Mapping[str, object]],
     current_price: Decimal,
+    *,
+    live_lot_size: int | None = None,
+    available_cash: Decimal | None = None,
 ) -> int:
+    strategy_snapshot = report.get("strategy_snapshot")
+    version = (
+        str(strategy_snapshot.get("strategy_version") or "")
+        if isinstance(strategy_snapshot, Mapping)
+        else ""
+    )
     try:
-        lot_size = int(action.get("lot_size") or 0)
+        lot_size = int(
+            live_lot_size
+            if live_lot_size is not None
+            else action.get("lot_size") or 0
+        )
     except (TypeError, ValueError):
         raise ValueError("trend review buy action is invalid") from None
-    frozen_quantity = _required_decimal(
-        action.get("estimated_shares"), "estimated shares"
+    frozen_quantity = (
+        _required_decimal(action.get("estimated_shares"), "estimated shares")
+        if version in {"v1", "v2", "v3", "v4"}
+        else _required_decimal(action.get("estimated_shares"), "estimated shares")
+        if action.get("estimated_shares") is not None
+        else Decimal("0")
     )
     target_amount = _required_decimal(action.get("target_amount"), "target amount")
     current_price = _required_decimal(current_price, "current price")
@@ -2256,14 +2274,21 @@ def _remaining_buy_quantity(
         "price FX",
     )
     cash = _required_decimal(
-        snapshot.get("available_cash", snapshot.get("cash")),
+        available_cash
+        if available_cash is not None
+        else snapshot.get("available_cash", snapshot.get("cash")),
         "simulate available cash",
     )
     if (
         lot_size <= 0
-        or frozen_quantity <= 0
-        or frozen_quantity != frozen_quantity.to_integral_value()
-        or frozen_quantity % lot_size
+        or (
+            version in {"v1", "v2", "v3", "v4"}
+            and (
+                frozen_quantity <= 0
+                or frozen_quantity != frozen_quantity.to_integral_value()
+                or frozen_quantity % lot_size
+            )
+        )
         or target_amount <= 0
         or current_price <= 0
         or fx <= 0
@@ -2304,17 +2329,16 @@ def _remaining_buy_quantity(
     remaining_quantity = frozen_quantity - confirmed_quantity
     remaining_amount = target_amount - confirmed_notional
     caps = [
-        _floor_to_lot(remaining_quantity, lot_size),
         _floor_to_lot(remaining_amount / (current_price * fx), lot_size),
         _floor_to_lot(cash / (current_price * fx), lot_size),
     ]
-    strategy_snapshot = report.get("strategy_snapshot")
-    version = (
-        str(strategy_snapshot.get("strategy_version") or "")
-        if isinstance(strategy_snapshot, Mapping)
-        else ""
-    )
-    if version in {"v2", "v3", "v4"}:
+    if version in {"v1", "v2", "v3", "v4"}:
+        caps.insert(0, _floor_to_lot(remaining_quantity, lot_size))
+    if version in {"v2", "v3", "v4", "v5"} and (
+        version in {"v2", "v3", "v4"}
+        or action.get("atr") is not None
+        and action.get("planned_stop_risk") is not None
+    ):
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -2347,14 +2371,15 @@ def _remaining_buy_quantity(
     return min(caps)
 
 
-def _activate_fill_protection_line(
+def _record_fill_protection(
     *,
     data_dir: Path,
     market: str,
     symbol: str,
     execution_date: str,
-    atr: Decimal,
-    active_line: str,
+    average_price: Decimal,
+    atr: Decimal | None,
+    recorded_at: str,
 ) -> None:
     from .a_share_trend import load_protection_state, write_protection_state
 
@@ -2365,17 +2390,35 @@ def _activate_fill_protection_line(
     positions = dict(state["positions"])
     existing = positions.get(symbol)
     prior = dict(existing) if isinstance(existing, Mapping) else {}
-    positions[symbol] = {
+    position = {
         **prior,
-        "initial_line": str(prior.get("initial_line") or active_line),
-        "active_line": active_line,
-        "atr14": format(atr, "f"),
+        "entry_fill_price": format(average_price, "f"),
         "position_started_for": str(
             prior.get("position_started_for") or execution_date
         ),
         "tracking_active": prior.get("tracking_active") is True,
         "updated_for": execution_date,
     }
+    if atr is None:
+        position.update(
+            {
+                "protection_status": "pending",
+                "protection_pending_since": str(
+                    prior.get("protection_pending_since") or recorded_at
+                ),
+            }
+        )
+    else:
+        active_line = average_price - Decimal("2") * atr
+        position.update(
+            {
+                "initial_line": str(prior.get("initial_line") or active_line),
+                "active_line": format(active_line, "f"),
+                "atr14": format(atr, "f"),
+                "protection_status": "active",
+            }
+        )
+    positions[symbol] = position
     write_protection_state(state_path, {**state, "positions": positions})
 
 
@@ -2416,22 +2459,78 @@ def _preflight_open_actions(
                 target_weight = _required_decimal(
                     action.get("target_weight"), "target weight"
                 )
-                atr = _required_decimal(action.get("atr"), "action ATR")
-                lot_size = int(action.get("lot_size") or 0)
-                quantity = _required_decimal(
-                    action.get("estimated_shares"), "estimated shares"
-                )
+                if strategy_version == "v5":
+                    target_amount = _required_decimal(
+                        action.get("target_amount"), "target amount"
+                    )
+                    raw_lot_size = action.get("lot_size")
+                    if isinstance(raw_lot_size, bool):
+                        raise TypeError
+                    lot_size = (
+                        int(raw_lot_size)
+                        if raw_lot_size is not None
+                        else 0
+                    )
+                    if raw_lot_size is not None and (
+                        lot_size <= 0 or str(raw_lot_size) != str(lot_size)
+                    ):
+                        raise ValueError
+                    raw_quantity = action.get("estimated_shares")
+                    quantity = (
+                        _required_decimal(raw_quantity, "estimated shares")
+                        if raw_quantity is not None
+                        else None
+                    )
+                    raw_atr = action.get("atr")
+                    atr = (
+                        _required_decimal(raw_atr, "action ATR")
+                        if raw_atr is not None
+                        else None
+                    )
+                    pending_fields = action.get("pending_fields", [])
+                    if (
+                        not isinstance(pending_fields, list)
+                        or len(set(pending_fields)) != len(pending_fields)
+                        or any(
+                            not isinstance(field, str)
+                            or field not in {"quote", "atr", "lot_size"}
+                            for field in pending_fields
+                        )
+                        or action.get("market_data_status")
+                        not in {"complete", "pending"}
+                        or target_weight <= 0
+                        or target_amount <= 0
+                        or (
+                            quantity is not None
+                            and (
+                                quantity < 0
+                                or quantity != quantity.to_integral_value()
+                                or lot_size > 0
+                                and quantity % lot_size
+                            )
+                        )
+                        or (atr is not None and atr <= 0)
+                        or action.get("market_data_status") == "complete"
+                        and pending_fields
+                    ):
+                        raise ValueError
+                else:
+                    atr = _required_decimal(action.get("atr"), "action ATR")
+                    lot_size = int(action.get("lot_size") or 0)
+                    quantity = _required_decimal(
+                        action.get("estimated_shares"), "estimated shares"
+                    )
+                    if (
+                        target_weight <= 0
+                        or atr <= 0
+                        or lot_size <= 0
+                        or quantity <= 0
+                        or quantity != quantity.to_integral_value()
+                        or quantity % lot_size
+                    ):
+                        raise ValueError
             except (TypeError, ValueError):
                 raise ValueError("trend review buy action is invalid") from None
-            if (
-                target_weight <= 0
-                or atr <= 0
-                or lot_size <= 0
-                or quantity <= 0
-                or quantity != quantity.to_integral_value()
-                or quantity % lot_size
-            ):
-                raise ValueError("trend review buy action is invalid")
         elif action_name == "SELL_PARTIAL":
             try:
                 fraction = _required_decimal(
@@ -2479,6 +2578,8 @@ def execute_trend_review_open(
     execution_date: str,
     now: str,
     quote_prices: Mapping[str, Decimal],
+    quote_lot_sizes: Mapping[str, int] | None = None,
+    allow_late_buys: bool = False,
     order_history_start: str | None = None,
     prior_sell_requests: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
@@ -2530,6 +2631,18 @@ def execute_trend_review_open(
     nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
     if nav <= 0:
         raise TrendReviewAccountStateError("simulate net value must be positive")
+    available_cash = _required_decimal(
+        snapshot.get("available_cash", snapshot.get("cash")),
+        "simulate available cash",
+    )
+    reserved_cash = Decimal("0")
+    metadata = report.get("metadata")
+    price_fx = _required_decimal(
+        metadata.get("price_fx_to_account_currency", "1")
+        if isinstance(metadata, Mapping)
+        else "1",
+        "price FX",
+    )
     from .futu_symbols import to_futu_symbol
 
     report_sha = _report_hash(report)
@@ -2652,8 +2765,13 @@ def execute_trend_review_open(
         if action_name == "BUY" and futu_code not in sell_symbols:
             if same_day and local_time < datetime.strptime("09:30", "%H:%M").time():
                 buy_window_event = ("pending", "buy_window_not_open")
-            elif local_current.date() > execution_day or not buy_window_open:
+            elif (
+                not allow_late_buys
+                and (local_current.date() > execution_day or not buy_window_open)
+            ):
                 buy_window_event = ("missed", "buy_window_closed")
+            elif allow_late_buys and not market_open:
+                buy_window_event = ("missed", "market_closed")
         if action_name == "SELL_ALL":
             reason_id = str(
                 action.get("event_id") or action.get("reason") or ""
@@ -3190,14 +3308,23 @@ def execute_trend_review_open(
                 )
                 protection_fact = {}
                 if action_name == "BUY" and average_price is not None:
+                    raw_atr = action.get("atr")
+                    action_atr = (
+                        _required_decimal(raw_atr, "action ATR")
+                        if raw_atr is not None
+                        else None
+                    )
                     protection_fact = {
-                        "active_protection_line": format(
-                            average_price
-                            - Decimal("2")
-                            * _required_decimal(action.get("atr"), "action ATR"),
+                        "entry_fill_price": format(average_price, "f"),
+                        "protection_status": (
+                            "active" if action_atr is not None else "pending"
+                        ),
+                    }
+                    if action_atr is not None:
+                        protection_fact["active_protection_line"] = format(
+                            average_price - Decimal("2") * action_atr,
                             "f",
                         )
-                    }
                 if (position_zero or any(
                     order.get("order_id")
                     or order.get("order_status")
@@ -3259,13 +3386,14 @@ def execute_trend_review_open(
                         recorded_at=now,
                     )
                     if protection_fact:
-                        _activate_fill_protection_line(
+                        _record_fill_protection(
                             data_dir=data_dir,
                             market=market,
                             symbol=symbol,
                             execution_date=execution_date,
-                            atr=_required_decimal(action.get("atr"), "action ATR"),
-                            active_line=protection_fact["active_protection_line"],
+                            average_price=average_price,
+                            atr=action_atr,
+                            recorded_at=now,
                         )
                 if remaining <= 0:
                     continue
@@ -3330,6 +3458,30 @@ def execute_trend_review_open(
                         )
                         blocked_status = "quote_unavailable"
                         continue
+                    live_lot_size = (
+                        quote_lot_sizes.get(futu_code)
+                        if isinstance(quote_lot_sizes, Mapping)
+                        else None
+                    )
+                    if strategy_version == "v5" and action.get("lot_size") is None:
+                        try:
+                            valid_live_lot = int(live_lot_size or 0)
+                        except (TypeError, ValueError):
+                            valid_live_lot = 0
+                        if valid_live_lot <= 0:
+                            _write_action_status_once(
+                                data_dir=data_dir,
+                                market=market,
+                                execution_date=execution_date,
+                                action_key=action_key,
+                                action_root=action_events_root,
+                                evidence=action_evidence,
+                                status="pending",
+                                reason="market_lot_size_unavailable",
+                                recorded_at=now,
+                            )
+                            blocked_status = "lot_size_unavailable"
+                            continue
                     remaining = Decimal(
                         _remaining_buy_quantity(
                             action,
@@ -3339,6 +3491,8 @@ def execute_trend_review_open(
                             _required_decimal(
                                 quote_prices.get(futu_code), "current quote price"
                             ),
+                            live_lot_size=live_lot_size,
+                            available_cash=available_cash - reserved_cash,
                         )
                     )
                     if remaining <= 0:
@@ -3409,6 +3563,30 @@ def execute_trend_review_open(
                     )
                     blocked_status = "quote_unavailable"
                     continue
+                live_lot_size = (
+                    quote_lot_sizes.get(futu_code)
+                    if isinstance(quote_lot_sizes, Mapping)
+                    else None
+                )
+                if strategy_version == "v5" and action.get("lot_size") is None:
+                    try:
+                        valid_live_lot = int(live_lot_size or 0)
+                    except (TypeError, ValueError):
+                        valid_live_lot = 0
+                    if valid_live_lot <= 0:
+                        _write_action_status_once(
+                            data_dir=data_dir,
+                            market=market,
+                            execution_date=execution_date,
+                            action_key=action_key,
+                            action_root=action_events_root,
+                            evidence=action_evidence,
+                            status="pending",
+                            reason="market_lot_size_unavailable",
+                            recorded_at=now,
+                        )
+                        blocked_status = "lot_size_unavailable"
+                        continue
                 quantity = _remaining_buy_quantity(
                     action,
                     report,
@@ -3417,6 +3595,8 @@ def execute_trend_review_open(
                     _required_decimal(
                         quote_prices.get(futu_code), "current quote price"
                     ),
+                    live_lot_size=live_lot_size,
+                    available_cash=available_cash - reserved_cash,
                 )
             else:
                 quantity = sell_quantity
@@ -3557,6 +3737,12 @@ def execute_trend_review_open(
                 }
             ),
         )
+        if action_name == "BUY":
+            reserved_cash += (
+                _required_decimal(request.get("qty"), "target quantity")
+                * _required_decimal(quote_prices.get(futu_code), "current quote price")
+                * price_fx
+            )
         order_id = str(response.get("futu_order_id") or "")
         _write_action_event(
             data_dir=data_dir,

@@ -672,6 +672,47 @@ def cn_buy_report(
     }
 
 
+def v5_report_with_pending_buy(
+    *,
+    market: str = "CN",
+    symbol: str = "600001",
+    target_amount: str = "4000",
+    lot_size: int | None = 100,
+) -> dict[str, object]:
+    payload = cn_buy_report(symbol=symbol)
+    payload["strategy_snapshot"] = {
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/v5",
+        "strategy_version": "v5",
+        "process_version": "v5sha",
+        "parameters": {"buy_window": "09:30-10:00"},
+        "parameter_rows": [
+            {"group": "仓位执行", "name": "买入窗口", "value": "09:30-10:00"}
+        ],
+    }
+    payload["strategy_judgments"] = {
+        "formal_actions": [{
+            "action": "BUY",
+            "symbol": symbol,
+            "target_weight": "0.04",
+            "target_amount": target_amount,
+            "lot_size": lot_size,
+            "estimated_shares": None,
+            "atr": None,
+            "estimated_initial_line": None,
+            "planned_stop_risk": None,
+            "planned_stop_risk_pct": None,
+            "normal_cost": None,
+            "market_data_status": "pending",
+            "pending_fields": [
+                field for field, missing in (
+                    ("quote", True), ("atr", True), ("lot_size", lot_size is None)
+                )
+                if missing
+            ],
+        }]}
+    return payload
+
+
 TEST_QUOTE_PRICES = {
     "SH.600001": Decimal("10"),
     "SH.600002": Decimal("10"),
@@ -769,6 +810,82 @@ def test_partial_action_validation() -> None:
         del report["strategy_judgments"]["formal_actions"][0][field]
         with pytest.raises(ValueError, match="partial sell action is invalid"):
             trend_review._preflight_open_actions(report, "CN")
+
+
+def test_v5_buy_uses_live_quote_without_atr_or_estimate(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    report = v5_report_with_pending_buy(target_amount="4000", lot_size=100)
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-23",
+        now="2026-07-23T09:31:00+08:00",
+        quote_prices={"SH.600001": Decimal("10.20")},
+    )
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["qty"] == "300"
+
+
+def test_v5_hk_buy_uses_live_lot_size(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    report = v5_report_with_pending_buy(
+        market="HK", symbol="00700", target_amount="52000", lot_size=None
+    )
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="HK",
+        execution_date="2026-07-23",
+        now="2026-07-23T09:31:00+08:00",
+        quote_prices={"HK.00700": Decimal("510")},
+        quote_lot_sizes={"HK.00700": 100},
+    )
+    assert client.requests[0]["qty"] == "100"
+
+
+def test_v5_fill_without_atr_persists_pending_protection(tmp_path: Path) -> None:
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": v5_report_with_pending_buy(target_amount="4000", lot_size=100),
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-23",
+        "now": "2026-07-23T09:31:00+08:00",
+        "quote_prices": {"SH.600001": Decimal("10.2")},
+    }
+    trend_review.execute_trend_review_open(**arguments)
+    request = client.requests[0]
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": request["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": request["qty"],
+        "dealt_qty": request["qty"],
+        "dealt_avg_price": "10.2",
+        "order_status": "FILLED_ALL",
+    }]
+    trend_review.execute_trend_review_open(**arguments)
+    state = json.loads(
+        (tmp_path / "trend_a_share/protection_state.json").read_text()
+    )["positions"]["600001"]
+    assert state["entry_fill_price"] == "10.2"
+    assert state["protection_status"] == "pending"
+    assert "initial_line" not in state
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-23", "SH.600001", "buy"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            tmp_path / "trend_review/ledgers/CN/actions/2026-07-23" / action_key
+        ).glob("*.json")
+    ]
+    assert any(event.get("protection_status") == "pending" for event in events)
 
 
 def test_partial_and_full_sell_for_one_symbol_are_rejected() -> None:

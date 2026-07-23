@@ -32,6 +32,10 @@ STATUS_ACTIONS = {
     "missed_window": "今日不再追单",
     "incomplete": "核对券商订单并人工处理",
 }
+PROTECTION_STATUS_LABELS = {
+    "pending": ("已成交但保护线待补全", "每日趋势报告继续监控，等待 ATR 恢复"),
+    "active": ("保护线已恢复", "按新保护线继续自动监控"),
+}
 REASON_LABELS = {
     "window closed": "窗口已关闭",
     "buy_window_closed": "买入窗口已关闭",
