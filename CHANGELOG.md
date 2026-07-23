@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-23
 
+- Reworked the A-share trend candidate audit into a desktop comparison table
+  and mobile cards that show each reported exclusion's actual value against the
+  frozen strategy requirement, retain historical ATR explanations, and expose
+  unknown rule codes without changing candidate selection or execution.
+
 - Unified CN/HK/US Trend Animals `boiling`/`champagne` exits: the first signal
   per full position lifecycle trims 30% in SIMULATE (market-lot rounded), while
   protection, danger, right-side exit, and CN temperature-flat still sell all;
