@@ -15,6 +15,7 @@ from .kelly_order_execution import (
 )
 from .kelly_trade_samples import _write_json_atomic
 from .tiger_account import TigerAccountClient, TigerAccountError
+from .trend_kelly import trend_kelly_identity_matches
 from .trend_review import _report_hash
 from .trend_simulate_positions import _action_events
 
@@ -1355,14 +1356,18 @@ def _strategy_stats(
     }
     stats = []
     for source, market, strategy_id, version in sorted(identities):
+        target_identity = (market, strategy_id, version)
         eligible = [
             round_ for round_ in rounds
-            if (
-                round_["source"],
-                round_["market"],
-                round_["strategy_id"],
-                round_["opening_strategy_version"],
-            ) == (source, market, strategy_id, version)
+            if round_["source"] == source
+            and trend_kelly_identity_matches(
+                (
+                    str(round_["market"]),
+                    str(round_["strategy_id"]),
+                    str(round_["opening_strategy_version"]),
+                ),
+                target_identity,
+            )
             and round_["attribution_status"] == "attributed"
             and round_["costs_complete"] is True
             and round_["net_return"] is not None

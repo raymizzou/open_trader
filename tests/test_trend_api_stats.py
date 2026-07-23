@@ -61,6 +61,55 @@ def fill(
     return result
 
 
+def _cn_closed_pair(
+    label: str, version: str, *, source: str,
+) -> list[dict[str, object]]:
+    broker = "futu" if source == "simulation" else "eastmoney"
+    account_id = "12958918" if source == "simulation" else "eastmoney_main"
+    pair = [
+        fill(
+            f"{label}-buy",
+            side="buy",
+            quantity="1",
+            price="10",
+            fee="0.1",
+            filled_at="2026-07-10T15:00:00+08:00",
+            strategy_id=f"trend_animals_warm_to_hot/CN/{version}",
+            strategy_version=version,
+            source=source,
+            broker=broker,
+            account_id=account_id,
+            market="CN",
+            currency="CNY",
+        ),
+        fill(
+            f"{label}-sell",
+            side="sell",
+            quantity="1",
+            price="11",
+            fee="0.1",
+            filled_at="2026-07-11T15:00:00+08:00",
+            strategy_id=f"trend_animals_warm_to_hot/CN/{version}",
+            strategy_version=version,
+            source=source,
+            broker=broker,
+            account_id=account_id,
+            market="CN",
+            currency="CNY",
+        ),
+    ]
+    for sequence, item in enumerate(pair, start=1):
+        item["symbol"] = label
+        if source == "actual":
+            item.update({
+                "statement_period": f"2026-07-{9 + sequence:02d}",
+                "execution_granularity": "statement_trade_date",
+                "timestamp_semantics": "market_close_ordering_sentinel",
+                "statement_sequence": 1,
+            })
+    return pair
+
+
 @pytest.mark.parametrize(
     ("broker", "market", "currency", "account_id"),
     [
@@ -341,6 +390,43 @@ def test_round_keeps_opening_version_and_new_version_has_empty_actual_stats() ->
     assert actual[("trend_animals_warm_to_hot/US/v1", "v1")]["eligible_sample_count"] == 1
     assert actual[("trend_animals_warm_to_hot/US/v2", "v2")]["eligible_sample_count"] == 0
     assert actual[("trend_animals_warm_to_hot/US/v2", "v2")]["win_rate"] is None
+
+
+def test_cn_v7_stats_inherit_only_v4_for_both_sources() -> None:
+    fills = [
+        item
+        for source in ("simulation", "actual")
+        for version in ("v4", "v5", "v6", "v7")
+        for item in _cn_closed_pair(
+            f"{source}-{version}", version, source=source
+        )
+    ]
+    payload = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v7",
+            "strategy_version": "v7",
+        }],
+        generated_at="2026-07-12T00:00:00+08:00",
+        statistics_cutoff_at="2026-07-11T23:59:59+08:00",
+    )
+    stats = {
+        (
+            item["source"],
+            item["strategy_id"],
+            item["opening_strategy_version"],
+        ): item
+        for item in payload["stats"]
+    }
+
+    for source in ("simulation", "actual"):
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v7", "v7")
+        ]["eligible_sample_count"] == 2
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v4", "v4")
+        ]["eligible_sample_count"] == 1
 
 
 def test_fill_and_round_order_uses_timestamp_instants_not_iso_text() -> None:
