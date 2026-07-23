@@ -9,6 +9,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
   Phillips, or Eastmoney simulated-holdings view, so post-report additions do
   not remain stale; verified `3026` tests, live Dashboard/API refreshes, and
   the Dashboard acceptance gate (`PASS`) on deployed SHA `3ed7ec3`.
+- Consolidated Feishu trend notifications: retained A/B1/C routing, grouped
+  actionable order failures by market, side, and status, and merged OpenD
+  connectivity/rate-limit incidents across CN, HK, and US while preserving
+  per-market order types.
+- Added persisted one-retry Feishu delivery, legacy-safe A7 review routing,
+  frozen deadline-group retry, and bounded local-channel delivery; verified
+  `3085` automated tests on merged `main`.
 
 ## 2026-07-22
 
