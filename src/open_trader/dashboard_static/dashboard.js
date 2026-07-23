@@ -2310,7 +2310,9 @@ function renderTrendActualOverlay(overlay) {
           `真实持仓 ${formatDisplayNumber(item.actual_quantity)}`,
           `市值 ${formatPlain(item.currency)} ${formatDisplayNumber(item.actual_market_value)}`,
           hasValue(item.frozen_reference_price) ? `冻结参考价 ${formatPlain(item.currency)} ${formatDisplayNumber(item.frozen_reference_price)}` : "",
-          hasValue(item.protection_line) ? `${formatPlain(item.protection_line_label || "策略保护线")} ${formatDisplayNumber(item.protection_line)}` : "",
+          hasValue(item.protection_line)
+            ? `${formatPlain(item.protection_line_label || "策略保护线")} ${formatDisplayNumber(item.protection_line)}`
+            : formatPlain(item.protection_line_label || ""),
           hasValue(item.manual_execution_guidance) ? formatPlain(item.manual_execution_guidance) : "",
         ];
     return `<div class="trend-actual-row"><header><strong>${escapeHtml(`${formatPlain(item.symbol)} ${formatPlain(item.name)}`.trim())}</strong><span data-deviation="${escapeHtml(formatPlain(item.deviation))}">${escapeHtml(formatPlain(item.deviation_label))}</span></header>

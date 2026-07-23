@@ -487,6 +487,26 @@ def test_pending_protection_uses_first_computable_atr_before_current_atr() -> No
     assert state["atr14"] == str(first_atr)
 
 
+def test_markdown_calls_out_pending_protection_line() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=[],
+        holding_snapshots={"600001": holding("600001")},
+        prior_state={"schema_version": 1, "positions": {"600001": {
+            "entry_fill_price": "10.2",
+            "protection_status": "pending",
+            "protection_pending_since": "2026-07-14T10:35:00+08:00",
+            "position_started_for": "2026-07-14",
+            "updated_for": "2026-07-14",
+        }}},
+        bars_by_symbol={"600001": []},
+    )
+
+    assert "保护线待 ATR 补全" in render_markdown(built)
+
+
 def unlock_live_drawdown(
     data_dir: Path, *, market: str = "CN", equity: str = "100000"
 ) -> None:

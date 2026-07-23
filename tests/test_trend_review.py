@@ -828,6 +828,34 @@ def test_v5_buy_uses_live_quote_without_atr_or_estimate(tmp_path: Path) -> None:
     assert client.requests[0]["qty"] == "300"
 
 
+def test_v5_recovered_atr_caps_pending_buy_by_single_entry_risk(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    report = v5_report_with_pending_buy(target_amount="100000", lot_size=None)
+    action = report["strategy_judgments"]["formal_actions"][0]
+    action.update({"close": "10", "atr": "1", "pending_fields": ["lot_size"]})
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "single_entry_risk_limit": "500",
+        "portfolio_remaining_risk": "10000",
+    }
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-23",
+        now="2026-07-23T09:31:00+08:00",
+        quote_prices={"SH.600001": Decimal("10")},
+        quote_lot_sizes={"SH.600001": 100},
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["qty"] == "200"
+
+
 def test_v5_hk_buy_uses_live_lot_size(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
     report = v5_report_with_pending_buy(
@@ -3740,6 +3768,43 @@ def test_report_revision_does_not_duplicate_existing_symbol_intent(
     assert first["submitted_count"] == 1
     assert repeated["submitted_count"] == 0
     assert len(client.requests) == 1
+
+
+def test_corrected_report_revision_isolated_from_base_action_ledger(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    first_report = cn_buy_report(symbol="600001")
+    revised_report = cn_buy_report(symbol="600001")
+    revised_report["generated_at"] = "2026-07-17T09:32:00+08:00"
+
+    first = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=first_report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+    revised = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=revised_report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:32:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        report_revision=1,
+    )
+
+    assert first["submitted_count"] == 1
+    assert revised["submitted_count"] == 1
+    assert len(client.requests) == 2
+    assert client.requests[0]["remark"] != client.requests[1]["remark"]
+    assert len(
+        list(tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*"))
+    ) == 2
 
 
 def test_formal_sell_all_submits_full_position_market_order(tmp_path: Path) -> None:

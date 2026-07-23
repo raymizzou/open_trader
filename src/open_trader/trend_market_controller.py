@@ -967,6 +967,7 @@ def _execute_locked_report(
         execution_date=execution_date,
         now=now,
         allow_late_buys=allow_late_buys,
+        report_revision=revision,
     )
     sell_symbols = {
         to_futu_symbol(market, str(action.get("symbol") or ""))
@@ -1044,6 +1045,7 @@ def _execute_locked_report(
             quote_prices=prices,
             quote_lot_sizes=lot_sizes,
             allow_late_buys=allow_late_buys,
+            report_revision=revision,
         )
         if allow_new_buys and quote_failure:
             raise RuntimeError("current quote unavailable for pending trend buy")
@@ -1440,8 +1442,33 @@ def _notify_pending_protection(
 ) -> int:
     sent = 0
     seen: set[str] = set()
-    title_label, action = PROTECTION_STATUS_LABELS["pending"]
-    for event in events:
+    pending_events: dict[str, Mapping[str, object]] = {}
+    candidate_events: list[Mapping[str, object]] = list(events)
+    actions_root = (
+        config.data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+    )
+    # Protection pending facts live under the execution date on which the
+    # fill happened.  A later daily report may recover ATR on a different
+    # date, so scan all immutable action-date directories instead of only the
+    # current cycle passed by the controller.
+    for date_root in actions_root.glob("*"):
+        if not date_root.is_dir():
+            continue
+        for action_root in date_root.glob("*"):
+            if not action_root.is_dir():
+                continue
+            for path in action_root.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, Mapping):
+                    candidate_events.append(payload)
+    for event in candidate_events:
         if (
             event.get("side") != "buy"
             or event.get("status") not in {"filled", "partially_filled", "incomplete"}
@@ -1449,9 +1476,76 @@ def _notify_pending_protection(
         ):
             continue
         symbol = str(event.get("symbol") or "").strip()
-        if not symbol or symbol in seen:
+        if not symbol:
             continue
+        previous = pending_events.get(symbol)
+        if previous is not None and str(previous.get("recorded_at") or "") >= str(
+            event.get("recorded_at") or ""
+        ):
+            continue
+        pending_events[symbol] = event
+
+    state_path = config.data_dir / {
+        "CN": "trend_a_share",
+        "HK": "trend_hk_phillips",
+        "US": "trend_us_tiger",
+    }[market] / "protection_state.json"
+    recovered: dict[str, Mapping[str, object]] = {}
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        positions = state.get("positions") if isinstance(state, Mapping) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        positions = None
+    if isinstance(positions, Mapping):
+        for symbol, event in pending_events.items():
+            position = positions.get(symbol)
+            if not isinstance(position, Mapping):
+                continue
+            if (
+                position.get("protection_status") == "active"
+                and str(position.get("protection_recovered_for") or "")
+                >= str(pending_events[symbol].get("date") or execution_date)
+                and str(position.get("active_line") or "").strip()
+            ):
+                recovered[symbol] = position
+
+    for symbol, position in recovered.items():
+        title_label, action = PROTECTION_STATUS_LABELS["active"]
+        transition_date = str(
+            position.get("protection_recovered_for") or execution_date
+        )
+        title = (
+            f"【提醒｜{BROKER_LABELS[market]}｜"
+            f"{MARKET_LABELS[market]}{title_label}｜{symbol}】"
+        )
+        message = (
+            f"发生：{symbol} 的 ATR 已恢复，保护线已补全为 {position['active_line']}\n"
+            "影响：当前仓位恢复到自动保护监控\n"
+            f"现在做：{action}"
+        )
+        sent += int(
+            _notify_feishu_once(
+                title,
+                message,
+                (
+                    config,
+                    market,
+                    transition_date,
+                    f"protection_{symbol}",
+                    "active",
+                    "",
+                ),
+            )
+        )
         seen.add(symbol)
+
+    title_label, action = PROTECTION_STATUS_LABELS["pending"]
+    for symbol in pending_events:
+        if symbol in seen:
+            continue
+        transition_date = str(
+            pending_events[symbol].get("date") or execution_date
+        )
         title = (
             f"【需处理｜{BROKER_LABELS[market]}｜"
             f"{MARKET_LABELS[market]}{title_label}｜{symbol}】"
@@ -1468,7 +1562,7 @@ def _notify_pending_protection(
                 (
                     config,
                     market,
-                    execution_date,
+                    transition_date,
                     f"protection_{symbol}",
                     "pending",
                     "",

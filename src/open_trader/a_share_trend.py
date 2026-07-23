@@ -2457,6 +2457,8 @@ def build_report(
                     )
                     if present
                 )
+        if protection_status == "pending" and active_line is None:
+            warnings = (*warnings, "protection_pending")
         industry = snapshot.industry if snapshot else ""
         if industry:
             industries[industry] += 1
@@ -2857,6 +2859,7 @@ REASON_LABELS = {
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
     "holding_lot_size_unavailable": "持仓整手信息不可用",
+    "protection_pending": "保护线待 ATR 补全",
     "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
@@ -3035,6 +3038,8 @@ def _append_feishu_action_sections(
                 line += f"｜{_action_label('SELL_ALL')}"
             if item.get("active_line") not in {None, ""}:
                 line += f"｜保护线 {_feishu_money(item['active_line'])}"
+            elif "protection_pending" in item.get("warnings", []):
+                line += "｜保护线待 ATR 补全"
             lines.append(line)
     if buys:
         lines.extend(["", "买入"])
@@ -3266,7 +3271,7 @@ def render_markdown(report: TrendReport) -> str:
         f"允许买入 {len(report.buy_actions)}｜"
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
     ]
-    if report.strategy_snapshot.get("strategy_version") in {"v3", "v4"}:
+    if report.strategy_snapshot.get("strategy_version") in {"v3", "v4", "v5"}:
         phase = {
             "cold_start": "冷启动",
             "active_all_samples": "全样本启用",
@@ -3366,6 +3371,8 @@ def render_markdown(report: TrendReport) -> str:
                     line += f"｜提示 {'、'.join(warnings)}"
             if item.active_line is not None:
                 line += f"｜活动保护线 {_money(item.active_line)}"
+            elif "protection_pending" in item.warnings:
+                line += "｜保护线待 ATR 补全"
             lines.append(line)
     else:
         lines.append("- 无需卖出。")
@@ -3428,6 +3435,8 @@ def render_markdown(report: TrendReport) -> str:
         )
         if item.active_line is not None:
             line += f"｜活动保护线 {_money(item.active_line)}"
+        elif "protection_pending" in item.warnings:
+            line += "｜保护线待 ATR 补全"
         if market == "CN":
             line += (
                 f"｜执行参考价 "

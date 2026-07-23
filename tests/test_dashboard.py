@@ -315,6 +315,30 @@ def test_dashboard_accepts_pending_v5_buy_action_projection() -> None:
     )
 
 
+def test_dashboard_enforces_v5_kelly_cap_for_complete_buy() -> None:
+    payload = _valid_v3_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(snapshot, dict)
+    assert isinstance(summary, dict)
+    assert isinstance(judgments, dict)
+    snapshot["strategy_version"] = "v5"
+    summary.update({
+        "kelly_phase": "active_all_samples",
+        "kelly_cap": "0.02",
+        "kelly_eligible_sample_count": 30,
+        "kelly_selected_sample_count": 30,
+    })
+
+    assert not dashboard_module._valid_v2_risk_items(
+        payload,
+        judgments,
+        summary,
+        strategy_version="v5",
+    )
+
+
 def test_dashboard_rejects_malformed_pending_v5_lot_size() -> None:
     payload = {"strategy_snapshot": {"strategy_version": "v5"}}
     judgments = {

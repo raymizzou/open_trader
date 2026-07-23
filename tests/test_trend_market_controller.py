@@ -235,6 +235,47 @@ def test_pending_protection_notification_uses_stable_symbol_status_key(
     assert notifications[0][0] == notifications[1][0]
 
 
+def test_pending_protection_notification_announces_atr_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    notifications: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, message, key: notifications.append((title, message, key)) or True,
+    )
+    state_path = tmp_path / "data/trend_a_share/protection_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "schema_version": 1,
+        "positions": {
+            "600001": {
+                "protection_status": "active",
+                "protection_recovered_for": "2026-07-21",
+                "active_line": "9.2",
+            }
+        },
+    }), encoding="utf-8")
+    events = [{
+        "market": "CN",
+        "date": "2026-07-19",
+        "symbol": "600001",
+        "side": "buy",
+        "status": "filled",
+        "protection_status": "pending",
+    }]
+
+    assert controller._notify_pending_protection(
+        config, "CN", "2026-07-22", events
+    ) == 1
+    assert notifications[0][2][1:] == (
+        "CN", "2026-07-21", "protection_600001", "active", ""
+    )
+    assert "保护线已恢复" in notifications[0][0]
+    assert "9.2" in notifications[0][1]
+
+
 def test_controller_notification_stops_after_one_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

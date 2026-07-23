@@ -569,18 +569,61 @@ def validate_integrated_candidate(
             assert isinstance(buys, list), f"{broker} 正式买入动作无效"
             for action in buys:
                 assert isinstance(action, Mapping), f"{broker} 正式买入动作无效"
+                weight = _position_decimal(action.get("target_weight"), "目标仓位")
+                assert Decimal("0") < weight <= Decimal("0.04"), (
+                    f"{broker} 买入目标超过固定名义仓位上限"
+                )
+                pending = (
+                    expected_strategy_version == "v5"
+                    and action.get("market_data_status") == "pending"
+                )
+                if pending:
+                    pending_fields = action.get("pending_fields")
+                    assert (
+                        isinstance(pending_fields, list)
+                        and pending_fields
+                        and all(
+                            field in {"quote", "atr", "lot_size"}
+                            for field in pending_fields
+                        )
+                    ), f"{broker} v5 待补行情字段无效"
+                    raw_quantity = action.get("estimated_shares")
+                    raw_lot = action.get("lot_size")
+                    quantity = (
+                        _position_decimal(raw_quantity, "买入数量")
+                        if raw_quantity is not None
+                        else None
+                    )
+                    lot = (
+                        _position_decimal(raw_lot, "整手数量")
+                        if raw_lot is not None
+                        else None
+                    )
+                    if quantity is not None:
+                        assert quantity == quantity.to_integral_value(), (
+                            f"{broker} v5 买入数量不是整数"
+                        )
+                    if lot is None:
+                        assert "lot_size" in pending_fields, (
+                            f"{broker} v5 缺少整手数量但未声明待补"
+                        )
+                    else:
+                        assert lot > 0 and lot == lot.to_integral_value(), (
+                            f"{broker} v5 整手数量无效"
+                        )
+                    if quantity is not None and lot is not None:
+                        assert quantity % lot == 0, (
+                            f"{broker} v5 买入数量未按整手向下取整"
+                        )
+                    continue
                 quantity = _position_decimal(action.get("estimated_shares"), "买入数量")
                 lot = _position_decimal(action.get("lot_size"), "整手数量")
-                weight = _position_decimal(action.get("target_weight"), "目标仓位")
                 assert (
                     quantity == quantity.to_integral_value()
                     and lot > 0
                     and lot == lot.to_integral_value()
                     and quantity % lot == 0
                 ), f"{broker} 买入数量未按整手向下取整"
-                assert Decimal("0") < weight <= Decimal("0.04"), (
-                    f"{broker} 买入目标超过固定名义仓位上限"
-                )
 
             drawdown = report.get("drawdown_summary")
             formal_buys = report.get("buy_actions")

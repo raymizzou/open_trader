@@ -1295,6 +1295,38 @@ def test_acceptance_allows_v5_missing_drawdown_without_formal_buys(
     ) == []
 
 
+def test_acceptance_allows_v5_pending_buy_without_completed_quantity(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["eastmoney"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_a_share/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    pending_buy = dict(report["buy_actions"][0])  # type: ignore[index]
+    pending_buy.update({
+        "estimated_shares": None,
+        "lot_size": None,
+        "atr": None,
+        "market_data_status": "pending",
+        "pending_fields": ["quote", "atr", "lot_size"],
+    })
+    frozen["strategy_judgments"]["formal_actions"] = [pending_buy]
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report.update({
+        "report_sha256": dashboard_acceptance._report_hash(frozen),
+        "buy_actions": [pending_buy],
+    })
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+
 @pytest.mark.parametrize(
     ("artifact", "expected"),
     [

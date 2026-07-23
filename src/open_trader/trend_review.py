@@ -317,6 +317,7 @@ def _protection_event_identity(
     market: str,
     execution_date: str,
     action_key: str,
+    report_revision: int = 0,
 ) -> tuple[str, int, str] | None:
     if (
         event.get("status") != "reason_added"
@@ -345,7 +346,13 @@ def _protection_event_identity(
         or event.get("sell_goal") != "position_zero"
         or futu_code != expected_futu_code
         or action_key
-        != trend_action_key(market, execution_date, futu_code, "sell")
+        != trend_action_key(
+            market,
+            execution_date,
+            futu_code,
+            "sell",
+            report_revision=report_revision,
+        )
         or event.get("report_sha256") != report_sha
         or recorded_at.tzinfo is None
         or recorded_at.utcoffset() is None
@@ -456,16 +463,30 @@ def _ledger_fact_attempt(
 
 
 def trend_action_key(
-    market: str, execution_date: str, futu_code: str, side: str
+    market: str,
+    execution_date: str,
+    futu_code: str,
+    side: str,
+    *,
+    report_revision: int = 0,
 ) -> str:
-    identity = ":".join(
-        (
-            _market(market),
-            date.fromisoformat(execution_date).isoformat(),
-            futu_code.strip().upper(),
-            side.strip().lower(),
-        )
-    )
+    if (
+        isinstance(report_revision, bool)
+        or not isinstance(report_revision, int)
+        or report_revision < 0
+    ):
+        raise ValueError("report revision must be a non-negative integer")
+    identity_parts = [
+        _market(market),
+        date.fromisoformat(execution_date).isoformat(),
+        futu_code.strip().upper(),
+        side.strip().lower(),
+    ]
+    # Keep the historical key for the base report, while isolating every
+    # corrected report revision from old intents/events for the same symbol.
+    if report_revision:
+        identity_parts.append(f"r{report_revision}")
+    identity = ":".join(identity_parts)
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -768,7 +789,12 @@ def _order_has_action_identity(
 
 
 def _action_facts(
-    root: Path, *, futu_code: str, side: str
+    root: Path,
+    *,
+    futu_code: str,
+    side: str,
+    report_sha: str | None = None,
+    report_shas: set[str] | None = None,
 ) -> list[tuple[Path, dict[str, object], dict[str, object], int]]:
     facts: list[tuple[Path, dict[str, object], dict[str, object], int]] = []
     for path in _ledger_fact_paths(root):
@@ -792,6 +818,12 @@ def _action_facts(
             == futu_code.strip().upper()
             and str(request.get("side") or "").strip().rsplit(".", 1)[-1].lower()
             == side.strip().rsplit(".", 1)[-1].lower()
+            and (
+                report_sha is None
+                and (report_shas is None or payload.get("report_sha256") in report_shas)
+                or report_sha is not None
+                and payload.get("report_sha256") == report_sha
+            )
         ):
             facts.append((path, payload, request, attempt))
     return sorted(
@@ -977,6 +1009,7 @@ def record_trend_review_missed_buys(
     execution_date: str,
     now: str,
     allow_late_buys: bool = False,
+    report_revision: int = 0,
 ) -> int:
     market = _market(market)
     actions, strategy_version = _preflight_open_actions(report, market)
@@ -1006,7 +1039,11 @@ def record_trend_review_missed_buys(
             continue
         futu_code = to_futu_symbol(market, symbol)
         action_key = trend_action_key(
-            market, execution_date, futu_code, "buy"
+            market,
+            execution_date,
+            futu_code,
+            "buy",
+            report_revision=report_revision,
         )
         facts = _action_facts(
             data_dir
@@ -1017,6 +1054,7 @@ def record_trend_review_missed_buys(
             / execution_date,
             futu_code=futu_code,
             side="buy",
+            report_sha=report_sha if report_revision > 0 else None,
         )
         if facts:
             continue
@@ -1174,28 +1212,10 @@ def _locked_action_context(
     symbol: str,
     side: str,
 ) -> tuple[str, int, Mapping[str, object], str]:
-    batch_path = (
-        data_dir
-        / "trend_review"
-        / "ledgers"
-        / market
-        / "batches"
-        / f"{execution_date}.json"
+    batch, report, _ = _load_execution_batch_context(
+        data_dir, market=market, execution_date=execution_date
     )
-    try:
-        batch = json.loads(batch_path.read_text(encoding="utf-8"))
-        batch = _validate_execution_batch(
-            batch, market=market, execution_date=execution_date
-        )
-        report_path = Path(str(batch["report_path"]))
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"invalid trend execution batch: {batch_path}") from exc
-    if (
-        not isinstance(report, Mapping)
-        or _report_hash(report) != batch["report_sha256"]
-    ):
-        raise ValueError(f"invalid trend execution batch: {batch_path}")
+    report_sha = str(batch["report_sha256"])
     actions, strategy_version = _preflight_open_actions(report, market)
     expected_actions = {"BUY"} if side == "buy" else {"SELL_ALL", "SELL_PARTIAL"}
     matches = [
@@ -1207,7 +1227,62 @@ def _locked_action_context(
     if len(matches) != 1:
         raise ValueError("invalid trend action identity")
     index, action = matches[0]
-    return str(batch["report_sha256"]), index, action, strategy_version
+    return report_sha, index, action, strategy_version
+
+
+def _batch_report_revision(path: Path) -> int:
+    match = re.search(r"-r(?P<revision>\d+)\.json\Z", path.name)
+    return int(match.group("revision")) if match else 0
+
+
+def _load_execution_batch_context(
+    data_dir: Path,
+    *,
+    market: str,
+    execution_date: str,
+    revision: int | None = None,
+) -> tuple[dict[str, object], Mapping[str, object], int]:
+    """Load the highest (or explicitly requested) immutable execution batch."""
+    market = _market(market)
+    execution_date = date.fromisoformat(execution_date).isoformat()
+    batch_root = data_dir / "trend_review" / "ledgers" / market / "batches"
+    if revision is not None:
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("report revision must be a non-negative integer")
+        candidates = [
+            batch_root
+            / f"{execution_date}{'' if revision == 0 else f'-r{revision}'}.json"
+        ]
+    else:
+        candidates = sorted(
+            [
+                *batch_root.glob(f"{execution_date}.json"),
+                *batch_root.glob(f"{execution_date}-r*.json"),
+            ],
+            key=lambda path: _batch_report_revision(path),
+            reverse=True,
+        )
+    if not candidates:
+        raise ValueError(f"invalid trend execution batch: {batch_root}")
+    batch_path = candidates[0]
+    try:
+        batch = json.loads(batch_path.read_text(encoding="utf-8"))
+        batch = _validate_execution_batch(
+            batch,
+            market=market,
+            execution_date=execution_date,
+            revision=_batch_report_revision(batch_path),
+        )
+        report_path = Path(str(batch["report_path"]))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid trend execution batch: {batch_path}") from exc
+    if (
+        not isinstance(report, Mapping)
+        or _report_hash(report) != batch["report_sha256"]
+    ):
+        raise ValueError(f"invalid trend execution batch: {batch_path}")
+    return batch, report, _batch_report_revision(batch_path)
 
 
 def _valid_sell_goal_metadata(
@@ -1489,8 +1564,24 @@ def load_trend_action_audit(
     from .futu_symbols import to_futu_symbol
 
     futu_code = to_futu_symbol(market, symbol)
+    batch_root = data_dir / "trend_review" / "ledgers" / market / "batches"
+    has_batch = any(batch_root.glob(f"{execution_date}.json")) or any(
+        batch_root.glob(f"{execution_date}-r*.json")
+    )
+    if has_batch:
+        batch, _batch_report, report_revision = _load_execution_batch_context(
+            data_dir, market=market, execution_date=execution_date
+        )
+        report_sha = str(batch["report_sha256"])
+    else:
+        report_revision = 0
+        report_sha = ""
     action_key = trend_action_key(
-        market, execution_date, futu_code, side
+        market,
+        execution_date,
+        futu_code,
+        side,
+        report_revision=report_revision,
     )
     action_root = (
         data_dir
@@ -1501,6 +1592,20 @@ def load_trend_action_audit(
         / execution_date
         / action_key
     )
+    events = _action_events(action_root)
+    protection_shas = {
+        identity[0]
+        for event in events
+        if (
+            identity := _protection_event_identity(
+                event,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                report_revision=report_revision,
+            )
+        )
+    }
     facts = _action_facts(
         data_dir
         / "trend_review"
@@ -1510,8 +1615,12 @@ def load_trend_action_audit(
         / execution_date,
         futu_code=futu_code,
         side=side,
+        report_shas=(
+            {report_sha, *protection_shas}
+            if report_revision > 0
+            else None
+        ),
     )
-    events = _action_events(action_root)
     filled_terminal = False
     for event in events:
         try:
@@ -1667,6 +1776,7 @@ def load_trend_action_audit(
                 market=market,
                 execution_date=execution_date,
                 action_key=action_key,
+                report_revision=report_revision,
             )
         )
     }
@@ -1818,16 +1928,49 @@ def overheat_trim_progress(
             execution_date = date.fromisoformat(date_name).isoformat()
         except ValueError:
             continue
-        action_key = trend_action_key(market, execution_date, futu_code, "sell")
+        batch_candidates = sorted(
+            [
+                *(ledger / "batches").glob(f"{execution_date}.json"),
+                *(ledger / "batches").glob(f"{execution_date}-r*.json"),
+            ],
+            key=_batch_report_revision,
+            reverse=True,
+        )
+        batch_revision = (
+            _batch_report_revision(batch_candidates[0])
+            if batch_candidates
+            else 0
+        )
+        batch_report_sha = None
+        if batch_candidates:
+            batch, _batch_report, _ = _load_execution_batch_context(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                revision=batch_revision,
+            )
+            batch_report_sha = str(batch["report_sha256"])
+        action_key = trend_action_key(
+            market,
+            execution_date,
+            futu_code,
+            "sell",
+            report_revision=batch_revision,
+        )
         action_root = action_dates / execution_date / action_key
         facts = _action_facts(
             open_dates / execution_date,
             futu_code=futu_code,
             side="sell",
+            report_sha=(
+                batch_report_sha
+                if batch_revision > 0
+                else None
+            ),
         )
         if not facts and not action_root.is_dir():
             continue
-        has_batch = (ledger / "batches" / f"{execution_date}.json").is_file()
+        has_batch = bool(batch_candidates)
         if has_batch:
             events, resolutions = load_trend_action_audit(
                 data_dir,
@@ -2112,7 +2255,23 @@ def resolve_trend_action(
     from .futu_symbols import to_futu_symbol
 
     futu_code = to_futu_symbol(market, symbol)
-    action_key = trend_action_key(market, execution_date, futu_code, side)
+    batch_revision = 0
+    batch_report_sha: str | None = None
+    batch_root = data_dir / "trend_review" / "ledgers" / market / "batches"
+    if any(
+        batch_root.glob(f"{execution_date}.json")
+    ) or any(batch_root.glob(f"{execution_date}-r*.json")):
+        batch, _batch_report, batch_revision = _load_execution_batch_context(
+            data_dir, market=market, execution_date=execution_date
+        )
+        batch_report_sha = str(batch["report_sha256"])
+    action_key = trend_action_key(
+        market,
+        execution_date,
+        futu_code,
+        side,
+        report_revision=batch_revision,
+    )
     action_root = (
         data_dir
         / "trend_review"
@@ -2135,6 +2294,11 @@ def resolve_trend_action(
             / execution_date,
             futu_code=futu_code,
             side=side,
+            report_sha=(
+                batch_report_sha
+                if batch_revision > 0
+                else None
+            ),
         )
         resolutions = _action_resolutions(
             action_root,
@@ -2370,19 +2534,22 @@ def _remaining_buy_quantity(
     if version in {"v2", "v3", "v4", "v5"} and (
         version in {"v2", "v3", "v4"}
         or action.get("atr") is not None
-        and action.get("planned_stop_risk") is not None
     ):
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
-            raise ValueError("trend review risk summary is unavailable")
+            if version == "v5" and action.get("planned_stop_risk") is None:
+                # A lightweight v5 test/report may omit the optional risk
+                # summary; execution still remains quote/lot driven.
+                risk_summary = None
+            else:
+                raise ValueError("trend review risk summary is unavailable")
+        if risk_summary is None:
+            return min(caps)
         atr = _required_decimal(action.get("atr"), "action ATR")
-        planned_risk = _required_decimal(
-            action.get("planned_stop_risk"), "planned stop risk"
-        )
         cost_rate = _required_decimal(
             risk_summary.get("normal_cost_rate"), "normal cost rate"
         )
-        if atr <= 0 or planned_risk <= 0 or cost_rate <= 0:
+        if atr <= 0 or cost_rate <= 0:
             raise ValueError("trend review buy completion risk is invalid")
         confirmed_risk = sum(
             (
@@ -2395,11 +2562,36 @@ def _remaining_buy_quantity(
             ),
             Decimal("0"),
         )
-        remaining_risk = planned_risk - confirmed_risk
         unit_risk = (
             Decimal("2") * atr * fx
             + current_price * fx * cost_rate
         )
+        if action.get("planned_stop_risk") is not None:
+            planned_risk = _required_decimal(
+                action.get("planned_stop_risk"), "planned stop risk"
+            )
+            if planned_risk <= 0:
+                raise ValueError("trend review buy completion risk is invalid")
+            remaining_risk = planned_risk - confirmed_risk
+        else:
+            # v5 may have been frozen before ATR/quote recovery.  Once ATR is
+            # available, rebuild the same single-entry and known portfolio
+            # risk caps instead of treating the pending action as uncapped.
+            single_limit = _required_decimal(
+                risk_summary.get("single_entry_risk_limit"),
+                "single entry risk limit",
+            )
+            if single_limit <= 0:
+                raise ValueError("trend review buy completion risk is invalid")
+            remaining_risk = single_limit
+            portfolio_remaining = risk_summary.get("portfolio_remaining_risk")
+            if portfolio_remaining is not None:
+                portfolio_limit = _required_decimal(
+                    portfolio_remaining, "portfolio remaining risk"
+                )
+                if portfolio_limit < 0:
+                    raise ValueError("trend review buy completion risk is invalid")
+                remaining_risk = min(remaining_risk, portfolio_limit)
         caps.append(_floor_to_lot(remaining_risk / unit_risk, lot_size))
     return min(caps)
 
@@ -2643,6 +2835,7 @@ def execute_trend_review_open(
     allow_late_buys: bool = False,
     order_history_start: str | None = None,
     prior_sell_requests: Sequence[Mapping[str, object]] = (),
+    report_revision: int = 0,
 ) -> dict[str, object]:
     market = _market(market)
     actions, strategy_version = _preflight_open_actions(report, market)
@@ -2742,7 +2935,13 @@ def execute_trend_review_open(
             continue
         futu_code = to_futu_symbol(market, symbol)
         side = "buy" if action_name == "BUY" else "sell"
-        action_key = trend_action_key(market, execution_date, futu_code, side)
+        action_key = trend_action_key(
+            market,
+            execution_date,
+            futu_code,
+            side,
+            report_revision=report_revision,
+        )
         action_evidence = {
             "market": market,
             "date": execution_date,
@@ -2765,7 +2964,16 @@ def execute_trend_review_open(
             / execution_date
             / action_key
         )
-        action_facts = _action_facts(root, futu_code=futu_code, side=side)
+        action_facts = _action_facts(
+            root,
+            futu_code=futu_code,
+            side=side,
+            report_sha=(
+                report_sha
+                if report_revision > 0 and strategy_version != "protection-v1"
+                else None
+            ),
+        )
         sell_metadata: dict[str, object] = (
             {"sell_goal": "position_zero"}
             if action_name == "SELL_ALL"
@@ -3861,6 +4069,18 @@ def execute_trend_review_stop(
 
     futu_code = to_futu_symbol(market, symbol)
     ledger = data_dir / "trend_review" / "ledgers" / market
+
+    def report_revision_for(execution_date: str) -> int:
+        batch_root = ledger / "batches"
+        candidates = [
+            *(batch_root.glob(f"{execution_date}.json")),
+            *(batch_root.glob(f"{execution_date}-r*.json")),
+        ]
+        return max(
+            (_batch_report_revision(path) for path in candidates),
+            default=0,
+        )
+
     protection_state = load_protection_state(
         data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
     )
@@ -3904,7 +4124,11 @@ def execute_trend_review_stop(
         except ValueError:
             continue
         action_root = root / trend_action_key(
-            market, execution_date, futu_code, "sell"
+            market,
+            execution_date,
+            futu_code,
+            "sell",
+            report_revision=report_revision_for(execution_date),
         )
         if action_root.is_dir() and any(
             belongs_to_current_position(event)
@@ -3913,6 +4137,7 @@ def execute_trend_review_stop(
             partial_dates.add(execution_date)
     partial_execution_date = max(partial_dates, default=trading_date)
     order_history_start = min(partial_dates, default=trading_date)
+    report_revision = report_revision_for(partial_execution_date)
     return execute_trend_review_open(
         data_dir=data_dir,
         report=_protection_report(symbol, event_id),
@@ -3922,6 +4147,7 @@ def execute_trend_review_stop(
         now=now,
         quote_prices={},
         order_history_start=order_history_start,
+        report_revision=report_revision,
         prior_sell_requests=tuple(
             request
             for execution_date, requests in partial_requests.items()

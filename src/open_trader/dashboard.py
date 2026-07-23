@@ -1237,7 +1237,7 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             or target_weight > PORTFOLIO_RISK_LIMIT
-            or strategy_version in {"v3", "v4"}
+            or strategy_version in {"v3", "v4", "v5"}
             and summary.get("kelly_phase") != "cold_start"
             and target_weight
             > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
@@ -1966,7 +1966,7 @@ def _project_trend_actual_item(
             if action.get("active_line") not in {None, ""}
             else "预计保护线"
             if action.get("estimated_initial_line") not in {None, ""}
-            else ""
+            else "保护线待 ATR 补全"
         ),
         "estimated_exit_loss": (
             _money_text(estimated_loss) if estimated_loss is not None else ""
