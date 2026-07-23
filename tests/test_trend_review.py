@@ -856,6 +856,78 @@ def test_v5_recovered_atr_caps_pending_buy_by_single_entry_risk(
     assert client.requests[0]["qty"] == "200"
 
 
+def test_v5_recovered_atr_respects_known_portfolio_risk_when_unknown_exists(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient()
+    report = v5_report_with_pending_buy(target_amount="10000", lot_size=100)
+    action = report["strategy_judgments"]["formal_actions"][0]
+    action.update(
+        {
+            "close": "10",
+            "atr": "1",
+            "market_data_status": "complete",
+            "pending_fields": [],
+        }
+    )
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "single_entry_risk_limit": "400",
+        "portfolio_risk_limit": "4000",
+        "portfolio_remaining_risk": None,
+        "known_portfolio_planned_risk": "3800",
+    }
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-23",
+        now="2026-07-23T09:31:00+08:00",
+        quote_prices={"SH.600001": Decimal("10")},
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+
+
+def test_v5_recovered_atr_deducts_confirmed_fill_risk_from_caps() -> None:
+    report = v5_report_with_pending_buy(target_amount="10000", lot_size=100)
+    action = report["strategy_judgments"]["formal_actions"][0]
+    action.update(
+        {
+            "close": "10",
+            "atr": "1",
+            "market_data_status": "complete",
+            "pending_fields": [],
+        }
+    )
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "single_entry_risk_limit": "400",
+        "portfolio_risk_limit": "4000",
+        "portfolio_remaining_risk": None,
+        "known_portfolio_planned_risk": "3800",
+    }
+
+    remaining = trend_review._remaining_buy_quantity(
+        action,
+        report,
+        {"available_cash": "100000"},
+        [
+            {
+                "order_id": "SIM-1",
+                "dealt_qty": "100",
+                "dealt_avg_price": "10",
+            }
+        ],
+        Decimal("10"),
+    )
+
+    assert remaining == 0
+
+
 def test_v5_hk_buy_uses_live_lot_size(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
     report = v5_report_with_pending_buy(

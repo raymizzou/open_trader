@@ -2583,15 +2583,38 @@ def _remaining_buy_quantity(
             )
             if single_limit <= 0:
                 raise ValueError("trend review buy completion risk is invalid")
-            remaining_risk = single_limit
+            remaining_risk = max(Decimal("0"), single_limit - confirmed_risk)
             portfolio_remaining = risk_summary.get("portfolio_remaining_risk")
+            if portfolio_remaining is None:
+                # With unknown ATR/quote fields the report intentionally leaves
+                # the aggregate remaining field unavailable, but its known
+                # portion still consumes the portfolio budget.  Once this
+                # action's ATR recovers, enforce that known budget instead of
+                # silently treating the pending buy as single-entry-only.
+                known_planned = risk_summary.get("known_portfolio_planned_risk")
+                portfolio_limit_value = risk_summary.get("portfolio_risk_limit")
+                if known_planned is not None and portfolio_limit_value is not None:
+                    known_planned = _required_decimal(
+                        known_planned, "known portfolio planned risk"
+                    )
+                    portfolio_limit_value = _required_decimal(
+                        portfolio_limit_value, "portfolio risk limit"
+                    )
+                    if known_planned < 0 or portfolio_limit_value < 0:
+                        raise ValueError("trend review buy completion risk is invalid")
+                    portfolio_remaining = max(
+                        Decimal("0"), portfolio_limit_value - known_planned
+                    )
             if portfolio_remaining is not None:
                 portfolio_limit = _required_decimal(
                     portfolio_remaining, "portfolio remaining risk"
                 )
                 if portfolio_limit < 0:
                     raise ValueError("trend review buy completion risk is invalid")
-                remaining_risk = min(remaining_risk, portfolio_limit)
+                remaining_risk = min(
+                    remaining_risk,
+                    max(Decimal("0"), portfolio_limit - confirmed_risk),
+                )
         caps.append(_floor_to_lot(remaining_risk / unit_risk, lot_size))
     return min(caps)
 
