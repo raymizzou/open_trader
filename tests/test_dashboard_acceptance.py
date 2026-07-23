@@ -21,7 +21,10 @@ from open_trader.dashboard_acceptance import (
     validate_dashboard_payload,
     validate_quotes_payload,
 )
-from open_trader.strategy_drawdown import strategy_parameter_hash
+from open_trader.strategy_drawdown import (
+    automatic_bootstrap_strategy_drawdown,
+    strategy_parameter_hash,
+)
 
 
 MISSING_FRESH = object()
@@ -512,6 +515,91 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
         dashboard_acceptance._check_trend_artifact_projection(
             reports, "tiger", projected
         )
+
+
+def test_acceptance_recognizes_only_strict_partial_sell_actions() -> None:
+    partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "AAPL",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 3,
+        "lot_size": 1,
+        "overheat_signals": ["boiling"],
+    }
+
+    assert not dashboard_acceptance._trend_action_needs_review(partial)
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": []}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "estimated_shares": 301, "lot_size": 100}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": ["boiling", "boiling"]}
+    )
+    assert dashboard_acceptance._trend_action_needs_review(
+        {**partial, "overheat_signals": [{"signal": "boiling"}]}
+    )
+
+
+def test_acceptance_suppresses_partial_when_same_symbol_has_full_exit(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    partial = {
+        "action": "SELL_PARTIAL",
+        "symbol": "SH.600001",
+        "reason": "overheat_take_profit",
+        "target_fraction": "0.30",
+        "position_started_for": "2026-07-01",
+        "estimated_shares": 300,
+        "lot_size": 100,
+        "overheat_signals": ["boiling"],
+    }
+    full = {"action": "SELL_ALL", "symbol": "600001", "reason": "danger_signal"}
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_judgments": {
+            "formal_actions": [partial, full],
+            "holding_decisions": [],
+            "top10_candidates": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "available": True,
+        "broker": "eastmoney",
+        "market": "CN",
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "sell_actions": [full],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "counts": {"sell": 1, "buy": 0, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": "2026-07-15.json",
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "eastmoney", projected
+    )
 
 
 def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
@@ -1308,6 +1396,105 @@ def test_acceptance_rejects_frozen_parameter_audit_identity_mismatch(
         account_ids=account_ids,
     )
 
+    assert any("冻结策略参数与回撤审计身份" in error for error in errors)
+
+
+def test_acceptance_allows_only_the_audited_v4_overheat_trim_compatibility(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    artifact = reports_dir / "trend_us_tiger/2026-07-20.json"
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    parameters = frozen["strategy_snapshot"]["parameters"]
+    assert isinstance(parameters, dict)
+    old_parameters = dict(parameters)
+    updated_parameters = {
+        **old_parameters,
+        "overheat_trim_fraction": "0.30",
+        "overheat_trim_once_per_position": True,
+        "overheat_trim_signals": ["boiling", "champagne"],
+        "overheat_trim_rounding": "floor_to_market_lot",
+        "overheat_trim_below_lot": "no_order_terminal",
+        "full_exit_precedes_partial_exit": True,
+    }
+    decision = automatic_bootstrap_strategy_drawdown(
+        tmp_path / "state",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        parameters=old_parameters,
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    decision = automatic_bootstrap_strategy_drawdown(
+        tmp_path / "state",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        parameters=updated_parameters,
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha="b" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-21T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from=None,
+    )
+    frozen["strategy_snapshot"]["parameters"] = updated_parameters
+    frozen["drawdown_summary"]["bootstrap_event"]["parameter_hash"] = (
+        strategy_parameter_hash(old_parameters)
+    )
+    frozen["drawdown_summary"]["parameter_compatibility_event"] = decision[
+        "parameter_compatibility_event"
+    ]
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+    frozen["strategy_snapshot"]["parameters"] = old_parameters
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    rollback_errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+    assert any("冻结策略参数与回撤审计身份" in error for error in rollback_errors)
+
+    frozen["strategy_snapshot"]["parameters"] = updated_parameters
+    frozen["strategy_snapshot"]["parameters"]["overheat_trim_fraction"] = "0.31"
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    report["report_sha256"] = _report_hash(frozen)
+    report["drawdown_summary"] = frozen["drawdown_summary"]
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
     assert any("冻结策略参数与回撤审计身份" in error for error in errors)
 
 

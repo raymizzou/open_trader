@@ -16,6 +16,7 @@ from open_trader.trend_api_stats import (
     _merge_synced_fills,
     _tiger_order_fee,
     _tiger_transaction_record,
+    build_trend_api_stats_payload,
     load_trend_api_stats,
     sync_trend_api_stats,
     write_trend_api_stats,
@@ -454,6 +455,93 @@ def normalized_fill(
         "attribution_status": "outside_strategy",
         "exclusion_reason": "order_not_linked_to_frozen_strategy",
     }
+
+
+def test_partial_actual_sell_is_attributed_and_round_closes_only_after_final_sell() -> None:
+    strategy_id = "trend_animals_warm_to_hot/US/v4"
+    frozen_reports = [
+        {
+            "market": "US",
+            "execution_date": "2026-01-01",
+            "strategy_id": strategy_id,
+            "strategy_version": "v4",
+            "report_sha256": "a" * 64,
+            "formal_actions": [{"action": "BUY", "symbol": "AAA"}],
+        },
+        {
+            "market": "US",
+            "execution_date": "2026-01-02",
+            "strategy_id": strategy_id,
+            "strategy_version": "v4",
+            "report_sha256": "b" * 64,
+            "formal_actions": [{"action": "SELL_PARTIAL", "symbol": "AAA"}],
+        },
+        {
+            "market": "US",
+            "execution_date": "2026-01-03",
+            "strategy_id": strategy_id,
+            "strategy_version": "v4",
+            "report_sha256": "c" * 64,
+            "formal_actions": [{"action": "SELL_ALL", "symbol": "AAA"}],
+        },
+    ]
+    actual_fills = [
+        {
+            **normalized_fill(
+                "actual-buy", "actual-buy", source="actual", side="buy",
+                filled_at="2026-01-01T10:00:00-05:00", price="10",
+            ),
+            "quantity": "10",
+            "fee": "1",
+        },
+        {
+            **normalized_fill(
+                "actual-partial", "actual-partial", source="actual", side="sell",
+                filled_at="2026-01-02T10:00:00-05:00", price="12",
+            ),
+            "quantity": "3",
+            "fee": "0.3",
+        },
+        {
+            **normalized_fill(
+                "actual-final", "actual-final", source="actual", side="sell",
+                filled_at="2026-01-03T10:00:00-05:00", price="11",
+            ),
+            "quantity": "7",
+            "fee": "0.5",
+        },
+    ]
+    strategy_versions = [{
+        "market": "US", "strategy_id": strategy_id, "strategy_version": "v4",
+    }]
+
+    partial = _attribute_actual_fills(actual_fills[:2], frozen_reports)
+
+    assert partial[-1]["strategy_id"] == strategy_id
+    assert partial[-1]["strategy_version"] == "v4"
+    assert partial[-1]["attribution_status"] == "attributed"
+    partial_payload = build_trend_api_stats_payload(
+        partial,
+        strategy_versions=strategy_versions,
+        generated_at="2026-01-03T00:00:00+00:00",
+        statistics_cutoff_at="2026-01-02T23:59:59+00:00",
+    )
+    assert partial_payload["rounds"] == []
+
+    closed_payload = build_trend_api_stats_payload(
+        _attribute_actual_fills(actual_fills, frozen_reports),
+        strategy_versions=strategy_versions,
+        generated_at="2026-01-04T00:00:00+00:00",
+        statistics_cutoff_at="2026-01-03T23:59:59+00:00",
+    )
+
+    assert len(closed_payload["rounds"]) == 1
+    assert closed_payload["rounds"][0]["fill_ids"] == [
+        "actual-buy", "actual-partial", "actual-final",
+    ]
+    assert closed_payload["rounds"][0]["buy_quantity"] == "10"
+    assert closed_payload["rounds"][0]["sell_quantity"] == "10"
+    assert closed_payload["rounds"][0]["fees"] == "1.8"
 
 
 def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_artifact(

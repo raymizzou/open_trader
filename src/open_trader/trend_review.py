@@ -340,6 +340,7 @@ def _protection_event_identity(
         or event.get("action_index") != 0
         or event.get("side") != "sell"
         or event.get("reason") != "protection_event"
+        or event.get("sell_goal") != "position_zero"
         or futu_code != expected_futu_code
         or action_key
         != trend_action_key(market, execution_date, futu_code, "sell")
@@ -810,6 +811,7 @@ def _write_reconciled_result(
     report_sha: str,
     action_index: int,
     reconciled_at: str,
+    metadata: Mapping[str, object] | None = None,
 ) -> Path:
     return _write_immutable(
         _result_path(intent_path),
@@ -823,6 +825,7 @@ def _write_reconciled_result(
                 "response": response,
                 "reconciled": True,
                 "submitted_at": reconciled_at,
+                **(metadata or {}),
             }
         ),
     )
@@ -951,19 +954,22 @@ def record_trend_review_missed_buys(
         and current.time().replace(tzinfo=None) <= window_end
     ):
         return 0
+    from .futu_symbols import to_futu_symbol
+
     report_sha = _report_hash(report)
     sell_symbols = {
-        str(action.get("symbol") or "").strip()
+        to_futu_symbol(market, str(action.get("symbol") or ""))
         for action in actions
-        if action.get("action") == "SELL_ALL"
+        if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     completed = 0
     for index, action in enumerate(actions):
         symbol = str(action.get("symbol") or "").strip()
-        if action.get("action") != "BUY" or symbol in sell_symbols:
+        if (
+            action.get("action") != "BUY"
+            or to_futu_symbol(market, symbol) in sell_symbols
+        ):
             continue
-        from .futu_symbols import to_futu_symbol
-
         futu_code = to_futu_symbol(market, symbol)
         action_key = trend_action_key(
             market, execution_date, futu_code, "buy"
@@ -1157,17 +1163,61 @@ def _locked_action_context(
     ):
         raise ValueError(f"invalid trend execution batch: {batch_path}")
     actions, strategy_version = _preflight_open_actions(report, market)
-    expected_action = "BUY" if side == "buy" else "SELL_ALL"
+    expected_actions = {"BUY"} if side == "buy" else {"SELL_ALL", "SELL_PARTIAL"}
     matches = [
         (index, action)
         for index, action in enumerate(actions)
-        if action.get("action") == expected_action
+        if action.get("action") in expected_actions
         and str(action.get("symbol") or "").strip() == symbol
     ]
     if len(matches) != 1:
         raise ValueError("invalid trend action identity")
     index, action = matches[0]
     return str(batch["report_sha256"]), index, action, strategy_version
+
+
+def _valid_sell_goal_metadata(
+    payload: Mapping[str, object],
+    *,
+    action: Mapping[str, object],
+    protection_identity: bool,
+    allow_zero_lifecycle_target: bool = False,
+) -> bool:
+    if protection_identity:
+        expected_goal = "position_zero"
+    elif action.get("action") == "SELL_PARTIAL":
+        expected_goal = "partial_30"
+    else:
+        expected_goal = None
+    if expected_goal == "position_zero":
+        return (
+            payload.get("sell_goal") == expected_goal
+            and "position_started_for" not in payload
+            and "lifecycle_target_qty" not in payload
+        )
+    if expected_goal is None:
+        return (
+            payload.get("sell_goal") in {None, "position_zero"}
+            and "position_started_for" not in payload
+            and "lifecycle_target_qty" not in payload
+        )
+    try:
+        target = _required_decimal(
+            payload.get("lifecycle_target_qty"), "lifecycle target quantity"
+        )
+        lot_size = _required_decimal(action.get("lot_size"), "lot size")
+    except ValueError:
+        return False
+    return (
+        payload.get("sell_goal") == expected_goal
+        and payload.get("position_started_for")
+        == action.get("position_started_for")
+        and (target >= 0 if allow_zero_lifecycle_target else target > 0)
+        and target == target.to_integral_value()
+        and lot_size > 0
+        and lot_size == lot_size.to_integral_value()
+        and target % lot_size == 0
+    )
 
 
 def _strict_action_facts(
@@ -1181,6 +1231,7 @@ def _strict_action_facts(
     report_sha: str,
     action_index: int,
     strategy_version: str,
+    action: Mapping[str, object],
     protection_identities: set[tuple[str, int, str]],
 ) -> tuple[list[Mapping[str, object]], set[str]]:
     requests: list[Mapping[str, object]] = []
@@ -1191,9 +1242,12 @@ def _strict_action_facts(
         )
     ).hexdigest()
     legacy_remark = f"trend-review:{market}:{execution_date}:{legacy_key[:24]}"
+    protection_fact_identities = {
+        (item[0], item[1]) for item in protection_identities
+    }
     allowed_fact_identities = {
         (report_sha, action_index),
-        *((item[0], item[1]) for item in protection_identities),
+        *protection_fact_identities,
     }
     for path, payload, request, attempt in facts:
         timestamp_name = (
@@ -1217,6 +1271,12 @@ def _strict_action_facts(
             payload.get("market") != market
             or payload.get("date") != execution_date
             or fact_identity not in allowed_fact_identities
+            or side == "sell"
+            and not _valid_sell_goal_metadata(
+                payload,
+                action=action,
+                protection_identity=fact_identity in protection_fact_identities,
+            )
             or request.get("market") != market
             or str(request.get("futu_code") or "").strip().upper()
             != futu_code.upper()
@@ -1500,6 +1560,70 @@ def load_trend_action_audit(
         symbol=symbol,
         side=side,
     )
+    below_lot_events = [
+        event for event in events if event.get("status") == "below_lot"
+    ]
+    if below_lot_events:
+        try:
+            lot_size = _required_decimal(action.get("lot_size"), "lot size")
+            target_fraction = _required_decimal(
+                action.get("target_fraction"), "target fraction"
+            )
+        except ValueError as exc:
+            raise ValueError("invalid trend action event evidence") from exc
+        if (
+            len(below_lot_events) != 1
+            or action.get("action") != "SELL_PARTIAL"
+            or side != "sell"
+            or lot_size <= 0
+            or lot_size != lot_size.to_integral_value()
+            or target_fraction != Decimal("0.30")
+            or facts
+        ):
+            raise ValueError("invalid trend action event evidence")
+        event = below_lot_events[0]
+        try:
+            target_qty = _required_decimal(event.get("target_qty"), "target quantity")
+            filled_qty = _required_decimal(event.get("filled_qty"), "filled quantity")
+            lifecycle_target = _required_decimal(
+                event.get("lifecycle_target_qty"), "lifecycle target quantity"
+            )
+        except ValueError as exc:
+            raise ValueError("invalid trend action event evidence") from exc
+        if (
+            event.get("reason") != "overheat_target_below_lot"
+            or event.get("sell_goal") != "partial_30"
+            or event.get("position_started_for")
+            != action.get("position_started_for")
+            or target_qty != 0
+            or filled_qty != 0
+            or lifecycle_target != 0
+            or event.get("order_ids") != []
+        ):
+            raise ValueError("invalid trend action event evidence")
+        position_qty, broker_filled, broker_order_ids = _validate_broker_evidence(
+            data_dir,
+            event,
+            market=market,
+            execution_date=execution_date,
+            action_key=action_key,
+            symbol=symbol,
+            futu_code=futu_code,
+            side=side,
+            report_sha=report_sha,
+            action_index=action_index,
+            requests=(),
+            result_order_ids=set(),
+        )
+        if (
+            position_qty <= 0
+            or _overheat_trim_quantity(
+                position_qty, target_fraction, int(lot_size)
+            ) != 0
+            or broker_filled != 0
+            or broker_order_ids
+        ):
+            raise ValueError("invalid trend action event evidence")
     protection_identities = {
         identity
         for event in events
@@ -1522,6 +1646,7 @@ def load_trend_action_audit(
         report_sha=report_sha,
         action_index=action_index,
         strategy_version=strategy_version,
+        action=action,
         protection_identities=protection_identities,
     )
     allowed_event_identities = {
@@ -1536,13 +1661,22 @@ def load_trend_action_audit(
         )
         if event_identity not in allowed_event_identities:
             raise ValueError("invalid trend action event identity")
+        if side == "sell" and not _valid_sell_goal_metadata(
+            event,
+            action=action,
+            protection_identity=event_identity in protection_identities,
+            allow_zero_lifecycle_target=event.get("status") == "below_lot",
+        ):
+            raise ValueError("invalid trend action event evidence")
         status = event.get("status")
         if status == "missed" and facts:
             raise ValueError("invalid trend action event evidence")
-        if status != "filled" and not (
+        if status not in {"filled", "partially_filled", "submitted"} and not (
             status == "incomplete"
             and event.get("reason") == "position_zero_confirmed"
         ):
+            continue
+        if status == "submitted" and "observation_path" not in event:
             continue
         position_qty, broker_filled, broker_order_ids = _validate_broker_evidence(
             data_dir,
@@ -1560,10 +1694,21 @@ def load_trend_action_audit(
         )
         filled_qty = _required_decimal(event.get("filled_qty"), "filled quantity")
         target_qty = _required_decimal(event.get("target_qty"), "target quantity")
-        expected_target = (
-            _required_decimal(requests[0].get("qty"), "target quantity")
-            if requests
-            else Decimal("0")
+        position_zero_requests = [
+            fact[2]
+            for fact in facts
+            if fact[1].get("sell_goal") == "position_zero"
+        ]
+        expected_target = _required_decimal(
+            (
+                position_zero_requests[0]
+                if event.get("sell_goal") == "position_zero"
+                and position_zero_requests
+                else requests[0]
+                if requests
+                else {"qty": "0"}
+            ).get("qty"),
+            "target quantity",
         )
         if (
             event.get("order_ids") != broker_order_ids
@@ -1571,18 +1716,19 @@ def load_trend_action_audit(
             or target_qty != expected_target
         ):
             raise ValueError("invalid trend action event evidence")
-        if status == "filled":
+        if status in {"filled", "partially_filled"}:
             frozen_target = _required_decimal(
                 action.get("estimated_shares"), "estimated shares"
             ) if side == "buy" else expected_target
             if (
                 not requests
                 or not broker_order_ids
-                or filled_qty < target_qty
+                or (status == "filled" and filled_qty < target_qty)
+                or (status == "partially_filled" and filled_qty >= target_qty)
                 or target_qty > frozen_target
             ):
                 raise ValueError("invalid trend action event evidence")
-        elif position_qty != 0:
+        elif status == "incomplete" and position_qty != 0:
             raise ValueError("invalid trend action event evidence")
     if filled_terminal and any(
         event.get("status") == "missed" for event in events
@@ -1599,6 +1745,297 @@ def load_trend_action_audit(
         action_attempts={item[3] for item in facts},
     )
     return events, resolutions
+
+
+def overheat_trim_progress(
+    data_dir: Path,
+    *,
+    market: str,
+    symbol: str,
+    position_started_for: str,
+) -> dict[str, object]:
+    """Rebuild one partial-sell lifecycle from validated immutable facts."""
+    market = _market(market)
+    symbol = symbol.strip()
+    position_started_for = date.fromisoformat(position_started_for).isoformat()
+    if not symbol:
+        raise ValueError("trend action identity is invalid")
+    from .futu_symbols import to_futu_symbol
+
+    futu_code = to_futu_symbol(market, symbol)
+    ledger = data_dir / "trend_review" / "ledgers" / market
+    action_dates = ledger / "actions"
+    open_dates = ledger / "open"
+    targets: set[Decimal] = set()
+    dealt_by_order: dict[str, Decimal] = {}
+    below_lot = False
+    source_paths: list[str] = []
+    submitted_order_ids: set[str] = set()
+    observed_order_statuses: dict[str, str] = {}
+    uncertain_action = False
+    date_names = {
+        path.name
+        for root in (action_dates, open_dates)
+        for path in root.glob("*")
+        if path.is_dir()
+    }
+    for date_name in sorted(date_names):
+        try:
+            execution_date = date.fromisoformat(date_name).isoformat()
+        except ValueError:
+            continue
+        action_key = trend_action_key(market, execution_date, futu_code, "sell")
+        action_root = action_dates / execution_date / action_key
+        facts = _action_facts(
+            open_dates / execution_date,
+            futu_code=futu_code,
+            side="sell",
+        )
+        if not facts and not action_root.is_dir():
+            continue
+        has_batch = (ledger / "batches" / f"{execution_date}.json").is_file()
+        if has_batch:
+            events, resolutions = load_trend_action_audit(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                symbol=symbol,
+                side="sell",
+            )
+            _, _, action, _ = _locked_action_context(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                symbol=symbol,
+                side="sell",
+            )
+            if (
+                action.get("action") != "SELL_PARTIAL"
+                or action.get("position_started_for") != position_started_for
+            ):
+                continue
+            action_abandoned = any(
+                item.get("resolution") == "abandon" for item in resolutions
+            )
+            payloads = [item[1] for item in facts] + events
+        else:
+            events = []
+            action_abandoned = False
+            facts = [
+                item
+                for item in facts
+                if item[1].get("sell_goal") == "partial_30"
+                and item[1].get("position_started_for") == position_started_for
+            ]
+            payloads = [item[1] for item in facts]
+            if not payloads:
+                continue
+        if not payloads:
+            continue
+        source_paths.append(
+            str(
+                (action_root if action_root.is_dir() else facts[0][0]).relative_to(
+                    data_dir
+                )
+            )
+        )
+        for payload in payloads:
+            if payload.get("sell_goal") == "position_zero":
+                continue
+            if payload.get("sell_goal") != "partial_30":
+                raise ValueError("invalid overheat trim lifecycle fact")
+            if payload.get("position_started_for") != position_started_for:
+                raise ValueError("invalid overheat trim lifecycle fact")
+            try:
+                targets.add(
+                    _required_decimal(
+                        payload.get("lifecycle_target_qty"),
+                        "lifecycle target quantity",
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError("invalid overheat trim lifecycle fact") from exc
+        if facts and not events and not action_abandoned:
+            uncertain_action = True
+        if any(
+            event.get("sell_goal") == "partial_30"
+            and event.get("status") == "below_lot"
+            for event in events
+        ):
+            below_lot = True
+        for event in events:
+            if event.get("sell_goal") != "partial_30":
+                continue
+            status = event.get("status")
+            order_ids = event.get("order_ids")
+            if (
+                not action_abandoned
+                and status in {"submitted", "partially_filled"}
+                and isinstance(order_ids, list)
+            ):
+                submitted_order_ids.update(
+                    str(order_id).strip()
+                    for order_id in order_ids
+                    if str(order_id).strip()
+                )
+            uncertain_action = uncertain_action or (
+                not action_abandoned and status == "uncertain"
+            )
+            if event.get("status") not in {"filled", "partially_filled"}:
+                continue
+            observation = event.get("observation_path")
+            if not isinstance(observation, str):
+                raise ValueError("invalid overheat trim lifecycle fact")
+            observation_path = ledger / "open" / execution_date / observation
+            try:
+                payload = json.loads(observation_path.read_text(encoding="utf-8"))
+                orders = payload["orders"]
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+            ) as exc:
+                raise ValueError("invalid overheat trim lifecycle fact") from exc
+            if not isinstance(orders, list):
+                raise ValueError("invalid overheat trim lifecycle fact")
+            for order in orders:
+                if not isinstance(order, Mapping):
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                order_id = str(order.get("order_id") or "").strip()
+                if not order_id:
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                dealt_by_order[order_id] = max(
+                    dealt_by_order.get(order_id, Decimal("0")),
+                    _required_decimal(
+                        order.get("dealt_qty", "0"), "broker dealt quantity"
+                    ),
+                )
+        for event in events:
+            if event.get("sell_goal") != "partial_30":
+                continue
+            observation = event.get("observation_path")
+            if not isinstance(observation, str):
+                continue
+            observation_path = ledger / "open" / execution_date / observation
+            try:
+                payload = json.loads(observation_path.read_text(encoding="utf-8"))
+                orders = payload["orders"]
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+            ) as exc:
+                raise ValueError("invalid overheat trim lifecycle fact") from exc
+            if not isinstance(orders, list):
+                raise ValueError("invalid overheat trim lifecycle fact")
+            for order in orders:
+                if not isinstance(order, Mapping):
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                order_id = str(order.get("order_id") or "").strip()
+                broker_status = str(
+                    order.get("order_status") or order.get("status") or ""
+                ).strip().upper()
+                if not order_id:
+                    raise ValueError("invalid overheat trim lifecycle fact")
+                observed_order_statuses[order_id] = broker_status or "AMBIGUOUS"
+    if len(targets) > 1:
+        raise ValueError("conflicting overheat trim lifecycle targets")
+    target = next(iter(targets), Decimal("0"))
+    filled = sum(dealt_by_order.values(), start=Decimal("0"))
+    if filled > target:
+        raise ValueError("overheat trim fills exceed lifecycle target")
+    status = (
+        "below_lot"
+        if below_lot
+        else "complete"
+        if target and filled >= target
+        else "pending"
+    )
+    terminal_order_ids = {
+        order_id
+        for order_id, broker_status in observed_order_statuses.items()
+        if broker_status in TERMINAL_ORDER_STATUSES
+    }
+    active_order = any(
+        broker_status in ACTIVE_ORDER_STATUSES
+        for broker_status in observed_order_statuses.values()
+    )
+    ambiguous_order = any(
+        broker_status not in TERMINAL_ORDER_STATUSES | ACTIVE_ORDER_STATUSES
+        for broker_status in observed_order_statuses.values()
+    )
+    has_unresolved_order = active_order or ambiguous_order or uncertain_action or bool(
+        submitted_order_ids - terminal_order_ids
+    )
+    return {
+        "lifecycle_target_qty": format(target, "f"),
+        "filled_qty": format(filled, "f"),
+        "status": status,
+        "source_paths": source_paths,
+        "has_unresolved_order": has_unresolved_order,
+    }
+
+
+def rebuild_overheat_trim_projection(
+    data_dir: Path,
+    *,
+    market: str,
+    state_path: Path,
+) -> dict[str, object]:
+    """Persist only derived trim fields; immutable action facts stay authoritative."""
+    from .a_share_trend import load_protection_state, write_protection_state
+
+    state = load_protection_state(state_path)
+    positions = state.get("positions")
+    if not isinstance(positions, dict):
+        raise ValueError("protection state positions must be an object")
+    rebuilt_positions: dict[str, object] = {}
+    rebuilt = {"schema_version": 1, "positions": rebuilt_positions}
+    changed = False
+    for symbol, raw_state in positions.items():
+        if not isinstance(raw_state, Mapping):
+            raise ValueError(f"protection state for {symbol} must be an object")
+        position = dict(raw_state)
+        started_for = position.get("position_started_for")
+        if not isinstance(started_for, str) or not started_for:
+            rebuilt_positions[symbol] = position
+            continue
+        progress = overheat_trim_progress(
+            data_dir,
+            market=market,
+            symbol=symbol,
+            position_started_for=started_for,
+        )
+        fields = {
+            "overheat_trim_status": progress["status"],
+            "overheat_trim_target_qty": progress["lifecycle_target_qty"],
+            "overheat_trim_filled_qty": progress["filled_qty"],
+            "overheat_trim_started_for": started_for,
+        }
+        if progress["lifecycle_target_qty"] == "0" and not progress["source_paths"]:
+            fields = {}
+        for key in (
+            "overheat_trim_status",
+            "overheat_trim_target_qty",
+            "overheat_trim_filled_qty",
+            "overheat_trim_started_for",
+        ):
+            if key not in fields:
+                changed = changed or key in position
+                position.pop(key, None)
+        if fields:
+            changed = changed or any(
+                position.get(key) != value for key, value in fields.items()
+            )
+            position.update(fields)
+        rebuilt_positions[symbol] = position
+    if changed:
+        write_protection_state(state_path, rebuilt)
+    return rebuilt
 
 
 def resolve_trend_action(
@@ -1686,10 +2123,66 @@ def resolve_trend_action(
             if event.get("status") == "uncertain"
             and int(event.get("attempt") or 1) not in resolved_attempts
         }
-        attempt_no = max(unresolved_attempts, default=0)
+        partial_retry_attempt = 0
+        if resolution == "authorize-retry" and any(
+            payload.get("sell_goal") == "partial_30"
+            for _, payload, _, _ in facts
+        ):
+            events, _ = load_trend_action_audit(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                symbol=symbol,
+                side=side,
+            )
+            for event in events:
+                observation = event.get("observation_path")
+                if not isinstance(observation, str):
+                    continue
+                path = (
+                    data_dir
+                    / "trend_review"
+                    / "ledgers"
+                    / market
+                    / "open"
+                    / execution_date
+                    / observation
+                )
+                try:
+                    observed = json.loads(path.read_text(encoding="utf-8"))
+                    orders = observed["orders"]
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    TypeError,
+                ) as exc:
+                    raise ValueError("invalid trend action event evidence") from exc
+                if not isinstance(orders, list):
+                    raise ValueError("invalid trend action event evidence")
+                for order in orders:
+                    if not isinstance(order, Mapping):
+                        raise ValueError("invalid trend action event evidence")
+                    broker_status = str(
+                        order.get("order_status") or order.get("status") or ""
+                    ).strip().upper()
+                    if broker_status not in TERMINAL_ORDER_STATUSES:
+                        continue
+                    matching_attempts = [
+                        attempt
+                        for _, _, request, attempt in facts
+                        if _order_matches_request(order, request)
+                    ]
+                    if matching_attempts:
+                        partial_retry_attempt = max(
+                            partial_retry_attempt, *matching_attempts
+                        )
+        attempt_no = partial_retry_attempt or max(unresolved_attempts, default=0)
         if (
             not attempt_no
             or attempt_no != action_attempt
+            or attempt_no in resolved_attempts
             or any(
                 item.get("resolution") in {"confirm-submitted", "abandon"}
                 for item in resolutions
@@ -1731,6 +2224,12 @@ def _floor_to_lot(value: Decimal, lot_size: int) -> int:
     if lot_size <= 0 or not value.is_finite() or value <= 0:
         return 0
     return int(value // Decimal(lot_size)) * lot_size
+
+
+def _overheat_trim_quantity(
+    position_qty: Decimal, fraction: Decimal, lot_size: int
+) -> Decimal:
+    return Decimal(_floor_to_lot(position_qty * fraction, lot_size))
 
 
 def _remaining_buy_quantity(
@@ -1899,14 +2398,19 @@ def _preflight_open_actions(
     from .futu_symbols import to_futu_symbol
 
     validated: list[Mapping[str, object]] = []
+    sell_actions_by_symbol: set[str] = set()
     for action in actions:
         if not isinstance(action, Mapping):
             raise ValueError("trend review action is invalid")
         action_name = str(action.get("action") or "")
         symbol = str(action.get("symbol") or "").strip()
-        if action_name not in {"BUY", "SELL_ALL"} or not symbol:
+        if action_name not in {"BUY", "SELL_ALL", "SELL_PARTIAL"} or not symbol:
             raise ValueError("trend review action is invalid")
-        to_futu_symbol(market, symbol)
+        futu_code = to_futu_symbol(market, symbol)
+        if action_name in {"SELL_ALL", "SELL_PARTIAL"}:
+            if futu_code in sell_actions_by_symbol:
+                raise ValueError("trend review has conflicting sell actions")
+            sell_actions_by_symbol.add(futu_code)
         if action_name == "BUY":
             try:
                 target_weight = _required_decimal(
@@ -1928,6 +2432,40 @@ def _preflight_open_actions(
                 or quantity % lot_size
             ):
                 raise ValueError("trend review buy action is invalid")
+        elif action_name == "SELL_PARTIAL":
+            try:
+                fraction = _required_decimal(
+                    action.get("target_fraction"), "target fraction"
+                )
+                lot = _required_decimal(action.get("lot_size"), "lot size")
+                if isinstance(action.get("lot_size"), bool):
+                    raise TypeError
+                lot_size = int(action.get("lot_size"))
+                estimate = _required_decimal(
+                    action.get("estimated_shares"), "estimated shares"
+                )
+                position_started_for = action.get("position_started_for")
+                started = date.fromisoformat(str(position_started_for)).isoformat()
+                signals = action.get("overheat_signals")
+            except (TypeError, ValueError):
+                raise ValueError("trend review partial sell action is invalid") from None
+            if (
+                fraction != Decimal("0.30")
+                or lot <= 0
+                or lot != lot.to_integral_value()
+                or lot != Decimal(lot_size)
+                or estimate < 0
+                or estimate != estimate.to_integral_value()
+                or estimate % lot
+                or not isinstance(position_started_for, str)
+                or position_started_for != started
+                or not isinstance(signals, list)
+                or not signals
+                or not all(isinstance(signal, str) for signal in signals)
+                or set(signals) - {"boiling", "champagne"}
+                or len(signals) != len(set(signals))
+            ):
+                raise ValueError("trend review partial sell action is invalid")
         validated.append(action)
     return validated, strategy_version
 
@@ -1941,12 +2479,19 @@ def execute_trend_review_open(
     execution_date: str,
     now: str,
     quote_prices: Mapping[str, Decimal],
+    order_history_start: str | None = None,
+    prior_sell_requests: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     market = _market(market)
     actions, strategy_version = _preflight_open_actions(report, market)
     current = datetime.fromisoformat(now)
     local_current = current.astimezone(MARKET_TIMEZONES[market])
     execution_day = date.fromisoformat(execution_date)
+    order_history_start = (
+        date.fromisoformat(order_history_start).isoformat()
+        if order_history_start is not None
+        else execution_date
+    )
     same_day = local_current.date() == execution_day
     buy_window_end = "16:00" if market == "US" else "10:00"
     local_time = local_current.time().replace(tzinfo=None)
@@ -1992,9 +2537,12 @@ def execute_trend_review_open(
     artifacts: list[str] = []
     blocked_status: str | None = None
     sell_symbols = {
-        str(action.get("symbol") or "").strip()
+        to_futu_symbol(market, str(action.get("symbol") or ""))
         for action in actions
-        if isinstance(action, Mapping) and action.get("action") == "SELL_ALL"
+        if (
+            isinstance(action, Mapping)
+            and action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        )
     }
     root = (
         data_dir
@@ -2007,7 +2555,8 @@ def execute_trend_review_open(
     ordered_actions = sorted(
         enumerate(actions),
         key=lambda item: not (
-            isinstance(item[1], Mapping) and item[1].get("action") == "SELL_ALL"
+            isinstance(item[1], Mapping)
+            and item[1].get("action") in {"SELL_ALL", "SELL_PARTIAL"}
         ),
     )
     for index, action in ordered_actions:
@@ -2015,7 +2564,7 @@ def execute_trend_review_open(
             continue
         action_name = str(action.get("action") or "")
         symbol = str(action.get("symbol") or "").strip()
-        if action_name not in {"BUY", "SELL_ALL"}:
+        if action_name not in {"BUY", "SELL_ALL", "SELL_PARTIAL"}:
             continue
         futu_code = to_futu_symbol(market, symbol)
         side = "buy" if action_name == "BUY" else "sell"
@@ -2043,6 +2592,42 @@ def execute_trend_review_open(
             / action_key
         )
         action_facts = _action_facts(root, futu_code=futu_code, side=side)
+        sell_metadata: dict[str, object] = (
+            {"sell_goal": "position_zero"}
+            if action_name == "SELL_ALL"
+            else {}
+        )
+        if sell_metadata:
+            action_evidence = {**action_evidence, **sell_metadata}
+        if action_name == "SELL_PARTIAL":
+            progress = overheat_trim_progress(
+                data_dir,
+                market=market,
+                symbol=symbol,
+                position_started_for=str(action["position_started_for"]),
+            )
+            lifecycle_target = _required_decimal(
+                progress["lifecycle_target_qty"], "lifecycle target quantity"
+            )
+            lifecycle_filled = _required_decimal(
+                progress["filled_qty"], "lifecycle filled quantity"
+            )
+            if not action_facts and progress["has_unresolved_order"]:
+                blocked_status = "unresolved"
+                continue
+            if lifecycle_target > 0 or progress["source_paths"]:
+                sell_metadata = {
+                    "sell_goal": "partial_30",
+                    "position_started_for": str(action["position_started_for"]),
+                    "lifecycle_target_qty": format(lifecycle_target, "f"),
+                }
+                action_evidence = {**action_evidence, **sell_metadata}
+                sell_quantity = int(lifecycle_target - lifecycle_filled)
+                if (
+                    progress["status"] in {"complete", "below_lot"}
+                    or sell_quantity <= 0
+                ):
+                    continue
         resolutions = _action_resolutions(
             action_events_root,
             market=market,
@@ -2058,8 +2643,13 @@ def execute_trend_review_open(
             for item in resolutions
             if item.get("resolution") == "authorize-retry"
         }
+        partial_abandoned = action_name == "SELL_ALL" and any(
+            item.get("resolution") == "abandon" for item in resolutions
+        ) and any(
+            item[1].get("sell_goal") == "partial_30" for item in action_facts
+        )
         buy_window_event = None
-        if action_name == "BUY" and symbol not in sell_symbols:
+        if action_name == "BUY" and futu_code not in sell_symbols:
             if same_day and local_time < datetime.strptime("09:30", "%H:%M").time():
                 buy_window_event = ("pending", "buy_window_not_open")
             elif local_current.date() > execution_day or not buy_window_open:
@@ -2087,9 +2677,15 @@ def execute_trend_review_open(
                     recorded_at=now,
                 )
         if any(
-            item.get("resolution") in {"confirm-submitted", "abandon"}
+            item.get("resolution") == "confirm-submitted"
+            or (
+                item.get("resolution") == "abandon"
+                and not partial_abandoned
+            )
             for item in resolutions
         ):
+            continue
+        if local_current.date() < execution_day:
             continue
         sell_position = next(
             (
@@ -2112,19 +2708,96 @@ def execute_trend_review_open(
             if sell_position is not None
             else 0
         )
+        if action_name == "SELL_PARTIAL":
+            if sell_metadata:
+                sell_quantity = int(lifecycle_target - lifecycle_filled)
+            if any(
+                event.get("status") == "below_lot"
+                for event in _action_events(action_events_root)
+            ):
+                continue
+            if not action_facts and not sell_metadata:
+                try:
+                    live_positions = _positive_positions(snapshot)
+                    matching_positions = [
+                        item
+                        for item in live_positions
+                        if str(item.get("code") or item.get("futu_code") or "")
+                        .strip()
+                        .upper()
+                        == futu_code.upper()
+                    ]
+                    live_quantity = sum(
+                        (
+                            _required_decimal(
+                                item.get("qty", item.get("quantity")),
+                                "position qty",
+                            )
+                            for item in matching_positions
+                        ),
+                        start=Decimal("0"),
+                    )
+                except ValueError as exc:
+                    raise TrendReviewAccountStateError(
+                        "simulate partial sell position is invalid"
+                    ) from exc
+                if (
+                    not matching_positions
+                    or live_quantity <= 0
+                    or live_quantity != live_quantity.to_integral_value()
+                ):
+                    raise TrendReviewAccountStateError(
+                        "simulate partial sell position is unavailable"
+                    )
+                target = _overheat_trim_quantity(
+                    live_quantity,
+                    _required_decimal(action.get("target_fraction"), "target fraction"),
+                    int(action["lot_size"]),
+                )
+                sell_metadata = {
+                    "sell_goal": "partial_30",
+                    "position_started_for": str(action["position_started_for"]),
+                    "lifecycle_target_qty": format(target, "f"),
+                }
+                action_evidence = {**action_evidence, **sell_metadata}
+                sell_quantity = int(target)
+                if target <= 0:
+                    broker_evidence = _write_broker_observation(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        evidence=action_evidence,
+                        snapshot=snapshot,
+                        orders=(),
+                        recorded_at=now,
+                    )
+                    _write_action_event(
+                        data_dir=data_dir,
+                        market=market,
+                        execution_date=execution_date,
+                        action_key=action_key,
+                        payload={
+                            **action_evidence,
+                            **broker_evidence,
+                            "status": "below_lot",
+                            "reason": "overheat_target_below_lot",
+                            "target_qty": "0",
+                            "filled_qty": "0",
+                            "order_ids": [],
+                        },
+                        recorded_at=now,
+                    )
+                    continue
         if action_name == "SELL_ALL":
             position_zero_complete = any(
-                event.get("status") == "filled"
-                or (
-                    event.get("status") == "incomplete"
-                    and event.get("reason") == "position_zero_confirmed"
-                )
+                event.get("status") in {"filled", "incomplete"}
+                and event.get("reason") == "position_zero_confirmed"
+                and event.get("sell_goal") in {None, "position_zero"}
                 for event in _action_events(action_events_root)
             )
             if position_zero_complete:
                 continue
-        if local_current.date() < execution_day:
-            continue
         if action_name == "SELL_ALL" and sell_quantity <= 0 and not action_facts:
             broker_evidence = _write_broker_observation(
                 data_dir=data_dir,
@@ -2156,11 +2829,11 @@ def execute_trend_review_open(
             continue
         if (
             not same_day
-            and action_name == "SELL_ALL"
+            and action_name in {"SELL_ALL", "SELL_PARTIAL"}
             and not (local_current.date() > execution_day and bool(action_facts))
         ):
             continue
-        if action_name == "BUY" and symbol in sell_symbols:
+        if action_name == "BUY" and futu_code in sell_symbols:
             continue
         if action_name == "BUY" and not action_facts and buy_window_event:
             event_status, event_reason = buy_window_event
@@ -2176,10 +2849,23 @@ def execute_trend_review_open(
                 recorded_at=now,
             )
             continue
-        if action_name == "SELL_ALL" and not market_open and sell_quantity > 0:
+        if (
+            action_name in {"SELL_ALL", "SELL_PARTIAL"}
+            and not market_open
+            and sell_quantity > 0
+        ):
             continue
         if action_facts:
             request = action_facts[0][2]
+            partial_upgrade = action_name == "SELL_ALL" and any(
+                item[1].get("sell_goal") == "partial_30"
+                for item in action_facts
+            )
+            goal_facts = [
+                item
+                for item in action_facts
+                if item[1].get("sell_goal") == "position_zero"
+            ] if partial_upgrade else action_facts
             broker_order: Mapping[str, object] | None = None
             pending_intent = next(
                 (
@@ -2187,6 +2873,10 @@ def execute_trend_review_open(
                     for item in action_facts
                     if not _result_path(item[0]).exists()
                     and item[3] not in authorized_attempts
+                    and (
+                        not partial_abandoned
+                        or item[1].get("sell_goal") != "partial_30"
+                    )
                 ),
                 None,
             )
@@ -2213,7 +2903,7 @@ def execute_trend_review_open(
                     )
                 orders = _listed_orders(
                     client,
-                    start=execution_date,
+                    start=order_history_start,
                     end=local_current.date().isoformat(),
                 )
                 broker_fact, broker_order = _broker_attempt_fact(orders, request)
@@ -2265,6 +2955,15 @@ def execute_trend_review_open(
                         report_sha=pending_report_sha,
                         action_index=pending_action_index,
                         reconciled_at=now,
+                        metadata={
+                            key: pending_payload[key]
+                            for key in (
+                                "sell_goal",
+                                "position_started_for",
+                                "lifecycle_target_qty",
+                            )
+                            if key in pending_payload
+                        },
                     )
                 if rejected_status is not None:
                     reason = f"simulate {side} order rejected: {rejected_status}"
@@ -2309,9 +3008,30 @@ def execute_trend_review_open(
             ):
                 orders = _listed_orders(
                     client,
-                    start=execution_date,
+                    start=order_history_start,
                     end=local_current.date().isoformat(),
                 )
+                if action_name == "SELL_ALL" and partial_upgrade:
+                    prior_orders = [
+                        order
+                        for order in orders
+                        if any(
+                            _order_has_action_identity(order, request)
+                            for request in prior_sell_requests
+                        )
+                    ]
+                    prior_statuses = {
+                        str(order.get("order_status") or order.get("status") or "")
+                        .strip()
+                        .upper()
+                        for order in prior_orders
+                    }
+                    if prior_statuses & ACTIVE_ORDER_STATUSES:
+                        blocked_status = "submitted"
+                        break
+                    if prior_statuses - TERMINAL_ORDER_STATUSES:
+                        blocked_status = "uncertain"
+                        break
                 requests_by_remark: dict[str, list[dict[str, object]]] = {}
                 for _, _, intent_request, _ in action_facts:
                     requests_by_remark.setdefault(
@@ -2357,12 +3077,26 @@ def execute_trend_review_open(
                         )
                     )
                 ]
+                goal_requests = [item[2] for item in goal_facts]
+                goal_matched = [
+                    order
+                    for order in matched
+                    if any(
+                        _order_has_action_identity(order, candidate)
+                        for candidate in goal_requests
+                    )
+                ]
                 latest_attempt = max(item[3] for item in action_facts)
                 latest_requests = [
                     intent_request
                     for _, _, intent_request, attempt_no in action_facts
                     if attempt_no == latest_attempt
                 ]
+                latest_is_abandoned_partial = partial_abandoned and all(
+                    payload.get("sell_goal") == "partial_30"
+                    for _, payload, _, attempt_no in action_facts
+                    if attempt_no == latest_attempt
+                )
                 latest_matched = [
                     order
                     for order in orders
@@ -2385,6 +3119,7 @@ def execute_trend_review_open(
                     if not latest_matched
                     and not position_zero
                     and latest_attempt not in authorized_attempts
+                    and not latest_is_abandoned_partial
                     else None
                 )
                 if inconclusive_reason is not None:
@@ -2402,12 +3137,17 @@ def execute_trend_review_open(
                     )
                     blocked_status = "uncertain"
                     break
-                target_quantity = _required_decimal(request.get("qty"), "target quantity")
+                target_quantity = _required_decimal(
+                    (goal_requests[0] if goal_requests else request).get("qty"),
+                    "target quantity",
+                )
                 dealt_by_order = {
                     str(order.get("order_id") or index): _required_decimal(
                         order.get("dealt_qty", "0"), "broker dealt quantity"
                     )
-                    for index, order in enumerate(matched)
+                    for index, order in enumerate(
+                        goal_matched if partial_upgrade else matched
+                    )
                 }
                 broker_filled = sum(
                     dealt_by_order.values(), start=Decimal("0")
@@ -2420,7 +3160,7 @@ def execute_trend_review_open(
                     remaining = Decimal(sell_quantity)
                 order_ids = [
                     str(order.get("order_id"))
-                    for order in matched
+                    for order in (goal_matched if partial_upgrade else matched)
                     if order.get("order_id") not in {None, ""}
                 ]
                 weighted_prices = [
@@ -2430,7 +3170,7 @@ def execute_trend_review_open(
                             order.get("dealt_avg_price"), "broker average fill price"
                         ),
                     )
-                    for order in matched
+                    for order in (goal_matched if partial_upgrade else matched)
                     if _required_decimal(
                         order.get("dealt_qty", "0"), "broker dealt quantity"
                     ) > 0
@@ -2458,12 +3198,12 @@ def execute_trend_review_open(
                             "f",
                         )
                     }
-                if position_zero or any(
+                if (position_zero or any(
                     order.get("order_id")
                     or order.get("order_status")
                     or order.get("dealt_qty")
-                    for order in matched
-                ):
+                    for order in (goal_matched if partial_upgrade else matched)
+                )) and (not partial_upgrade or goal_facts):
                     terminal_evidence = (
                         _write_broker_observation(
                             data_dir=data_dir,
@@ -2472,10 +3212,16 @@ def execute_trend_review_open(
                             action_key=action_key,
                             evidence=action_evidence,
                             snapshot=snapshot,
-                            orders=matched,
+                            orders=(
+                                goal_matched if partial_upgrade else matched
+                            ),
                             recorded_at=now,
                         )
-                        if position_zero or filled >= target_quantity
+                        if (
+                            position_zero
+                            or filled > 0
+                            or action_name == "SELL_PARTIAL"
+                        )
                         else {}
                     )
                     _write_action_event(
@@ -2523,6 +3269,11 @@ def execute_trend_review_open(
                         )
                 if remaining <= 0:
                     continue
+                if (
+                    action_name == "SELL_PARTIAL"
+                    and latest_attempt not in authorized_attempts
+                ):
+                    continue
                 if action_name == "BUY" and buy_window_event:
                     event_status, event_reason = buy_window_event
                     _write_action_status_once(
@@ -2544,6 +3295,8 @@ def execute_trend_review_open(
                     for order in latest_matched
                 }
                 if broker_statuses & ACTIVE_ORDER_STATUSES:
+                    if action_name == "SELL_ALL":
+                        blocked_status = "submitted"
                     continue
                 if broker_statuses - TERMINAL_ORDER_STATUSES:
                     attempt = latest_attempt
@@ -2623,6 +3376,7 @@ def execute_trend_review_open(
                             "attempt": attempt,
                             "request": request,
                             "created_at": now,
+                            **sell_metadata,
                         }
                     ),
                 )
@@ -2636,6 +3390,7 @@ def execute_trend_review_open(
                         report_sha=report_sha,
                         action_index=index,
                         reconciled_at=now,
+                        metadata=sell_metadata,
                     )
                     continue
         else:
@@ -2680,7 +3435,7 @@ def execute_trend_review_open(
             }
             orders = _listed_orders(
                 client,
-                start=execution_date,
+                start=order_history_start,
                 end=local_current.date().isoformat(),
             )
             same_remark = [
@@ -2741,6 +3496,7 @@ def execute_trend_review_open(
                         "action_index": index,
                         "request": request,
                         "created_at": now,
+                        **sell_metadata,
                     }
                 ),
             )
@@ -2754,9 +3510,18 @@ def execute_trend_review_open(
                     report_sha=report_sha,
                     action_index=index,
                     reconciled_at=now,
+                    metadata=sell_metadata,
                 )
                 continue
-        base_request = action_facts[0][2] if action_facts else request
+        base_request = (
+            goal_facts[0][2]
+            if action_facts and partial_upgrade and goal_facts
+            else request
+            if action_facts and partial_upgrade
+            else action_facts[0][2]
+            if action_facts
+            else request
+        )
         target_qty = str(base_request.get("qty") or request.get("qty") or "")
         try:
             response = client.place_order(request)
@@ -2788,6 +3553,7 @@ def execute_trend_review_open(
                     "request": request,
                     "response": response,
                     "submitted_at": now,
+                    **sell_metadata,
                 }
             ),
         )
@@ -2808,6 +3574,8 @@ def execute_trend_review_open(
         )
         artifacts.append(str(result_path))
         submitted += 1
+    state_path = data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
+    rebuild_overheat_trim_projection(data_dir, market=market, state_path=state_path)
     return {
         "status": (
             blocked_status
@@ -2841,14 +3609,78 @@ def execute_trend_review_stop(
     trading_date = date.fromisoformat(trading_date).isoformat()
     if not symbol or not event_id:
         raise ValueError("trend review protection event is invalid")
+    from .a_share_trend import load_protection_state
+    from .futu_symbols import to_futu_symbol
+
+    futu_code = to_futu_symbol(market, symbol)
+    ledger = data_dir / "trend_review" / "ledgers" / market
+    protection_state = load_protection_state(
+        data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
+    )
+    position_state = protection_state["positions"].get(symbol)
+    position_started_for = (
+        date.fromisoformat(position_state["position_started_for"]).isoformat()
+        if isinstance(position_state, Mapping)
+        and isinstance(position_state.get("position_started_for"), str)
+        and position_state["position_started_for"]
+        else None
+    )
+
+    def belongs_to_current_position(payload: Mapping[str, object]) -> bool:
+        return payload.get("sell_goal") == "partial_30" and (
+            position_started_for is None
+            or payload.get("position_started_for") == position_started_for
+        )
+
+    partial_dates: set[str] = set()
+    partial_requests: dict[str, list[Mapping[str, object]]] = {}
+    for root in sorted((ledger / "open").glob("*")):
+        if not root.is_dir():
+            continue
+        try:
+            execution_date = date.fromisoformat(root.name).isoformat()
+        except ValueError:
+            continue
+        facts = [
+            fact
+            for fact in _action_facts(root, futu_code=futu_code, side="sell")
+            if belongs_to_current_position(fact[1])
+        ]
+        if facts:
+            partial_dates.add(execution_date)
+            partial_requests[execution_date] = [fact[2] for fact in facts]
+    for root in sorted((ledger / "actions").glob("*")):
+        if not root.is_dir():
+            continue
+        try:
+            execution_date = date.fromisoformat(root.name).isoformat()
+        except ValueError:
+            continue
+        action_root = root / trend_action_key(
+            market, execution_date, futu_code, "sell"
+        )
+        if action_root.is_dir() and any(
+            belongs_to_current_position(event)
+            for event in _action_events(action_root)
+        ):
+            partial_dates.add(execution_date)
+    partial_execution_date = max(partial_dates, default=trading_date)
+    order_history_start = min(partial_dates, default=trading_date)
     return execute_trend_review_open(
         data_dir=data_dir,
         report=_protection_report(symbol, event_id),
         client=client,
         market=market,
-        execution_date=trading_date,
+        execution_date=partial_execution_date,
         now=now,
         quote_prices={},
+        order_history_start=order_history_start,
+        prior_sell_requests=tuple(
+            request
+            for execution_date, requests in partial_requests.items()
+            if execution_date < partial_execution_date
+            for request in requests
+        ),
     )
 
 

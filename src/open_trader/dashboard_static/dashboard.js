@@ -1923,8 +1923,10 @@ const TREND_REASON_LABELS = {
   left_trend_right_side: "右侧趋势已结束",
   holding_signal_unknown: "趋势信号不完整",
   holding_kline_unavailable: "持仓日线数据不可用",
+  holding_lot_size_unavailable: "持仓整手信息不可用",
   trend_intact: "趋势保持完好",
   temperature_changed_to_flat: "趋势温度转平",
+  overheat_take_profit: "沸腾/开香槟过热止盈",
   a_share_only: "仅限 A 股股票",
   temperature_missing: "个股趋势温度缺失",
   temperature_transition_not_entry: "不是温转热或温转沸",
@@ -2133,9 +2135,20 @@ function renderTrendExecutionRow(item, columnCount) {
     uncertain: "状态不确定，禁止自动重试",
     conflict: "订单事实冲突，禁止提交", missed: "已错过策略窗口",
     incomplete: "未完成", early_revision_executed: "早期版本已执行",
+    below_lot: "不足整手，未下单",
   }[status] || "待执行";
   const details = [statusLabel];
-  if (hasValue(execution.filled_qty) || hasValue(execution.target_qty)) {
+  if (item.action === "SELL_PARTIAL") {
+    const target = firstPresent(execution.lifecycle_target_qty, execution.target_qty, item.estimated_shares);
+    if (hasValue(target)) details.push(`模拟目标数量 ${formatDisplayNumber(target)}`);
+    if (hasValue(execution.filled_qty)) details.push(`模拟已成交 ${formatDisplayNumber(execution.filled_qty)}`);
+    const remaining = firstPresent(execution.remaining_qty, (
+      numericValue(target) !== null && numericValue(execution.filled_qty) !== null
+        ? Math.max(0, numericValue(target) - numericValue(execution.filled_qty))
+        : null
+    ));
+    if (hasValue(remaining)) details.push(`模拟剩余数量 ${formatDisplayNumber(remaining)}`);
+  } else if (hasValue(execution.filled_qty) || hasValue(execution.target_qty)) {
     details.push(`成交 ${formatDisplayNumber(execution.filled_qty)} / ${formatDisplayNumber(execution.target_qty)}`);
   }
   if (hasValue(execution.avg_fill_price)) details.push(`均价 ${formatDisplayNumber(execution.avg_fill_price)}`);
@@ -2218,6 +2231,7 @@ function trendSimulationDeviation(action, quantity) {
   if (action.action === "BUY" && !action.execution) return ["pending", "待执行"];
   if (action.action === "HOLD") return quantity > 0 ? ["followed", "一致"] : ["not_held", "未持有"];
   if (action.action === "SELL_ALL") return quantity === 0 ? ["followed", "一致"] : ["missed_sell", "待卖出"];
+  if (action.action === "SELL_PARTIAL") return action.execution ? ["review", "待核对"] : ["pending", "待执行"];
   return ["review", "待核对"];
 }
 
@@ -2274,6 +2288,7 @@ function renderTrendActualOverlay(overlay) {
     const target = hasValue(item.target_weight)
       ? `目标仓位 ${decimalAsPercent(item.target_weight, "—")}`
       : "";
+    const partial = item.frozen_action === "SELL_PARTIAL" || hasValue(item.manual_execution_guidance);
     const facts = outside
       ? [
           `真实持仓 ${formatDisplayNumber(item.actual_quantity)}`,
@@ -2283,13 +2298,14 @@ function renderTrendActualOverlay(overlay) {
       : [
           `冻结动作 ${formatPlain(item.frozen_action_label)}`,
           target,
-          `模拟数量 ${hasValue(item.simulation_quantity) ? formatDisplayNumber(item.simulation_quantity) : "—"}`,
-          `实盘参考数量 ${hasValue(item.actual_reference_quantity) ? formatDisplayNumber(item.actual_reference_quantity) : "—"}`,
+          `${partial ? "模拟预计数量" : "模拟数量"} ${hasValue(item.simulation_quantity) ? formatDisplayNumber(item.simulation_quantity) : "—"}`,
+          ...(partial ? [] : [`实盘参考数量 ${hasValue(item.actual_reference_quantity) ? formatDisplayNumber(item.actual_reference_quantity) : "—"}`]),
           hasValue(item.reference_note) ? formatPlain(item.reference_note) : "",
           `真实持仓 ${formatDisplayNumber(item.actual_quantity)}`,
           `市值 ${formatPlain(item.currency)} ${formatDisplayNumber(item.actual_market_value)}`,
           hasValue(item.frozen_reference_price) ? `冻结参考价 ${formatPlain(item.currency)} ${formatDisplayNumber(item.frozen_reference_price)}` : "",
           hasValue(item.protection_line) ? `${formatPlain(item.protection_line_label || "策略保护线")} ${formatDisplayNumber(item.protection_line)}` : "",
+          hasValue(item.manual_execution_guidance) ? formatPlain(item.manual_execution_guidance) : "",
         ];
     return `<div class="trend-actual-row"><header><strong>${escapeHtml(`${formatPlain(item.symbol)} ${formatPlain(item.name)}`.trim())}</strong><span data-deviation="${escapeHtml(formatPlain(item.deviation))}">${escapeHtml(formatPlain(item.deviation_label))}</span></header>
       <div class="trend-actual-facts">${facts.filter(Boolean).map((fact) => `<span>${escapeHtml(fact)}</span>`).join("")}</div>
@@ -2414,7 +2430,7 @@ function syncCnTrendBuyAccessibility() {
 }
 
 function renderCnSellOrHoldStage(title, items, kind) {
-  const action = { sell: "全部卖出", review: "人工复核" }[kind] || "继续持有";
+  const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const headings = [
     "标的", "动作", "执行参考价（Futu 前复权）", "温度变化", "强度",
@@ -2422,7 +2438,7 @@ function renderCnSellOrHoldStage(title, items, kind) {
   ];
   const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
     ${renderCnTrendCell("标的", cnTrendIdentity(item))}
-    ${renderCnTrendCell("动作", action)}
+    ${renderCnTrendCell("动作", action(item))}
     ${renderCnTrendCell("执行参考价（Futu 前复权）", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
     ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
     ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
@@ -2434,12 +2450,12 @@ function renderCnSellOrHoldStage(title, items, kind) {
 }
 
 function renderMarketSellOrHoldStage(title, items, kind) {
-  const action = { sell: "全部卖出", review: "人工复核" }[kind] || "继续持有";
+  const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const headings = ["标的", "动作", "执行参考价", "强度", reasonHeading, "活动保护线", "持仓提示"];
   const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
     ${renderCnTrendCell("标的", cnTrendIdentity(item))}
-    ${renderCnTrendCell("动作", action)}
+    ${renderCnTrendCell("动作", action(item))}
     ${renderCnTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
     ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
     ${renderCnTrendCell(reasonHeading, TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
@@ -2554,7 +2570,10 @@ function renderCnTrendDisciplines() {
       <li>危险信号触发时全部卖出</li>
       <li>离开右侧趋势时全部卖出</li>
       <li>温、热或沸转为平时全部卖出</li>
-      <li>沸腾或开香槟只上移保护线，不减仓</li>
+      <li>沸腾或开香槟：每个完整持仓生命周期首次出现时止盈减仓 30%</li>
+      <li>两种信号合并为一次；模拟盘按下单时持仓向下取整为整手</li>
+      <li>剩余仓位继续受活动保护线和强制清仓条件约束</li>
+      <li>Trend Animals API 未提供波动率放大字段；本地不推断</li>
     </ol></details>
   </section>`;
 }
@@ -2605,6 +2624,8 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const identity = report.artifact && report.report_sha256 && report.strategy_version
     ? ` data-report-artifact="${escapeHtml(formatPlain(report.artifact))}" data-report-sha256="${escapeHtml(formatPlain(report.report_sha256))}" data-strategy-version="${escapeHtml(formatPlain(report.strategy_version))}"`
     : "";
+  const sellLabel = (Array.isArray(report.sell_actions) && report.sell_actions.some((item) => item?.action === "SELL_PARTIAL"))
+    ? "卖出触发" : "全部卖出";
   const strategyVersion = report.strategy_version
     ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
     : "";
@@ -2631,7 +2652,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
       </dl>
       <div class="trend-report-metrics cn-trend-counts">
         <span>正式买入 ${escapeHtml(formatDisplayNumber(counts.buy || 0))}</span>
-        <span>全部卖出 ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span>
+        <span>${escapeHtml(sellLabel)} ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span>
         <span>继续持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span>
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
@@ -2650,6 +2671,10 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${isCn ? renderCnTrendDisciplines() : ""}
     ${isCn ? renderCnTrendAudit(audit) : renderTrendAudit(audit)}
   </${root}>`;
+}
+
+function trendSellActionLabel(item) {
+  return item?.action === "SELL_PARTIAL" ? "止盈减仓 30%" : "全部卖出";
 }
 
 function renderTrendControllerStatus(broker) {
@@ -2731,6 +2756,7 @@ function renderOptionAttentionTransition(transition) {
 function optionAttentionAction(action) {
   if (action === "BUY") return "允许买入";
   if (action === "SELL_ALL") return "卖出复核";
+  if (action === "SELL_PARTIAL") return "止盈减仓 30%";
   if (action === "HOLD") return "继续持有";
   return "观察";
 }

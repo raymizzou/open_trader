@@ -25,6 +25,7 @@ from .a_share_trend import (
     valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
+from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
     KLINE_FIELDS,
@@ -869,17 +870,65 @@ def _latest_valid_report_payload(
     return path, payload, execution_date, as_of_date, freshness_date, generated_at
 
 
+def _valid_partial_trend_action(item: dict[str, Any]) -> bool:
+    try:
+        target_fraction = Decimal(str(item.get("target_fraction")))
+        lot = Decimal(str(item.get("lot_size")))
+        if isinstance(item.get("lot_size"), bool):
+            return False
+        lot_size = int(item.get("lot_size"))
+        estimate = Decimal(str(item.get("estimated_shares")))
+        position_started_for = item.get("position_started_for")
+        started = date.fromisoformat(str(position_started_for)).isoformat()
+        signals = item.get("overheat_signals")
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not all(value.is_finite() for value in (target_fraction, lot, estimate)):
+        return False
+    valid_signals = (
+        isinstance(signals, list)
+        and bool(signals)
+        and all(
+            isinstance(signal, str) and signal in {"boiling", "champagne"}
+            for signal in signals
+        )
+        and len(signals) == len(set(signals))
+    )
+    return (
+        item.get("reason") == "overheat_take_profit"
+        and target_fraction == Decimal("0.30")
+        and lot > 0
+        and lot == lot.to_integral_value()
+        and lot == Decimal(lot_size)
+        and estimate >= 0
+        and estimate == estimate.to_integral_value()
+        and estimate % lot == 0
+        and isinstance(position_started_for, str)
+        and position_started_for == started
+        and valid_signals
+    )
+
+
 def _trend_action_needs_review(item: dict[str, Any]) -> bool:
     action = item.get("action")
     reason = item.get("reason")
     known_reason = isinstance(reason, str) and reason in REASON_LABELS
     if action == "BUY":
         return reason not in (None, "") and not known_reason
+    if action == "SELL_PARTIAL":
+        return not _valid_partial_trend_action(item)
     return (
         action == "MANUAL_REVIEW"
         or action not in ACTION_LABELS
         or action in {"SELL_ALL", "HOLD"} and not known_reason
     )
+
+
+def _canonical_trend_sell_symbol(item: dict[str, Any], market: str) -> str:
+    try:
+        return to_futu_symbol(market, str(item.get("symbol") or ""))
+    except ValueError:
+        return ""
 
 
 def _project_trend_actions(
@@ -899,7 +948,7 @@ def _project_trend_actions(
                 {"execution": executions[key]}
                 if (key := (
                     str(item.get("symbol") or "").strip(),
-                    {"BUY": "buy", "SELL_ALL": "sell"}.get(
+                    {"BUY": "buy", "SELL_ALL": "sell", "SELL_PARTIAL": "sell"}.get(
                         item.get("action"), ""
                     ),
                 )) in executions
@@ -909,11 +958,28 @@ def _project_trend_actions(
         for item in judgments["formal_actions"]
     ]
     holdings = judgments["holding_decisions"]
-    sell_actions = [
-        item
+    metadata = payload.get("metadata")
+    market = (
+        str(metadata.get("market") or "CN").upper()
+        if isinstance(metadata, dict)
+        else "CN"
+    )
+    full_exit_symbols = {
+        symbol
         for item in formal
         if item.get("action") == "SELL_ALL"
         and not _trend_action_needs_review(item)
+        if (symbol := _canonical_trend_sell_symbol(item, market))
+    }
+    sell_actions = [
+        item
+        for item in formal
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        and not _trend_action_needs_review(item)
+        and not (
+            item.get("action") == "SELL_PARTIAL"
+            and _canonical_trend_sell_symbol(item, market) in full_exit_symbols
+        )
     ]
     buy_actions = [
         item
@@ -1784,12 +1850,17 @@ def _project_trend_actual_item(
         "frozen_action_label": {
             "BUY": "正式买入",
             "SELL_ALL": "全部卖出",
+            "SELL_PARTIAL": "止盈减仓 30%",
             "HOLD": "继续持有",
             "SKIP": "跳过",
             "MANUAL_REVIEW": "人工复核",
         }.get(frozen_action, "人工复核"),
         "target_weight": str(action.get("target_weight") or ""),
-        "simulation_quantity": str(action.get("estimated_shares") or ""),
+        "simulation_quantity": (
+            str(action["estimated_shares"])
+            if action.get("estimated_shares") is not None
+            else ""
+        ),
         "actual_reference_quantity": (
             _decimal_text(reference_quantity)
             if reference_quantity is not None
@@ -1825,6 +1896,8 @@ def _project_trend_actual_item(
             else "暂无策略保护线，风险未纳入估算"
         ),
     }
+    if frozen_action == "SELL_PARTIAL":
+        item["manual_execution_guidance"] = "按实盘下单时持仓的 30% 向下取整"
     if frozen_action == "BUY" and price_fx_note:
         item["reference_note"] = price_fx_note
     return item
@@ -2011,6 +2084,22 @@ def _trend_action_executions(
             "updated_at": str(event.get("recorded_at") or ""),
             "reason": str(event.get("reason") or ""),
         }
+        if event.get("sell_goal") == "partial_30":
+            execution = executions[(symbol, side)]
+            execution["sell_goal"] = "partial_30"
+            execution["lifecycle_target_qty"] = str(
+                event.get("lifecycle_target_qty") or ""
+            )
+            try:
+                lifecycle_target = Decimal(execution["lifecycle_target_qty"])
+                filled = Decimal(execution["filled_qty"])
+            except (InvalidOperation, ValueError):
+                pass
+            else:
+                if lifecycle_target.is_finite() and filled.is_finite():
+                    execution["remaining_qty"] = _decimal_text(
+                        max(Decimal("0"), lifecycle_target - filled)
+                    )
     return executions
 
 

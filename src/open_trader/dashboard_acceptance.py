@@ -13,7 +13,11 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
-from .dashboard import _is_dashboard_holding, _read_csv_rows
+from .dashboard import (
+    _is_dashboard_holding,
+    _read_csv_rows,
+    _valid_partial_trend_action,
+)
 from .daily_premarket import _optional_positive_tm_id, _read_env_file
 from .futu_symbols import to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
@@ -24,7 +28,7 @@ from .trend_simulate_positions import (
     _reports_by_hash,
 )
 from .trend_review import _report_hash
-from .strategy_drawdown import strategy_parameter_hash
+from .strategy_drawdown import valid_strategy_parameter_audit_identity
 
 
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
@@ -103,8 +107,10 @@ TREND_REASON_LABELS = {
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
     "holding_kline_unavailable": "持仓日线数据不可用",
+    "holding_lot_size_unavailable": "持仓整手信息不可用",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
+    "overheat_take_profit": "沸腾/开香槟过热止盈",
     "a_share_only": "仅限 A 股股票",
     "temperature_missing": "个股趋势温度缺失",
     "temperature_transition_not_entry": "不是温转热或温转沸",
@@ -594,8 +600,15 @@ def validate_integrated_candidate(
                 and bootstrap.get("event_id")
                 and bootstrap.get("actor")
             ), f"{broker} 自动回撤基准审计不完整"
-            assert bootstrap.get("parameter_hash") == strategy_parameter_hash(
-                parameters
+            assert valid_strategy_parameter_audit_identity(
+                market=market,
+                strategy_id=str(snapshot.get("strategy_id") or ""),
+                strategy_version="v4",
+                parameters=parameters,
+                bootstrap_event=bootstrap,
+                parameter_compatibility_event=drawdown.get(
+                    "parameter_compatibility_event"
+                ),
             ), f"{broker} 冻结策略参数与回撤审计身份不一致"
             assert (
                 drawdown.get("entry_allowed") is True or not buys
@@ -1713,9 +1726,11 @@ def _trend_action_needs_review(item: Mapping[str, Any]) -> bool:
     known_reason = isinstance(reason, str) and reason in TREND_REASON_LABELS
     if action == "BUY":
         return reason not in (None, "") and not known_reason
+    if action == "SELL_PARTIAL":
+        return not _valid_partial_trend_action(dict(item))
     return (
         action == "MANUAL_REVIEW"
-        or action not in {"SELL_ALL", "HOLD", "MANUAL_REVIEW"}
+        or action not in {"SELL_ALL", "SELL_PARTIAL", "HOLD", "MANUAL_REVIEW"}
         or action in {"SELL_ALL", "HOLD"} and not known_reason
     )
 
@@ -1811,9 +1826,27 @@ def _check_trend_artifact_projection(
     assert isinstance(holdings, list) and all(
         isinstance(item, Mapping) for item in holdings
     ), f"{broker} 冻结报告持仓动作无效"
+    def canonical_sell_symbol(item: Mapping[str, Any]) -> str:
+        try:
+            return to_futu_symbol(expected_market, str(item.get("symbol") or ""))
+        except ValueError:
+            return ""
+
+    full_exit_symbols = {
+        symbol
+        for item in formal
+        if item.get("action") == "SELL_ALL"
+        and not _trend_action_needs_review(item)
+        if (symbol := canonical_sell_symbol(item))
+    }
     sells = [
         item for item in formal
-        if item.get("action") == "SELL_ALL" and not _trend_action_needs_review(item)
+        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
+        and not _trend_action_needs_review(item)
+        and not (
+            item.get("action") == "SELL_PARTIAL"
+            and canonical_sell_symbol(item) in full_exit_symbols
+        )
     ]
     buys = [
         item for item in formal
@@ -1889,7 +1922,7 @@ def _check_action_trend_stages(
     stage_texts: list[str], report: Mapping[str, Any], broker: str,
 ) -> None:
     expected = (
-        ("优先处理 · 卖出触发", "sell_actions", "全部卖出"),
+        ("优先处理 · 卖出触发", "sell_actions", None),
         ("需要确认 · 人工复核", "review_actions", "人工复核"),
         (
             f"{_plain(report.get('buy_window'))} · 正式买入计划",
@@ -1907,6 +1940,13 @@ def _check_action_trend_stages(
             continue
         for item in rows:
             assert isinstance(item, Mapping), f"{broker} 的 {title} 动作格式无效"
+            action = (
+                "止盈减仓 30%"
+                if item.get("action") == "SELL_PARTIAL"
+                else "全部卖出"
+                if key == "sell_actions"
+                else action
+            )
             assert action in text, f"{broker} 的 {title} 缺少动作 {action}"
             for value in (item.get("symbol"), item.get("name")):
                 if value:

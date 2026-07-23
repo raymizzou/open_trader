@@ -93,6 +93,186 @@ def test_parameter_hash_is_canonical() -> None:
     assert len(strategy_parameter_hash({"limit": "0.05"})) == 64
 
 
+OVERHEAT_TRIM_PARAMETERS = {
+    "overheat_trim_fraction": "0.30",
+    "overheat_trim_once_per_position": True,
+    "overheat_trim_signals": ["boiling", "champagne"],
+    "overheat_trim_rounding": "floor_to_market_lot",
+    "overheat_trim_below_lot": "no_order_terminal",
+    "full_exit_precedes_partial_exit": True,
+}
+
+
+def test_v4_overheat_trim_compatibility_appends_only_a_validated_audit_event(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    old_parameters = {"drawdown_limit": "0.05", "market": "US"}
+    request = {
+        "market": "US",
+        "strategy_id": "trend_animals_warm_to_hot/US/v4",
+        "strategy_version": "v4",
+        "parameters": old_parameters,
+        "baseline_equity": Decimal("100000"),
+        "source_date": "2026-07-17",
+        "accepted_git_sha": "a" * 40,
+        "actor": "deployment",
+        "occurred_at": "2026-07-20T08:00:00+08:00",
+        "reason": "first_activation",
+        "entry_eligible_from": "2026-07-20",
+    }
+    automatic_bootstrap_strategy_drawdown(data_dir, **request)
+    state_path = data_dir / "trend_drawdown/state.json"
+    before = json.loads(state_path.read_text(encoding="utf-8"))
+    updated_parameters = {**old_parameters, **OVERHEAT_TRIM_PARAMETERS}
+
+    decision = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **{
+            **request,
+            "parameters": updated_parameters,
+            "baseline_equity": None,
+            "source_date": None,
+            "accepted_git_sha": "b" * 40,
+            "occurred_at": "2026-07-21T08:00:00+08:00",
+            "entry_eligible_from": None,
+        },
+    )
+
+    after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert after["records"] == before["records"]
+    assert after["audit_events"][:-1] == before["audit_events"]
+    compatibility = after["audit_events"][-1]
+    assert compatibility == {
+        "event_id": compatibility["event_id"],
+        "event_type": "parameter_compatibility",
+        "market": "US",
+        "strategy_id": "trend_animals_warm_to_hot/US/v4",
+        "strategy_version": "v4",
+        "actor": "deployment",
+        "occurred_at": "2026-07-21T08:00:00+08:00",
+        "old_parameter_hash": strategy_parameter_hash(old_parameters),
+        "new_parameter_hash": strategy_parameter_hash(updated_parameters),
+        "compatibility_revision": "trend_overheat_trim_v1",
+        "accepted_git_sha": "b" * 40,
+    }
+    assert decision["parameter_compatibility_event"] == compatibility
+
+    state_after_first_transition = state_path.read_bytes()
+    replay = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **{
+            **request,
+            "parameters": updated_parameters,
+            "baseline_equity": None,
+            "source_date": None,
+            "accepted_git_sha": "b" * 40,
+            "occurred_at": "2026-07-21T08:00:00+08:00",
+            "entry_eligible_from": None,
+        },
+    )
+    assert replay == decision
+    assert state_path.read_bytes() == state_after_first_transition
+
+    with pytest.raises(
+        ValueError, match="strategy parameters changed without a version bump"
+    ):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            **{
+                **request,
+                "baseline_equity": None,
+                "source_date": None,
+                "entry_eligible_from": None,
+            },
+        )
+    assert state_path.read_bytes() == state_after_first_transition
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {**OVERHEAT_TRIM_PARAMETERS, "overheat_trim_fraction": "0.31"},
+        {
+            **OVERHEAT_TRIM_PARAMETERS,
+            "overheat_trim_signals": ["champagne", "boiling"],
+        },
+        {**OVERHEAT_TRIM_PARAMETERS, "unexpected_parameter": "nope"},
+    ],
+)
+def test_v4_overheat_trim_compatibility_rejects_any_nonapproved_transition(
+    tmp_path: Path, parameters: dict[str, object],
+) -> None:
+    data_dir = tmp_path / "data"
+    old_parameters = {"drawdown_limit": "0.05", "market": "HK"}
+    request = {
+        "market": "HK",
+        "strategy_id": "trend_animals_warm_to_hot/HK/v4",
+        "strategy_version": "v4",
+        "parameters": old_parameters,
+        "baseline_equity": Decimal("100000"),
+        "source_date": "2026-07-17",
+        "accepted_git_sha": "a" * 40,
+        "actor": "deployment",
+        "occurred_at": "2026-07-20T08:00:00+08:00",
+        "reason": "first_activation",
+        "entry_eligible_from": "2026-07-20",
+    }
+    automatic_bootstrap_strategy_drawdown(data_dir, **request)
+    state_path = data_dir / "trend_drawdown/state.json"
+    before = state_path.read_bytes()
+
+    with pytest.raises(
+        ValueError, match="strategy parameters changed without a version bump"
+    ):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            **{
+                **request,
+                "parameters": {**old_parameters, **parameters},
+                "baseline_equity": None,
+                "source_date": None,
+                "entry_eligible_from": None,
+            },
+        )
+
+    assert state_path.read_bytes() == before
+
+
+def test_v4_ordinary_parameter_drift_still_requires_a_version_bump(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    request = {
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        "strategy_version": "v4",
+        "parameters": {"drawdown_limit": "0.05", "market": "CN"},
+        "baseline_equity": Decimal("100000"),
+        "source_date": "2026-07-17",
+        "accepted_git_sha": "a" * 40,
+        "actor": "deployment",
+        "occurred_at": "2026-07-20T08:00:00+08:00",
+        "reason": "first_activation",
+        "entry_eligible_from": "2026-07-20",
+    }
+    automatic_bootstrap_strategy_drawdown(data_dir, **request)
+
+    with pytest.raises(
+        ValueError, match="strategy parameters changed without a version bump"
+    ):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            **{
+                **request,
+                "parameters": {"drawdown_limit": "0.06", "market": "CN"},
+                "baseline_equity": None,
+                "source_date": None,
+                "entry_eligible_from": None,
+            },
+        )
+
+
 def test_automatic_bootstrap_is_audited_and_idempotent_by_parameters(
     tmp_path: Path,
 ) -> None:
