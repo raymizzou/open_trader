@@ -527,7 +527,6 @@ def _valid_trend_review_projection(
         or not isinstance(interval, dict)
         or set(interval) != {"start", "end"}
         or not _valid_iso_date(interval["start"])
-        or snapshot.get("effective_from") != interval["start"]
         or interval["end"] != common_cutoff
         or (
             common_cutoff is not None
@@ -556,7 +555,6 @@ def _valid_trend_review_projection(
             or not isinstance(interval, dict)
             or set(interval) != {"start", "end"}
             or not _valid_iso_date(interval["start"])
-            or snapshot.get("effective_from") != interval["start"]
             or interval["end"] != common_cutoff
             or (
                 common_cutoff is not None
@@ -575,6 +573,8 @@ def _valid_trend_review_projection(
     ):
         if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
             return False
+    if not _valid_iso_date(snapshot.get("effective_from")):
+        return False
     if not isinstance(snapshot.get("parameters"), dict):
         return False
     rows = snapshot.get("parameter_rows")

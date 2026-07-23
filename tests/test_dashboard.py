@@ -687,6 +687,30 @@ def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> 
     assert review["metrics"]["calmar"]["actual"]["value"] == "9.4"
 
 
+def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
+    tmp_path: Path,
+) -> None:
+    payload = trend_review_projection_v2("US", "tiger")
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot.update(
+        {
+            "strategy_id": "trend_animals_warm_to_hot/US/v4",
+            "strategy_version": "v4",
+            "effective_from": "2026-07-20",
+        }
+    )
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is True
+    assert review["interval"] == {"start": "2026-07-17", "end": "2026-07-17"}
+    assert review["strategy_snapshot"]["effective_from"] == "2026-07-20"
+
+
 @pytest.mark.parametrize(
     ("mutation", "broker"),
     [
@@ -722,7 +746,7 @@ def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> 
         (lambda payload: payload.update(common_cutoff="2026/07/17"), "tiger"),
         (lambda payload: payload.update(common_cutoff="2026-02-30"), "tiger"),
         (
-            lambda payload: payload["interval"].update(start="2026-07-16"),
+            lambda payload: payload["interval"].update(start="2026-02-30"),
             "tiger",
         ),
         (
