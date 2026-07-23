@@ -1107,6 +1107,7 @@ def integrated_v4_payload(
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         pending = market == "HK"
+        strategy_version = "v5" if market == "CN" else "v4"
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {
             "status": "active",
@@ -1140,8 +1141,8 @@ def integrated_v4_payload(
             },
             "account": serialized_trend_account(fresh=True),
             "strategy_snapshot": {
-                "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
-                "strategy_version": "v4",
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/{strategy_version}",
+                "strategy_version": strategy_version,
                 "process_version": "a" * 40,
                 "parameters": {
                     "single_entry_risk_limit": "0.004",
@@ -1209,7 +1210,7 @@ def integrated_v4_payload(
             "market": market,
             "artifact": artifact.name,
             "report_sha256": _report_hash(frozen),
-            "strategy_version": "v4",
+            "strategy_version": strategy_version,
             "buy_actions": [] if pending else [buy],
             "sell_actions": [],
             "hold_actions": [],

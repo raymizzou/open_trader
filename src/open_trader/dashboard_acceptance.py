@@ -494,14 +494,15 @@ def validate_integrated_candidate(
             parameters = (
                 snapshot.get("parameters") if isinstance(snapshot, Mapping) else None
             )
+            expected_strategy_version = "v5" if market == "CN" else "v4"
             assert (
                 isinstance(parameters, Mapping)
-                and snapshot.get("strategy_version") == "v4"
+                and snapshot.get("strategy_version") == expected_strategy_version
                 and re.fullmatch(
                     r"[0-9a-f]{40}", str(snapshot.get("process_version") or "")
                 )
-                and report.get("strategy_version") == "v4"
-            ), f"{broker} 冻结 Kelly/回撤 v4 策略身份无效"
+                and report.get("strategy_version") == expected_strategy_version
+            ), f"{broker} 冻结 Kelly/回撤 {expected_strategy_version} 策略身份无效"
             for key, expected, label in (
                 ("single_entry_risk_limit", Decimal("0.004"), "单笔风险"),
                 ("portfolio_risk_limit", Decimal("0.04"), "组合风险"),
@@ -603,7 +604,7 @@ def validate_integrated_candidate(
             assert valid_strategy_parameter_audit_identity(
                 market=market,
                 strategy_id=str(snapshot.get("strategy_id") or ""),
-                strategy_version="v4",
+                strategy_version=expected_strategy_version,
                 parameters=parameters,
                 bootstrap_event=bootstrap,
                 parameter_compatibility_event=drawdown.get(
