@@ -1537,6 +1537,17 @@ def _project_broker_trend_report(
         market=market,
         strategy_snapshot=payload.get("strategy_snapshot"),
     )
+    strategy_snapshot = payload.get("strategy_snapshot")
+    raw_strategy_parameters = (
+        strategy_snapshot.get("parameters")
+        if isinstance(strategy_snapshot, dict)
+        else None
+    )
+    strategy_parameters = (
+        dict(raw_strategy_parameters)
+        if isinstance(raw_strategy_parameters, dict)
+        else {}
+    )
     actual_overlay = _project_trend_actual_overlay(
         broker=broker,
         market=market,
@@ -1603,6 +1614,7 @@ def _project_broker_trend_report(
         ),
         "audit": {
             "candidates": audit_candidates,
+            "strategy_parameters": strategy_parameters,
             "excluded": payload.get("excluded", {}),
             "account_exceptions": account.get("exceptions", []),
             "industry_concentration": payload.get("industry_concentration", []),

@@ -864,6 +864,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     )
     assert reports["tiger"]["audit"] == {
         "candidates": [{"symbol": "VIXY", "strength": "95"}],
+        "strategy_parameters": {},
         "excluded": {"QQQ": ["already_held"]},
         "industry_concentration": [["科技", 1, "0.25"]],
         "data_sources": ["Trend Animals", "Tiger US daily K-line"],
@@ -1439,6 +1440,73 @@ def test_dashboard_projects_frozen_risk_summary_and_skips(tmp_path: Path) -> Non
         "status_text": "交易统计暂不可用",
     }
     assert report["risk_skips"] == payload["strategy_judgments"]["risk_skips"]
+
+
+def test_dashboard_projects_frozen_strategy_parameters_into_cn_audit(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update({
+        "max_filter_price": "200",
+        "min_strength": "95",
+        "allowed_industry_temperatures": ["热", "沸"],
+        "allowed_phases": ["谷雨", "立夏", "夏至"],
+        "min_market_cap_100m": "100",
+        "min_amount_100m": "2",
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["eastmoney"]
+
+    assert report["available"] is True
+    assert report["audit"]["strategy_parameters"] == parameters
+    assert report["audit"]["strategy_parameters"] is not parameters
+
+
+@pytest.mark.parametrize("parameters", ["missing", ["legacy"]])
+def test_dashboard_projects_legacy_strategy_parameters_as_empty_dict(
+    tmp_path: Path, parameters: object,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    if parameters == "missing":
+        snapshot.pop("parameters")
+    else:
+        snapshot["parameters"] = parameters
+
+    report = dashboard_module._project_broker_trend_report(
+        selected=(
+            path,
+            payload,
+            date(2026, 7, 15),
+            date(2026, 7, 14),
+            date(2026, 7, 15),
+            datetime.fromisoformat("2026-07-15T20:00:00+08:00"),
+        ),
+        data_dir=config.data_dir,
+        reports_dir=path.parent,
+        broker="eastmoney",
+        market="CN",
+        market_label="A股",
+        broker_label="东方财富",
+        buy_window="09:30–10:00",
+        report_date="2026-07-15",
+    )
+
+    assert report["available"] is True
+    assert report["audit"]["strategy_parameters"] == {}
 
 
 def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
