@@ -2520,6 +2520,11 @@ def build_report(
                 f"模拟持仓 {unknown_existing_risk_symbols[0]} 活动保护线缺失，暂停新开仓"
             )
         critical_data_reason = critical_data_reason or kelly_data_reason
+        planned_risk_for_plan = (
+            existing_planned_risk
+            if snapshot_version == "v5" or not unknown_existing_risk_symbols
+            else None
+        )
         buy_actions, risk_skips, risk_summary = _plan_buy_actions(
             ranked=candidate_decision.eligible,
             net_value=account.net_value,
@@ -2529,7 +2534,7 @@ def build_report(
             market=market,
             lot_sizes=lot_sizes,
             price_fx_to_account_currency=price_fx_to_account_currency,
-            portfolio_planned_risk=existing_planned_risk,
+            portfolio_planned_risk=planned_risk_for_plan,
             normal_cost_rate=normal_cost_rate,
             critical_data_reason=critical_data_reason,
             kelly_state=kelly_state,
@@ -2636,6 +2641,13 @@ def build_report(
         }
         for item in candidates
     ]
+    report_metadata = {
+        **dict(metadata or {}),
+        "position_weight": str(position_weight),
+        "position_weight_source": position_weight_source,
+    }
+    if snapshot_version == "v5":
+        report_metadata["market"] = market.upper()
     return TrendReport(
         schema_version=1,
         generated_at=generated_at
@@ -2660,12 +2672,7 @@ def build_report(
             "excluded": excluded_signals,
             "candidates": candidate_signals,
         },
-        metadata={
-            **dict(metadata or {}),
-            "market": market.upper(),
-            "position_weight": str(position_weight),
-            "position_weight_source": position_weight_source,
-        },
+        metadata=report_metadata,
         strategy_snapshot=resolved_strategy_snapshot,
         drawdown_summary=(
             dict(drawdown_summary) if drawdown_summary is not None else None
@@ -3392,7 +3399,11 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     parameters = snapshot.get("parameters")
     if not isinstance(parameters, Mapping):
         raise ValueError("strategy snapshot does not match report actions")
-    market = str(report.metadata.get("market") or "CN").upper()
+    market = str(
+        report.metadata.get("market")
+        or snapshot.get("market")
+        or "CN"
+    ).upper()
     expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
     if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")

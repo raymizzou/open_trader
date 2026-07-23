@@ -1290,6 +1290,8 @@ def test_frozen_v2_v3_v4_payload_omits_v5_only_action_fields(
         strategy_snapshot=snapshot,
         drawdown_summary=drawdown_summary,
     )
+    if version != "v5":
+        assert "market" not in built.metadata
     action = trend_module._report_payload(built)["strategy_judgments"]["formal_actions"][0]
     assert "market_data_status" not in action
     assert "pending_fields" not in action
