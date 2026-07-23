@@ -41,3 +41,6 @@ Verification:
 Fix-wave commits: `0b1c7d7`, `a86b32c` (stable alert de-duplication).
 
 The same focused command remained green after `a86b32c`: `619 passed in 7.90s`.
+
+Final preflight fix: pending v5 actions now require at least one expected
+missing field; focused regression plus full Task 3 suite: `620 passed in 7.80s`.
