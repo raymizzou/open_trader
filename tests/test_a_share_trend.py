@@ -1088,7 +1088,9 @@ def test_v5_missing_quote_and_atr_keeps_formal_buy_without_pausing_batch() -> No
         holding_snapshots={},
         bars_by_symbol={},
         strategy_snapshot=snapshot,
-        drawdown_summary=active_drawdown_summary(snapshot, "2026-07-15"),
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(account().net_value)
+        ),
     )
 
     assert [item.symbol for item in built.buy_actions] == ["600001", "600002"]
