@@ -2249,6 +2249,8 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
+    if version != "v5":
+        live_lot_size = None
     try:
         lot_size = int(
             live_lot_size
@@ -2258,11 +2260,9 @@ def _remaining_buy_quantity(
     except (TypeError, ValueError):
         raise ValueError("trend review buy action is invalid") from None
     frozen_quantity = (
-        _required_decimal(action.get("estimated_shares"), "estimated shares")
-        if version in {"v1", "v2", "v3", "v4"}
+        Decimal("0")
+        if version == "v5" and action.get("estimated_shares") is None
         else _required_decimal(action.get("estimated_shares"), "estimated shares")
-        if action.get("estimated_shares") is not None
-        else Decimal("0")
     )
     target_amount = _required_decimal(action.get("target_amount"), "target amount")
     current_price = _required_decimal(current_price, "current price")
@@ -2282,7 +2282,7 @@ def _remaining_buy_quantity(
     if (
         lot_size <= 0
         or (
-            version in {"v1", "v2", "v3", "v4"}
+            version != "v5"
             and (
                 frozen_quantity <= 0
                 or frozen_quantity != frozen_quantity.to_integral_value()
@@ -2332,7 +2332,7 @@ def _remaining_buy_quantity(
         _floor_to_lot(remaining_amount / (current_price * fx), lot_size),
         _floor_to_lot(cash / (current_price * fx), lot_size),
     ]
-    if version in {"v1", "v2", "v3", "v4"}:
+    if version != "v5":
         caps.insert(0, _floor_to_lot(remaining_quantity, lot_size))
     if version in {"v2", "v3", "v4", "v5"} and (
         version in {"v2", "v3", "v4"}
@@ -2400,6 +2400,8 @@ def _record_fill_protection(
         "updated_for": execution_date,
     }
     if atr is None:
+        for key in ("initial_line", "active_line", "atr14", "protection_recovered_for"):
+            position.pop(key, None)
         position.update(
             {
                 "protection_status": "pending",
@@ -2420,6 +2422,26 @@ def _record_fill_protection(
         )
     positions[symbol] = position
     write_protection_state(state_path, {**state, "positions": positions})
+
+
+def _v5_pending_fields(action: Mapping[str, object]) -> tuple[str, ...]:
+    fields: list[str] = []
+    for field in ("close", "atr"):
+        value = action.get(field)
+        try:
+            missing = value is None or _required_decimal(value, field) <= 0
+        except ValueError:
+            missing = True
+        if missing:
+            fields.append("quote" if field == "close" else field)
+    raw_lot_size = action.get("lot_size")
+    try:
+        lot_size = int(raw_lot_size) if not isinstance(raw_lot_size, bool) else 0
+    except (TypeError, ValueError):
+        lot_size = 0
+    if raw_lot_size is None or lot_size <= 0:
+        fields.append("lot_size")
+    return tuple(fields)
 
 
 def _preflight_open_actions(
@@ -2455,6 +2477,8 @@ def _preflight_open_actions(
                 raise ValueError("trend review has conflicting sell actions")
             sell_actions_by_symbol.add(futu_code)
         if action_name == "BUY":
+            if strategy_version not in {"v1", "v2", "v3", "v4", "v5"}:
+                raise ValueError("trend review buy action is invalid")
             try:
                 target_weight = _required_decimal(
                     action.get("target_weight"), "target weight"
@@ -2488,6 +2512,7 @@ def _preflight_open_actions(
                         else None
                     )
                     pending_fields = action.get("pending_fields", [])
+                    expected_pending_fields = _v5_pending_fields(action)
                     if (
                         not isinstance(pending_fields, list)
                         or len(set(pending_fields)) != len(pending_fields)
@@ -2496,6 +2521,7 @@ def _preflight_open_actions(
                             or field not in {"quote", "atr", "lot_size"}
                             for field in pending_fields
                         )
+                        or tuple(pending_fields) != expected_pending_fields
                         or action.get("market_data_status")
                         not in {"complete", "pending"}
                         or target_weight <= 0

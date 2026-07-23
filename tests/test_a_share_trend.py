@@ -458,6 +458,35 @@ def test_pending_protection_recovers_from_fill_price_and_entry_day_atr() -> None
     assert state["protection_recovered_for"] == built.as_of_date
 
 
+def test_pending_protection_uses_first_computable_atr_before_current_atr() -> None:
+    daily_bars = [
+        replace(bar, high=Decimal("11") if index < 15 else Decimal("20"))
+        for index, bar in enumerate(bars(count=20, end_date="2026-07-20"))
+    ]
+    first_atr = atr14(daily_bars[:15])
+    current_atr = atr14(daily_bars)
+    assert first_atr is not None and current_atr is not None
+    assert first_atr != current_atr
+    built = build_report(
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        account=account("600001"),
+        candidates=[],
+        holding_snapshots={},
+        prior_state={"schema_version": 1, "positions": {"600001": {
+            "entry_fill_price": "10.2",
+            "protection_status": "pending",
+            "protection_pending_since": "2026-07-12T10:35:00+08:00",
+            "position_started_for": "2026-07-12",
+            "updated_for": "2026-07-19",
+        }}},
+        bars_by_symbol={"600001": daily_bars},
+    )
+    state = built.protection_state["positions"]["600001"]
+    assert Decimal(state["initial_line"]) == Decimal("10.2") - Decimal("2") * first_atr
+    assert state["atr14"] == str(first_atr)
+
+
 def unlock_live_drawdown(
     data_dir: Path, *, market: str = "CN", equity: str = "100000"
 ) -> None:

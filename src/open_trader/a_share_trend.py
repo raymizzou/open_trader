@@ -2374,15 +2374,16 @@ def build_report(
             )
             recovery_atr = atr14(entry_bars)
             if recovery_atr is None:
-                recovery_atr = current_atr or _first_computable_atr(
+                recovery_atr = _first_computable_atr(
                     tuple(bar for bar in daily_bars if bar.date <= as_of_date)
-                )
+                ) or current_atr
             if recovery_atr is not None:
                 initial_line = active_line = (
                     entry_fill_price
                     - INITIAL_PROTECTION_ATR_MULTIPLE * recovery_atr
                 )
                 old_atr = recovery_atr
+                current_atr = recovery_atr
                 protection_status = "active"
                 protection_recovered_for = as_of_date
         if active_line is None and current_atr is not None and close is not None:

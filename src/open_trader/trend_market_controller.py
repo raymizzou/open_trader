@@ -5,7 +5,7 @@ import json
 import os
 import re
 import socket
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from contextlib import suppress
 from dataclasses import dataclass
@@ -49,6 +49,7 @@ from .market_trend_watch import (
 from .notification_policy import (
     BROKER_LABELS,
     MARKET_LABELS,
+    PROTECTION_STATUS_LABELS,
     brief_zh_detail,
     group_order_alerts,
     render_attention,
@@ -883,6 +884,12 @@ def _execute_locked_report(
         raise ValueError(f"invalid locked trend report: {locked_path}")
     judgments = locked_report["strategy_judgments"]
     actions = judgments["formal_actions"]
+    strategy_snapshot = locked_report.get("strategy_snapshot")
+    strategy_version = (
+        str(strategy_snapshot.get("strategy_version") or "")
+        if isinstance(strategy_snapshot, Mapping)
+        else ""
+    )
     if not actions:
         return {
             "status": "unchanged",
@@ -949,14 +956,15 @@ def _execute_locked_report(
                     for symbol, snapshot in snapshots.items()
                     if snapshot.last_price is not None
                 }
-                try:
-                    lot_sizes = {
-                        symbol: int(lot_size)
-                        for symbol, lot_size in quote.get_lot_sizes(symbols).items()
-                        if int(lot_size) > 0
-                    }
-                except Exception:
-                    lot_sizes = {}
+                if strategy_version == "v5":
+                    try:
+                        lot_sizes = {
+                            symbol: int(lot_size)
+                            for symbol, lot_size in quote.get_lot_sizes(symbols).items()
+                            if int(lot_size) > 0
+                        }
+                    except Exception:
+                        lot_sizes = {}
             except Exception:
                 prices = {}
                 quote_failure = True
@@ -1357,6 +1365,50 @@ def _notify_order_groups(
             occurred_at,
         )
         sent += int(_notify_feishu_once(title, message, key))
+    return sent
+
+
+def _notify_pending_protection(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    events: Sequence[Mapping[str, object]],
+) -> int:
+    sent = 0
+    title_label, action = PROTECTION_STATUS_LABELS["pending"]
+    for event in events:
+        if (
+            event.get("side") != "buy"
+            or event.get("status") not in {"filled", "partially_filled", "incomplete"}
+            or event.get("protection_status") != "pending"
+        ):
+            continue
+        symbol = str(event.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        title = (
+            f"【需处理｜{BROKER_LABELS[market]}｜"
+            f"{MARKET_LABELS[market]}{title_label}｜{symbol}】"
+        )
+        message = (
+            f"发生：{symbol} 已成交，但保护线尚未补全\n"
+            f"影响：当前仓位继续由每日趋势报告监控\n"
+            f"现在做：{action}"
+        )
+        sent += int(
+            _notify_feishu_once(
+                title,
+                message,
+                (
+                    config,
+                    market,
+                    execution_date,
+                    f"protection_{symbol}",
+                    "pending",
+                    "",
+                ),
+            )
+        )
     return sent
 
 
@@ -2737,6 +2789,14 @@ def run_trend_market_controller(
                     operation_failures = 0
                     operation_retry_after = None
                     operation_blocker = None
+                    _notify_pending_protection(
+                        config,
+                        market,
+                        work_cycle.execution_date,
+                        _latest_action_events(
+                            config, market, work_cycle.execution_date
+                        ),
+                    )
                     status = str(execution.get("status") or "")
                     if status in {"uncertain", "conflict"}:
                         blocker = status

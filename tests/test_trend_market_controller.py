@@ -192,6 +192,7 @@ def test_controller_notification_retries_only_feishu_once(
         "channels": ["macos"],
     }
 
+
     controller._retry_pending_feishu_notifications(config)
     assert controller._notify_once(
         "US 趋势控制器阻塞", "snapshot unavailable", key
@@ -199,6 +200,38 @@ def test_controller_notification_retries_only_feishu_once(
 
     assert feishu.attempt_count == 2
     assert len(macos.messages) == 1
+
+
+def test_pending_protection_notification_uses_stable_symbol_status_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    notifications: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_feishu_once",
+        lambda title, message, key: notifications.append((title, message, key)) or True,
+    )
+    events = [{
+        "market": "CN",
+        "date": "2026-07-20",
+        "symbol": "600001",
+        "side": "buy",
+        "status": "partially_filled",
+        "protection_status": "pending",
+    }]
+
+    assert controller._notify_pending_protection(
+        config, "CN", "2026-07-20", events
+    ) == 1
+    assert controller._notify_pending_protection(
+        config, "CN", "2026-07-20", events
+    ) == 1
+    assert notifications[0][2][1:] == (
+        "CN", "2026-07-20", "protection_600001", "pending", ""
+    )
+    assert "保护线待补全" in notifications[0][0]
+    assert notifications[0][0] == notifications[1][0]
 
 
 def test_controller_notification_stops_after_one_retry(

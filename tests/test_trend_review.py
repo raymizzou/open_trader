@@ -846,6 +846,25 @@ def test_v5_hk_buy_uses_live_lot_size(tmp_path: Path) -> None:
     assert client.requests[0]["qty"] == "100"
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"pending_fields": ["atr"]},
+        {"close": "10"},
+        {"market_data_status": "complete"},
+        {"pending_fields": ["quote", "atr", "lot_size"]},
+    ],
+)
+def test_v5_pending_fields_must_match_missing_market_data(
+    changes: dict[str, object],
+) -> None:
+    report = v5_report_with_pending_buy()
+    action = report["strategy_judgments"]["formal_actions"][0]
+    action.update(changes)
+    with pytest.raises(ValueError, match="trend review buy action is invalid"):
+        trend_review._preflight_open_actions(report, "CN")
+
+
 def test_v5_fill_without_atr_persists_pending_protection(tmp_path: Path) -> None:
     client = FakeTrendSimClient()
     arguments = {
