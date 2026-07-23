@@ -1122,12 +1122,27 @@ def _notify_channels_once(
         with _notification_retry_lock(path):
             if legacy_path is not None:
                 with _notification_retry_lock(legacy_path):
-                    if legacy_path.exists() and _read_json(
-                        legacy_path, "trend controller notification"
-                    ).get("schema_version") == (
-                        "open_trader.trend_controller.notification.v1"
-                    ):
-                        return True
+                    if legacy_path.exists():
+                        legacy_state = _read_json(
+                            legacy_path, "trend controller notification"
+                        )
+                        if legacy_state.get("schema_version") == (
+                            "open_trader.trend_controller.notification.v1"
+                        ):
+                            return True
+                        if (
+                            legacy_state.get("schema_version")
+                            == "open_trader.trend_controller.notification.v2"
+                            and "趋势复盘待恢复"
+                            in str(legacy_state.get("feishu_title") or "")
+                        ):
+                            if any(
+                                channel in {"feishu", "feishu_app"}
+                                for channel in legacy_state.get("channels", [])
+                            ):
+                                return True
+                            path = legacy_path
+                            non_feishu_payload = None
             if path.exists():
                 state = _read_json(path, "trend controller notification")
                 if (

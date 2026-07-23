@@ -542,6 +542,172 @@ def test_legacy_review_notification_is_not_replayed_as_current_review(
     assert not review_path.exists()
 
 
+def test_delivered_legacy_v2_review_is_not_replayed_as_current_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "occurred_at": "2026-07-22T09:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+            "feishu_message": "review unavailable",
+            "channels": ["feishu_app"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert sent == []
+    assert not review_path.exists()
+
+
+def test_legacy_v2_controller_alert_does_not_suppress_current_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "occurred_at": "2026-07-22T09:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】",
+            "feishu_message": "controller unavailable",
+            "channels": ["feishu_app"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert [channels for _, _, channels in sent] == [
+        {"macos", "xiaoai"},
+        {"feishu", "feishu_app"},
+    ]
+    assert review_path.exists()
+
+
+def test_pending_legacy_v2_review_retries_only_its_feishu_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v2",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "occurred_at": "2026-07-22T09:00:00+08:00",
+            "non_feishu_attempted": True,
+            "feishu_attempts": 1,
+            "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+            "feishu_message": "review unavailable",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert [channels for _, _, channels in sent] == [{"feishu", "feishu_app"}]
+    assert not review_path.exists()
+    assert json.loads(legacy_path.read_text(encoding="utf-8")) == {
+        "schema_version": "open_trader.trend_controller.notification.v2",
+        "market": "US",
+        "execution_date": "2026-07-22",
+        "action": "controller",
+        "reason": "RuntimeError",
+        "occurred_at": "2026-07-22T09:00:00+08:00",
+        "non_feishu_attempted": True,
+        "feishu_attempts": 2,
+        "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+        "feishu_message": "review unavailable",
+        "channels": ["macos", "feishu_app"],
+    }
+
+
 def test_protection_blocker_notifies_feishu_once_per_market_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
