@@ -5163,7 +5163,8 @@ const html = renderCnTrendAudit({
 for (const text of [
   "行业温度","平","要求：热或沸", "总市值","20 亿元","要求：至少 100 亿元",
   "日成交额","1 亿元","要求：至少 2 亿元", "筛选价","数据未提供",
-  "要求：筛选价必须存在", "未识别规则：future_rule_&lt;script&gt;","请核对冻结报告", "未触发"
+  "要求：筛选价必须存在", "未识别规则：future_rule_&lt;script&gt;","请核对冻结报告", "未触发",
+  "rank", "未进入候选排名"
 ]) {
   if (!html.includes(text)) throw new Error(text + "\n" + html);
 }

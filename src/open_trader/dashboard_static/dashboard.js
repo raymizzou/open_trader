@@ -2739,7 +2739,9 @@ function renderCnTrendAudit(audit, report = {}) {
       "危险信号 " + cnTrendAuditDanger(item.danger),
     ].map((fact) => "<span>" + escapeHtml(fact) + "</span>").join("");
     const details = Object.entries(item).map(([key, value]) => {
-      const display = Array.isArray(value)
+      const display = key === "rank" && !hasValue(value)
+        ? "未进入候选排名"
+        : Array.isArray(value)
         ? value.map(formatPlain).join("、")
         : value && typeof value === "object"
           ? JSON.stringify(value)
