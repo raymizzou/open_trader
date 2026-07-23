@@ -2027,15 +2027,156 @@ def _check_cn_buy_rows(workspace: Any, report: Mapping[str, Any]) -> None:
             )
 
 
-def _check_trend_audit(audit: Any, report: Mapping[str, Any], broker: str) -> None:
+def _check_trend_audit(
+    audit: Any,
+    report: Mapping[str, Any],
+    broker: str,
+    *,
+    page: Any | None = None,
+) -> None:
     assert audit.count() == 1 and audit.get_attribute("open") is None, (
         f"{broker} 趋势报告审计详情未保持收起"
     )
     summary = audit.locator("summary")
     assert summary.count() == 1, f"{broker} 趋势报告缺少审计摘要"
     summary.click()
+    if broker == "eastmoney":
+        data = report.get("audit") if isinstance(report.get("audit"), Mapping) else {}
+        candidates = (
+            data.get("candidates")
+            if isinstance(data.get("candidates"), list) else []
+        )
+        table = audit.locator(".trend-audit-table")
+        assert table.count() == 1, "eastmoney 缺少候选审计表"
+        assert table.locator("thead th").all_inner_texts() == [
+            "标的", "结论", "未通过项目", "已通过的关键事实", "审计",
+        ], "eastmoney 候选审计表头不匹配"
+        rows = table.locator(".trend-audit-row")
+        assert rows.count() == len(candidates), "eastmoney 候选审计行数与 API 不一致"
+        assert audit.locator(
+            "section h3", has_text="排除项"
+        ).count() == 0, "eastmoney 仍重复显示排除项"
+        audit_text = audit.inner_text()
+        assert "为什么没有进入买入名单" in audit_text, (
+            "eastmoney 缺少审计解释标题"
+        )
+        passed = sum(
+            isinstance(item, Mapping) and item.get("eligible") is True
+            for item in candidates
+        )
+        excluded = sum(
+            isinstance(item, Mapping) and item.get("eligible") is False
+            for item in candidates
+        )
+        for label, value in (
+            ("候选", len(candidates)),
+            ("通过", passed),
+            ("排除", excluded),
+        ):
+            assert f"{label} {value}" in audit_text, (
+                f"eastmoney 审计摘要缺少 {label} {value}"
+            )
+        for index, item in enumerate(candidates):
+            assert isinstance(item, Mapping), "eastmoney 候选审计数据格式无效"
+            row = rows.nth(index)
+            identity = row.locator('td[data-label="标的"]')
+            identity_text = identity.inner_text()
+            for value in (item.get("symbol"), item.get("name")):
+                if value:
+                    assert str(value) in identity_text, (
+                        f"eastmoney 候选审计行 {index + 1} 缺少 {value}"
+                    )
+            reasons = (
+                item.get("excluded_reasons")
+                if isinstance(item.get("excluded_reasons"), list) else []
+            )
+            expected_status = (
+                "通过纪律"
+                if item.get("eligible") is True
+                else f"已排除 · {len(reasons)} 项未通过"
+                if item.get("eligible") is False and reasons
+                else "数据缺失"
+                if item.get("eligible") is False
+                else "待确认"
+            )
+            status = row.locator(
+                'td[data-label="结论"] .trend-audit-status'
+            )
+            assert status.count() == 1 and status.inner_text().strip() == expected_status, (
+                f"eastmoney 候选审计行 {index + 1} 结论不匹配"
+            )
+            reason_nodes = row.locator(".trend-audit-reason")
+            assert reason_nodes.count() == len(reasons), (
+                f"eastmoney 候选审计行 {index + 1} 原因数量不匹配"
+            )
+            reason_texts = reason_nodes.all_inner_texts()
+            for reason, reason_text in zip(reasons, reason_texts):
+                assert "→" in reason_text, (
+                    f"eastmoney 候选审计行 {index + 1} 原因缺少实际值箭头"
+                )
+                assert "要求" in reason_text or "ATR" in reason_text, (
+                    f"eastmoney 候选审计行 {index + 1} 原因缺少要求说明"
+                )
+                if str(reason) not in TREND_REASON_LABELS:
+                    assert str(reason) in reason_text, (
+                        f"eastmoney 候选审计行 {index + 1} 未显示未知原因 {reason}"
+                    )
+            details = row.locator(".trend-audit-more")
+            assert details.count() == 1, (
+                f"eastmoney 候选审计行 {index + 1} 缺少全部字段审计"
+            )
+            detail_summary = details.locator("summary")
+            assert detail_summary.count() == 1, (
+                f"eastmoney 候选审计行 {index + 1} 缺少字段展开控件"
+            )
+            detail_summary.click()
+        industry_section = audit.locator(
+            "section", has_text="行业集中度"
+        )
+        assert industry_section.count() == 1, "eastmoney 缺少行业集中度"
+        industries = (
+            data.get("industry_concentration")
+            if isinstance(data.get("industry_concentration"), list) else []
+        )
+        industry_text = industry_section.inner_text()
+        if not industries:
+            assert "无" in industry_text, "eastmoney 空行业集中度未显示 无"
+        for row in industries:
+            for position, value in enumerate(row if isinstance(row, list) else []):
+                expected = _plain(value) if position == 0 else _display_number(value)
+                assert expected in industry_text, (
+                    f"eastmoney 行业集中度缺少 {value}"
+                )
+        sources = (
+            data.get("data_sources")
+            if isinstance(data.get("data_sources"), list) else []
+        )
+        for source in sources:
+            assert str(source) in audit_text, f"eastmoney 审计详情缺少数据来源 {source}"
+        cost = data.get("actual_api_cost")
+        if cost is None:
+            cost = data.get("estimated_api_cost")
+        if cost is None:
+            cost = "未知"
+        assert f"API 成本：{_plain(cost)}" in audit_text, (
+            "eastmoney 审计详情缺少 API 成本"
+        )
+        target_page = page or getattr(audit, "page", None)
+        viewport = (
+            (getattr(target_page, "viewport_size", None) or {}).get("width")
+            if target_page is not None else None
+        )
+        if viewport is not None and viewport <= 760:
+            assert audit.evaluate(
+                "node => node.scrollWidth <= node.clientWidth"
+            ), "eastmoney 移动候选审计横向溢出"
+            assert target_page is not None, (
+                "eastmoney 移动审计检查缺少 page"
+            )
+            _check_mobile_targets(target_page, ".trend-audit-more summary")
+        return
     sections = audit.locator("section").all_inner_texts()
-    expected_sections = 3 if broker == "eastmoney" else 4
+    expected_sections = 4
     assert len(sections) == expected_sections, (
         f"{broker} 趋势报告审计区块数量不是 {expected_sections}"
     )
@@ -2428,7 +2569,7 @@ def _check_account_holdings(
                 )
             ), f"{broker} 趋势报告动作卡超出 {width}px 视口"
         audit = workspace.locator(".trend-audit")
-        _check_trend_audit(audit, report, broker)
+        _check_trend_audit(audit, report, broker, page=page)
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势报告工作区出现横向滚动"

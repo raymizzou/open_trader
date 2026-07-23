@@ -1865,8 +1865,9 @@ def trend_stage_texts(broker: str) -> list[str]:
 def trend_audit_text(broker: str) -> str:
     if broker == "eastmoney":
         return (
-            "审计详情 完整候选审计 600000 浦发银行 强度 94 "
-            "排除项 600000 趋势强度低于 95 行业集中度 无 "
+            "审计详情 为什么没有进入买入名单 候选 1 通过 0 排除 1 "
+            "600000 浦发银行 已排除 · 1 项未通过 趋势强度 94 → 要求：不低于 95 "
+            "查看全部字段 行业集中度 无 "
             "数据来源：Trend Animals、Futu CN calendar/QFQ daily K-line API 成本：2.00"
         )
     if broker == "phillips":
@@ -1880,8 +1881,9 @@ def trend_audit_text(broker: str) -> str:
 def trend_audit_sections(broker: str) -> list[str]:
     if broker == "eastmoney":
         return [
-            "完整候选审计 600000 浦发银行 强度 94",
-            "排除项 600000 趋势强度低于 95",
+            "为什么没有进入买入名单 候选 1 通过 0 排除 1 "
+            "600000 浦发银行 已排除 · 1 项未通过 趋势强度 94 → 要求：不低于 95 "
+            "查看全部字段",
             "行业集中度 无",
         ]
     if broker == "phillips":
@@ -2952,32 +2954,115 @@ def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
 
 def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     class Locator:
-        def __init__(self, selector: str = "audit") -> None:
+        def __init__(
+            self, selector: str = "audit", has_text: str | None = None,
+        ) -> None:
             self.selector = selector
+            self.has_text = has_text
 
         def count(self) -> int:
-            return 1
+            return {
+                "audit": 1,
+                "table": 1,
+                "header": 5,
+                "rows": 1,
+                "identity": 1,
+                "status": 1,
+                "reasons": 1,
+                "details": 1,
+                "detail-summary": 1,
+                "industry-section": 1,
+                "excluded-heading": 0,
+            }.get(self.selector, 1)
 
         def get_attribute(self, _name: str) -> None:
             return None
 
-        def locator(self, selector: str) -> "Locator":
-            return Locator(selector)
+        def locator(
+            self, selector: str, **kwargs: object,
+        ) -> "Locator":
+            if self.selector == "audit" and selector == ".trend-audit-table":
+                return Locator("table")
+            if self.selector == "audit" and selector == "section h3":
+                return Locator(
+                    "excluded-heading"
+                    if kwargs.get("has_text") == "排除项"
+                    else "section-heading",
+                    kwargs.get("has_text") if isinstance(
+                        kwargs.get("has_text"), str
+                    ) else None,
+                )
+            if self.selector == "audit" and selector == "section":
+                return Locator("industry-section", kwargs.get("has_text"))
+            if self.selector == "table" and selector == "thead th":
+                return Locator("header")
+            if self.selector == "table" and selector == ".trend-audit-row":
+                return Locator("rows")
+            if self.selector == "rows" and selector == 'td[data-label="标的"]':
+                return Locator("identity")
+            if self.selector == "rows" and selector == (
+                'td[data-label="结论"] .trend-audit-status'
+            ):
+                return Locator("status")
+            if self.selector == "rows" and selector == ".trend-audit-reason":
+                return Locator("reasons")
+            if self.selector == "rows" and selector == ".trend-audit-more":
+                return Locator("details")
+            if self.selector == "details" and selector == "summary":
+                return Locator("detail-summary")
+            return Locator(selector, kwargs.get("has_text"))
+
+        def nth(self, index: int) -> "Locator":
+            assert self.selector == "rows" and index == 0
+            return self
 
         def click(self) -> None:
             return None
 
         def all_inner_texts(self) -> list[str]:
-            assert self.selector == "section"
-            return ["候选榜 无", "排除项 无", "账户不参与项 无", "行业集中度 无"]
+            if self.selector == "header":
+                return ["标的", "结论", "未通过项目", "已通过的关键事实", "审计"]
+            if self.selector == "reasons":
+                return ["趋势强度\n94 → 要求：不低于 95"]
+            raise AssertionError(f"unexpected all_inner_texts: {self.selector}")
 
         def inner_text(self) -> str:
-            return "审计详情 API 成本：未知"
+            return {
+                "audit": "审计详情 为什么没有进入买入名单 候选 1 通过 0 排除 1 "
+                "行业集中度 无 API 成本：未知",
+                "identity": "600000 浦发银行",
+                "status": "已排除 · 1 项未通过",
+                "industry-section": "行业集中度 无",
+                "detail-summary": "查看全部字段",
+            }.get(self.selector, "")
+
+        def evaluate(self, expression: str) -> bool:
+            assert expression == "node => node.scrollWidth <= node.clientWidth"
+            return True
+
+        def evaluate_all(self, expression: str) -> list[dict[str, object]]:
+            assert self.selector == "detail-summary"
+            assert "getBoundingClientRect" in expression
+            return [{"height": 44, "label": "查看全部字段"}]
+
+    class MobilePage:
+        viewport_size = {"width": 375, "height": 844}
+
+        def locator(self, selector: str) -> Locator:
+            assert selector == ".trend-audit-more summary"
+            return Locator("detail-summary")
 
     report = {
         "audit": {
-            "candidates": [],
-            "excluded": {},
+            "strategy_parameters": {"min_strength": "95"},
+            "candidates": [{
+                "symbol": "600000",
+                "name": "浦发银行",
+                "eligible": False,
+                "strength": "94",
+                "excluded_reasons": ["strength_below_95"],
+            }],
+            "excluded": {"600000": ["strength_below_95"]},
             "industry_concentration": [],
             "data_sources": [],
             "actual_api_cost": None,
@@ -2985,7 +3070,10 @@ def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
         },
     }
 
-    dashboard_acceptance._check_trend_audit(Locator(), report, "futu")
+    dashboard_acceptance._check_trend_audit(Locator(), report, "eastmoney")
+    dashboard_acceptance._check_trend_audit(
+        Locator(), report, "eastmoney", page=MobilePage()
+    )
 
 
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
