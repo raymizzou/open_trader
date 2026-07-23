@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>趋势报告审计原因 UI Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f1e9;
+      --surface: #fffdf9;
+      --surface-soft: #f7f2e9;
+      --text: #26231f;
+      --muted: #6f675e;
+      --line: #ddd3c5;
+      --accent: #81572f;
+      --accent-soft: #efe3d3;
+      --danger: #a1362b;
+      --danger-soft: #f9e9e6;
+      --warn: #805819;
+      --warn-soft: #fbf1d8;
+      --ok: #356947;
+      --ok-soft: #e7f1e9;
+      --shadow: 0 12px 32px rgb(57 43 29 / 8%);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+      margin: 0;
+    }
+    button, summary { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, summary:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+      outline-offset: 2px;
+    }
+    .shell { margin: 0 auto; max-width: 1500px; padding: 28px 28px 108px; }
+    .prototype-note {
+      background: var(--warn-soft);
+      border: 1px solid #e3c886;
+      border-radius: 8px;
+      color: #624616;
+      margin-bottom: 14px;
+      padding: 9px 12px;
+    }
+    .report {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      padding: 20px;
+    }
+    .report-header {
+      align-items: end;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: 20px;
+      justify-content: space-between;
+      padding-bottom: 16px;
+    }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(22px, 3vw, 30px); }
+    h2 { font-size: 18px; }
+    .eyebrow {
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 750;
+      letter-spacing: .08em;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+    }
+    .report-meta {
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      font-size: 13px;
+      gap: 6px 14px;
+      justify-content: flex-end;
+    }
+    .summary {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin: 16px 0;
+    }
+    .summary div {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: grid;
+      gap: 2px;
+      padding: 10px 12px;
+    }
+    .summary span { color: var(--muted); font-size: 12px; }
+    .summary strong { font-size: 19px; font-variant-numeric: tabular-nums; }
+    .summary .summary-danger strong { color: var(--danger); }
+    .audit {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0 16px 16px;
+    }
+    .audit > summary {
+      align-items: center;
+      color: var(--accent);
+      cursor: pointer;
+      display: flex;
+      font-weight: 750;
+      min-height: 48px;
+    }
+    .audit-intro {
+      align-items: center;
+      display: flex;
+      gap: 14px;
+      justify-content: space-between;
+      margin: 4px 0 14px;
+    }
+    .audit-intro p { color: var(--muted); font-size: 14px; }
+    .reason-counts { display: flex; flex-wrap: wrap; gap: 6px; }
+    .count-chip, .status {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 3px 8px;
+      white-space: nowrap;
+    }
+    .status.excluded { background: var(--danger-soft); border-color: #e6bbb5; color: var(--danger); }
+    .status.missing { background: var(--warn-soft); border-color: #e3c886; color: var(--warn); }
+    .status.passed { background: var(--ok-soft); border-color: #b8d2be; color: var(--ok); }
+    .candidate-list { display: grid; gap: 10px; }
+    .candidate-card {
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--danger);
+      border-radius: 8px;
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+    }
+    .candidate-card[data-missing="true"] { border-left-color: var(--warn); }
+    .candidate-head {
+      align-items: start;
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+    }
+    .identity { display: grid; gap: 2px; }
+    .identity strong { font-size: 17px; }
+    .identity span { color: var(--muted); font-size: 13px; }
+    .reasons {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    }
+    .reason {
+      background: var(--danger-soft);
+      border: 1px solid #e8c4bf;
+      border-radius: 7px;
+      display: grid;
+      gap: 4px;
+      padding: 9px 10px;
+    }
+    .reason[data-kind="missing"] { background: var(--warn-soft); border-color: #e3c886; }
+    .reason-label { font-size: 12px; font-weight: 750; }
+    .comparison {
+      align-items: baseline;
+      display: grid;
+      gap: 7px;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    }
+    .comparison span { min-width: 0; }
+    .comparison .actual { color: var(--danger); font-weight: 750; }
+    .reason[data-kind="missing"] .actual { color: var(--warn); }
+    .comparison .arrow { color: var(--muted); }
+    .comparison .required { color: var(--muted); font-size: 13px; }
+    .facts { display: flex; flex-wrap: wrap; gap: 6px; }
+    .facts span {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      font-size: 12px;
+      padding: 3px 7px;
+    }
+    .candidate-more { border-top: 1px dashed var(--line); padding-top: 8px; }
+    .candidate-more summary { color: var(--accent); cursor: pointer; font-size: 13px; font-weight: 700; }
+    .all-facts {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 8px;
+    }
+    .all-facts div { background: var(--surface-soft); border-radius: 6px; padding: 7px 8px; }
+    .all-facts dt { color: var(--muted); font-size: 11px; }
+    .all-facts dd { font-size: 13px; font-weight: 650; margin: 2px 0 0; overflow-wrap: anywhere; }
+    .table-wrap { border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+    table { border-collapse: collapse; min-width: 980px; width: 100%; }
+    th, td { border-bottom: 1px solid var(--line); padding: 11px 12px; text-align: left; vertical-align: top; }
+    th { background: var(--surface-soft); color: var(--muted); font-size: 12px; position: sticky; top: 0; }
+    tr:last-child td { border-bottom: 0; }
+    .table-reasons { display: grid; gap: 6px; }
+    .table-reason { display: grid; gap: 1px; }
+    .table-reason strong { color: var(--danger); font-size: 13px; }
+    .table-reason span { color: var(--muted); font-size: 12px; }
+    .detail-button, .candidate-button {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--accent);
+      min-height: 40px;
+      padding: 7px 10px;
+    }
+    .detail-button:hover, .candidate-button:hover { background: var(--accent-soft); }
+    .inspector {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(250px, .75fr) minmax(0, 2fr);
+    }
+    .candidate-menu { display: grid; gap: 7px; }
+    .candidate-button {
+      align-items: center;
+      color: var(--text);
+      display: flex;
+      justify-content: space-between;
+      text-align: left;
+    }
+    .candidate-button[aria-selected="true"] { background: var(--accent-soft); border-color: var(--accent); }
+    .inspector-panel { border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    .inspector-panel .candidate-card { border: 0; padding: 0; }
+    .variant-switcher {
+      align-items: center;
+      background: #2b2722;
+      border: 1px solid #4b433a;
+      border-radius: 999px;
+      bottom: 22px;
+      box-shadow: 0 12px 34px rgb(0 0 0 / 24%);
+      color: #fff;
+      display: flex;
+      gap: 8px;
+      left: 50%;
+      padding: 7px;
+      position: fixed;
+      transform: translateX(-50%);
+      z-index: 10;
+    }
+    .variant-switcher button {
+      background: transparent;
+      border: 0;
+      border-radius: 999px;
+      color: inherit;
+      min-height: 40px;
+      min-width: 40px;
+    }
+    .variant-switcher button:hover { background: rgb(255 255 255 / 12%); }
+    .variant-switcher span { font-size: 13px; font-weight: 700; min-width: 190px; text-align: center; }
+    .variant-label { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+    .hidden { display: none !important; }
+
+    @media (max-width: 760px) {
+      .shell { padding: 12px 12px 100px; }
+      .report { padding: 14px; }
+      .report-header, .audit-intro { align-items: stretch; display: grid; }
+      .report-meta { justify-content: flex-start; }
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .audit { padding-inline: 10px; }
+      .reasons, .all-facts, .inspector { grid-template-columns: minmax(0, 1fr); }
+      .candidate-head { align-items: stretch; display: grid; }
+      .status { justify-self: start; }
+      .variant-switcher { bottom: 12px; width: calc(100% - 24px); }
+      .variant-switcher span { flex: 1; min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <p class="prototype-note"><strong>PROTOTYPE：</strong>仅用于比较审计详情布局，不连接真实账户，也不会触发交易。</p>
+    <section class="report" aria-label="A 股趋势报告审计详情原型">
+      <header class="report-header">
+        <div>
+          <p class="eyebrow">审计详情</p>
+          <h1>完整候选审计</h1>
+        </div>
+        <div class="report-meta">
+          <span>数据截至 2026-07-22</span>
+          <span>策略版本 v5</span>
+          <span>示例 5 / 17 只</span>
+        </div>
+      </header>
+      <div class="summary" aria-label="候选统计">
+        <div><span>候选信号</span><strong>17</strong></div>
+        <div><span>通过纪律</span><strong>0</strong></div>
+        <div class="summary-danger"><span>已排除</span><strong>17</strong></div>
+        <div><span>ATR / 行情排除</span><strong>0</strong></div>
+      </div>
+      <details class="audit" open>
+        <summary>审计详情</summary>
+        <div class="audit-intro">
+          <div>
+            <h2>为什么没有进入买入名单</h2>
+            <p>默认只展开未通过项目；通过指标保留在“全部审计数据”。</p>
+          </div>
+          <div class="reason-counts" aria-label="排除原因统计">
+            <span class="count-chip">行业温度 16</span>
+            <span class="count-chip">筛选价 3</span>
+            <span class="count-chip">市值 3</span>
+            <span class="count-chip">成交额 1</span>
+          </div>
+        </div>
+        <p class="variant-label" id="variant-description"></p>
+        <div id="variant-root"></div>
+      </details>
+    </section>
+  </main>
+
+  <nav class="variant-switcher" aria-label="原型版本切换">
+    <button type="button" id="previous" aria-label="上一个版本">←</button>
+    <span id="variant-name"></span>
+    <button type="button" id="next" aria-label="下一个版本">→</button>
+  </nav>
+
+  <script>
+    "use strict";
+
+    // Three audit-reason layouts, switchable with ?variant=A|B|C.
+    const candidates = [
+      {
+        symbol: "600671", name: "天目药业", industry: "中药", missing: false,
+        reasons: [
+          ["行业温度", "平", "要求：热或沸", "fail"],
+          ["总市值", "20 亿元", "要求：至少 100 亿元", "fail"],
+          ["日成交额", "1.0 亿元", "要求：至少 2 亿元", "fail"],
+        ],
+        facts: ["温 → 热", "强度 99.5", "节气 立夏", "危险信号 未触发"],
+        all: [["筛选价", "21.52 元"], ["执行参考价", "21.52 元"], ["行业", "中药"], ["行业 ID", "621743"], ["ATR14", "1.53"], ["右侧天数", "1 天"], ["可交易", "是"], ["趋势右侧", "是"]],
+      },
+      {
+        symbol: "600236", name: "桂冠电力", industry: "电力", missing: false,
+        reasons: [["行业温度", "平", "要求：热或沸", "fail"]],
+        facts: ["温 → 沸", "强度 99.3", "节气 立夏", "危险信号 未触发"],
+        all: [["筛选价", "12.54 元"], ["执行参考价", "12.24 元"], ["总市值", "960 亿元"], ["日成交额", "9.0 亿元"], ["ATR14", "0.58"], ["右侧天数", "1 天"], ["可交易", "是"], ["趋势右侧", "是"]],
+      },
+      {
+        symbol: "301536", name: "星宸科技", industry: "半导体", missing: false,
+        reasons: [["行业温度", "平", "要求：热或沸", "fail"]],
+        facts: ["温 → 沸", "强度 99.5", "节气 立夏", "危险信号 未触发"],
+        all: [["筛选价", "137.00 元"], ["执行参考价", "137.00 元"], ["总市值", "250 亿元"], ["日成交额", "50.0 亿元"], ["ATR14", "12.23"], ["右侧天数", "1 天"], ["可交易", "是"], ["趋势右侧", "是"]],
+      },
+      {
+        symbol: "300779", name: "惠城环保", industry: "公用事业", missing: true,
+        reasons: [["行业温度", "数据未提供", "要求：热或沸", "missing"]],
+        facts: ["温 → 沸", "强度 97.5", "节气 立夏", "危险信号 未触发"],
+        all: [["筛选价", "69.12 元"], ["执行参考价", "69.12 元"], ["总市值", "150 亿元"], ["日成交额", "17.0 亿元"], ["ATR14", "5.42"], ["右侧天数", "1 天"], ["可交易", "是"], ["趋势右侧", "是"]],
+      },
+      {
+        symbol: "688235", name: "百济神州", industry: "化学制药", missing: false,
+        reasons: [
+          ["筛选价", "277.28 元", "要求：不高于 200 元", "fail"],
+          ["行业温度", "温", "要求：热或沸", "fail"],
+        ],
+        facts: ["温 → 热", "强度 97.6", "节气 立夏", "危险信号 未触发"],
+        all: [["执行参考价", "277.29 元"], ["总市值", "1,530 亿元"], ["日成交额", "16.0 亿元"], ["ATR14", "18.01"], ["右侧天数", "1 天"], ["可交易", "是"], ["趋势右侧", "是"], ["行业 ID", "621707"]],
+      },
+    ];
+
+    const variants = {
+      A: ["A — 原因优先卡片", "先读失败原因，再按需展开完整事实；推荐方案。"],
+      B: ["B — 紧凑对照表", "适合桌面快速横向扫描，手机端需要转为卡片。"],
+      C: ["C — 名单 + 详情检查器", "左侧快速切换标的，右侧集中阅读一只股票。"],
+    };
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[char]));
+    }
+
+    function status(candidate) {
+      return `<span class="status ${candidate.missing ? "missing" : "excluded"}">${candidate.missing ? "数据缺失" : `已排除 · ${candidate.reasons.length} 项未通过`}</span>`;
+    }
+
+    function reasons(candidate) {
+      return `<div class="reasons">${candidate.reasons.map(([label, actual, required, kind]) => `
+        <div class="reason" data-kind="${kind}">
+          <span class="reason-label">${escapeHtml(label)}</span>
+          <div class="comparison">
+            <span class="actual">${escapeHtml(actual)}</span>
+            <span class="arrow" aria-hidden="true">→</span>
+            <span class="required">${escapeHtml(required)}</span>
+          </div>
+        </div>`).join("")}</div>`;
+    }
+
+    function allFacts(candidate) {
+      return `<details class="candidate-more"><summary>展开全部审计数据</summary>
+        <dl class="all-facts">${candidate.all.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+      </details>`;
+    }
+
+    function card(candidate) {
+      return `<article class="candidate-card" data-missing="${candidate.missing}">
+        <header class="candidate-head">
+          <div class="identity"><strong>${escapeHtml(candidate.symbol)} ${escapeHtml(candidate.name)}</strong><span>${escapeHtml(candidate.industry)}</span></div>
+          ${status(candidate)}
+        </header>
+        ${reasons(candidate)}
+        <div class="facts">${candidate.facts.map((fact) => `<span>${escapeHtml(fact)}</span>`).join("")}</div>
+        ${allFacts(candidate)}
+      </article>`;
+    }
+
+    function renderA() {
+      return `<div class="candidate-list">${candidates.map(card).join("")}</div>`;
+    }
+
+    function renderB() {
+      return `<div class="table-wrap"><table>
+        <thead><tr><th>标的</th><th>结论</th><th>未通过项目：实际值 → 要求</th><th>已通过的关键事实</th><th>审计</th></tr></thead>
+        <tbody>${candidates.map((candidate) => `<tr>
+          <td><strong>${escapeHtml(candidate.symbol)}</strong><br>${escapeHtml(candidate.name)}<br><small>${escapeHtml(candidate.industry)}</small></td>
+          <td>${status(candidate)}</td>
+          <td><div class="table-reasons">${candidate.reasons.map(([label, actual, required]) => `<div class="table-reason"><strong>${escapeHtml(label)}：${escapeHtml(actual)}</strong><span>${escapeHtml(required)}</span></div>`).join("")}</div></td>
+          <td>${candidate.facts.map(escapeHtml).join("<br>")}</td>
+          <td><button class="detail-button" type="button" data-table-detail="${escapeHtml(candidate.symbol)}">展开数据</button></td>
+        </tr>`).join("")}</tbody>
+      </table></div>`;
+    }
+
+    function renderInspector(index = 0) {
+      const root = document.querySelector("#variant-root");
+      const candidate = candidates[index] || candidates[0];
+      root.innerHTML = `<div class="inspector">
+        <div class="candidate-menu" role="listbox" aria-label="候选标的">
+          ${candidates.map((item, itemIndex) => `<button class="candidate-button" type="button" role="option" aria-selected="${itemIndex === index}" data-candidate="${itemIndex}"><span><strong>${escapeHtml(item.symbol)}</strong> ${escapeHtml(item.name)}</span><span>${item.reasons.length} 项</span></button>`).join("")}
+        </div>
+        <section class="inspector-panel" aria-live="polite">${card(candidate)}</section>
+      </div>`;
+      root.querySelectorAll("[data-candidate]").forEach((button) => {
+        button.addEventListener("click", () => renderInspector(Number(button.dataset.candidate)));
+      });
+    }
+
+    function currentVariant() {
+      const requested = new URLSearchParams(window.location.search).get("variant")?.toUpperCase();
+      return variants[requested] ? requested : "A";
+    }
+
+    function setVariant(variant) {
+      const params = new URLSearchParams(window.location.search);
+      params.set("variant", variant);
+      window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+      render();
+    }
+
+    function cycle(direction) {
+      const keys = Object.keys(variants);
+      const index = keys.indexOf(currentVariant());
+      setVariant(keys[(index + direction + keys.length) % keys.length]);
+    }
+
+    function render() {
+      const variant = currentVariant();
+      document.querySelector("#variant-name").textContent = variants[variant][0];
+      document.querySelector("#variant-description").textContent = variants[variant][1];
+      const root = document.querySelector("#variant-root");
+      if (variant === "A") root.innerHTML = renderA();
+      if (variant === "B") root.innerHTML = renderB();
+      if (variant === "C") renderInspector();
+      document.title = `${variants[variant][0]} · 趋势报告审计 UI`;
+    }
+
+    document.querySelector("#previous").addEventListener("click", () => cycle(-1));
+    document.querySelector("#next").addEventListener("click", () => cycle(1));
+    window.addEventListener("keydown", (event) => {
+      if (["INPUT", "TEXTAREA"].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+      if (event.key === "ArrowLeft") cycle(-1);
+      if (event.key === "ArrowRight") cycle(1);
+    });
+    window.addEventListener("popstate", render);
+    render();
+  </script>
+</body>
+</html>
