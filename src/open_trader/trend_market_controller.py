@@ -1111,8 +1111,23 @@ def _notify_channels_once(
         / execution_date
         / f"{digest}.json"
     )
+    legacy_path = (
+        path.with_name(
+            f"{hashlib.sha256('|'.join((market, execution_date, 'controller', reason)).encode('utf-8')).hexdigest()}.json"
+        )
+        if action == "review"
+        else None
+    )
     try:
         with _notification_retry_lock(path):
+            if legacy_path is not None:
+                with _notification_retry_lock(legacy_path):
+                    if legacy_path.exists() and _read_json(
+                        legacy_path, "trend controller notification"
+                    ).get("schema_version") == (
+                        "open_trader.trend_controller.notification.v1"
+                    ):
+                        return True
             if path.exists():
                 state = _read_json(path, "trend controller notification")
                 if (

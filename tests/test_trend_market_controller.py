@@ -496,6 +496,52 @@ def test_legacy_controller_notification_is_not_replayed(
     assert macos.messages == []
 
 
+def test_legacy_review_notification_is_not_replayed_as_current_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent = _record_controller_notification_attempts(monkeypatch)
+    legacy_identity = "|".join(
+        ("US", "2026-07-22", "controller", "RuntimeError")
+    )
+    legacy_digest = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+    legacy_path = (
+        config.data_dir
+        / "trend_controller/US/notifications/2026-07-22"
+        / f"{legacy_digest}.json"
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_controller.notification.v1",
+            "market": "US",
+            "execution_date": "2026-07-22",
+            "action": "controller",
+            "reason": "RuntimeError",
+            "notified_at": "2026-07-22T09:00:00+08:00",
+            "channels": ["macos"],
+        }),
+        encoding="utf-8",
+    )
+    review_identity = "|".join(
+        ("US", "2026-07-22", "review", "RuntimeError")
+    )
+    review_digest = hashlib.sha256(review_identity.encode("utf-8")).hexdigest()
+    review_path = legacy_path.with_name(f"{review_digest}.json")
+
+    assert controller._notify_controller_failure(
+        config,
+        "US",
+        "2026-07-22",
+        "review",
+        RuntimeError("same exception"),
+        datetime.fromisoformat("2026-07-22T10:00:00+08:00"),
+    ) is True
+
+    assert sent == []
+    assert not review_path.exists()
+
+
 def test_protection_blocker_notifies_feishu_once_per_market_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
