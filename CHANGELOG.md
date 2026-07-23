@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-23
 
+- Unified CN/HK/US Trend Animals `boiling`/`champagne` exits: the first signal
+  per full position lifecycle trims 30% in SIMULATE (market-lot rounded), while
+  protection, danger, right-side exit, and CN temperature-flat still sell all;
+  real accounts remain manual. Verified the Dashboard acceptance gate (`PASS`)
+  on deployed SHA `b6b94ce` and `3166` tests after merging to `main`.
 - Fixed Dashboard manual refresh to invalidate and reload the active Tiger,
   Phillips, or Eastmoney simulated-holdings view, so post-report additions do
   not remain stale; verified `3026` tests, live Dashboard/API refreshes, and
