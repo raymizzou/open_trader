@@ -175,7 +175,14 @@ def run_drawdown_preflight(
             continue
         key = (market, strategy_id, strategy_version)
         was_present = key in existing_keys
-        if not was_present and item.baseline_equity is None:
+        # Only the approved v5 strategy migration may use audited prior equity.
+        # Legacy v1-v4 versions must still fail closed when their frozen
+        # completed-date baseline is unavailable.
+        migratable_v5 = (
+            strategy_id == f"trend_animals_warm_to_hot/{market}/v5"
+            and strategy_version == "v5"
+        )
+        if migratable_v5 and not was_present and item.baseline_equity is None:
             migrated_equity = audited_prior_strategy_equity(
                 data_dir, market=market
             )

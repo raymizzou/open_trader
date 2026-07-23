@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -65,6 +66,7 @@ PROTECTION_STATE_ROOTS = {
     "HK": "trend_hk_phillips",
     "US": "trend_us_tiger",
 }
+REPORT_STEM = re.compile(r"\d{4}-\d{2}-\d{2}(?:-r\d+)?\Z")
 
 
 class TrendReplayIncompleteError(ValueError):
@@ -493,12 +495,20 @@ def _validate_execution_batch(
         raise ValueError("trend execution batch has an invalid locked_at") from None
     report_sha = payload.get("report_sha256")
     report_revision = payload.get("report_revision", 0)
+    report_path = Path(str(payload.get("report_path") or ""))
+    report_match = REPORT_STEM.fullmatch(report_path.stem)
+    report_path_revision = (
+        int(report_path.stem.rsplit("-r", 1)[1])
+        if report_match is not None and "-r" in report_path.stem
+        else 0
+    )
     if (
         payload.get("schema_version") != "open_trader.trend_review.batch.v1"
         or payload.get("market") != market
         or payload.get("execution_date") != execution_date
         or not isinstance(payload.get("report_path"), str)
         or not payload["report_path"]
+        or revision > 0 and report_match is None
         or not isinstance(report_sha, str)
         or len(report_sha) != 64
         or any(character not in "0123456789abcdef" for character in report_sha)
@@ -508,6 +518,7 @@ def _validate_execution_batch(
         or not isinstance(report_revision, int)
         or report_revision < 0
         or report_revision != revision
+        or revision > 0 and report_path_revision != revision
     ):
         raise ValueError("trend execution batch is invalid")
     return payload

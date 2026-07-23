@@ -156,6 +156,29 @@ def test_new_strategy_version_migrates_from_audited_prior_equity(
     assert event["reason"] == "new_strategy_version"
 
 
+def test_legacy_strategy_without_frozen_baseline_does_not_migrate_from_prior(
+    tmp_path: Path,
+) -> None:
+    prior = market_input("CN")
+    assert run_preflight(tmp_path, {"CN": prior})["status"] == "ready"
+    legacy = replace(
+        prior,
+        strategy_snapshot={
+            **prior.strategy_snapshot,
+            "strategy_id": "trend_animals_warm_to_hot/CN/v3",
+            "strategy_version": "v3",
+        },
+        baseline_equity=None,
+    )
+
+    result = run_preflight(tmp_path, {"CN": legacy})
+
+    assert result["status"] == "failed"
+    assert result["markets"][0]["failure_status"] == "baseline_unavailable"
+    state = json.loads((tmp_path / "data/trend_drawdown/state.json").read_text())
+    assert not any(item.get("strategy_version") == "v3" for item in state["records"])
+
+
 def test_preflight_accepts_the_approved_v4_overheat_trim_transition(
     tmp_path: Path,
 ) -> None:

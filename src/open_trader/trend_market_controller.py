@@ -1901,7 +1901,13 @@ def _revision_state(
     if not completion_path.exists():
         return request, None
     completion = _read_json(completion_path, "trend report revision completion")
-    report_path = Path(str(completion.get("report_path") or ""))
+    report_path_value = completion.get("report_path")
+    report_path = Path(str(report_path_value or ""))
+    report_path_confined = (
+        isinstance(report_path_value, str)
+        and bool(report_path_value)
+        and report_path.resolve().parent == _report_dir(config, market).resolve()
+    )
     report = _read_json(report_path, "completed trend report revision")
     try:
         completed_at = datetime.fromisoformat(str(completion["completed_at"]))
@@ -1921,6 +1927,7 @@ def _revision_state(
         or completion.get("request_path") != str(request_path)
         or completion.get("request_sha256")
         != hashlib.sha256(request_path.read_bytes()).hexdigest()
+        or not report_path_confined
         or _report_order(report_path)[0] != as_of_date
         or _report_order(report_path)[1] <= max(0, baseline_revision)
         or not _valid_report(config, market, execution_date, report_path, report)
