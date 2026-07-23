@@ -5258,7 +5258,7 @@ def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
 ) -> None:
     config = controller_config(tmp_path)
     expected = {"status": "uncertain", "submitted_count": 0}
-    notifications: list[tuple[str, str, object, object]] = []
+    notifications: list[tuple[str, str, object]] = []
 
     class Orders:
         closed = False
@@ -5273,10 +5273,9 @@ def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
     )
     monkeypatch.setattr(
         controller,
-        "_notify_once",
-        lambda title, message, key, **kwargs: notifications.append(
-            (title, message, key, kwargs.get("channels"))
-        ) or True,
+        "_notify_feishu_once",
+        lambda title, message, key: notifications.append((title, message, key))
+        or True,
     )
 
     assert controller._run_stop(
@@ -5292,7 +5291,6 @@ def test_run_stop_returns_uncertain_upgrade_and_notifies_once(
     assert orders.closed is True
     assert len(notifications) == 1
     assert notifications[0][2][3:5] == ("protection_sell", "uncertain")
-    assert notifications[0][3] == {"feishu", "feishu_app"}
 
 
 def test_default_protection_loader_gates_each_new_account_context(
