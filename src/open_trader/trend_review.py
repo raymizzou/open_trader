@@ -9,12 +9,13 @@ import os
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, time
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import UTC, date, datetime, time
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
+from .models import TradeFill
 
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
@@ -33,6 +34,16 @@ BENCHMARK_FUTU_SYMBOLS = {
     "CN": "SH.000985",
     "US": "US.SPY",
     "HK": "HK.800701",
+}
+TREND_V1_EFFECTIVE_FROM = {
+    "CN": "2026-07-16",
+    "US": "2026-07-17",
+    "HK": "2026-07-17",
+}
+ACTUAL_FILL_MARKETS_BY_BROKER = {
+    "eastmoney": "CN",
+    "phillips": "HK",
+    "tiger": "US",
 }
 REJECTED_ORDER_STATUSES = {
     "FAILED",
@@ -122,19 +133,56 @@ def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
     ).encode()
 
 
-def _write_immutable(path: Path, body: bytes) -> Path:
+def _create_immutable(path: Path, body: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         if path.read_bytes() != body:
             raise FileExistsError(f"immutable artifact collision: {path}") from None
-        return path
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(body)
-        handle.flush()
-        os.fsync(handle.fileno())
+        return False
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def _write_immutable(path: Path, body: bytes) -> Path:
+    _create_immutable(path, body)
     return path
+
+
+def _write_immutable_batch(artifacts: Sequence[tuple[Path, bytes]]) -> None:
+    prepared: dict[Path, bytes] = {}
+    for path, body in artifacts:
+        previous = prepared.get(path)
+        if previous is not None and previous != body:
+            raise FileExistsError(f"immutable artifact collision: {path}")
+        prepared[path] = body
+    for path, body in prepared.items():
+        if path.exists() and path.read_bytes() != body:
+            raise FileExistsError(f"immutable artifact collision: {path}")
+
+    created: list[Path] = []
+    try:
+        for path, body in prepared.items():
+            if _create_immutable(path, body):
+                created.append(path)
+    except Exception:
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _market(value: object) -> str:
@@ -142,6 +190,252 @@ def _market(value: object) -> str:
     if market not in {"CN", "US", "HK"}:
         raise ValueError(f"unsupported trend review market: {value}")
     return market
+
+
+def _fact_path(
+    data_dir: Path, stream: str, market: str, trading_date: str
+) -> Path:
+    return (
+        data_dir
+        / "trend_review"
+        / "facts"
+        / stream
+        / market
+        / f"{trading_date}.json"
+    )
+
+
+def freeze_discipline_fact(
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    equity: object,
+    orders: Sequence[Mapping[str, object]],
+    strategy_snapshot: Mapping[str, object],
+) -> Path:
+    market = _market(market)
+    payload = {
+        "schema_version": "open_trader.trend_review.discipline.v1",
+        "market": market,
+        "date": trading_date,
+        "equity_after_fees": str(_required_decimal(equity, "discipline equity")),
+        "orders": [dict(order) for order in orders],
+        "strategy_snapshot": dict(strategy_snapshot),
+    }
+    return _write_immutable(
+        _fact_path(data_dir, "discipline", market, trading_date),
+        _canonical_json_bytes(payload),
+    )
+
+
+def freeze_actual_equity_fact(
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    equity: object,
+    opening_positions: Sequence[Mapping[str, object]],
+    strategy_snapshot: Mapping[str, object],
+) -> Path:
+    market = _market(market)
+    payload = {
+        "schema_version": "open_trader.trend_review.actual_equity.v1",
+        "market": market,
+        "date": trading_date,
+        "equity": str(_required_decimal(equity, "actual equity")),
+        "opening_positions": [dict(position) for position in opening_positions],
+        "strategy_snapshot": dict(strategy_snapshot),
+    }
+    return _write_immutable(
+        _fact_path(data_dir, "actual_equity", market, trading_date),
+        _canonical_json_bytes(payload),
+    )
+
+
+def freeze_benchmark_fact(
+    data_dir: Path,
+    market: str,
+    trading_date: str,
+    benchmark: Mapping[str, object],
+) -> Path:
+    market = _market(market)
+    validated = _validate_benchmark(
+        benchmark, market=market, trading_date=trading_date
+    )
+    payload = {
+        "schema_version": "open_trader.trend_review.benchmark.v1",
+        "market": market,
+        "date": trading_date,
+        "benchmark": dict(validated),
+    }
+    return _write_immutable(
+        _fact_path(data_dir, "benchmark", market, trading_date),
+        _canonical_json_bytes(payload),
+    )
+
+
+def _actual_fill_identity(fill: Mapping[str, object]) -> tuple[str, str, str]:
+    return (
+        str(fill["broker"]),
+        str(fill["account_alias"]),
+        str(fill["source_id"]),
+    )
+
+
+def _compatible_actual_fill_body(
+    path: Path, payload: Mapping[str, object]
+) -> bytes:
+    body = _canonical_json_bytes(payload)
+    if not path.exists():
+        return body
+    existing_body = path.read_bytes()
+    try:
+        existing = json.loads(existing_body)
+    except (UnicodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(existing, dict) or "source_sequence" not in existing:
+        return body
+    source_sequence = existing.pop("source_sequence")
+    if source_sequence is not None and (
+        not isinstance(source_sequence, int)
+        or isinstance(source_sequence, bool)
+        or source_sequence < 0
+    ):
+        return body
+    return existing_body if _canonical_json_bytes(existing) == body else body
+
+
+def freeze_actual_fill_batch(
+    data_dir: Path,
+    source_metadata: Mapping[str, object],
+    fills: Sequence[TradeFill],
+    complete_through: str,
+    *,
+    coverage_start: str | None = None,
+) -> list[Path]:
+    try:
+        complete_date = date.fromisoformat(complete_through)
+    except ValueError:
+        raise ValueError("actual fill complete_through must be an ISO date") from None
+    if complete_date.isoformat() != complete_through:
+        raise ValueError("actual fill complete_through must be an ISO date")
+    coverage_start = coverage_start or complete_through
+    try:
+        coverage_start_date = date.fromisoformat(coverage_start)
+    except ValueError:
+        raise ValueError("actual fill coverage_start must be an ISO date") from None
+    if (
+        coverage_start_date.isoformat() != coverage_start
+        or coverage_start_date > complete_date
+    ):
+        raise ValueError("actual fill coverage_start must not follow complete_through")
+    broker = str(source_metadata.get("broker") or "").lower()
+    broker_market = ACTUAL_FILL_MARKETS_BY_BROKER.get(broker)
+    explicit_market = source_metadata.get("market")
+    raw_market = explicit_market if explicit_market is not None else broker_market
+    if raw_market is None and fills:
+        raw_market = fills[0].market
+    market = _market(raw_market)
+    if broker_market is not None and market != broker_market:
+        raise ValueError("actual fill source metadata market does not match broker")
+    paths: list[Path] = []
+    identities: list[tuple[str, str, str]] = []
+    artifacts: list[tuple[Path, bytes]] = []
+    fill_order: list[dict[str, object]] = []
+    for fill in fills:
+        if not isinstance(fill, TradeFill):
+            raise ValueError("actual fill must be a TradeFill")
+        if _market(fill.market) != market:
+            raise ValueError("actual fill market does not match source metadata")
+        payload = {
+            "schema_version": "open_trader.trend_review.fill.v1",
+            **asdict(fill),
+        }
+        if any(
+            not str(payload.get(field) or "").strip()
+            for field in (
+                "source_id",
+                "broker",
+                "account_alias",
+                "symbol",
+                "currency",
+                "executed_at",
+            )
+        ):
+            raise ValueError("actual fill has missing required fields")
+        if payload["side"] not in {"BUY", "SELL"}:
+            raise ValueError("actual fill side must be BUY or SELL")
+        if _required_decimal(payload["quantity"], "fill quantity") <= 0:
+            raise ValueError("fill quantity must be positive")
+        if _required_decimal(payload["price"], "fill price") <= 0:
+            raise ValueError("fill price must be positive")
+        if payload["fees"] is not None:
+            _required_decimal(payload["fees"], "fill fees")
+        source_sequence = payload.get("source_sequence")
+        if source_sequence is not None and (
+            not isinstance(source_sequence, int)
+            or isinstance(source_sequence, bool)
+            or source_sequence < 0
+        ):
+            raise ValueError("actual fill source_sequence must be a non-negative integer")
+        payload.pop("source_sequence")
+        executed_at = str(payload["executed_at"])
+        try:
+            execution_date = (
+                date.fromisoformat(executed_at)
+                if len(executed_at) == 10
+                else datetime.fromisoformat(executed_at.replace("Z", "+00:00")).date()
+            )
+        except ValueError:
+            raise ValueError(
+                "actual fill executed_at must be an ISO date or timestamp"
+            ) from None
+        if execution_date > complete_date:
+            raise ValueError("actual fill is later than complete_through")
+        identity = _actual_fill_identity(payload)
+        digest = hashlib.sha256(
+            _canonical_json_bytes({"identity": identity})
+        ).hexdigest()
+        path = (
+            data_dir
+            / "trend_review"
+            / "facts"
+            / "actual_fills"
+            / market
+            / f"{digest}.json"
+        )
+        paths.append(path)
+        artifacts.append((path, _compatible_actual_fill_body(path, payload)))
+        identities.append(identity)
+        fill_order.append(
+            {
+                "identity": list(identity),
+                "source_sequence": source_sequence,
+            }
+        )
+    completeness = {
+        "schema_version": "open_trader.trend_review.fill_completeness.v1",
+        "market": market,
+        "complete_through": complete_through,
+        "coverage_start": coverage_start,
+        "coverage_end": complete_through,
+        "source_metadata": dict(source_metadata),
+        "fill_identities": sorted(identities),
+        "fill_order": fill_order,
+    }
+    digest = hashlib.sha256(_canonical_json_bytes(completeness)).hexdigest()
+    artifacts.append(
+        (
+            data_dir
+            / "trend_review"
+            / "facts"
+            / "actual_fill_completeness"
+            / market
+            / f"{digest}.json",
+            _canonical_json_bytes(completeness),
+        )
+    )
+    _write_immutable_batch(artifacts)
+    return paths
 
 
 def freeze_trend_evidence(
@@ -3734,6 +4028,247 @@ def capture_trend_review_close(
     return _write_immutable(path, _canonical_json_bytes(payload))
 
 
+def validate_trend_review_close_report(
+    report: Mapping[str, object], trading_date: str, market: str
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    market = _market(market)
+    account = report.get("account")
+    if not isinstance(account, Mapping):
+        raise ValueError("trend report account is unavailable")
+    strategy_snapshot = report.get("strategy_snapshot")
+    try:
+        strategy_snapshot = normalize_trend_strategy_snapshot(
+            strategy_snapshot, market
+        )
+    except ValueError:
+        raise ValueError("trend report strategy snapshot is unavailable")
+    if account.get("fresh") is True and account.get("source_date") == trading_date:
+        _required_decimal(account.get("net_value"), "actual net value")
+        positions = account.get("positions")
+        if not isinstance(positions, list) or any(
+            not isinstance(position, Mapping) for position in positions
+        ):
+            raise ValueError("trend report account positions are unavailable")
+    return account, strategy_snapshot
+
+
+def _legacy_strategy_snapshot_variants(
+    expected: Mapping[str, object], market: str,
+) -> tuple[dict[str, object], ...]:
+    """Return the immutable pre-v3 snapshot shapes still found on disk."""
+    base = copy.deepcopy(dict(expected))
+    base["strategy_id"] = f"trend_animals_warm_to_hot/{market}/v1"
+    base["strategy_version"] = "v1"
+    base["effective_from"] = "2026-07-14"
+    parameters = base.get("parameters")
+    rows = base.get("parameter_rows")
+    if not isinstance(parameters, dict) or not isinstance(rows, list):
+        return ()
+    removed_parameters = {
+        "single_entry_risk_limit",
+        "portfolio_risk_limit",
+        "abnormal_loss_buffer",
+        "normal_cost_rate",
+        "normal_cost_model",
+        "overheat_trim_fraction",
+        "overheat_trim_once_per_position",
+        "overheat_trim_signals",
+        "overheat_trim_rounding",
+        "overheat_trim_below_lot",
+        "full_exit_precedes_partial_exit",
+        "kelly_sample_minimum",
+        "kelly_rolling_window",
+        "kelly_fraction",
+        "kelly_optimizer",
+        "kelly_sample_scope",
+        "kelly_source",
+    }
+    for key in removed_parameters:
+        parameters.pop(key, None)
+    riskless_current_rows = copy.deepcopy(dict(expected))
+    riskless_current_rows["strategy_id"] = (
+        f"trend_animals_warm_to_hot/{market}/v1"
+    )
+    riskless_current_rows["strategy_version"] = "v1"
+    riskless_current_rows["effective_from"] = "2026-07-14"
+    riskless_parameters = riskless_current_rows.get("parameters")
+    if isinstance(riskless_parameters, dict):
+        for key in (
+            "single_entry_risk_limit",
+            "portfolio_risk_limit",
+            "abnormal_loss_buffer",
+            "normal_cost_rate",
+            "normal_cost_model",
+        ):
+            riskless_parameters.pop(key, None)
+    row_names_to_drop = {
+        "单笔计划止损风险上限",
+        "组合正常计划风险上限",
+        "异常损失缓冲",
+        "过热止盈比例",
+        "过热止盈信号",
+        "过热止盈次数",
+        "过热止盈取整",
+        "不足一手处理",
+        "清仓优先级",
+    }
+    filtered_rows: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("name") in row_names_to_drop:
+            continue
+        item = dict(row)
+        if item.get("name") == "买入数量":
+            item["value"] = (
+                "按 1 股整数倍向下取整"
+                if market == "US"
+                else "按 100 股整数倍向下取整"
+                if market == "CN"
+                else "按 Futu 返回的每标的整手股数向下取整"
+            )
+        elif item.get("name") == "过热跟踪":
+            item["value"] = "此前 5 个完整交易日最低价；保护线只升不降"
+        filtered_rows.append(item)
+    base["parameter_rows"] = filtered_rows
+    variants = [riskless_current_rows]
+    mapped_riskless = copy.deepcopy(riskless_current_rows)
+    mapped_riskless["effective_from"] = {
+        "CN": "2026-07-16",
+        "US": "2026-07-17",
+        "HK": "2026-07-17",
+    }[market]
+    variants.append(mapped_riskless)
+    variants.append(base)
+    effective_from = {
+        "CN": "2026-07-16",
+        "US": "2026-07-17",
+        "HK": "2026-07-17",
+    }[market]
+    mapped_base = copy.deepcopy(base)
+    mapped_base["effective_from"] = effective_from
+    variants.append(mapped_base)
+
+    feature = copy.deepcopy(base)
+    feature_parameters = feature["parameters"]
+    assert isinstance(feature_parameters, dict)
+    feature_parameters["use_available_cash"] = True
+    feature_parameters["trailing_activation_signals"] = ["boiling", "champagne"]
+    feature_rows = feature["parameter_rows"]
+    assert isinstance(feature_rows, list)
+    for row in feature_rows:
+        if row.get("name") == "买入数量":
+            row["value"] = f"使用已有现金，{row['value']}"
+        elif row.get("name") == "过热跟踪":
+            row["value"] = (
+                "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降"
+            )
+    variants.append(feature)
+    mapped_feature = copy.deepcopy(feature)
+    mapped_feature["effective_from"] = effective_from
+    variants.append(mapped_feature)
+    return tuple(variants)
+
+
+def normalize_trend_strategy_snapshot(
+    snapshot: object,
+    market: str,
+    *,
+    expected_snapshot: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    market = _market(market)
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("strategy snapshot is unavailable")
+    if expected_snapshot is None:
+        parameters = snapshot.get("parameters")
+        pools = (
+            parameters.get("candidate_pool_ids")
+            if isinstance(parameters, Mapping)
+            else None
+        )
+        process_version = snapshot.get("process_version")
+        if (
+            not isinstance(pools, list)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in pools
+            )
+            or not isinstance(process_version, str)
+        ):
+            raise ValueError("strategy snapshot is unavailable")
+        from .a_share_trend import (
+            live_trend_strategy_snapshot,
+            trend_strategy_snapshot,
+        )
+
+        if snapshot.get("strategy_version") == "v4":
+            expected_snapshot = live_trend_strategy_snapshot(
+                market, process_version, pools
+            )
+        else:
+            expected_snapshot = trend_strategy_snapshot(
+                market, process_version, pools
+            )
+            if snapshot.get("strategy_version") == "v2":
+                expected_snapshot = {
+                    **expected_snapshot,
+                    "strategy_id": f"trend_animals_warm_to_hot/{market}/v2",
+                    "strategy_version": "v2",
+                }
+    expected = copy.deepcopy(dict(expected_snapshot))
+    if _canonical_json_bytes(dict(snapshot)) == _canonical_json_bytes(expected):
+        return expected
+
+    if any(
+        _canonical_json_bytes(dict(snapshot)) == _canonical_json_bytes(variant)
+        for variant in _legacy_strategy_snapshot_variants(expected, market)
+    ):
+        return expected
+
+    legacy = copy.deepcopy(expected)
+    legacy["effective_from"] = "2026-07-14"
+    legacy_parameters = legacy.get("parameters")
+    if not isinstance(legacy_parameters, dict):
+        raise ValueError("strategy snapshot is unavailable")
+    legacy_parameters.pop("use_available_cash", None)
+    legacy_parameters.pop("trailing_activation_signals", None)
+    old_buy_quantity = {
+        "CN": "按 100 股整数倍向下取整",
+        "US": "按 1 股整数倍向下取整",
+        "HK": "按 Futu 返回的每标的整手股数向下取整",
+    }[market]
+    rows = legacy.get("parameter_rows")
+    if not isinstance(rows, list):
+        raise ValueError("strategy snapshot is unavailable")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("strategy snapshot is unavailable")
+        if row.get("name") == "买入数量":
+            row["value"] = old_buy_quantity
+        elif row.get("name") == "过热跟踪":
+            row["value"] = "此前 5 个完整交易日最低价；保护线只升不降"
+    if _canonical_json_bytes(dict(snapshot)) != _canonical_json_bytes(legacy):
+        raise ValueError(
+            "strategy snapshot does not match current or known legacy rules"
+        )
+    return expected
+
+
+def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
+    return _canonical_json_bytes(
+        {
+            key: snapshot[key]
+            for key in (
+                "strategy_id",
+                "strategy_name",
+                "strategy_version",
+                "market",
+                "effective_from",
+                "parameters",
+                "parameter_rows",
+            )
+        }
+    )
+
+
 def _validate_benchmark(
     benchmark: object, *, market: str, trading_date: str
 ) -> Mapping[str, object]:
@@ -3769,6 +4304,238 @@ def _load_daily_facts(data_dir: Path, market: str) -> list[dict[str, object]]:
     if not facts:
         raise ValueError(f"no trend review daily facts for {market}")
     return facts
+
+
+def _load_dated_fact_stream(
+    data_dir: Path,
+    stream: str,
+    market: str,
+    schema_version: str,
+) -> list[dict[str, object]]:
+    root = data_dir / "trend_review" / "facts" / stream / market
+    facts: list[dict[str, object]] = []
+    for path in sorted(root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != schema_version
+            or payload.get("market") != market
+            or payload.get("date") != path.stem
+        ):
+            raise ValueError(f"invalid trend review {stream} fact: {path}")
+        facts.append(payload)
+    return facts
+
+
+def _load_actual_fills(
+    data_dir: Path, market: str
+) -> tuple[list[dict[str, object]], list[tuple[str, str]]]:
+    fills: list[dict[str, object]] = []
+    root = data_dir / "trend_review" / "facts" / "actual_fills" / market
+    for path in sorted(root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version")
+            != "open_trader.trend_review.fill.v1"
+            or payload.get("market") != market
+        ):
+            raise ValueError(f"invalid trend review actual fill fact: {path}")
+        fills.append(payload)
+    coverage: list[tuple[str, str]] = []
+    source_sequences: dict[tuple[str, str, str], set[int | None]] = {}
+    completeness_root = (
+        data_dir
+        / "trend_review"
+        / "facts"
+        / "actual_fill_completeness"
+        / market
+    )
+    for path in sorted(completeness_root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version")
+            != "open_trader.trend_review.fill_completeness.v1"
+            or payload.get("market") != market
+        ):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        coverage_end = str(
+            payload.get("coverage_end") or payload.get("complete_through") or ""
+        )
+        coverage_start = str(payload.get("coverage_start") or coverage_end)
+        try:
+            start_date = date.fromisoformat(coverage_start)
+            end_date = date.fromisoformat(coverage_end)
+        except ValueError:
+            raise ValueError(
+                f"invalid trend review fill completeness fact: {path}"
+            ) from None
+        if (
+            start_date.isoformat() != coverage_start
+            or end_date.isoformat() != coverage_end
+            or start_date > end_date
+        ):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        coverage.append((coverage_start, coverage_end))
+        raw_order = payload.get("fill_order", [])
+        if not isinstance(raw_order, list):
+            raise ValueError(f"invalid trend review fill completeness fact: {path}")
+        for item in raw_order:
+            if (
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("identity"), list)
+                or len(item["identity"]) != 3
+            ):
+                raise ValueError(f"invalid trend review fill completeness fact: {path}")
+            identity = tuple(str(value) for value in item["identity"])
+            sequence = item.get("source_sequence")
+            if sequence is not None and (
+                not isinstance(sequence, int)
+                or isinstance(sequence, bool)
+                or sequence < 0
+            ):
+                raise ValueError(f"invalid trend review fill completeness fact: {path}")
+            source_sequences.setdefault(identity, set()).add(sequence)
+    date_only_groups: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for fill in fills:
+        executed_at = str(fill.get("executed_at") or "")
+        if len(executed_at) == 10:
+            date_only_groups.setdefault(
+                (str(fill.get("symbol") or ""), executed_at), []
+            ).append(_actual_fill_identity(fill))
+    ordered_identities = {
+        identity
+        for identities in date_only_groups.values()
+        if len(identities) > 1
+        for identity in identities
+    }
+    for fill in fills:
+        identity = _actual_fill_identity(fill)
+        sequences = source_sequences.get(identity, set())
+        if len(sequences) > 1 and identity in ordered_identities:
+            raise ValueError(f"conflicting actual fill source order: {identity}")
+        if len(sequences) == 1:
+            sequence = next(iter(sequences))
+            if sequence is not None:
+                fill["source_sequence"] = sequence
+    return fills, coverage
+
+
+def _completed_cycles(
+    fills: Sequence[Mapping[str, object]],
+    opening_positions: Sequence[Mapping[str, object]] = (),
+) -> list[dict[str, object]]:
+    positions = {
+        str(row["symbol"]): {
+            "symbol": str(row["symbol"]),
+            "entry_date": str(row["opened_at"])[:10],
+            "quantity": _required_decimal(row["quantity"], "opening quantity"),
+            "fills": [],
+        }
+        for row in opening_positions
+    }
+    completed: list[dict[str, object]] = []
+    seen: dict[tuple[str, str, str], bytes] = {}
+    unique_fills: list[Mapping[str, object]] = []
+    for fill in fills:
+        identity = _actual_fill_identity(fill)
+        payload = _canonical_json_bytes(dict(fill))
+        existing = seen.get(identity)
+        if existing is None:
+            seen[identity] = payload
+            unique_fills.append(fill)
+        elif existing != payload:
+            raise ValueError(f"conflicting actual fill identity: {identity}")
+    date_only_groups: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for fill in unique_fills:
+        executed_at = str(fill["executed_at"])
+        if len(executed_at) == 10:
+            date_only_groups.setdefault(
+                (str(fill["symbol"]), executed_at), []
+            ).append(fill)
+    for grouped in date_only_groups.values():
+        if len(grouped) < 2:
+            continue
+        sequences = [fill.get("source_sequence") for fill in grouped]
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in sequences
+        ) or len(set(sequences)) != len(sequences):
+            raise ValueError("ambiguous actual fill order")
+
+    def sort_key(row: Mapping[str, object]) -> tuple[float, int, str]:
+        text = str(row["executed_at"])
+        moment = (
+            datetime.fromisoformat(f"{text}T00:00:00+00:00")
+            if len(text) == 10
+            else datetime.fromisoformat(text.replace("Z", "+00:00"))
+        )
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        sequence = row.get("source_sequence")
+        return (
+            moment.timestamp(),
+            sequence if isinstance(sequence, int) else 0,
+            str(row["source_id"]),
+        )
+
+    for fill in sorted(
+        unique_fills,
+        key=sort_key,
+    ):
+        symbol = str(fill["symbol"])
+        quantity = _required_decimal(fill["quantity"], "fill quantity")
+        if quantity <= 0:
+            raise ValueError("fill quantity must be positive")
+        current = positions.get(symbol)
+        if fill["side"] == "BUY":
+            if current is None:
+                current = {
+                    "symbol": symbol,
+                    "entry_date": str(fill["executed_at"])[:10],
+                    "quantity": Decimal("0"),
+                    "fills": [],
+                }
+                positions[symbol] = current
+            current["quantity"] = (
+                _required_decimal(current["quantity"], "open quantity") + quantity
+            )
+        elif fill["side"] == "SELL":
+            if current is None or _required_decimal(
+                current["quantity"], "open quantity"
+            ) < quantity:
+                raise ValueError("sell fill exceeds actual position")
+            current["quantity"] = (
+                _required_decimal(current["quantity"], "open quantity") - quantity
+            )
+        else:
+            raise ValueError("actual fill side must be BUY or SELL")
+        current["fills"].append(dict(fill))
+        if current["quantity"] == 0:
+            completed.append(
+                {**current, "exit_date": str(fill["executed_at"])[:10]}
+            )
+            del positions[symbol]
+    return completed
+
+
+def _common_cutoff(
+    effective_from: str,
+    discipline_dates: set[str],
+    actual_dates: set[str],
+    benchmark_dates: set[str],
+) -> str | None:
+    if effective_from not in benchmark_dates:
+        return None
+    cutoff: str | None = None
+    for trading_date in sorted(
+        day for day in benchmark_dates if day >= effective_from
+    ):
+        if trading_date not in discipline_dates or trading_date not in actual_dates:
+            break
+        cutoff = trading_date
+    return cutoff
 
 
 def _completed_trades(facts: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -3907,6 +4674,8 @@ def _rate_on_or_before(
 
 
 def _annualized_sharpe(excess_returns: Sequence[Decimal]) -> Decimal | None:
+    if any(not value.is_finite() for value in excess_returns):
+        raise ValueError("Sharpe returns must be finite")
     if len(excess_returns) < 2:
         return None
     mean = sum(excess_returns, Decimal("0")) / Decimal(len(excess_returns))
@@ -3930,7 +4699,13 @@ def _portfolio_metrics(
             "sharpe_ratio": None,
             "calmar_ratio": None,
         }
-    equities = [Decimal(row["equity"]) for row in curve]
+    if not initial_cash.is_finite() or initial_cash <= 0:
+        raise ValueError("initial cash must be finite and positive")
+    equities = [
+        _required_decimal(row["equity"], "portfolio equity") for row in curve
+    ]
+    if any(equity < 0 for equity in equities):
+        raise ValueError("portfolio equity must be non-negative")
     dates = [date.fromisoformat(row["date"]) for row in curve]
     total_return = (equities[-1] / initial_cash - Decimal("1")) * Decimal("100")
     elapsed_days = max(1, (dates[-1] - dates[0]).days)
@@ -4011,157 +4786,289 @@ def build_trend_review_projection(
     data_dir: Path, market: str
 ) -> dict[str, object]:
     market = _market(market)
-    facts = _load_daily_facts(data_dir, market)
-    trades = _completed_trades(facts)
+    effective_from = TREND_V1_EFFECTIVE_FROM[market]
+    daily_root = data_dir / "trend_review" / "daily" / market
+    legacy = _load_daily_facts(data_dir, market) if any(daily_root.glob("*.json")) else []
+    discipline_by_date = {str(fact["date"]): fact for fact in legacy}
+    actual_by_date = {
+        str(fact["date"]): {
+            "date": fact["date"],
+            "actual_equity": fact["actual_equity"],
+            "strategy_snapshot": fact.get("strategy_snapshot"),
+            "opening_positions": [],
+            "new_fact": False,
+        }
+        for fact in legacy
+        if "actual_equity" in fact
+    }
+    benchmark_by_date = {
+        str(fact["date"]): dict(fact["benchmark"])
+        for fact in legacy
+    }
+    for fact in _load_dated_fact_stream(
+        data_dir,
+        "discipline",
+        market,
+        "open_trader.trend_review.discipline.v1",
+    ):
+        discipline_by_date[str(fact["date"])] = {
+            "date": fact["date"],
+            "discipline_equity_after_fees": fact["equity_after_fees"],
+            "orders": fact["orders"],
+            "strategy_snapshot": fact.get("strategy_snapshot"),
+        }
+    for fact in _load_dated_fact_stream(
+        data_dir,
+        "actual_equity",
+        market,
+        "open_trader.trend_review.actual_equity.v1",
+    ):
+        actual_by_date[str(fact["date"])] = {
+            "date": fact["date"],
+            "actual_equity": fact["equity"],
+            "strategy_snapshot": fact.get("strategy_snapshot"),
+            "opening_positions": fact.get("opening_positions", []),
+            "new_fact": True,
+        }
+    for fact in _load_dated_fact_stream(
+        data_dir,
+        "benchmark",
+        market,
+        "open_trader.trend_review.benchmark.v1",
+    ):
+        benchmark = _validate_benchmark(
+            fact.get("benchmark"), market=market, trading_date=str(fact["date"])
+        )
+        benchmark_by_date[str(fact["date"])] = dict(benchmark)
+    if not discipline_by_date and not actual_by_date and not benchmark_by_date:
+        raise ValueError(f"no trend review facts for {market}")
+
+    def normalize_v1_snapshot_or_none(
+        fact: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        snapshot = fact.get("strategy_snapshot")
+        if not isinstance(snapshot, Mapping) or snapshot.get(
+            "strategy_version"
+        ) not in {"v1", "v3"}:
+            return None
+        try:
+            return normalize_trend_strategy_snapshot(snapshot, market)
+        except ValueError:
+            return None
+
+    discipline_facts = [
+        {
+            **discipline_by_date[trading_date],
+            "strategy_snapshot": normalized,
+        }
+        for trading_date in sorted(discipline_by_date)
+        if (
+            normalized := normalize_v1_snapshot_or_none(
+                discipline_by_date[trading_date]
+            )
+        )
+        is not None
+    ]
+    actual_facts = [
+        {
+            **actual_by_date[trading_date],
+            "strategy_snapshot": normalized,
+        }
+        for trading_date in sorted(actual_by_date)
+        if (
+            normalized := normalize_v1_snapshot_or_none(
+                actual_by_date[trading_date]
+            )
+        )
+        is not None
+    ]
+    strategy_identities = {
+        _strategy_identity(fact["strategy_snapshot"])
+        for fact in (*discipline_facts, *actual_facts)
+        if str(fact["date"]) >= effective_from
+    }
+    if len(strategy_identities) > 1:
+        raise ValueError("strategy snapshot identity changed within version interval")
+    fills, actual_fill_coverage = _load_actual_fills(data_dir, market)
+    equity_cutoff = _common_cutoff(
+        effective_from,
+        {str(fact["date"]) for fact in discipline_facts},
+        {str(fact["date"]) for fact in actual_facts},
+        set(benchmark_by_date),
+    )
+    common_cutoff = None
+    if equity_cutoff is not None:
+        for trading_date in sorted(
+            day
+            for day in benchmark_by_date
+            if effective_from <= day <= equity_cutoff
+        ):
+            if not any(
+                start <= trading_date <= end
+                for start, end in actual_fill_coverage
+            ):
+                break
+            common_cutoff = trading_date
+    interval_discipline = [
+        fact
+        for fact in discipline_facts
+        if common_cutoff is not None
+        and effective_from <= str(fact["date"]) <= common_cutoff
+    ]
+
+    snapshot_facts = sorted(
+        (
+            fact
+            for fact in (*discipline_facts, *actual_facts)
+            if effective_from <= str(fact["date"])
+            and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
+        ),
+        key=lambda fact: str(fact["date"]),
+    )
+    snapshot = (
+        dict(snapshot_facts[-1]["strategy_snapshot"])
+        if snapshot_facts
+        else next(
+            (
+                dict(fact["strategy_snapshot"])
+                for fact in sorted(
+                    (
+                        fact
+                        for fact in (*discipline_facts, *actual_facts)
+                        if str(fact["date"]) < effective_from
+                    ),
+                    key=lambda fact: str(fact["date"]),
+                    reverse=True,
+                )
+            ),
+            {},
+        )
+    )
+    discipline_cycles = _completed_trades(interval_discipline)
+    interval_actual = {
+        str(fact["date"]): fact
+        for fact in actual_facts
+        if common_cutoff is not None
+        and effective_from <= str(fact["date"]) <= common_cutoff
+    }
+    interval_fills = [
+        fill
+        for fill in fills
+        if common_cutoff is not None
+        and effective_from <= str(fill["executed_at"])[:10] <= common_cutoff
+        and str(fill["executed_at"])[:10] in interval_actual
+    ]
+    opening_fact = interval_actual.get(effective_from)
+    if opening_fact is not None and opening_fact.get("new_fact") is not True:
+        opening_fact = None
+    opening_positions = (
+        [
+            {**position, "opened_at": position.get("opened_at", opening_fact["date"])}
+            for position in opening_fact.get("opening_positions", [])
+            if isinstance(position, Mapping)
+        ]
+        if opening_fact is not None
+        else []
+    )
+    if not isinstance(opening_positions, list):
+        raise ValueError("actual opening positions must be a list")
+    actual_cycles = _completed_cycles(interval_fills, opening_positions)
+
     rates_path = data_dir / "rates" / "DGS3MO.csv"
     rates = _load_dgs3mo_csv(rates_path)
-    completed_batches = len(trades) // 30
-    if completed_batches == 0:
-        reason = "尚未完成 30 笔纪律模拟交易"
-        metrics = {
-            key: {
-                series: _metric(None, reason)
-                for series in ("discipline", "actual", "benchmark")
-            }
-            for key in (
-                "period_net_return",
-                "market_excess_return",
-                "max_drawdown",
-                "calmar",
-                "sharpe",
-            )
-        }
-        batch = {
-            "batch_number": 1,
-            "completed_trade_count": len(trades),
-            "start_date": trades[0]["entry_date"] if trades else facts[0]["date"],
-            "end_date": None,
-        }
-        batch_path: Path | None = None
-    else:
-        batch_number = completed_batches
-        selected_trades = trades[(batch_number - 1) * 30 : batch_number * 30]
-        start_date = min(str(trade["entry_date"]) for trade in selected_trades)
-        end_date = str(selected_trades[-1]["exit_date"])
-        selected_facts = [
-            fact for fact in facts if start_date <= str(fact["date"]) <= end_date
-        ]
-        discipline_curve = _normalized_curve(
-            selected_facts, "discipline_equity_after_fees"
-        )
-        actual_curve = _normalized_curve(selected_facts, "actual_equity")
-        benchmark_facts = [
+    curve_dates = [
+        trading_date
+        for trading_date in sorted(benchmark_by_date)
+        if common_cutoff is not None
+        and effective_from <= trading_date <= common_cutoff
+    ]
+    discipline_curve = _normalized_curve(
+        [discipline_by_date[trading_date] for trading_date in curve_dates],
+        "discipline_equity_after_fees",
+    ) if curve_dates else None
+    actual_curve = _normalized_curve(
+        [actual_by_date[trading_date] for trading_date in curve_dates],
+        "actual_equity",
+    ) if curve_dates else None
+    benchmark_curve = _normalized_curve(
+        [
             {
-                "date": fact["date"],
-                "benchmark_equity": fact["benchmark"]["close"],
+                "date": trading_date,
+                "benchmark_equity": benchmark_by_date[trading_date]["close"],
             }
-            for fact in selected_facts
-        ]
-        benchmark_curve = _normalized_curve(
-            benchmark_facts, "benchmark_equity"
-        )
-        discipline_metrics = _curve_metrics(
-            discipline_curve, rates, missing_reason="纪律模拟日终净值缺失"
-        )
-        actual_metrics = _curve_metrics(
-            actual_curve, rates, missing_reason="实际执行日终净值缺失"
-        )
-        benchmark_metrics = _curve_metrics(
-            benchmark_curve, rates, missing_reason="市场基准缺失"
-        )
+            for trading_date in curve_dates
+        ],
+        "benchmark_equity",
+    ) if curve_dates else None
+    discipline_metrics = _curve_metrics(
+        discipline_curve, rates, missing_reason="纪律模拟日终净值缺失"
+    )
+    actual_metrics = _curve_metrics(
+        actual_curve, rates, missing_reason="实际执行日终净值缺失"
+    )
+    benchmark_metrics = _curve_metrics(
+        benchmark_curve, rates, missing_reason="市场基准缺失"
+    )
 
-        def values(metric_name: str) -> dict[str, dict[str, object]]:
-            return {
-                "discipline": discipline_metrics[metric_name],
-                "actual": actual_metrics[metric_name],
-                "benchmark": benchmark_metrics[metric_name],
-            }
+    def values(metric_name: str) -> dict[str, dict[str, object]]:
+        return {
+            "discipline": discipline_metrics[metric_name],
+            "actual": actual_metrics[metric_name],
+            "benchmark": benchmark_metrics[metric_name],
+        }
 
-        def excess(
-            item: dict[str, object], benchmark_item: dict[str, object]
-        ) -> dict[str, object]:
-            if item["value"] is None:
-                return item
-            if benchmark_item["value"] is None:
-                return benchmark_item
-            return _metric(
-                str(
-                    _required_decimal(item["value"], "return")
-                    - _required_decimal(benchmark_item["value"], "benchmark return")
-                )
+    def excess(
+        item: dict[str, object], benchmark_item: dict[str, object]
+    ) -> dict[str, object]:
+        if item["value"] is None:
+            return item
+        if benchmark_item["value"] is None:
+            return benchmark_item
+        return _metric(
+            str(
+                _required_decimal(item["value"], "return")
+                - _required_decimal(benchmark_item["value"], "benchmark return")
             )
-
-        metrics = {
-            "period_net_return": values("total_return_pct"),
-            "market_excess_return": {
-                "discipline": excess(
-                    discipline_metrics["total_return_pct"],
-                    benchmark_metrics["total_return_pct"],
-                ),
-                "actual": excess(
-                    actual_metrics["total_return_pct"],
-                    benchmark_metrics["total_return_pct"],
-                ),
-                "benchmark": _metric("0"),
-            },
-            "max_drawdown": values("max_drawdown_pct"),
-            "calmar": values("calmar_ratio"),
-            "sharpe": values("sharpe_ratio"),
-        }
-        batch = {
-            "batch_number": batch_number,
-            "completed_trade_count": 30,
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-        batch_path = (
-            data_dir
-            / "trend_review"
-            / "batches"
-            / market
-            / f"{batch_number:04d}.json"
         )
-        batch_payload = {
-            "schema_version": "open_trader.trend_review.batch.v1",
-            "market": market,
-            "batch": batch,
-            "strategy_snapshot": selected_facts[-1].get("strategy_snapshot"),
-            "curves": {
-                "discipline": discipline_curve,
-                "actual": actual_curve,
-                "benchmark": benchmark_curve,
-            },
-            "metrics": metrics,
-            "completed_trades": selected_trades,
-            "benchmark_source_id": BENCHMARK_SOURCE_IDS[market],
-            "benchmark_sha256": hashlib.sha256(
-                _canonical_json_bytes({
-                    "benchmarks": [fact["benchmark"] for fact in selected_facts]
-                })
-            ).hexdigest(),
-            "rates_sha256": hashlib.sha256(rates_path.read_bytes()).hexdigest(),
-            "generated_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
-            "process_version": (
-                selected_facts[-1].get("strategy_snapshot") or {}
-            ).get("process_version"),
-        }
-        if batch_path.exists():
-            existing = json.loads(batch_path.read_text(encoding="utf-8"))
-            metrics = existing["metrics"]
-            batch = existing["batch"]
-        else:
-            _write_immutable(batch_path, _canonical_json_bytes(batch_payload))
 
-    latest_snapshot = facts[-1].get("strategy_snapshot")
+    metrics = {
+        "period_net_return": values("total_return_pct"),
+        "market_excess_return": {
+            "discipline": excess(
+                discipline_metrics["total_return_pct"],
+                benchmark_metrics["total_return_pct"],
+            ),
+            "actual": excess(
+                actual_metrics["total_return_pct"],
+                benchmark_metrics["total_return_pct"],
+            ),
+            "benchmark": _metric("0") if benchmark_curve else _metric(None, "市场基准缺失"),
+        },
+        "max_drawdown": values("max_drawdown_pct"),
+        "calmar": values("calmar_ratio"),
+        "sharpe": values("sharpe_ratio"),
+    }
+    sample_counts = {
+        "discipline": len(discipline_cycles),
+        "actual": len(actual_cycles),
+        "required": 30,
+    }
+    for series in ("discipline", "actual"):
+        count = sample_counts[series]
+        if count < 30:
+            for metric in metrics.values():
+                metric[series] = _metric(None, f"{count} / 30，数据不足")
+
     projection = {
-        "schema_version": "open_trader.trend_review.projection.v1",
+        "schema_version": "open_trader.trend_review.projection.v2",
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
         "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
-        "strategy_snapshot": latest_snapshot,
-        "batch": batch,
-        "batch_path": None if batch_path is None else str(batch_path),
+        "strategy_snapshot": snapshot,
+        "sample_counts": sample_counts,
+        "common_cutoff": common_cutoff,
+        "interval": {"start": effective_from, "end": common_cutoff},
         "metrics": metrics,
     }
     _write_json_atomic(
@@ -4323,6 +5230,11 @@ def rebuild_trend_report_from_evidence(
         if rows is None or isinstance(rows, list)
     }
     process_version = str(evidence.get("process_version") or "")
+    normalize_trend_strategy_snapshot(snapshot, str(inputs["market"]))
+    replay_snapshot = {
+        **dict(snapshot),
+        "process_version": process_version,
+    }
     price_fx = decimal_or_none(inputs["price_fx_to_account_currency"])
     if price_fx is None or not price_fx.is_finite() or price_fx <= 0:
         raise TrendReplayIncompleteError(
@@ -4391,7 +5303,7 @@ def rebuild_trend_report_from_evidence(
         normal_cost_rate=normal_cost_rate or Decimal("0"),
         process_version=process_version,
         candidate_pool_ids=tuple(int(item) for item in inputs["candidate_pool_ids"]),
-        strategy_snapshot=snapshot,
+        strategy_snapshot=replay_snapshot,
         kelly_rounds=kelly_rounds,
         kelly_data_reason=kelly_data_reason,
         drawdown_summary=(

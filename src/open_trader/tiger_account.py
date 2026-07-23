@@ -4,6 +4,7 @@ import csv
 import inspect
 import os
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 import json
 from decimal import Decimal, InvalidOperation
 import uuid
@@ -18,7 +19,7 @@ from .portfolio import (
     pct,
     recalculate_portfolio_weights,
 )
-from .models import AssetClass, CashBalance, Market, Position
+from .models import AssetClass, CashBalance, Market, Position, TradeFill
 from .parsers.base import detect_asset_class
 
 
@@ -449,6 +450,107 @@ def _account_alias(account: str) -> str:
     return f"tiger_{text[-4:]}"
 
 
+def _compact_iso_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"invalid ISO date: {value}") from None
+    if parsed.isoformat() != value:
+        raise ValueError(f"invalid ISO date: {value}")
+    return value.replace("-", "")
+
+
+def _tiger_trade_fill(
+    transaction: object,
+    *,
+    account_alias: str,
+    fees: Decimal | None,
+) -> TradeFill:
+    source_id = _text(transaction, "id")
+    source_order_id = _text(transaction, "order_id")
+    contract = _get_attr(transaction, "contract", None)
+    symbol = _text(contract, "symbol").upper()
+    currency = _text(contract, "currency").upper()
+    side = _text(transaction, "action").upper()
+    quantity = _parse_finite_decimal(_text(transaction, "filled_quantity"))
+    price = _parse_finite_decimal(_text(transaction, "filled_price"))
+    executed_at = _tiger_executed_at(_get_attr(transaction, "transacted_at", None))
+    if (
+        not source_id
+        or not source_order_id
+        or not symbol
+        or side not in {"BUY", "SELL"}
+        or quantity is None
+        or quantity <= 0
+        or price is None
+        or price <= 0
+        or executed_at is None
+    ):
+        raise ValueError("invalid Tiger fill")
+    market = _tiger_transaction_market(transaction)
+    return TradeFill(
+        source_id=source_id,
+        source_order_id=source_order_id,
+        broker="tiger",
+        account_alias=account_alias,
+        market=market,
+        symbol=symbol,
+        currency=currency,
+        side=side,
+        quantity=quantity,
+        price=price,
+        fees=fees,
+        executed_at=executed_at,
+    )
+
+
+def _tiger_transaction_market(transaction: object) -> Market:
+    contract = _get_attr(transaction, "contract", None)
+    market = _market_from_text(_text(contract, "market"))
+    if market is not Market.OTHER:
+        return market
+    return {"USD": Market.US, "HKD": Market.HK, "CNY": Market.CN}.get(
+        _text(contract, "currency").upper(), Market.OTHER
+    )
+
+
+def _tiger_executed_at(value: object) -> str | None:
+    if isinstance(value, datetime):
+        current = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return current.isoformat()
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        timestamp = Decimal(text)
+    except InvalidOperation:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat()
+        except ValueError:
+            return None
+    if not timestamp.is_finite():
+        return None
+    seconds = timestamp / 1000 if abs(timestamp) >= 100_000_000_000 else timestamp
+    try:
+        return datetime.fromtimestamp(float(seconds), UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _tiger_order_fees(order: object | None) -> Decimal | None:
+    if order is None:
+        return None
+    commission = _parse_finite_decimal(_text(order, "commission"))
+    if commission is not None:
+        return commission
+    totals = [
+        total
+        for charge in (_get_attr(order, "charges", None) or [])
+        if (total := _parse_finite_decimal(_text(charge, "total"))) is not None
+    ]
+    return sum(totals, Decimal("0")) if totals else None
+
+
 def _is_active_account(account: object) -> bool:
     return _text(account, "status").upper() in {"FUNDED", "OPEN"}
 
@@ -609,6 +711,173 @@ class TigerAccountClient:
             cash_records=cash_records,
             position_records=position_records,
         )
+
+    def fetch_actual_fills(self, start_date: str, end_date: str) -> list[TradeFill]:
+        since_date = _compact_iso_date(start_date)
+        to_date = _compact_iso_date(end_date)
+        transactions: list[object] = []
+        page_token: str | None = None
+        while True:
+            try:
+                response = self.trade_client.get_transactions(
+                    account=self.config.account,
+                    since_date=since_date,
+                    to_date=to_date,
+                    limit=100,
+                    page_token=page_token,
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if "symbol" not in message or "empty" not in message:
+                    raise TigerAccountError(
+                        "failed to query Tiger transactions",
+                        error_type="transaction_query_failed",
+                    ) from exc
+                try:
+                    current_day = date.fromisoformat(start_date)
+                    final_day = date.fromisoformat(end_date)
+                    while current_day <= final_day:
+                        next_day = current_day + timedelta(days=1)
+                        response = self.trade_client.get_filled_orders(
+                            account=self.config.account,
+                            start_time=f"{current_day.isoformat()} 00:00:00",
+                            end_time=f"{next_day.isoformat()} 00:00:00",
+                            limit=100,
+                        )
+                        if response is None:
+                            raise ValueError("Tiger filled orders are unavailable")
+                        orders = (
+                            list(response)
+                            if isinstance(response, list)
+                            else list(_get_attr(response, "result", []))
+                        )
+                        if len(orders) >= 100:
+                            raise ValueError("Tiger filled orders may be truncated")
+                        for order in orders:
+                            order_id = _get_attr(
+                                order, "id", _get_attr(order, "order_id")
+                            )
+                            if order_id is None:
+                                raise ValueError("Tiger filled order is missing id")
+                            scoped_transactions: list[object] = []
+                            scoped_page_token: str | None = None
+                            while True:
+                                scoped = self.trade_client.get_transactions(
+                                    account=self.config.account,
+                                    order_id=order_id,
+                                    limit=100,
+                                    page_token=scoped_page_token,
+                                )
+                                if scoped is None:
+                                    raise ValueError(
+                                        "Tiger order transactions are unavailable"
+                                    )
+                                if isinstance(scoped, list):
+                                    page = list(scoped)
+                                    if not page:
+                                        raise ValueError(
+                                            "Tiger order transactions are empty"
+                                        )
+                                    scoped_transactions.extend(page)
+                                    if len(page) < 100:
+                                        break
+                                    if scoped_page_token is not None:
+                                        raise ValueError(
+                                            "Tiger order transaction pagination is incomplete"
+                                        )
+                                    scoped_page_token = ""
+                                    continue
+                                page = list(_get_attr(scoped, "result", []))
+                                if not page:
+                                    raise ValueError(
+                                        "Tiger order transactions are empty"
+                                    )
+                                scoped_transactions.extend(page)
+                                next_token = _get_attr(
+                                    scoped,
+                                    "next_page_token",
+                                    _get_attr(scoped, "page_token", None),
+                                )
+                                if next_token:
+                                    scoped_page_token = str(next_token)
+                                    continue
+                                if len(page) >= 100:
+                                    raise ValueError(
+                                        "Tiger order transaction pagination is incomplete"
+                                    )
+                                break
+                            transactions.extend(scoped_transactions)
+                        current_day = next_day
+                except Exception as fallback_exc:
+                    raise TigerAccountError(
+                        "failed to query Tiger transactions",
+                        error_type="transaction_query_failed",
+                    ) from fallback_exc
+                break
+            if response is None:
+                break
+            if isinstance(response, list):
+                transactions.extend(response)
+                if page_token is None and len(response) == 100:
+                    page_token = ""
+                    continue
+                break
+            transactions.extend(list(_get_attr(response, "result", [])))
+            next_token = _get_attr(
+                response,
+                "next_page_token",
+                _get_attr(response, "page_token", None),
+            )
+            if not next_token:
+                break
+            page_token = str(next_token)
+
+        transactions = list(
+            {_text(transaction, "id"): transaction for transaction in transactions}.values()
+        )
+        transactions = [
+            transaction
+            for transaction in transactions
+            if _tiger_transaction_market(transaction) is Market.US
+        ]
+        counts_by_order: dict[str, int] = {}
+        for transaction in transactions:
+            order_id = _text(transaction, "order_id")
+            counts_by_order[order_id] = counts_by_order.get(order_id, 0) + 1
+        orders: dict[str, object | None] = {}
+        for transaction in transactions:
+            order_id = _text(transaction, "order_id")
+            if order_id in orders:
+                continue
+            try:
+                orders[order_id] = self.trade_client.get_order(
+                    order_id=_get_attr(transaction, "order_id"),
+                    show_charges=True,
+                )
+            except Exception as exc:
+                raise TigerAccountError(
+                    "failed to query Tiger order charges",
+                    error_type="order_query_failed",
+                ) from exc
+
+        try:
+            return [
+                _tiger_trade_fill(
+                    transaction,
+                    account_alias=_account_alias(self.config.account),
+                    fees=(
+                        _tiger_order_fees(orders[_text(transaction, "order_id")])
+                        if counts_by_order[_text(transaction, "order_id")] == 1
+                        else None
+                    ),
+                )
+                for transaction in transactions
+            ]
+        except (InvalidOperation, ValueError) as exc:
+            raise TigerAccountError(
+                "Tiger transaction response contains invalid fill data",
+                error_type="transaction_invalid",
+            ) from exc
 
     def close(self) -> None:
         close = getattr(self.trade_client, "close", None)

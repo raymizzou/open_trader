@@ -12,6 +12,7 @@ from open_trader.models import (
     Market,
     Position,
     StatementTrade,
+    TradeFill,
     WarningRecord,
 )
 
@@ -22,6 +23,10 @@ class ParseResult:
     broker: str
     positions: list[Position] = field(default_factory=list)
     cash_balances: list[CashBalance] = field(default_factory=list)
+    fills: list[TradeFill] = field(default_factory=list)
+    fills_complete: bool = False
+    fills_coverage_start: str | None = None
+    fills_coverage_end: str | None = None
     trades: list[StatementTrade] = field(default_factory=list)
     warnings: list[WarningRecord] = field(default_factory=list)
     page_count: int = 0
@@ -41,6 +46,10 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def source_id_for_fill(broker: str, values: list[str]) -> str:
+    return sha256("\x1f".join([broker, *values]).encode("utf-8")).hexdigest()
 
 
 def parse_decimal(value: str | None) -> Decimal | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,14 @@ import open_trader.cli as cli
 import open_trader.pipeline as pipeline
 from open_trader.cli import build_parser
 from open_trader.fx import StaticMonthEndFxProvider
-from open_trader.models import AssetClass, CashBalance, Market, Position, WarningRecord
+from open_trader.models import (
+    AssetClass,
+    CashBalance,
+    Market,
+    Position,
+    TradeFill,
+    WarningRecord,
+)
 from open_trader.parsers.base import ParseResult
 from open_trader.pipeline import ImportResult, run_import
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
@@ -27,18 +35,28 @@ class FakeParser:
         broker: str = "fake",
         result_broker: str | None = None,
         position_currency: str = "USD",
+        symbol: str = "NVDA",
+        cash_currency: str = "USD",
         warning_page: int | None = 1,
         position_broker: str | None = None,
         cash_broker: str | None = None,
         warning_broker: str | None = None,
+        fills_complete: bool = False,
+        fills_coverage_start: str | None = None,
+        fills_coverage_end: str | None = None,
     ) -> None:
         self.broker = broker
         self.result_broker = result_broker or broker
         self.position_currency = position_currency
+        self.symbol = symbol
+        self.cash_currency = cash_currency
         self.warning_page = warning_page
         self.position_broker = position_broker or self.result_broker
         self.cash_broker = cash_broker or self.result_broker
         self.warning_broker = warning_broker or self.result_broker
+        self.fills_complete = fills_complete
+        self.fills_coverage_start = fills_coverage_start
+        self.fills_coverage_end = fills_coverage_end
 
     def parse(self, path: Path, month: str) -> ParseResult:
         return ParseResult(
@@ -51,8 +69,8 @@ class FakeParser:
                     account_alias="main",
                     market=Market.US,
                     asset_class=AssetClass.STOCK,
-                    symbol="NVDA",
-                    name="NVIDIA Corp",
+                    symbol=self.symbol,
+                    name=self.symbol,
                     currency=self.position_currency,
                     quantity=Decimal("2"),
                     cost_price=Decimal("100"),
@@ -69,13 +87,16 @@ class FakeParser:
                     statement_id=f"{month}-{self.result_broker}",
                     broker=self.cash_broker,
                     account_alias="main",
-                    currency="USD",
+                    currency=self.cash_currency,
                     cash_balance=Decimal("50"),
                     available_balance=Decimal("45"),
                     confidence="high",
                     notes="",
                 )
             ],
+            fills_complete=self.fills_complete,
+            fills_coverage_start=self.fills_coverage_start,
+            fills_coverage_end=self.fills_coverage_end,
             warnings=[
                 WarningRecord(
                     statement_id=f"{month}-{self.result_broker}",
@@ -98,6 +119,111 @@ class SpyParser(FakeParser):
     def parse(self, path: Path, month: str) -> ParseResult:
         self.parse_called = True
         return super().parse(path, month)
+
+
+class FillParser(FakeParser):
+    def parse(self, path: Path, month: str) -> ParseResult:
+        result = super().parse(path, month)
+        return ParseResult(
+            statement_id=result.statement_id,
+            broker=result.broker,
+            positions=result.positions,
+            cash_balances=result.cash_balances,
+            fills=[
+                TradeFill(
+                    source_id="fill-1",
+                    source_order_id=None,
+                    broker="fake",
+                    account_alias="main",
+                    market=Market.US,
+                    symbol="NVDA",
+                    currency="USD",
+                    side="BUY",
+                    quantity=Decimal("2"),
+                    price=Decimal("100"),
+                    fees=Decimal("1"),
+                    executed_at="2026-05-10",
+                    source_sequence=7,
+                )
+            ],
+            fills_complete=True,
+            warnings=result.warnings,
+            page_count=result.page_count,
+        )
+
+
+class BrokerFillParser(FakeParser):
+    def __init__(
+        self,
+        broker: str,
+        market: Market,
+        *,
+        fills_coverage_start: str | None = None,
+        fills_coverage_end: str | None = None,
+    ) -> None:
+        currency = "CNY" if market is Market.CN else "HKD"
+        super().__init__(
+            broker=broker,
+            position_currency=currency,
+            cash_currency=currency,
+        )
+        self.market = market
+        self.fills_coverage_start = fills_coverage_start
+        self.fills_coverage_end = fills_coverage_end
+
+    def parse(self, path: Path, month: str) -> ParseResult:
+        result = super().parse(path, month)
+        return ParseResult(
+            statement_id=result.statement_id,
+            broker=result.broker,
+            positions=result.positions,
+            cash_balances=result.cash_balances,
+            fills=[
+                TradeFill(
+                    source_id=f"{self.broker}-fill-1",
+                    source_order_id=None,
+                    broker=self.broker,
+                    account_alias="main",
+                    market=self.market,
+                    symbol="600000" if self.market is Market.CN else "00700",
+                    currency="CNY" if self.market is Market.CN else "HKD",
+                    side="BUY",
+                    quantity=Decimal("100"),
+                    price=Decimal("10"),
+                    fees=Decimal("1"),
+                    executed_at="2026-05-10",
+                )
+            ],
+            fills_complete=True,
+            fills_coverage_start=self.fills_coverage_start,
+            fills_coverage_end=self.fills_coverage_end,
+            warnings=result.warnings,
+            page_count=result.page_count,
+        )
+
+
+class InvalidExecutionBrokerFillParser(BrokerFillParser):
+    def parse(self, path: Path, month: str) -> ParseResult:
+        result = super().parse(path, month)
+        return ParseResult(
+            statement_id=result.statement_id,
+            broker=result.broker,
+            positions=result.positions,
+            cash_balances=result.cash_balances,
+            fills=result.fills,
+            fills_complete=False,
+            warnings=[
+                WarningRecord(
+                    statement_id=result.statement_id,
+                    broker=self.broker,
+                    page=1,
+                    severity="warning",
+                    code="invalid_execution_row",
+                    message="invalid execution row",
+                )
+            ],
+            page_count=result.page_count,
+        )
 
 
 def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
@@ -160,6 +286,478 @@ def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
         "code": "fake_warning",
         "message": "fake warning",
     }
+
+
+def test_uploaded_statement_without_fill_completeness_keeps_audit_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    result = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=FakeParser(
+            broker="eastmoney", position_currency="CNY", cash_currency="CNY",
+            fills_complete=False,
+        ),
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider("2026-05", {"CNY": Decimal("1.08")}),
+    )
+
+    assert result.positions_count == 1
+    assert (result.run_dir / "manifest.csv").exists()
+    assert not (tmp_path / "data/trend_review/facts/actual_fill_completeness").exists()
+
+
+def test_uploaded_statement_persists_each_fill_once(tmp_path: Path) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FillParser(),
+        "data_dir": tmp_path / "data",
+        "portfolio_path": tmp_path / "current" / "portfolio.csv",
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"USD": Decimal("7.8")}
+        ),
+    }
+
+    result = pipeline.run_uploaded_statement(**arguments)
+    rows = list(csv.DictReader((result.run_dir / "extracted_fills.csv").open()))
+    assert [row["source_id"] for row in rows] == ["fill-1"]
+    assert rows[0]["source_sequence"] == "7"
+
+    repeated = pipeline.run_uploaded_statement(**arguments)
+    repeated_rows = list(
+        csv.DictReader((repeated.run_dir / "extracted_fills.csv").open())
+    )
+    assert [row["source_id"] for row in repeated_rows] == ["fill-1"]
+    assert repeated_rows[0]["source_sequence"] == "7"
+
+
+@pytest.mark.parametrize(
+    ("broker", "market"),
+    [("eastmoney", Market.CN), ("phillips", Market.HK)],
+)
+def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
+    broker: str,
+    market: Market,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / f"{broker}.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": BrokerFillParser(
+            broker,
+            market,
+            fills_coverage_start=(
+                "2026-05-01" if broker == "eastmoney" else "2026-05-10"
+            ),
+            fills_coverage_end="2026-05-10",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": tmp_path / "current/portfolio.csv",
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08"), "HKD": Decimal("1")}
+        ),
+    }
+
+    pipeline.run_uploaded_statement(**arguments)
+    fill_paths = list(
+        (data_dir / f"trend_review/facts/actual_fills/{market.value}").glob("*.json")
+    )
+    assert len(fill_paths) == 1
+    first_bytes = fill_paths[0].read_bytes()
+    assert not list(
+        (data_dir / "trend_review/facts/actual_fills").glob(
+            f"{'HK' if market is Market.CN else 'CN'}/*.json"
+        )
+    )
+
+    pipeline.run_uploaded_statement(**arguments)
+
+    assert fill_paths[0].read_bytes() == first_bytes
+    completeness = list(
+        (
+            data_dir
+            / f"trend_review/facts/actual_fill_completeness/{market.value}"
+        ).glob("*.json")
+    )
+    assert len(completeness) == 1
+    completeness_payload = json.loads(completeness[0].read_text(encoding="utf-8"))
+    assert completeness_payload["source_metadata"]["market"] == market.value
+    assert completeness_payload["coverage_start"] == (
+        "2026-05-01" if broker == "eastmoney" else "2026-05-10"
+    )
+    assert completeness_payload["coverage_end"] == "2026-05-10"
+
+
+def test_uploaded_statement_uses_declared_fill_coverage_start(tmp_path: Path) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    pipeline.run_uploaded_statement(
+        statement_date="2026-07-16",
+        statement_path=source,
+        parser=BrokerFillParser(
+            "eastmoney",
+            Market.CN,
+            fills_coverage_start="2026-06-16",
+            fills_coverage_end="2026-07-15",
+        ),
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-07", {"CNY": Decimal("1.08")}
+        ),
+    )
+
+    completeness = next(
+        (data_dir / "trend_review/facts/actual_fill_completeness/CN").glob("*.json")
+    )
+    payload = json.loads(completeness.read_text(encoding="utf-8"))
+    assert payload["coverage_start"] == "2026-06-16"
+    assert payload["coverage_end"] == "2026-07-15"
+
+
+def test_uploaded_statement_without_declared_coverage_does_not_advance_facts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    pipeline.run_uploaded_statement(
+        statement_date="2026-07-16",
+        statement_path=source,
+        parser=BrokerFillParser("eastmoney", Market.CN),
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-07", {"CNY": Decimal("1.08")}
+        ),
+    )
+
+    assert not (
+        data_dir / "trend_review/facts/actual_fill_completeness"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    ("broker", "market"),
+    [("eastmoney", Market.CN), ("phillips", Market.HK)],
+)
+def test_uploaded_statement_with_invalid_execution_row_does_not_advance_fill_facts(
+    broker: str,
+    market: Market,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / f"{broker}.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    result = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=InvalidExecutionBrokerFillParser(broker, market),
+        data_dir=data_dir,
+        portfolio_path=tmp_path / "current/portfolio.csv",
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08"), "HKD": Decimal("1")}
+        ),
+    )
+
+    assert not (data_dir / "trend_review/facts/actual_fills" / market.value).exists()
+    assert not (
+        data_dir / "trend_review/facts/actual_fill_completeness" / market.value
+    ).exists()
+    assert list(csv.DictReader((result.run_dir / "extracted_fills.csv").open()))
+    warnings = list(
+        csv.DictReader((result.run_dir / "parse_warnings.csv").open())
+    )
+    assert [warning["code"] for warning in warnings] == ["invalid_execution_row"]
+    assert result.positions_count == 1
+
+
+def test_uploaded_empty_statement_freezes_completeness_only_after_success(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            fills_complete=True,
+            fills_coverage_start="2026-05-01",
+            fills_coverage_end="2026-05-10",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": tmp_path / "current/portfolio.csv",
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    }
+
+    pipeline.run_uploaded_statement(**arguments)
+
+    completeness = list(
+        (data_dir / "trend_review/facts/actual_fill_completeness/CN").glob("*.json")
+    )
+    assert len(completeness) == 1
+
+    failed_dir = tmp_path / "failed-data"
+    with pytest.raises(KeyError, match="SGD"):
+        pipeline.run_uploaded_statement(
+            **{
+                **arguments,
+                "data_dir": failed_dir,
+                "portfolio_path": tmp_path / "failed/portfolio.csv",
+                "parser": FakeParser(
+                    broker="eastmoney",
+                    position_currency="SGD",
+                    cash_currency="CNY",
+                ),
+            }
+        )
+    assert not (failed_dir / "trend_review/facts").exists()
+
+
+def test_monthly_import_does_not_guess_fill_completeness_date(tmp_path: Path) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"statement")
+    data_dir = tmp_path / "data"
+
+    run_import(
+        month="2026-05",
+        statement_paths={"eastmoney": source},
+        parsers=[BrokerFillParser("eastmoney", Market.CN)],
+        data_dir=data_dir,
+        fx_provider=StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    )
+
+    assert not (data_dir / "trend_review/facts").exists()
+
+
+def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"first statement")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            symbol="600001",
+            fills_complete=True,
+            fills_coverage_start="2026-05-01",
+            fills_coverage_end="2026-05-10",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": portfolio_path,
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    }
+    first = pipeline.run_uploaded_statement(**arguments)
+
+    def tree_bytes(root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    original_run = tree_bytes(first.run_dir)
+    original_portfolio = portfolio_path.read_bytes()
+    original_facts = tree_bytes(data_dir / "trend_review/facts")
+    source.write_bytes(b"second statement")
+    arguments["parser"] = FakeParser(
+        broker="eastmoney",
+        position_currency="CNY",
+        cash_currency="CNY",
+        symbol="600002",
+        fills_complete=True,
+        fills_coverage_start="2026-05-01",
+        fills_coverage_end="2026-05-10",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "freeze_actual_fill_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("simulated fact writer failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="simulated fact writer failure"):
+        pipeline.run_uploaded_statement(**arguments)
+
+    assert tree_bytes(first.run_dir) == original_run
+    assert portfolio_path.read_bytes() == original_portfolio
+    assert tree_bytes(data_dir / "trend_review/facts") == original_facts
+    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
+    assert list(portfolio_path.parent.glob(".portfolio.csv.*.backup")) == []
+
+
+def test_uploaded_statement_commits_before_backup_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "eastmoney.pdf"
+    source.write_bytes(b"first statement")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    arguments = {
+        "statement_date": "2026-05-10",
+        "statement_path": source,
+        "parser": FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            symbol="600001",
+            fills_complete=True,
+            fills_coverage_start="2026-05-01",
+            fills_coverage_end="2026-05-10",
+        ),
+        "data_dir": data_dir,
+        "portfolio_path": portfolio_path,
+        "fx_provider": StaticMonthEndFxProvider(
+            "2026-05", {"CNY": Decimal("1.08")}
+        ),
+    }
+    pipeline.run_uploaded_statement(**arguments)
+    source.write_bytes(b"second statement")
+    arguments["parser"] = FakeParser(
+        broker="eastmoney",
+        position_currency="CNY",
+        cash_currency="CNY",
+        symbol="600002",
+        fills_complete=True,
+        fills_coverage_start="2026-05-01",
+        fills_coverage_end="2026-05-10",
+    )
+    real_rmtree = pipeline.rmtree
+
+    def fail_backup_cleanup(path: Path) -> None:
+        if path.suffix == ".backup":
+            raise OSError("simulated backup cleanup failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(pipeline, "rmtree", fail_backup_cleanup)
+
+    result = pipeline.run_uploaded_statement(**arguments)
+
+    expected_sha = pipeline.sha256_file(source)
+    manifest = list(
+        csv.DictReader((result.run_dir / "manifest.csv").open(encoding="utf-8"))
+    )
+    assert manifest[0]["source_sha256"] == expected_sha
+    assert "600002" in result.portfolio_path.read_text(encoding="utf-8")
+    assert "600002" in portfolio_path.read_text(encoding="utf-8")
+    completeness = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            data_dir / "trend_review/facts/actual_fill_completeness/CN"
+        ).glob("*.json")
+    ]
+    assert any(
+        fact["source_metadata"]["source_sha256"] == expected_sha
+        for fact in completeness
+    )
+    assert len(list((data_dir / "runs").glob(".2026-05*.backup"))) == 1
+
+
+def test_uploaded_statements_for_two_brokers_share_monthly_run(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    fx_provider = StaticMonthEndFxProvider(
+        "2026-05", {"USD": Decimal("7.8"), "CNY": Decimal("1.08")}
+    )
+
+    for broker, currency, symbol in (
+        ("eastmoney", "CNY", "600900"),
+        ("phillips", "USD", "NVDA"),
+    ):
+        pipeline.run_uploaded_statement(
+            statement_date="2026-05-10",
+            statement_path=source,
+            parser=FakeParser(
+                broker=broker,
+                position_currency=currency,
+                symbol=symbol,
+                cash_currency=currency,
+            ),
+            data_dir=data_dir,
+            portfolio_path=portfolio_path,
+            fx_provider=fx_provider,
+        )
+
+    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
+    assert {row["brokers"] for row in rows} == {"eastmoney", "phillips"}
+
+
+def test_uploaded_statement_accepts_old_run_without_fills_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statement.pdf"
+    source.write_bytes(b"fake pdf contents")
+    data_dir = tmp_path / "data"
+    portfolio_path = tmp_path / "current/portfolio.csv"
+    fx_provider = StaticMonthEndFxProvider(
+        "2026-05", {"USD": Decimal("7.8"), "CNY": Decimal("1.08")}
+    )
+    first = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=FakeParser(
+            broker="eastmoney",
+            position_currency="CNY",
+            cash_currency="CNY",
+            symbol="600900",
+        ),
+        data_dir=data_dir,
+        portfolio_path=portfolio_path,
+        fx_provider=fx_provider,
+    )
+    (first.run_dir / "extracted_fills.csv").unlink()
+
+    second = pipeline.run_uploaded_statement(
+        statement_date="2026-05-10",
+        statement_path=source,
+        parser=FillParser(),
+        data_dir=data_dir,
+        portfolio_path=portfolio_path,
+        fx_provider=fx_provider,
+    )
+
+    fills = list(csv.DictReader((second.run_dir / "extracted_fills.csv").open()))
+    positions = list(
+        csv.DictReader((second.run_dir / "extracted_positions.csv").open())
+    )
+    assert [row["source_id"] for row in fills] == ["fill-1"]
+    assert {row["broker"] for row in positions} == {"eastmoney", "fake"}
 
 
 def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:

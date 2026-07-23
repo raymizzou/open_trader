@@ -155,6 +155,7 @@ TREND_REVIEW_METRICS = {
     "sharpe",
 }
 TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
+ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TREND_MARKET_TIMEZONES = {
     "CN": SHANGHAI,
@@ -501,6 +502,9 @@ def _valid_trend_review_projection(
     if not isinstance(payload, dict):
         return False
     snapshot = payload.get("strategy_snapshot")
+    sample_counts = payload.get("sample_counts")
+    common_cutoff = payload.get("common_cutoff")
+    interval = payload.get("interval")
     metrics = payload.get("metrics")
     schema_version = payload.get("schema_version")
     if (
@@ -512,6 +516,25 @@ def _valid_trend_review_projection(
         or payload.get("broker") != broker
         or payload.get("market") != market
         or not isinstance(snapshot, dict)
+        or not isinstance(sample_counts, dict)
+        or set(sample_counts) != {"discipline", "actual", "required"}
+        or any(
+            type(sample_counts[key]) is not int or sample_counts[key] < 0
+            for key in ("discipline", "actual")
+        )
+        or type(sample_counts["required"]) is not int
+        or sample_counts["required"] != 30
+        or not isinstance(interval, dict)
+        or set(interval) != {"start", "end"}
+        or not _valid_iso_date(interval["start"])
+        or interval["end"] != common_cutoff
+        or (
+            common_cutoff is not None
+            and (
+                not _valid_iso_date(common_cutoff)
+                or common_cutoff < interval["start"]
+            )
+        )
         or not isinstance(metrics, dict)
         or set(metrics) != TREND_REVIEW_METRICS
     ):
@@ -532,7 +555,6 @@ def _valid_trend_review_projection(
             or not isinstance(interval, dict)
             or set(interval) != {"start", "end"}
             or not _valid_iso_date(interval["start"])
-            or snapshot.get("effective_from") != interval["start"]
             or interval["end"] != common_cutoff
             or (
                 common_cutoff is not None
@@ -551,6 +573,8 @@ def _valid_trend_review_projection(
     ):
         if not isinstance(snapshot.get(key), str) or not snapshot[key].strip():
             return False
+    if not _valid_iso_date(snapshot.get("effective_from")):
+        return False
     if not isinstance(snapshot.get("parameters"), dict):
         return False
     rows = snapshot.get("parameter_rows")
@@ -560,7 +584,10 @@ def _valid_trend_review_projection(
         or any(
             not isinstance(row, dict)
             or set(row) != {"group", "name", "value"}
-            or any(not isinstance(row[key], str) or not row[key].strip() for key in row)
+            or any(
+                not isinstance(row[key], str) or not row[key].strip()
+                for key in row
+            )
             for row in rows
         )
     ):
@@ -601,6 +628,9 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
             "market": market,
             "market_label": market_label,
             "strategy_snapshot": payload["strategy_snapshot"],
+            "sample_counts": payload["sample_counts"],
+            "common_cutoff": payload["common_cutoff"],
+            "interval": payload["interval"],
             "metrics": payload["metrics"],
         }
     return reviews

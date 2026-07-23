@@ -51,7 +51,9 @@ from .trend_delivery import deliver_daily_trend_text
 from .trend_review import (
     _floor_to_lot,
     freeze_report_evidence,
+    normalize_trend_strategy_snapshot,
     rebuild_overheat_trim_projection,
+    TREND_V1_EFFECTIVE_FROM,
 )
 
 
@@ -459,7 +461,7 @@ def trend_strategy_snapshot(
             ("仓位执行", "异常损失缓冲", "账户净值的 1%，不得用于开仓"),
             ("仓位执行", "热状态仓位", "账户净值的 4%"),
             ("仓位执行", "沸状态仓位", "账户净值的 2%"),
-            ("仓位执行", "买入数量", "按 100 股整数倍向下取整"),
+            ("仓位执行", "买入数量", "使用已有现金，按 100 股整数倍向下取整"),
             ("仓位执行", "买入窗口", "下一交易日 09:30–10:00"),
             ("退出保护", "初始保护线", "成交均价减 2.0 倍 ATR14"),
             ("退出保护", "退出条件", "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"),
@@ -469,7 +471,11 @@ def trend_strategy_snapshot(
             ("退出保护", "过热止盈取整", "按市场最小交易单位向下取整"),
             ("退出保护", "不足一手处理", "不下单并记为本生命周期终态"),
             ("退出保护", "清仓优先级", "强制清仓优先于过热止盈"),
-            ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
+            (
+                "退出保护",
+                "过热跟踪",
+                "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降",
+            ),
         ]
     else:
         parameters = {
@@ -511,7 +517,9 @@ def trend_strategy_snapshot(
             (
                 "仓位执行",
                 "买入数量",
-                "按 1 股整数倍向下取整" if market == "US" else "按 Futu 返回的每标的整手股数向下取整",
+                "使用已有现金，按 1 股整数倍向下取整"
+                if market == "US"
+                else "使用已有现金，按 Futu 返回的每标的整手股数向下取整",
             ),
             (
                 "仓位执行",
@@ -526,7 +534,11 @@ def trend_strategy_snapshot(
             ("退出保护", "过热止盈取整", "按市场最小交易单位向下取整"),
             ("退出保护", "不足一手处理", "不下单并记为本生命周期终态"),
             ("退出保护", "清仓优先级", "强制清仓优先于过热止盈"),
-            ("退出保护", "过热跟踪", "此前 5 个完整交易日最低价；保护线只升不降"),
+            (
+                "退出保护",
+                "过热跟踪",
+                "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降",
+            ),
         ]
 
     return {
@@ -581,6 +593,53 @@ def live_trend_strategy_snapshot(
             },
         ],
     }
+
+
+def _expected_report_strategy_snapshot(
+    market: str,
+    process_version: str,
+    candidate_pool_ids: Sequence[int],
+    supplied: Mapping[str, object] | None,
+) -> dict[str, object]:
+    requested_version = (
+        str(supplied.get("strategy_version") or "")
+        if supplied is not None
+        else ""
+    )
+    if requested_version == "v4":
+        return live_trend_strategy_snapshot(
+            market, process_version, candidate_pool_ids
+        )
+    snapshot = trend_strategy_snapshot(market, process_version, candidate_pool_ids)
+    if requested_version == "v2":
+        snapshot = {
+            **snapshot,
+            "strategy_id": f"trend_animals_warm_to_hot/{market.upper()}/v2",
+            "strategy_version": "v2",
+        }
+    return snapshot
+
+
+def _preserve_v1_replay_snapshot(snapshot: Mapping[str, object]) -> bool:
+    """Keep the main-branch nominal v1 shape intact during replay."""
+    if snapshot.get("strategy_version") != "v1":
+        return False
+    parameters = snapshot.get("parameters")
+    rows = snapshot.get("parameter_rows")
+    if not isinstance(parameters, Mapping) or not isinstance(rows, list):
+        return False
+    row_names = {
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping)
+    }
+    return (
+        "single_entry_risk_limit" not in parameters
+        and "portfolio_risk_limit" not in parameters
+        and "normal_cost_rate" not in parameters
+        and "单笔计划止损风险上限" in row_names
+        and "过热止盈比例" in row_names
+    )
 
 
 @dataclass(frozen=True)
@@ -2000,21 +2059,45 @@ def build_report(
     kelly_data_reason: str = "",
     drawdown_summary: Mapping[str, object] | None = None,
 ) -> TrendReport:
-    resolved_strategy_snapshot = (
-        {
-            **dict(strategy_snapshot),
-            "process_version": process_version
-            or str((metadata or {}).get("process_version") or ""),
-        }
-        if strategy_snapshot is not None
-        else trend_strategy_snapshot(
-            market,
-            process_version
-            or str((metadata or {}).get("process_version") or ""),
-            candidate_pool_ids,
-            normal_cost_rate=normal_cost_rate,
-        )
+    resolved_process_version = process_version or str(
+        (metadata or {}).get("process_version")
+        or (strategy_snapshot or {}).get("process_version")
+        or ""
     )
+    resolved_candidate_pool_ids: Sequence[int] = candidate_pool_ids
+    if not resolved_candidate_pool_ids and strategy_snapshot is not None:
+        supplied_parameters = strategy_snapshot.get("parameters")
+        supplied_pool_ids = (
+            supplied_parameters.get("candidate_pool_ids")
+            if isinstance(supplied_parameters, Mapping)
+            else None
+        )
+        if isinstance(supplied_pool_ids, list) and all(
+            isinstance(item, int) and not isinstance(item, bool)
+            for item in supplied_pool_ids
+        ):
+            resolved_candidate_pool_ids = tuple(supplied_pool_ids)
+    canonical_strategy_snapshot = _expected_report_strategy_snapshot(
+        market,
+        resolved_process_version,
+        resolved_candidate_pool_ids,
+        strategy_snapshot,
+    )
+    if strategy_snapshot is None:
+        resolved_strategy_snapshot = canonical_strategy_snapshot
+    else:
+        normalized_strategy_snapshot = normalize_trend_strategy_snapshot(
+            strategy_snapshot,
+            market,
+            expected_snapshot=canonical_strategy_snapshot,
+        )
+        # v1 reports must replay with their original nominal-sizing contract;
+        # normalization is validation here, not an upgrade of historical facts.
+        resolved_strategy_snapshot = (
+            {**dict(strategy_snapshot), "process_version": resolved_process_version}
+            if _preserve_v1_replay_snapshot(strategy_snapshot)
+            else normalized_strategy_snapshot
+        )
     snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
     kelly_state = (
         TrendKellyState(
@@ -3119,11 +3202,30 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     if not isinstance(parameters, Mapping):
         raise ValueError("strategy snapshot does not match report actions")
     market = str(report.metadata.get("market") or "CN").upper()
-    expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
-    if parameters.get("buy_window") != expected_window:
+    pool_ids = parameters.get("candidate_pool_ids")
+    if not isinstance(pool_ids, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in pool_ids
+    ):
         raise ValueError("strategy snapshot does not match report actions")
     version = snapshot.get("strategy_version")
     if version not in {"v1", "v2", "v3", "v4"}:
+        raise ValueError("strategy snapshot does not match report actions")
+    expected_snapshot = _expected_report_strategy_snapshot(
+        market,
+        str(snapshot.get("process_version") or ""),
+        pool_ids,
+        snapshot,
+    )
+    try:
+        normalize_trend_strategy_snapshot(
+            snapshot,
+            market,
+            expected_snapshot=expected_snapshot,
+        )
+    except ValueError:
+        raise ValueError("strategy snapshot does not match report actions") from None
+    expected_window = "美股常规交易时段" if market == "US" else "09:30-10:00"
+    if parameters.get("buy_window") != expected_window:
         raise ValueError("strategy snapshot does not match report actions")
     if (
         "overheat_trim_fraction" in parameters
@@ -3208,6 +3310,15 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             and report.buy_actions
         ):
             raise ValueError("strategy snapshot does not match report actions")
+    if (
+        "use_available_cash" in parameters
+        and (
+            parameters.get("use_available_cash") is not True
+            or parameters.get("trailing_activation_signals")
+            != ["boiling", "champagne"]
+        )
+    ):
+        raise ValueError("strategy snapshot does not match report actions")
     try:
         protection_multiple = Decimal(str(parameters["initial_protection_atr_multiple"]))
     except (InvalidOperation, KeyError, ValueError):

@@ -608,6 +608,20 @@ def test_dashboard_muted_text_meets_aa_on_approved_soft_surface() -> None:
         assert surface_selector in contract_selectors
 
 
+def test_trend_review_workspace_does_not_hide_horizontal_overflow() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    hidden_overflow_selectors = {
+        selector.strip()
+        for selectors in re.findall(
+            r"([^{}]+)\{[^{}]*overflow-x:\s*hidden;[^{}]*\}", css
+        )
+        for selector in selectors.split(",")
+    }
+
+    assert ".trend-report-workspace" not in hidden_overflow_selectors
+
+
 def test_dashboard_success_text_meets_aa_on_every_adjusted_surface() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     tokens = dict(re.findall(r"--([\w-]+): (#[0-9a-f]{6});", css))
@@ -4634,6 +4648,7 @@ def test_dashboard_trend_review_is_compact_exact_and_account_scoped() -> None:
     output = run_dashboard_js(r'''
 const review=(broker,brokerLabel,market,marketLabel)=>({
   available:true,broker,broker_label:brokerLabel,market,market_label:marketLabel,
+  sample_counts:{discipline:31,actual:29,required:30},common_cutoff:"2026-07-17",
   strategy_snapshot:{strategy_id:`trend/${market}/v1`,strategy_name:`${marketLabel}短线右侧趋势`,
     strategy_version:"v1",process_version:"abc1234",parameters:{position_limit:10},
     parameter_rows:[
@@ -4666,15 +4681,28 @@ for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘
 }
 if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");
 const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);
-for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","版本 v1","当前策略参数",
+for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","第 1 版","当前策略参数",
   "仓位执行","持仓上限","10 笔","退出保护","初始保护线","成交均价减 2.0 倍 ATR14",
-  "收益与回撤","期间净收益率","相对市场超额收益","最大回撤",
-  "风险调整收益","卡玛比率","夏普比率","纪律模拟","实际执行","市场基准",
+  "纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17",
+  "纪律模拟与市场","实际执行与市场","期间净收益率","相对市场超额收益","最大回撤",
+  "卡玛比率","夏普比率","同期市场",
   "12.6%","1.42","实际执行日终净值缺失"]) {
   if (!html.includes(text)) throw new Error(text+"\n"+html);
 }
-if ((html.match(/class="trend-review-chart"/g)||[]).length!==2) throw new Error(html);
-for (const forbidden of ["复盘结论","Connected","创建回测","导出参数","Alpha","Beta","Sortino","胜率","盈亏比"]) {
+if ((html.match(/class="trend-review-header-side"/g)||[]).length!==1) throw new Error(html);
+const side=html.match(/<div class="trend-review-header-side">([\s\S]*?)<\/div>/)?.[1]||"";
+const sideOrder=["data-close-trend-report","纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17"];
+if (sideOrder.some((text,index)=>!side.includes(text)||(index&&side.indexOf(text)<=side.indexOf(sideOrder[index-1])))) throw new Error(side);
+const panels=html.match(/<figure class="trend-review-comparison"[\s\S]*?<\/figure>/g)||[];
+if (panels.length!==2) throw new Error(html);
+for (const panel of panels) {
+  if ((panel.match(/class="trend-review-metric"/g)||[]).length!==5) throw new Error(panel);
+  if ((panel.match(/class="trend-review-series/g)||[]).length!==10) throw new Error(panel);
+  if ((panel.match(/>同期市场</g)||[]).length!==5) throw new Error(panel);
+}
+const noCutoff=renderTrendReviewWorkspace({...state.dashboard.trend_reviews.eastmoney,common_cutoff:null});
+if (!noCutoff.includes("共同截止日 暂无")) throw new Error(noCutoff);
+for (const forbidden of ["复盘结论","运行状态","创建回测","导出参数","缺陷入口","Connected","Backtest","Sharpe","Calmar","Alpha","Beta","Sortino","胜率","盈亏比"]) {
   if (html.includes(forbidden)) throw new Error(forbidden+"\n"+html);
 }
 console.log("ok");

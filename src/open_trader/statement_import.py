@@ -110,7 +110,7 @@ class StatementImportService:
                 raise
             if backup is not None:
                 backup.unlink(missing_ok=True)
-        return {
+        result = {
             "status": "ok",
             "broker": broker,
             "statement_date": statement_date,
@@ -125,6 +125,9 @@ class StatementImportService:
             ),
             "statistics_cutoff_at": statistics_cutoff_at,
         }
+        if parsed.fills:
+            result["fills"] = len(parsed.fills)
+        return result
 
     def _parser(self, broker: str) -> StatementParser:
         if broker == "phillips":
@@ -155,7 +158,8 @@ class StatementImportService:
                     for row in csv.DictReader(handle):
                         if row.get("broker", "").strip().lower() != broker:
                             continue
-                        match = STATEMENT_PERIOD.match(row.get("statement_id", ""))
+                        value = row.get("statement_id", "")
+                        match = STATEMENT_PERIOD.match(f"{value}-")
                         if match is not None:
                             periods.append(match.group(1))
         return max(periods) if periods else ""

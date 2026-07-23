@@ -20,6 +20,7 @@ from .models import (
     ManifestRecord,
     Market,
     Position,
+    TradeFill,
     WarningRecord,
 )
 from .parsers.base import ParseResult, StatementParser, sha256_file
@@ -29,6 +30,7 @@ from .portfolio import (
     merge_eastmoney_portfolio_rows,
     replace_broker_portfolio_rows,
 )
+from .trend_review import ACTUAL_FILL_MARKETS_BY_BROKER, freeze_actual_fill_batch
 
 
 MANIFEST_FIELDNAMES = [
@@ -70,6 +72,22 @@ CASH_FIELDNAMES = [
     "available_balance",
     "confidence",
     "notes",
+]
+
+FILL_FIELDNAMES = [
+    "source_id",
+    "broker",
+    "market",
+    "symbol",
+    "side",
+    "source_order_id",
+    "account_alias",
+    "quantity",
+    "price",
+    "fees",
+    "currency",
+    "executed_at",
+    "source_sequence",
 ]
 
 WARNING_FIELDNAMES = [
@@ -114,6 +132,7 @@ def run_import(
         fx_provider=fx_provider,
         update_latest=update_latest,
         replace_latest_broker=None,
+        actual_fill_complete_through=None,
     )
 
 
@@ -143,6 +162,7 @@ def run_uploaded_statement(
         fx_provider=fx_provider,
         update_latest=True,
         replace_latest_broker=parser.broker,
+        actual_fill_complete_through=statement_date,
     )
 
 
@@ -158,6 +178,7 @@ def _run_import(
     fx_provider: StaticMonthEndFxProvider,
     update_latest: bool,
     replace_latest_broker: str | None,
+    actual_fill_complete_through: str | None,
 ) -> ImportResult:
     parser_list = list(parsers)
     _validate_statement_paths(statement_paths, parser_list)
@@ -167,32 +188,56 @@ def _run_import(
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
+    fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
     manifest: list[ManifestRecord] = []
     if replace_latest_broker is not None:
-        positions, cash_balances, warnings, manifest = _preserved_run_records(
+        positions, cash_balances, fills, warnings, manifest = _preserved_run_records(
             run_dir, replace_latest_broker
         )
     uploaded_positions: list[Position] = []
     uploaded_cash: list[CashBalance] = []
+    uploaded_fill_batches: list[
+        tuple[str, str, list[TradeFill], str, str]
+    ] = []
 
     for parser in parser_list:
         source_path = statement_paths[parser.broker]
         parsed_at = datetime.now(UTC).isoformat()
         parse_result = parser.parse(source_path, statement_period)
         _validate_parse_result_brokers(parser.broker, parse_result)
+        source_sha256 = sha256_file(source_path)
 
         positions.extend(parse_result.positions)
         cash_balances.extend(parse_result.cash_balances)
+        fills.extend(parse_result.fills)
         uploaded_positions.extend(parse_result.positions)
         uploaded_cash.extend(parse_result.cash_balances)
+        if (
+            parse_result.fills_complete
+            and parse_result.fills_coverage_start is not None
+            and parse_result.fills_coverage_end is not None
+            and (
+                actual_fill_complete_through is None
+                or parse_result.fills_coverage_end <= actual_fill_complete_through
+            )
+        ):
+            uploaded_fill_batches.append(
+                (
+                    parser.broker,
+                    source_sha256,
+                    list(parse_result.fills),
+                    parse_result.fills_coverage_start,
+                    parse_result.fills_coverage_end,
+                )
+            )
         warnings.extend(parse_result.warnings)
         manifest.append(
             ManifestRecord(
                 month=month,
                 broker=parse_result.broker,
                 source_file=str(source_path),
-                source_sha256=sha256_file(source_path),
+                source_sha256=source_sha256,
                 parsed_at=parsed_at,
                 page_count=parse_result.page_count,
                 parser_version=parser.parser_version,
@@ -210,7 +255,7 @@ def _run_import(
     if replace_latest_broker is not None and latest_path.exists():
         detail_dir = _latest_daily_detail_dir(data_dir)
         if detail_dir is not None:
-            latest_positions, latest_cash, _, _ = _preserved_run_records(
+            latest_positions, latest_cash, _, _, _ = _preserved_run_records(
                 detail_dir, replace_latest_broker
             )
             latest_portfolio_rows = build_portfolio_rows(
@@ -237,6 +282,7 @@ def _run_import(
     backup_run_dir: Path | None = None
     temp_run_promoted = False
     latest_replaced = False
+    fills = list({(fill.broker, fill.source_id): fill for fill in fills}.values())
     try:
         if update_latest:
             latest_dir.mkdir(parents=True, exist_ok=True)
@@ -255,6 +301,11 @@ def _run_import(
             temp_run_dir / "extracted_cash.csv",
             CASH_FIELDNAMES,
             (_cash_to_row(cash) for cash in cash_balances),
+        )
+        write_rows(
+            temp_run_dir / "extracted_fills.csv",
+            FILL_FIELDNAMES,
+            (_fill_to_row(fill) for fill in fills),
         )
         write_rows(
             temp_run_dir / "parse_warnings.csv",
@@ -284,10 +335,31 @@ def _run_import(
             run_dir.rename(backup_run_dir)
         temp_run_dir.rename(run_dir)
         temp_run_promoted = True
-        if backup_run_dir is not None and backup_run_dir.exists():
-            rmtree(backup_run_dir)
-        if backup_latest_path is not None and backup_latest_path.exists():
-            _best_effort_unlink(backup_latest_path)
+        if actual_fill_complete_through is not None:
+            for (
+                broker,
+                source_sha256,
+                batch_fills,
+                fills_coverage_start,
+                fills_coverage_end,
+            ) in uploaded_fill_batches:
+                if broker in {"eastmoney", "phillips"}:
+                    freeze_actual_fill_batch(
+                        data_dir,
+                        {
+                            "broker": broker,
+                            "market": ACTUAL_FILL_MARKETS_BY_BROKER[broker],
+                            "source_sha256": source_sha256,
+                        },
+                        batch_fills,
+                        fills_coverage_end,
+                        coverage_start=fills_coverage_start,
+                    )
+        if actual_fill_complete_through is None:
+            if backup_run_dir is not None and backup_run_dir.exists():
+                rmtree(backup_run_dir)
+            if backup_latest_path is not None and backup_latest_path.exists():
+                _best_effort_unlink(backup_latest_path)
     except Exception:
         _rollback_failed_promotion(
             run_dir=run_dir,
@@ -300,6 +372,12 @@ def _run_import(
             latest_replaced=latest_replaced,
         )
         raise
+
+    if actual_fill_complete_through is not None:
+        if backup_run_dir is not None and backup_run_dir.exists():
+            _best_effort_rmtree(backup_run_dir)
+        if backup_latest_path is not None and backup_latest_path.exists():
+            _best_effort_unlink(backup_latest_path)
 
     portfolio_path = run_dir / "portfolio.csv"
 
@@ -340,6 +418,7 @@ def _preserved_run_records(
 ) -> tuple[
     list[Position],
     list[CashBalance],
+    list[TradeFill],
     list[WarningRecord],
     list[ManifestRecord],
 ]:
@@ -352,6 +431,11 @@ def _preserved_run_records(
     cash = [
         _cash_from_row(row)
         for row in _read_rows(run_dir / "extracted_cash.csv")
+        if _detail_broker(row) != target
+    ]
+    fills = [
+        _fill_from_row(row)
+        for row in _read_rows(run_dir / "extracted_fills.csv")
         if _detail_broker(row) != target
     ]
     warnings = [
@@ -380,7 +464,7 @@ def _preserved_run_records(
         for row in _read_rows(run_dir / "manifest.csv")
         if row.get("broker", "").strip().lower() != target
     ]
-    return positions, cash, warnings, manifest
+    return positions, cash, fills, warnings, manifest
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
@@ -430,6 +514,28 @@ def _cash_from_row(row: dict[str, str]) -> CashBalance:
         available_balance=_optional_decimal(row.get("available_balance", "")),
         confidence=_confidence(row.get("confidence", "")),
         notes=row.get("notes", ""),
+    )
+
+
+def _fill_from_row(row: dict[str, str]) -> TradeFill:
+    return TradeFill(
+        source_id=row.get("source_id", ""),
+        source_order_id=row.get("source_order_id") or None,
+        broker=_detail_broker(row),
+        account_alias=row.get("account_alias", ""),
+        market=_enum_or_default(Market, row.get("market", ""), Market.OTHER),
+        symbol=row.get("symbol", ""),
+        currency=row.get("currency", "").upper(),
+        side=row.get("side", "").upper(),
+        quantity=Decimal(row["quantity"]),
+        price=Decimal(row["price"]),
+        fees=_optional_decimal(row.get("fees", "")),
+        executed_at=row.get("executed_at", ""),
+        source_sequence=(
+            int(row["source_sequence"])
+            if row.get("source_sequence", "").strip()
+            else None
+        ),
     )
 
 
@@ -605,7 +711,7 @@ def _validate_parse_result_brokers(
             f"parser broker {expected_broker} returned result broker {result_broker}"
         )
 
-    for collection_name in ("positions", "cash_balances", "warnings"):
+    for collection_name in ("positions", "cash_balances", "fills", "warnings"):
         for record in getattr(parse_result, collection_name):
             if record.broker != expected_broker:
                 raise ValueError(
@@ -658,6 +764,26 @@ def _cash_to_row(cash: CashBalance) -> dict[str, str]:
         "available_balance": _decimal_to_str(cash.available_balance),
         "confidence": cash.confidence,
         "notes": cash.notes,
+    }
+
+
+def _fill_to_row(fill: TradeFill) -> dict[str, str]:
+    return {
+        "source_id": fill.source_id,
+        "broker": fill.broker,
+        "market": fill.market.value,
+        "symbol": fill.symbol,
+        "side": fill.side,
+        "source_order_id": fill.source_order_id or "",
+        "account_alias": fill.account_alias,
+        "quantity": _decimal_to_str(fill.quantity),
+        "price": _decimal_to_str(fill.price),
+        "fees": _decimal_to_str(fill.fees),
+        "currency": fill.currency,
+        "executed_at": fill.executed_at,
+        "source_sequence": (
+            "" if fill.source_sequence is None else str(fill.source_sequence)
+        ),
     }
 
 

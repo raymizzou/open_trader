@@ -16,8 +16,15 @@ from open_trader.models import (
     Market,
     Position,
     StatementTrade,
+    TradeFill,
+    WarningRecord,
 )
-from open_trader.parsers.base import ParseResult, StatementParser, parse_decimal
+from open_trader.parsers.base import (
+    ParseResult,
+    StatementParser,
+    parse_decimal,
+    source_id_for_fill,
+)
 
 
 BROKER = "eastmoney"
@@ -31,7 +38,7 @@ POSITION_HEADER = (
     "成本价",
     "证券市值",
 )
-TRANSACTION_HEADER = (
+EXECUTION_HEADER = TRANSACTION_HEADER = (
     "发生日期",
     "买卖类别",
     "证券代码",
@@ -45,8 +52,22 @@ TRANSACTION_HEADER = (
     "资金余额",
 )
 SUPPORTED_MARKETS = {"沪市A股", "深市A股"}
+NON_TRADE_EXECUTION_CATEGORIES = {
+    "证券红利",
+    "证券转入",
+    "证券转出",
+    "红利入账",
+    "天天宝申购",
+    "天天宝赎回",
+    "银行转证券",
+    "证券转银行",
+    "利息归本",
+}
 MONEY = r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)"
 PRINT_DATE = re.compile(r"打印日期\s*[:：]\s*(\d{4}-\d{2}-\d{2})")
+QUERY_INTERVAL = re.compile(
+    r"查询区间\s*[:：]\s*(\d{4}/\d{2}/\d{2})\s*-\s*(\d{4}/\d{2}/\d{2})"
+)
 
 
 def parse_eastmoney_page(
@@ -82,6 +103,48 @@ def parse_eastmoney_page(
     if cash_balance is None or cash_balance < 0 or available_balance is None:
         raise ValueError("东方财富对账单缺少人民币资金汇总")
 
+    fills: list[TradeFill] = []
+    warnings: list[WarningRecord] = []
+    occurrences: dict[tuple[str, ...], int] = {}
+    sequence_by_group: dict[tuple[str, str], int] = {}
+    execution_tables = tuple(
+        candidate
+        for candidate in tables
+        if candidate and _normalize_row(candidate[0]) == EXECUTION_HEADER
+    )
+    fills_complete = bool(execution_tables)
+    for execution_table in execution_tables:
+        for row in execution_table[1:]:
+            values = _normalize_row(row)
+            category = values[1] if len(values) > 1 else ""
+            occurrence = occurrences.get(values, 0)
+            occurrences[values] = occurrence + 1
+            fill = _parse_fill(row, occurrence)
+            if fill is not None:
+                group = (fill.symbol, fill.executed_at)
+                source_sequence = sequence_by_group.get(group, 0)
+                sequence_by_group[group] = source_sequence + 1
+                fill = replace(fill, source_sequence=source_sequence)
+                fills.append(fill)
+            elif (
+                any(values)
+                and category not in NON_TRADE_EXECUTION_CATEGORIES
+            ):
+                fills_complete = False
+                warnings.append(
+                    WarningRecord(
+                        statement_id=statement_id,
+                        broker=BROKER,
+                        page=None,
+                        severity="warning",
+                        code="invalid_execution_row",
+                        message="东方财富成交行缺少成交标识、方向、数量、价格或日期",
+                    )
+                )
+
+    fills_coverage_start, fills_coverage_end = _fill_coverage_interval(
+        first_page_text
+    )
     return ParseResult(
         statement_id=statement_id,
         broker=BROKER,
@@ -99,7 +162,75 @@ def parse_eastmoney_page(
                 notes="cash derived from statement total assets less securities value",
             )
         ],
+        fills=fills,
+        fills_complete=fills_complete,
+        fills_coverage_start=fills_coverage_start,
+        fills_coverage_end=fills_coverage_end,
+        warnings=warnings,
     )
+
+
+def _parse_fill(row: list[str | None], occurrence: int) -> TradeFill | None:
+    if len(row) != len(EXECUTION_HEADER):
+        return None
+    values = [_normalize_cell(cell) for cell in row]
+    executed_at = _execution_date(values[0])
+    side = {"证券买入": "BUY", "证券卖出": "SELL"}.get(values[1])
+    quantity = parse_decimal(values[4])
+    price = parse_decimal(values[5])
+    if (
+        executed_at is None
+        or side is None
+        or re.fullmatch(r"\d{6}", values[2]) is None
+        or quantity is None
+        or quantity <= 0
+        or price is None
+        or price <= 0
+    ):
+        return None
+    fee_parts = [parse_decimal(value) for value in values[7:10]]
+    fees = (
+        sum(fee_parts, Decimal("0"))
+        if all(fee is not None for fee in fee_parts)
+        else None
+    )
+    return TradeFill(
+        source_id=source_id_for_fill(BROKER, [*values, str(occurrence)]),
+        source_order_id=None,
+        broker=BROKER,
+        account_alias=ACCOUNT_ALIAS,
+        market=Market.CN,
+        symbol=values[2],
+        currency="CNY",
+        side=side,
+        quantity=quantity,
+        price=price,
+        fees=fees,
+        executed_at=executed_at,
+    )
+
+
+def _execution_date(value: str) -> str | None:
+    try:
+        return date.fromisoformat(
+            f"{value[:4]}-{value[4:6]}-{value[6:]}" if re.fullmatch(r"\d{8}", value) else value
+        ).isoformat()
+    except ValueError:
+        return None
+
+
+def _fill_coverage_interval(text: str) -> tuple[str | None, str | None]:
+    match = QUERY_INTERVAL.search(text)
+    if match is None:
+        return None, None
+    try:
+        start = date.fromisoformat(match.group(1).replace("/", "-"))
+        end = date.fromisoformat(match.group(2).replace("/", "-"))
+    except ValueError:
+        raise ValueError("东方财富对账单包含无效查询区间") from None
+    if start > end:
+        raise ValueError("东方财富对账单包含无效查询区间")
+    return start.isoformat(), end.isoformat()
 
 
 def _parse_trades(
@@ -115,7 +246,7 @@ def _parse_trades(
             if normalized == TRANSACTION_HEADER:
                 continue
             if len(normalized) != len(TRANSACTION_HEADER):
-                raise ValueError("东方财富对账单包含无效成交行")
+                continue
             (
                 traded_date,
                 side_label,
@@ -154,7 +285,7 @@ def _parse_trades(
                 or total is None
                 or any(part is None or part < 0 for part in fee_parts)
             ):
-                raise ValueError("东方财富对账单包含无效成交行")
+                continue
             fee = sum((part for part in fee_parts if part is not None), Decimal("0"))
             notional = quantity * price
             expected_total = -(notional + fee) if side == "buy" else notional - fee

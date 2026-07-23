@@ -95,6 +95,23 @@ class CashBalance:
 
 
 @dataclass(frozen=True)
+class TradeFill:
+    source_id: str
+    source_order_id: str | None
+    broker: str
+    account_alias: str
+    market: Market
+    symbol: str
+    currency: str
+    side: Literal["BUY", "SELL"]
+    quantity: Decimal
+    price: Decimal
+    fees: Decimal | None
+    executed_at: str
+    source_sequence: int | None = None
+
+
+@dataclass(frozen=True)
 class WarningRecord:
     statement_id: str
     broker: str

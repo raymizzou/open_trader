@@ -217,6 +217,276 @@ def test_parse_phillips_text_extracts_hk_and_us_positions() -> None:
     assert us.currency == "USD"
 
 
+def test_phillips_statement_extracts_actual_trade_fills() -> None:
+    result = parse_phillips_text(
+        """Issue Date : 10/07/26
+Transaction Details
+日期Date 產品 Product 參考 Reference 類別 Type 摘要 Description 數量 Quantity 單價 Price 成交金額 Consideration 金額 Amount
+10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 100 380.0000 38,000.00 37,900.00
+""",
+        "2026-07",
+    )
+
+    assert [(fill.market.value, fill.symbol, fill.side) for fill in result.fills] == [
+        ("HK", "00700", "SELL"),
+    ]
+    assert result.fills[0].quantity == Decimal("100")
+    assert result.fills[0].price == Decimal("380.0000")
+    assert result.fills[0].executed_at == "2026-07-10"
+    assert result.fills[0].source_id
+    assert result.fills[0].source_order_id == "REF00001"
+    assert result.fills_complete is True
+    assert result.fills_coverage_start == "2026-07-10"
+    assert result.fills_coverage_end == "2026-07-10"
+
+
+def test_phillips_without_transaction_section_does_not_claim_fill_completeness() -> None:
+    result = parse_phillips_text("Securities Portfolio\n", "2026-07")
+
+    assert result.fills_complete is False
+
+
+def test_phillips_non_trade_equity_activity_does_not_block_completeness() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n10/07/26 Equity REF Dividend 000700 Tencent 10.00\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "10/07/26 14/07/26 Equity Sold 000700 Tencent 100 380.00 38,000.00 37,900.00",
+        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 380.00 38,000.00 37,900.00",
+        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 100 missing 38,000.00 37,900.00",
+    ],
+)
+def test_phillips_statement_warns_for_incomplete_execution_row(line: str) -> None:
+    result = parse_phillips_text(
+        f"Transaction Details\n{line}\n",
+        "2026-07",
+    )
+
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_trade_shaped_row_without_known_side_is_incomplete() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "10/07/26 14/07/26 Equity REF00001 Pending 000700 Tencent "
+        "100 380.00 38,000.00 37,900.00\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent",
+        "10/07/26 14/07/26 Equity REF00001 000700 Tencent",
+        "BROKEN TRANSACTION ACTIVITY",
+    ],
+)
+def test_phillips_any_nonempty_unparsed_transaction_activity_is_incomplete(
+    line: str,
+) -> None:
+    result = parse_phillips_text(
+        f"Transaction Details\n{line}\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_repeated_transaction_heading_does_not_restore_completeness() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "BROKEN TRANSACTION ACTIVITY\n"
+        "Transaction Details\n"
+        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent "
+        "100 380.00 38,000.00 37,900.00\n",
+        "2026-07",
+    )
+
+    assert len(result.fills) == 1
+    assert result.fills_complete is False
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_cash_section_ends_transaction_validation() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "Cash Balance\n"
+        "HKD 100.00\n",
+        "2026-07",
+    )
+
+    assert result.fills_complete is True
+    assert result.warnings == []
+    assert result.cash_balances[0].cash_balance == Decimal("100.00")
+
+
+def test_phillips_statement_warns_when_execution_date_is_missing() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+Equity REF00001 Sold 000700 Tencent 100 380.00 38,000.00 37,900.00
+""",
+        "2026-07",
+    )
+
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_ignores_non_hk_execution_rows_with_warning() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 11/07/26 Equity REF00001 Sold Apple 1 200.00 200.00 199.00
+Securities Portfolio
+Equity XNAS AAPL Apple 0 10/07/26 1 200.00 200.00 0.50 100.00
+""",
+        "2026-07",
+    )
+
+    assert result.fills == []
+    assert [warning.code for warning in result.warnings] == [
+        "unsupported_execution_market"
+    ]
+
+
+def test_phillips_identical_execution_rows_get_stable_distinct_ids() -> None:
+    text = """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 100 380.0000 38,000.00 37,900.00
+10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent 100 380.0000 38,000.00 37,900.00
+"""
+
+    first = parse_phillips_text(text, "2026-07")
+    repeated = parse_phillips_text(text, "2026-07")
+
+    assert len({fill.source_id for fill in first.fills}) == 2
+    assert [fill.source_id for fill in first.fills] == [
+        fill.source_id for fill in repeated.fills
+    ]
+    assert [fill.source_sequence for fill in first.fills] == [0, 1]
+
+
+def test_phillips_source_sequence_is_local_to_symbol_and_execution_date() -> None:
+    target_one = (
+        "10/07/26 14/07/26 Equity REF00001 Bought 000700 Tencent "
+        "100 380.00 38,000.00 37,900.00"
+    )
+    target_two = (
+        "10/07/26 14/07/26 Equity REF00002 Sold 000700 Tencent "
+        "100 381.00 38,100.00 38,000.00"
+    )
+    other_day = (
+        "09/07/26 13/07/26 Equity REF00003 Bought 000700 Tencent "
+        "100 379.00 37,900.00 37,800.00"
+    )
+    other_symbol = (
+        "10/07/26 14/07/26 Equity REF00004 Bought 000522 Other "
+        "100 3.00 300.00 299.00"
+    )
+
+    first = parse_phillips_text(
+        "Transaction Details\n"
+        + "\n".join((other_day, target_one, other_symbol, target_two)),
+        "2026-07",
+    )
+    reordered = parse_phillips_text(
+        "Transaction Details\n"
+        + "\n".join((other_symbol, target_one, target_two, other_day)),
+        "2026-07",
+    )
+
+    assert [
+        fill.source_sequence
+        for fill in first.fills
+        if fill.symbol == "00700" and fill.executed_at == "2026-07-10"
+    ] == [0, 1]
+    assert [
+        fill.source_sequence
+        for fill in reordered.fills
+        if fill.symbol == "00700" and fill.executed_at == "2026-07-10"
+    ] == [0, 1]
+
+
+def test_phillips_execution_accepts_numeric_code_without_inline_name() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold 0200 522 3.38 1,764.36 1,760.00
+""",
+        "2026-07",
+    )
+
+    assert [(fill.market.value, fill.symbol) for fill in result.fills] == [
+        ("HK", "00200")
+    ]
+
+
+def test_phillips_execution_resolves_hk_symbol_from_explicit_portfolio_name() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold CSOP UST20 610 66.56 40,601.60 40,590.00
+Securities Portfolio
+Equity XHKG 003433 CSOP UST20 610 10/07/26 0 66.5600 0.00 0.0000 0.00
+""",
+        "2026-07",
+    )
+
+    assert [(fill.market.value, fill.symbol) for fill in result.fills] == [
+        ("HK", "03433")
+    ]
+
+
+def test_phillips_execution_skips_name_shared_by_multiple_hk_symbols() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold Shared Name 1 10.00 10.00 9.00
+Securities Portfolio
+Equity XHKG 003433 Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+Equity XHKG 000200 Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+""",
+        "2026-07",
+    )
+
+    assert result.fills == []
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
+
+
+def test_phillips_execution_skips_name_shared_by_hk_and_us_symbols() -> None:
+    result = parse_phillips_text(
+        """Transaction Details
+10/07/26 14/07/26 Equity REF00001 Sold Shared Name 1 10.00 10.00 9.00
+Securities Portfolio
+Equity XNAS AAPL Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+Equity XHKG 000200 Shared Name 1 10/07/26 1 10.00 10.00 0.50 5.00
+""",
+        "2026-07",
+    )
+
+    assert result.fills == []
+    assert [warning.code for warning in result.warnings] == [
+        "invalid_execution_row"
+    ]
 def test_parse_phillips_text_extracts_trade_reference_time_price_and_fee() -> None:
     result = parse_phillips_text(
         """綜合日成交單及結單

@@ -195,6 +195,11 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         set(row) == {"group", "name", "value"}
         for row in snapshot["parameter_rows"]
     )
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert rows["买入数量"].startswith("使用已有现金，")
+    assert rows["过热跟踪"] == (
+        "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降"
+    )
     live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
     assert (live["strategy_id"], live["strategy_version"]) == (
         f"trend_animals_warm_to_hot/{market}/v4", "v4"

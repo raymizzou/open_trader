@@ -531,12 +531,26 @@ def test_cn_strategy_snapshot_matches_runtime_rules_and_report_actions() -> None
         set(row) == {"group", "name", "value"}
         for row in snapshot["parameter_rows"]
     )
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert {
+        "买入数量": "使用已有现金，按 100 股整数倍向下取整",
+        "过热跟踪": "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降",
+    }.items() <= rows.items()
 
     built = report(candidates=(candidate("600001"),))
     assert built.buy_actions[0].lot_size == 100
     assert trend_module._report_payload(built)["strategy_snapshot"] == (
         built.strategy_snapshot
     )
+
+
+@pytest.mark.parametrize(
+    "market", ["CN", "US", "HK"],
+)
+def test_trend_v3_effective_date_is_shared_across_markets(market: str) -> None:
+    assert trend_module.trend_strategy_snapshot(
+        market, "abc123", (622466,)
+    )["effective_from"] == "2026-07-20"
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
@@ -548,8 +562,92 @@ def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
         strategy_snapshot={**built.strategy_snapshot, "parameters": parameters},
     )
 
-    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+    with pytest.raises(
+        ValueError, match="strategy snapshot does not match report actions"
+    ):
         trend_module.validate_report_strategy_snapshot(broken)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("use_available_cash", False),
+        ("trailing_activation_signals", ["boiling"]),
+    ],
+)
+def test_report_rejects_snapshot_that_changes_shared_execution_rules(
+    parameter: str, value: object
+) -> None:
+    built = report(candidates=(candidate("600001"),))
+    parameters = {**built.strategy_snapshot["parameters"], parameter: value}
+    broken = replace(
+        built,
+        strategy_snapshot={**built.strategy_snapshot, "parameters": parameters},
+    )
+
+    with pytest.raises(
+        ValueError, match="strategy snapshot does not match report actions"
+    ):
+        trend_module.validate_report_strategy_snapshot(broken)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("min_strength", "94"),
+        ("candidate_limit", 9),
+        ("position_limit", 9),
+        ("allowed_phases", ["谷雨"]),
+    ],
+)
+def test_build_report_rejects_any_injected_snapshot_parameter_drift(
+    parameter: str, value: object,
+) -> None:
+    canonical = trend_module.trend_strategy_snapshot("CN", "sha", ())
+    changed = {
+        **canonical,
+        "parameters": {**canonical["parameters"], parameter: value},
+    }
+
+    with pytest.raises(ValueError, match="strategy snapshot"):
+        build_report(
+            as_of_date="2026-07-16",
+            execution_date="2026-07-17",
+            account=account(),
+            candidates=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            market="CN",
+            process_version="sha",
+            candidate_pool_ids=(),
+            strategy_snapshot=changed,
+        )
+
+
+def test_build_report_upgrades_exact_repository_legacy_snapshot() -> None:
+    legacy = json.loads(
+        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+            encoding="utf-8"
+        )
+    )["strategy_snapshot"]
+    pools = tuple(legacy["parameters"]["candidate_pool_ids"])
+
+    built = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version=legacy["process_version"],
+        candidate_pool_ids=pools,
+        strategy_snapshot=legacy,
+    )
+
+    assert built.strategy_snapshot == trend_module.trend_strategy_snapshot(
+        "CN", legacy["process_version"], pools
+    )
 
 
 def test_candidates_filter_then_sort_deterministically() -> None:
