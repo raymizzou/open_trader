@@ -16,6 +16,7 @@ from open_trader.drawdown_preflight import (
 from open_trader.notifications import NullNotifier
 from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
+    audited_prior_strategy_equity,
     observe_strategy_equity,
 )
 
@@ -123,6 +124,36 @@ def test_existing_state_does_not_require_repeated_frozen_baseline(
     assert result["status"] == "ready"
     assert result["markets"][0]["status"] == "ready"
     assert state_path.read_bytes() == before
+
+
+def test_new_strategy_version_migrates_from_audited_prior_equity(
+    tmp_path: Path,
+) -> None:
+    prior = market_input("CN")
+    assert run_preflight(tmp_path, {"CN": prior})["status"] == "ready"
+    assert audited_prior_strategy_equity(tmp_path / "data", market="CN") == Decimal("100")
+    migrated = replace(
+        prior,
+        strategy_snapshot={
+            **prior.strategy_snapshot,
+            "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+            "strategy_version": "v5",
+        },
+        baseline_equity=None,
+    )
+
+    result = run_preflight(tmp_path, {"CN": migrated})
+
+    assert result["status"] == "ready"
+    assert result["markets"][0]["status"] == "bootstrapped"
+    state = json.loads((tmp_path / "data/trend_drawdown/state.json").read_text())
+    event = next(
+        item
+        for item in state["audit_events"]
+        if item.get("strategy_version") == "v5"
+    )
+    assert event["baseline_equity"] == "100"
+    assert event["reason"] == "new_strategy_version"
 
 
 def test_preflight_accepts_the_approved_v4_overheat_trim_transition(

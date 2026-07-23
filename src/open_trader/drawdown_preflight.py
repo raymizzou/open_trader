@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from .notifications import Notifier
 from .strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
+    audited_prior_strategy_equity,
     recover_strategy_drawdown_state,
     strategy_drawdown_keys,
     strategy_drawdown_state_status,
@@ -174,6 +175,19 @@ def run_drawdown_preflight(
             continue
         key = (market, strategy_id, strategy_version)
         was_present = key in existing_keys
+        if not was_present and item.baseline_equity is None:
+            migrated_equity = audited_prior_strategy_equity(
+                data_dir, market=market
+            )
+            if migrated_equity is not None:
+                item = DrawdownMarketInput(
+                    market=item.market,
+                    strategy_snapshot=item.strategy_snapshot,
+                    baseline_equity=migrated_equity,
+                    source_date=item.source_date,
+                    entry_eligible_from=item.entry_eligible_from,
+                    error=item.error,
+                )
         if not was_present and (
             item.baseline_equity is None
             or item.source_date is None

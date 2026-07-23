@@ -575,6 +575,39 @@ def strategy_drawdown_keys(data_dir: Path) -> set[tuple[str, str, str]]:
     return {_record_key(record) for record in records}
 
 
+def audited_prior_strategy_equity(
+    data_dir: Path, *, market: str
+) -> Decimal | None:
+    """Return the latest audited equity for a prior strategy in ``market``.
+
+    This is migration evidence for a newly versioned strategy. It deliberately
+    reads only the validated drawdown state; it never queries a live account or
+    treats a current broker NAV as a historical baseline.
+    """
+    path = _state_path(data_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = _load_state(path)
+    except ValueError:
+        return None
+    records = payload["records"]
+    assert isinstance(records, list)
+    candidates = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("market") == market
+    ]
+    candidates.sort(key=lambda record: (str(record.get("updated_at") or ""), _record_key(record)), reverse=True)
+    for record in candidates:
+        try:
+            equity = _positive_decimal(record["current_equity"], "current_equity")
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            continue
+        return equity
+    return None
+
+
 def recover_strategy_drawdown_state(
     data_dir: Path, *, actor: str, occurred_at: str
 ) -> dict[str, object]:
