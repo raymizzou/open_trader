@@ -5170,6 +5170,25 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_cn_audit_unknown_prototype_reason_codes_use_safe_fallback() -> None:
+    output = run_dashboard_js(r'''
+const html = renderCnTrendAudit({candidates:[{
+  symbol:"600001", name:"测试", eligible:false,
+  excluded_reasons:["constructor","__proto__","toString"]
+}]});
+for (const text of [
+  "未识别规则：constructor", "未识别规则：__proto__", "未识别规则：toString",
+  "请核对冻结报告"
+]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+if (html.includes("未知原因") || html.includes("function")) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_cn_disciplines_default_closed_only_on_mobile() -> None:
     output = run_dashboard_js(r'''
 const report={market:"CN",counts:{},sell_actions:[],buy_actions:[],hold_actions:[],audit:{}};

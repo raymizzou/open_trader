@@ -2682,7 +2682,9 @@ function cnTrendAuditReason(reason, item, parameters, report) {
       cnTrendAuditRequirement(parameters, "max_right_side_days_exclusive", (value) => `要求：少于 ${formatDisplayNumber(value)} 天`),
     ],
   };
-  const values = rules[reason];
+  const values = Object.prototype.hasOwnProperty.call(rules, reason)
+    ? rules[reason]
+    : undefined;
   return values
     ? {code: reason, label: values[0], actual: values[1], requirement: values[2]}
     : {
