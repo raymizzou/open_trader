@@ -1679,6 +1679,42 @@ def _valid_v4_dashboard_trend_payload() -> dict[str, object]:
     return payload
 
 
+def _valid_v5_dashboard_trend_payload() -> dict[str, object]:
+    payload = copy.deepcopy(_valid_v4_dashboard_trend_payload())
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+        "strategy_version": "v5",
+    })
+    drawdown = payload["drawdown_summary"]
+    assert isinstance(drawdown, dict)
+    drawdown.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+        "strategy_version": "v5",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v5|v5",
+    })
+    bootstrap = drawdown["bootstrap_event"]
+    assert isinstance(bootstrap, dict)
+    bootstrap.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+        "strategy_version": "v5",
+    })
+    return payload
+
+
+def test_dashboard_accepts_cn_v5_risk_and_drawdown_contract() -> None:
+    payload = _valid_v5_dashboard_trend_payload()
+    assert dashboard_module._valid_trend_risk_summary(payload)
+
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.pop("single_entry_risk_limit")
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
 def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
     tmp_path: Path,
 ) -> None:

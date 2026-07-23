@@ -30,6 +30,26 @@ from open_trader.strategy_drawdown import (
 from open_trader.models import Market, TradeFill
 
 
+def test_cn_v4_and_v5_snapshots_normalize_without_cross_version_rewrite() -> None:
+    old = live_trend_strategy_snapshot(
+        "CN",
+        "abc123",
+        (622466, 697199),
+        strategy_version="v4",
+    )
+    current = live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199)
+    )
+
+    assert trend_review.normalize_trend_strategy_snapshot(old, "CN") == old
+    assert (
+        trend_review.normalize_trend_strategy_snapshot(current, "CN")
+        == current
+    )
+    assert old["parameters"]["max_filter_price"] == "200"
+    assert "max_filter_price" not in current["parameters"]
+
+
 def frozen_evidence() -> dict[str, object]:
     return {
         "market": "CN",
@@ -149,7 +169,10 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
     tmp_path: Path,
 ) -> None:
     snapshot = live_trend_strategy_snapshot(
-        "CN", "oldsha", (622466, 697199)
+        "CN",
+        "oldsha",
+        (622466, 697199),
+        strategy_version="v4",
     )
     drawdown = {
         "schema_version": "open_trader.strategy_drawdown.v1",
@@ -4344,7 +4367,7 @@ def test_partial_buy_cash_below_one_lot_creates_no_attempt(tmp_path: Path) -> No
     assert len(client.requests) == 1
 
 
-@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4"])
+@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v5"])
 def test_partial_buy_risk_cap_limits_retry_lots(
     tmp_path: Path, strategy_version: str
 ) -> None:

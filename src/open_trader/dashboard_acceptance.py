@@ -133,7 +133,7 @@ TREND_REASON_LABELS = {
     "strength_below_95": "趋势强度低于 95",
     "industry_id_missing": "行业 ID 缺失",
     "industry_temperature_missing": "行业温度缺失",
-    "industry_temperature_not_hot": "行业温度未达到热或沸",
+    "industry_temperature_not_hot": "行业温度未达到要求",
     "phase_missing": "趋势节气缺失",
     "phase_after_summer_solstice": "趋势节气晚于夏至",
     "market_cap_missing": "市值缺失",
@@ -461,6 +461,7 @@ def validate_integrated_candidate(
     labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
     for broker, market in TREND_SIMULATE_MARKETS.items():
         try:
+            expected_version = "v5" if broker == "eastmoney" else "v4"
             report = reports.get(broker)
             assert isinstance(report, Mapping) and report.get("available") is True, (
                 f"{broker} {market} 趋势报告不可用"
@@ -509,12 +510,12 @@ def validate_integrated_candidate(
             )
             assert (
                 isinstance(parameters, Mapping)
-                and snapshot.get("strategy_version") == "v4"
+                and snapshot.get("strategy_version") == expected_version
                 and re.fullmatch(
                     r"[0-9a-f]{40}", str(snapshot.get("process_version") or "")
                 )
-                and report.get("strategy_version") == "v4"
-            ), f"{broker} 冻结 Kelly/回撤 v4 策略身份无效"
+                and report.get("strategy_version") == expected_version
+            ), f"{broker} 冻结 Kelly/回撤策略身份无效"
             for key, expected, label in (
                 ("single_entry_risk_limit", Decimal("0.004"), "单笔风险"),
                 ("portfolio_risk_limit", Decimal("0.04"), "组合风险"),
@@ -616,7 +617,7 @@ def validate_integrated_candidate(
             assert valid_strategy_parameter_audit_identity(
                 market=market,
                 strategy_id=str(snapshot.get("strategy_id") or ""),
-                strategy_version="v4",
+                strategy_version=expected_version,
                 parameters=parameters,
                 bootstrap_event=bootstrap,
                 parameter_compatibility_event=drawdown.get(

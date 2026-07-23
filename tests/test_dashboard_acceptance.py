@@ -1136,6 +1136,7 @@ def integrated_v4_payload(
         "eastmoney": "trend_a_share",
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
+        strategy_version = "v5" if market == "CN" else "v4"
         pending = market == "HK"
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {
@@ -1170,8 +1171,10 @@ def integrated_v4_payload(
             },
             "account": serialized_trend_account(fresh=True),
             "strategy_snapshot": {
-                "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
-                "strategy_version": "v4",
+                "strategy_id": (
+                    f"trend_animals_warm_to_hot/{market}/{strategy_version}"
+                ),
+                "strategy_version": strategy_version,
                 "process_version": "a" * 40,
                 "parameters": {
                     "single_entry_risk_limit": "0.004",
@@ -1239,7 +1242,7 @@ def integrated_v4_payload(
             "market": market,
             "artifact": artifact.name,
             "report_sha256": _report_hash(frozen),
-            "strategy_version": "v4",
+            "strategy_version": strategy_version,
             "buy_actions": [] if pending else [buy],
             "sell_actions": [],
             "hold_actions": [],
@@ -1367,9 +1370,9 @@ def test_acceptance_rejects_integrated_contract_drift(
 
 
 @pytest.mark.parametrize(
-    ("mutation", "expected"),
-    [
-        ("process", "冻结 Kelly/回撤 v4 策略身份"),
+        ("mutation", "expected"),
+        [
+            ("process", "冻结 Kelly/回撤策略身份"),
         ("stale", "当前真实数据"),
         ("account", "模拟账户快照不是最新"),
     ],
