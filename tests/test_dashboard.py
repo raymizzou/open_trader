@@ -315,6 +315,43 @@ def test_dashboard_accepts_pending_v5_buy_action_projection() -> None:
     )
 
 
+def test_dashboard_rejects_malformed_pending_v5_lot_size() -> None:
+    payload = {"strategy_snapshot": {"strategy_version": "v5"}}
+    judgments = {
+        "formal_actions": [
+            {
+                "action": "BUY",
+                "symbol": "600001",
+                "target_weight": "0.04",
+                "target_amount": "4000",
+                "close": None,
+                "atr": None,
+                "lot_size": "100",
+                "estimated_shares": None,
+                "estimated_initial_line": None,
+                "planned_stop_risk": None,
+                "planned_stop_risk_pct": None,
+                "normal_cost": None,
+                "market_data_status": "pending",
+                "pending_fields": ["quote", "atr", "lot_size"],
+                "decisive_constraint": "组合剩余风险",
+            }
+        ],
+        "risk_skips": [],
+    }
+    summary = {
+        "status": "active_with_unknown_risk",
+        "portfolio_risk_limit": "4000",
+        "new_known_planned_risk": "0",
+        "unknown_new_risk_symbols": ["600001"],
+        "unknown_existing_risk_symbols": [],
+    }
+
+    assert not dashboard_module._valid_v2_risk_items(
+        payload, judgments, summary, strategy_version="v5"
+    )
+
+
 def test_trend_report_history_uses_payload_date_and_keeps_revisions(
     tmp_path: Path,
 ) -> None:
@@ -1549,6 +1586,81 @@ def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
         if key != "trade_stats"
     } == payload["risk_summary"]
     assert report["drawdown_summary"] == payload["drawdown_summary"]
+
+
+def test_dashboard_accepts_v5_unknown_risk_lists_in_full_validation() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    drawdown = payload["drawdown_summary"]
+    assert (
+        isinstance(snapshot, dict)
+        and isinstance(summary, dict)
+        and isinstance(judgments, dict)
+        and isinstance(drawdown, dict)
+    )
+    snapshot.update(
+        {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+            "strategy_version": "v5",
+        }
+    )
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.update(
+        {
+            "requires_atr14": False,
+            "market_data_completion": "deferred_to_execution",
+        }
+    )
+    summary.update(
+        {
+            "status": "active_with_unknown_risk",
+            "status_label": "部分风险未知",
+            "pause_reason": "",
+            "existing_planned_risk": None,
+            "new_planned_risk": None,
+            "portfolio_planned_risk": None,
+            "portfolio_planned_risk_pct": None,
+            "portfolio_remaining_risk": None,
+            "portfolio_remaining_risk_pct": None,
+            "known_existing_planned_risk": "0",
+            "new_known_planned_risk": "0",
+            "known_portfolio_planned_risk": "0",
+            "unknown_existing_risk_symbols": [],
+            "unknown_new_risk_symbols": ["600001"],
+        }
+    )
+    buy = judgments["formal_actions"][0]
+    assert isinstance(buy, dict)
+    buy.update(
+        {
+            "close": None,
+            "atr": None,
+            "estimated_shares": None,
+            "estimated_initial_line": None,
+            "planned_stop_risk": None,
+            "planned_stop_risk_pct": None,
+            "normal_cost": None,
+            "market_data_status": "pending",
+            "pending_fields": ["quote", "atr"],
+        }
+    )
+    drawdown.update(
+        {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+            "strategy_version": "v5",
+            "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v5|v5",
+            "bootstrap_event": {
+                **drawdown["bootstrap_event"],
+                "strategy_id": "trend_animals_warm_to_hot/CN/v5",
+                "strategy_version": "v5",
+            },
+        }
+    )
+
+    assert dashboard_module._valid_trend_risk_summary(payload)
 
 
 def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(

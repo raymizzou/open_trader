@@ -1060,8 +1060,15 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     summary = payload.get("risk_summary")
     if summary is None:
         return strategy_version not in {"v2", "v3", "v4", "v5"}
+    allowed_list_keys = (
+        {"unknown_existing_risk_symbols", "unknown_new_risk_symbols"}
+        if strategy_version == "v5"
+        else set()
+    )
     if not isinstance(summary, dict) or any(
-        isinstance(value, (dict, list)) for value in summary.values()
+        isinstance(value, dict)
+        or isinstance(value, list) and key not in allowed_list_keys
+        for key, value in summary.items()
     ):
         return False
     if strategy_version not in {"v2", "v3", "v4", "v5"}:
@@ -1154,13 +1161,18 @@ def _valid_v2_risk_items(
         lot_size = item.get("lot_size")
         close = _dashboard_risk_decimal(item.get("close"))
         atr = _dashboard_risk_decimal(item.get("atr"))
+        valid_lot_size = (
+            isinstance(lot_size, int)
+            and not isinstance(lot_size, bool)
+            and lot_size > 0
+        )
         pending_fields = item.get("pending_fields")
         missing_fields = tuple(
             field
             for field, missing in (
                 ("quote", close is None or close <= 0),
                 ("atr", atr is None or atr <= 0),
-                ("lot_size", lot_size is None or lot_size <= 0),
+                ("lot_size", not valid_lot_size),
             )
             if missing
         )
@@ -1170,6 +1182,7 @@ def _valid_v2_risk_items(
                 not missing_fields
                 or not isinstance(pending_fields, list)
                 or tuple(pending_fields) != missing_fields
+                or lot_size is not None and not valid_lot_size
                 or isinstance(shares, bool)
                 or shares is not None
                 and (
@@ -1178,8 +1191,7 @@ def _valid_v2_risk_items(
                     or not can_estimate
                     and shares != 0
                     or can_estimate
-                    and isinstance(lot_size, int)
-                    and not isinstance(lot_size, bool)
+                    and valid_lot_size
                     and shares % lot_size != 0
                 )
                 or item.get("estimated_initial_line") is not None
