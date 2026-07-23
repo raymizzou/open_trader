@@ -5110,14 +5110,60 @@ const html=renderTrendReportWorkspace({
       actual_reference_quantity:attack,actual_quantity:attack,actual_market_value:attack,
       currency:attack,deviation_label:attack,frozen_reference_price:attack,
       protection_line:attack,risk_note:attack}],outside_positions:[]},
-  audit:{candidates:[{symbol:attack,name:attack,
-    excluded_reasons:[attack],filter_price:attack,close:attack}],excluded:{[attack]:[attack]},
+  audit:{strategy_parameters:{max_filter_price:attack,allowed_industry_temperatures:[attack]},
+    candidates:[{symbol:attack,name:attack,
+    excluded_reasons:["industry_temperature_not_hot",attack],filter_price:attack,close:attack}],excluded:{[attack]:["filter_price_missing",attack]},
     industry_concentration:[[attack]],data_sources:[attack],actual_api_cost:attack},
 });
 if (html.includes(attack) || !html.includes("&lt;img") ||
     !html.includes('class="cn-trend-report"') ||
     !html.includes("筛选价（Trend Animals）") ||
     !html.includes("执行参考价（Futu 前复权）")) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cn_audit_explains_reported_reasons_with_frozen_requirements() -> None:
+    output = run_dashboard_js(r'''
+const html = renderCnTrendAudit({
+  strategy_parameters:{
+    max_filter_price:"200", min_strength:"95",
+    allowed_industry_temperatures:["热","沸"],
+    allowed_phases:["谷雨","立夏","夏至"],
+    min_market_cap_100m:"100", min_amount_100m:"2"
+  },
+  candidates:[
+    {symbol:"600671",name:"天目药业",eligible:false,rank:null,
+     excluded_reasons:["industry_temperature_not_hot","market_cap_below_100","amount_below_2"],
+     industry_temperature:"平",market_cap:"20",amount:"1",danger:false},
+    {symbol:"600236",name:"桂冠电力",eligible:false,
+     excluded_reasons:["filter_price_missing","future_rule_<script>"]},
+    {symbol:"600001",name:"通过样本",eligible:true,rank:1,
+     excluded_reasons:[],temperature_prev:"温",temperature_curr:"热",
+     strength:"99",phase:"立夏",danger:false}
+  ],
+  industry_concentration:[], data_sources:["Trend Animals"]
+}, {data_date:"2026-07-22"});
+for (const text of [
+  "行业温度","平","要求：热或沸", "总市值","20 亿元","要求：至少 100 亿元",
+  "日成交额","1 亿元","要求：至少 2 亿元", "筛选价","数据未提供",
+  "要求：筛选价必须存在", "未识别规则：future_rule_&lt;script&gt;","请核对冻结报告", "未触发"
+]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+for (const forbidden of ["未知原因", ">null<", ">false<"]) {
+  if (html.includes(forbidden)) throw new Error(forbidden + "\n" + html);
+}
+const historical = renderCnTrendAudit({candidates:[{symbol:"600001",eligible:false,
+  excluded_reasons:["atr_unavailable","data_date_mismatch","strength_below_95"],
+  atr:null,as_of_date:"2026-07-21",strength:"94"}]}, {data_date:"2026-07-22"});
+for (const text of ["ATR14","数据未提供","该历史策略版本要求 ATR14","数据日期","2026-07-21",
+  "要求：与报告数据日 2026-07-22 一致"]) {
+  if (!historical.includes(text)) throw new Error(text + "\n" + historical);
+}
+if (!historical.includes("冻结策略参数未提供")) throw new Error(historical);
 console.log("ok");
 ''')
 

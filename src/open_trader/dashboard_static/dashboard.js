@@ -2578,33 +2578,157 @@ function renderCnTrendDisciplines() {
   </section>`;
 }
 
-function renderCnTrendAudit(audit) {
+function cnTrendAuditValue(value, suffix = "") {
+  if (!hasValue(value)) return "数据未提供";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return `${formatDisplayNumber(value)}${suffix}`;
+}
+
+function cnTrendAuditDanger(value) {
+  return value === true ? "已触发"
+    : value === false ? "未触发"
+    : "数据未提供";
+}
+
+function cnTrendAuditList(value) {
+  return Array.isArray(value) && value.length
+    ? value.map(formatPlain).join("或")
+    : "";
+}
+
+function cnTrendAuditRequirement(parameters, key, render) {
+  const value = parameters && typeof parameters === "object"
+    ? parameters[key]
+    : undefined;
+  return hasValue(value) ? render(value) : "冻结策略参数未提供";
+}
+
+function cnTrendAuditReason(reason, item, parameters, report) {
+  const temperature = `${cnTrendAuditValue(item.temperature_prev)} → ${cnTrendAuditValue(item.temperature_curr)}`;
+  const rules = {
+    a_share_only: ["资产类型", cnTrendAuditValue(item.asset), "要求：仅限 A 股股票"],
+    temperature_missing: ["个股温度", "数据未提供", "要求：个股温度必须存在"],
+    temperature_transition_not_entry: [
+      "温度变化", temperature,
+      cnTrendAuditRequirement(parameters, "temperature_transition", (value) => {
+        const from = cnTrendAuditList(value && value.from);
+        const to = cnTrendAuditList(value && value.to);
+        return from && to ? `要求：${from} → ${to}` : "冻结策略参数未提供";
+      }),
+    ],
+    filter_price_missing: ["筛选价", "数据未提供", "要求：筛选价必须存在"],
+    filter_price_above_200: [
+      "筛选价", cnTrendAuditValue(item.filter_price, " 元"),
+      cnTrendAuditRequirement(parameters, "max_filter_price", (value) => `要求：不高于 ${formatDisplayNumber(value)} 元`),
+    ],
+    strength_missing: ["趋势强度", "数据未提供", "要求：趋势强度必须存在"],
+    strength_below_95: [
+      "趋势强度", cnTrendAuditValue(item.strength),
+      cnTrendAuditRequirement(parameters, "min_strength", (value) => `要求：不低于 ${formatDisplayNumber(value)}`),
+    ],
+    industry_id_missing: ["行业 ID", "数据未提供", "要求：行业 ID 必须存在"],
+    industry_temperature_missing: ["行业温度", "数据未提供", "要求：行业温度必须存在"],
+    industry_temperature_not_hot: [
+      "行业温度", cnTrendAuditValue(item.industry_temperature),
+      cnTrendAuditRequirement(parameters, "allowed_industry_temperatures", (value) => `要求：${cnTrendAuditList(value) || "冻结策略参数未提供"}`),
+    ],
+    phase_missing: ["趋势节气", "数据未提供", "要求：趋势节气必须存在"],
+    phase_after_summer_solstice: [
+      "趋势节气", cnTrendAuditValue(item.phase),
+      cnTrendAuditRequirement(parameters, "allowed_phases", (value) => `要求：${cnTrendAuditList(value) || "冻结策略参数未提供"}`),
+    ],
+    market_cap_missing: ["总市值", "数据未提供", "要求：总市值必须存在"],
+    market_cap_below_100: [
+      "总市值", cnTrendAuditValue(item.market_cap, " 亿元"),
+      cnTrendAuditRequirement(parameters, "min_market_cap_100m", (value) => `要求：至少 ${formatDisplayNumber(value)} 亿元`),
+    ],
+    amount_missing: ["日成交额", "数据未提供", "要求：日成交额必须存在"],
+    amount_below_2: [
+      "日成交额", cnTrendAuditValue(item.amount, " 亿元"),
+      cnTrendAuditRequirement(parameters, "min_amount_100m", (value) => `要求：至少 ${formatDisplayNumber(value)} 亿元`),
+    ],
+    right_side_days_missing: ["右侧天数", "数据未提供", "要求：右侧天数必须存在"],
+    right_side_not_true: ["右侧趋势", "未进入右侧", "要求：必须处于右侧趋势"],
+    not_tradable: ["交易状态", "当前不可交易", "要求：必须可交易"],
+    danger_signal: ["危险信号", cnTrendAuditDanger(item.danger), "要求：不得触发"],
+    danger_unknown: ["危险信号", "数据未提供", "要求：危险信号必须明确"],
+    name_missing: ["标的名称", "数据未提供", "要求：标的名称必须存在"],
+    asset_missing: ["资产类型", "数据未提供", "要求：资产类型必须存在"],
+    unsupported_asset: ["资产类型", cnTrendAuditValue(item.asset), "要求：A 股股票"],
+    already_held: ["账户状态", "当前已持有", "要求：新开仓候选不得已持有"],
+    excluded_security: [
+      "证券范围",
+      [item.name, item.exchange].filter(hasValue).map(formatPlain).join(" / ") || "数据未提供",
+      "要求：非北交所、ST 或退市标的",
+    ],
+    unsupported_exchange: ["交易所", cnTrendAuditValue(item.exchange), "要求：沪深市场"],
+    atr_unavailable: ["ATR14", "数据未提供", "该历史策略版本要求 ATR14"],
+    data_date_mismatch: [
+      "数据日期", cnTrendAuditValue(item.as_of_date),
+      hasValue(report && report.data_date)
+        ? `要求：与报告数据日 ${formatPlain(report.data_date)} 一致`
+        : "报告数据日未提供",
+    ],
+    amount_below_1: [
+      "日成交额", cnTrendAuditValue(item.amount, " 亿元"),
+      cnTrendAuditRequirement(parameters, "min_amount_100m", (value) => `要求：至少 ${formatDisplayNumber(value)} 亿元`),
+    ],
+    strength_not_above_90: [
+      "趋势强度", cnTrendAuditValue(item.strength),
+      cnTrendAuditRequirement(parameters, "min_strength", (value) => `要求：高于 ${formatDisplayNumber(value)}`),
+    ],
+    right_side_days_not_below_10: [
+      "右侧天数", cnTrendAuditValue(item.days, " 天"),
+      cnTrendAuditRequirement(parameters, "max_right_side_days_exclusive", (value) => `要求：少于 ${formatDisplayNumber(value)} 天`),
+    ],
+  };
+  const values = rules[reason];
+  return values
+    ? {code: reason, label: values[0], actual: values[1], requirement: values[2]}
+    : {
+      code: formatPlain(reason),
+      label: `未识别规则：${formatPlain(reason)}`,
+      actual: "无法解析",
+      requirement: "请核对冻结报告",
+    };
+}
+
+function renderCnTrendAudit(audit, report = {}) {
+  audit = audit && typeof audit === "object" ? audit : {};
   const candidates = cnTrendRows(audit.candidates);
+  const parameters = audit.strategy_parameters && typeof audit.strategy_parameters === "object"
+    ? audit.strategy_parameters : {};
   const excluded = audit.excluded && typeof audit.excluded === "object" && !Array.isArray(audit.excluded) ? audit.excluded : {};
   const industries = Array.isArray(audit.industry_concentration) ? audit.industry_concentration.filter(Array.isArray) : [];
   const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
   const candidateRows = candidates.map((item) => {
     const reasons = Array.isArray(item.excluded_reasons)
-      ? item.excluded_reasons.map((reason) => TREND_REASON_LABELS[reason] || "未知原因")
+      ? item.excluded_reasons.map((reason) => cnTrendAuditReason(reason, item, parameters, report))
       : [];
+    const reasonText = reasons.length
+      ? reasons.map((entry) => `${entry.label} ${entry.actual} ${entry.requirement}`).join("、")
+      : "无";
     const result = item.eligible === true ? "通过策略纪律" : item.eligible === false ? "已排除" : "未知";
     return `<li>${escapeHtml([
-      cnTrendIdentity(item), `最终排名 ${formatPlain(item.rank)}`, `结论 ${result}`,
-      `排除原因 ${reasons.join("、") || "无"}`,
-      `筛选价（Trend Animals） ${formatPlain(item.filter_price)}`,
-      `执行参考价（Futu 前复权） ${formatPlain(item.close)}`,
-      `温度 ${cnTrendTemperature(item)}`, `节气 ${formatPlain(item.phase)}`,
-      `强度 ${formatPlain(item.strength)}`, `行业 ${formatPlain(item.industry)}`,
-      `行业 ID ${formatPlain(item.industry_tm_id)}`,
-      `行业温度 ${formatPlain(item.industry_temperature)}`,
-      `市值 ${formatPlain(item.market_cap)}`, `日成交额 ${formatPlain(item.amount)}`,
-      `ATR14 ${formatPlain(item.atr)}`, `危险信号 ${formatPlain(item.danger)}`,
+      cnTrendIdentity(item), `最终排名 ${cnTrendAuditValue(item.rank)}`, `结论 ${result}`,
+      `排除原因 ${reasonText}`,
+      `筛选价（Trend Animals） ${cnTrendAuditValue(item.filter_price)}`,
+      `执行参考价（Futu 前复权） ${cnTrendAuditValue(item.close)}`,
+      `温度 ${cnTrendTemperature(item)}`, `节气 ${cnTrendAuditValue(item.phase)}`,
+      `强度 ${cnTrendAuditValue(item.strength)}`, `行业 ${cnTrendAuditValue(item.industry)}`,
+      `行业 ID ${cnTrendAuditValue(item.industry_tm_id)}`,
+      `行业温度 ${cnTrendAuditValue(item.industry_temperature)}`,
+      `市值 ${cnTrendAuditValue(item.market_cap, " 亿元")}`, `日成交额 ${cnTrendAuditValue(item.amount, " 亿元")}`,
+      `ATR14 ${cnTrendAuditValue(item.atr)}`, `危险信号 ${cnTrendAuditDanger(item.danger)}`,
     ].join("｜"))}</li>`;
   }).join("");
   return `<details class="trend-audit"><summary>审计详情</summary>
     <section><h3>完整候选审计</h3><ol>${candidateRows || "<li>无</li>"}</ol></section>
     <section><h3>排除项</h3><ul>${Object.entries(excluded).length
-      ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => TREND_REASON_LABELS[reason] || "未知原因").join("、"))}</li>`).join("")
+      ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => {
+        const detail = cnTrendAuditReason(reason, {}, parameters, report);
+        return `${detail.label} ${detail.actual} ${detail.requirement}`;
+      }).join("、"))}</li>`).join("")
       : "<li>无</li>"}</ul></section>
     <section><h3>行业集中度</h3><ul>${industries.length
       ? industries.map((item) => `<li>${escapeHtml(item.map(formatPlain).join("｜"))}</li>`).join("")
@@ -2669,7 +2793,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
       ${sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold")}
     </div>
     ${isCn ? renderCnTrendDisciplines() : ""}
-    ${isCn ? renderCnTrendAudit(audit) : renderTrendAudit(audit)}
+    ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
   </${root}>`;
 }
 
