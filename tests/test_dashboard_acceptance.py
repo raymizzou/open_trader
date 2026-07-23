@@ -5736,6 +5736,55 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     assert expectations[0]["artifact"] == "old.json"
 
 
+def test_acceptance_allows_exact_history_to_lag_a_duplicate_terminal_event(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, old_hash = _write_acceptance_history_artifact(
+        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+    )
+    projected_event = _write_acceptance_action(
+        tmp_path / "data", report_sha256=old_hash
+    )
+    newer_event = {
+        **projected_event,
+        "recorded_at": "2026-07-18T08:27:19+08:00",
+    }
+    newer_path = (
+        tmp_path
+        / "data/trend_review/ledgers/US/actions/2026-07-17/action/newer.json"
+    )
+    newer_path.write_text(json.dumps(newer_event), encoding="utf-8")
+    history = [{
+        "available": True,
+        "artifact": "old.json",
+        "execution_date": "2026-07-17",
+        "strategy_version": "v1",
+    }]
+    exact = {
+        "old.json": {
+            "artifact": "old.json",
+            "report_sha256": old_hash,
+            "strategy_version": "v1",
+            "report_date": "2026-07-17",
+            "audit": {"artifact": "old.json"},
+            "buy_actions": [{
+                "symbol": "NDAQ",
+                "execution": {
+                    "status": "missed",
+                    "updated_at": projected_event["recorded_at"],
+                },
+            }],
+        }
+    }
+
+    expectations = dashboard_acceptance._validate_history_projection(
+        tmp_path / "data", reports_dir, "tiger", history, exact
+    )
+
+    assert expectations[0]["event"] == newer_event
+
+
 def test_acceptance_rejects_latest_exact_api_identity_that_differs_from_local_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

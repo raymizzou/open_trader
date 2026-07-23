@@ -913,14 +913,19 @@ def _validate_history_projection(
         if isinstance(row, Mapping) and row.get("available") is True
     }
     latest_events: dict[tuple[str, str, str], Mapping[str, object]] = {}
+    events_by_action: dict[
+        tuple[str, str, str], list[Mapping[str, object]]
+    ] = {}
     for _, _, _, event in _action_events(data_dir, market):
         report_hash = str(event.get("report_sha256") or "").strip().lower()
         if len(report_hash) == 64:
-            latest_events[(
+            action = (
                 report_hash,
                 str(event.get("symbol") or "").strip().upper(),
                 str(event.get("side") or "").strip().lower(),
-            )] = event
+            )
+            latest_events[action] = event
+            events_by_action.setdefault(action, []).append(event)
 
     expectations: list[dict[str, Any]] = []
     for (report_hash, symbol, side), event in latest_events.items():
@@ -960,7 +965,11 @@ def _validate_history_projection(
         assert (
             isinstance(execution, Mapping)
             and execution.get("status") == event.get("status")
-            and execution.get("updated_at") == event.get("recorded_at")
+            and any(
+                execution.get("status") == observed.get("status")
+                and execution.get("updated_at") == observed.get("recorded_at")
+                for observed in events_by_action[(report_hash, symbol, side)]
+            )
         ), f"{artifact} 历史报告动作 {symbol} 消失或执行状态不匹配"
         expectations.append({**report, "symbol": symbol, "side": side, "event": event})
     return expectations
