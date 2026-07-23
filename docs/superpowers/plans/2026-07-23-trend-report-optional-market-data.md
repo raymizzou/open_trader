@@ -15,8 +15,8 @@
 - 新策略身份固定为 `trend_animals_warm_to_hot/{market}/v5`，生效日期 `2026-07-23`；v1-v4 报告和校验不可改变。
 - Trend Animals 资格和排序不依赖 Futu 行情、ATR14 或港股每手股数。
 - 缺少实时价、合法交易单位、有效净值或现金时不得猜测数据或提交订单。
-- 每个市场/账户持仓上限维持 10 只；已知组合计划风险达到净值 4% 时仍暂停新买入。
-- 缺 ATR 的动作不等待、不降级、不增加数量上限；正常目标仓位、Kelly、现金、席位和交易单位仍生效。
+- v1–v4 的历史报告继续保留各自的 10 只持仓席位规则；当前 v5 不设总持仓数量上限，已知组合计划风险达到净值 4% 时仍暂停新买入。
+- 缺 ATR 的动作不等待、不降级、不增加数量上限；正常目标仓位、Kelly、现金、组合风险和交易单位仍生效。
 - `2026-07-22-r1` 是唯一获批的窗口外模拟盘执行例外；默认调度仍严格遵守窗口。
 - 不增加依赖、不新增行情源、不使用 Trend Animals `priceIndex` 冒充实时价。
 - 开发中只运行聚焦测试和直接工作流；`make acceptance` 只在最终交付门禁运行一次。
@@ -236,7 +236,7 @@ pending_fields = tuple(
 )
 ```
 
-完整数据继续调用 `size_entry_by_risk`。数据不完整时生成正式动作，目标金额为 `min(net_value * weight, remaining_cash)`；只有 `close` 和 `lot_size` 可用时估算股数并扣减计划现金。缺报价或每手股数的动作占用报告席位但不预留现金；不递补报告外候选。
+完整数据继续调用 `size_entry_by_risk`。数据不完整时生成正式动作，目标金额为 `min(net_value * weight, remaining_cash)`；只有 `close` 和 `lot_size` 可用时估算股数并扣减计划现金。缺报价或每手股数的动作不预留现金；v5 不占用总持仓席位，也不递补报告外候选。
 
 把 `_post_sell_planned_risk` 改为累计可计算持仓风险，并把缺行情/保护线的标的放入 `unknown_existing_risk_symbols`；无效净值、现金、汇率、成本或持仓数量仍返回硬阻塞原因。
 
@@ -897,7 +897,7 @@ and trend_execution_mode(config, hostname_fn=socket.gethostname).mode == "execut
 
 授权文件写入 `data/trend_controller/CN/late_buy_authorizations/2026-07-23.json`，字段必须包含 schema、market、as_of_date、execution_date、report_path、report_sha256、actor、reason、authorized_at。重复调用只能读取完全相同授权；任何字段冲突都失败关闭。
 
-把授权布尔值传入 `record_trend_review_missed_buys` 和 `execute_trend_review_open`。它只忽略买入窗口关闭，不绕过同日、市场开盘、报价、每手股数、现金、席位、账户、策略身份或幂等校验。
+把授权布尔值传入 `record_trend_review_missed_buys` 和 `execute_trend_review_open`。它只忽略买入窗口关闭，不绕过同日、市场开盘、报价、每手股数、现金、组合风险、账户、策略身份或幂等校验；v1–v4 的历史席位规则仍按原报告执行，v5 不设总数上限。
 
 在 CLI 添加 `trend-market correct`；`--actor` 和 `--reason` 必填，`--allow-late-buys` 默认 false。不要把该开关加入常驻 `trend-market run`。
 
