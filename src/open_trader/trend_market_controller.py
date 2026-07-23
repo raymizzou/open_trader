@@ -1375,6 +1375,7 @@ def _notify_pending_protection(
     events: Sequence[Mapping[str, object]],
 ) -> int:
     sent = 0
+    seen: set[str] = set()
     title_label, action = PROTECTION_STATUS_LABELS["pending"]
     for event in events:
         if (
@@ -1384,8 +1385,9 @@ def _notify_pending_protection(
         ):
             continue
         symbol = str(event.get("symbol") or "").strip()
-        if not symbol:
+        if not symbol or symbol in seen:
             continue
+        seen.add(symbol)
         title = (
             f"【需处理｜{BROKER_LABELS[market]}｜"
             f"{MARKET_LABELS[market]}{title_label}｜{symbol}】"
