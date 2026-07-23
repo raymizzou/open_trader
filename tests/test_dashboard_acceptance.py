@@ -3029,7 +3029,7 @@ def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
         def inner_text(self) -> str:
             return {
                 "audit": "审计详情 为什么没有进入买入名单 候选 1 通过 0 排除 1 "
-                "行业集中度 无 API 成本：未知",
+                "趋势强度 1 行业集中度 无 API 成本：未知",
                 "identity": "600000 浦发银行",
                 "status": "已排除 · 1 项未通过",
                 "industry-section": "行业集中度 无",
@@ -3074,6 +3074,15 @@ def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     dashboard_acceptance._check_trend_audit(
         Locator(), report, "eastmoney", page=MobilePage()
     )
+
+    class MissingReasonCountLocator(Locator):
+        def inner_text(self) -> str:
+            return super().inner_text().replace("趋势强度 1 ", "")
+
+    with pytest.raises(AssertionError, match="原因统计"):
+        dashboard_acceptance._check_trend_audit(
+            MissingReasonCountLocator(), report, "eastmoney"
+        )
 
 
 def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:

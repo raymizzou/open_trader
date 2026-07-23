@@ -1528,6 +1528,43 @@ def _plain(value: Any) -> str:
     return "-" if value is None or str(value).strip() == "" else str(value)
 
 
+def _trend_audit_reason_label(reason: Any) -> str:
+    code = _plain(reason)
+    mapped = TREND_REASON_LABELS.get(code)
+    if mapped is None:
+        return code
+    for prefix, label in (
+        ("filter_price_", "筛选价"),
+        ("strength_", "趋势强度"),
+        ("industry_temperature_", "行业温度"),
+        ("market_cap_", "总市值"),
+        ("amount_", "日成交额"),
+        ("right_side_days_", "右侧天数"),
+    ):
+        if code.startswith(prefix):
+            return label
+    return {
+        "a_share_only": "资产类型",
+        "temperature_missing": "个股温度",
+        "temperature_transition_not_entry": "温度变化",
+        "industry_id_missing": "行业 ID",
+        "phase_missing": "趋势节气",
+        "phase_after_summer_solstice": "趋势节气",
+        "right_side_not_true": "右侧趋势",
+        "not_tradable": "交易状态",
+        "danger_signal": "危险信号",
+        "danger_unknown": "危险信号",
+        "name_missing": "标的名称",
+        "asset_missing": "资产类型",
+        "unsupported_asset": "资产类型",
+        "already_held": "账户状态",
+        "excluded_security": "证券范围",
+        "unsupported_exchange": "交易所",
+        "atr_unavailable": "ATR14",
+        "data_date_mismatch": "数据日期",
+    }.get(code, mapped)
+
+
 def _check_visible_decimal_precision(text: str, label: str) -> None:
     offenders = re.findall(
         r"(?<![\w.-])[+-]?\d[\d,]*\.\d{3,}(?![\w.-])", text
@@ -2075,6 +2112,21 @@ def _check_trend_audit(
         ):
             assert f"{label} {value}" in audit_text, (
                 f"eastmoney 审计摘要缺少 {label} {value}"
+            )
+        reason_counts: dict[str, int] = {}
+        for item in candidates:
+            if not isinstance(item, Mapping):
+                continue
+            reasons = (
+                item.get("excluded_reasons")
+                if isinstance(item.get("excluded_reasons"), list) else []
+            )
+            for reason in reasons:
+                label = _trend_audit_reason_label(reason)
+                reason_counts[label] = reason_counts.get(label, 0) + 1
+        for label, count in reason_counts.items():
+            assert f"{label} {count}" in audit_text, (
+                f"eastmoney 审计摘要缺少原因统计 {label} {count}"
             )
         for index, item in enumerate(candidates):
             assert isinstance(item, Mapping), "eastmoney 候选审计数据格式无效"
