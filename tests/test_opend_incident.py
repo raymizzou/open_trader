@@ -191,6 +191,43 @@ def test_recovery_ignores_health_before_subsecond_failure(
     assert read_incident(tmp_path)["active"] is True
 
 
+def test_later_failure_invalidates_that_markets_prior_health(tmp_path: Path) -> None:
+    write_controller_statuses(tmp_path, cn="10:00:20", hk="10:00:20", us="10:00:20")
+    first_fault = datetime.fromisoformat("2026-07-22T10:00:00+08:00")
+    record_opend_failure(
+        data_dir=tmp_path,
+        market="CN",
+        category="connectivity",
+        reason="连接超时",
+        occurred_at=first_fault,
+        send_feishu=lambda _title, _message: "feishu_app",
+    )
+    record_opend_health(
+        tmp_path, "CN", datetime.fromisoformat("2026-07-22T10:00:10+08:00")
+    )
+    record_opend_failure(
+        data_dir=tmp_path,
+        market="CN",
+        category="connectivity",
+        reason="再次连接超时",
+        occurred_at=datetime.fromisoformat("2026-07-22T10:00:20+08:00"),
+        send_feishu=lambda _title, _message: "feishu_app",
+    )
+
+    for market in ("HK", "US"):
+        record_opend_health(
+            tmp_path,
+            market,
+            datetime.fromisoformat("2026-07-22T10:00:21+08:00"),
+        )
+
+    assert read_incident(tmp_path)["active"] is True
+    record_opend_health(
+        tmp_path, "CN", datetime.fromisoformat("2026-07-22T10:00:21+08:00")
+    )
+    assert read_incident(tmp_path)["active"] is False
+
+
 def test_categories_are_separate_and_each_stops_after_one_retry(
     tmp_path: Path,
 ) -> None:

@@ -7,11 +7,12 @@ import re
 import socket
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from time import sleep
 from zoneinfo import ZoneInfo
 
@@ -1031,12 +1032,21 @@ def _notification_key(
 
 def _write_notification_state(path: Path, state: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp: Path | None = None
     try:
-        temp.write_bytes(_canonical_json_bytes(state))
+        with NamedTemporaryFile(
+            "wb",
+            delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as handle:
+            temp = Path(handle.name)
+            handle.write(_canonical_json_bytes(state))
         os.replace(temp, path)
     finally:
-        temp.unlink(missing_ok=True)
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 def _notification_retry_lock(path: Path) -> RunLock:
@@ -1101,38 +1111,9 @@ def _notify_channels_once(
         / execution_date
         / f"{digest}.json"
     )
-    existing_v2 = path.exists()
-    if existing_v2:
-        state = _read_json(path, "trend controller notification")
-        if (
-            state.get("schema_version")
-            == "open_trader.trend_controller.notification.v1"
-        ):
-            return True
-        if (
-            state.get("schema_version")
-            != "open_trader.trend_controller.notification.v2"
-        ):
-            raise ValueError(f"invalid trend controller notification: {path}")
-        lock = _notification_retry_lock(path)
-    else:
-        state = {
-            "schema_version": "open_trader.trend_controller.notification.v2",
-            "market": market,
-            "execution_date": execution_date,
-            "action": action,
-            "reason": reason,
-            "occurred_at": occurred_at,
-            "non_feishu_attempted": False,
-            "feishu_attempts": 0,
-            "feishu_title": feishu_payload[0] if feishu_payload else "",
-            "feishu_message": feishu_payload[1] if feishu_payload else "",
-            "channels": [],
-        }
-        lock = nullcontext()
     try:
-        with lock:
-            if existing_v2:
+        with _notification_retry_lock(path):
+            if path.exists():
                 state = _read_json(path, "trend controller notification")
                 if (
                     state.get("schema_version")
@@ -1146,6 +1127,20 @@ def _notify_channels_once(
                     raise ValueError(
                         f"invalid trend controller notification: {path}"
                     )
+            else:
+                state = {
+                    "schema_version": "open_trader.trend_controller.notification.v2",
+                    "market": market,
+                    "execution_date": execution_date,
+                    "action": action,
+                    "reason": reason,
+                    "occurred_at": occurred_at,
+                    "non_feishu_attempted": False,
+                    "feishu_attempts": 0,
+                    "feishu_title": feishu_payload[0] if feishu_payload else "",
+                    "feishu_message": feishu_payload[1] if feishu_payload else "",
+                    "channels": [],
+                }
             channels = [
                 channel
                 for channel in state.get("channels", [])
@@ -1346,7 +1341,7 @@ def _notify_controller_failure(
         if action == "review"
         else f"{market} 趋势控制器阻塞"
     )
-    notification_action = "controller" if action == "review" else action
+    notification_action = action
     reason = brief_zh_detail(str(error))
     category = classify_opend_error(error)
     occurred_text = occurred_at.isoformat(timespec="seconds")
@@ -1356,7 +1351,7 @@ def _notify_controller_failure(
         )
         return _notify_once(
             title,
-            reason,
+            str(error),
             (
                 config,
                 market,
@@ -1420,9 +1415,16 @@ def _notify_controller_failure(
             message=shared_message,
         )
     except OpenDIncidentStateError:
-        return _notify_once(
+        fallback_title, fallback_message = _controller_feishu_payload(
             title,
             reason,
+            market=market,
+            execution_date=execution_date,
+            action=notification_action,
+        )
+        return _notify_feishu_once(
+            fallback_title,
+            fallback_message,
             (
                 config,
                 market,

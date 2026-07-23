@@ -935,6 +935,78 @@ def test_failed_callback_group_retries_frozen_payload(
     ) == 1
 
 
+def test_deadline_group_retries_frozen_payload_after_ledger_changes(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_hk_details(data_dir)
+    state_path = data_dir / "trend_hk_phillips/protection_state.json"
+    events_path = data_dir / "trend_hk_phillips/watch_events.jsonl"
+    write_protection_state(state_path, {"schema_version": 1, "positions": {}})
+    action_path = (
+        data_dir
+        / "trend_review/ledgers/HK/actions/2026-07-16/00700-buy/first.json"
+    )
+    action_path.parent.mkdir(parents=True)
+    action_path.write_text(
+        json.dumps({"symbol": "00700", "side": "buy", "status": "incomplete"}),
+        encoding="utf-8",
+    )
+
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-16"]
+
+        def get_snapshots(self, _symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {}
+
+        def close(self) -> None:
+            pass
+
+    class FlakyDeadlineFeishu(RecordingFeishuNotifier):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts: list[tuple[str, str]] = []
+
+        def notify(self, title: str, message: str) -> None:
+            self.attempts.append((title, message))
+            if len(self.attempts) == 1:
+                raise RuntimeError("Feishu unavailable")
+            super().notify(title, message)
+
+    feishu = FlakyDeadlineFeishu()
+
+    def watch() -> None:
+        watch_market_protection(
+            market="HK",
+            data_dir=data_dir,
+            portfolio_path=tmp_path / "unused.csv",
+            state_path=state_path,
+            events_path=events_path,
+            report_lock_path=None,
+            quote_client=Quote(),
+            notifier=feishu,
+            poll_seconds=5,
+            reconnect_seconds=60,
+            once=True,
+            now_fn=lambda: datetime(2026, 7, 16, 10, 0, tzinfo=SHANGHAI),
+            sleep_fn=lambda _seconds: None,
+            on_session_open=lambda _date: None,
+        )
+
+    watch()
+    action_path.write_text(
+        json.dumps({"symbol": "00700", "side": "buy", "status": "filled"}),
+        encoding="utf-8",
+    )
+    watch()
+    watch()
+
+    assert len(feishu.attempts) == 2
+    assert feishu.attempts[0] == feishu.attempts[1]
+    assert len(feishu.messages) == 1
+
+
 def test_directionless_callback_failures_share_stable_batch_identity(
     tmp_path: Path,
 ) -> None:

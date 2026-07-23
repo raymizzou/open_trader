@@ -179,6 +179,9 @@ def record_opend_failure(
             reasons[market] = reason
             state["affected_markets"] = sorted(affected)
             state["reasons"] = reasons
+            healthy = {str(item) for item in state["healthy_markets"]}
+            healthy.discard(market)
+            state["healthy_markets"] = sorted(healthy)
             state["updated_at"] = now_text
             if (
                 not state["feishu_delivered_at"]

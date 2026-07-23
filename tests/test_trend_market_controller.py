@@ -377,6 +377,78 @@ def test_direct_notification_retry_and_scanner_send_feishu_once(
     assert attempts.value == 1
 
 
+def test_concurrent_first_controller_notifications_send_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    sent: list[set[str]] = []
+    first_non_feishu = threading.Event()
+    second_non_feishu = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    local_attempts = 0
+    mutex = threading.Lock()
+
+    def send(
+        _notifier: object,
+        _title: str,
+        _message: str,
+        *,
+        channels: set[str],
+    ) -> list[SimpleNamespace]:
+        nonlocal local_attempts
+        if "feishu" not in channels:
+            with mutex:
+                local_attempts += 1
+                attempt = local_attempts
+            if attempt == 1:
+                first_non_feishu.set()
+                assert release_first.wait(timeout=2)
+            else:
+                second_non_feishu.set()
+                assert release_second.wait(timeout=2)
+        sent.append(channels)
+        channel = "feishu_app" if "feishu" in channels else "macos"
+        return [SimpleNamespace(channel=channel, success=True)]
+
+    monkeypatch.setattr(controller, "send_notification_with_results", send)
+    key = (
+        config,
+        "US",
+        "2026-07-22",
+        "controller",
+        "snapshot_failed",
+        "2026-07-22T10:00:00+08:00",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            controller._notify_once,
+            "US 趋势控制器阻塞",
+            "snapshot unavailable",
+            key,
+        )
+        assert first_non_feishu.wait(timeout=2)
+        second = pool.submit(
+            controller._notify_once,
+            "US 趋势控制器阻塞",
+            "snapshot unavailable",
+            key,
+        )
+        if second_non_feishu.wait(timeout=1):
+            release_first.set()
+            assert first.result(timeout=2) is True
+            release_second.set()
+        else:
+            assert second.done()
+            release_first.set()
+            assert first.result(timeout=2) is True
+        second.result(timeout=2)
+
+    assert sent.count({"macos", "xiaoai"}) == 1
+    assert sent.count({"feishu", "feishu_app"}) == 1
+
+
 def test_legacy_controller_notification_is_not_replayed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -561,6 +633,7 @@ def test_shared_incident_state_failure_falls_back_to_per_market_feishu(
     feishu = [item for item in sent if "feishu" in item[2]]
     assert len(feishu) == 1
     assert feishu[0][0] == "【需处理｜东方财富｜A股趋势控制器阻塞｜2026-07-22】"
+    assert len([item for item in sent if "feishu" not in item[2]]) == 1
 
 
 def test_unknown_controller_errors_stay_per_market(
@@ -581,6 +654,14 @@ def test_unknown_controller_errors_stay_per_market(
     feishu = [item for item in sent if "feishu" in item[2]]
     assert len(feishu) == 1
     assert feishu[0][0] == "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】"
+    local = [item for item in sent if "feishu" not in item[2]]
+    assert local == [
+        (
+            "US 趋势控制器阻塞",
+            "unknown broker response",
+            {"macos", "xiaoai"},
+        )
+    ]
     assert not (
         config.data_dir / "trend_controller/shared/incidents"
     ).exists()
@@ -593,6 +674,32 @@ def test_unknown_controller_errors_stay_per_market(
     assert json.loads(states[0].read_text(encoding="utf-8"))["reason"] == (
         "RuntimeError"
     )
+
+
+def test_review_and_controller_failures_keep_distinct_notification_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    _record_controller_notification_attempts(monkeypatch)
+    occurred_at = datetime.fromisoformat("2026-07-22T10:00:00+08:00")
+
+    for action in ("review", "controller"):
+        controller._notify_controller_failure(
+            config,
+            "US",
+            "2026-07-22",
+            action,
+            RuntimeError("same exception"),
+            occurred_at,
+        )
+
+    states = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in config.data_dir.glob(
+            "trend_controller/US/notifications/2026-07-22/*.json"
+        )
+    ]
+    assert {state["action"] for state in states} == {"review", "controller"}
 
 
 def active_cn_cycle() -> ControllerCycle:
@@ -1681,8 +1788,8 @@ def test_close_review_failure_is_nonblocking_progress(
         "artifact_paths": [],
     }
     assert result["next_check_at"] == "2026-07-20T15:01:10+08:00"
-    assert notifications[0][1] == "详见控制器日志"
-    assert notifications[0][2][3:5] == ("controller", "snapshot_failed")
+    assert notifications[0][1] == reason
+    assert notifications[0][2][3:5] == ("review", "snapshot_failed")
 
 
 def test_review_backoff_does_not_delay_order_execution(

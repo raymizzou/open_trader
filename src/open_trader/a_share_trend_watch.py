@@ -935,58 +935,61 @@ def _retry_pending_callback_feishu_groups(
     now: datetime,
     market: str,
 ) -> None:
-    prefix = "trend_review_callback_failure_notification"
-    events = [
-        event
-        for event in load_watch_events(events_path)
-        if event.get("trading_date") == trading_date
-        and event.get("market") == market
-        and str(event.get("event_type") or "").startswith(prefix)
-    ]
-    group_ids = {
-        str(event.get("group_id") or "") for event in events
-    } - {""}
-    for group_id in sorted(group_ids):
-        group_events = [
-            event for event in events if event.get("group_id") == group_id
-        ]
-        attempts = [
+    for prefix in (
+        "trend_review_callback_failure_notification",
+        "trend_review_deadline_notification",
+    ):
+        events = [
             event
-            for event in group_events
-            if event.get("event_type") == f"{prefix}_attempted_feishu"
+            for event in load_watch_events(events_path)
+            if event.get("trading_date") == trading_date
+            and event.get("market") == market
+            and str(event.get("event_type") or "").startswith(prefix)
         ]
-        if len(attempts) != 1 or any(
-            event.get("event_type") in {
-                f"{prefix}_delivered_feishu",
-                f"{prefix}_exhausted_feishu",
-            }
-            for event in group_events
-        ):
-            continue
-        attempt = attempts[0]
-        title = attempt.get("notification_title")
-        message = attempt.get("notification_message")
-        symbols = attempt.get("group_symbols")
-        if (
-            not isinstance(title, str)
-            or not isinstance(message, str)
-            or not isinstance(symbols, list)
-            or not all(isinstance(symbol, str) for symbol in symbols)
-        ):
-            continue
-        _send_persisted_feishu_group(
-            events_path=events_path,
-            notifier=notifier,
-            trading_date=trading_date,
-            now=now,
-            market=market,
-            status=str(attempt.get("reason") or "failed"),
-            event_prefix=prefix,
-            group_id=group_id,
-            symbols=symbols,
-            title=title,
-            message=message,
-        )
+        group_ids = {
+            str(event.get("group_id") or "") for event in events
+        } - {""}
+        for group_id in sorted(group_ids):
+            group_events = [
+                event for event in events if event.get("group_id") == group_id
+            ]
+            attempts = [
+                event
+                for event in group_events
+                if event.get("event_type") == f"{prefix}_attempted_feishu"
+            ]
+            if len(attempts) != 1 or any(
+                event.get("event_type") in {
+                    f"{prefix}_delivered_feishu",
+                    f"{prefix}_exhausted_feishu",
+                }
+                for event in group_events
+            ):
+                continue
+            attempt = attempts[0]
+            title = attempt.get("notification_title")
+            message = attempt.get("notification_message")
+            symbols = attempt.get("group_symbols")
+            if (
+                not isinstance(title, str)
+                or not isinstance(message, str)
+                or not isinstance(symbols, list)
+                or not all(isinstance(symbol, str) for symbol in symbols)
+            ):
+                continue
+            _send_persisted_feishu_group(
+                events_path=events_path,
+                notifier=notifier,
+                trading_date=trading_date,
+                now=now,
+                market=market,
+                status=str(attempt.get("reason") or "failed"),
+                event_prefix=prefix,
+                group_id=group_id,
+                symbols=symbols,
+                title=title,
+                message=message,
+            )
 
 
 def _deliver_trigger_notification(
