@@ -4713,9 +4713,12 @@ const cn = renderTrendReportWorkspace({
      active_line:"1450",entry_hints:["行业温度数据不可用"]},
   ],audit:{candidates:[
     {symbol:"AUDIT-ONLY",name:"仅审计",eligible:false,rank:null,
-     excluded_reasons:["strength_below_95"],filter_price:"9.8",close:"9.7",
+     excluded_reasons:["strength_below_95","market_cap_below_100","amount_below_2"],filter_price:"9.8",close:"9.7",
      temperature_prev:"温",temperature_curr:"温",phase:"立夏",strength:"94",
-     industry:"银行",industry_temperature:"热",market_cap:"120",amount:"3",atr:"0.4",danger:false},
+     industry:"银行",industry_temperature:"热",market_cap:"80",amount:"1",atr:"0.4",danger:false},
+    {symbol:"AUDIT-PASSED",name:"通过审计",eligible:true,rank:1,
+     excluded_reasons:[],temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99",danger:false},
+    {symbol:"AUDIT-MISSING",name:"缺失审计",eligible:false,excluded_reasons:[],danger:null},
   ],excluded:{"AUDIT-ONLY":["strength_below_95"]},industry_concentration:[],
     data_sources:["Trend Animals","Futu CN calendar/QFQ daily K-line"]},
 });
@@ -4726,6 +4729,17 @@ for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买�
   "趋势信号不完整","行业温度数据不可用","买入纪律","卖出纪律","审计详情"]) {
   if (!cn.includes(text)) throw new Error(text + "\n" + cn);
 }
+for (const text of ["为什么没有进入买入名单", "候选 3", "通过 1", "排除 2",
+  "标的", "结论", "未通过项目", "已通过的关键事实", "审计",
+  "已排除 · 3 项未通过", "通过纪律", "查看全部字段"]) {
+  if (!cn.includes(text)) throw new Error(text + "\n" + cn);
+}
+if ((cn.match(/class="trend-audit-row"/g) || []).length !== 3 ||
+    !cn.includes('class="trend-audit-table"') ||
+    !cn.includes('class="trend-audit-reason"') ||
+    cn.includes("<h3>排除项</h3>")) throw new Error(cn);
+const empty = renderCnTrendAudit({candidates:{}}, {});
+if (!empty.includes("无候选审计数据")) throw new Error(empty);
 const stageOrder=["优先处理 · 卖出触发","需要确认 · 人工复核",
   "09:30–10:00 · 正式买入计划","盘中持续 · 已有持仓"].map((text)=>cn.indexOf(`<h2>${text}</h2>`));
 if(stageOrder.some((index)=>index<0)||!stageOrder.every((index,i)=>i===0||stageOrder[i-1]<index))throw new Error(cn);
@@ -5320,6 +5334,11 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert "overflow-x: hidden;" in mobile
     assert ".trend-discipline summary" in mobile
     assert "min-height: 44px;" in mobile
+    assert ".trend-audit-table {" in css
+    assert ".trend-audit-row" in mobile
+    assert ".trend-audit-table thead" in mobile
+    assert "display: none;" in mobile
+    assert ".trend-audit-reason" in mobile
 
 
 def test_dashboard_renders_fixed_order_futu_option_attention_list() -> None:

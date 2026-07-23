@@ -2695,49 +2695,91 @@ function cnTrendAuditReason(reason, item, parameters, report) {
     };
 }
 
+function cnTrendAuditTableTemperature(item) {
+  return cnTrendAuditValue(item.temperature_prev) + " → " + cnTrendAuditValue(item.temperature_curr);
+}
+
 function renderCnTrendAudit(audit, report = {}) {
   audit = audit && typeof audit === "object" ? audit : {};
   const candidates = cnTrendRows(audit.candidates);
-  const parameters = audit.strategy_parameters && typeof audit.strategy_parameters === "object"
+  const parameters = audit.strategy_parameters
+    && typeof audit.strategy_parameters === "object"
+    && !Array.isArray(audit.strategy_parameters)
     ? audit.strategy_parameters : {};
-  const excluded = audit.excluded && typeof audit.excluded === "object" && !Array.isArray(audit.excluded) ? audit.excluded : {};
-  const industries = Array.isArray(audit.industry_concentration) ? audit.industry_concentration.filter(Array.isArray) : [];
+  const industries = Array.isArray(audit.industry_concentration)
+    ? audit.industry_concentration.filter(Array.isArray) : [];
   const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
-  const candidateRows = candidates.map((item) => {
+  const reasonCounts = new Map();
+
+  const rows = candidates.map((item) => {
     const reasons = Array.isArray(item.excluded_reasons)
-      ? item.excluded_reasons.map((reason) => cnTrendAuditReason(reason, item, parameters, report))
+      ? item.excluded_reasons.map((reason) =>
+        cnTrendAuditReason(reason, item, parameters, report))
       : [];
-    const reasonText = reasons.length
-      ? reasons.map((entry) => `${entry.label} ${entry.actual} ${entry.requirement}`).join("、")
-      : "无";
-    const result = item.eligible === true ? "通过策略纪律" : item.eligible === false ? "已排除" : "未知";
-    return `<li>${escapeHtml([
-      cnTrendIdentity(item), `最终排名 ${cnTrendAuditValue(item.rank)}`, `结论 ${result}`,
-      `排除原因 ${reasonText}`,
-      `筛选价（Trend Animals） ${cnTrendAuditValue(item.filter_price)}`,
-      `执行参考价（Futu 前复权） ${cnTrendAuditValue(item.close)}`,
-      `温度 ${cnTrendTemperature(item)}`, `节气 ${cnTrendAuditValue(item.phase)}`,
-      `强度 ${cnTrendAuditValue(item.strength)}`, `行业 ${cnTrendAuditValue(item.industry)}`,
-      `行业 ID ${cnTrendAuditValue(item.industry_tm_id)}`,
-      `行业温度 ${cnTrendAuditValue(item.industry_temperature)}`,
-      `市值 ${cnTrendAuditValue(item.market_cap, " 亿元")}`, `日成交额 ${cnTrendAuditValue(item.amount, " 亿元")}`,
-      `ATR14 ${cnTrendAuditValue(item.atr)}`, `危险信号 ${cnTrendAuditDanger(item.danger)}`,
-    ].join("｜"))}</li>`;
+    reasons.forEach((reason) =>
+      reasonCounts.set(reason.label, (reasonCounts.get(reason.label) || 0) + 1));
+    const status = item.eligible === true
+      ? {key: "passed", text: "通过纪律"}
+      : item.eligible === false && reasons.length
+        ? {key: "excluded", text: "已排除 · " + reasons.length + " 项未通过"}
+        : item.eligible === false
+          ? {key: "missing", text: "数据缺失"}
+          : {key: "review", text: "待确认"};
+    const failed = reasons.length
+      ? reasons.map((reason) => (
+        '<div class="trend-audit-reason"><strong>' + escapeHtml(reason.label)
+          + '</strong><span>' + escapeHtml(reason.actual) + " → "
+          + escapeHtml(reason.requirement) + "</span></div>"
+      )).join("")
+      : '<span class="trend-audit-none">无</span>';
+    const facts = [
+      "温度 " + cnTrendAuditTableTemperature(item),
+      "强度 " + cnTrendAuditValue(item.strength),
+      "节气 " + cnTrendAuditValue(item.phase),
+      "危险信号 " + cnTrendAuditDanger(item.danger),
+    ].map((fact) => "<span>" + escapeHtml(fact) + "</span>").join("");
+    const details = Object.entries(item).map(([key, value]) => {
+      const display = Array.isArray(value)
+        ? value.map(formatPlain).join("、")
+        : value && typeof value === "object"
+          ? JSON.stringify(value)
+          : cnTrendAuditValue(value);
+      return "<div><dt>" + escapeHtml(key) + "</dt><dd>"
+        + escapeHtml(display) + "</dd></div>";
+    }).join("");
+    return '<tr class="trend-audit-row">'
+      + '<td data-label="标的"><strong>' + escapeHtml(cnTrendIdentity(item))
+      + '</strong><span>' + escapeHtml(cnTrendAuditValue(item.industry)) + "</span></td>"
+      + '<td data-label="结论"><span class="trend-audit-status" data-status="'
+      + status.key + '">' + escapeHtml(status.text) + "</span></td>"
+      + '<td data-label="未通过项目"><div class="trend-audit-reasons">' + failed + "</div></td>"
+      + '<td data-label="已通过的关键事实"><div class="trend-audit-facts">' + facts + "</div></td>"
+      + '<td data-label="审计"><details class="trend-audit-more"><summary>查看全部字段</summary><dl>'
+      + details + "</dl></details></td></tr>";
   }).join("");
-  return `<details class="trend-audit"><summary>审计详情</summary>
-    <section><h3>完整候选审计</h3><ol>${candidateRows || "<li>无</li>"}</ol></section>
-    <section><h3>排除项</h3><ul>${Object.entries(excluded).length
-      ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => {
-        const detail = cnTrendAuditReason(reason, {}, parameters, report);
-        return `${detail.label} ${detail.actual} ${detail.requirement}`;
-      }).join("、"))}</li>`).join("")
-      : "<li>无</li>"}</ul></section>
-    <section><h3>行业集中度</h3><ul>${industries.length
-      ? industries.map((item) => `<li>${escapeHtml(item.map(formatPlain).join("｜"))}</li>`).join("")
-      : "<li>无</li>"}</ul></section>
-    <p>数据来源：${escapeHtml(dataSources.map(formatPlain).join("、") || "无")}</p>
-    <p>API 成本：${escapeHtml(formatPlain(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))}</p>
-  </details>`;
+  const passed = candidates.filter((item) => item.eligible === true).length;
+  const excluded = candidates.filter((item) => item.eligible === false).length;
+  const reasonSummary = [...reasonCounts.entries()]
+    .map(([label, count]) => "<span>" + escapeHtml(label) + " " + count + "</span>").join("");
+  const tableBody = rows || '<tr class="trend-audit-empty"><td colspan="5">无候选审计数据</td></tr>';
+  return '<details class="trend-audit"><summary>审计详情</summary>'
+    + '<section><h3>为什么没有进入买入名单</h3>'
+    + '<div class="trend-audit-summary"><span>候选 ' + candidates.length
+    + "</span><span>通过 " + passed + "</span><span>排除 " + excluded + "</span>"
+    + '</div><div class="trend-audit-reason-counts">'
+    + (reasonSummary || "<span>无未通过原因</span>")
+    + '</div><table class="trend-audit-table"><thead><tr>'
+    + '<th scope="col">标的</th><th scope="col">结论</th><th scope="col">未通过项目</th>'
+    + '<th scope="col">已通过的关键事实</th><th scope="col">审计</th>'
+    + "</tr></thead><tbody>" + tableBody + "</tbody></table></section>"
+    + '<section><h3>行业集中度</h3><ul>'
+    + (industries.length
+      ? industries.map((item) => "<li>" + escapeHtml(item.map(formatPlain).join("｜")) + "</li>").join("")
+      : "<li>无</li>")
+    + "</ul></section>"
+    + '<p>数据来源：' + escapeHtml(dataSources.map(formatPlain).join("、") || "无") + "</p>"
+    + '<p>API 成本：' + escapeHtml(formatPlain(audit.actual_api_cost ?? audit.estimated_api_cost ?? "未知"))
+    + "</p></details>";
 }
 
 function renderCnTrendReportWorkspace(report, embedded = false, historical = false) {

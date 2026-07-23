@@ -1778,6 +1778,60 @@ table {
   margin: 14px 0 0;
 }
 
+.trend-audit-summary,
+.trend-audit-reason-counts,
+.trend-audit-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.trend-audit-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.trend-audit-table th,
+.trend-audit-table td {
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  padding: 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.trend-audit-table th:nth-child(1) { width: 14%; }
+.trend-audit-table th:nth-child(2) { width: 13%; }
+.trend-audit-table th:nth-child(3) { width: 32%; }
+.trend-audit-table th:nth-child(4) { width: 25%; }
+.trend-audit-table th:nth-child(5) { width: 16%; }
+
+.trend-audit-reasons,
+.trend-audit-reason,
+.trend-audit-more dl {
+  display: grid;
+  gap: 6px;
+}
+
+.trend-audit-reason {
+  border-left: 3px solid var(--warning);
+  padding-left: 8px;
+}
+
+.trend-audit-reason-counts span,
+.trend-audit-summary span {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.trend-audit-status[data-status="passed"] { color: var(--ok); }
+.trend-audit-status[data-status="excluded"] { color: var(--danger); }
+.trend-audit-status[data-status="missing"],
+.trend-audit-status[data-status="review"] { color: var(--warning); }
+
 .trend-stage li,
 .trend-audit p {
   overflow-wrap: anywhere;
@@ -4290,6 +4344,8 @@ tbody tr.active-row,
 .cn-trend-card td:nth-child(-n + 2),
 .cn-trend-execution td,
 .cn-trend-buy .cn-trend-execution td,
+.trend-audit-summary span,
+.trend-audit-reason-counts span,
 .option-attention-market th {
   --muted: var(--text);
 }
@@ -4572,6 +4628,52 @@ table {
     display: flex;
     padding: 10px;
     width: 100%;
+  }
+
+  .trend-audit-table {
+    display: block;
+    max-width: 100%;
+  }
+
+  .trend-audit-table thead {
+    display: none;
+  }
+
+  .trend-audit-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .trend-audit-row {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    display: grid;
+    overflow: hidden;
+  }
+
+  .trend-audit-row td {
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+    padding: 10px;
+  }
+
+  .trend-audit-row td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .trend-audit-reason {
+    min-width: 0;
+  }
+
+  .trend-audit-more summary {
+    align-items: center;
+    display: flex;
+    min-height: 44px;
   }
 
   .trend-discipline summary,
