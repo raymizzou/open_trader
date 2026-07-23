@@ -404,13 +404,17 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
 
 
 def unlock_live_drawdown(
-    data_dir: Path, *, market: str = "CN", equity: str = "100000"
+    data_dir: Path,
+    *,
+    market: str = "CN",
+    equity: str = "100000",
+    strategy_version: str = "v5",
 ) -> None:
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
-        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
-        strategy_version="v4",
+        strategy_id=f"trend_animals_warm_to_hot/{market}/{strategy_version}",
+        strategy_version=strategy_version,
         parameters={"drawdown_limit": "0.05"},
         baseline_equity=Decimal(equity),
         source_date="2026-07-13",
@@ -551,6 +555,23 @@ def test_trend_v3_effective_date_is_shared_across_markets(market: str) -> None:
     assert trend_module.trend_strategy_snapshot(
         market, "abc123", (622466,)
     )["effective_from"] == "2026-07-20"
+
+
+def test_live_cn_strategy_snapshot_is_v5_with_relaxed_entry_gates() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199)
+    )
+
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v5"
+    assert snapshot["strategy_version"] == "v5"
+    assert snapshot["effective_from"] == "2026-07-24"
+    assert snapshot["parameters"]["allowed_industry_temperatures"] == [
+        "温", "热", "沸",
+    ]
+    assert "max_filter_price" not in snapshot["parameters"]
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert "筛选价格" not in rows
+    assert rows["行业温度"] == "温、热或沸"
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
@@ -926,7 +947,7 @@ def test_candidate_infers_exchange_when_api_omits_suffix(
 
 
 @pytest.mark.parametrize("phase", ["谷雨", "立夏", "夏至"])
-@pytest.mark.parametrize("industry_temperature", ["热", "沸"])
+@pytest.mark.parametrize("industry_temperature", ["温", "热", "沸"])
 def test_cn_candidate_accepts_allowed_phase_and_industry_temperature(
     phase: str, industry_temperature: str,
 ) -> None:
@@ -944,9 +965,8 @@ def test_cn_candidate_accepts_allowed_phase_and_industry_temperature(
         ({"asset": "ETF基金"}, "a_share_only"),
         ({"temperature_prev": "平"}, "temperature_transition_not_entry"),
         ({"temperature_curr": "温"}, "temperature_transition_not_entry"),
-        ({"filter_price": Decimal("200.01")}, "filter_price_above_200"),
         ({"strength": Decimal("94.99")}, "strength_below_95"),
-        ({"industry_temperature": "温"}, "industry_temperature_not_hot"),
+        ({"industry_temperature": "平"}, "industry_temperature_not_hot"),
         ({"phase": "小暑"}, "phase_after_summer_solstice"),
         ({"market_cap": Decimal("99.99")}, "market_cap_below_100"),
         ({"amount": Decimal("1.99")}, "amount_below_2"),
@@ -967,7 +987,6 @@ def test_cn_candidate_rejects_failed_discipline(
     [
         ("temperature_prev", "temperature_missing"),
         ("temperature_curr", "temperature_missing"),
-        ("filter_price", "filter_price_missing"),
         ("strength", "strength_missing"),
         ("industry_tm_id", "industry_id_missing"),
         ("industry_temperature", "industry_temperature_missing"),
@@ -984,6 +1003,15 @@ def test_cn_candidate_missing_required_fact_is_excluded(
         [replace(candidate("600001"), **{field: None})], held_symbols=set()
     )
     assert reason in decision.excluded["600001"]
+
+
+@pytest.mark.parametrize("filter_price", [None, "200.01", "1500"])
+def test_cn_candidate_does_not_gate_on_filter_price(
+    filter_price: str | None,
+) -> None:
+    item = candidate("600001", filter_price=filter_price)
+
+    assert build_candidate_list([item], held_symbols=set()).eligible == (item,)
 
 
 @pytest.mark.parametrize(
@@ -1611,7 +1639,7 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
     assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
 
 
-def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
+def test_v5_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
     strategy_snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "drawdown123", (622466, 697199)
     )
@@ -1619,9 +1647,9 @@ def test_v4_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None
         "schema_version": "open_trader.strategy_drawdown.v1",
         "market": "CN",
         "strategy_id": strategy_snapshot["strategy_id"],
-        "strategy_version": "v4",
+        "strategy_version": "v5",
         "kelly_sample_key": (
-            "CN|trend_animals_warm_to_hot/CN/v4|v4"
+            "CN|trend_animals_warm_to_hot/CN/v5|v5"
         ),
         "state_status": "ok",
         "status": "paused",
@@ -4248,7 +4276,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -4402,13 +4430,13 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["account"]["positions"] == []
     assert payload["metadata"]["simulate_acc_id"] == 101
-    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
     assert payload["drawdown_summary"]["state_status"] == "missing"
     assert payload["drawdown_summary"]["entry_allowed"] is False
     assert payload["strategy_judgments"]["formal_actions"] == []
 
 
-def test_generated_report_keeps_v4_identity_kelly_scope_and_drawdown_continuity(
+def test_generated_report_keeps_v5_identity_kelly_scope_and_drawdown_continuity(
     tmp_path: Path,
 ) -> None:
     config = trend_config(tmp_path)
@@ -4426,8 +4454,8 @@ def test_generated_report_keeps_v4_identity_kelly_scope_and_drawdown_continuity(
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     snapshot = payload["strategy_snapshot"]
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v4"
-    assert snapshot["strategy_version"] == "v4"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v5"
+    assert snapshot["strategy_version"] == "v5"
     assert snapshot["parameters"]["kelly_sample_scope"] == (
         "market+strategy_id+opening_strategy_version"
     )
@@ -4435,7 +4463,7 @@ def test_generated_report_keeps_v4_identity_kelly_scope_and_drawdown_continuity(
     assert after["audit_events"] == before["audit_events"]
 
 
-def test_report_runner_sends_exact_broker_v4_text(tmp_path: Path) -> None:
+def test_report_runner_sends_exact_broker_v5_text(tmp_path: Path) -> None:
     calls: list[str] = []
     api_kwargs: dict[str, object] = {}
     config = trend_config(tmp_path)
