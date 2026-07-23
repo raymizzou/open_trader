@@ -404,9 +404,23 @@ def valid_v5_risk_contract(
     status = summary.get("status")
     if unknown:
         if (
-            status != "active_with_unknown_risk"
-            or summary.get("status_label") != "部分风险未知"
-            or summary.get("pause_reason") != ""
+            status not in {"active_with_unknown_risk", "paused"}
+            or (
+                status == "active_with_unknown_risk"
+                and (
+                    summary.get("status_label") != "部分风险未知"
+                    or summary.get("pause_reason") != ""
+                )
+            )
+            or (
+                status == "paused"
+                and (
+                    summary.get("status_label")
+                    not in {"暂停新开仓", "组合风险已满"}
+                    or not isinstance(summary.get("pause_reason"), str)
+                    or not summary.get("pause_reason")
+                )
+            )
         ):
             return False
         if any(
@@ -421,10 +435,18 @@ def valid_v5_risk_contract(
             )
         ):
             return False
-        known_new = _nonnegative_risk_decimal(
-            summary.get("new_known_planned_risk")
+        known_existing = _nonnegative_risk_decimal(
+            summary.get("known_existing_planned_risk")
         )
-        if known_new is None:
+        known_new = _nonnegative_risk_decimal(summary.get("new_known_planned_risk"))
+        known_total = _nonnegative_risk_decimal(
+            summary.get("known_portfolio_planned_risk")
+        )
+        if (
+            known_existing is None
+            or known_new is None
+            or known_total != known_existing + known_new
+        ):
             return False
         shadow = dict(summary)
         account_nav = _nonnegative_risk_decimal(expected_nav)
@@ -433,18 +455,28 @@ def valid_v5_risk_contract(
         portfolio_limit = account_nav * PORTFOLIO_RISK_LIMIT
         shadow.update(
             {
-                "status": "active",
-                "status_label": "风险预算内",
-                "pause_reason": "",
-                "existing_planned_risk": Decimal("0"),
+                "status": (
+                    "paused" if status == "paused" else "active"
+                ),
+                "status_label": (
+                    str(summary.get("status_label"))
+                    if status == "paused"
+                    else "风险预算内"
+                ),
+                "pause_reason": (
+                    str(summary.get("pause_reason"))
+                    if status == "paused"
+                    else ""
+                ),
+                "existing_planned_risk": known_existing,
                 "new_planned_risk": known_new,
-                "portfolio_planned_risk": known_new,
-                "portfolio_planned_risk_pct": known_new / account_nav,
+                "portfolio_planned_risk": known_total,
+                "portfolio_planned_risk_pct": known_total / account_nav,
                 "portfolio_remaining_risk": max(
-                    Decimal("0"), portfolio_limit - known_new
+                    Decimal("0"), portfolio_limit - known_total
                 ),
                 "portfolio_remaining_risk_pct": max(
-                    Decimal("0"), portfolio_limit - known_new
+                    Decimal("0"), portfolio_limit - known_total
                 ) / account_nav,
             }
         )
@@ -1617,7 +1649,13 @@ def _risk_summary(
         "pause_reason": pause_reason,
         "existing_planned_risk": None if has_unknown else existing_planned_risk,
         "new_planned_risk": None if has_unknown else new_planned_risk,
+        "known_existing_planned_risk": existing_planned_risk,
         "new_known_planned_risk": new_planned_risk,
+        "known_portfolio_planned_risk": (
+            existing_planned_risk + new_planned_risk
+            if existing_planned_risk is not None
+            else None
+        ),
         "portfolio_planned_risk": None if has_unknown else planned_risk,
         "portfolio_planned_risk_pct": (
             planned_risk / net_value
@@ -1749,6 +1787,7 @@ def _plan_buy_actions(
             normal_cost_rate=normal_cost_rate,
             pause_reason=critical_data_reason,
             kelly_state=kelly_state,
+            unknown_existing_risk_symbols=unknown_existing_risk_symbols,
         )
 
     known_existing_risk = portfolio_planned_risk or Decimal("0")
@@ -1775,6 +1814,7 @@ def _plan_buy_actions(
             normal_cost_rate=normal_cost_rate,
             pause_reason=pause_reason,
             kelly_state=kelly_state,
+            unknown_existing_risk_symbols=unknown_existing_risk_symbols,
         )
     if (
         portfolio_planned_risk is not None
@@ -1798,6 +1838,7 @@ def _plan_buy_actions(
             normal_cost_rate=normal_cost_rate,
             pause_reason=pause_reason,
             kelly_state=kelly_state,
+            unknown_existing_risk_symbols=unknown_existing_risk_symbols,
         )
     remaining_cash = available_cash
     remaining_risk = max(
@@ -1858,6 +1899,26 @@ def _plan_buy_actions(
             if missing
         )
         if allow_pending_market_data and pending_fields:
+            estimated_shares: int | None = None
+            pending_cash_required = Decimal("0")
+            if (
+                "quote" not in pending_fields
+                and "lot_size" not in pending_fields
+                and lot_size is not None
+                and item.close is not None
+            ):
+                budget_per_share = item.close * price_fx_to_account_currency * (
+                    Decimal("1") + normal_cost_rate
+                )
+                estimated = int(target_amount / budget_per_share / lot_size) * lot_size
+                if estimated > 0:
+                    estimated_shares = estimated
+                    pending_cash_required = (
+                        Decimal(estimated)
+                        * item.close
+                        * price_fx_to_account_currency
+                        * (Decimal("1") + normal_cost_rate)
+                    )
             actions.append(
                 BuyAction(
                     symbol=item.symbol,
@@ -1865,7 +1926,7 @@ def _plan_buy_actions(
                     industry=item.industry,
                     target_weight=weight,
                     target_amount=target_amount,
-                    estimated_shares=None,
+                    estimated_shares=estimated_shares,
                     lot_size=lot_size if lot_size and lot_size > 0 else None,
                     filter_price=item.filter_price,
                     close=item.close,
@@ -1887,6 +1948,7 @@ def _plan_buy_actions(
                     pending_fields=pending_fields,
                 )
             )
+            remaining_cash -= pending_cash_required
             slots -= 1
             continue
         if lot_size is None or lot_size <= 0:
@@ -2159,7 +2221,7 @@ def _post_sell_planned_risk(
             * price_fx_to_account_currency
             + holding.close * price_fx_to_account_currency * normal_cost_rate
         )
-    return (None if unknown_symbols else planned_risk), tuple(dict.fromkeys(unknown_symbols)), ""
+    return planned_risk, tuple(dict.fromkeys(unknown_symbols)), ""
 
 
 def build_report(
@@ -2472,7 +2534,11 @@ def build_report(
             critical_data_reason=critical_data_reason,
             kelly_state=kelly_state,
             allow_pending_market_data=snapshot_version == "v5",
-            unknown_existing_risk_symbols=unknown_existing_risk_symbols,
+            unknown_existing_risk_symbols=(
+                unknown_existing_risk_symbols
+                if snapshot_version == "v5"
+                else ()
+            ),
         )
         if snapshot_version in {"v4", "v5"} and (
             not valid_drawdown_decision(
@@ -2596,6 +2662,7 @@ def build_report(
         },
         metadata={
             **dict(metadata or {}),
+            "market": market.upper(),
             "position_weight": str(position_weight),
             "position_weight_source": position_weight_source,
         },
@@ -3332,6 +3399,12 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     version = snapshot.get("strategy_version")
     if version not in {"v1", "v2", "v3", "v4", "v5"}:
         raise ValueError("strategy snapshot does not match report actions")
+    if version == "v5" and (
+        snapshot.get("strategy_id")
+        != f"trend_animals_warm_to_hot/{market}/v5"
+        or snapshot.get("effective_from") != "2026-07-23"
+    ):
+        raise ValueError("strategy snapshot does not match report actions")
     if (
         "overheat_trim_fraction" in parameters
         or any(item.action == "SELL_PARTIAL" for item in report.holdings)
@@ -3395,10 +3468,30 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             if action.market_data_status not in {"complete", "pending"}:
                 raise ValueError("strategy snapshot does not match report actions")
             if action.market_data_status == "pending":
+                can_estimate_pending = (
+                    "quote" not in pending_fields
+                    and "lot_size" not in pending_fields
+                )
                 if (
                     not pending_fields
                     or action.pending_fields != pending_fields
-                    or action.estimated_shares is not None
+                    or (
+                        can_estimate_pending
+                        and (
+                            action.estimated_shares is not None
+                            and action.estimated_shares < 0
+                            or action.lot_size is None
+                            or (
+                                action.estimated_shares is not None
+                                and action.estimated_shares > 0
+                                and action.estimated_shares % action.lot_size != 0
+                            )
+                        )
+                    )
+                    or (
+                        not can_estimate_pending
+                        and action.estimated_shares not in {None, 0}
+                    )
                     or action.estimated_initial_line is not None
                     or action.planned_stop_risk is not None
                     or action.planned_stop_risk_pct is not None
@@ -3441,7 +3534,11 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         expected_new = (
             report.risk_summary.get("new_known_planned_risk")
             if version == "v5"
-            and report.risk_summary.get("status") == "active_with_unknown_risk"
+            and (
+                report.risk_summary.get("status") == "active_with_unknown_risk"
+                or report.risk_summary.get("unknown_existing_risk_symbols")
+                or report.risk_summary.get("unknown_new_risk_symbols")
+            )
             else report.risk_summary.get("new_planned_risk")
         )
         if _nonnegative_risk_decimal(expected_new) != new_planned_risk:
@@ -3519,6 +3616,9 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     for item in report.buy_actions:
         action = _json_value(asdict(item))
         assert isinstance(action, dict)
+        if report.strategy_snapshot.get("strategy_version") != "v5":
+            action.pop("market_data_status", None)
+            action.pop("pending_fields", None)
         if legacy_v1:
             for key in (
                 "planned_stop_risk",
@@ -3559,7 +3659,17 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     if report.drawdown_summary is not None:
         payload["drawdown_summary"] = _json_value(report.drawdown_summary)
     if not legacy_v1:
-        payload["risk_summary"] = _json_value(report.risk_summary)
+        risk_summary = dict(report.risk_summary)
+        if report.strategy_snapshot.get("strategy_version") != "v5":
+            for key in (
+                "known_existing_planned_risk",
+                "new_known_planned_risk",
+                "known_portfolio_planned_risk",
+                "unknown_existing_risk_symbols",
+                "unknown_new_risk_symbols",
+            ):
+                risk_summary.pop(key, None)
+        payload["risk_summary"] = _json_value(risk_summary)
     if report.replay_evidence is not None:
         payload["replay_evidence"] = dict(report.replay_evidence)
     for key in ("delivery_status", "process_version"):

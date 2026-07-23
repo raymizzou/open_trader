@@ -1103,6 +1103,62 @@ def test_v5_missing_quote_and_atr_keeps_formal_buy_without_pausing_batch() -> No
     assert built.risk_summary["unknown_new_risk_symbols"] == ["600001"]
 
 
+def test_v5_missing_atr_estimates_quantity_and_reserves_cash() -> None:
+    item = replace(candidate("600001"), atr=None)
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    acct = account()
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=acct,
+        candidates=[item],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(acct.net_value)
+        ),
+    )
+    action = built.buy_actions[0]
+    assert action.market_data_status == "pending"
+    assert action.pending_fields == ("atr",)
+    assert action.estimated_shares is not None
+    assert action.estimated_shares % 100 == 0
+    assert built.risk_summary["unknown_new_risk_symbols"] == ["600001"]
+
+
+def test_v5_missing_atr_under_one_lot_keeps_zero_pending_quantity() -> None:
+    item = replace(candidate("600001", close="100"), atr=None)
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    acct = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100"),
+        available_cash=Decimal("100"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=acct,
+        candidates=[item],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(snapshot, "2026-07-15", equity="100"),
+    )
+    action = built.buy_actions[0]
+    assert action.pending_fields == ("atr",)
+    assert action.estimated_shares in {None, 0}
+    trend_module._report_payload(built)
+
+
 def test_v5_hk_missing_lot_size_keeps_pending_formal_buy() -> None:
     item = replace(candidate("600001"), symbol="00700", exchange="HK")
     snapshot = trend_module.live_trend_strategy_snapshot(
@@ -1125,6 +1181,7 @@ def test_v5_hk_missing_lot_size_keeps_pending_formal_buy() -> None:
     action = built.buy_actions[0]
     assert action.lot_size is None
     assert action.pending_fields == ("lot_size",)
+    assert trend_module._report_payload(built)["metadata"]["market"] == "HK"
 
 
 def test_v5_existing_unknown_risk_does_not_pause_known_buys() -> None:
@@ -1147,6 +1204,123 @@ def test_v5_existing_unknown_risk_does_not_pause_known_buys() -> None:
     assert [item.symbol for item in built.buy_actions] == ["600002"]
     assert built.risk_summary["unknown_existing_risk_symbols"] == ["600001"]
     assert built.risk_summary["status"] == "active_with_unknown_risk"
+
+
+def test_v5_known_existing_risk_still_enforces_four_percent_gate() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    acct = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=(
+            AccountPosition("600001", "未知持仓", "stock", Decimal("100"), None, Decimal("1000")),
+            AccountPosition("600002", "已知持仓", "stock", Decimal("5000"), None, Decimal("50000")),
+        ),
+        exceptions=(),
+        position_count=2,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=acct,
+        candidates=[candidate("600003")],
+        holding_snapshots={"600001": None, "600002": holding("600002")},
+        bars_by_symbol={"600002": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600002": {
+                    "initial_line": "9",
+                    "active_line": "9",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(snapshot, "2026-07-15", equity="100000"),
+    )
+    assert built.buy_actions == ()
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["unknown_existing_risk_symbols"] == ["600001"]
+    assert built.risk_summary["known_existing_planned_risk"] == Decimal("5050.000")
+    assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
+    trend_module._report_payload(built)
+
+
+@pytest.mark.parametrize("version", ["v2", "v3", "v4"])
+def test_frozen_v2_v3_v4_payload_omits_v5_only_action_fields(
+    version: str,
+) -> None:
+    acct = account()
+    if version == "v4":
+        snapshot = trend_module.live_trend_strategy_snapshot(
+            "CN", "v5sha", (622466, 697199)
+        )
+        snapshot = {
+            **snapshot,
+            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+            "strategy_version": "v4",
+            "effective_from": "2026-07-20",
+        }
+        drawdown_summary = active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(acct.net_value)
+        )
+    else:
+        snapshot = trend_module.trend_strategy_snapshot(
+            "CN", "v3sha", (622466, 697199)
+        )
+        snapshot = {
+            **snapshot,
+            "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
+            "strategy_version": version,
+        }
+        drawdown_summary = None
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=acct,
+        candidates=[candidate("600001")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=drawdown_summary,
+    )
+    action = trend_module._report_payload(built)["strategy_judgments"]["formal_actions"][0]
+    assert "market_data_status" not in action
+    assert "pending_fields" not in action
+
+
+def test_v5_strategy_identity_is_immutable_in_report_validation() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "v5sha", (622466, 697199)
+    )
+    acct = account()
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=acct,
+        candidates=[candidate("600001")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=snapshot,
+        drawdown_summary=active_drawdown_summary(
+            snapshot, "2026-07-15", equity=str(acct.net_value)
+        ),
+    )
+    tampered = replace(
+        built,
+        strategy_snapshot={
+            **built.strategy_snapshot,
+            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+        },
+    )
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(tampered)
 
 
 def test_atr14_requires_fifteen_valid_bars() -> None:

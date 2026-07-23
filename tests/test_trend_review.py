@@ -349,6 +349,14 @@ def test_v5_rebuild_preserves_pending_market_data_action(tmp_path: Path) -> None
         "quote",
         "atr",
     ]
+    missing_lots = json.loads(json.dumps(evidence))
+    missing_lots["strategy_snapshot"]["market"] = "HK"
+    del missing_lots["rebuild_inputs"]["lot_sizes"]
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="missing original input: lot_sizes",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(missing_lots)
 
 
 def test_v1_rebuild_keeps_legacy_nominal_sizing_without_v2_risk_fields() -> None:

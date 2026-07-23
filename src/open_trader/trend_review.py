@@ -4203,6 +4203,8 @@ def rebuild_trend_report_from_evidence(
         required.update({"kelly_rounds", "kelly_data_reason"})
     if strategy_version in {"v4", "v5"}:
         required.add("drawdown_summary")
+    if strategy_version == "v5" and str(snapshot.get("market") or "").upper() == "HK":
+        required.add("lot_sizes")
     missing = sorted(required - inputs.keys())
     if missing:
         raise TrendReplayIncompleteError(
@@ -4356,6 +4358,17 @@ def rebuild_trend_report_from_evidence(
         raise TrendReplayIncompleteError(
             "invalid original input: kelly_data_reason"
         )
+    raw_lot_sizes = inputs.get("lot_sizes")
+    if raw_lot_sizes is None:
+        raw_lot_sizes = {}
+    if not isinstance(raw_lot_sizes, Mapping):
+        raise TrendReplayIncompleteError("invalid original input: lot_sizes")
+    try:
+        lot_sizes = {
+            str(key): int(value) for key, value in raw_lot_sizes.items()
+        }
+    except (TypeError, ValueError, OverflowError):
+        raise TrendReplayIncompleteError("invalid original input: lot_sizes") from None
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -4379,10 +4392,7 @@ def rebuild_trend_report_from_evidence(
             "process_version": process_version,
         },
         market=str(inputs["market"]),
-        lot_sizes={
-            str(key): int(value)
-            for key, value in dict(inputs.get("lot_sizes") or {}).items()
-        },
+        lot_sizes=lot_sizes,
         position_weight=Decimal(str(inputs.get("position_weight") or "0.04")),
         position_weight_source=str(
             inputs.get("position_weight_source") or "fallback_4pct"
