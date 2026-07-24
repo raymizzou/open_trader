@@ -1590,6 +1590,172 @@ def test_dashboard_projects_frozen_strategy_parameters_into_cn_audit(
     assert report["audit"]["strategy_parameters"] is not parameters
 
 
+def _dashboard_frozen_report_payload() -> dict[str, object]:
+    report = trend_module.build_report(
+        as_of_date="2026-07-15",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T20:00:00+08:00",
+        account=trend_module.AccountSnapshot(
+            source_date="2026-07-15",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("50000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        metadata={"market": "CN", "broker": "eastmoney", "run_date": "2026-07-15"},
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=None,
+        estimated_api_cost_complete=False,
+    )
+    return trend_module._report_payload(report)
+
+
+def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _dashboard_frozen_report_payload()
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["api_cost"] == payload["api_cost"]
+    assert projected["industry_context_status"] == payload["industry_context_status"]
+    assert projected["industry_contexts"] == payload["industry_contexts"]
+    assert projected["strategy_parameter_rows"] == payload["strategy_snapshot"][
+        "parameter_rows"
+    ]
+    assert projected["audit"]["estimated_api_cost"] == payload[
+        "estimated_api_cost"
+    ]
+    assert projected["audit"]["actual_api_cost"] == payload["actual_api_cost"]
+
+
+def test_dashboard_rejects_malformed_frozen_cost_projection(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _dashboard_frozen_report_payload()
+    api_cost = payload["api_cost"]
+    assert isinstance(api_cost, dict)
+    api_cost["estimated"] = "not-a-decimal"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is False
+    assert projected["status_text"] == "暂时不可用"
+
+
+def test_dashboard_rejects_malformed_frozen_parameter_rows(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _dashboard_frozen_report_payload()
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["parameter_rows"] = [{"group": "坏"}]
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is False
+    assert projected["status_text"] == "暂时不可用"
+
+
+def test_dashboard_accepts_pre_task5_api_cost_shape(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _dashboard_frozen_report_payload()
+    api_cost = payload["api_cost"]
+    assert isinstance(api_cost, dict)
+    api_cost.pop("label")
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is True
+    assert projected["api_cost"] == api_cost
+
+
+def test_dashboard_accepts_legacy_api_cost_without_context_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    payload["api_cost"] = {
+        "actual": "1.00",
+        "estimated": "1.20",
+        "estimate_complete": True,
+        "unit": "Trend Animals 余额单位",
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is True
+    assert projected["api_cost"] == payload["api_cost"]
+    assert projected["industry_context_status"] == {}
+    assert projected["industry_contexts"] == []
+    assert projected["strategy_parameter_rows"] == []
+
+
+def test_dashboard_legacy_projection_keeps_raw_cost_and_empty_new_facts(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    payload["estimated_api_cost"] = "1.20"
+    payload["actual_api_cost"] = "1.00"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is True
+    assert projected["api_cost"] is None
+    assert projected["industry_context_status"] == {}
+    assert projected["industry_contexts"] == []
+    assert projected["strategy_parameter_rows"] == []
+    assert projected["audit"]["estimated_api_cost"] == "1.20"
+    assert projected["audit"]["actual_api_cost"] == "1.00"
+
+
 @pytest.mark.parametrize("parameters", ["missing", ["legacy"]])
 def test_dashboard_projects_legacy_strategy_parameters_as_empty_dict(
     tmp_path: Path, parameters: object,

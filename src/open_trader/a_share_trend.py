@@ -72,6 +72,7 @@ DISCLAIMER_TEXT = (
 )
 NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
 STALE_TIGER_ACCOUNT_WARNING = "账户数据非实时，禁止新增买入；持仓需复核"
+TREND_API_COST_UNIT = "Trend Animals 余额单位"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 UNIFIED_TREND_FIELDS = (
     "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
@@ -1013,6 +1014,44 @@ def _decimal(value: object) -> Decimal:
     if not result.is_finite():
         raise ValueError(f"invalid decimal value: {value!r}")
     return result
+
+
+def _format_api_cost(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    if "." not in text:
+        return text
+    fraction = text.partition(".")[2]
+    # Trend Animals catalog values are millesimal; preserve that published
+    # precision for sub-unit costs while dropping unrelated padding.
+    if abs(value) < 1 and len(fraction) == 3:
+        return text
+    return text.rstrip("0").rstrip(".")
+
+
+def trend_api_cost_label(
+    *,
+    actual: Decimal | None,
+    estimated: Decimal | None,
+    estimate_complete: bool,
+) -> str:
+    if actual is not None:
+        return (
+            f"本报告 API 费用：实扣 {_format_api_cost(actual)} "
+            f"{TREND_API_COST_UNIT}"
+        )
+    if estimated is not None and estimate_complete:
+        return (
+            f"本报告 API 费用：估算 {_format_api_cost(estimated)} "
+            f"{TREND_API_COST_UNIT}（实扣不可得）"
+        )
+    if estimated is not None:
+        return (
+            f"本报告 API 费用：未知（快照估算 {_format_api_cost(estimated)} "
+            f"{TREND_API_COST_UNIT}；成分费用未计）"
+        )
+    return "本报告 API 费用：未知"
 
 
 def _optional_decimal(value: object) -> Decimal | None:
@@ -3305,6 +3344,27 @@ def _append_feishu_attention(
         lines.append(f"{index}. {item.get('symbol') or '-'}{suffix}")
 
 
+def _serialized_api_cost_label(payload: Mapping[str, object]) -> str | None:
+    api_cost = payload.get("api_cost")
+    if isinstance(api_cost, Mapping) and isinstance(api_cost.get("label"), str):
+        return api_cost["label"]
+    if "actual_api_cost" not in payload and "estimated_api_cost" not in payload:
+        return None
+    actual = payload.get("actual_api_cost")
+    estimated = payload.get("estimated_api_cost")
+    try:
+        actual_decimal = None if actual is None else Decimal(str(actual))
+        estimated_decimal = None if estimated is None else Decimal(str(estimated))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    complete = payload.get("estimated_api_cost_complete", True)
+    return trend_api_cost_label(
+        actual=actual_decimal,
+        estimated=estimated_decimal,
+        estimate_complete=complete is True,
+    )
+
+
 def render_trend_feishu_text(
     payload: Mapping[str, object], *, broker_label: str, market_label: str
 ) -> tuple[str, str]:
@@ -3376,6 +3436,8 @@ def render_trend_feishu_text(
         f"账户状态：{status}",
         summary,
     ]
+    if cost_label := _serialized_api_cost_label(payload):
+        lines.append(cost_label)
     _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
     _append_feishu_attention(lines, payload.get("option_attention"), market=market)
     lines.extend(["", "请人工确认，不自动下单。"])
@@ -3644,12 +3706,12 @@ def render_markdown(report: TrendReport) -> str:
         f"- 数据来源：{_data_source_label(source)}" for source in report.data_sources
     )
     lines.append(
-        "- API 计费估算："
-        + ("未知" if report.estimated_api_cost is None else str(report.estimated_api_cost))
-    )
-    lines.append(
-        "- 本次余额变化："
-        + ("未知" if report.actual_api_cost is None else str(report.actual_api_cost))
+        "- "
+        + trend_api_cost_label(
+            actual=report.actual_api_cost,
+            estimated=report.estimated_api_cost,
+            estimate_complete=report.estimated_api_cost_complete,
+        )
     )
     lines.extend(
         [
@@ -3930,7 +3992,12 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
             "actual": _json_value(report.actual_api_cost),
             "estimated": _json_value(report.estimated_api_cost),
             "estimate_complete": report.estimated_api_cost_complete,
-            "unit": "Trend Animals 余额单位",
+            "unit": TREND_API_COST_UNIT,
+            "label": trend_api_cost_label(
+                actual=report.actual_api_cost,
+                estimated=report.estimated_api_cost,
+                estimate_complete=report.estimated_api_cost_complete,
+            ),
         },
         "industry_contexts": [
             _json_value(asdict(context)) for context in report.industry_contexts
@@ -4672,9 +4739,14 @@ def _balance(row: Mapping[str, object]) -> Decimal:
     for key in ("balance", "remainingBalance", "amount"):
         if key in row:
             try:
-                return _decimal(row[key])
+                value = _decimal(row[key])
             except ValueError:
                 break
+            if value < 0:
+                raise TrendAnimalsError(
+                    "getAccountBalance returned no valid balance"
+                )
+            return value
     raise TrendAnimalsError("getAccountBalance returned no valid balance")
 
 

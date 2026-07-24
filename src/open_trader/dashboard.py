@@ -19,6 +19,8 @@ from .a_share_trend import (
     PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
     SINGLE_ENTRY_RISK_LIMIT,
+    TREND_API_COST_UNIT,
+    trend_api_cost_label,
     valid_serialized_account,
     valid_v2_risk_contract,
     valid_v3_risk_contract,
@@ -1079,6 +1081,261 @@ def _valid_trend_collections(
     )
 
 
+def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
+    fact_keys = {"api_cost", "industry_context_status", "industry_contexts"}
+    if not fact_keys.intersection(payload):
+        return True
+    api_cost = payload.get("api_cost")
+    status = payload.get("industry_context_status")
+    contexts = payload.get("industry_contexts")
+    if not isinstance(api_cost, dict):
+        return False
+    api_cost_keys = set(api_cost)
+    legacy_api_cost = api_cost_keys == {
+        "actual",
+        "estimated",
+        "estimate_complete",
+        "unit",
+    }
+    current_api_cost = legacy_api_cost or api_cost_keys == {
+        "actual",
+        "estimated",
+        "estimate_complete",
+        "unit",
+        "label",
+    }
+    if not current_api_cost:
+        return False
+
+    def valid_cost(value: object) -> bool:
+        if value is None or isinstance(value, bool):
+            return value is None
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return parsed.is_finite() and parsed >= 0
+
+    if (
+        not valid_cost(api_cost["actual"])
+        or not valid_cost(api_cost["estimated"])
+        or type(api_cost["estimate_complete"]) is not bool
+        or api_cost["unit"] != TREND_API_COST_UNIT
+        or not legacy_api_cost
+        and (
+            not isinstance(api_cost["label"], str)
+            or not api_cost["label"].strip()
+        )
+    ):
+        return False
+    try:
+        actual = (
+            None
+            if api_cost["actual"] is None
+            else Decimal(str(api_cost["actual"]))
+        )
+        estimated = (
+            None
+            if api_cost["estimated"] is None
+            else Decimal(str(api_cost["estimated"]))
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not legacy_api_cost and api_cost["label"] != trend_api_cost_label(
+        actual=actual,
+        estimated=estimated,
+        estimate_complete=api_cost["estimate_complete"],
+    ):
+        return False
+    if legacy_api_cost and not {
+        "industry_context_status",
+        "industry_contexts",
+    }.intersection(payload):
+        return True
+    snapshot = payload.get("strategy_snapshot")
+    if not isinstance(snapshot, dict):
+        return False
+    rows = snapshot.get("parameter_rows")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(
+            not isinstance(row, dict)
+            or set(row) != {"group", "name", "value"}
+            or any(
+                not isinstance(row[key], str) or not row[key].strip() for key in row
+            )
+            for row in rows
+        )
+    ):
+        return False
+
+    if not isinstance(status, dict):
+        return False
+    mode = status.get("ordering_mode")
+    if mode not in {
+        "context_with_history",
+        "context_current_only",
+        "legacy_invalid_current",
+        "legacy_no_eligible_candidates",
+    }:
+        return False
+    if type(status.get("current_complete")) is not bool or type(
+        status.get("history_complete")
+    ) is not bool:
+        return False
+    fallback_reason = status.get("fallback_reason")
+    if fallback_reason is not None and (
+        not isinstance(fallback_reason, str) or not fallback_reason.strip()
+    ):
+        return False
+    if mode == "context_with_history" and (
+        not status["current_complete"] or not status["history_complete"]
+    ):
+        return False
+    if mode == "context_current_only" and (
+        not status["current_complete"] or status["history_complete"]
+    ):
+        return False
+    if mode == "legacy_invalid_current" and status["current_complete"]:
+        return False
+    affected = status.get("affected_industry_ids")
+    if affected is not None and (
+        not isinstance(affected, list)
+        or not all(
+            value == "unknown"
+            or (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+            )
+            for value in affected
+        )
+    ):
+        return False
+    validation_reasons = status.get("validation_reasons")
+    if validation_reasons is not None and (
+        not isinstance(validation_reasons, dict)
+        or any(
+            not isinstance(key, str)
+            or not isinstance(reasons, list)
+            or not all(isinstance(reason, str) and reason.strip() for reason in reasons)
+            for key, reasons in validation_reasons.items()
+        )
+    ):
+        return False
+
+    if not isinstance(contexts, list):
+        return False
+    context_keys = {
+        "industry_tm_id",
+        "industry",
+        "as_of_date",
+        "component_count",
+        "snapshot_count",
+        "tradable_count",
+        "valid_count",
+        "right_count",
+        "snapshot_coverage",
+        "right_state_coverage",
+        "right_share",
+        "warm_to_hot_count",
+        "temperature",
+        "strength",
+        "valid",
+        "invalid_reasons",
+        "prior_as_of_date",
+        "prior_temperature",
+        "prior_right_share",
+        "temperature_direction",
+        "right_share_change_pp",
+    }
+
+    def valid_decimal(value: object, *, minimum: Decimal, maximum: Decimal) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return parsed.is_finite() and minimum <= parsed <= maximum
+
+    seen_ids: set[int] = set()
+    for context in contexts:
+        if not isinstance(context, dict) or set(context) != context_keys:
+            return False
+        industry_id = context["industry_tm_id"]
+        if (
+            isinstance(industry_id, bool)
+            or not isinstance(industry_id, int)
+            or industry_id <= 0
+            or industry_id in seen_ids
+            or not isinstance(context["industry"], str)
+            or not context["industry"].strip()
+            or not _valid_iso_date(context["as_of_date"])
+            or type(context["valid"]) is not bool
+            or not isinstance(context["invalid_reasons"], list)
+            or not all(
+                isinstance(reason, str) and reason.strip()
+                for reason in context["invalid_reasons"]
+            )
+        ):
+            return False
+        seen_ids.add(industry_id)
+        for key in (
+            "component_count",
+            "snapshot_count",
+            "tradable_count",
+            "valid_count",
+            "right_count",
+            "warm_to_hot_count",
+        ):
+            if (
+                isinstance(context[key], bool)
+                or not isinstance(context[key], int)
+                or context[key] < 0
+            ):
+                return False
+        if not valid_decimal(
+            context["snapshot_coverage"], minimum=Decimal("0"), maximum=Decimal("1")
+        ) or not valid_decimal(
+            context["right_state_coverage"], minimum=Decimal("0"), maximum=Decimal("1")
+        ):
+            return False
+        for key in ("right_share", "prior_right_share"):
+            if context[key] is not None and not valid_decimal(
+                context[key], minimum=Decimal("0"), maximum=Decimal("1")
+            ):
+                return False
+        if context["strength"] is not None and not valid_decimal(
+            context["strength"], minimum=Decimal("0"), maximum=Decimal("100")
+        ):
+            return False
+        if context["prior_as_of_date"] is not None and not _valid_iso_date(
+            context["prior_as_of_date"]
+        ):
+            return False
+        if context["prior_temperature"] is not None and not isinstance(
+            context["prior_temperature"], str
+        ):
+            return False
+        if context["temperature"] is not None and not isinstance(
+            context["temperature"], str
+        ):
+            return False
+        if context["temperature_direction"] is not None and context[
+            "temperature_direction"
+        ] not in {"rising", "unchanged", "falling"}:
+            return False
+        if context["right_share_change_pp"] is not None and not valid_decimal(
+            context["right_share_change_pp"],
+            minimum=Decimal("-100"),
+            maximum=Decimal("100"),
+        ):
+            return False
+    return True
+
+
 def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     snapshot = payload.get("strategy_snapshot")
     strategy_version = (
@@ -1366,6 +1623,7 @@ def _valid_trend_report_payload(
         and str(metadata.get("market") or "").upper() == market
         and str(metadata.get("broker") or "").lower() == broker
         and _valid_trend_collections(payload, judgments)
+        and _valid_frozen_trend_facts(payload)
         and _valid_trend_risk_summary(payload)
         and _valid_option_attention(payload, market=market)
         and as_of_date <= freshness_date <= execution_date
@@ -1582,6 +1840,25 @@ def _project_broker_trend_report(
         if isinstance(raw_strategy_parameters, dict)
         else {}
     )
+    frozen_api_cost = payload.get("api_cost")
+    if not isinstance(frozen_api_cost, dict):
+        frozen_api_cost = None
+    frozen_industry_context_status = payload.get("industry_context_status")
+    if not isinstance(frozen_industry_context_status, dict):
+        frozen_industry_context_status = {}
+    frozen_industry_contexts = payload.get("industry_contexts")
+    if not isinstance(frozen_industry_contexts, list):
+        frozen_industry_contexts = []
+    frozen_parameter_rows = (
+        strategy_snapshot.get("parameter_rows")
+        if isinstance(strategy_snapshot, dict)
+        and {"api_cost", "industry_context_status", "industry_contexts"}.intersection(
+            payload
+        )
+        else None
+    )
+    if not isinstance(frozen_parameter_rows, list):
+        frozen_parameter_rows = []
     actual_overlay = _project_trend_actual_overlay(
         broker=broker,
         market=market,
@@ -1634,6 +1911,10 @@ def _project_broker_trend_report(
         "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
+        "api_cost": frozen_api_cost,
+        "industry_context_status": frozen_industry_context_status,
+        "industry_contexts": frozen_industry_contexts,
+        "strategy_parameter_rows": frozen_parameter_rows,
         "actual_overlay": actual_overlay,
         "hold_actions": hold_actions,
         "review_actions": review_actions,

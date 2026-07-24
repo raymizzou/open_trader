@@ -901,6 +901,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
     assert payload["estimated_api_cost"] == "0.142"
+    assert payload["api_cost"]["label"] == "本报告 API 费用：实扣 0 Trend Animals 余额单位"
     assert payload["signal_snapshots"]["holdings"]["00700"] | {
         "gain_since_entry": "0.048",
         "phase_prev": "谷雨",
@@ -1133,6 +1134,7 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
         "cache=client-managed"
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
+    assert payload["api_cost"]["label"] == "本报告 API 费用：实扣 0 Trend Animals 余额单位"
     assert payload["account"]["fresh"] is True
     assert payload["metadata"]["simulate_acc_id"] == 102
     assert payload["account"]["source_date"] == "2026-07-14"

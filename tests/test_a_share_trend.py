@@ -929,11 +929,97 @@ def test_report_payload_freezes_industry_context_and_ordering_facts() -> None:
         "estimated": "0.479",
         "estimate_complete": False,
         "unit": "Trend Animals 余额单位",
+        "label": "本报告 API 费用：实扣 0.610 Trend Animals 余额单位",
     }
     ordering = payload["strategy_judgments"]["top10_candidates"][0]["ordering_context"]
     assert ordering["applied"] is True
     assert ordering["industry_tm_id"] == 621707
     assert ordering["ordering_mode"] == "context_with_history"
+
+
+@pytest.mark.parametrize(
+    ("actual", "estimated", "estimate_complete", "expected"),
+    [
+        (
+            Decimal("0.610"),
+            Decimal("0.479"),
+            False,
+            "本报告 API 费用：实扣 0.610 Trend Animals 余额单位",
+        ),
+        (
+            None,
+            Decimal("0.479"),
+            True,
+            "本报告 API 费用：估算 0.479 Trend Animals 余额单位（实扣不可得）",
+        ),
+        (
+            None,
+            Decimal("0.479"),
+            False,
+            "本报告 API 费用：未知（快照估算 0.479 Trend Animals 余额单位；成分费用未计）",
+        ),
+        (
+            Decimal("0.000"),
+            None,
+            False,
+            "本报告 API 费用：实扣 0 Trend Animals 余额单位",
+        ),
+        (
+            Decimal("1.2000"),
+            None,
+            False,
+            "本报告 API 费用：实扣 1.2 Trend Animals 余额单位",
+        ),
+    ],
+)
+def test_trend_api_cost_label_has_one_canonical_branch(
+    actual: Decimal | None,
+    estimated: Decimal | None,
+    estimate_complete: bool,
+    expected: str,
+) -> None:
+    assert trend_module.trend_api_cost_label(
+        actual=actual,
+        estimated=estimated,
+        estimate_complete=estimate_complete,
+    ) == expected
+
+
+@pytest.mark.parametrize("raw_balance", ["-0.001", "NaN", "Infinity"])
+def test_balance_rejects_negative_or_nonfinite_values(raw_balance: str) -> None:
+    with pytest.raises(TrendAnimalsError, match="valid balance"):
+        trend_module._balance({"balance": raw_balance})
+
+
+def test_report_cost_label_is_shared_by_markdown_feishu_and_json() -> None:
+    built = replace(
+        report(),
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=None,
+        estimated_api_cost_complete=False,
+    )
+    expected = (
+        "本报告 API 费用：未知（快照估算 0.479 Trend Animals 余额单位；成分费用未计）"
+    )
+
+    markdown = render_markdown(built)
+    payload = trend_module._report_payload(built)
+    _, feishu = render_trend_feishu_text(
+        payload,
+        broker_label="东方财富",
+        market_label="A股",
+    )
+
+    assert markdown.count(expected) == 1
+    assert feishu.count(expected) == 1
+    assert payload["api_cost"]["label"] == expected
+    assert payload["api_cost"] == {
+        "actual": None,
+        "estimated": "0.479",
+        "estimate_complete": False,
+        "unit": "Trend Animals 余额单位",
+        "label": expected,
+    }
 
 
 def test_build_report_rejects_external_context_status_when_contexts_are_missing() -> None:
@@ -4980,7 +5066,8 @@ def test_report_runner_sends_exact_broker_v7_text(tmp_path: Path) -> None:
             "【日报｜东方财富｜A股趋势报告｜2026-07-15】",
             "数据截至：2026-07-14\n"
             "账户状态：已更新\n"
-            "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
+            "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n"
+            "本报告 API 费用：实扣 1 Trend Animals 余额单位\n\n"
             "买入\n"
             "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n"
             "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n\n"
