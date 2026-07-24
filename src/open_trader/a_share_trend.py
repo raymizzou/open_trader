@@ -121,6 +121,13 @@ ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
 HOT_TEMPERATURES = {"热", "沸"}
 CN_ALLOWED_INDUSTRY_TEMPERATURES = {"温", "热", "沸"}
 KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
+MARKET_V5_EFFECTIVE_FROM = {"US": "2026-07-24", "HK": "2026-07-27"}
+MARKET_CURRENCY = {"CN": "CNY", "US": "USD", "HK": "HKD"}
+CNY_PER_LOCAL_CURRENCY = {
+    "CN": Decimal("1"),
+    "US": Decimal("7.85") / Decimal("1.08"),
+    "HK": Decimal("1") / Decimal("1.08"),
+}
 
 V2_RISK_NUMERIC_FIELDS = (
     "existing_planned_risk",
@@ -564,11 +571,23 @@ def live_trend_strategy_snapshot(
     *,
     normal_cost_rate: Decimal = NORMAL_COST_RATE,
     strategy_version: str | None = None,
+    execution_date: str | None = None,
 ) -> dict[str, object]:
     market = market.upper()
-    version = strategy_version or ("v7" if market == "CN" else "v4")
+    if strategy_version is not None:
+        version = strategy_version
+    elif market == "CN":
+        version = "v7"
+    elif market in MARKET_V5_EFFECTIVE_FROM and (
+        execution_date is None
+        or execution_date >= MARKET_V5_EFFECTIVE_FROM[market]
+    ):
+        version = "v5"
+    else:
+        version = "v4"
     if (
-        version not in {"v4", "v6", "v7"}
+        version not in {"v4", "v5", "v6", "v7"}
+        or version == "v5" and market not in {"US", "HK"}
         or version in {"v6", "v7"} and market != "CN"
     ):
         raise ValueError("unsupported live trend strategy version")
@@ -580,6 +599,53 @@ def live_trend_strategy_snapshot(
     )
     parameters = dict(snapshot["parameters"])
     rows = [dict(row) for row in snapshot["parameter_rows"]]
+    if version == "v5":
+        rate = CNY_PER_LOCAL_CURRENCY[market]
+        parameters.pop("min_strength_exclusive", None)
+        parameters.pop("max_right_side_days_exclusive", None)
+        parameters.pop("min_amount_100m", None)
+        parameters.update(
+            {
+                "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+                "min_strength": str(CN_MIN_STRENGTH),
+                "allowed_industry_temperatures": ["温", "热", "沸"],
+                "allowed_phases": ["谷雨", "立夏", "夏至"],
+                "min_market_cap_cny_100m": str(CN_MIN_MARKET_CAP_100M),
+                "min_amount_cny_100m": str(CN_MIN_AMOUNT_100M),
+                "market_value_currency": MARKET_CURRENCY[market],
+                "cny_per_local_currency": str(rate),
+                "requires_right_side_days": True,
+                "exit_reasons": [
+                    "danger",
+                    "left_right_side",
+                    "temperature_to_flat",
+                    "protection",
+                ],
+            }
+        )
+        rows = [
+            row
+            for row in rows
+            if row["name"] not in {"趋势强度", "右侧天数", "单日成交额"}
+        ]
+        insert_at = next(
+            (index for index, row in enumerate(rows) if row["name"] == "其他要求"),
+            len(rows),
+        )
+        rows[insert_at:insert_at] = [
+            {"group": "入场过滤", "name": "趋势温度", "value": "前一状态为温；当前状态为热或沸"},
+            {"group": "入场过滤", "name": "趋势强度", "value": "不低于 95"},
+            {"group": "入场过滤", "name": "行业温度", "value": "温、热或沸"},
+            {"group": "入场过滤", "name": "趋势节气", "value": "谷雨、立夏或夏至"},
+            {"group": "入场过滤", "name": "总市值", "value": "不低于人民币 100 亿元（按冻结汇率换算）"},
+            {"group": "入场过滤", "name": "单日成交额", "value": "不低于人民币 2 亿元（按冻结汇率换算）"},
+        ]
+        for row in rows:
+            if row["name"] == "其他要求":
+                row["value"] = (
+                    "趋势右侧、可交易、无危险信号、日期一致、非当前持仓、"
+                    "右侧天数存在、ATR14 可计算"
+                )
     if version in {"v6", "v7"}:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
@@ -605,7 +671,11 @@ def live_trend_strategy_snapshot(
         "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
         "strategy_version": version,
         "effective_from": (
-            "2026-07-24" if version in {"v6", "v7"} else "2026-07-20"
+            MARKET_V5_EFFECTIVE_FROM[market]
+            if version == "v5"
+            else "2026-07-24"
+            if version in {"v6", "v7"}
+            else "2026-07-20"
         ),
         "parameters": parameters,
         "parameter_rows": [
@@ -630,7 +700,7 @@ def _expected_report_strategy_snapshot(
         if supplied is not None
         else ""
     )
-    if requested_version in {"v4", "v6", "v7"}:
+    if requested_version in {"v4", "v5", "v6", "v7"}:
         return live_trend_strategy_snapshot(
             market,
             process_version,
@@ -1321,11 +1391,20 @@ def _candidate_reasons(
     expected_date: str | None = None,
     *,
     market: str = "CN",
+    strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
 ) -> list[str]:
     reasons: list[str] = []
-    if market == "CN":
+    shared_discipline = market == "CN" or strategy_version == "v5"
+    cny_rate = (
+        cny_per_local_currency
+        if cny_per_local_currency is not None
+        else CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
+    )
+    if shared_discipline:
         if item.asset != "A股":
-            reasons.append("a_share_only")
+            if market == "CN":
+                reasons.append("a_share_only")
         if item.temperature_prev is None or item.temperature_curr is None:
             reasons.append("temperature_missing")
         elif item.temperature_prev != "温" or item.temperature_curr not in HOT_TEMPERATURES:
@@ -1346,12 +1425,18 @@ def _candidate_reasons(
             reasons.append("phase_after_summer_solstice")
         if item.market_cap is None:
             reasons.append("market_cap_missing")
-        elif item.market_cap < CN_MIN_MARKET_CAP_100M:
-            reasons.append("market_cap_below_100")
+        elif item.market_cap * cny_rate < CN_MIN_MARKET_CAP_100M:
+            reasons.append(
+                "market_cap_below_100"
+                if market == "CN"
+                else "market_cap_below_100_cny"
+            )
         if item.amount is None:
             reasons.append("amount_missing")
-        elif item.amount < CN_MIN_AMOUNT_100M:
-            reasons.append("amount_below_2")
+        elif item.amount * cny_rate < CN_MIN_AMOUNT_100M:
+            reasons.append(
+                "amount_below_2" if market == "CN" else "amount_below_2_cny"
+            )
         if item.days is None:
             reasons.append("right_side_days_missing")
     else:
@@ -1399,6 +1484,8 @@ def build_candidate_list(
     held_symbols: set[str],
     expected_date: str | None = None,
     market: str = "CN",
+    strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
 ) -> CandidateDecision:
     eligible: list[CandidateInput] = []
     excluded: dict[str, list[str]] = {}
@@ -1412,7 +1499,12 @@ def build_candidate_list(
                 reason
                 for item in items
                 for reason in _candidate_reasons(
-                    item, held_symbols, expected_date, market=market
+                    item,
+                    held_symbols,
+                    expected_date,
+                    market=market,
+                    strategy_version=strategy_version,
+                    cny_per_local_currency=cny_per_local_currency,
                 )
             )
         )
@@ -1908,7 +2000,9 @@ def _holding_action(
     triggered: set[str],
     market: str = "CN",
     overheat_trim_terminal: bool = False,
+    temperature_to_flat: bool | None = None,
 ) -> tuple[str, str]:
+    temperature_to_flat = market == "CN" if temperature_to_flat is None else temperature_to_flat
     if symbol in triggered:
         return "SELL_ALL", "protection_line_already_triggered"
     if snapshot is not None and snapshot.danger is True:
@@ -1916,7 +2010,7 @@ def _holding_action(
     if snapshot is not None and snapshot.right_side is False:
         return "SELL_ALL", "left_trend_right_side"
     if (
-        market == "CN"
+        temperature_to_flat
         and snapshot is not None
         and snapshot.temperature_prev in {"温", "热", "沸"}
         and snapshot.temperature_curr == "平"
@@ -1937,7 +2031,7 @@ def _holding_action(
             snapshot.champagne,
         )
     ) or (
-        market == "CN"
+        temperature_to_flat
         and (
             snapshot.temperature_prev not in KNOWN_TEMPERATURES
             or snapshot.temperature_curr not in KNOWN_TEMPERATURES
@@ -2120,6 +2214,12 @@ def build_report(
             else normalized_strategy_snapshot
         )
     snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
+    cny_per_local_currency = CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
+    snapshot_parameters = resolved_strategy_snapshot.get("parameters")
+    if snapshot_version == "v5" and isinstance(snapshot_parameters, Mapping):
+        frozen_rate = snapshot_parameters.get("cny_per_local_currency")
+        if frozen_rate is not None:
+            cny_per_local_currency = _decimal(frozen_rate)
     kelly_state = (
         TrendKellyState(
             phase="unavailable",
@@ -2132,14 +2232,14 @@ def build_report(
             last_closed_at="",
             selected_round_ids=(),
         )
-        if snapshot_version in {"v3", "v4", "v6", "v7"} and kelly_data_reason
+        if snapshot_version in {"v3", "v4", "v5", "v6", "v7"} and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
             market=market,
             strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
             opening_strategy_version=snapshot_version,
         )
-        if snapshot_version in {"v3", "v4", "v6", "v7"}
+        if snapshot_version in {"v3", "v4", "v5", "v6", "v7"}
         else None
     )
     held_symbols = {position.symbol for position in account.positions}
@@ -2148,6 +2248,8 @@ def build_report(
         held_symbols=held_symbols,
         expected_date=as_of_date,
         market=market,
+        strategy_version=snapshot_version,
+        cny_per_local_currency=cny_per_local_currency,
     )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
     old_positions = _state_positions(prior_state)
@@ -2187,6 +2289,7 @@ def build_report(
             triggered=triggered,
             market=market,
             overheat_trim_terminal=overheat_trim_terminal,
+            temperature_to_flat=(market == "CN" or snapshot_version == "v5"),
         )
         initial_line = _state_decimal(old_state, "initial_line")
         active_line = _state_decimal(old_state, "active_line")
@@ -2253,7 +2356,7 @@ def build_report(
                         snapshot.champagne,
                     )
                 ) or (
-                    market == "CN"
+                    (market == "CN" or snapshot_version == "v5")
                     and (
                         snapshot.temperature_prev not in KNOWN_TEMPERATURES
                         or snapshot.temperature_curr not in KNOWN_TEMPERATURES
@@ -2380,7 +2483,7 @@ def build_report(
             critical_data_reason=critical_data_reason,
             kelly_state=kelly_state,
         )
-        if snapshot_version in {"v4", "v6", "v7"} and (
+        if snapshot_version in {"v4", "v5", "v6", "v7"} and (
             not valid_drawdown_decision(
                 drawdown_summary,
                 expected_market=market,
@@ -2444,7 +2547,12 @@ def build_report(
     }
     excluded_signals = {
         symbol: [
-            _candidate_signal(item, market=market)
+            _candidate_signal(
+                item,
+                market=market,
+                strategy_version=snapshot_version,
+                cny_per_local_currency=cny_per_local_currency,
+            )
             for item in candidates
             if item.symbol == symbol
         ]
@@ -2456,10 +2564,20 @@ def build_report(
     }
     candidate_signals = [
         {
-            **_candidate_signal(item, market=market),
+            **_candidate_signal(
+                item,
+                market=market,
+                strategy_version=snapshot_version,
+                cny_per_local_currency=cny_per_local_currency,
+            ),
             "eligible": (item.tm_id, item.symbol) in ranks,
             "excluded_reasons": _candidate_reasons(
-                item, held_symbols, as_of_date, market=market
+                item,
+                held_symbols,
+                as_of_date,
+                market=market,
+                strategy_version=snapshot_version,
+                cny_per_local_currency=cny_per_local_currency,
             ),
             "rank": ranks.get((item.tm_id, item.symbol)),
             "pools": list(item.pools),
@@ -2575,7 +2693,13 @@ def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
     return signal
 
 
-def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]:
+def _candidate_signal(
+    item: CandidateInput,
+    *,
+    market: str,
+    strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
+) -> dict[str, object]:
     signal = {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
@@ -2601,6 +2725,24 @@ def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]
         "phase": item.phase,
         **_paid_expansion_signal(item),
     }
+    if market.upper() == "CN" or strategy_version == "v5":
+        rate = (
+            cny_per_local_currency
+            if cny_per_local_currency is not None
+            else CNY_PER_LOCAL_CURRENCY.get(market.upper(), Decimal("1"))
+        )
+        signal.update(
+            {
+                "market_value_currency": MARKET_CURRENCY[market.upper()],
+                "cny_per_local_currency": rate,
+                "market_cap_cny_100m": (
+                    item.market_cap * rate if item.market_cap is not None else None
+                ),
+                "amount_cny_100m": (
+                    item.amount * rate if item.amount is not None else None
+                ),
+            }
+        )
     if market.upper() in {"US", "HK"}:
         signal.update(boiling=item.boiling, champagne=item.champagne)
     return signal
@@ -3000,7 +3142,7 @@ def render_markdown(report: TrendReport) -> str:
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
     ]
     if report.strategy_snapshot.get("strategy_version") in {
-        "v3", "v4", "v6", "v7",
+        "v3", "v4", "v5", "v6", "v7",
     }:
         phase = {
             "cold_start": "冷启动",
@@ -3231,7 +3373,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     ):
         raise ValueError("strategy snapshot does not match report actions")
     version = snapshot.get("strategy_version")
-    if version not in {"v1", "v2", "v3", "v4", "v6", "v7"}:
+    if version not in {"v1", "v2", "v3", "v4", "v5", "v6", "v7"}:
         raise ValueError("strategy snapshot does not match report actions")
     expected_snapshot = _expected_report_strategy_snapshot(
         market,
@@ -3262,11 +3404,12 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         or parameters.get("full_exit_precedes_partial_exit") is not True
     ):
         raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v2", "v3", "v4", "v6", "v7"}:
+    if version in {"v2", "v3", "v4", "v5", "v6", "v7"}:
         valid_contract = {
             "v2": valid_v2_risk_contract,
             "v3": valid_v3_risk_contract,
             "v4": valid_v4_risk_contract,
+            "v5": valid_v4_risk_contract,
             "v6": valid_v4_risk_contract,
             "v7": valid_v4_risk_contract,
         }[version]
@@ -3321,7 +3464,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             report.risk_summary.get("new_planned_risk")
         ) != new_planned_risk:
             raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v4", "v6", "v7"}:
+    if version in {"v4", "v5", "v6", "v7"}:
         if (
             not valid_drawdown_decision(
                 report.drawdown_summary,
@@ -3356,7 +3499,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             else target
         )
         expected_weight = Decimal(str(nominal_weight))
-        if version in {"v3", "v4", "v6", "v7"} and report.risk_summary.get("kelly_phase") != "cold_start":
+        if version in {"v3", "v4", "v5", "v6", "v7"} and report.risk_summary.get("kelly_phase") != "cold_start":
             cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
             if cap is None:
                 raise ValueError("strategy snapshot does not match report actions")
@@ -4182,6 +4325,39 @@ def _holding_snapshot(
     )
 
 
+def load_industry_temperatures(
+    api: object,
+    *,
+    tm_ids: Sequence[int],
+    expected_date: str,
+) -> tuple[list[Mapping[str, object]], dict[int, str | None]]:
+    requested_ids = sorted(set(tm_ids))
+    rows = (
+        api.get_snapshots(
+            tm_ids=requested_ids,
+            fields=A_SHARE_INDUSTRY_FIELDS,
+            expected_date=expected_date,
+        )
+        if requested_ids
+        else []
+    )
+    returned = [_row_tm_id(row) for row in rows]
+    if len(returned) != len(set(returned)) or any(
+        tm_id not in tm_ids for tm_id in returned
+    ):
+        raise TrendAnimalsError("industry snapshot returned mismatched tmIds")
+    if any(row.get("asOfDate") != expected_date for row in rows):
+        raise TrendAnimalsError("industry snapshot returned a stale data date")
+    return rows, {
+        _row_tm_id(row): (
+            str(row["trendTemperatureCurr"])
+            if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
+            else None
+        )
+        for row in rows
+    }
+
+
 def _attempt_report(
     *,
     config: DailyPremarketConfig,
@@ -4281,31 +4457,11 @@ def _attempt_report(
                 and value > 0
             }
         )
-        industry_rows = (
-            api.get_snapshots(
-                tm_ids=industry_ids,
-                fields=A_SHARE_INDUSTRY_FIELDS,
-                expected_date=run_date,
-            )
-            if industry_ids
-            else []
+        industry_rows, industry_temperatures = load_industry_temperatures(
+            api,
+            tm_ids=industry_ids,
+            expected_date=run_date,
         )
-        returned_industry_ids = [_row_tm_id(row) for row in industry_rows]
-        if (
-            len(returned_industry_ids) != len(set(returned_industry_ids))
-            or any(tm_id not in industry_ids for tm_id in returned_industry_ids)
-        ):
-            raise TrendAnimalsError("industry snapshot returned mismatched tmIds")
-        if any(row.get("asOfDate") != run_date for row in industry_rows):
-            raise TrendAnimalsError("industry snapshot returned a stale data date")
-        industry_temperatures = {
-            _row_tm_id(row): (
-                str(row["trendTemperatureCurr"])
-                if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
-                else None
-            )
-            for row in industry_rows
-        }
         balance_after = _balance(api.get_account_balance())
 
         candidates: list[CandidateInput] = []

@@ -33,6 +33,7 @@ from open_trader.a_share_trend import (
     evaluate_candidate,
     load_eastmoney_account,
     load_futu_simulate_trend_account,
+    load_industry_temperatures,
     load_protection_state,
     load_watch_events,
     render_trend_failure_text,
@@ -590,6 +591,187 @@ def test_live_cn_v6_strategy_snapshot_remains_historical() -> None:
     assert snapshot["parameters"]["allowed_industry_temperatures"] == [
         "温", "热", "沸",
     ]
+
+
+@pytest.mark.parametrize(
+    ("market", "execution_date", "version"),
+    [
+        ("US", "2026-07-23", "v4"),
+        ("US", "2026-07-24", "v5"),
+        ("HK", "2026-07-26", "v4"),
+        ("HK", "2026-07-27", "v5"),
+    ],
+)
+def test_market_strategy_version_follows_execution_date(
+    market: str, execution_date: str, version: str
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market, "sha", (622460,), execution_date=execution_date
+    )
+    assert snapshot["strategy_version"] == version
+
+
+@pytest.mark.parametrize(
+    ("market", "rate", "currency"),
+    [
+        ("US", "7.268518518518518518518518519", "USD"),
+        ("HK", "0.9259259259259259259259259259", "HKD"),
+    ],
+)
+def test_v5_freezes_shared_entry_rules_and_cny_rate(
+    market: str, rate: str, currency: str
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market, "sha", (622460,), strategy_version="v5"
+    )
+    assert snapshot["parameters"] | {
+        "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+        "min_strength": "95",
+        "allowed_industry_temperatures": ["温", "热", "沸"],
+        "allowed_phases": ["谷雨", "立夏", "夏至"],
+        "min_market_cap_cny_100m": "100",
+        "min_amount_cny_100m": "2",
+        "market_value_currency": currency,
+        "cny_per_local_currency": rate,
+        "requires_right_side_days": True,
+    } == snapshot["parameters"]
+    assert "max_filter_price" not in snapshot["parameters"]
+    assert "max_right_side_days_exclusive" not in snapshot["parameters"]
+    assert snapshot["parameters"]["exit_reasons"] == [
+        "danger", "left_right_side", "temperature_to_flat", "protection"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "changes", "reason"),
+    [
+        ("620001", {"strength": Decimal("94.99")}, "strength_below_95"),
+        ("620002", {"industry_temperature": "凉"}, "industry_temperature_not_hot"),
+        ("620003", {"phase": "小暑"}, "phase_after_summer_solstice"),
+        ("620004", {"days": None}, "right_side_days_missing"),
+    ],
+)
+def test_us_v5_shared_non_currency_candidate_gates(
+    symbol: str, changes: dict[str, object], reason: str
+) -> None:
+    rate = Decimal("7.85") / Decimal("1.08")
+    item = replace(
+        candidate(
+            symbol,
+            exchange="US",
+            asset="美股",
+            market_cap=str(Decimal("100") / rate),
+            amount=str(Decimal("2") / rate),
+        ),
+        as_of_date="2026-07-23",
+        **changes,
+    )
+    decision = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        expected_date="2026-07-23",
+        market="US",
+        strategy_version="v5",
+        cny_per_local_currency=rate,
+    )
+    assert decision.excluded[symbol] == [reason]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "field", "value", "reason"),
+    [
+        ("620005", "market_cap", Decimal("100") / (Decimal("7.85") / Decimal("1.08")) - Decimal("0.01"), "market_cap_below_100_cny"),
+        ("620006", "amount", Decimal("2") / (Decimal("7.85") / Decimal("1.08")) - Decimal("0.01"), "amount_below_2_cny"),
+    ],
+)
+def test_us_v5_shared_currency_candidate_gates(
+    symbol: str, field: str, value: Decimal, reason: str
+) -> None:
+    rate = Decimal("7.85") / Decimal("1.08")
+    item = replace(
+        candidate(
+            symbol,
+            exchange="US",
+            asset="美股",
+            market_cap=str(Decimal("100") / rate),
+            amount=str(Decimal("2") / rate),
+        ),
+        as_of_date="2026-07-23",
+        **{field: value},
+    )
+    decision = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        expected_date="2026-07-23",
+        market="US",
+        strategy_version="v5",
+        cny_per_local_currency=rate,
+    )
+    assert decision.excluded[symbol] == [reason]
+
+
+def test_v5_candidate_signal_keeps_local_values_and_adds_cny_audit() -> None:
+    rate = Decimal("7.85") / Decimal("1.08")
+    item = replace(
+        candidate(
+            "620007",
+            exchange="US",
+            asset="美股",
+            market_cap="100",
+            amount="2",
+        )
+    )
+    signal = trend_module._candidate_signal(
+        item,
+        market="US",
+        strategy_version="v5",
+        cny_per_local_currency=rate,
+    )
+    assert signal["market_value_currency"] == "USD"
+    assert signal["market_cap"] == Decimal("100")
+    assert signal["amount"] == Decimal("2")
+    assert signal["market_cap_cny_100m"] == Decimal("100") * rate
+    assert signal["amount_cny_100m"] == Decimal("2") * rate
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize("previous", ["温", "热", "沸"])
+def test_v5_holding_temperature_transition_exits_but_v4_replay_holds(
+    market: str, previous: str
+) -> None:
+    snapshot = holding(
+        "600001", temperature_prev=previous, temperature_curr="平"
+    )
+    assert trend_module._holding_action(
+        symbol="600001",
+        snapshot=snapshot,
+        triggered=set(),
+        market=market,
+        temperature_to_flat=True,
+    ) == ("SELL_ALL", "temperature_changed_to_flat")
+    assert trend_module._holding_action(
+        symbol="600001",
+        snapshot=snapshot,
+        triggered=set(),
+        market=market,
+        temperature_to_flat=False,
+    ) == ("HOLD", "trend_intact")
+
+
+def test_load_industry_temperatures_deduplicates_and_validates_rows() -> None:
+    class Api:
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs["tm_ids"] == [700002, 700003]
+            return [
+                {"tmId": 700002, "asOfDate": "2026-07-23", "trendTemperatureCurr": "温"},
+                {"tmId": 700003, "asOfDate": "2026-07-23", "trendTemperatureCurr": "未知"},
+            ]
+
+    rows, temperatures = load_industry_temperatures(
+        Api(), tm_ids=(700003, 700002, 700002), expected_date="2026-07-23"
+    )
+    assert len(rows) == 2
+    assert temperatures == {700002: "温", 700003: None}
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
@@ -3998,6 +4180,10 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "close",
         "atr",
         "market_cap",
+        "market_value_currency",
+        "cny_per_local_currency",
+        "market_cap_cny_100m",
+        "amount_cny_100m",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",
@@ -4067,6 +4253,10 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "close",
         "atr",
         "market_cap",
+        "market_value_currency",
+        "cny_per_local_currency",
+        "market_cap_cny_100m",
+        "amount_cny_100m",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",
