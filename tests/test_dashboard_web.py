@@ -1811,7 +1811,7 @@ const cn = [
     execution:{status:"partially_filled",filled_qty:"13.129",target_qty:"23.428",
       avg_fill_price:"207.185",order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
   }], "sell"),
-  renderCnBuyStage({buy_window:"09:30–10:00",buy_actions:[{
+  renderTrendBuyStage({buy_window:"09:30–10:00",buy_actions:[{
     symbol:"600001",name:"测试",filter_price:"1234567.505",close:"24.545714285714",
     temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99.876",
     industry:"科技",industry_temperature:"热",market_cap:"12345.678",amount:"2.345",
@@ -1827,7 +1827,7 @@ const us = [
     symbol:"00001234",name:"编号测试",close:"30.594999999999995",strength:"90.444",
     reason:"trend_intact",active_line:"28.305071428571",
   }], "hold"),
-  renderMarketBuyStage({buy_window:"常规时段",buy_actions:[{
+  renderTrendBuyStage({buy_window:"常规时段",buy_actions:[{
     symbol:"EA",name:"艺电",close:"207.185",strength:"99.876",industry:"通讯服务",
     target_weight:"0.04123456",target_amount:"4941.499",estimated_shares:"9007199254740993",
     estimated_initial_line:"205.46930",execution:{status:"partially_filled",
@@ -1968,7 +1968,7 @@ state.dashboard = {kelly_lab:{available:true,experiment_count:"10000",experiment
 }]}};
 const kelly = renderKellyLabPanel();
 const trend = [
-  renderMarketBuyStage({buy_window:"09:30–10:00",buy_actions:[{symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}]}),
+  renderTrendBuyStage({buy_window:"09:30–10:00",buy_actions:[{symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}]}),
   renderMarketSellOrHoldStage("盘中持续 · 已有持仓", [{symbol:"02840",name:"SPDR 金",reason:"trend_intact",active_line:"1234567.50"}], "hold"),
   renderTrendAudit({
     candidates:[{symbol:"02840",name:"SPDR 金",strength:"10000"}],
@@ -1992,7 +1992,7 @@ console.log(JSON.stringify({kelly,trend,grouped,omitted}));
         assert expected in rendered["kelly"]
     assert ">02840 SPDR 金<" in rendered["trend"]
     for expected in (
-        "10,000 股", "金额上限", "29,320,000", "预计保护线", "1,234,567.5",
+            "10,000 股", "目标金额", "29,320,000", "预计保护线", "1,234,567.5",
         "活动保护线", "强度 10,000", "科技｜10,000｜2,932",
         "API 成本：1,234.5",
     ):
