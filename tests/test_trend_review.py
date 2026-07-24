@@ -3576,6 +3576,144 @@ def test_us_open_does_not_carry_market_order_after_close(tmp_path: Path) -> None
     } == json.loads(events[0].read_text(encoding="utf-8"))
 
 
+def test_action_audit_accepts_buy_after_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    report = cn_buy_report()
+    report_path = tmp_path / "reports/2026-07-16.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = trend_review._report_hash(report)
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
+    trend_review.record_trend_review_missed_buys(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:01:00+08:00",
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-17", "SH.600001", "buy"
+    )
+    request = {
+        "market": "CN",
+        "futu_code": "SH.600001",
+        "side": "buy",
+        "order_type": "MARKET",
+        "price": "0",
+        "qty": "300",
+        "remark": trend_review.trend_attempt_remark(
+            "CN", "2026-07-17", action_key, 1
+        ),
+    }
+    intent = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-17"
+        / f"{action_key}-intent.json"
+    )
+    trend_review._write_immutable(
+        intent,
+        trend_review._canonical_json_bytes(
+            {
+                "market": "CN",
+                "date": "2026-07-17",
+                "report_sha256": report_sha,
+                "action_index": 0,
+                "request": request,
+                "created_at": "2026-07-17T10:03:00+08:00",
+            }
+        ),
+    )
+    trend_review._write_immutable(
+        trend_review._result_path(intent),
+        trend_review._canonical_json_bytes(
+            {
+                "market": "CN",
+                "date": "2026-07-17",
+                "report_sha256": report_sha,
+                "action_index": 0,
+                "request": request,
+                "response": {
+                    "futu_order_id": "SIM-LATE-1",
+                    "status": "submitted",
+                },
+                "submitted_at": "2026-07-17T10:03:00+08:00",
+            }
+        ),
+    )
+    trend_review._write_action_event(
+        data_dir=tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        action_key=action_key,
+        payload={
+            "market": "CN",
+            "date": "2026-07-17",
+            "strategy_version": report["strategy_snapshot"]["strategy_version"],
+            "report_sha256": report_sha,
+            "action_index": 0,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": "submitted",
+            "attempt": 1,
+            "target_qty": "300",
+            "order_ids": ["SIM-LATE-1"],
+        },
+        recorded_at="2026-07-17T10:03:00+08:00",
+    )
+    authorization = (
+        tmp_path
+        / "trend_controller/CN/late_buy_authorizations/2026-07-17.json"
+    )
+    trend_review._write_immutable(
+        authorization,
+        trend_review._canonical_json_bytes(
+            {
+                "schema_version":
+                    "open_trader.trend_controller.late_buy_authorization.v1",
+                "market": "CN",
+                "as_of_date": "2026-07-16",
+                "execution_date": "2026-07-17",
+                "report_path": str(report_path),
+                "report_sha256": report_sha,
+                "actor": "ray",
+                "reason": "explicit same-day simulated late buy",
+                "authorized_at": "2026-07-17T10:02:00+08:00",
+            }
+        ),
+    )
+
+    events, _ = trend_review.load_trend_action_audit(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        symbol="600001",
+        side="buy",
+    )
+
+    assert [event["status"] for event in events] == ["missed", "submitted"]
+    payload = json.loads(authorization.read_text(encoding="utf-8"))
+    payload["report_sha256"] = "0" * 64
+    authorization.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid late buy authorization"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="buy",
+        )
+
+
 def test_report_revision_does_not_duplicate_existing_symbol_intent(
     tmp_path: Path,
 ) -> None:
