@@ -50,6 +50,7 @@ from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, 
 from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 from open_trader.trend_kelly import TrendKellyRound
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
+from open_trader.trend_industry_context import IndustryContext
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -709,6 +710,170 @@ def test_candidates_filter_then_sort_deterministically() -> None:
     assert decisions.excluded["600003"] == ["already_held"]
     assert decisions.excluded["600005"] == ["strength_below_95"]
     assert decisions.excluded["600006"] == ["danger_signal"]
+
+
+def _industry_context(
+    industry_tm_id: int,
+    *,
+    temperature: str = "热",
+    strength: str = "90",
+    warm_to_hot_count: int = 5,
+    right_share: str = "0.50",
+    prior_temperature: str | None = "温",
+    prior_right_share: str | None = "0.40",
+    direction: str | None = "rising",
+    change_pp: str | None = "10",
+    valid: bool = True,
+    invalid_reasons: tuple[str, ...] = (),
+) -> IndustryContext:
+    return IndustryContext(
+        industry_tm_id=industry_tm_id,
+        industry=f"行业{industry_tm_id}",
+        as_of_date="2026-07-14",
+        component_count=20,
+        snapshot_count=20,
+        tradable_count=20,
+        valid_count=20,
+        right_count=10,
+        snapshot_coverage=Decimal("1"),
+        right_state_coverage=Decimal("1"),
+        right_share=Decimal(right_share),
+        warm_to_hot_count=warm_to_hot_count,
+        temperature=temperature,
+        strength=Decimal(strength),
+        valid=valid,
+        invalid_reasons=invalid_reasons,
+        prior_as_of_date="2026-07-13" if prior_temperature is not None else None,
+        prior_temperature=prior_temperature,
+        prior_right_share=(
+            None if prior_right_share is None else Decimal(prior_right_share)
+        ),
+        temperature_direction=direction,
+        right_share_change_pp=(
+            None if change_pp is None else Decimal(change_pp)
+        ),
+    )
+
+
+def test_candidate_industry_context_ordering_uses_report_wide_context_keys() -> None:
+    rows = [
+        candidate("600001", strength="99", days=1, amount="9", industry_tm_id=1),
+        candidate("600002", strength="98", days=1, amount="9", industry_tm_id=2),
+        candidate("600003", strength="97", days=1, amount="9", industry_tm_id=3),
+    ]
+    contexts = {
+        1: _industry_context(1, temperature="热", strength="90", direction="falling"),
+        2: _industry_context(2, temperature="沸", strength="95", direction="unchanged"),
+        3: _industry_context(3, temperature="热", strength="95", direction="rising"),
+    }
+
+    decisions = build_candidate_list(
+        rows, held_symbols=set(), industry_contexts=contexts
+    )
+
+    assert [item.symbol for item in decisions.eligible] == [
+        "600003",
+        "600002",
+        "600001",
+    ]
+
+
+def test_candidate_context_missing_prior_uses_current_only_for_every_candidate() -> None:
+    rows = [candidate("600001", industry_tm_id=1), candidate("600002", industry_tm_id=2)]
+    contexts = {
+        1: _industry_context(1, direction="rising", change_pp="10"),
+        2: _industry_context(
+            2,
+            prior_temperature=None,
+            prior_right_share=None,
+            direction=None,
+            change_pp=None,
+        ),
+    }
+
+    decisions = build_candidate_list(
+        rows, held_symbols=set(), industry_contexts=contexts
+    )
+
+    assert decisions.ordering_mode == "context_current_only"
+
+
+def test_invalid_current_industry_context_restores_legacy_order() -> None:
+    rows = [
+        candidate("600001", strength="99", days=5, amount="2", industry_tm_id=1),
+        candidate("600002", strength="98", days=1, amount="2", industry_tm_id=2),
+    ]
+    contexts = {
+        1: _industry_context(1, valid=False, invalid_reasons=("bad",)),
+        2: _industry_context(2),
+    }
+
+    decisions = build_candidate_list(
+        rows, held_symbols=set(), industry_contexts=contexts
+    )
+
+    assert decisions.ordering_mode == "legacy_invalid_current"
+    assert [item.symbol for item in decisions.eligible] == ["600001", "600002"]
+
+
+def test_missing_industry_id_triggers_report_wide_legacy_fallback() -> None:
+    item = replace(
+        candidate("600001", industry_tm_id=None),
+        asset="US stock",
+        exchange="US",
+        temperature_prev=None,
+        temperature_curr=None,
+        phase=None,
+        market_cap=None,
+    )
+    decision = build_candidate_list([item], held_symbols=set(), market="US")
+
+    assert decision.eligible == (item,)
+    assert decision.ordering_mode == "legacy_invalid_current"
+    assert decision.industry_context_status["affected_industry_ids"] == ["unknown"]
+
+
+def test_candidate_industry_context_hard_gate_still_excludes_candidate() -> None:
+    item = candidate("600001", danger=True, industry_tm_id=1)
+    decisions = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        industry_contexts={1: _industry_context(1, strength="100")},
+    )
+
+    assert decisions.eligible == ()
+    assert decisions.excluded["600001"] == ["danger_signal"]
+
+
+def test_report_payload_freezes_industry_context_and_ordering_facts() -> None:
+    contexts = (_industry_context(621707, right_share="0.278688524590"),)
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(candidate("600001", industry_tm_id=621707),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        industry_contexts=contexts,
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=Decimal("0.610"),
+        estimated_api_cost_complete=False,
+    )
+
+    payload = trend_module._report_payload(built)
+    assert payload["industry_context_status"]["ordering_mode"] == "context_with_history"
+    assert payload["industry_contexts"][0]["industry_tm_id"] == 621707
+    assert payload["industry_contexts"][0]["right_share"] == "0.278688524590"
+    assert payload["api_cost"] == {
+        "actual": "0.610",
+        "estimated": "0.479",
+        "estimate_complete": False,
+        "unit": "Trend Animals 余额单位",
+    }
+    ordering = payload["strategy_judgments"]["top10_candidates"][0]["ordering_context"]
+    assert ordering["applied"] is True
+    assert ordering["industry_tm_id"] == 621707
+    assert ordering["ordering_mode"] == "context_with_history"
 
 
 @pytest.mark.parametrize("name", ["ST示例", "*ST示例", "示例ST", "退市示例"])

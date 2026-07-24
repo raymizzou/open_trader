@@ -485,6 +485,11 @@ def freeze_report_evidence(
         "market_data": bars_by_symbol,
         "account": getattr(report, "account"),
         "strategy_snapshot": strategy_snapshot,
+        "industry_contexts": getattr(report, "industry_contexts", ()),
+        "industry_context_status": getattr(report, "industry_context_status", {}),
+        "estimated_api_cost_complete": getattr(
+            report, "estimated_api_cost_complete", True
+        ),
         "process_version": str(strategy_snapshot.get("process_version") or ""),
         "rebuild_inputs": {
             "as_of_date": getattr(report, "as_of_date"),
@@ -499,6 +504,13 @@ def freeze_report_evidence(
             "data_sources": getattr(report, "data_sources"),
             "estimated_api_cost": getattr(report, "estimated_api_cost"),
             "actual_api_cost": getattr(report, "actual_api_cost"),
+            "industry_contexts": getattr(report, "industry_contexts", ()),
+            "industry_context_status": getattr(
+                report, "industry_context_status", {}
+            ),
+            "estimated_api_cost_complete": getattr(
+                report, "estimated_api_cost_complete", True
+            ),
             "market": str(metadata.get("market") or "CN"),
             "lot_sizes": dict(lot_sizes),
             "position_weight": metadata.get("position_weight"),
@@ -5133,9 +5145,83 @@ def rebuild_trend_report_from_evidence(
         TREND_API_STATS_SCHEMA_VERSION,
         trend_kelly_rounds_from_payload,
     )
+    from .trend_industry_context import IndustryContext
 
     def decimal_or_none(value: object) -> Decimal | None:
         return None if value is None or value == "" else Decimal(str(value))
+
+    def industry_context_from_raw(raw: object) -> IndustryContext:
+        if not isinstance(raw, Mapping):
+            raise TrendReplayIncompleteError(
+                "invalid original input: industry_contexts"
+            )
+        try:
+            raw_integer_fields = {
+                field: raw[field]
+                for field in (
+                    "industry_tm_id",
+                    "component_count",
+                    "snapshot_count",
+                    "tradable_count",
+                    "valid_count",
+                    "right_count",
+                    "warm_to_hot_count",
+                )
+            }
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in raw_integer_fields.values()
+            ):
+                raise ValueError
+            integer_fields = {
+                field: int(value) for field, value in raw_integer_fields.items()
+            }
+            context = IndustryContext(
+                **integer_fields,
+                industry=str(raw["industry"]),
+                as_of_date=str(raw["as_of_date"]),
+                snapshot_coverage=Decimal(str(raw["snapshot_coverage"])),
+                right_state_coverage=Decimal(str(raw["right_state_coverage"])),
+                right_share=decimal_or_none(raw.get("right_share")),
+                temperature=(
+                    None
+                    if raw.get("temperature") is None
+                    else str(raw["temperature"])
+                ),
+                strength=decimal_or_none(raw.get("strength")),
+                valid=raw["valid"] is True,
+                invalid_reasons=tuple(str(item) for item in raw["invalid_reasons"]),
+                prior_as_of_date=(
+                    None
+                    if raw.get("prior_as_of_date") is None
+                    else str(raw["prior_as_of_date"])
+                ),
+                prior_temperature=(
+                    None
+                    if raw.get("prior_temperature") is None
+                    else str(raw["prior_temperature"])
+                ),
+                prior_right_share=decimal_or_none(raw.get("prior_right_share")),
+                temperature_direction=(
+                    None
+                    if raw.get("temperature_direction") is None
+                    else str(raw["temperature_direction"])
+                ),
+                right_share_change_pp=decimal_or_none(
+                    raw.get("right_share_change_pp")
+                ),
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            raise TrendReplayIncompleteError(
+                "invalid original input: industry_contexts"
+            ) from None
+        if not isinstance(raw.get("valid"), bool) or not isinstance(
+            raw.get("invalid_reasons"), list
+        ):
+            raise TrendReplayIncompleteError(
+                "invalid original input: industry_contexts"
+            )
+        return context
 
     account_raw = inputs["account"]
     if not isinstance(account_raw, Mapping):
@@ -5272,6 +5358,20 @@ def rebuild_trend_report_from_evidence(
         raise TrendReplayIncompleteError(
             "invalid original input: kelly_data_reason"
         )
+    contexts_raw = inputs.get("industry_contexts", [])
+    if not isinstance(contexts_raw, list):
+        raise TrendReplayIncompleteError("invalid original input: industry_contexts")
+    industry_contexts = tuple(industry_context_from_raw(item) for item in contexts_raw)
+    status_raw = inputs.get("industry_context_status")
+    if status_raw is not None and not isinstance(status_raw, Mapping):
+        raise TrendReplayIncompleteError(
+            "invalid original input: industry_context_status"
+        )
+    estimated_api_cost_complete = inputs.get("estimated_api_cost_complete", True)
+    if not isinstance(estimated_api_cost_complete, bool):
+        raise TrendReplayIncompleteError(
+            "invalid original input: estimated_api_cost_complete"
+        )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -5316,6 +5416,11 @@ def rebuild_trend_report_from_evidence(
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
         ),
+        industry_contexts=industry_contexts,
+        industry_context_status=(
+            dict(status_raw) if isinstance(status_raw, Mapping) else None
+        ),
+        estimated_api_cost_complete=estimated_api_cost_complete,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:

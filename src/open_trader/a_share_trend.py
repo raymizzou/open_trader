@@ -6,7 +6,7 @@ import json
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -41,6 +41,10 @@ from .trend_kelly import (
     TrendKellyState,
     calculate_trend_kelly,
     load_trend_kelly_rounds,
+)
+from .trend_industry_context import (
+    IndustryContext,
+    KNOWN_TEMPERATURES as INDUSTRY_KNOWN_TEMPERATURES,
 )
 from .trend_animals import (
     TrendAnimalsClient,
@@ -121,6 +125,16 @@ ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
 HOT_TEMPERATURES = {"热", "沸"}
 CN_ALLOWED_INDUSTRY_TEMPERATURES = {"温", "热", "沸"}
 KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
+KNOWN_TEMPERATURE_ORDER = {
+    value: index for index, value in enumerate(INDUSTRY_KNOWN_TEMPERATURES)
+}
+TEMPERATURE_DIRECTION_ORDER = {"rising": 0, "unchanged": 1, "falling": 2}
+INDUSTRY_ORDERING_MODES = {
+    "context_with_history",
+    "context_current_only",
+    "legacy_invalid_current",
+    "legacy_no_eligible_candidates",
+}
 
 V2_RISK_NUMERIC_FIELDS = (
     "existing_planned_risk",
@@ -789,6 +803,8 @@ class CandidateInput:
 class CandidateDecision:
     eligible: tuple[CandidateInput, ...]
     excluded: dict[str, list[str]]
+    ordering_mode: str = "legacy_no_eligible_candidates"
+    industry_context_status: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -896,6 +912,9 @@ class TrendReport:
     signal_snapshots: dict[str, object]
     metadata: dict[str, object]
     strategy_snapshot: dict[str, object]
+    industry_contexts: tuple[IndustryContext, ...]
+    industry_context_status: dict[str, object]
+    estimated_api_cost_complete: bool
     drawdown_summary: dict[str, object] | None = None
     replay_evidence: dict[str, str] | None = None
 
@@ -1393,12 +1412,203 @@ def _candidate_sort_key(item: CandidateInput) -> tuple[Decimal, int, Decimal, st
     )
 
 
+def _candidate_context_sort_key(
+    item: CandidateInput,
+    context: IndustryContext,
+    *,
+    include_history: bool,
+) -> tuple[object, ...]:
+    temperature = context.temperature
+    strength = context.strength
+    right_share = context.right_share
+    assert temperature in KNOWN_TEMPERATURE_ORDER
+    assert strength is not None
+    assert right_share is not None
+    history = (
+        (
+            TEMPERATURE_DIRECTION_ORDER[context.temperature_direction],
+            -context.right_share_change_pp,
+        )
+        if include_history
+        else ()
+    )
+    return (
+        *(history[:1]),
+        -KNOWN_TEMPERATURE_ORDER[temperature],
+        -strength,
+        -context.warm_to_hot_count,
+        *(history[1:]),
+        -right_share,
+        *_candidate_sort_key(item),
+    )
+
+
+def _context_current_reasons(context: object) -> list[str]:
+    if not isinstance(context, IndustryContext):
+        return ["industry_context_missing"]
+    reasons = list(context.invalid_reasons)
+    if not context.valid and not reasons:
+        reasons.append("industry_context_invalid")
+    if not isinstance(context.temperature, str) or context.temperature not in KNOWN_TEMPERATURE_ORDER:
+        reasons.append("industry_temperature_invalid")
+    if (
+        not isinstance(context.strength, Decimal)
+        or not context.strength.is_finite()
+        or not Decimal("0") <= context.strength <= Decimal("100")
+    ):
+        reasons.append("industry_strength_invalid")
+    if (
+        not isinstance(context.right_share, Decimal)
+        or not context.right_share.is_finite()
+        or not Decimal("0") <= context.right_share <= Decimal("1")
+    ):
+        reasons.append("industry_right_share_invalid")
+    if (
+        isinstance(context.warm_to_hot_count, bool)
+        or not isinstance(context.warm_to_hot_count, int)
+        or context.warm_to_hot_count < 0
+    ):
+        reasons.append("warm_to_hot_count_invalid")
+    return list(dict.fromkeys(reasons))
+
+
+def _context_has_history(context: IndustryContext) -> bool:
+    return (
+        context.prior_as_of_date is not None
+        and isinstance(context.prior_temperature, str)
+        and context.prior_temperature in KNOWN_TEMPERATURE_ORDER
+        and isinstance(context.prior_right_share, Decimal)
+        and context.prior_right_share.is_finite()
+        and isinstance(context.temperature_direction, str)
+        and context.temperature_direction in TEMPERATURE_DIRECTION_ORDER
+        and isinstance(context.right_share_change_pp, Decimal)
+        and context.right_share_change_pp.is_finite()
+    )
+
+
+def _industry_context_state(
+    eligible: Sequence[CandidateInput],
+    industry_contexts: Mapping[int, IndustryContext] | None,
+    *,
+    expected_date: str | None = None,
+) -> tuple[str, dict[str, object], dict[int, IndustryContext]]:
+    if not eligible:
+        return (
+            "legacy_no_eligible_candidates",
+            {
+                "ordering_mode": "legacy_no_eligible_candidates",
+                "current_complete": False,
+                "history_complete": False,
+                "fallback_reason": None,
+            },
+            dict(industry_contexts or {}),
+        )
+
+    contexts = dict(industry_contexts or {})
+    affected: set[int | str] = set()
+    reasons_by_id: dict[str, list[str]] = {}
+    fallback_reason: str | None = None
+
+    def add_failure(industry_id: int | str, reasons: Sequence[str]) -> None:
+        normalized = list(dict.fromkeys(reasons)) or ["industry_context_invalid"]
+        affected.add(industry_id)
+        reasons_by_id[str(industry_id)] = normalized
+
+    for item in eligible:
+        industry_id = item.industry_tm_id
+        if industry_id is None:
+            add_failure("unknown", ("industry_id_missing",))
+            fallback_reason = fallback_reason or "industry_id_missing"
+            continue
+        context = contexts.get(industry_id)
+        reasons = _context_current_reasons(context)
+        if isinstance(context, IndustryContext):
+            if context.industry_tm_id != industry_id:
+                reasons.append("industry_context_id_mismatch")
+            if expected_date is not None and context.as_of_date != expected_date:
+                reasons.append("industry_context_date_mismatch")
+        if reasons:
+            add_failure(industry_id, reasons)
+            if reasons == ["industry_context_missing"]:
+                fallback_reason = fallback_reason or "industry_context_missing"
+            else:
+                fallback_reason = fallback_reason or "industry_context_invalid"
+
+    # The context map is report-wide. An invalid context outside the current
+    # candidate set still makes the report's breadth facts incomplete.
+    for industry_id, context in contexts.items():
+        if not isinstance(industry_id, int) or isinstance(industry_id, bool):
+            continue
+        reasons = _context_current_reasons(context)
+        if isinstance(context, IndustryContext):
+            if context.industry_tm_id != industry_id:
+                reasons.append("industry_context_id_mismatch")
+            if expected_date is not None and context.as_of_date != expected_date:
+                reasons.append("industry_context_date_mismatch")
+        if reasons:
+            add_failure(industry_id, reasons)
+            fallback_reason = fallback_reason or "industry_context_invalid"
+
+    if affected:
+        affected_ids = sorted(
+            affected,
+            key=lambda value: (value == "unknown", str(value)),
+        )
+        return (
+            "legacy_invalid_current",
+            {
+                "ordering_mode": "legacy_invalid_current",
+                "current_complete": False,
+                "history_complete": False,
+                "fallback_reason": fallback_reason or "industry_context_invalid",
+                "affected_industry_ids": affected_ids,
+                "validation_reasons": reasons_by_id,
+            },
+            contexts,
+        )
+
+    history_complete = all(_context_has_history(context) for context in contexts.values())
+    mode = "context_with_history" if history_complete else "context_current_only"
+    return (
+        mode,
+        {
+            "ordering_mode": mode,
+            "current_complete": True,
+            "history_complete": history_complete,
+            "fallback_reason": None,
+        },
+        contexts,
+    )
+
+
+def _sort_candidates_for_mode(
+    eligible: Sequence[CandidateInput],
+    *,
+    mode: str,
+    contexts: Mapping[int, IndustryContext],
+) -> list[CandidateInput]:
+    ranked = list(eligible)
+    if mode in {"context_with_history", "context_current_only"}:
+        include_history = mode == "context_with_history"
+        ranked.sort(
+            key=lambda item: _candidate_context_sort_key(
+                item,
+                contexts[item.industry_tm_id],
+                include_history=include_history,
+            )
+        )
+    else:
+        ranked.sort(key=_candidate_sort_key)
+    return ranked
+
+
 def build_candidate_list(
     rows: Sequence[CandidateInput],
     *,
     held_symbols: set[str],
     expected_date: str | None = None,
     market: str = "CN",
+    industry_contexts: Mapping[int, IndustryContext] | None = None,
 ) -> CandidateDecision:
     eligible: list[CandidateInput] = []
     excluded: dict[str, list[str]] = {}
@@ -1420,8 +1630,18 @@ def build_candidate_list(
             excluded[symbol] = reasons
         else:
             eligible.append(min(items, key=_candidate_sort_key))
-    eligible.sort(key=_candidate_sort_key)
-    return CandidateDecision(tuple(eligible), excluded)
+    ordering_mode, context_status, contexts = _industry_context_state(
+        eligible, industry_contexts, expected_date=expected_date
+    )
+    eligible = _sort_candidates_for_mode(
+        eligible, mode=ordering_mode, contexts=contexts
+    )
+    return CandidateDecision(
+        tuple(eligible),
+        excluded,
+        ordering_mode=ordering_mode,
+        industry_context_status=context_status,
+    )
 
 
 def estimate_buy_actions(
@@ -2079,6 +2299,9 @@ def build_report(
     kelly_rounds: Sequence[TrendKellyRound] = (),
     kelly_data_reason: str = "",
     drawdown_summary: Mapping[str, object] | None = None,
+    industry_contexts: Sequence[IndustryContext] = (),
+    industry_context_status: Mapping[str, object] | None = None,
+    estimated_api_cost_complete: bool = True,
 ) -> TrendReport:
     resolved_process_version = process_version or str(
         (metadata or {}).get("process_version")
@@ -2143,12 +2366,71 @@ def build_report(
         else None
     )
     held_symbols = {position.symbol for position in account.positions}
+    frozen_industry_contexts = tuple(industry_contexts)
+    industry_context_map = {
+        context.industry_tm_id: context for context in frozen_industry_contexts
+    }
     candidate_decision = build_candidate_list(
         candidates,
         held_symbols=held_symbols,
         expected_date=as_of_date,
         market=market,
+        industry_contexts=industry_context_map,
     )
+    resolved_industry_context_status = dict(
+        candidate_decision.industry_context_status
+        if not candidate_decision.eligible
+        else industry_context_status or candidate_decision.industry_context_status
+    )
+    if str(resolved_industry_context_status.get("ordering_mode") or "") not in INDUSTRY_ORDERING_MODES:
+        resolved_industry_context_status["ordering_mode"] = candidate_decision.ordering_mode
+    resolved_industry_context_status.setdefault(
+        "ordering_mode", candidate_decision.ordering_mode
+    )
+    resolved_industry_context_status.setdefault(
+        "current_complete",
+        candidate_decision.industry_context_status.get("current_complete", False),
+    )
+    resolved_industry_context_status.setdefault(
+        "history_complete",
+        candidate_decision.industry_context_status.get("history_complete", False),
+    )
+    resolved_industry_context_status.setdefault("fallback_reason", None)
+    requested_ordering_mode = str(
+        resolved_industry_context_status.get("ordering_mode") or ""
+    )
+    if requested_ordering_mode in INDUSTRY_ORDERING_MODES:
+        can_apply_requested_context = requested_ordering_mode in {
+            "context_with_history",
+            "context_current_only",
+        } and all(
+            not _context_current_reasons(industry_context_map.get(item.industry_tm_id))
+            for item in candidate_decision.eligible
+        ) and all(
+            not _context_current_reasons(context)
+            for context in industry_context_map.values()
+        )
+        if requested_ordering_mode == "context_with_history":
+            can_apply_requested_context = can_apply_requested_context and all(
+                _context_has_history(context)
+                for context in industry_context_map.values()
+            )
+        if requested_ordering_mode not in {
+            "context_with_history",
+            "context_current_only",
+        } or can_apply_requested_context:
+            candidate_decision = replace(
+                candidate_decision,
+                eligible=tuple(
+                    _sort_candidates_for_mode(
+                        candidate_decision.eligible,
+                        mode=requested_ordering_mode,
+                        contexts=industry_context_map,
+                    )
+                ),
+                ordering_mode=requested_ordering_mode,
+                industry_context_status=resolved_industry_context_status,
+            )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
@@ -2497,6 +2779,9 @@ def build_report(
             "position_weight_source": position_weight_source,
         },
         strategy_snapshot=resolved_strategy_snapshot,
+        industry_contexts=frozen_industry_contexts,
+        industry_context_status=resolved_industry_context_status,
+        estimated_api_cost_complete=estimated_api_cost_complete,
         drawdown_summary=(
             dict(drawdown_summary) if drawdown_summary is not None else None
         ),
@@ -3219,6 +3504,40 @@ def _json_value(value: object) -> object:
     return value
 
 
+def _candidate_ordering_context(
+    item: CandidateInput,
+    *,
+    contexts: Mapping[int, IndustryContext],
+    status: Mapping[str, object],
+) -> dict[str, object]:
+    mode = str(status.get("ordering_mode") or "legacy_invalid_current")
+    context = contexts.get(item.industry_tm_id) if item.industry_tm_id is not None else None
+    if mode not in {"context_with_history", "context_current_only"} or context is None:
+        return {
+            "applied": False,
+            "industry_tm_id": item.industry_tm_id,
+            "ordering_mode": mode,
+            "fallback_reason": status.get("fallback_reason"),
+        }
+    values: dict[str, object] = {
+        "applied": True,
+        "industry_tm_id": context.industry_tm_id,
+        "ordering_mode": mode,
+        "temperature": context.temperature,
+        "industry_strength": context.strength,
+        "warm_to_hot_count": context.warm_to_hot_count,
+        "right_share": context.right_share,
+    }
+    if mode == "context_with_history":
+        values.update(
+            {
+                "temperature_direction": context.temperature_direction,
+                "right_share_change_pp": context.right_share_change_pp,
+            }
+        )
+    return values
+
+
 def validate_report_strategy_snapshot(report: TrendReport) -> None:
     snapshot = report.strategy_snapshot
     parameters = snapshot.get("parameters")
@@ -3383,11 +3702,19 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     )
     holding_decisions = [_json_value(asdict(item)) for item in report.holdings]
     top10_candidates = []
+    industry_context_map = {
+        context.industry_tm_id: context for context in report.industry_contexts
+    }
     for item in report.candidates:
         candidate = asdict(item)
         if market == "CN":
             candidate.pop("boiling")
             candidate.pop("champagne")
+        candidate["ordering_context"] = _candidate_ordering_context(
+            item,
+            contexts=industry_context_map,
+            status=report.industry_context_status,
+        )
         top10_candidates.append(_json_value(candidate))
     formal_actions = [
         _json_value(asdict(item))
@@ -3428,6 +3755,16 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "data_sources": list(report.data_sources),
         "estimated_api_cost": _json_value(report.estimated_api_cost),
         "actual_api_cost": _json_value(report.actual_api_cost),
+        "api_cost": {
+            "actual": _json_value(report.actual_api_cost),
+            "estimated": _json_value(report.estimated_api_cost),
+            "estimate_complete": report.estimated_api_cost_complete,
+            "unit": "Trend Animals 余额单位",
+        },
+        "industry_contexts": [
+            _json_value(asdict(context)) for context in report.industry_contexts
+        ],
+        "industry_context_status": _json_value(report.industry_context_status),
         "protection_state": report.protection_state,
         "signal_snapshots": _json_value(report.signal_snapshots),
         "metadata": _json_value(report.metadata),

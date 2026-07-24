@@ -28,6 +28,7 @@ from open_trader.strategy_drawdown import (
     observe_strategy_equity,
 )
 from open_trader.models import Market, TradeFill
+from open_trader.trend_industry_context import IndustryContext
 
 
 def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> None:
@@ -510,6 +511,111 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
     assert corrected["process_version"] == "fixedsha"
     assert corrected["strategy_judgments"]["formal_actions"] == source_actions
     assert corrected["option_attention"] == source["option_attention"]
+
+
+def test_rebuild_preserves_frozen_industry_context_ordering_facts(tmp_path: Path) -> None:
+    context = IndustryContext(
+        industry_tm_id=621707,
+        industry="行业621707",
+        as_of_date="2026-07-16",
+        component_count=20,
+        snapshot_count=20,
+        tradable_count=20,
+        valid_count=20,
+        right_count=10,
+        snapshot_coverage=Decimal("1"),
+        right_state_coverage=Decimal("1"),
+        right_share=Decimal("0.5"),
+        warm_to_hot_count=5,
+        temperature="热",
+        strength=Decimal("90"),
+        valid=True,
+        invalid_reasons=(),
+        prior_as_of_date="2026-07-15",
+        prior_temperature="温",
+        prior_right_share=Decimal("0.4"),
+        temperature_direction="rising",
+        right_share_change_pp=Decimal("10"),
+    )
+    candidate = CandidateInput(
+        tm_id=1,
+        symbol="600001",
+        exchange="SH",
+        name="示例",
+        asset="A股",
+        industry="行业621707",
+        as_of_date="2026-07-16",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("10"),
+        atr=Decimal("0.5"),
+        industry_tm_id=621707,
+        industry_temperature="热",
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+    )
+    account = AccountSnapshot(
+        source_date="2026-07-16",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+    )
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account,
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        process_version="oldsha",
+        candidate_pool_ids=(1,),
+        industry_contexts=(context,),
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=Decimal("0.610"),
+        estimated_api_cost_complete=False,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=[],
+        query={"component_pool_ids": [1], "snapshot_fields": []},
+        responses={},
+        candidate_pool_ids=(1,),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=[],
+        option_attention_broker_label=None,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    assert rebuilt["industry_contexts"] == source["industry_contexts"]
+    assert rebuilt["industry_context_status"] == source["industry_context_status"]
+    assert rebuilt["api_cost"] == source["api_cost"]
+    assert [
+        item["symbol"] for item in rebuilt["strategy_judgments"]["top10_candidates"]
+    ] == [
+        item["symbol"] for item in source["strategy_judgments"]["top10_candidates"]
+    ]
+    assert rebuilt["strategy_judgments"]["top10_candidates"][0]["ordering_context"] == source[
+        "strategy_judgments"
+    ]["top10_candidates"][0]["ordering_context"]
 
 
 class FakeTrendSimClient:
