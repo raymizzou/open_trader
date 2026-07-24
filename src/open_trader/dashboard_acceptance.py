@@ -576,7 +576,14 @@ def validate_integrated_candidate(
 
             judgments = frozen.get("strategy_judgments")
             assert isinstance(judgments, Mapping), f"{broker} 冻结策略动作缺失"
-            assert report.get("risk_skips") == judgments.get("risk_skips", []), (
+            expected_risk_skips = [
+                _project_trend_money_fields(
+                    dict(item), payload=dict(frozen), market=market
+                )
+                for item in judgments.get("risk_skips", [])
+                if isinstance(item, Mapping)
+            ]
+            assert report.get("risk_skips") == expected_risk_skips, (
                 f"{broker} 风险跳过动作与冻结报告不一致"
             )
             buys = report.get("buy_actions")
