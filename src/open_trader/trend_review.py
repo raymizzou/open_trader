@@ -1507,6 +1507,7 @@ def _valid_late_buy_authorization(
     )
     if not path.exists():
         return False
+    # Authorization is report-scoped; the frozen report hash binds it to every buy.
     batch_path = (
         data_dir
         / "trend_review"
@@ -1560,7 +1561,10 @@ def _valid_late_buy_authorization(
             observation_name = event.get("observation_path")
             if observation_name is None:
                 continue
-            if not isinstance(observation_name, str) or Path(observation_name).name != observation_name:
+            if (
+                not isinstance(observation_name, str)
+                or Path(observation_name).name != observation_name
+            ):
                 raise ValueError("invalid observation path")
             observation = json.loads(
                 (
