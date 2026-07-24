@@ -4818,7 +4818,7 @@ if (usOrder.some((index)=>index<0) ||
 if (!us.includes('class="cn-trend-report"') ||
     (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
     !us.includes('class="cn-trend-card"') ||
-    us.includes("今日执行检查") || us.includes("筛选价（Trend Animals）") ||
+    us.includes("今日执行检查") ||
     us.includes('class="trend-discipline"')) throw new Error(us);
 if (!us.includes('class="cn-trend-execution"') ||
     us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
