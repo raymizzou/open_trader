@@ -3,6 +3,8 @@
 ## Status
 
 Implemented and committed as `382dafe feat: version contextual trend selection`.
+Dashboard compatibility follow-up was committed as
+`b379658 fix: keep dashboard trend versions compatible`.
 
 ## TDD evidence
 
