@@ -16,6 +16,17 @@ SNAPSHOT_SCHEMA_VERSION = "open_trader.strategy_drawdown_snapshot.v1"
 DECISION_SCHEMA_VERSION = "open_trader.strategy_drawdown.v1"
 DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
+UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
+UNIFIED_TREND_V5_PARAMETER_HASHES = {
+    "US": (
+        "860170403d6241cd3590c02449de7a1bd11842124055587f7c4eec64b927d253",
+        "351da97ebaea03fbc5b854f4f4a7c0f4d610b5da675f4e6ff0db7f21f653d823",
+    ),
+    "HK": (
+        "3b01863b51009be4047031b31df7c577a05067d67801ad67bb0bebaaa1c11918",
+        "a6da3b625a1ad69dce589d600cfdad81776f0223aa16db36faa63c234e23255e",
+    ),
+}
 OVERHEAT_TRIM_COMPATIBILITY_PARAMETERS = {
     "overheat_trim_fraction": "0.30",
     "overheat_trim_once_per_position": True,
@@ -288,7 +299,7 @@ def valid_strategy_parameter_audit_identity(
     bootstrap_event: object,
     parameter_compatibility_event: object,
 ) -> bool:
-    """Accept the frozen hash, or the single approved v4 trim transition."""
+    """Accept the frozen hash or one explicitly approved compatibility transition."""
     try:
         key = _strategy_key(market, strategy_id, strategy_version)
         current_hash = strategy_parameter_hash(parameters)
@@ -304,7 +315,7 @@ def valid_strategy_parameter_audit_identity(
             and _record_key(parameter_compatibility_event) == key
             and parameter_compatibility_event.get("old_parameter_hash") == old_hash
             and parameter_compatibility_event.get("new_parameter_hash") == current_hash
-            and _approved_overheat_trim_transition(key, parameters, old_hash)
+            and _compatibility_transition_revision(key, parameters, old_hash) is not None
         )
     return old_hash == current_hash
 
@@ -381,14 +392,15 @@ def automatic_bootstrap_strategy_drawdown(
                     raise ValueError("strategy parameters changed without a version bump")
             elif event.get("parameter_hash") != parameter_hash:
                 old_hash = event.get("parameter_hash")
-                if not _approved_overheat_trim_transition(
+                compatibility_revision = _compatibility_transition_revision(
                     key, parameters, old_hash
-                ):
+                )
+                if compatibility_revision is None:
                     raise ValueError("strategy parameters changed without a version bump")
                 assert isinstance(old_hash, str)
                 events.append({
                     "event_id": _parameter_compatibility_event_id(
-                        key, old_hash, parameter_hash
+                        key, old_hash, parameter_hash, compatibility_revision
                     ),
                     "event_type": "parameter_compatibility",
                     "market": key[0],
@@ -398,7 +410,7 @@ def automatic_bootstrap_strategy_drawdown(
                     "occurred_at": occurred_at,
                     "old_parameter_hash": old_hash,
                     "new_parameter_hash": parameter_hash,
-                    "compatibility_revision": OVERHEAT_TRIM_COMPATIBILITY_REVISION,
+                    "compatibility_revision": compatibility_revision,
                     "accepted_git_sha": accepted_git_sha,
                 })
                 _write_state(path, payload)
@@ -882,11 +894,12 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
     new_hash = value["new_parameter_hash"]
     return (
         value["event_type"] == "parameter_compatibility"
-        and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v4"
-        and key[2] == "v4"
         and isinstance(value["event_id"], str)
         and value["event_id"] == _parameter_compatibility_event_id(
-            key, str(old_hash), str(new_hash)
+            key,
+            str(old_hash),
+            str(new_hash),
+            str(value["compatibility_revision"]),
         )
         and isinstance(value["actor"], str)
         and bool(value["actor"].strip())
@@ -894,18 +907,35 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
         and _is_sha256(old_hash)
         and _is_sha256(new_hash)
         and old_hash != new_hash
-        and value["compatibility_revision"] == OVERHEAT_TRIM_COMPATIBILITY_REVISION
+        and (
+            (
+                key[1] == f"trend_animals_warm_to_hot/{key[0]}/v4"
+                and key[2] == "v4"
+                and value["compatibility_revision"]
+                == OVERHEAT_TRIM_COMPATIBILITY_REVISION
+            )
+            or (
+                key[0] in UNIFIED_TREND_V5_PARAMETER_HASHES
+                and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v5"
+                and key[2] == "v5"
+                and value["compatibility_revision"]
+                == UNIFIED_TREND_V5_COMPATIBILITY_REVISION
+                and (old_hash, new_hash)
+                == UNIFIED_TREND_V5_PARAMETER_HASHES[key[0]]
+            )
+        )
         and _is_sha1(value["accepted_git_sha"])
     )
 
 
 def _parameter_compatibility_event_id(
-    key: tuple[str, str, str], old_hash: str, new_hash: str,
+    key: tuple[str, str, str],
+    old_hash: str,
+    new_hash: str,
+    compatibility_revision: str = OVERHEAT_TRIM_COMPATIBILITY_REVISION,
 ) -> str:
     return "parameter-compatibility-" + hashlib.sha256(
-        "|".join((*key, old_hash, new_hash, OVERHEAT_TRIM_COMPATIBILITY_REVISION)).encode(
-            "utf-8"
-        )
+        "|".join((*key, old_hash, new_hash, compatibility_revision)).encode("utf-8")
     ).hexdigest()
 
 
@@ -927,6 +957,33 @@ def _approved_overheat_trim_transition(
         if type(actual) is not type(expected) or actual != expected:
             return False
     return strategy_parameter_hash(previous_parameters) == old_hash
+
+
+def _approved_unified_trend_v5_transition(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> bool:
+    expected = UNIFIED_TREND_V5_PARAMETER_HASHES.get(key[0])
+    return (
+        expected is not None
+        and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v5"
+        and key[2] == "v5"
+        and old_hash == expected[0]
+        and strategy_parameter_hash(parameters) == expected[1]
+    )
+
+
+def _compatibility_transition_revision(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> str | None:
+    if _approved_overheat_trim_transition(key, parameters, old_hash):
+        return OVERHEAT_TRIM_COMPATIBILITY_REVISION
+    if _approved_unified_trend_v5_transition(key, parameters, old_hash):
+        return UNIFIED_TREND_V5_COMPATIBILITY_REVISION
+    return None
 
 
 def _valid_recovery_event(value: object) -> bool:

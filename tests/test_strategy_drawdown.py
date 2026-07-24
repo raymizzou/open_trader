@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from open_trader.a_share_trend import live_trend_strategy_snapshot
 from open_trader.strategy_drawdown import (
+    UNIFIED_TREND_V5_COMPATIBILITY_REVISION,
+    UNIFIED_TREND_V5_PARAMETER_HASHES,
     automatic_bootstrap_strategy_drawdown,
     manual_unlock_strategy_drawdown,
     observe_strategy_equity,
@@ -101,6 +104,160 @@ OVERHEAT_TRIM_PARAMETERS = {
     "overheat_trim_below_lot": "no_order_terminal",
     "full_exit_precedes_partial_exit": True,
 }
+
+
+def _v5_snapshot(market: str) -> dict[str, object]:
+    pool_ids = (622460,) if market == "US" else (622494,)
+    return live_trend_strategy_snapshot(
+        market, "verify", pool_ids, strategy_version="v5"
+    )
+
+
+def _seed_legacy_v5_state(
+    tmp_path: Path,
+    *,
+    market: str,
+    strategy_version: str = "v5",
+    parameter_hash: str | None = None,
+) -> Path:
+    data_dir = tmp_path / "data"
+    strategy_id = f"trend_animals_warm_to_hot/{market}/{strategy_version}"
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        parameters={"legacy": market},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-23",
+        accepted_git_sha="a" * 40,
+        actor="legacy",
+        occurred_at="2026-07-23T09:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-24",
+    )
+    path = data_dir / "trend_drawdown/state.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    event = payload["audit_events"][0]
+    event["parameter_hash"] = parameter_hash or UNIFIED_TREND_V5_PARAMETER_HASHES[market][0]
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return data_dir
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_unified_v5_compatibility_transition_is_audited(
+    tmp_path: Path, market: str
+) -> None:
+    data_dir = _seed_legacy_v5_state(tmp_path, market=market)
+    snapshot = _v5_snapshot(market)
+    accepted_sha = "c" * 40
+
+    decision = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v5",
+        strategy_version="v5",
+        parameters=snapshot["parameters"],
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha=accepted_sha,
+        actor="acceptance",
+        occurred_at="2026-07-24T11:00:00+08:00",
+        reason="new_strategy_version",
+        entry_eligible_from=None,
+    )
+
+    payload = json.loads(
+        (data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    compatibility = [
+        event
+        for event in payload["audit_events"]
+        if event["event_type"] == "parameter_compatibility"
+    ]
+    assert len(compatibility) == 1
+    assert compatibility[0]["old_parameter_hash"] == UNIFIED_TREND_V5_PARAMETER_HASHES[market][0]
+    assert compatibility[0]["new_parameter_hash"] == UNIFIED_TREND_V5_PARAMETER_HASHES[market][1]
+    assert compatibility[0]["compatibility_revision"] == UNIFIED_TREND_V5_COMPATIBILITY_REVISION
+    assert compatibility[0]["accepted_git_sha"] == accepted_sha
+    assert decision["parameter_compatibility_event"] == compatibility[0]
+    state_after_transition = (data_dir / "trend_drawdown/state.json").read_bytes()
+    replay = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/v5",
+        strategy_version="v5",
+        parameters=snapshot["parameters"],
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha="d" * 40,
+        actor="acceptance-replay",
+        occurred_at="2026-07-24T11:01:00+08:00",
+        reason="new_strategy_version",
+        entry_eligible_from=None,
+    )
+    assert replay == decision
+    assert (data_dir / "trend_drawdown/state.json").read_bytes() == state_after_transition
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_unified_v5_compatibility_rejects_wrong_legacy_identity(
+    tmp_path: Path, market: str
+) -> None:
+    data_dir = _seed_legacy_v5_state(
+        tmp_path,
+        market=market,
+        parameter_hash="f" * 64,
+    )
+    snapshot = _v5_snapshot(market)
+    before = (data_dir / "trend_drawdown/state.json").read_bytes()
+
+    with pytest.raises(ValueError, match="strategy parameters changed without a version bump"):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/v5",
+            strategy_version="v5",
+            parameters=snapshot["parameters"],
+            baseline_equity=None,
+            source_date=None,
+            accepted_git_sha="c" * 40,
+            actor="acceptance",
+            occurred_at="2026-07-24T11:00:00+08:00",
+            reason="new_strategy_version",
+            entry_eligible_from=None,
+        )
+    assert (data_dir / "trend_drawdown/state.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_unified_v5_compatibility_rejects_wrong_new_parameters(
+    tmp_path: Path, market: str
+) -> None:
+    data_dir = _seed_legacy_v5_state(tmp_path, market=market)
+    snapshot = _v5_snapshot(market)
+    changed_parameters = {
+        **snapshot["parameters"],
+        "target_weight": "0.05",
+    }
+    before = (data_dir / "trend_drawdown/state.json").read_bytes()
+
+    with pytest.raises(ValueError, match="strategy parameters changed without a version bump"):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/v5",
+            strategy_version="v5",
+            parameters=changed_parameters,
+            baseline_equity=None,
+            source_date=None,
+            accepted_git_sha="c" * 40,
+            actor="acceptance",
+            occurred_at="2026-07-24T11:00:00+08:00",
+            reason="new_strategy_version",
+            entry_eligible_from=None,
+        )
+    assert (data_dir / "trend_drawdown/state.json").read_bytes() == before
 
 
 def test_v4_overheat_trim_compatibility_appends_only_a_validated_audit_event(
