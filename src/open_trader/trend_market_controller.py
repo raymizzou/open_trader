@@ -2964,32 +2964,53 @@ def run_trend_market_controller(
                 elif latest is None:
                     phase = "recovering_report"
                 elif _execution_due(work_cycle, now):
-                    selected = _locked_report(config, work_cycle, latest, now)
-                    if protection_error is not None:
-                        execution = _execute_locked_report(
-                            config,
-                            market,
-                            work_cycle.execution_date,
-                            selected[0],
-                            selected[1],
-                            allow_new_buys=False,
-                            quote_client=shared_quote(),
-                        )
+                    judgments = latest[1].get("strategy_judgments")
+                    formal_actions = (
+                        judgments.get("formal_actions")
+                        if isinstance(judgments, dict)
+                        else None
+                    )
+                    if _execution_completed(config, work_cycle) and formal_actions:
+                        execution = {
+                            "status": "reconciled",
+                            "market": market,
+                            "date": work_cycle.execution_date,
+                            "submitted_count": 0,
+                            "artifact_paths": [],
+                        }
                     else:
-                        execution = _execute_locked_report(
-                            config,
-                            market,
-                            work_cycle.execution_date,
-                            selected[0],
-                            selected[1],
-                            quote_client=shared_quote(),
-                        )
+                        selected = _locked_report(config, work_cycle, latest, now)
+                        if protection_error is not None:
+                            execution = _execute_locked_report(
+                                config,
+                                market,
+                                work_cycle.execution_date,
+                                selected[0],
+                                selected[1],
+                                allow_new_buys=False,
+                                quote_client=shared_quote(),
+                            )
+                        else:
+                            execution = _execute_locked_report(
+                                config,
+                                market,
+                                work_cycle.execution_date,
+                                selected[0],
+                                selected[1],
+                                quote_client=shared_quote(),
+                            )
                     last_success = execution
                     operation_failures = 0
                     operation_retry_after = None
                     operation_blocker = None
                     status = str(execution.get("status") or "")
-                    if status in {"uncertain", "conflict"}:
+                    if status == "reconciled":
+                        phase = (
+                            "monitoring"
+                            if cycle.market_open
+                            else cycle.session
+                        )
+                    elif status in {"uncertain", "conflict"}:
                         blocker = status
                         phase = status
                         occurred_at = now.isoformat(timespec="seconds")

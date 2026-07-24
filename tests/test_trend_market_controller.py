@@ -2923,6 +2923,52 @@ def test_report_finished_after_window_is_preserved_and_actions_become_missed(
     assert result["last_success"]["submitted_count"] == 0
 
 
+def test_completed_action_batch_is_reconciled_without_duplicate_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    report_path, report = write_report(config, buy=True)
+    write_report_delivery_receipt(config, report_path, report, status="sent")
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=report_path,
+        report=report,
+        locked_at=NOW.isoformat(),
+    )
+    write_controller_action(
+        config,
+        trend_action_key("CN", cycle.execution_date, "SH.600001", "buy"),
+        {
+            "market": "CN",
+            "date": cycle.execution_date,
+            "report_sha256": _report_hash(report),
+            "strategy_version": report["strategy_snapshot"]["strategy_version"],
+            "action_index": 0,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": "missed",
+            "reason": "buy_window_closed",
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: pytest.fail("completed batch was re-executed"),
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["last_success"]["status"] == "reconciled"
+    assert result["phase"] == "monitoring"
+
+
 def test_controller_groups_uncertain_actions_by_side_for_feishu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
