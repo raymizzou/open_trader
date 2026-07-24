@@ -917,8 +917,7 @@ def _attempt_market_report(
             {
                 value
                 for row in snapshot_rows
-                if isinstance((value := row.get("industryTmId")), int)
-                and not isinstance(value, bool)
+                if (value := _optional_int(row.get("industryTmId"))) is not None
                 and value > 0
             }
         )

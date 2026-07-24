@@ -37,6 +37,7 @@ from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 from open_trader.a_share_trend import A_SHARE_INDUSTRY_FIELDS
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
+from open_trader.trend_animals import TrendAnimalsError
 from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     write_trend_api_stats,
@@ -905,6 +906,190 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     }]
     assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
     assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
+
+
+def _run_us_v5_industry_case(
+    tmp_path: Path,
+    *,
+    industry_rows: list[dict[str, object]] | None = None,
+    industry_error: TrendAnimalsError | None = None,
+) -> dict[str, object]:
+    cfg = config(tmp_path)
+
+    def snapshot(
+        tm_id: int,
+        symbol: str,
+        industry_tm_id: int,
+        *,
+        temperature_prev: str = "温",
+        temperature_curr: str = "热",
+    ) -> dict[str, object]:
+        return {
+            "tmId": tm_id,
+            "tickerName": symbol,
+            "tickerSymbol": f"{symbol}.US",
+            "asset": "美股",
+            "asOfDate": "2026-07-23",
+            "tradableFlag": True,
+            "industryTmId": industry_tm_id,
+            "industryName": "科技",
+            "priceIndex": "10",
+            "marketCap": "100",
+            "amount1d": "2",
+            "isTrendRightSide": True,
+            "trendTemperaturePrev": temperature_prev,
+            "trendTemperatureCurr": temperature_curr,
+            "daysSinceTrendEntry": 3,
+            "trendStrengthLocalCurr": "96",
+            "trendPhaseCurr": "立夏",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+        }
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            self.snapshot_calls: list[dict[str, object]] = []
+            self.balance_calls = 0
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [{"asset": "美股", "asOfDate": "2026-07-23"}]
+
+        def get_account_balance(self) -> dict[str, object]:
+            self.balance_calls += 1
+            return {"balance": "100" if self.balance_calls == 1 else "99"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert tm_id == 622460
+            return [
+                {"tmId": 1, "tickerSymbol": "HAS.US", "asOfDate": expected_date},
+                {"tmId": 3, "tickerSymbol": "MISSING.US", "asOfDate": expected_date},
+            ]
+
+        def search_exact_symbol(self, symbol: str) -> int:
+            assert symbol == "HELD"
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            self.snapshot_calls.append(dict(kwargs))
+            if kwargs["fields"] == A_SHARE_INDUSTRY_FIELDS:
+                if industry_error is not None:
+                    raise industry_error
+                return list(industry_rows or [])
+            assert kwargs["tm_ids"] == [1, 2, 3]
+            assert kwargs["fields"] == UNIFIED_TREND_FIELDS
+            return [
+                snapshot(1, "HAS", 900),
+                snapshot(
+                    2,
+                    "HELD",
+                    902,
+                    temperature_prev="热",
+                    temperature_curr="平",
+                ),
+                snapshot(3, "MISSING", 901),
+            ]
+
+    api = Api()
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-23", "2026-07-24"]
+
+        def get_daily_kline(
+            self, *args: object, **kwargs: object
+        ) -> list[DailyKlineBar]:
+            return [
+                DailyKlineBar(
+                    date=(datetime(2026, 7, 23) - timedelta(days=14 - index))
+                    .date()
+                    .isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def close(self) -> None:
+            pass
+
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-24",
+        notifier=NullNotifier(),
+        api_factory=lambda **kwargs: api,
+        quote_factory=Quote,
+        account_factory=simulation_account_with_positions("US.HELD"),
+        now_fn=lambda: datetime(2026, 7, 24, 12, tzinfo=SHANGHAI),
+        sleep_fn=lambda seconds: None,
+    )
+    assert result.status == "generated"
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    payload["_evidence"] = json.loads(evidence_path.read_text(encoding="utf-8"))
+    payload["_snapshot_calls"] = api.snapshot_calls
+    return payload
+
+
+def test_market_report_missing_industry_row_excludes_only_affected_candidate(
+    tmp_path: Path,
+) -> None:
+    payload = _run_us_v5_industry_case(
+        tmp_path,
+        industry_rows=[
+            {"tmId": 900, "asOfDate": "2026-07-23", "trendTemperatureCurr": "温"},
+            {"tmId": 902, "asOfDate": "2026-07-23", "trendTemperatureCurr": "温"},
+        ],
+    )
+
+    assert [
+        item["symbol"]
+        for item in payload["signal_snapshots"]["candidates"]
+        if item["eligible"]
+    ] == ["HAS"]
+    assert payload["excluded"]["MISSING"] == ["industry_temperature_missing"]
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
+
+
+def test_market_report_industry_request_failure_preserves_holding_exit_and_pauses_buys(
+    tmp_path: Path,
+) -> None:
+    payload = _run_us_v5_industry_case(
+        tmp_path,
+        industry_error=TrendAnimalsError("industry unavailable"),
+    )
+    reason = "行业温度数据不可用，暂停新开仓：industry unavailable"
+
+    formal_actions = payload["strategy_judgments"]["formal_actions"]
+    assert [
+        (item["action"], item["symbol"], item["reason"])
+        for item in formal_actions
+    ] == [("SELL_ALL", "HELD", "temperature_changed_to_flat")]
+    assert payload["strategy_judgments"]["top10_candidates"] == []
+    assert payload["metadata"]["industry_data_reason"] == reason
+    assert any(reason in fact for fact in payload["api_facts"])
+    assert payload["replay_evidence"]
 
 
 def test_actual_tiger_snapshots_do_not_change_us_simulation_report(

@@ -1391,7 +1391,7 @@ def main(argv: list[str] | None = None) -> int:
                         market,
                         accepted_git_sha,
                         pool_ids,
-                        execution_date=source_date,
+                        execution_date=entry_eligible_from,
                     )
                     baseline = frozen_missing_baseline(
                         config.reports_dir,

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from open_trader import cli
+import open_trader.a_share_trend as trend_module
 from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     observe_strategy_equity,
@@ -241,6 +242,98 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
         "bootstrapped", "bootstrapped", "bootstrapped"
     ]
     assert account_calls == []
+
+
+@pytest.mark.parametrize(
+    ("market", "source_date", "entry_date"),
+    [
+        ("US", "2026-07-23", "2026-07-24"),
+        ("HK", "2026-07-26", "2026-07-27"),
+    ],
+)
+def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    source_date: str,
+    entry_date: str,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        timezone="Asia/Shanghai",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    calls: list[tuple[str, str | None, str]] = []
+    market_inputs: dict[str, object] = {}
+
+    class Quote:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(self, **_: object) -> list[str]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    def strategy_snapshot(
+        current_market: str,
+        process_version: str,
+        pool_ids: tuple[int, ...],
+        *,
+        execution_date: str | None = None,
+    ) -> dict[str, object]:
+        snapshot = trend_module.live_trend_strategy_snapshot(
+            current_market,
+            process_version,
+            pool_ids,
+            execution_date=execution_date,
+        )
+        calls.append((current_market, execution_date, str(snapshot["strategy_version"])))
+        return snapshot
+
+    def preflight_dates(
+        current_market: str,
+        *,
+        now: datetime,
+        trading_days: list[str],
+    ) -> tuple[str, str]:
+        if current_market == market:
+            return source_date, entry_date
+        return "2026-07-23", "2026-07-24"
+
+    def run_preflight(**kwargs: object) -> dict[str, object]:
+        market_inputs.update(kwargs["market_inputs"])
+        return {"status": "ready"}
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "sha")
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-07-24T08:00:00+08:00"),
+    )
+    monkeypatch.setattr(cli, "strategy_drawdown_state_status", lambda path: "ok")
+    monkeypatch.setattr(cli, "market_preflight_dates", preflight_dates)
+    monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
+    monkeypatch.setattr(cli, "run_drawdown_preflight", run_preflight)
+
+    assert cli.main([
+        "trend-drawdown-preflight",
+        "--config", str(tmp_path / "daily.env"),
+        "--repo", str(tmp_path),
+        "--actor", "pytest",
+    ]) == 0
+    assert (market, entry_date, "v5") in calls
+    assert market_inputs[market].strategy_snapshot["strategy_version"] == "v5"
 
 
 def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
