@@ -3576,9 +3576,7 @@ def test_us_open_does_not_carry_market_order_after_close(tmp_path: Path) -> None
     } == json.loads(events[0].read_text(encoding="utf-8"))
 
 
-def test_action_audit_accepts_buy_after_bound_late_authorization(
-    tmp_path: Path,
-) -> None:
+def _late_buy_audit_fixture(tmp_path: Path) -> dict[str, Path]:
     report = cn_buy_report()
     report_path = tmp_path / "reports/2026-07-16.json"
     report_path.parent.mkdir(parents=True)
@@ -3648,7 +3646,7 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
             }
         ),
     )
-    trend_review._write_action_event(
+    event_path = trend_review._write_action_event(
         data_dir=tmp_path,
         market="CN",
         execution_date="2026-07-17",
@@ -3691,6 +3689,19 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
         ),
     )
 
+    return {
+        "authorization": authorization,
+        "intent": intent,
+        "result": trend_review._result_path(intent),
+        "event": event_path,
+    }
+
+
+def test_action_audit_accepts_buy_after_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    fixture = _late_buy_audit_fixture(tmp_path)
+
     events, _ = trend_review.load_trend_action_audit(
         tmp_path,
         market="CN",
@@ -3700,9 +3711,46 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
     )
 
     assert [event["status"] for event in events] == ["missed", "submitted"]
+    authorization = fixture["authorization"]
     payload = json.loads(authorization.read_text(encoding="utf-8"))
     payload["report_sha256"] = "0" * 64
     authorization.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid late buy authorization"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="buy",
+        )
+
+
+def test_action_audit_rejects_result_before_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    fixture = _late_buy_audit_fixture(tmp_path)
+    result = json.loads(fixture["result"].read_text(encoding="utf-8"))
+    result["submitted_at"] = "2026-07-17T10:01:00+08:00"
+    fixture["result"].write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid late buy authorization"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="buy",
+        )
+
+
+def test_action_audit_rejects_event_before_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    fixture = _late_buy_audit_fixture(tmp_path)
+    event = json.loads(fixture["event"].read_text(encoding="utf-8"))
+    event["recorded_at"] = "2026-07-17T10:01:00+08:00"
+    fixture["event"].write_text(json.dumps(event), encoding="utf-8")
 
     with pytest.raises(ValueError, match="invalid late buy authorization"):
         trend_review.load_trend_action_audit(

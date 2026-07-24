@@ -1528,18 +1528,54 @@ def _valid_late_buy_authorization(
         missed_at = [
             datetime.fromisoformat(str(event["recorded_at"])) for event in missed
         ]
-        fact_times = [
-            datetime.fromisoformat(
-                str(
-                    fact[
-                        "submitted_at"
-                        if fact_path.name.endswith("-result.json")
-                        else "created_at"
-                    ]
+        fact_times: list[datetime] = []
+        for fact_path, fact, _, _ in facts:
+            fact_times.append(
+                datetime.fromisoformat(
+                    str(
+                        fact[
+                            "submitted_at"
+                            if fact_path.name.endswith("-result.json")
+                            else "created_at"
+                        ]
+                    )
                 )
             )
-            for fact_path, fact, _, _ in facts
-        ]
+            result_path = (
+                fact_path
+                if fact_path.name.endswith("-result.json")
+                else _result_path(fact_path)
+            )
+            if result_path.exists() and result_path != fact_path:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                fact_times.append(
+                    datetime.fromisoformat(str(result["submitted_at"]))
+                )
+        action_times: list[datetime] = []
+        observation_times: list[datetime] = []
+        for event in events:
+            if event.get("status") not in {"submitted", "partially_filled", "filled"}:
+                continue
+            action_times.append(datetime.fromisoformat(str(event["recorded_at"])))
+            observation_name = event.get("observation_path")
+            if observation_name is None:
+                continue
+            if not isinstance(observation_name, str) or Path(observation_name).name != observation_name:
+                raise ValueError("invalid observation path")
+            observation = json.loads(
+                (
+                    data_dir
+                    / "trend_review"
+                    / "ledgers"
+                    / market
+                    / "open"
+                    / execution_date
+                    / observation_name
+                ).read_text(encoding="utf-8")
+            )
+            observation_times.append(
+                datetime.fromisoformat(str(observation["observed_at"]))
+            )
     except (
         KeyError,
         OSError,
@@ -1579,6 +1615,15 @@ def _valid_late_buy_authorization(
         or any(item > authorized_at for item in missed_at)
         or any(item.tzinfo is None or item.utcoffset() is None for item in fact_times)
         or any(item < authorized_at for item in fact_times)
+        or any(
+            item.tzinfo is None or item.utcoffset() is None for item in action_times
+        )
+        or any(item < authorized_at for item in action_times)
+        or any(
+            item.tzinfo is None or item.utcoffset() is None
+            for item in observation_times
+        )
+        or any(item < authorized_at for item in observation_times)
     ):
         raise ValueError(f"invalid late buy authorization: {path}")
     return True
