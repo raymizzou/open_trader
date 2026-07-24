@@ -5948,6 +5948,95 @@ def write_separate_review_facts(
     rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
 
 
+def write_projection_strategy_facts(
+    root: Path,
+    market: str,
+    snapshots: list[dict[str, object]],
+) -> None:
+    start = date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
+    benchmark_source = {
+        "CN": ("CSI_ALL_SHARE_PRICE", "SH.000985"),
+        "US": ("SPY_QFQ", "US.SPY"),
+        "HK": ("HSCI_PRICE", "HK.800701"),
+    }[market]
+    for index, snapshot in enumerate(snapshots):
+        trading_date = (start + timedelta(days=index)).isoformat()
+        trend_review.freeze_discipline_fact(
+            root, market, trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_actual_equity_fact(
+            root, market, trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_benchmark_fact(
+            root,
+            market,
+            trading_date,
+            {
+                "date": trading_date,
+                "close": "1000",
+                "source_id": benchmark_source[0],
+                "futu_symbol": benchmark_source[1],
+            },
+        )
+    trend_review.freeze_actual_fill_batch(
+        root,
+        {
+            "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
+            "market": market,
+            "source": "test",
+        },
+        [],
+        (start + timedelta(days=len(snapshots) - 1)).isoformat(),
+        coverage_start=start.isoformat(),
+    )
+    rates = root / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("market", "strategy_version"),
+    [("CN", "v8"), ("US", "v5"), ("HK", "v5")],
+)
+def test_projection_accepts_current_live_strategy_versions(
+    tmp_path: Path, market: str, strategy_version: str,
+) -> None:
+    snapshot = live_trend_strategy_snapshot(
+        market, "test-sha", (), strategy_version=strategy_version
+    )
+    write_projection_strategy_facts(tmp_path, market, [snapshot, snapshot])
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["strategy_snapshot"]["strategy_version"] == strategy_version
+
+
+@pytest.mark.parametrize(
+    ("market", "strategy_versions"),
+    [
+        ("CN", ("v4", "v7", "v8")),
+        ("US", ("v4", "v5")),
+        ("HK", ("v4", "v5")),
+    ],
+)
+def test_projection_accepts_approved_mixed_sample_identities(
+    tmp_path: Path,
+    market: str,
+    strategy_versions: tuple[str, ...],
+) -> None:
+    snapshots = [
+        live_trend_strategy_snapshot(
+            market, "test-sha", (), strategy_version=version
+        )
+        for version in strategy_versions
+    ]
+    write_projection_strategy_facts(tmp_path, market, snapshots)
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["strategy_snapshot"]["strategy_version"] == strategy_versions[-1]
+
+
 def test_pending_sell_with_zero_live_position_records_completion(
     tmp_path: Path,
 ) -> None:

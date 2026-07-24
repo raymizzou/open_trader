@@ -96,11 +96,41 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard.py tests/test_das
 528 passed in 1.27s
 ```
 
-Full repository suite after the follow-up:
+Full repository suite after the Dashboard and projection follow-ups:
 
 ```text
 make test
-3436 passed in 78.79s (0:01:18)
+3442 passed in 77.00s (0:01:17)
+```
+
+Compile and whitespace checks also completed successfully.
+
+## Projection compatibility follow-up
+
+The final review found that trend-review projection filtering still admitted
+only v1/v3 facts and compared all frozen snapshots as one exact identity. Tests
+were added first:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_trend_review.py -k 'projection_accepts_current_live_strategy_versions or projection_accepts_approved_mixed_sample_identities' -q
+6 failed, 220 deselected in 0.28s
+```
+
+Projection normalization now considers all v1-v8 snapshots, while the existing
+market/version snapshot validator and explicit Kelly identity map remain the
+authority for legal identities. The projection selects the latest effective
+live-version target and admits only that target's approved inherited identities
+(CN v8: v4/v7/v8; US/HK v5: v4/v5). Exact identity consistency is still enforced
+within each market/version identity; unapproved or malformed facts are excluded.
+
+Regression and affected-suite verification:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_trend_review.py -k 'projection_accepts_current_live_strategy_versions or projection_accepts_approved_mixed_sample_identities' -q
+6 passed, 220 deselected in 0.28s
+
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_market_trend.py tests/test_trend_kelly.py tests/test_trend_api_stats.py tests/test_trend_review.py -q
+669 passed in 3.47s
 ```
 
 Compile and whitespace checks also completed successfully.

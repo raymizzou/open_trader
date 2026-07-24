@@ -16,6 +16,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from .models import TradeFill
+from .trend_kelly import trend_kelly_identity_matches
 
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
@@ -76,6 +77,9 @@ PROTECTION_STATE_ROOTS = {
     "HK": "trend_hk_phillips",
     "US": "trend_us_tiger",
 }
+TREND_STRATEGY_VERSIONS = frozenset(
+    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"}
+)
 
 
 class TrendReplayIncompleteError(ValueError):
@@ -4865,7 +4869,7 @@ def build_trend_review_projection(
         snapshot = fact.get("strategy_snapshot")
         if not isinstance(snapshot, Mapping) or snapshot.get(
             "strategy_version"
-        ) not in {"v1", "v3"}:
+        ) not in TREND_STRATEGY_VERSIONS:
             return None
         try:
             return normalize_trend_strategy_snapshot(snapshot, market)
@@ -4898,12 +4902,65 @@ def build_trend_review_projection(
         )
         is not None
     ]
-    strategy_identities = {
-        _strategy_identity(fact["strategy_snapshot"])
+
+    def fact_identity(fact: Mapping[str, object]) -> tuple[str, str, str]:
+        snapshot = fact["strategy_snapshot"]
+        assert isinstance(snapshot, Mapping)
+        return (
+            str(snapshot.get("market") or market),
+            str(snapshot.get("strategy_id") or ""),
+            str(snapshot.get("strategy_version") or ""),
+        )
+
+    effective_facts = [
+        fact
         for fact in (*discipline_facts, *actual_facts)
         if str(fact["date"]) >= effective_from
-    }
-    if len(strategy_identities) > 1:
+    ]
+    live_facts = [
+        fact
+        for fact in effective_facts
+        if fact_identity(fact)[2] in {"v4", "v5", "v6", "v7", "v8"}
+    ]
+    target_candidates = live_facts or effective_facts
+    if target_candidates:
+        if live_facts:
+            target_fact = max(target_candidates, key=lambda fact: str(fact["date"]))
+        else:
+            # v1-v3 have no inheritance map. Prefer the newest legacy rule
+            # version when a late malformed/old fact is mixed into the stream.
+            target_fact = max(
+                target_candidates,
+                key=lambda fact: (
+                    int(fact_identity(fact)[2][1:]),
+                    str(fact["date"]),
+                ),
+            )
+    else:
+        target_candidates = [*discipline_facts, *actual_facts]
+        target_fact = (
+            max(target_candidates, key=lambda fact: str(fact["date"]))
+            if target_candidates
+            else None
+        )
+    target_identity = fact_identity(target_fact) if target_candidates else None
+
+    def is_target_identity(fact: Mapping[str, object]) -> bool:
+        if target_identity is None or str(fact["date"]) < effective_from:
+            return True
+        return trend_kelly_identity_matches(fact_identity(fact), target_identity)
+
+    discipline_facts = [fact for fact in discipline_facts if is_target_identity(fact)]
+    actual_facts = [fact for fact in actual_facts if is_target_identity(fact)]
+    identity_snapshots: dict[tuple[str, str, str], set[bytes]] = {}
+    for fact in (*discipline_facts, *actual_facts):
+        if str(fact["date"]) < effective_from:
+            continue
+        identity = fact_identity(fact)
+        identity_snapshots.setdefault(identity, set()).add(
+            _strategy_identity(fact["strategy_snapshot"])
+        )
+    if any(len(snapshots) > 1 for snapshots in identity_snapshots.values()):
         raise ValueError("strategy snapshot identity changed within version interval")
     fills, actual_fill_coverage = _load_actual_fills(data_dir, market)
     equity_cutoff = _common_cutoff(
