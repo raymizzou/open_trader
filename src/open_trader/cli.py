@@ -1376,9 +1376,7 @@ def main(argv: list[str] | None = None) -> int:
                     "HK": config.trend_animals_hk_tm_ids,
                     "US": config.trend_animals_us_tm_ids,
                 }[market]
-                strategy = live_trend_strategy_snapshot(
-                    market, accepted_git_sha, pool_ids
-                )
+                strategy: dict[str, object] | None = None
                 try:
                     today = now.date()
                     trading_days = quote.get_trading_days(
@@ -1388,6 +1386,12 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     source_date, entry_eligible_from = market_preflight_dates(
                         market, now=now, trading_days=trading_days
+                    )
+                    strategy = live_trend_strategy_snapshot(
+                        market,
+                        accepted_git_sha,
+                        pool_ids,
+                        execution_date=source_date,
                     )
                     baseline = frozen_missing_baseline(
                         config.reports_dir,
@@ -1409,6 +1413,13 @@ def main(argv: list[str] | None = None) -> int:
                         entry_eligible_from=entry_eligible_from,
                     )
                 except Exception as exc:
+                    if strategy is None:
+                        strategy = live_trend_strategy_snapshot(
+                            market,
+                            accepted_git_sha,
+                            pool_ids,
+                            execution_date=now.date().isoformat(),
+                        )
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
@@ -1464,6 +1475,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.market,
                 _process_version(config.repo),
                 pool_ids,
+                execution_date=expected_date,
             )
             result = manual_unlock_strategy_drawdown(
                 config.data_dir,

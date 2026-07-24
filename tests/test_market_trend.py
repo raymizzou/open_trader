@@ -35,6 +35,7 @@ from open_trader.notifications import (
 )
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
+from open_trader.a_share_trend import A_SHARE_INDUSTRY_FIELDS
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
@@ -200,7 +201,9 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     assert rows["过热跟踪"] == (
         "沸腾或开香槟触发后，活动保护线取原值与此前 5 个完整交易日最低价的较高者，只升不降"
     )
-    live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
+    live = trend_module.live_trend_strategy_snapshot(
+        market, "abc123", pool_ids, execution_date="2026-07-23"
+    )
     assert (live["strategy_id"], live["strategy_version"]) == (
         f"trend_animals_warm_to_hot/{market}/v4", "v4"
     )
@@ -681,7 +684,8 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         return {
             "tmId": tm_id, "tickerName": name, "tickerSymbol": symbol,
             "asset": "港股", "asOfDate": "2026-07-15", "tradableFlag": True,
-            "industryName": "科技", "amount1d": "2", "isTrendRightSide": True,
+            "industryTmId": 700001, "industryName": "科技", "amount1d": "2",
+            "isTrendRightSide": True,
             "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
             "gainSinceTrendEntry": "0.048", "trendPhasePrev": "谷雨",
             "trendPhaseCurr": "立夏", "trendStrengthLocalChange": "↑↑",
@@ -696,6 +700,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
 
     api_instances = 0
     lot_requests: list[list[str]] = []
+    snapshot_calls: list[dict[str, object]] = []
 
     class Api:
         ignored_stale_components = (
@@ -730,6 +735,14 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            snapshot_calls.append(dict(kwargs))
+            if kwargs["fields"] == A_SHARE_INDUSTRY_FIELDS:
+                assert kwargs["tm_ids"] == [700001]
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": kwargs["expected_date"],
+                    "trendTemperatureCurr": "温",
+                }]
             assert kwargs["tm_ids"] == [1, 2]
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
@@ -870,6 +883,26 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["market"] == "HK"
     assert evidence["query"]["component_pool_ids"] == [622494]
+    expected_snapshot_calls = [
+        {
+            "tm_ids": [1, 2],
+            "fields": UNIFIED_TREND_FIELDS,
+            "expected_date": "2026-07-15",
+        },
+        {
+            "tm_ids": [700001],
+            "fields": A_SHARE_INDUSTRY_FIELDS,
+            "expected_date": "2026-07-15",
+        },
+    ]
+    assert snapshot_calls == [*expected_snapshot_calls, *expected_snapshot_calls]
+    assert payload["signal_snapshots"]["candidates"][0]["industry_temperature"] == "温"
+    assert evidence["query"]["industry_fields"] == list(A_SHARE_INDUSTRY_FIELDS)
+    assert evidence["responses"]["industries"] == [{
+        "tmId": 700001,
+        "asOfDate": "2026-07-15",
+        "trendTemperatureCurr": "温",
+    }]
     assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
     assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
 

@@ -33,6 +33,7 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
     )
     account_calls: list[dict[str, object]] = []
     strategy_calls: list[tuple[str, str, tuple[int, ...]]] = []
+    strategy_execution_dates: list[str | None] = []
     clock = ["2026-07-20T09:30:00+08:00"]
     account_equity = ["95000"]
 
@@ -50,9 +51,10 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
         return SimpleNamespace(net_value=Decimal(account_equity[0]))
 
     def strategy_snapshot(
-        market: str, process_version: str, pool_ids: tuple[int, ...]
+        market: str, process_version: str, pool_ids: tuple[int, ...], **kwargs: object
     ) -> dict[str, object]:
         strategy_calls.append((market, process_version, pool_ids))
+        strategy_execution_dates.append(kwargs.get("execution_date"))
         return {
             "strategy_id": "trend_animals_warm_to_hot/CN/v4",
             "strategy_version": "v4",
@@ -107,6 +109,7 @@ def test_trend_drawdown_unlock_cli_writes_and_prints_audited_rebase(
     assert strategy_calls == [
         ("CN", "accepted-sha", (622466, 697199)),
     ]
+    assert strategy_execution_dates == ["2026-07-20"]
     state = json.loads(
         (data_dir / "trend_drawdown" / "state.json").read_text(encoding="utf-8")
     )
@@ -217,7 +220,7 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
     monkeypatch.setattr(
         cli,
         "live_trend_strategy_snapshot",
-        lambda market, process_version, pool_ids: {
+        lambda market, process_version, pool_ids, **kwargs: {
             "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
             "strategy_version": "v4",
             "parameters": {"market": market},
@@ -276,7 +279,7 @@ def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
     )
     monkeypatch.setattr(
         cli, "live_trend_strategy_snapshot",
-        lambda market, process_version, pool_ids: {
+        lambda market, process_version, pool_ids, **kwargs: {
             "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
             "strategy_version": "v4",
             "parameters": {"market": market},
@@ -334,7 +337,7 @@ def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_base
     monkeypatch.setattr(
         cli,
         "live_trend_strategy_snapshot",
-        lambda market, process_version, pool_ids: {
+        lambda market, process_version, pool_ids, **kwargs: {
             "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
             "strategy_version": "v4",
             "parameters": {"market": market},
