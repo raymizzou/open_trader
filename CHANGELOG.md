@@ -3,6 +3,21 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-24
+
+- Added eligible-industry breadth context to CN/HK/US trend ordering, with
+  deterministic contextual keys and an exact whole-report fallback to the
+  legacy order when current context is incomplete or invalid.
+- Persisted local right-side history for prior-day direction and percentage-point
+  comparisons; reports omit history-dependent keys when an earlier valid record
+  is unavailable instead of synthesizing one.
+- Standardized independent per-market API-cost reporting, including honest
+  unknown/incomplete estimates when component-call pricing cannot be proven.
+- Advanced live strategy versions to CN v8, US v5, and HK v5 while preserving
+  only the approved Kelly sample identities and their frozen review continuity.
+- Replaced the long discipline list with frozen lifecycle Dashboard cards while
+  retaining existing report components, evidence, exclusions, and risk views.
+
 ## 2026-07-23
 
 - Added the current CN trend rules as v7: accept warm, hot, or boiling
