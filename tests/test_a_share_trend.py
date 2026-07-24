@@ -640,6 +640,32 @@ def test_v5_freezes_shared_entry_rules_and_cny_rate(
     assert snapshot["parameters"]["exit_reasons"] == [
         "danger", "left_right_side", "temperature_to_flat", "protection"
     ]
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert rows["退出条件"] == (
+        "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
+    )
+
+
+def test_v4_parameter_rows_keep_historical_exit_condition() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "US", "sha", (622460,), strategy_version="v4"
+    )
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert rows["退出条件"] == "危险信号、离开趋势右侧或触发保护线时全部卖出"
+
+
+@pytest.mark.parametrize(
+    ("reason", "label"),
+    [
+        ("market_cap_below_100_cny", "市值折算人民币后低于 100 亿元"),
+        ("amount_below_2_cny", "日成交额折算人民币后低于 2 亿元"),
+    ],
+)
+def test_v5_cny_exclusion_reasons_have_operator_labels(
+    reason: str, label: str
+) -> None:
+    assert trend_module.REASON_LABELS[reason] == label
+    assert trend_module._reason_label(reason) == label
 
 
 @pytest.mark.parametrize(

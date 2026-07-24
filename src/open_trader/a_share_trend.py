@@ -646,6 +646,10 @@ def live_trend_strategy_snapshot(
                     "趋势右侧、可交易、无危险信号、日期一致、非当前持仓、"
                     "右侧天数存在、ATR14 可计算"
                 )
+            elif row["name"] == "退出条件":
+                row["value"] = (
+                    "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
+                )
     if version in {"v6", "v7"}:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
@@ -2789,8 +2793,10 @@ REASON_LABELS = {
     "phase_after_summer_solstice": "趋势节气晚于夏至",
     "market_cap_missing": "市值缺失",
     "market_cap_below_100": "市值低于 100 亿元",
+    "market_cap_below_100_cny": "市值折算人民币后低于 100 亿元",
     "amount_missing": "日成交额缺失",
     "amount_below_2": "日成交额不足 2 亿元",
+    "amount_below_2_cny": "日成交额折算人民币后低于 2 亿元",
     "right_side_days_missing": "右侧天数缺失",
     "right_side_not_true": "尚未进入右侧趋势",
     "strength_not_above_90": "趋势强度未超过 90",
