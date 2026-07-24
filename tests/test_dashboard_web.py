@@ -9362,7 +9362,7 @@ for (const market of ["CN","US","HK"]) {
   }
       if (html.includes("趋势强度不低于 95")) throw new Error(`${market}: hard-coded rule leaked`);
       if (!html.includes("未知&lt;纪律&gt;") || !html.includes("值&lt;script&gt;alert(1)&lt;/script&gt;") || html.includes("<script>alert(1)</script>")) throw new Error(`${market}: frozen row was not escaped`);
-  if ((html.match(/累计回撤/g) || []).length > 1) throw new Error(`${market}: drawdown duplicated`);
+  if (!html.includes("策略累计回撤暂停") || !html.includes("达到 5% 暂停")) throw new Error(`${market}: cumulative drawdown discipline missing`);
 }
 const oldHtml = renderTrendReportWorkspace({...report("US"),strategy_version:"v4",strategy_parameter_rows:[{group:"入场过滤",name:"旧规则",value:"旧报告冻结值"}]}, true, true);
 if (!oldHtml.includes("旧报告冻结值") || oldHtml.includes("冻结组合")) throw new Error(oldHtml);

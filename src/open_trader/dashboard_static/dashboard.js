@@ -2650,7 +2650,7 @@ function trendDisciplineLifecycle(parameterRows) {
       key = TREND_DISCIPLINE_ROW_NAMES.holding.has(name) ? "holding"
         : TREND_DISCIPLINE_ROW_NAMES.exit.has(name) ? "exit" : "other";
     } else if (group === "累计回撤") {
-      return;
+      key = "other";
     }
     byKey[key].rows.push(row);
   });
