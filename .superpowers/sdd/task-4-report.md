@@ -64,12 +64,50 @@ Both completed with exit status 0 and no output.
 - v8/v5 snapshots list approved sample identities, contextual ordering keys/fallback, industry member/state fields, and fee semantics. Existing v4/v6/v7 frozen rows remain unchanged.
 - Risk, Kelly, snapshot normalization, and report-evidence replay allowlists treat v8/v5 like the existing v4/v6/v7 machinery.
 - `纪律.md` is v2 and records the contextual ordering, whole-report fallback/omission rules, exact fee labels/unit, and approved sample continuity.
+- Dashboard risk/drawdown validation recognizes v8/v5 as strict v4-contract versions, including Kelly and drawdown constraints. Integrated Dashboard acceptance accepts the current CN v8 and US/HK v5 defaults while retaining the approved historical replay versions (CN v4/v6/v7 and US/HK v4).
 
-No Dashboard, runner collection, or cost-calculation code was changed. `trend_api_stats` already emits a stat row for every contributing opening identity, so no schema/display change was needed.
+Runner collection and cost-calculation code were not changed. `trend_api_stats` already emits a stat row for every contributing opening identity, so no schema/display change was needed.
+
+## Dashboard compatibility follow-up
+
+The parent review found two remaining Dashboard backend version allowlists. Tests
+were added before the implementation:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard.py -k 'current_live_risk' -q
+2 failed, 229 deselected in 0.46s
+
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard_acceptance.py -k 'integrated_templates_and_three_market_reports' -q
+1 failed, 296 deselected in 0.65s
+```
+
+The implementation then added v5/v8 to the Dashboard's strict risk/drawdown
+contract and Kelly/drawdown constraint sets, and made integrated acceptance use
+the report's version only when it is in the explicit per-market compatibility
+allowlist. This keeps historical replay validation while accepting current live
+defaults.
+
+Focused Dashboard suites:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard.py tests/test_dashboard_acceptance.py -q
+528 passed in 1.27s
+```
+
+Full repository suite after the follow-up:
+
+```text
+make test
+3436 passed in 78.79s (0:01:18)
+```
+
+Compile and whitespace checks also completed successfully.
 
 ## Concerns
 
 The task brief did not list `src/open_trader/trend_review.py`, but its snapshot
 normalization and replay allowlists must accept v8/v5 or the new frozen reports
 cannot be validated/rebuilt. No live background process or Dashboard acceptance
-gate was run; the parent task owns that final gate.
+gate was run; the parent task owns that final gate. The acceptance allowlist
+retains approved historical versions deliberately; it rejects versions outside
+the market-specific set.

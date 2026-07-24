@@ -1095,6 +1095,8 @@ def trend_controllers() -> dict[str, dict[str, object]]:
 
 def integrated_v4_payload(
     tmp_path: Path,
+    *,
+    current_live_versions: bool = False,
 ) -> tuple[dict[str, object], Path, dict[str, int]]:
     from open_trader.trend_review import _report_hash
 
@@ -1136,7 +1138,11 @@ def integrated_v4_payload(
         "eastmoney": "trend_a_share",
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
-        strategy_version = "v7" if market == "CN" else "v4"
+        strategy_version = (
+            ("v8" if market == "CN" else "v5")
+            if current_live_versions
+            else ("v7" if market == "CN" else "v4")
+        )
         pending = market == "HK"
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {
@@ -1281,6 +1287,22 @@ def test_acceptance_validates_integrated_templates_and_three_market_reports(
     tmp_path: Path,
 ) -> None:
     payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+
+def test_acceptance_validates_current_live_strategy_versions(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(
+        tmp_path, current_live_versions=True
+    )
 
     assert dashboard_acceptance.validate_integrated_candidate(
         payload,

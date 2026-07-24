@@ -1746,6 +1746,51 @@ def test_dashboard_accepts_cn_v7_risk_and_drawdown_contract() -> None:
     assert dashboard_module._valid_trend_risk_summary(payload)
 
 
+@pytest.mark.parametrize("strategy_version", ["v5", "v8"])
+def test_dashboard_accepts_current_live_risk_and_drawdown_contract(
+    strategy_version: str,
+) -> None:
+    payload = _valid_v6_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    drawdown = payload["drawdown_summary"]
+    assert isinstance(snapshot, dict) and isinstance(drawdown, dict)
+    snapshot.update({
+        "strategy_id": f"trend_animals_warm_to_hot/CN/{strategy_version}",
+        "strategy_version": strategy_version,
+    })
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["kelly_sample_inherits"] = [
+        {
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v4",
+            "opening_strategy_version": "v4",
+        },
+        {
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v7",
+            "opening_strategy_version": "v7",
+        },
+    ]
+    drawdown.update({
+        "strategy_id": f"trend_animals_warm_to_hot/CN/{strategy_version}",
+        "strategy_version": strategy_version,
+        "kelly_sample_key": (
+            f"CN|trend_animals_warm_to_hot/CN/{strategy_version}|{strategy_version}"
+        ),
+    })
+    bootstrap = drawdown["bootstrap_event"]
+    assert isinstance(bootstrap, dict)
+    bootstrap.update({
+        "strategy_id": f"trend_animals_warm_to_hot/CN/{strategy_version}",
+        "strategy_version": strategy_version,
+    })
+
+    assert dashboard_module._valid_trend_risk_summary(payload)
+    parameters.pop("single_entry_risk_limit")
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
 def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
     tmp_path: Path,
 ) -> None:

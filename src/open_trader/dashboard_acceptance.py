@@ -44,6 +44,11 @@ TREND_REPORT_DIRECTORIES = {
 TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
+TREND_ACCEPTED_STRATEGY_VERSIONS = {
+    "CN": frozenset({"v4", "v6", "v7", "v8"}),
+    "US": frozenset({"v4", "v5"}),
+    "HK": frozenset({"v4", "v5"}),
+}
 ACCOUNT_VIEW_LABELS = {
     "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
     "phillips": ("真实持仓", "模拟盘持仓", "趋势报告", "港股复盘"),
@@ -461,10 +466,13 @@ def validate_integrated_candidate(
     labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
     for broker, market in TREND_SIMULATE_MARKETS.items():
         try:
-            expected_version = "v7" if broker == "eastmoney" else "v4"
             report = reports.get(broker)
             assert isinstance(report, Mapping) and report.get("available") is True, (
                 f"{broker} {market} 趋势报告不可用"
+            )
+            expected_version = str(report.get("strategy_version") or "")
+            assert expected_version in TREND_ACCEPTED_STRATEGY_VERSIONS[market], (
+                f"{broker} 趋势策略版本不在兼容白名单"
             )
             assert report.get("broker") == broker and report.get("market") == market, (
                 f"{broker} 三市场报告身份不匹配"
