@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
     ACTION_LABELS,
+    CNY_PER_LOCAL_CURRENCY,
     NON_REALTIME_ACCOUNT_WARNING,
     PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
@@ -961,6 +962,51 @@ def _canonical_trend_sell_symbol(item: dict[str, Any], market: str) -> str:
         return ""
 
 
+def _project_trend_money_fields(
+    item: dict[str, Any], *, payload: dict[str, Any], market: str
+) -> dict[str, Any]:
+    projected = dict(item)
+    snapshot = payload.get("strategy_snapshot")
+    parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
+    rate_value = projected.get("cny_per_local_currency")
+    if rate_value in (None, "") and isinstance(parameters, dict):
+        rate_value = parameters.get("cny_per_local_currency")
+    try:
+        rate = Decimal(str(rate_value)) if rate_value not in (None, "") else CNY_PER_LOCAL_CURRENCY[market]
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        rate = CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
+    if not rate.is_finite() or rate <= 0:
+        rate = CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
+    for raw_key, normalized_key in (
+        ("market_cap", "market_cap_cny_100m"),
+        ("amount", "amount_cny_100m"),
+    ):
+        if projected.get(normalized_key) not in (None, ""):
+            continue
+        raw = projected.get(raw_key)
+        if raw in (None, "") or isinstance(raw, bool):
+            continue
+        try:
+            value = Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if value.is_finite():
+            projected[normalized_key] = _decimal_text(value * rate)
+    return projected
+
+
+def _project_trend_money_items(
+    items: object, *, payload: dict[str, Any], market: str
+) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    return [
+        _project_trend_money_fields(item, payload=payload, market=market)
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
 def _project_trend_actions(
     payload: dict[str, Any],
     executions: dict[tuple[str, str], dict[str, Any]],
@@ -971,15 +1017,25 @@ def _project_trend_actions(
     list[dict[str, Any]],
 ]:
     judgments = payload["strategy_judgments"]
+    metadata = payload.get("metadata")
+    market = (
+        str(metadata.get("market") or "CN").upper()
+        if isinstance(metadata, dict)
+        else "CN"
+    )
     formal = [
         {
-            **item,
+            **(
+                projected_item := _project_trend_money_fields(
+                    item, payload=payload, market=market
+                )
+            ),
             **(
                 {"execution": executions[key]}
                 if (key := (
-                    str(item.get("symbol") or "").strip(),
+                    str(projected_item.get("symbol") or "").strip(),
                     {"BUY": "buy", "SELL_ALL": "sell", "SELL_PARTIAL": "sell"}.get(
-                        item.get("action"), ""
+                        projected_item.get("action"), ""
                     ),
                 )) in executions
                 else {}
@@ -987,12 +1043,8 @@ def _project_trend_actions(
         }
         for item in judgments["formal_actions"]
     ]
-    holdings = judgments["holding_decisions"]
-    metadata = payload.get("metadata")
-    market = (
-        str(metadata.get("market") or "CN").upper()
-        if isinstance(metadata, dict)
-        else "CN"
+    holdings = _project_trend_money_items(
+        judgments["holding_decisions"], payload=payload, market=market
     )
     full_exit_symbols = {
         symbol
@@ -1553,6 +1605,11 @@ def _project_broker_trend_report(
     sell_actions, buy_actions, hold_actions, review_actions = (
         _project_trend_actions(payload, executions)
     )
+    risk_skips = _project_trend_money_items(
+        payload["strategy_judgments"].get("risk_skips", []),
+        payload=payload,
+        market=market,
+    )
     account_fresh = account.get("fresh") is True
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})
@@ -1587,7 +1644,7 @@ def _project_broker_trend_report(
         buy_actions=buy_actions,
         hold_actions=hold_actions,
         review_actions=review_actions,
-        risk_skips=payload["strategy_judgments"].get("risk_skips", []),
+        risk_skips=risk_skips,
         broker_positions=broker_positions or [],
         cash_details=cash_details or [],
     )
@@ -1629,7 +1686,7 @@ def _project_broker_trend_report(
         ),
         "sell_actions": sell_actions,
         "buy_actions": buy_actions,
-        "risk_skips": payload["strategy_judgments"].get("risk_skips", []),
+        "risk_skips": risk_skips,
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "actual_overlay": actual_overlay,

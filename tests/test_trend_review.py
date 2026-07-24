@@ -3603,6 +3603,26 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
     )
 
     assert [event["status"] for event in events] == ["missed", "submitted"]
+    missed_path = next(
+        path
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+        if json.loads(path.read_text(encoding="utf-8"))["status"] == "missed"
+    )
+    original_missed = missed_path.read_bytes()
+    tampered_missed = json.loads(original_missed)
+    tampered_missed["recorded_at"] = "2026-07-17T10:00:00+08:00"
+    missed_path.write_text(json.dumps(tampered_missed), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="buy",
+        )
+    missed_path.write_bytes(original_missed)
     payload = json.loads(authorization.read_text(encoding="utf-8"))
     payload["report_sha256"] = "0" * 64
     authorization.write_text(json.dumps(payload), encoding="utf-8")

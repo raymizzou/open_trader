@@ -1866,6 +1866,30 @@ console.log(JSON.stringify({cn,us,missing}));
         assert raw not in combined
 
 
+def test_dashboard_trend_buy_missing_cells_and_cny_money_are_explicit() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendBuyStage({buy_window:"美股常规交易时段",buy_actions:[{
+  symbol:null,name:null,temperature_prev:null,temperature_curr:null,
+  filter_price:"207.27",close:"207.27",phase:"立夏",strength:"99.8",
+  industry:"医疗保健",industry_temperature:null,
+  market_cap:"3610",amount:"52",market_cap_cny_100m:"12345.678",
+  amount_cny_100m:"377.654",target_weight:"0.04",target_amount:"4941.49",
+  estimated_shares:23,estimated_initial_line:"205.47",
+}],risk_skips:[]});
+const row = html.match(/<tr class="cn-trend-card">[\s\S]*?<\/tr>/)?.[0] || "";
+if (!row.includes('<td data-label="标的">数据未提供</td>')) throw new Error(row);
+if (!row.includes('<td data-label="温度变化">数据未提供</td>')) throw new Error(row);
+if (row.includes("- → -") || row.includes('<td data-label="标的">-</td>')) throw new Error(row);
+if (!row.includes('<td data-label="市值（亿元）">12,345.68</td>')) throw new Error(row);
+if (!row.includes('<td data-label="日成交额（亿元）">377.65</td>')) throw new Error(row);
+if (row.includes('<td data-label="市值（亿元）">3,610</td>') ||
+    row.includes('<td data-label="日成交额（亿元）">52</td>')) throw new Error(row);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_display_number_preserves_lossless_integer_semantics() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify([

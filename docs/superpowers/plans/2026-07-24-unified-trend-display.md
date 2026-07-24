@@ -10,11 +10,14 @@
 
 ## Global Constraints
 
-- Only `dashboard_static/dashboard.js` and focused frontend tests change.
+- Dashboard renderer/projection, acceptance comparison, and focused tests may
+  change; frozen reports and strategy rules remain untouched.
 - Prices remain in each instrument's market currency.
 - Market cap and daily amount remain normalized CNY billions.
-- Missing values render as `数据未提供`; do not infer or backfill.
-- Do not change backend projections, frozen reports, strategy parameters, or exchange-rate logic.
+- Legacy local-currency actions receive projection-only normalized CNY fields
+  using the existing fixed market rates when no frozen normalized field exists;
+  persisted reports and exchange-rate definitions are unchanged.
+- Missing business values render as `数据未提供`; do not infer them.
 
 ---
 

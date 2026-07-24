@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 from .dashboard import (
     _is_dashboard_holding,
+    _project_trend_money_fields,
     _read_csv_rows,
     _valid_partial_trend_action,
 )
@@ -1891,6 +1892,18 @@ def _check_trend_artifact_projection(
     assert isinstance(holdings, list) and all(
         isinstance(item, Mapping) for item in holdings
     ), f"{broker} 冻结报告持仓动作无效"
+    formal = [
+        _project_trend_money_fields(
+            dict(item), payload=dict(payload), market=expected_market
+        )
+        for item in formal
+    ]
+    holdings = [
+        _project_trend_money_fields(
+            dict(item), payload=dict(payload), market=expected_market
+        )
+        for item in holdings
+    ]
     def canonical_sell_symbol(item: Mapping[str, Any]) -> str:
         try:
             return to_futu_symbol(expected_market, str(item.get("symbol") or ""))
@@ -2022,8 +2035,8 @@ def _check_action_trend_stages(
                     item.get("filter_price"), item.get("close"),
                     f"{_trend_table_text(item.get('temperature_prev'))} → {_trend_table_text(item.get('temperature_curr'))}",
                     item.get("phase"), item.get("strength"), item.get("industry"),
-                    item.get("industry_temperature"), item.get("market_cap"),
-                    item.get("amount"), f"{format(weight.normalize(), 'f')}%",
+                    item.get("industry_temperature"), item.get("market_cap_cny_100m"),
+                    item.get("amount_cny_100m"), f"{format(weight.normalize(), 'f')}%",
                     item.get("target_amount"), f"{_plain(item.get('estimated_shares'))} 股",
                     _display_price(item.get("estimated_initial_line")),
                 )

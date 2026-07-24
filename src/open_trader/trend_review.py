@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -1165,6 +1166,26 @@ def _action_events(root: Path) -> list[dict[str, object]]:
     return events
 
 
+def _validate_canonical_action_event_names(root: Path) -> None:
+    for path in sorted(root.glob("*.json")):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+-[0-9a-f]{12}\.json", path.name):
+            continue
+        try:
+            body = path.read_bytes()
+            payload = json.loads(body)
+            recorded_at = payload.get("recorded_at")
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError) as exc:
+            raise ValueError("invalid trend action event evidence") from exc
+        if not isinstance(payload, dict) or not isinstance(recorded_at, str):
+            raise ValueError("invalid trend action event evidence")
+        expected = (
+            f"{recorded_at.replace(':', '-')}-"
+            f"{hashlib.sha256(body).hexdigest()[:12]}.json"
+        )
+        if path.name != expected:
+            raise ValueError("invalid trend action event evidence")
+
+
 def _write_uncertain_action_event_once(
     *,
     data_dir: Path,
@@ -1870,6 +1891,7 @@ def load_trend_action_audit(
         side=side,
     )
     events = _action_events(action_root)
+    _validate_canonical_action_event_names(action_root)
     filled_terminal = False
     for event in events:
         try:

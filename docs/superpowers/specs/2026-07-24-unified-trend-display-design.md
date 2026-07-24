@@ -16,15 +16,18 @@ historical artifacts.
   目标仓位、目标金额、预计数量、预计保护线。
 - Keep prices in the instrument's market currency. Keep market cap and daily
   amount in the existing normalized CNY billions.
-- Render absent values as `数据未提供`; do not infer or backfill them.
+- The Dashboard projection exposes normalized CNY-亿元 fields for legacy local
+  currency actions using the existing fixed market rate when a frozen normalized
+  field is absent; persisted reports are not rewritten.
+- Render absent values as `数据未提供`; do not infer missing business fields.
 - Preserve existing execution, risk, audit, and mobile horizontal-scroll
   behavior.
 
 ## Scope
 
-Only `dashboard_static/dashboard.js` and its focused frontend tests change.
-Backend projections, frozen reports, strategy parameters, and exchange-rate
-logic remain untouched.
+The Dashboard renderer/projection, acceptance comparator, and focused tests may
+change. Frozen reports, strategy parameters, and exchange-rate definitions
+remain untouched; projection-only normalization uses the existing fixed rates.
 
 ## Verification
 

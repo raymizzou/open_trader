@@ -2012,6 +2012,64 @@ def test_dashboard_projects_partial_sell_goal_and_manual_real_account_guidance(
     assert below_lot["simulation_quantity"] == "0"
 
 
+@pytest.mark.parametrize(
+    ("market", "raw_market_cap", "raw_amount", "expected_market_cap", "expected_amount"),
+    [
+        ("US", "3610", "52", "26239.35185185185185185185185", "377.962962962962962962962963"),
+        ("HK", "3610", "52", "3342.592592592592592592592592", "48.14814814814814814814814815"),
+    ],
+)
+def test_dashboard_projects_legacy_trend_money_as_cny_billions(
+    market: str,
+    raw_market_cap: str,
+    raw_amount: str,
+    expected_market_cap: str,
+    expected_amount: str,
+) -> None:
+    payload = {
+        "metadata": {"market": market},
+        "strategy_snapshot": {"strategy_version": "v1"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "TARGET",
+                "market_cap": raw_market_cap,
+                "amount": raw_amount,
+            }],
+            "holding_decisions": [],
+        },
+    }
+
+    _, buys, _, _ = dashboard_module._project_trend_actions(payload, {})
+
+    assert buys[0]["market_cap_cny_100m"] == expected_market_cap
+    assert buys[0]["amount_cny_100m"] == expected_amount
+
+
+def test_dashboard_preserves_frozen_trend_cny_money_fields() -> None:
+    payload = {
+        "metadata": {"market": "US"},
+        "strategy_snapshot": {"strategy_version": "v5"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "TARGET",
+                "market_cap": "3610",
+                "amount": "52",
+                "market_cap_cny_100m": "12345.678",
+                "amount_cny_100m": "377.654",
+                "cny_per_local_currency": "7.25",
+            }],
+            "holding_decisions": [],
+        },
+    }
+
+    _, buys, _, _ = dashboard_module._project_trend_actions(payload, {})
+
+    assert buys[0]["market_cap_cny_100m"] == "12345.678"
+    assert buys[0]["amount_cny_100m"] == "377.654"
+
+
 def test_dashboard_projects_only_strict_partial_sells_and_full_exit_wins() -> None:
     valid_partial = {
         "action": "SELL_PARTIAL",
