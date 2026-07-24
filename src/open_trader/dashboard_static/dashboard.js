@@ -2454,7 +2454,6 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate, si
       <dl><div><dt>策略累计回撤</dt><dd>${trendRiskPercent(drawdown.drawdown_pct)} / ${trendRiskPercent(drawdown.drawdown_limit_pct)}</dd></div>
       <div><dt>策略模拟净值</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.current_equity))}</dd></div>
       <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}${recoveryRows}</div>` : ""}
-    ${simulationOverlay}
     ${renderTrendActualOverlay(actualOverlay)}
     </div>
   </details>`;
@@ -3057,8 +3056,11 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const holdStage = sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold");
   const disciplineCards = renderTrendDisciplineCards(report);
   const industryContext = renderTrendIndustryContext(report);
+  const simulationOverlay = historical
+    ? ""
+    : renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]);
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date,
-    historical ? "" : renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]));
+    simulationOverlay);
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
@@ -3093,6 +3095,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${industryContext}
     ${disciplineCards}
     ${riskSummary}
+    ${simulationOverlay}
     ${renderTrendControllerStatus(report.broker)}
     ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
   </${root}>`;
