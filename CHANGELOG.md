@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-24
 
+- Unified CN/US/HK trend-report buy tables around one column order and explicit
+  missing-value labels while preserving market-specific discipline and audit
+  sections; verified the focused Dashboard web and acceptance suites.
 - Added an append-only CN trend-report revision migration that can select an
   already delivered report without rewriting the original revision completion
   or rerunning the report.
