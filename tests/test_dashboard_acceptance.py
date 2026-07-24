@@ -4658,6 +4658,22 @@ def test_validate_dashboard_payload_accepts_real_contract() -> None:
     assert validate_dashboard_payload(valid_payload(), expected_cn=5) == []
 
 
+def test_acceptance_allows_recent_frozen_report_after_friday_close() -> None:
+    report = {
+        "data_status": "stale",
+        "generated_at": "2026-07-24T18:00:00+08:00",
+    }
+
+    assert dashboard_acceptance._trend_report_is_current_or_recent_weekend_snapshot(
+        report,
+        now=datetime(2026, 7, 25, 9, 0, tzinfo=dashboard_acceptance.SHANGHAI),
+    )
+    assert not dashboard_acceptance._trend_report_is_current_or_recent_weekend_snapshot(
+        report,
+        now=datetime(2026, 7, 24, 9, 0, tzinfo=dashboard_acceptance.SHANGHAI),
+    )
+
+
 def test_validate_dashboard_payload_rejects_retired_tiger_strategy_payload() -> None:
     payload = valid_payload()
     payload["tiger_" + "long_term_strategy"] = {"status": "shadow"}

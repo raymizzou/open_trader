@@ -14,6 +14,7 @@ from typing import Any
 from urllib.request import urlopen
 
 from .dashboard import (
+    SHANGHAI,
     _is_dashboard_holding,
     _project_trend_money_fields,
     _read_csv_rows,
@@ -401,6 +402,36 @@ def trend_advice_signature(payload: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(signature)
 
 
+def _trend_report_is_current_or_recent_weekend_snapshot(
+    report: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Keep strict current-report checks while allowing the latest weekend snapshot.
+
+    The dashboard is routinely reviewed after the Friday close, before the next
+    market session has produced a new report.  In that window a recent frozen
+    report is intentionally marked ``stale`` by the product; rejecting it here
+    would make the acceptance gate depend on the wall-clock crossing midnight.
+    Weekdays still require ``data_status=current``.
+    """
+    if report.get("data_status") == "current":
+        return True
+    if report.get("data_status") != "stale":
+        return False
+    now = now or datetime.now(SHANGHAI)
+    if now.weekday() < 5:
+        return False
+    try:
+        generated_at = datetime.fromisoformat(str(report.get("generated_at") or ""))
+    except (TypeError, ValueError):
+        return False
+    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+        return False
+    age = (now.date() - generated_at.astimezone(SHANGHAI).date()).days
+    return 0 <= age <= 3
+
+
 def validate_integrated_candidate(
     payload: Mapping[str, Any],
     *,
@@ -478,7 +509,7 @@ def validate_integrated_candidate(
             assert report.get("broker") == broker and report.get("market") == market, (
                 f"{broker} 三市场报告身份不匹配"
             )
-            assert report.get("data_status") == "current", (
+            assert _trend_report_is_current_or_recent_weekend_snapshot(report), (
                 f"{broker} 未加载当前真实数据报告"
             )
             assert report.get("account_fresh") is True, (
