@@ -5,6 +5,8 @@
 Implemented and committed as `382dafe feat: version contextual trend selection`.
 Dashboard compatibility follow-up was committed as
 `b379658 fix: keep dashboard trend versions compatible`.
+Projection compatibility follow-up was committed as
+`60da93c fix: preserve inherited trend review identities`.
 
 ## TDD evidence
 
