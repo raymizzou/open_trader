@@ -79,3 +79,34 @@ Compilation and `git diff --check` both passed.
 ## Commit
 
 Implementation and tests: `bdd1cd8397f6802c2b529f70b1bb583c73b822cd`
+
+## Review fix
+
+The review found that replacing `CandidateInput.industry_temperature` with
+the later breadth state could re-run the CN entry hard gate and remove a
+candidate whose early gate temperature was allowed. The runner now preserves
+the early temperature; the later state remains frozen in `industry_contexts`.
+
+RED regression:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest \
+  tests/test_a_share_trend.py -k cn_entry_gate_keeps_early_temperature -v
+```
+
+Before the fix, the assertion failed because `top10_candidates` was `[]`
+instead of `['000001', '000002']` while the later state was `平`.
+
+GREEN covering runners:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest \
+  tests/test_a_share_trend.py tests/test_market_trend.py -q
+```
+
+Exact result: `346 passed in 1.35s`.
+
+The context suite also passed: `17 passed in 0.03s`; compilation and
+`git diff --check` passed.
+
+Review-fix commit: `fa9d0699f9423b651bf40e507600f0b1045153f9`
