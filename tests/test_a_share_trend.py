@@ -4432,6 +4432,7 @@ class ReadyApi:
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
         industry_ids: dict[int, int] | None = None,
+        industry_state_temperature: str = "热",
         ignored_stale_components: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.calls = calls
@@ -4444,6 +4445,7 @@ class ReadyApi:
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
         self.industry_ids = industry_ids or {}
+        self.industry_state_temperature = industry_state_temperature
         self.ignored_stale_components = ignored_stale_components
         self.snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
         self.balance_calls = 0
@@ -4520,7 +4522,7 @@ class ReadyApi:
                 {
                     "tmId": tm_id,
                     "asOfDate": expected_date,
-                    "trendTemperatureCurr": "热",
+                    "trendTemperatureCurr": self.industry_state_temperature,
                     "trendStrengthLocalCurr": "92",
                 }
                 for tm_id in tm_ids
@@ -4595,6 +4597,28 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["query"]["component_pool_ids"] == [622466, 697199]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
+
+
+def test_cn_entry_gate_keeps_early_temperature_when_industry_state_changes(
+    tmp_path: Path,
+) -> None:
+    api = ReadyApi([], industry_state_temperature="平")
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: api,
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert [
+        item["symbol"] for item in payload["strategy_judgments"]["top10_candidates"]
+    ] == [
+        "000001",
+        "000002",
+    ]
+    assert payload["industry_contexts"][0]["temperature"] == "平"
 
 
 def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_members(

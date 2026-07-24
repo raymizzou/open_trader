@@ -977,37 +977,6 @@ def _attempt_market_report(
                 history_root=paths.root.parent / "trend_industry_context",
             )
         )
-        context_by_id = {
-            context.industry_tm_id: context for context in industry_contexts
-        }
-        candidates = [
-            replace(
-                item,
-                industry_temperature=(
-                    context_by_id[item.industry_tm_id].temperature
-                    if item.industry_tm_id in context_by_id
-                    and context_by_id[item.industry_tm_id].temperature is not None
-                    else item.industry_temperature
-                ),
-            )
-            for item in candidates
-        ]
-        holding_snapshots = {
-            symbol: (
-                replace(
-                    snapshot,
-                    industry_temperature=(
-                        context_by_id[snapshot.industry_tm_id].temperature
-                        if snapshot.industry_tm_id in context_by_id
-                        and context_by_id[snapshot.industry_tm_id].temperature is not None
-                        else snapshot.industry_temperature
-                    ),
-                )
-                if snapshot is not None
-                else None
-            )
-            for symbol, snapshot in holding_snapshots.items()
-        }
         balance_after = _balance(api.get_account_balance())
 
         lot_sizes: dict[str, int] = {}
