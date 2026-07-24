@@ -50,11 +50,12 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def unlock_live_drawdown(data_dir: Path, market: str) -> None:
+    version = "v5"
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
-        strategy_id=f"trend_animals_warm_to_hot/{market}/v4",
-        strategy_version="v4",
+        strategy_id=f"trend_animals_warm_to_hot/{market}/{version}",
+        strategy_version=version,
         parameters={"drawdown_limit": "0.05"},
         baseline_equity=Decimal("100000"),
         source_date="2026-07-13",
@@ -206,7 +207,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     )
     live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
     assert (live["strategy_id"], live["strategy_version"]) == (
-        f"trend_animals_warm_to_hot/{market}/v4", "v4"
+        f"trend_animals_warm_to_hot/{market}/v5", "v5"
     )
     assert live["parameters"]["overheat_trim_fraction"] == "0.30"
     assert {row["name"] for row in live["parameter_rows"]} >= {
@@ -217,6 +218,25 @@ def test_market_strategy_snapshot_matches_runtime_rules(
         "不足一手处理",
         "清仓优先级",
     }
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_live_market_strategy_snapshot_defaults_to_v5_with_exact_inheritance(
+    market: str,
+) -> None:
+    pools = (622460,) if market == "US" else (622494,)
+    snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
+
+    assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/v5"
+    assert snapshot["strategy_version"] == "v5"
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": market,
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v5")
+    ]
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -876,7 +896,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None

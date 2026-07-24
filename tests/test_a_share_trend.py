@@ -409,7 +409,7 @@ def unlock_live_drawdown(
     *,
     market: str = "CN",
     equity: str = "100000",
-    strategy_version: str = "v7",
+    strategy_version: str = "v8",
 ) -> None:
     automatic_bootstrap_strategy_drawdown(
         data_dir,
@@ -560,7 +560,7 @@ def test_trend_v3_effective_date_is_shared_across_markets(market: str) -> None:
 
 def test_live_cn_strategy_snapshot_is_v7_with_v4_sample_inheritance() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
-        "CN", "abc123", (622466, 697199)
+        "CN", "abc123", (622466, 697199), strategy_version="v7"
     )
 
     assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v7"
@@ -591,6 +591,66 @@ def test_live_cn_v6_strategy_snapshot_remains_historical() -> None:
     assert snapshot["parameters"]["allowed_industry_temperatures"] == [
         "温", "热", "沸",
     ]
+
+
+def test_live_cn_strategy_snapshot_defaults_to_v8_with_all_approved_inheritance() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199)
+    )
+
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v8"
+    assert snapshot["strategy_version"] == "v8"
+    assert snapshot["effective_from"] == "2026-07-24"
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": "CN",
+            "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v7", "v8")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("market", "expected_version"),
+    [("US", "v5"), ("HK", "v5")],
+)
+def test_live_non_cn_strategy_snapshot_defaults_to_v5_with_exact_inheritance(
+    market: str, expected_version: str,
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market, "abc123", (622460,) if market == "US" else (622494,)
+    )
+
+    assert snapshot["strategy_id"] == (
+        f"trend_animals_warm_to_hot/{market}/{expected_version}"
+    )
+    assert snapshot["strategy_version"] == expected_version
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": market,
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v5")
+    ]
+
+
+@pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8"])
+def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466,), strategy_version=version
+    )
+    assert snapshot["strategy_version"] == version
+
+
+@pytest.mark.parametrize("version", ["v4", "v5"])
+def test_live_us_hk_supported_versions_remain_replay_valid(version: str) -> None:
+    for market, pools in (("US", (622460,)), ("HK", (622494,))):
+        snapshot = trend_module.live_trend_strategy_snapshot(
+            market, "abc123", pools, strategy_version=version
+        )
+        assert snapshot["strategy_version"] == version
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
@@ -1601,7 +1661,7 @@ def test_cn_v7_report_keeps_v4_samples_without_admitting_v5_or_v6() -> None:
         bars_by_symbol={},
         market="CN",
         strategy_snapshot=trend_module.live_trend_strategy_snapshot(
-            "CN", "abc123", (622466, 697199)
+            "CN", "abc123", (622466, 697199), strategy_version="v7"
         ),
         kelly_rounds=rounds,
     )
@@ -1913,7 +1973,7 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
 
 def test_v7_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
     strategy_snapshot = trend_module.live_trend_strategy_snapshot(
-        "CN", "drawdown123", (622466, 697199)
+        "CN", "drawdown123", (622466, 697199), strategy_version="v7"
     )
     drawdown_summary = {
         "schema_version": "open_trader.strategy_drawdown.v1",
@@ -4579,7 +4639,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v7"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v8"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -4843,13 +4903,13 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["account"]["positions"] == []
     assert payload["metadata"]["simulate_acc_id"] == 101
-    assert payload["strategy_snapshot"]["strategy_version"] == "v7"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v8"
     assert payload["drawdown_summary"]["state_status"] == "missing"
     assert payload["drawdown_summary"]["entry_allowed"] is False
     assert payload["strategy_judgments"]["formal_actions"] == []
 
 
-def test_generated_report_keeps_v7_identity_kelly_scope_and_drawdown_continuity(
+def test_generated_report_keeps_v8_identity_kelly_scope_and_drawdown_continuity(
     tmp_path: Path,
 ) -> None:
     config = trend_config(tmp_path)
@@ -4867,16 +4927,19 @@ def test_generated_report_keeps_v7_identity_kelly_scope_and_drawdown_continuity(
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     snapshot = payload["strategy_snapshot"]
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v7"
-    assert snapshot["strategy_version"] == "v7"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v8"
+    assert snapshot["strategy_version"] == "v8"
     assert snapshot["parameters"]["kelly_sample_scope"] == (
         "market+strategy_id+opening_strategy_version"
     )
-    assert snapshot["parameters"]["kelly_sample_inherits"] == [{
-        "market": "CN",
-        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
-        "opening_strategy_version": "v4",
-    }]
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": "CN",
+            "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v7", "v8")
+    ]
     after = json.loads(state_path.read_text(encoding="utf-8"))
     assert after["audit_events"] == before["audit_events"]
 

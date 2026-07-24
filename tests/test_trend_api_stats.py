@@ -429,6 +429,46 @@ def test_cn_v7_stats_inherit_only_v4_for_both_sources() -> None:
         ]["eligible_sample_count"] == 1
 
 
+def test_cn_v8_stats_expose_all_approved_contributing_opening_versions() -> None:
+    fills = [
+        item
+        for source in ("simulation", "actual")
+        for version in ("v4", "v5", "v6", "v7", "v8")
+        for item in _cn_closed_pair(
+            f"{source}-{version}", version, source=source
+        )
+    ]
+    payload = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v8",
+            "strategy_version": "v8",
+        }],
+        generated_at="2026-07-12T00:00:00+08:00",
+        statistics_cutoff_at="2026-07-11T23:59:59+08:00",
+    )
+    stats = {
+        (
+            item["source"],
+            item["strategy_id"],
+            item["opening_strategy_version"],
+        ): item
+        for item in payload["stats"]
+    }
+
+    for source in ("simulation", "actual"):
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v8", "v8")
+        ]["eligible_sample_count"] == 3
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v5", "v5")
+        ]["eligible_sample_count"] == 1
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v6", "v6")
+        ]["eligible_sample_count"] == 1
+
+
 def test_fill_and_round_order_uses_timestamp_instants_not_iso_text() -> None:
     buy = fill(
         "buy", side="buy", quantity="1", price="10", fee="0",
