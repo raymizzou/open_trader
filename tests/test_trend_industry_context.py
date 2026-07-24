@@ -142,6 +142,47 @@ def test_calculation_records_stable_reasons_for_invalid_context_inputs() -> None
     )
 
 
+@pytest.mark.parametrize("warm_to_hot_count", [True, -1, "3"])
+def test_calculation_rejects_invalid_warm_to_hot_count(
+    warm_to_hot_count: object,
+) -> None:
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="工业",
+        expected_date="2026-07-24",
+        component_tm_ids=list(range(1, 11)),
+        member_rows=[_member(tm_id) for tm_id in range(1, 11)],
+        industry_row=_industry(),
+        warm_to_hot_count=warm_to_hot_count,  # type: ignore[arg-type]
+    )
+
+    assert context.warm_to_hot_count == 0
+    assert not context.valid
+    assert context.invalid_reasons == ("warm_to_hot_count_invalid",)
+
+
+def test_calculation_requires_matching_industry_state_row_id() -> None:
+    industry_row = _industry()
+    industry_row.pop("tmId")
+
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="工业",
+        expected_date="2026-07-24",
+        component_tm_ids=list(range(1, 11)),
+        member_rows=[_member(tm_id) for tm_id in range(1, 11)],
+        industry_row=industry_row,
+        warm_to_hot_count=0,
+    )
+
+    assert context.temperature is None
+    assert context.strength is None
+    assert context.invalid_reasons == (
+        "industry_temperature_invalid",
+        "industry_strength_invalid",
+    )
+
+
 def _valid_context(
     industry_tm_id: int = 700001,
     *,
@@ -149,18 +190,19 @@ def _valid_context(
     temperature: str = "热",
     right_share: str = "0.279",
 ) -> IndustryContext:
+    share = Decimal(right_share)
     return IndustryContext(
         industry_tm_id=industry_tm_id,
         industry="工业",
         as_of_date=as_of_date,
-        component_count=100,
-        snapshot_count=100,
-        tradable_count=100,
-        valid_count=100,
-        right_count=27,
+        component_count=1000,
+        snapshot_count=1000,
+        tradable_count=1000,
+        valid_count=1000,
+        right_count=int(share * Decimal("1000")),
         snapshot_coverage=Decimal("1"),
         right_state_coverage=Decimal("1"),
-        right_share=Decimal(right_share),
+        right_share=share,
         warm_to_hot_count=5,
         temperature=temperature,
         strength=Decimal("90"),
@@ -254,3 +296,50 @@ def test_history_loader_skips_invalid_file_and_duplicate_industry_rows(
     assert load_latest_prior_context(
         tmp_path, market="CN", before_date="2026-07-24"
     ) == {}
+
+
+@pytest.mark.parametrize("field", ["generated_at", "strategy_version"])
+def test_history_loader_requires_top_level_metadata(
+    tmp_path: Path, field: str
+) -> None:
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-22T18:00:00+08:00",
+        strategy_version="v8",
+        contexts=(_valid_context(as_of_date="2026-07-22"),),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop(field)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    ) == {}
+
+
+def test_history_loader_skips_semantically_invalid_stored_valid_context(
+    tmp_path: Path,
+) -> None:
+    # This mutation is intentionally performed in-memory to keep the test at
+    # the history loader seam while proving stored `valid=True` is not trusted.
+    valid = _valid_context(industry_tm_id=700002, as_of_date="2026-07-22")
+    invalid = _valid_context(industry_tm_id=700001, as_of_date="2026-07-22")
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-22T18:00:00+08:00",
+        strategy_version="v8",
+        contexts=(invalid, valid),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    next(
+        row for row in payload["industries"] if row["industry_tm_id"] == 700001
+    )["component_count"] = 9
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    )
+
+    assert set(loaded) == {700002}

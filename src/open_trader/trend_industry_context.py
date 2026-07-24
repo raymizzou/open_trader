@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 from dataclasses import dataclass, fields, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -49,6 +49,7 @@ def calculate_industry_context(
     industry_row: Mapping[str, object] | None,
     warm_to_hot_count: int,
 ) -> IndustryContext:
+    normalized_warm_to_hot_count = _nonnegative_int(warm_to_hot_count)
     component_ids = {
         value for value in (_positive_int(item) for item in component_tm_ids) if value
     }
@@ -120,6 +121,8 @@ def calculate_industry_context(
         invalid_reasons.append("right_state_coverage_below_90pct")
     if valid_count < 10:
         invalid_reasons.append("valid_count_below_10")
+    if normalized_warm_to_hot_count is None:
+        invalid_reasons.append("warm_to_hot_count_invalid")
     if temperature is None:
         invalid_reasons.append("industry_temperature_invalid")
     if strength is None:
@@ -137,11 +140,7 @@ def calculate_industry_context(
         snapshot_coverage=snapshot_coverage,
         right_state_coverage=right_state_coverage,
         right_share=right_share,
-        warm_to_hot_count=(
-            warm_to_hot_count
-            if isinstance(warm_to_hot_count, int) and not isinstance(warm_to_hot_count, bool)
-            else 0
-        ),
+        warm_to_hot_count=normalized_warm_to_hot_count or 0,
         temperature=temperature,
         strength=strength,
         valid=not invalid_reasons,
@@ -162,14 +161,20 @@ def _positive_int(value: object) -> int | None:
     return value
 
 
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _industry_row_matches(
     row: Mapping[str, object], industry_tm_id: int, expected_date: str
 ) -> bool:
-    if _row_value(row, "asOfDate", "as_of_date") != expected_date:
-        return False
-    if "tmId" in row or "tm_id" in row:
-        return _positive_int(_row_value(row, "tmId", "tm_id")) == industry_tm_id
-    return True
+    return (
+        _row_value(row, "asOfDate", "as_of_date") == expected_date
+        and ("tmId" in row or "tm_id" in row)
+        and _positive_int(_row_value(row, "tmId", "tm_id")) == industry_tm_id
+    )
 
 
 def _valid_strength(value: object) -> Decimal | None:
@@ -290,6 +295,8 @@ def write_industry_context_history(
     contexts: Sequence[IndustryContext],
 ) -> Path:
     market_name = str(market).upper()
+    if not _valid_history_metadata(generated_at, strategy_version):
+        raise ValueError("industry context history metadata is invalid")
     context_rows = list(contexts)
     if any(not isinstance(context, IndustryContext) for context in context_rows):
         raise ValueError("industry context history rows must be IndustryContext objects")
@@ -349,6 +356,21 @@ def _parse_iso_date(value: object) -> date:
         raise ValueError(f"invalid history date: {value!r}") from None
 
 
+def _valid_history_metadata(generated_at: object, strategy_version: object) -> bool:
+    if (
+        not isinstance(generated_at, str)
+        or not generated_at.strip()
+        or not isinstance(strategy_version, str)
+        or not strategy_version.strip()
+    ):
+        return False
+    try:
+        datetime.fromisoformat(generated_at)
+    except ValueError:
+        return False
+    return True
+
+
 def _context_to_mapping(context: IndustryContext) -> dict[str, object]:
     return {
         field.name: _json_value(getattr(context, field.name))
@@ -380,6 +402,9 @@ def _contexts_from_history_payload(
         payload.get("schema_version") != _HISTORY_SCHEMA_VERSION
         or payload.get("market") != market
         or payload.get("as_of_date") != stored_date
+        or not _valid_history_metadata(
+            payload.get("generated_at"), payload.get("strategy_version")
+        )
         or not isinstance(payload.get("industries"), list)
     ):
         return None
@@ -394,7 +419,8 @@ def _contexts_from_history_payload(
         if context.industry_tm_id in seen_ids:
             return None
         seen_ids.add(context.industry_tm_id)
-        contexts.append(context)
+        if _context_is_valid_for_history(context):
+            contexts.append(context)
     return contexts
 
 
@@ -429,12 +455,10 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
     reasons = row.get("invalid_reasons")
     if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
         return None
-    if row["valid"] and reasons:
-        return None
     decimals: dict[str, Decimal] = {}
     for field in ("snapshot_coverage", "right_state_coverage"):
         parsed = _history_decimal(row.get(field))
-        if parsed is None or parsed < 0 or parsed > 1:
+        if parsed is None:
             return None
         decimals[field] = parsed
     optional_decimals: dict[str, Decimal | None] = {}
@@ -447,10 +471,6 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         parsed = _history_optional_decimal(row.get(field))
         if row.get(field) is not None and parsed is None:
             return None
-        if field in {"right_share", "prior_right_share"} and parsed is not None and not (
-            Decimal("0") <= parsed <= Decimal("1")
-        ):
-            return None
         optional_decimals[field] = parsed
     temperature = row.get("temperature")
     prior_temperature = row.get("prior_temperature")
@@ -459,24 +479,12 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
     for value in (temperature, prior_temperature, temperature_direction, prior_as_of_date):
         if value is not None and not isinstance(value, str):
             return None
-    if temperature is not None and temperature not in KNOWN_TEMPERATURES:
-        return None
-    if prior_temperature is not None and prior_temperature not in KNOWN_TEMPERATURES:
-        return None
-    if temperature_direction is not None and temperature_direction not in {
-        "rising",
-        "unchanged",
-        "falling",
-    }:
-        return None
     if prior_as_of_date is not None:
         try:
             _parse_iso_date(prior_as_of_date)
         except ValueError:
             return None
     strength = optional_decimals["strength"]
-    if strength is not None and not (Decimal("0") <= strength <= Decimal("100")):
-        return None
     return IndustryContext(
         industry_tm_id=industry_tm_id,
         industry=str(row["industry"]),
@@ -494,6 +502,42 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         prior_right_share=optional_decimals["prior_right_share"],
         temperature_direction=temperature_direction,
         right_share_change_pp=optional_decimals["right_share_change_pp"],
+    )
+
+
+def _context_is_valid_for_history(context: IndustryContext) -> bool:
+    if not context.valid or context.invalid_reasons:
+        return False
+    if context.component_count < 10:
+        return False
+    if not (
+        0 <= context.snapshot_count <= context.component_count
+        and context.snapshot_coverage >= Decimal("0.9")
+        and context.snapshot_coverage
+        == Decimal(context.snapshot_count) / Decimal(context.component_count)
+    ):
+        return False
+    if not (
+        0 <= context.tradable_count <= context.snapshot_count
+        and 0 <= context.valid_count <= context.tradable_count
+        and context.valid_count >= 10
+        and context.right_state_coverage >= Decimal("0.9")
+        and context.right_state_coverage
+        == Decimal(context.valid_count) / Decimal(context.tradable_count)
+    ):
+        return False
+    if not (
+        0 <= context.right_count <= context.valid_count
+        and context.right_share is not None
+        and 0 <= context.right_share <= 1
+        and context.right_share
+        == Decimal(context.right_count) / Decimal(context.valid_count)
+    ):
+        return False
+    return (
+        _nonnegative_int(context.warm_to_hot_count) is not None
+        and context.temperature in KNOWN_TEMPERATURES
+        and _valid_strength(context.strength) is not None
     )
 
 
