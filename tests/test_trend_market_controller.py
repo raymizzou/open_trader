@@ -6052,6 +6052,100 @@ def test_pending_revision_completes_existing_delivered_r1_without_r2(
     assert not (r1_path.parent / "2026-07-17-r2.json").exists()
 
 
+def test_revision_migration_selects_existing_report_without_rewriting_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    request_path = controller._request_revision(config, cycle, NOW)
+    r1_path, r1 = write_report(config, revision=1)
+    write_report_delivery_receipt(config, r1_path, r1, status="sent")
+    controller._complete_revision(config, cycle, (r1_path, r1), NOW)
+    r6_path, r6 = write_report(config, revision=6)
+    write_report_delivery_receipt(config, r6_path, r6, status="sent")
+
+    migration_path = controller._record_revision_migration(
+        config,
+        cycle,
+        (r6_path, r6),
+        actor="acceptance",
+        reason="选择已存在且已交付的 r6，不重跑报告",
+        authorized_at=datetime.fromisoformat("2026-07-20T10:01:00+08:00"),
+        accepted_git_sha="a" * 40,
+    )
+
+    migration = json.loads(migration_path.read_text(encoding="utf-8"))
+    assert migration["revision_request_path"] == str(request_path)
+    assert migration["from_report_path"] == str(r1_path)
+    assert migration["to_report_path"] == str(r6_path)
+    assert migration["to_report_sha256"] == _report_hash(r6)
+    _, effective_completion = controller._revision_state(
+        config, cycle.market, cycle.as_of_date, cycle.execution_date
+    )
+    assert effective_completion is not None
+    assert effective_completion["report_path"] == str(r6_path)
+    assert effective_completion["report_sha256"] == _report_hash(r6)
+    original_completion = json.loads(
+        controller._revision_paths(config, cycle.market, cycle.as_of_date)[1]
+        .read_text(encoding="utf-8")
+    )
+    assert original_completion["report_path"] == str(r1_path)
+    assert (
+        controller._record_revision_migration(
+            config,
+            cycle,
+            (r6_path, r6),
+            actor="acceptance",
+            reason="选择已存在且已交付的 r6，不重跑报告",
+            authorized_at=datetime.fromisoformat("2026-07-20T10:01:00+08:00"),
+            accepted_git_sha="a" * 40,
+        )
+        == migration_path
+    )
+    with pytest.raises(ValueError, match="immutable trend report revision migration collision"):
+        controller._record_revision_migration(
+            config,
+            cycle,
+            (r6_path, r6),
+            actor="acceptance",
+            reason="选择已存在且已交付的 r6，不重跑报告",
+            authorized_at=datetime.fromisoformat("2026-07-20T10:02:00+08:00"),
+            accepted_git_sha="a" * 40,
+        )
+    migration["unexpected"] = True
+    migration_path.write_text(json.dumps(migration), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid trend report revision migration"):
+        controller._revision_state(
+            config, cycle.market, cycle.as_of_date, cycle.execution_date
+        )
+
+
+def test_revision_migration_rejects_report_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    write_report(config)
+    controller._request_revision(config, cycle, NOW)
+    r1_path, r1 = write_report(config, revision=1)
+    write_report_delivery_receipt(config, r1_path, r1, status="sent")
+    controller._complete_revision(config, cycle, (r1_path, r1), NOW)
+
+    with pytest.raises(ValueError, match="invalid trend report revision migration"):
+        controller._record_revision_migration(
+            config,
+            cycle,
+            (r1_path, r1),
+            actor="acceptance",
+            reason="不能回滚",
+            authorized_at=datetime.fromisoformat("2026-07-20T10:01:00+08:00"),
+            accepted_git_sha="a" * 40,
+        )
+
+
 def test_pending_revision_recovers_existing_failed_r1_and_binds_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

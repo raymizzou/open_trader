@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-24
 
+- Added an append-only CN trend-report revision migration that can select an
+  already delivered report without rewriting the original revision completion
+  or rerunning the report.
 - Unified CN/US/HK trend entry and flat-temperature exit discipline; US/HK now
   use frozen local-currency-to-CNY thresholds, industry snapshots, and v5
   cold-start samples while CN retains its v4+v7 exception. Verified the full

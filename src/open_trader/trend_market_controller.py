@@ -1576,6 +1576,16 @@ def _revision_paths(
     )
 
 
+def _revision_migration_path(
+    config: DailyPremarketConfig, market: str, as_of_date: str
+) -> Path:
+    return (
+        _controller_root(config, market)
+        / "revision_migrations"
+        / f"{as_of_date}.json"
+    )
+
+
 def _revision_gate_path(
     config: DailyPremarketConfig, market: str, execution_date: str
 ) -> Path:
@@ -1684,6 +1694,242 @@ def _pending_revision_report(
     return latest
 
 
+def _load_revision_migration(
+    config: DailyPremarketConfig,
+    market: str,
+    as_of_date: str,
+    execution_date: str,
+    request_path: Path,
+    request: Mapping[str, object],
+    completion_path: Path,
+    completion: Mapping[str, object],
+    baseline_revision: int,
+) -> dict[str, object] | None:
+    path = _revision_migration_path(config, market, as_of_date)
+    if not path.exists():
+        return None
+    migration = _read_json(path, "trend report revision migration")
+    expected_keys = {
+        "schema_version",
+        "market",
+        "as_of_date",
+        "execution_date",
+        "revision_request_path",
+        "revision_request_sha256",
+        "source_completion_path",
+        "source_completion_sha256",
+        "from_report_path",
+        "from_report_sha256",
+        "from_revision",
+        "to_report_path",
+        "to_report_sha256",
+        "to_revision",
+        "actor",
+        "reason",
+        "authorized_at",
+        "accepted_git_sha",
+    }
+    if set(migration) != expected_keys:
+        raise ValueError(f"invalid trend report revision migration: {path}")
+    source_report_path = Path(str(completion.get("report_path") or ""))
+    target_report_path = Path(str(migration.get("to_report_path") or ""))
+    try:
+        authorized_at = datetime.fromisoformat(str(migration["authorized_at"]))
+        from_revision = migration["from_revision"]
+        to_revision = migration["to_revision"]
+        if (
+            not isinstance(from_revision, int)
+            or isinstance(from_revision, bool)
+            or not isinstance(to_revision, int)
+            or isinstance(to_revision, bool)
+        ):
+            raise ValueError("revision number must be an integer")
+        target_report = _read_json(
+            target_report_path, "migrated trend report revision"
+        )
+        target_recovery_revision = _recovery_revision_for_report(
+            config,
+            market,
+            (target_report_path, target_report),
+            require_receipt=True,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid trend report revision migration: {path}") from exc
+    try:
+        request_sha = hashlib.sha256(request_path.read_bytes()).hexdigest()
+        completion_sha = hashlib.sha256(completion_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(f"invalid trend report revision migration: {path}") from exc
+    valid = (
+        migration.get("schema_version")
+        == "open_trader.trend_controller.revision_migration.v1"
+        and migration.get("market") == market
+        and migration.get("as_of_date") == as_of_date
+        and migration.get("execution_date") == execution_date
+        and migration.get("revision_request_path") == str(request_path)
+        and migration.get("revision_request_sha256") == request_sha
+        and migration.get("source_completion_path") == str(completion_path)
+        and migration.get("source_completion_sha256") == completion_sha
+        and migration.get("from_report_path") == str(source_report_path)
+        and migration.get("from_report_sha256") == completion.get("report_sha256")
+        and migration.get("from_revision") == from_revision
+        and migration.get("to_report_path") == str(target_report_path)
+        and migration.get("to_report_sha256") == _report_hash(target_report)
+        and migration.get("to_revision") == to_revision
+        and _report_order(source_report_path)
+        == (as_of_date, from_revision)
+        and from_revision > max(0, baseline_revision)
+        and _report_order(target_report_path)[0] == as_of_date
+        and to_revision > from_revision
+        and target_report_path.resolve().parent == _report_dir(config, market).resolve()
+        and _valid_report(
+            config, market, execution_date, target_report_path, target_report
+        )
+        and target_recovery_revision is None
+        and isinstance(migration.get("actor"), str)
+        and bool(migration["actor"])
+        and migration["actor"] == migration["actor"].strip()
+        and isinstance(migration.get("reason"), str)
+        and bool(migration["reason"])
+        and migration["reason"] == migration["reason"].strip()
+        and authorized_at.tzinfo is not None
+        and authorized_at.utcoffset() is not None
+        and migration.get("authorized_at")
+        == authorized_at.isoformat(timespec="seconds")
+        and isinstance(migration.get("accepted_git_sha"), str)
+        and bool(re.fullmatch(r"[0-9a-f]{40}", migration["accepted_git_sha"]))
+    )
+    if not valid:
+        raise ValueError(f"invalid trend report revision migration: {path}")
+    return migration
+
+
+def _record_revision_migration(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    target_report: tuple[Path, Mapping[str, object]],
+    *,
+    actor: str,
+    reason: str,
+    authorized_at: datetime,
+    accepted_git_sha: str,
+) -> Path:
+    """Append an audited revision selection without rewriting report history."""
+    require_trend_executor(config, hostname_fn=socket.gethostname)
+    market = _market(cycle.market)
+    path = _revision_migration_path(config, market, cycle.as_of_date)
+    actor = actor.strip()
+    reason = reason.strip()
+    target_path, target_payload = target_report
+    try:
+        authorized_at = datetime.fromisoformat(
+            authorized_at.isoformat(timespec="seconds")
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid trend report revision migration: {path}") from exc
+    if path.exists():
+        request_path, completion_path = _revision_paths(
+            config, market, cycle.as_of_date
+        )
+        request, completion = _revision_state(
+            config, market, cycle.as_of_date, cycle.execution_date
+        )
+        if request is None or completion is None:
+            raise ValueError(f"invalid trend report revision migration: {path}")
+        migration = _load_revision_migration(
+            config,
+            market,
+            cycle.as_of_date,
+            cycle.execution_date,
+            request_path,
+            request,
+            completion_path,
+            _read_json(completion_path, "trend report revision completion"),
+            int(request["baseline_revision"]),
+        )
+        if migration is None:
+            raise ValueError(f"invalid trend report revision migration: {path}")
+        if (
+            migration.get("to_report_path") != str(target_path)
+            or migration.get("to_report_sha256") != _report_hash(target_payload)
+            or migration.get("actor") != actor
+            or migration.get("reason") != reason
+            or migration.get("authorized_at")
+            != authorized_at.isoformat(timespec="seconds")
+            or migration.get("accepted_git_sha") != accepted_git_sha
+        ):
+            raise ValueError(f"immutable trend report revision migration collision: {path}")
+        return path
+    try:
+        request_path, completion_path = _revision_paths(
+            config, market, cycle.as_of_date
+        )
+        request, completion = _revision_state(
+            config, market, cycle.as_of_date, cycle.execution_date
+        )
+        stored_target = _read_json(
+            target_path, "migrated trend report revision"
+        )
+        target_revision = _report_order(target_path)[1]
+        source_path = Path(str(completion.get("report_path") or "")) if completion else Path()
+        source_revision = _report_order(source_path)[1]
+        valid = (
+            market == cycle.market
+            and request is not None
+            and completion is not None
+            and bool(actor)
+            and bool(reason)
+            and authorized_at.tzinfo is not None
+            and authorized_at.utcoffset() is not None
+            and isinstance(accepted_git_sha, str)
+            and bool(re.fullmatch(r"[0-9a-f]{40}", accepted_git_sha))
+            and not _batch_path(config, market, cycle.execution_date).exists()
+            and target_revision > source_revision
+            and target_path.resolve().parent == _report_dir(config, market).resolve()
+            and _report_order(target_path)[0] == cycle.as_of_date
+            and _valid_report(
+                config, market, cycle.execution_date, target_path, stored_target
+            )
+            and _recovery_revision_for_report(
+                config,
+                market,
+                (target_path, stored_target),
+                require_receipt=True,
+            )
+            is None
+            and _report_hash(stored_target) == _report_hash(target_payload)
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid trend report revision migration: {path}") from exc
+    if not valid:
+        raise ValueError(f"invalid trend report revision migration: {path}")
+    payload: dict[str, object] = {
+        "schema_version": "open_trader.trend_controller.revision_migration.v1",
+        "market": market,
+        "as_of_date": cycle.as_of_date,
+        "execution_date": cycle.execution_date,
+        "revision_request_path": str(request_path),
+        "revision_request_sha256": hashlib.sha256(
+            request_path.read_bytes()
+        ).hexdigest(),
+        "source_completion_path": str(completion_path),
+        "source_completion_sha256": hashlib.sha256(
+            completion_path.read_bytes()
+        ).hexdigest(),
+        "from_report_path": str(source_path),
+        "from_report_sha256": completion["report_sha256"],
+        "from_revision": source_revision,
+        "to_report_path": str(target_path),
+        "to_report_sha256": _report_hash(stored_target),
+        "to_revision": target_revision,
+        "actor": actor,
+        "reason": reason,
+        "authorized_at": authorized_at.isoformat(timespec="seconds"),
+        "accepted_git_sha": accepted_git_sha,
+    }
+    return _write_immutable(path, _canonical_json_bytes(payload))
+
+
 def _revision_state(
     config: DailyPremarketConfig,
     market: str,
@@ -1773,7 +2019,26 @@ def _revision_state(
         or recovery_revision is not None
     ):
         raise ValueError(f"invalid trend report revision completion: {completion_path}")
-    return request, completion
+    migration = _load_revision_migration(
+        config,
+        market,
+        as_of_date,
+        execution_date,
+        request_path,
+        request,
+        completion_path,
+        completion,
+        baseline_revision,
+    )
+    if migration is None:
+        return request, completion
+    effective_completion = dict(completion)
+    effective_completion["report_path"] = migration["to_report_path"]
+    effective_completion["report_sha256"] = migration["to_report_sha256"]
+    effective_completion["revision_migration_path"] = str(
+        _revision_migration_path(config, market, as_of_date)
+    )
+    return request, effective_completion
 
 
 def _legacy_cutover_path(
