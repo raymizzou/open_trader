@@ -760,6 +760,29 @@ def test_v5_candidate_signal_keeps_local_values_and_adds_cny_audit() -> None:
     assert signal["amount_cny_100m"] == Decimal("2") * rate
 
 
+def test_us_v5_build_report_candidate_signal_freezes_cny_audit() -> None:
+    rate = Decimal("7.85") / Decimal("1.08")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(replace(candidate("620008"), exchange="US", asset="美股"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
+            "US", "sha", (622460,), strategy_version="v5"
+        ),
+    )
+
+    signal = built.signal_snapshots["candidates"][0]
+    assert signal["market_value_currency"] == "USD"
+    assert signal["cny_per_local_currency"] == rate
+    assert signal["market_cap_cny_100m"] == Decimal("100") * rate
+    assert signal["amount_cny_100m"] == Decimal("2") * rate
+
+
 @pytest.mark.parametrize("market", ["US", "HK"])
 @pytest.mark.parametrize("previous", ["温", "热", "沸"])
 def test_v5_holding_temperature_transition_exits_but_v4_replay_holds(
@@ -782,6 +805,54 @@ def test_v5_holding_temperature_transition_exits_but_v4_replay_holds(
         market=market,
         temperature_to_flat=False,
     ) == ("HOLD", "trend_intact")
+
+
+def test_us_v5_build_report_temperature_transition_sells() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={
+            "600001": holding(
+                "600001", temperature_prev="温", temperature_curr="平"
+            )
+        },
+        bars_by_symbol={"600001": bars()},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
+            "US", "sha", (622460,), strategy_version="v5"
+        ),
+    )
+
+    assert (built.holdings[0].action, built.holdings[0].reason) == (
+        "SELL_ALL", "temperature_changed_to_flat"
+    )
+
+
+def test_us_v4_build_report_keeps_temperature_flat_as_hold() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={
+            "600001": holding(
+                "600001", temperature_prev="温", temperature_curr="平"
+            )
+        },
+        bars_by_symbol={"600001": bars()},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
+            "US", "sha", (622460,), strategy_version="v4"
+        ),
+    )
+
+    assert (built.holdings[0].action, built.holdings[0].reason) == (
+        "HOLD", "trend_intact"
+    )
 
 
 def test_load_industry_temperatures_deduplicates_and_validates_rows() -> None:
