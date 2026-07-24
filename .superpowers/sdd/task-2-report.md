@@ -91,3 +91,62 @@ Exact result: no output; exit status 0.
 
 Code and tests commit: `fd6c05342e7f0ab36094162b2163649978232eb0`
 
+## Follow-up review fixes
+
+The review regression tests were written first and failed before the fix:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'external_context_status or non_candidate_contexts' -v
+```
+
+Exact result:
+
+```text
+====================== 3 failed, 315 deselected in 0.36s =======================
+```
+
+The failures covered a caller-supplied contextual status being retained when
+the current context was missing, and invalid/no-history contexts unrelated to
+eligible candidates changing the report mode.
+
+After the narrow fix:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'external_context_status or non_candidate_contexts' -v
+```
+
+Exact result:
+
+```text
+====================== 3 passed, 315 deselected in 0.26s =======================
+```
+
+Required coverage command:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'candidate and industr or payload' tests/test_trend_review.py -k 'rebuild and trend' -q
+```
+
+Exact result:
+
+```text
+5 passed, 533 deselected in 0.26s
+```
+
+Full focused two-file suite:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_trend_review.py -q
+```
+
+Exact result:
+
+```text
+538 passed in 4.16s
+```
+
+The final status now always comes from the actual candidate decision; a
+caller-supplied status can contribute only non-canonical extra facts when its
+mode agrees. Current validation and history completeness inspect only industry
+IDs referenced by eligible candidates, while all supplied contexts remain
+frozen in the report. Follow-up fix commit: `88b3c867a6e4501272b578d5a9ed5d83f2dc7f47`.
