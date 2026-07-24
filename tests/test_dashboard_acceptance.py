@@ -1645,6 +1645,8 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
             clicked.append(self.selector)
 
         def get_attribute(self, name: str) -> str | None:
+            if name == "open":
+                return None
             assert name == "data-risk-status"
             return "active"
 
@@ -1672,7 +1674,7 @@ def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None
         {"group": "退出保护", "name": "退出条件", "value": "危险信号"},
         {"group": "其他", "name": "未知", "value": "历史只读"},
     ]
-    titles = ["入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律"]
+    titles = ["入场门槛", "候选排序", "仓位与执行", "持有管理", "退出规则", "其他设置"]
     workspace_text = " ".join(
         [*(str(row[key]) for row in rows for key in ("group", "name", "value")),
          "实际 API 成本 1.25 单位", "科技 当前温度 热 温度方向 上升 趋势强度 97.5",
@@ -1683,10 +1685,16 @@ def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None
         def __init__(self, title: str) -> None:
             self.title = title
 
+        def count(self) -> int:
+            return 1
+
         def inner_text(self) -> str:
-            return f"{self.title} 影响 1 条纪律"
+            return f"{self.title} 1 项"
 
         def focus(self) -> None:
+            return None
+
+        def click(self) -> None:
             return None
 
         def evaluate(self, expression: str) -> bool:
@@ -1704,7 +1712,7 @@ def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None
         def locator(self, selector: str) -> Summary | Count:
             if selector == "summary":
                 return self.summary
-            assert selector == ".trend-discipline-card-count"
+            assert selector == ".trend-discipline-category-body"
             return Count()
 
         def get_attribute(self, name: str) -> str:
@@ -1739,13 +1747,27 @@ def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None
         def inner_text(self) -> str:
             return workspace_text
 
+    class DisciplineWorkspace:
+        def count(self) -> int:
+            return 1
+
+        def get_attribute(self, name: str) -> str | None:
+            assert name == "open"
+            return None
+
+        def locator(self, selector: str) -> Summary | Cards:
+            if selector == ":scope > summary":
+                return Summary("纪律 6 类 · 7 项 · 本报告生成时参数")
+            assert selector == ".trend-discipline-category"
+            return Cards()
+
     class Root:
         def inner_text(self) -> str:
             return workspace_text
 
-        def locator(self, selector: str) -> Cards | Context:
-            if selector == ".trend-discipline-card":
-                return Cards()
+        def locator(self, selector: str) -> DisciplineWorkspace | Context:
+            if selector == ".trend-discipline-workspace":
+                return DisciplineWorkspace()
             assert selector == ".trend-industry-context"
             return Context()
 
@@ -2171,33 +2193,32 @@ def trend_workspace_text(
         ])
     if broker == "eastmoney":
         return (
-            "东方财富｜A股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
-            "生成时间 2026-07-15T20:00:00+08:00 账户状态 已更新 "
-            "正式买入 1 全部卖出 1 继续持有 1 人工复核 1 "
-            "优先处理 · 卖出触发 需要确认 · 人工复核 "
+            "东方财富｜A股 当天趋势报告 报告 2026-07-15 数据 2026-07-14 "
+            "生成 2026-07-15T20:00:00+08:00 账户 已更新 "
+            "买入 1 卖出 1 持有 1 复核 1 "
+            "优先处理 · 卖出触发 正式买入计划 需要确认 · 人工复核 "
             "09:30–10:00 · 正式买入计划 "
             "盘中持续 · 已有持仓 筛选价（Trend Animals） "
             "执行参考价（Futu 前复权） 全部卖出 正式买入 继续持有 "
-            "人工复核 冻结策略纪律 冻结纪律参数未提供，未加载当前规则 "
+            "人工复核 纪律 本报告未提供该类纪律参数 "
             "当前行业上下文未提供，无法确认排序；未使用当前规则 审计详情"
         )
     if broker == "phillips":
         return (
-            "辉立｜港股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
-            "生成时间 2026-07-15T11:31:00+08:00 账户状态 已更新 "
-            "正式买入 0 全部卖出 0 继续持有 0 人工复核 0 "
-            "优先处理 · 卖出触发 需要确认 · 人工复核 "
-            "09:30–10:00 · 正式买入计划 无 盘中持续 · 已有持仓 "
-            "冻结策略纪律 冻结纪律参数未提供，未加载当前规则 "
+            "辉立｜港股 当天趋势报告 报告 2026-07-15 数据 2026-07-14 "
+            "生成 2026-07-15T11:31:00+08:00 账户 已更新 "
+            "买入 0 卖出 0 持有 0 复核 0 "
+            "优先处理 · 卖出触发 正式买入计划 无 盘中持续 · 已有持仓 "
+            "纪律 本报告未提供该类纪律参数 "
             "当前行业上下文未提供，无法确认排序；未使用当前规则 审计详情"
         )
     return (
-        "老虎｜美股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
-        "生成时间 2026-07-15T11:30:36+08:00 账户状态 已更新 "
-        "正式买入 1 全部卖出 1 继续持有 1 人工复核 1 "
-        "优先处理 · 卖出触发 需要确认 · 人工复核 "
-        "美股常规交易时段 · 正式买入计划 盘中持续 · 已有持仓 "
-        "冻结策略纪律 冻结纪律参数未提供，未加载当前规则 "
+        "老虎｜美股 当天趋势报告 报告 2026-07-15 数据 2026-07-14 "
+        "生成 2026-07-15T11:30:36+08:00 账户 已更新 "
+        "买入 1 卖出 1 持有 1 复核 1 "
+        "优先处理 · 卖出触发 美股常规交易时段 · 正式买入计划 "
+        "需要确认 · 人工复核 盘中持续 · 已有持仓 "
+        "纪律 本报告未提供该类纪律参数 "
         "当前行业上下文未提供，无法确认排序；未使用当前规则 审计详情"
     )
 
@@ -2244,24 +2265,23 @@ def trend_stage_texts(broker: str) -> list[str]:
         return [
             "优先处理 · 卖出触发\n601398 工商银行 全部卖出 7.2 温 → 温 "
             "91.3 右侧趋势已结束 7.0 强度 91.3，低于入场线 95",
-            "需要确认 · 人工复核\n600036 招商银行 人工复核 45.2 热 → 热 "
-            "97 持仓日线数据不可用 42.0 筛选价数据不可用",
             "09:30–10:00 · 正式买入计划\n688046 药康生物 正式买入 29.14 "
             "28.81 温 → 热 立夏 99.9 医疗服务 热 110 6 4% 27061.98 900 股 24.55",
+            "需要确认 · 人工复核\n600036 招商银行 人工复核 45.2 热 → 热 "
+            "97 持仓日线数据不可用 42.0 筛选价数据不可用",
             "盘中持续 · 已有持仓\n600900 长江电力 继续持有 28.0 热 → 热 "
             "98.7 趋势保持完好 27.8 不是新的温转热或温转沸入场信号",
         ]
     if broker == "phillips":
         return [
             "优先处理 · 卖出触发\n无",
-            "需要确认 · 人工复核\n无",
             "09:30–10:00 · 正式买入计划\n无",
             "盘中持续 · 已有持仓\n无",
         ]
     return [
         "优先处理 · 卖出触发\nAAPL 苹果 全部卖出 200 99 危险信号触发 190",
-        "需要确认 · 人工复核\nQQQ 纳指ETF 人工复核 — — 趋势信号不完整 — —",
         "美股常规交易时段 · 正式买入计划\nVIXY 波动率ETF 正式买入 19 98 ETF 4% 25,142.16 5,000 股 18.50",
+        "需要确认 · 人工复核\nQQQ 纳指ETF 人工复核 — — 趋势信号不完整 — —",
         "盘中持续 · 已有持仓\nSPY 标普ETF 继续持有 510 97 趋势保持完好 500",
     ]
 
@@ -2397,6 +2417,12 @@ class TabbedAccountLocator:
             self.page._record_visible_sections()
             return
         if self.selector == "#trend-report-workspace:visible .trend-audit summary":
+            self.page.active = self.selector
+            return
+        if self.selector.endswith(" .trend-controller-status :scope > summary"):
+            self.page.active = self.selector
+            return
+        if self.selector.endswith(" .trend-discipline-workspace :scope > summary"):
             self.page.active = self.selector
             return
         if self.selector == (
@@ -2618,6 +2644,16 @@ class TabbedAccountLocator:
                 self.page.trend_broker is not None
                 and self.page.trend_broker != self.page.missing_controller_broker
             )
+        if self.selector.endswith(" .trend-controller-status :scope > summary"):
+            return 1
+        if self.selector == "#trend-report-workspace:visible .trend-discipline-workspace":
+            return int(self.page.trend_broker is not None)
+        if self.selector.endswith(" .trend-discipline-category"):
+            return 6 if self.page.trend_broker is not None else 0
+        if re.search(r"\.trend-discipline-category(?:\:nth\(\d+\))? summary$", self.selector):
+            return 6 if self.page.trend_broker is not None else 0
+        if re.search(r"\.trend-discipline-category:nth\(\d+\) \.trend-discipline-category-body$", self.selector):
+            return 1 if self.page.trend_broker is not None else 0
         if self.selector.endswith(" .trend-discipline-card"):
             return 6 if self.page.trend_broker is not None else 0
         if re.search(r"\.trend-discipline-card summary$", self.selector):
@@ -2633,7 +2669,9 @@ class TabbedAccountLocator:
         if self.selector == "#trend-report-workspace:visible .trend-discipline":
             return 2 if self.page.trend_broker == "eastmoney" else 0
         if self.selector == "#trend-report-workspace:visible .cn-trend-table":
-            return 4 if self.page.trend_broker is not None else 0
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            review = report.get("review_actions")
+            return 3 + int(isinstance(review, list) and bool(review)) if self.page.trend_broker is not None else 0
         if self.selector in {
             "#trend-report-workspace:visible .cn-trend-execution",
             "#trend-report-workspace:visible .cn-trend-execution span:first-child",
@@ -2697,6 +2735,8 @@ class TabbedAccountLocator:
             "#trend-report-workspace:visible .cn-trend-buy",
         }:
             return 1
+        if self.selector.endswith(" .trend-discipline-workspace :scope > summary"):
+            return 1
         if re.fullmatch(
             r'#trend-report-workspace:visible \.cn-trend-buy '
             r'\.cn-trend-card:nth\(\d+\) td\[data-label="'
@@ -2707,7 +2747,12 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown count selector: {self.selector}")
 
     def get_attribute(self, name: str) -> str | None:
+        if self.selector == "#trend-report-workspace:visible .trend-discipline-workspace":
+            assert name == "open"
+            return None
         if self.selector == "#trend-report-workspace:visible .trend-controller-status":
+            if name == "open":
+                return None
             assert name == "data-health"
             return str(self.page.controllers[str(self.page.trend_broker)]["health"])
         match = re.fullmatch(
@@ -2749,7 +2794,7 @@ class TabbedAccountLocator:
                     "正式买入计划" if mobile else "正式买入计划，可横向滚动"
                 ),
             }[name]
-        if re.search(r"\.trend-discipline-card:nth\(\d+\)$", self.selector):
+        if re.search(r"\.trend-discipline-category:nth\(\d+\)$", self.selector):
             assert name == "open"
             return ""
         assert self.selector == "#trend-report-workspace:visible .trend-audit"
@@ -2842,10 +2887,14 @@ class TabbedAccountLocator:
             ])
         if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
-        summary_match = re.search(r"\.trend-discipline-card:nth\((\d+)\) summary$", self.selector)
+        if self.selector.endswith(" .trend-discipline-workspace"):
+            return "纪律 6 类 · 0 项 · 本报告生成时参数 本报告未提供该类纪律参数"
+        if self.selector.endswith(" .trend-discipline-workspace :scope > summary"):
+            return "纪律 6 类 · 0 项 · 本报告生成时参数"
+        summary_match = re.search(r"\.trend-discipline-category:nth\((\d+)\) summary$", self.selector)
         if summary_match:
-            titles = ["入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律"]
-            return f"{titles[int(summary_match.group(1))]} 影响 0 条纪律 冻结纪律参数未提供，未加载当前规则"
+            titles = ["入场门槛", "候选排序", "仓位与执行", "持有管理", "退出规则", "其他设置"]
+            return f"{titles[int(summary_match.group(1))]} 0 项 本报告未提供该类纪律参数"
         if self.selector.endswith(" .trend-industry-context"):
             return "行业上下文 当前行业上下文未提供，无法确认排序；未使用当前规则"
         match = re.fullmatch(
@@ -3000,10 +3049,10 @@ class TabbedAccountLocator:
             return ["7", "42", "1,450", "24.55", "27.8"]
         if self.selector == "#trend-report-workspace:visible .trend-audit section":
             return trend_audit_sections(broker)
-        if self.selector.endswith(" .trend-discipline-card summary"):
+        if self.selector.endswith(" .trend-discipline-category summary"):
             return [
-                f"{title} 影响 0 条纪律 冻结纪律参数未提供，未加载当前规则"
-                for title in ("入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律")
+                f"{title} 0 项 本报告未提供该类纪律参数"
+                for title in ("入场门槛", "候选排序", "仓位与执行", "持有管理", "退出规则", "其他设置")
             ]
         if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
@@ -3079,7 +3128,7 @@ class TabbedAccountLocator:
         return {"x": 20, "width": 100}
 
     def evaluate_all(self, expression: str) -> list[dict[str, float]]:
-        if self.selector.endswith(" .trend-discipline-card summary") and "height" in expression:
+        if self.selector.endswith(" .trend-discipline-category summary") and "height" in expression:
             return [{"height": 44}] * 6
         target_expression = (
             "nodes => nodes.map(node => ({"
@@ -4015,12 +4064,11 @@ def test_acceptance_formats_grouped_numeric_expectations_without_touching_text()
         assert dashboard_acceptance._plain(value) == value
 
     dashboard_acceptance._check_action_trend_stages(
-        [
-            "优先处理 · 卖出触发 无",
-            "需要确认 · 人工复核 无",
-            "美股常规交易时段 · 正式买入计划 VIXY 波动率ETF "
-            "正式买入 19 98 ETF 4% 25,142.16 5,000 股 1,234.50",
-            "盘中持续 · 已有持仓 无",
+            [
+                "优先处理 · 卖出触发 无",
+                "美股常规交易时段 · 正式买入计划 VIXY 波动率ETF "
+                "正式买入 19 98 ETF 4% 25,142.16 5,000 股 1,234.50",
+                "盘中持续 · 已有持仓 无",
         ],
         {
             "buy_window": "美股常规交易时段",

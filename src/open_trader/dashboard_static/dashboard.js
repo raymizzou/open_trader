@@ -2426,7 +2426,14 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate, si
         <div><dt>任务身份</dt><dd>${escapeHtml(formatPlain(recovery.actor))}</dd></div>
         <div><dt>发生时间</dt><dd>${escapeHtml(formatPlain(recovery.occurred_at))}</dd></div>
       </dl></details>` : "";
-  return `<section class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(status))}" aria-label="模拟策略风险摘要">
+  const headline = hasPlanRisk
+    ? formatPlain(summary.status_label || "风险预算")
+    : hasDrawdown
+      ? formatPlain(drawdown.status_label || "策略回撤")
+      : "运行风险";
+  return `<details class="trend-risk-summary" data-risk-status="${escapeHtml(formatPlain(status))}" aria-label="模拟策略风险摘要">
+    <summary>组合计划风险 <span>${escapeHtml(headline)}</span></summary>
+    <div class="trend-risk-summary-body">
     ${hasPlanRisk ? `<header><strong>组合计划风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
       ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
       <dl>
@@ -2449,7 +2456,8 @@ function renderTrendRiskSummary(summary, drawdown, actualOverlay, reportDate, si
       <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}${recoveryRows}</div>` : ""}
     ${simulationOverlay}
     ${renderTrendActualOverlay(actualOverlay)}
-  </section>`;
+    </div>
+  </details>`;
 }
 
 function renderCnTrendTable(title, kind, headings, rows, note = "") {
@@ -2521,7 +2529,7 @@ function renderMarketSellOrHoldStage(title, items, kind) {
 }
 
 function renderMarketBuyStage(report) {
-  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "行业上下文确认", "目标仓位（占净值）", "金额上限", "预计数量", "预计保护线"];
+  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "行业确认", "目标仓位（占净值）", "金额上限", "预计数量", "预计保护线"];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
     const targetWeight = decimalAsPercent(item.target_weight, "—");
     return `<tr class="cn-trend-card">
@@ -2530,7 +2538,7 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
-      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
+      ${renderCnTrendCell("行业确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
       ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : "—")}
@@ -2545,7 +2553,7 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
-      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
+      ${renderCnTrendCell("行业确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
       ${renderCnTrendCell("预计数量", "0 股")}
@@ -2558,7 +2566,7 @@ function renderMarketBuyStage(report) {
 function renderCnBuyStage(report) {
   const headings = [
     "标的", "动作", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
-    "温度变化", "节气", "强度", "行业", "行业温度", "行业上下文确认", "市值（亿元）",
+    "温度变化", "节气", "强度", "行业", "行业温度", "行业确认", "市值（亿元）",
     "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
   ];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
@@ -2573,7 +2581,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
       ${renderCnTrendCell("行业温度", item.industry_temperature)}
-      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
+      ${renderCnTrendCell("行业确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
       ${renderCnTrendCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
@@ -2594,7 +2602,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
       ${renderCnTrendCell("行业温度", item.industry_temperature)}
-      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
+      ${renderCnTrendCell("行业确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
       ${renderCnTrendCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
@@ -2631,12 +2639,12 @@ function trendDisciplineLifecycle(parameterRows) {
       && hasValue(row.group) && hasValue(row.name) && hasValue(row.value))
     : [];
   const groups = [
-    {key: "entry", title: "入场硬门槛", rows: []},
-    {key: "sort", title: "确定性排序", rows: []},
+    {key: "entry", title: "入场门槛", rows: []},
+    {key: "sort", title: "候选排序", rows: []},
     {key: "execution", title: "仓位与执行", rows: []},
     {key: "holding", title: "持有管理", rows: []},
-    {key: "exit", title: "退出纪律", rows: []},
-    {key: "other", title: "其他纪律", rows: []},
+    {key: "exit", title: "退出规则", rows: []},
+    {key: "other", title: "其他设置", rows: []},
   ];
   const byKey = Object.fromEntries(groups.map((group) => [group.key, group]));
   rows.forEach((row) => {
@@ -2657,29 +2665,30 @@ function trendDisciplineLifecycle(parameterRows) {
   return groups;
 }
 
-function renderTrendDisciplineCard(card, open) {
+function renderTrendDisciplineCategory(card) {
   const rows = card.rows || [];
   const compact = rows.slice(0, 2).map((row) => `${formatPlain(row.name)}：${formatPlain(row.value)}`).join("；");
-  const emptyLabel = "冻结纪律参数未提供，未加载当前规则";
-  const countLabel = `冻结 ${rows.length} 项${compact ? ` · ${compact}` : ""}`;
-  const summaryFacts = compact || emptyLabel;
+  const emptyLabel = "本报告未提供该类纪律参数";
   const body = rows.length
     ? `<dl>${rows.map((row) => `<div><dt>${escapeHtml(`${formatPlain(row.group)} · ${formatPlain(row.name)}`)}</dt><dd>${escapeHtml(formatPlain(row.value))}</dd></div>`).join("")}</dl>`
     : `<p>${escapeHtml(emptyLabel)}</p>`;
-  return `<details class="trend-discipline-card"${open ? " open" : ""} data-discipline="${escapeHtml(card.key)}">
-    <summary><span>${escapeHtml(card.title)}</span><small>${escapeHtml(`影响 ${rows.length} 条纪律`)}</small><span class="trend-discipline-card-compact">${escapeHtml(summaryFacts)}</span></summary>
-    <div class="trend-discipline-card-body"><p class="trend-discipline-card-count">${escapeHtml(countLabel)}</p>${body}</div>
+  return `<details class="trend-discipline-category" data-discipline="${escapeHtml(card.key)}">
+    <summary><strong>${escapeHtml(card.title)}</strong><span>${escapeHtml(`${rows.length} 项`)}</span><small>${escapeHtml(compact || emptyLabel)}</small></summary>
+    <div class="trend-discipline-category-body">${body}</div>
   </details>`;
 }
 
 function renderTrendDisciplineCards(report) {
   const rows = trendFrozenStrategyRows(report);
-  const open = !isCnTrendMobile();
   const cards = trendDisciplineLifecycle(rows);
-  return `<section class="trend-discipline-workspace" aria-label="冻结趋势纪律">
-    <header><h2>冻结策略纪律</h2><p>${escapeHtml(rows.length ? "仅展示所选报告冻结的策略参数；历史报告不会套用当前规则。" : "冻结纪律参数未提供，未加载当前规则。")}</p></header>
-    <div class="trend-discipline-grid">${cards.map((card) => renderTrendDisciplineCard(card, open)).join("")}</div>
-  </section>`;
+  const headline = `${cards.length} 类 · ${rows.length} 项 · 本报告生成时参数`;
+  return `<details class="trend-discipline-workspace" aria-label="纪律">
+    <summary>纪律 <span>${escapeHtml(headline)}</span><small>已折叠</small></summary>
+    <div class="trend-discipline-workspace-body">
+      <p class="trend-discipline-note">仅展示所选报告生成时冻结的策略参数；历史报告不会套用当前规则。</p>
+      <div class="trend-discipline-grid">${cards.map((card) => renderTrendDisciplineCategory(card)).join("")}</div>
+    </div>
+  </details>`;
 }
 
 function formatTrendApiCost(value) {
@@ -2765,22 +2774,25 @@ function renderTrendIndustryContext(report) {
       priorShare ? `此前右侧占比 ${priorShare}` : "",
       change,
     ].filter(Boolean).join(" · ");
-    return `<article class="trend-industry-context-card${context.valid === false ? " invalid" : ""}">
-      <header><strong>${escapeHtml(formatPlain(context.industry || "行业"))}</strong><span>${escapeHtml(hasValue(context.temperature) ? `当前温度 ${formatPlain(context.temperature)}` : "当前温度 数据未提供")}</span></header>
-      <dl>
-        <div><dt>温度方向</dt><dd>${escapeHtml(hasValue(context.temperature_direction) ? trendIndustryDirection(context.temperature_direction) : "数据未提供")}</dd></div>
-        <div><dt>趋势强度</dt><dd>${escapeHtml(hasValue(context.strength) ? formatDisplayNumber(context.strength) : "数据未提供")}</dd></div>
-        <div><dt>温转热数量</dt><dd>${escapeHtml(hasValue(context.warm_to_hot_count) ? formatDisplayNumber(context.warm_to_hot_count) : "数据未提供")}</dd></div>
-        <div><dt>右侧占比</dt><dd>${escapeHtml(breadth)}</dd></div>
-      </dl>
-      ${history ? `<p>${escapeHtml(history)}</p>` : ""}
-      ${context.valid === false ? `<p class="trend-industry-context-invalid">${escapeHtml((context.invalid_reasons || []).map(formatPlain).join("、") || "数据不可用")}</p>` : ""}
-    </article>`;
+    const statusText = context.valid === false
+      ? (context.invalid_reasons || []).map(formatPlain).join("、") || "数据不可用"
+      : history;
+    return `<tr class="trend-industry-context-row${context.valid === false ? " invalid" : ""}">
+      <th scope="row" data-label="行业"><strong>${escapeHtml(formatPlain(context.industry || "行业"))}</strong></th>
+      <td data-label="当前温度">${escapeHtml(hasValue(context.temperature) ? formatPlain(context.temperature) : "数据未提供")}</td>
+      <td data-label="温度方向">${escapeHtml(hasValue(context.temperature_direction) ? trendIndustryDirection(context.temperature_direction) : "数据未提供")}</td>
+      <td data-label="趋势强度">${escapeHtml(hasValue(context.strength) ? formatDisplayNumber(context.strength) : "数据未提供")}</td>
+      <td data-label="温转热数量">${escapeHtml(hasValue(context.warm_to_hot_count) ? formatDisplayNumber(context.warm_to_hot_count) : "数据未提供")}</td>
+      <td data-label="右侧占比">${escapeHtml(breadth)}</td>
+      <td class="trend-industry-context-status${context.valid === false ? " trend-industry-context-invalid" : ""}" data-label="变化">${escapeHtml(statusText || "—")}</td>
+    </tr>`;
   }).join("");
   return `<section class="trend-industry-context" aria-label="行业上下文">
-    <header><h2>行业上下文 · 行业赚钱效应</h2><span>${escapeHtml(status.current_complete === false ? "当前数据不完整" : `${contexts.length} 个行业`)}</span></header>
+    <header><h2>行业上下文</h2><span>${escapeHtml(status.current_complete === false ? "当前数据不完整" : `${contexts.length} 个行业`)}</span></header>
     ${trendIndustryContextFallback(status, contexts)}
-    <div class="trend-industry-context-grid">${rows || "<p>行业上下文数据未提供</p>"}</div>
+    ${rows
+      ? `<div class="trend-industry-context-table-wrap"><table class="trend-industry-context-table"><thead><tr><th scope="col">行业</th><th scope="col">当前温度</th><th scope="col">温度方向</th><th scope="col">趋势强度</th><th scope="col">温转热数量</th><th scope="col">右侧占比</th><th scope="col">变化</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : "<p>行业上下文数据未提供</p>"}
   </section>`;
 }
 
@@ -3028,10 +3040,8 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const identity = report.artifact && report.report_sha256 && report.strategy_version
     ? ` data-report-artifact="${escapeHtml(formatPlain(report.artifact))}" data-report-sha256="${escapeHtml(formatPlain(report.report_sha256))}" data-strategy-version="${escapeHtml(formatPlain(report.strategy_version))}"`
     : "";
-  const sellLabel = (Array.isArray(report.sell_actions) && report.sell_actions.some((item) => item?.action === "SELL_PARTIAL"))
-    ? "卖出触发" : "全部卖出";
   const strategyVersion = report.strategy_version
-    ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))} · 策略版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
+    ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
     : "";
   const batchSha = report.execution_batch?.report_sha256;
   const revisionAnomaly = report.revision_anomaly === true
@@ -3040,11 +3050,13 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const batchError = report.execution_batch_blocking === true
     ? `<p class="trend-execution-batch-error">${escapeHtml(formatPlain(report.execution_batch_error || "执行批次无效，已阻止操作投影"))}</p>`
     : "";
+  const sellStage = sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell");
+  const reviewStage = Array.isArray(report.review_actions) && report.review_actions.length
+    ? sellOrHold("需要确认 · 人工复核", report.review_actions, "review")
+    : "";
+  const holdStage = sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold");
   const disciplineCards = renderTrendDisciplineCards(report);
-  const industryAction = `<div class="trend-industry-action-row">
-      ${renderTrendIndustryContext(report)}
-      ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
-    </div>`;
+  const industryContext = renderTrendIndustryContext(report);
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date,
     historical ? "" : renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]));
   return `<${root} class="cn-trend-report"${identity}>
@@ -3056,33 +3068,32 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
           : `<button class="trend-history-button" type="button" data-report-history="${escapeHtml(report.broker)}">历史报告</button>`
         : '<button type="button" data-close-trend-report>返回持仓看板</button>'}
       <dl>
-        <div><dt>报告日期</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
-        <div><dt>数据截至</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>
-        <div><dt>生成时间</dt><dd>${escapeHtml(formatPlain(report.generated_at))}</dd></div>
-        <div><dt>账户状态</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
+        <div><dt>报告</dt><dd>${escapeHtml(formatPlain(report.report_date))}</dd></div>
+        <div><dt>数据</dt><dd>${escapeHtml(formatPlain(report.data_date))}</dd></div>
+        <div><dt>生成</dt><dd>${escapeHtml(formatPlain(report.generated_at))}</dd></div>
+        <div><dt>账户</dt><dd>${escapeHtml(formatPlain(report.account_status))}</dd></div>
       </dl>
       <div class="trend-report-metrics cn-trend-counts">
-        <span>正式买入 ${escapeHtml(formatDisplayNumber(counts.buy || 0))}</span>
-        <span>${escapeHtml(sellLabel)} ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span>
-        <span>继续持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span>
-        <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
+        <span>卖出 ${escapeHtml(formatDisplayNumber(counts.sell || 0))}</span>
+        <span>买入 ${escapeHtml(formatDisplayNumber(counts.buy || 0))}</span>
+        <span>持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span>
+        <span>复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
       <div class="trend-report-facts">
         <span>状态 ${escapeHtml(formatPlain(report.status_text || report.data_status || report.account_status || "数据未提供"))}</span>
         <span class="trend-report-cost">${escapeHtml(trendReportCostLabel(report))}</span>
       </div>
     </header>
-    ${renderTrendControllerStatus(report.broker)}
     ${batchError}
     ${revisionAnomaly}
+    ${sellStage}
+    ${buyStage}
+    ${reviewStage}
+    ${holdStage}
+    ${industryContext}
     ${disciplineCards}
-    ${industryAction}
     ${riskSummary}
-    <div class="cn-trend-actions">
-      ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}
-      ${buyStage}
-      ${sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold")}
-    </div>
+    ${renderTrendControllerStatus(report.broker)}
     ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
   </${root}>`;
 }
@@ -3092,8 +3103,10 @@ function trendSellActionLabel(item) {
 }
 
 function renderTrendControllerStatus(broker) {
-  const controller = state.dashboard?.trend_controllers?.[broker];
-  if (!controller || typeof controller !== "object") return "";
+  const configured = state.dashboard?.trend_controllers?.[broker];
+  const controller = configured && typeof configured === "object"
+    ? configured
+    : {health: "unavailable", blocking: false, reason: "控制器状态未提供"};
   const health = String(controller.health || "unavailable");
   const blocking = controller.blocking === true;
   const headline = health === "readonly"
@@ -3111,10 +3124,10 @@ function renderTrendControllerStatus(broker) {
     ["当前阻塞", controller.blocker || controller.reason],
     ["下次检查", controller.next_check_at],
   ];
-  return `<section class="trend-controller-status${blocking ? " blocking" : ""}" data-health="${escapeHtml(health)}">
-    <header><h2>策略控制器</h2><strong>${escapeHtml(headline)}</strong></header>
-    <dl>${facts.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(hasValue(value) ? formatPlain(value) : "—")}</dd></div>`).join("")}</dl>
-  </section>`;
+  return `<details class="trend-controller-status${blocking ? " blocking" : ""}" data-health="${escapeHtml(health)}">
+    <summary>策略控制器 <span>${escapeHtml(headline)}</span><small>已折叠</small></summary>
+    <div class="trend-controller-status-body"><dl>${facts.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(hasValue(value) ? formatPlain(value) : "—")}</dd></div>`).join("")}</dl></div>
+  </details>`;
 }
 
 function formatTrendControllerLastSuccess(value) {

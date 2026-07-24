@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-24
 
+- Reworked the shared CN/HK/US trend-report Dashboard layout to prioritize the
+  summary, sell, buy, hold, and industry tables; compacted fields, rendered
+  multi-symbol plans as rows, and moved discipline, risk, controller, and audit
+  details into closed disclosures with Playwright coverage across all markets.
 - Added eligible-industry breadth context and prior-day history to deterministic
   CN/HK/US trend ordering with whole-report legacy fallback; standardized
   independent per-market API-cost reporting and advanced CN v8 / US-HK v5 while

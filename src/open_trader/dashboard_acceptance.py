@@ -1115,25 +1115,36 @@ def _check_frozen_trend_disciplines(
     raw_rows = report.get("strategy_parameter_rows")
     rows = raw_rows if isinstance(raw_rows, list) else []
     has_rows = bool(rows)
-    cards = report_root.locator(".trend-discipline-card")
-    assert cards.count() == 6, f"{broker} 冻结纪律卡数量不是 6"
+    workspace = report_root.locator(".trend-discipline-workspace")
+    assert workspace.count() == 1, f"{broker} 纪律区块数量不是 1"
+    assert workspace.get_attribute("open") is None, (
+        f"{broker} 纪律未默认收起"
+    )
+    workspace_summary = workspace.locator(":scope > summary")
+    assert workspace_summary.count() == 1, f"{broker} 纪律区块缺少摘要"
+    assert workspace_summary.inner_text().startswith("纪律"), (
+        f"{broker} 纪律摘要标题不正确"
+    )
+    workspace_summary.click()
+    cards = workspace.locator(".trend-discipline-category")
+    assert cards.count() == 6, f"{broker} 纪律类别数量不是 6"
     summaries = cards.locator("summary")
     titles = summaries.all_inner_texts()
-    for title in ("入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律"):
+    for title in ("入场门槛", "候选排序", "仓位与执行", "持有管理", "退出规则", "其他设置"):
         assert any(title in value for value in titles), (
-            f"{broker} 冻结纪律缺少 {title}"
+            f"{broker} 纪律缺少 {title}"
         )
     for index in range(cards.count()):
         card = cards.nth(index)
         summary = card.locator("summary")
         summary_text = summary.inner_text()
-        assert re.search(r"影响\s+\d+\s+条纪律", summary_text), (
-            f"{broker} 冻结纪律卡缺少影响计数：{summary_text}"
+        assert re.search(r"\d+\s+项", summary_text), (
+            f"{broker} 纪律类别缺少参数计数：{summary_text}"
         )
         if card.get_attribute("open") is None:
             summary.click()
-        assert card.locator(".trend-discipline-card-count").count() == 1, (
-            f"{broker} 冻结纪律卡缺少紧凑事实"
+        assert card.locator(".trend-discipline-category-body").count() == 1, (
+            f"{broker} 纪律类别缺少参数详情"
         )
         summary.focus()
         assert summary.evaluate("element => element === document.activeElement"), (
@@ -1157,7 +1168,7 @@ def _check_frozen_trend_disciplines(
                     f"{broker} 冻结纪律缺少 {key}：{value}"
                 )
     else:
-        assert "冻结纪律参数未提供，未加载当前规则" in workspace_text, (
+        assert "本报告未提供该类纪律参数" in workspace_text, (
             f"{broker} 无冻结参数时缺少明确空状态"
         )
         assert "趋势强度不低于 95" not in workspace_text, (
@@ -1220,9 +1231,10 @@ def _check_frozen_trend_disciplines(
         getattr(page, "viewport_size", None) or {}
     ).get("width", 0) <= 760:
         ordered_selectors = (
-            ".cn-trend-sell", ".cn-trend-review", ".trend-discipline-workspace",
-            ".trend-industry-context", ".cn-trend-buy", ".cn-trend-hold",
-            ".trend-risk-summary", ".trend-audit",
+            ".cn-trend-sell", ".cn-trend-buy", ".cn-trend-review",
+            ".cn-trend-hold", ".trend-industry-context",
+            ".trend-discipline-workspace", ".trend-risk-summary",
+            ".trend-controller-status", ".trend-audit",
         )
         boxes: list[dict[str, object]] = []
         try:
@@ -1242,6 +1254,8 @@ def _check_frozen_trend_disciplines(
                 float(boxes[index]["y"]) <= float(boxes[index + 1]["y"])
                 for index in range(len(boxes) - 1)
             ), f"{broker} 移动端趋势报告顺序不符合行动优先布局：{boxes}"
+    if workspace.get_attribute("open") is not None:
+        workspace_summary.click()
 
 
 def _check_report_identity(
@@ -1834,6 +1848,8 @@ def _check_integrated_trend_ui(
     ), f"{broker} 趋势报告缺少集成风险视图数据"
     risk = report_root.locator(".trend-risk-summary")
     assert risk.count() == 1, f"{broker} 趋势报告缺少风险摘要"
+    assert risk.get_attribute("open") is None, f"{broker} 风险摘要未默认收起"
+    risk.locator(":scope > summary").click()
     assert risk.get_attribute("data-risk-status") == summary.get("status"), (
         f"{broker} 风险状态未同时提供文字状态"
     )
@@ -1913,6 +1929,8 @@ def _check_integrated_trend_ui(
                 f"{broker} 实盘偏差状态未用文字表达"
             )
     assert "本次可用风险" not in text, f"{broker} UI 仍包含 本次可用风险"
+    if risk.get_attribute("open") is not None:
+        risk.locator(":scope > summary").click()
 
 
 def _display_number(value: Any) -> str:
@@ -2169,16 +2187,18 @@ def _trend_table_text(value: Any) -> str:
 def _check_action_trend_stages(
     stage_texts: list[str], report: Mapping[str, Any], broker: str,
 ) -> None:
-    expected = (
+    expected = [
         ("优先处理 · 卖出触发", "sell_actions", None),
-        ("需要确认 · 人工复核", "review_actions", "人工复核"),
         (
             f"{_plain(report.get('buy_window'))} · 正式买入计划",
             "buy_actions",
             "正式买入",
         ),
-        ("盘中持续 · 已有持仓", "hold_actions", "继续持有"),
-    )
+    ]
+    review_rows = report.get("review_actions")
+    if isinstance(review_rows, list) and review_rows:
+        expected.append(("需要确认 · 人工复核", "review_actions", "人工复核"))
+    expected.append(("盘中持续 · 已有持仓", "hold_actions", "继续持有"))
     assert len(stage_texts) == len(expected), f"{broker} 趋势报告阶段数量不正确"
     for text, (title, key, action) in zip(stage_texts, expected, strict=True):
         assert title in text, f"{broker} 趋势报告缺少阶段 {title}"
@@ -2748,7 +2768,7 @@ def _check_account_holdings(
         workspace_text = workspace.inner_text()
         identity = f"{_plain(report.get('broker_label'))}｜{_plain(report.get('market_label'))}"
         assert identity in workspace_text, f"{broker} 趋势报告身份不匹配"
-        for required in ("报告日期", "数据截至", "生成时间", "账户状态"):
+        for required in ("报告", "数据", "生成", "账户"):
             assert required in workspace_text, f"{broker} 趋势报告工作区缺少 {required}"
         header_values = workspace.locator(".trend-report-header dd").all_inner_texts()
         assert header_values == [
@@ -2758,18 +2778,22 @@ def _check_account_holdings(
         ], f"{broker} 趋势报告头部内容与 API 不一致"
         counts = report.get("counts") if isinstance(report.get("counts"), Mapping) else {}
         count_labels = (
-            ("正式买入", "buy"), ("全部卖出", "sell"),
-            ("继续持有", "hold"), ("人工复核", "review"),
+            ("买入", "buy"), ("卖出", "sell"),
+            ("持有", "hold"), ("复核", "review"),
         )
         for label, key in count_labels:
             assert f"{label} {_display_number(counts.get(key) or 0)}" in workspace_text, (
                 f"{broker} 趋势报告缺少 {label}计数"
             )
-        for required in (
-            "优先处理 · 卖出触发", "需要确认 · 人工复核",
+        required_stages = [
+            "优先处理 · 卖出触发",
             f"{_plain(report.get('buy_window'))} · 正式买入计划",
             "盘中持续 · 已有持仓", "全部卖出", "正式买入", "继续持有",
-        ):
+        ]
+        if isinstance(report.get("review_actions"), list) and report.get("review_actions"):
+            required_stages.insert(2, "需要确认 · 人工复核")
+            required_stages.append("人工复核")
+        for required in required_stages:
             assert required in workspace_text, (
                 f"{broker} 趋势报告工作区缺少 {required}"
             )
@@ -2778,7 +2802,11 @@ def _check_account_holdings(
         )
         stage_texts = workspace.locator(".cn-trend-stage").all_inner_texts()
         _check_action_trend_stages(stage_texts, report, broker)
-        assert workspace.locator(".cn-trend-table").count() == 4, (
+        expected_stage_tables = 3 + int(
+            isinstance(report.get("review_actions"), list)
+            and bool(report.get("review_actions"))
+        )
+        assert workspace.locator(".cn-trend-table").count() == expected_stage_tables, (
             f"{broker} 趋势报告动作表数量与 API 不一致"
         )
         sell_actions = report.get("sell_actions")
@@ -2805,7 +2833,7 @@ def _check_account_holdings(
         ):
             for required in (
                 "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
-                "买入纪律", "卖出纪律",
+                "纪律", "行业上下文",
             ):
                 assert required in workspace_text, (
                     f"eastmoney 趋势报告工作区缺少 {required}"
@@ -2816,17 +2844,10 @@ def _check_account_holdings(
                     'td[data-label="活动保护线"], td[data-label="预计保护线"]'
                 ).all_inner_texts()
             )
-            disciplines = workspace.locator(".trend-discipline")
-            assert disciplines.count() == 2, "eastmoney 趋势报告纪律卡数量不是 2"
-            assert workspace.locator(".trend-discipline summary").all_inner_texts() == [
-                "买入纪律", "卖出纪律",
-            ], "eastmoney 趋势报告纪律顺序不正确"
-            viewport = getattr(page, "viewport_size", None)
-            expected_open = (
-                0 if viewport and viewport.get("width", 0) <= 760 else 2
-            )
-            assert workspace.locator(".trend-discipline[open]").count() == expected_open, (
-                "eastmoney 趋势报告纪律默认展开状态不正确"
+            discipline = workspace.locator(".trend-discipline-workspace")
+            assert discipline.count() == 1, "eastmoney 趋势报告纪律区块缺失"
+            assert discipline.get_attribute("open") is None, (
+                "eastmoney 趋势报告纪律默认展开"
             )
         viewport = getattr(page, "viewport_size", None)
         if viewport and viewport.get("width", 0) <= 760:
@@ -3171,6 +3192,8 @@ def _check_trend_controller_status(
     assert isinstance(controller, Mapping), f"页面缺少 {broker} 趋势控制器状态"
     card = workspace.locator(".trend-controller-status")
     assert card.count() == 1, f"{broker} 趋势报告缺少控制器状态卡"
+    assert card.get_attribute("open") is None, f"{broker} 控制器状态未默认收起"
+    card.locator(":scope > summary").click()
     health = controller.get("health")
     assert card.get_attribute("data-health") == health, (
         f"{broker} 控制器状态卡健康标记与 API 不一致"
@@ -3283,6 +3306,8 @@ def _check_trend_controller_status(
             box["x"] >= -1 and box["x"] + box["width"] <= width + 1
             for box in boxes
         ), f"{broker} 控制器状态卡超出 {width}px 视口"
+    if card.get_attribute("open") is not None:
+        card.locator(":scope > summary").click()
 
 
 def _check_trend_review(
