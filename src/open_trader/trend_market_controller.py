@@ -1779,7 +1779,7 @@ def _load_revision_migration(
         and _report_order(source_report_path)
         == (as_of_date, from_revision)
         and from_revision > max(0, baseline_revision)
-        and _report_order(target_report_path)[0] == as_of_date
+        and _report_order(target_report_path) == (as_of_date, to_revision)
         and to_revision > from_revision
         and target_report_path.resolve().parent == _report_dir(config, market).resolve()
         and _valid_report(

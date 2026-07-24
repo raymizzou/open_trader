@@ -6114,6 +6114,13 @@ def test_revision_migration_selects_existing_report_without_rewriting_completion
             authorized_at=datetime.fromisoformat("2026-07-20T10:02:00+08:00"),
             accepted_git_sha="a" * 40,
         )
+    migration["to_revision"] = 5
+    migration_path.write_text(json.dumps(migration), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid trend report revision migration"):
+        controller._revision_state(
+            config, cycle.market, cycle.as_of_date, cycle.execution_date
+        )
+    migration["to_revision"] = 6
     migration["unexpected"] = True
     migration_path.write_text(json.dumps(migration), encoding="utf-8")
     with pytest.raises(ValueError, match="invalid trend report revision migration"):
