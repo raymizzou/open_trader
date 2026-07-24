@@ -4023,6 +4023,34 @@ console.log(JSON.stringify({holdingRenders,panelPreserved:currentPanel===frozenP
     }
 
 
+def test_dashboard_refresh_preserves_open_discipline_cards() -> None:
+    output = run_dashboard_js(r'''
+state.brokerFilter="tiger";
+state.accountViews.tiger="report";
+state.trendReportHistories.tiger={open:false};
+const card=(key,open)=>({dataset:{discipline:key},open});
+const oldCards=[card("entry",true),card("sort",false),card("exit",true)];
+const newCards=[card("entry",false),card("sort",false),card("exit",false)];
+const panel=(cards)=>({querySelectorAll(selector){
+  return selector.endsWith("[open]") ? cards.filter((item)=>item.open) : cards;
+}});
+let currentPanel=panel(oldCards);
+elements["account-holdings"]={querySelector(){return currentPanel;}};
+renderHeaderSummary=()=>{};
+renderAccountHoldings=()=>{currentPanel=panel(newCards);};
+renderDashboardViews();
+console.log(JSON.stringify(Object.fromEntries(
+  newCards.map((item)=>[item.dataset.discipline,item.open])
+)));
+''')
+
+    assert json.loads(output) == {
+        "entry": True,
+        "sort": False,
+        "exit": True,
+    }
+
+
 def test_dashboard_account_view_keyboard_and_mobile_acceptance_css() -> None:
     output = run_dashboard_js(r'''
 let focused="";

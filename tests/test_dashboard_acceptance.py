@@ -5883,6 +5883,11 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
             "report_sha256": old_hash,
             "strategy_version": "v1",
             "report_date": "2026-07-17",
+            "strategy_parameter_rows": [{
+                "group": "入场硬门槛",
+                "name": "趋势强度",
+                "value": "95",
+            }],
             "audit": {"artifact": "old.json"},
             "buy_actions": [{
                 "symbol": "NDAQ",
@@ -5899,6 +5904,9 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     )
 
     assert expectations[0]["artifact"] == "old.json"
+    assert expectations[0]["strategy_parameter_rows"] == exact["old.json"][
+        "strategy_parameter_rows"
+    ]
 
 
 def test_acceptance_allows_exact_history_to_lag_a_duplicate_terminal_event(

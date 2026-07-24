@@ -17,6 +17,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   only the approved Kelly sample identities and their frozen review continuity.
 - Replaced the long discipline list with frozen lifecycle Dashboard cards while
   retaining existing report components, evidence, exclusions, and risk views.
+- Fixed CN/HK/US Dashboard projection to display valid frozen discipline rows
+  from both legacy and current trend reports without loading current rules, and
+  preserved expanded discipline cards across live Dashboard refreshes.
 - Audited authorized late-buy recovery against the frozen report and bound every
   immutable order/evidence timestamp to the explicit authorization window.
 

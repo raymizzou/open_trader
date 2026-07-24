@@ -1082,6 +1082,20 @@ def _valid_trend_collections(
 
 
 def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
+    snapshot = payload.get("strategy_snapshot")
+    rows = snapshot.get("parameter_rows") if isinstance(snapshot, dict) else None
+    if rows is not None and (
+        not isinstance(rows, list)
+        or any(
+            not isinstance(row, dict)
+            or set(row) != {"group", "name", "value"}
+            or any(
+                not isinstance(row[key], str) or not row[key].strip() for key in row
+            )
+            for row in rows
+        )
+    ):
+        return False
     fact_keys = {"api_cost", "industry_context_status", "industry_contexts"}
     if not fact_keys.intersection(payload):
         return True
@@ -1152,22 +1166,7 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
         "industry_contexts",
     }.intersection(payload):
         return True
-    snapshot = payload.get("strategy_snapshot")
-    if not isinstance(snapshot, dict):
-        return False
-    rows = snapshot.get("parameter_rows")
-    if (
-        not isinstance(rows, list)
-        or not rows
-        or any(
-            not isinstance(row, dict)
-            or set(row) != {"group", "name", "value"}
-            or any(
-                not isinstance(row[key], str) or not row[key].strip() for key in row
-            )
-            for row in rows
-        )
-    ):
+    if not rows:
         return False
 
     if not isinstance(status, dict):
@@ -1852,9 +1851,6 @@ def _project_broker_trend_report(
     frozen_parameter_rows = (
         strategy_snapshot.get("parameter_rows")
         if isinstance(strategy_snapshot, dict)
-        and {"api_cost", "industry_context_status", "industry_contexts"}.intersection(
-            payload
-        )
         else None
     )
     if not isinstance(frozen_parameter_rows, list):

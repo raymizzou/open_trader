@@ -1910,11 +1910,30 @@ function renderDashboardViews() {
   const broker = state.brokerFilter;
   const selector = `#account-${broker}-view-panel`;
   const container = elements["account-holdings"] || elements["holdings-body"];
+  const currentPanel = typeof container?.querySelector === "function"
+    ? container.querySelector(selector)
+    : null;
+  const openDisciplineKeys = state.accountViews[broker] === "report"
+      && !state.trendReportHistories[broker]?.open
+      && currentPanel
+    ? new Set(Array.from(
+      currentPanel.querySelectorAll(".trend-discipline-card[open]"),
+      (card) => card.dataset.discipline,
+    ).filter(Boolean))
+    : null;
   const frozenPanel = state.accountViews[broker] === "report" && state.trendReportHistories[broker]?.open
-    ? container?.querySelector(selector)
+    ? currentPanel
     : null;
   renderAccountHoldings();
-  if (frozenPanel) container?.querySelector(selector)?.replaceWith(frozenPanel);
+  if (frozenPanel) {
+    container?.querySelector(selector)?.replaceWith(frozenPanel);
+  } else if (openDisciplineKeys) {
+    container?.querySelector(selector)?.querySelectorAll(
+      ".trend-discipline-card",
+    ).forEach((card) => {
+      card.open = openDisciplineKeys.has(card.dataset.discipline);
+    });
+  }
 }
 
 const TREND_REASON_LABELS = {

@@ -979,7 +979,7 @@ def _validate_history_projection(
                 for observed in events_by_action[(report_hash, symbol, side)]
             )
         ), f"{artifact} 历史报告动作 {symbol} 消失或执行状态不匹配"
-        expectations.append({**report, "symbol": symbol, "side": side, "event": event})
+        expectations.append({**exact, "symbol": symbol, "side": side, "event": event})
     return expectations
 
 
@@ -1335,7 +1335,7 @@ def _check_trend_account_views(
                 panel.locator("[data-current-trend-report]").wait_for()
                 _check_loaded_report_identity(panel, report, broker)
                 _check_frozen_trend_disciplines(
-                    panel.locator(".cn-trend-report"), report, broker, page=page
+                    panel.locator(".cn-trend-report"), loaded, broker, page=page
                 )
                 current = panel.locator("[data-current-trend-report]")
                 _check_history_control_contract(current, f"{broker} 返回当前报告")
@@ -1505,7 +1505,7 @@ def _check_history_endpoints(
                     f"{latest_artifact} 本地冻结报告缺失"
                 )
                 _check_report_identity(latest, local, broker)
-                expectations.append(dict(local))
+                expectations.append(dict(latest))
             expected_by_broker[broker] = expectations
         except Exception as exc:
             errors.append(f"{broker} 历史报告检查失败：{type(exc).__name__}: {exc}")

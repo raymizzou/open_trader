@@ -1682,6 +1682,28 @@ def test_dashboard_rejects_malformed_frozen_parameter_rows(tmp_path: Path) -> No
     assert projected["status_text"] == "暂时不可用"
 
 
+def test_dashboard_rejects_malformed_legacy_frozen_parameter_rows(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["parameter_rows"] = [{"group": "坏"}]
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is False
+    assert projected["status_text"] == "暂时不可用"
+
+
 def test_dashboard_accepts_pre_task5_api_cost_shape(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_a_share/2026-07-15.json"
@@ -1754,6 +1776,45 @@ def test_dashboard_legacy_projection_keeps_raw_cost_and_empty_new_facts(
     assert projected["strategy_parameter_rows"] == []
     assert projected["audit"]["estimated_api_cost"] == "1.20"
     assert projected["audit"]["actual_api_cost"] == "1.00"
+
+
+@pytest.mark.parametrize(
+    ("broker", "market", "directory"),
+    [
+        ("eastmoney", "CN", "trend_a_share"),
+        ("tiger", "US", "trend_us_tiger"),
+        ("phillips", "HK", "trend_hk_phillips"),
+    ],
+)
+def test_dashboard_projects_legacy_frozen_parameter_rows_for_all_markets(
+    tmp_path: Path,
+    broker: str,
+    market: str,
+    directory: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / directory / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _valid_v2_dashboard_trend_payload()
+    metadata = payload["metadata"]
+    snapshot = payload["strategy_snapshot"]
+    assert isinstance(metadata, dict) and isinstance(snapshot, dict)
+    metadata.update({"market": market, "broker": broker})
+    snapshot["strategy_id"] = f"trend_animals_warm_to_hot/{market}/v2"
+    rows = [
+        {"group": "入场过滤", "name": "冻结门槛", "value": f"{market} 历史规则"}
+    ]
+    snapshot["parameter_rows"] = rows
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )[broker]
+
+    assert projected["available"] is True
+    assert projected["strategy_parameter_rows"] == rows
 
 
 @pytest.mark.parametrize("parameters", ["missing", ["legacy"]])
