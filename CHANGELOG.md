@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-24
 
+- Added eligible-industry breadth context and prior-day history to deterministic
+  CN/HK/US trend ordering with whole-report legacy fallback; standardized
+  independent per-market API-cost reporting and advanced CN v8 / US-HK v5 while
+  preserving approved Kelly samples.
+- Replaced the long trend-discipline list with frozen lifecycle cards, kept the
+  cumulative-drawdown pause visible, and bound authorized late-buy evidence to
+  its report and authorization window; verified 3,471 tests and the Dashboard
+  acceptance gate (`PASS`) on `f1162e1`.
 - Completed the unified CN/US/HK trend-display rollout; final Dashboard
   acceptance passed with 3,423 tests and all three market controllers ready.
 - Unified CN/US/HK trend-report buy tables around one column order and explicit
