@@ -323,6 +323,20 @@ def write_industry_context_history(
     }
     content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     directory.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ValueError("conflicting same-date industry context history") from None
+        if (
+            isinstance(existing, Mapping)
+            and existing.get("schema_version") == _HISTORY_SCHEMA_VERSION
+            and existing.get("market") == market_name
+            and existing.get("as_of_date") == as_of_date
+            and existing.get("industries") == payload["industries"]
+        ):
+            return path
+        raise ValueError("conflicting same-date industry context history")
     temp_path: Path | None = None
     try:
         with NamedTemporaryFile(

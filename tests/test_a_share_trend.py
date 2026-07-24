@@ -4460,6 +4460,11 @@ class ReadyApi:
 
     def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
         self.calls.append(f"api.components.{tm_id}")
+        if tm_id == 700001:
+            return [
+                {"tmId": member_id, "tickerSymbol": f"60000{member_id}.SH", "asOfDate": expected_date}
+                for member_id in range(1, 11)
+            ]
         component_id = 1 if tm_id == 622466 else 2
         return [{"tmId": component_id, "tickerSymbol": f"60000{component_id}.SH", "asOfDate": expected_date}]
 
@@ -4497,6 +4502,28 @@ class ReadyApi:
                 }
                 for tm_id in tm_ids
                 if tm_id not in self.missing_industry_ids
+            ]
+        if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "tradableFlag": True,
+                    "isTrendRightSide": True,
+                }
+                for tm_id in tm_ids
+            ]
+        if fields == trend_module.INDUSTRY_STATE_FIELDS:
+            if self.industry_error:
+                raise self.industry_error
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                }
+                for tm_id in tm_ids
             ]
         rows = []
         for tm_id in self.snapshot_ids if self.snapshot_ids is not None else tm_ids:
@@ -4544,6 +4571,8 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert api.snapshot_requests == [
         ([1, 2], A_SHARE_SNAPSHOT_FIELDS),
         ([700001], A_SHARE_INDUSTRY_FIELDS),
+        (list(range(1, 11)), trend_module.INDUSTRY_MEMBER_FIELDS),
+        ([700001], trend_module.INDUSTRY_STATE_FIELDS),
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
@@ -4560,11 +4589,99 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         "cache=client-managed"
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
+    assert payload["api_cost"]["estimate_complete"] is False
     evidence_path = trend_config(tmp_path).data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["query"]["component_pool_ids"] == [622466, 697199]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
+
+
+def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_members(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Api:
+        def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
+            calls.append(("components", tm_id))
+            assert tm_id == 700001
+            return [
+                {"tmId": member_id, "asOfDate": expected_date}
+                for member_id in range(1, 13)
+            ] + [{"tmId": 1, "asOfDate": expected_date}]
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            calls.append(("snapshots", (tm_ids, fields)))
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": member_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for member_id in tm_ids
+                ]
+            assert fields == trend_module.INDUSTRY_STATE_FIELDS
+            return [
+                {
+                    "tmId": 700001,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                }
+            ]
+
+    candidate_rows = [
+        {
+            "tmId": member_id,
+            "industryTmId": 700001,
+            "industryName": "电力",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+        }
+        for member_id in range(1, 13)
+    ]
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(
+            candidate("000001"),
+            candidate("000002", danger=True),
+        ),
+        candidate_rows=candidate_rows,
+        held_symbols=set(),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert [context.industry_tm_id for context in contexts] == [700001]
+    assert contexts[0].component_count == 12
+    assert contexts[0].warm_to_hot_count == 12
+    assert status["ordering_mode"] == "context_current_only"
+    assert facts["member_ids"] == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    assert facts["member_fields"] == trend_module.INDUSTRY_MEMBER_FIELDS
+    assert facts["state_fields"] == trend_module.INDUSTRY_STATE_FIELDS
+    assert calls == [
+        ("components", 700001),
+        (
+            "snapshots",
+            (
+                list(range(1, 13)),
+                trend_module.INDUSTRY_MEMBER_FIELDS,
+            ),
+        ),
+        (
+            "snapshots",
+            (
+                [700001],
+                trend_module.INDUSTRY_STATE_FIELDS,
+            ),
+        ),
+    ]
 
 
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
@@ -4765,6 +4882,9 @@ def test_report_runner_sends_exact_broker_v7_text(tmp_path: Path) -> None:
         "futu.calendar", "api.update_status", "api.balance_before",
         "api.components.622466", "api.components.697199",
     ]
+    assert calls.index("api.balance_after") > max(
+        index for index, call in enumerate(calls) if call == "api.snapshots"
+    )
     assert calls.index("api.billing") < calls.index("api.snapshots")
     assert api_kwargs["cache_dir"] == config.data_dir / "trend_animals/cache"
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
@@ -5837,7 +5957,7 @@ def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tm
     assert result.status == "generated"
     assert result.report_path.exists() and result.json_path.exists()
     assert payload["delivery_status"] == "delivery_failed"
-    assert calls.count("api.snapshots") == 2
+    assert calls.count("api.snapshots") == 4
 
 
 def test_report_runner_sends_v1_text_only_to_feishu_and_short_status_to_macos(tmp_path: Path) -> None:

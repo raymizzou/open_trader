@@ -34,7 +34,11 @@ from open_trader.notifications import (
     NullNotifier,
 )
 from open_trader.kline_technical_facts import DailyKlineBar
-from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
+from open_trader.a_share_trend import (
+    INDUSTRY_MEMBER_FIELDS,
+    INDUSTRY_STATE_FIELDS,
+    UNIFIED_TREND_FIELDS,
+)
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
@@ -681,7 +685,8 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         return {
             "tmId": tm_id, "tickerName": name, "tickerSymbol": symbol,
             "asset": "港股", "asOfDate": "2026-07-15", "tradableFlag": True,
-            "industryName": "科技", "amount1d": "2", "isTrendRightSide": True,
+            "industryName": "科技", "industryTmId": 700001,
+            "amount1d": "2", "isTrendRightSide": True,
             "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
             "gainSinceTrendEntry": "0.048", "trendPhasePrev": "谷雨",
             "trendPhaseCurr": "立夏", "trendStrengthLocalChange": "↑↑",
@@ -713,6 +718,11 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             return {"balance": "100"}
 
         def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
+            if tm_id == 700001:
+                return [
+                    {"tmId": member_id, "tickerSymbol": f"028{member_id:03d}.HK", "asOfDate": expected_date}
+                    for member_id in range(1, 11)
+                ]
             assert tm_id == 622494
             return [{"tmId": 1, "tickerSymbol": "02800.HK", "asOfDate": expected_date}]
 
@@ -730,6 +740,23 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            if kwargs["fields"] == INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": kwargs["expected_date"],
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in kwargs["tm_ids"]
+                ]
+            if kwargs["fields"] == INDUSTRY_STATE_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": kwargs["expected_date"],
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                }]
             assert kwargs["tm_ids"] == [1, 2]
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
@@ -989,6 +1016,11 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
         def get_components(
             self, *, tm_id: int, expected_date: str
         ) -> list[dict[str, object]]:
+            if tm_id == 700001:
+                return [
+                    {"tmId": member_id, "tickerSymbol": f"QQ{member_id}.US", "asOfDate": expected_date}
+                    for member_id in range(1, 11)
+                ]
             assert (tm_id, expected_date) == (622460, "2026-07-14")
             return [{"tmId": 1, "tickerSymbol": "QQQ.US", "asOfDate": expected_date}]
 
@@ -1006,12 +1038,30 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            if kwargs["fields"] == INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": kwargs["expected_date"],
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in kwargs["tm_ids"]
+                ]
+            if kwargs["fields"] == INDUSTRY_STATE_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": kwargs["expected_date"],
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                }]
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
                 {
                     "tmId": tm_id, "tickerName": name, "tickerSymbol": f"{symbol}.US",
                     "asset": "美股", "asOfDate": "2026-07-14", "tradableFlag": True,
-                    "industryName": "ETF", "amount1d": "2", "isTrendRightSide": True,
+                    "industryName": "ETF", "industryTmId": 700001,
+                    "amount1d": "2", "isTrendRightSide": True,
                     "daysSinceTrendEntry": 3, "trendStrengthLocalCurr": "96",
                     "stopwinFlagByDangerSignal": False,
                     "stopwinFlagByBoilingTemperature": False,

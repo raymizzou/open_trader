@@ -45,6 +45,11 @@ from .trend_kelly import (
 from .trend_industry_context import (
     IndustryContext,
     KNOWN_TEMPERATURES as INDUSTRY_KNOWN_TEMPERATURES,
+    attach_prior_context,
+    calculate_industry_context,
+    load_latest_prior_context,
+    write_industry_context_history,
+    _context_from_mapping,
 )
 from .trend_animals import (
     TrendAnimalsClient,
@@ -88,6 +93,18 @@ A_SHARE_INDUSTRY_FIELDS = (
     "tmId",
     "asOfDate",
     "trendTemperatureCurr",
+)
+INDUSTRY_MEMBER_FIELDS = (
+    "tmId",
+    "asOfDate",
+    "tradableFlag",
+    "isTrendRightSide",
+)
+INDUSTRY_STATE_FIELDS = (
+    "tmId",
+    "asOfDate",
+    "trendTemperatureCurr",
+    "trendStrengthLocalCurr",
 )
 CN_MAX_FILTER_PRICE = Decimal("200")
 CN_MIN_STRENGTH = Decimal("95")
@@ -1635,6 +1652,141 @@ def build_candidate_list(
         ordering_mode=ordering_mode,
         industry_context_status=context_status,
     )
+
+
+def collect_industry_contexts(
+    *,
+    api: object,
+    candidates: Sequence[CandidateInput],
+    candidate_rows: Sequence[Mapping[str, object]],
+    held_symbols: set[str],
+    expected_date: str,
+    market: str,
+    history_root: Path,
+) -> tuple[tuple[IndustryContext, ...], dict[str, object], dict[str, object]]:
+    """Collect breadth/state only for industries that pass existing hard gates."""
+    candidate_decision = build_candidate_list(
+        candidates,
+        held_symbols=held_symbols,
+        expected_date=expected_date,
+        market=market,
+    )
+    eligible = candidate_decision.eligible
+    eligible_industry_ids = sorted(
+        {
+            item.industry_tm_id
+            for item in eligible
+            if item.industry_tm_id is not None
+        }
+    )
+    industry_names = {
+        item.industry_tm_id: item.industry
+        for item in eligible
+        if item.industry_tm_id is not None and item.industry
+    }
+    for row in candidate_rows:
+        industry_id = _optional_int(row.get("industryTmId"))
+        industry_name = row.get("industryName")
+        if (
+            industry_id is not None
+            and industry_id in eligible_industry_ids
+            and industry_id not in industry_names
+            and isinstance(industry_name, str)
+        ):
+            industry_names[industry_id] = industry_name.strip()
+    component_ids_by_industry: dict[int, set[int]] = {}
+    component_rows_by_industry: dict[int, list[Mapping[str, object]]] = {}
+    component_rows_count = 0
+    for industry_id in eligible_industry_ids:
+        rows = api.get_components(tm_id=industry_id, expected_date=expected_date)  # type: ignore[attr-defined]
+        component_rows_count += len(rows)
+        component_rows_by_industry[industry_id] = list(rows)
+        component_ids_by_industry[industry_id] = {
+            _row_tm_id(row) for row in rows
+        }
+    member_ids = sorted(
+        {
+            member_id
+            for component_ids in component_ids_by_industry.values()
+            for member_id in component_ids
+        }
+    )
+    member_rows = (
+        api.get_snapshots(  # type: ignore[attr-defined]
+            tm_ids=member_ids,
+            fields=INDUSTRY_MEMBER_FIELDS,
+            expected_date=expected_date,
+        )
+        if member_ids
+        else []
+    )
+    state_rows = (
+        api.get_snapshots(  # type: ignore[attr-defined]
+            tm_ids=eligible_industry_ids,
+            fields=INDUSTRY_STATE_FIELDS,
+            expected_date=expected_date,
+        )
+        if eligible_industry_ids
+        else []
+    )
+    state_by_id: dict[int, Mapping[str, object]] = {}
+    for row in state_rows:
+        tm_id = _row_tm_id(row)
+        if tm_id in state_by_id:
+            raise TrendAnimalsError("industry state snapshot returned duplicate tmIds")
+        state_by_id[tm_id] = row
+    warm_to_hot_ids: defaultdict[int, set[int]] = defaultdict(set)
+    for row in candidate_rows:
+        tm_id = _optional_int(row.get("tmId"))
+        industry_id = _optional_int(row.get("industryTmId"))
+        if (
+            tm_id is not None
+            and industry_id is not None
+            and row.get("trendTemperaturePrev") == "温"
+            and row.get("trendTemperatureCurr") in HOT_TEMPERATURES
+        ):
+            warm_to_hot_ids[industry_id].add(tm_id)
+    contexts = tuple(
+        calculate_industry_context(
+            industry_tm_id=industry_id,
+            industry=industry_names.get(industry_id, ""),
+            expected_date=expected_date,
+            component_tm_ids=sorted(component_ids_by_industry[industry_id]),
+            member_rows=member_rows,
+            industry_row=state_by_id.get(industry_id),
+            warm_to_hot_count=len(warm_to_hot_ids[industry_id]),
+        )
+        for industry_id in eligible_industry_ids
+    )
+    prior = load_latest_prior_context(
+        history_root,
+        market=market,
+        before_date=expected_date,
+    )
+    contexts = attach_prior_context(contexts, prior)
+    context_map = {context.industry_tm_id: context for context in contexts}
+    ordering = build_candidate_list(
+        candidates,
+        held_symbols=held_symbols,
+        expected_date=expected_date,
+        market=market,
+        industry_contexts=context_map,
+    )
+    facts = {
+        "eligible_industry_ids": tuple(eligible_industry_ids),
+        "component_requests": len(eligible_industry_ids),
+        "component_rows": component_rows_count,
+        "component_rows_by_industry": component_rows_by_industry,
+        "member_ids": tuple(member_ids),
+        "member_rows": len(member_rows),
+        "member_response": list(member_rows),
+        "member_fields": INDUSTRY_MEMBER_FIELDS,
+        "state_ids": tuple(eligible_industry_ids),
+        "state_rows": len(state_rows),
+        "state_response": list(state_rows),
+        "state_fields": INDUSTRY_STATE_FIELDS,
+    }
+    return contexts, dict(ordering.industry_context_status), facts
 
 
 def estimate_buy_actions(
@@ -4268,6 +4420,46 @@ def _deliver_a_share_daily_text(
     )
 
 
+def _write_frozen_industry_context_history(
+    *,
+    receipt: Mapping[str, object],
+    history_root: Path,
+    market: str,
+) -> Path | None:
+    payload = json.loads(str(receipt["report_json"]))
+    if not isinstance(payload, Mapping):
+        raise ValueError("frozen report payload must be an object")
+    rows = payload.get("industry_contexts")
+    if not isinstance(rows, list):
+        return None
+    contexts: list[IndustryContext] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("frozen industry context row is invalid")
+        context = _context_from_mapping(row)
+        if context is None:
+            raise ValueError("frozen industry context row is invalid")
+        contexts.append(context)
+    if not contexts:
+        return None
+    generated_at = payload.get("generated_at")
+    strategy_snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        strategy_snapshot.get("strategy_version")
+        if isinstance(strategy_snapshot, Mapping)
+        else None
+    )
+    if not isinstance(generated_at, str) or not isinstance(strategy_version, str):
+        raise ValueError("frozen report is missing industry history metadata")
+    return write_industry_context_history(
+        history_root,
+        market=market,
+        generated_at=generated_at,
+        strategy_version=strategy_version,
+        contexts=contexts,
+    )
+
+
 def _recover_receipt_report(
     *,
     config: DailyPremarketConfig,
@@ -4332,6 +4524,11 @@ def _recover_receipt_report(
         receipt=receipt,
         reports_dir=config.reports_dir / "trend_a_share",
         artifact_stem=artifact_stem,
+    )
+    _write_frozen_industry_context_history(
+        receipt=receipt,
+        history_root=config.data_dir / "trend_industry_context",
+        market="CN",
     )
     _notify_delivery_status(
         notifier,
@@ -4510,12 +4707,13 @@ def _attempt_report(
             return AShareTrendRunResult("waiting", None, None)
 
         balance_before = _balance(api.get_account_balance())
-        component_rows = []
-        component_pools: defaultdict[int, set[str]] = defaultdict(set)
-        for tm_id in (
+        candidate_pool_ids = (
             config.trend_animals_a_share_tm_id,
             config.trend_animals_etf_tm_id,
-        ):
+        )
+        component_rows = []
+        component_pools: defaultdict[int, set[str]] = defaultdict(set)
+        for tm_id in candidate_pool_ids:
             rows = api.get_components(tm_id=tm_id, expected_date=run_date)
             component_rows.extend(rows)
             for row in rows:
@@ -4600,8 +4798,6 @@ def _attempt_report(
             )
             for row in industry_rows
         }
-        balance_after = _balance(api.get_account_balance())
-
         candidates: list[CandidateInput] = []
         holding_snapshots: dict[str, HoldingSnapshot | None] = {
             position.symbol: None for position in account.positions
@@ -4664,13 +4860,72 @@ def _attempt_report(
                 except ValueError:
                     holding_snapshots[symbol] = None
 
-        estimated_cost = unified_unit_cost * len(requested_ids) + sum(
-            (
-                _billing_price(billing[field])
-                for field in A_SHARE_INDUSTRY_FIELDS
-            ),
-            Decimal("0"),
-        ) * len(industry_ids)
+        candidate_pool_rows = [
+            rows_by_tm_id[tm_id] for tm_id in sorted(component_ids)
+            if tm_id in rows_by_tm_id
+        ]
+        industry_contexts, industry_context_status, industry_facts = (
+            collect_industry_contexts(
+                api=api,
+                candidates=candidates,
+                candidate_rows=candidate_pool_rows,
+                held_symbols={position.symbol for position in account.positions},
+                expected_date=run_date,
+                market="CN",
+                history_root=config.data_dir / "trend_industry_context",
+            )
+        )
+        context_by_id = {
+            context.industry_tm_id: context for context in industry_contexts
+        }
+        candidates = [
+            replace(
+                item,
+                industry_temperature=(
+                    context_by_id[item.industry_tm_id].temperature
+                    if item.industry_tm_id in context_by_id
+                    and context_by_id[item.industry_tm_id].temperature is not None
+                    else item.industry_temperature
+                ),
+            )
+            for item in candidates
+        ]
+        holding_snapshots = {
+            symbol: (
+                replace(
+                    snapshot,
+                    industry_temperature=(
+                        context_by_id[snapshot.industry_tm_id].temperature
+                        if snapshot.industry_tm_id in context_by_id
+                        and context_by_id[snapshot.industry_tm_id].temperature is not None
+                        else snapshot.industry_temperature
+                    ),
+                )
+                if snapshot is not None
+                else None
+            )
+            for symbol, snapshot in holding_snapshots.items()
+        }
+        balance_after = _balance(api.get_account_balance())
+
+        estimated_cost = (
+            unified_unit_cost * len(requested_ids)
+            + sum(
+                (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
+                Decimal("0"),
+            )
+            * len(industry_ids)
+            + sum(
+                (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
+                Decimal("0"),
+            )
+            * len(industry_facts["member_ids"])
+            + sum(
+                (_billing_price(billing[field]) for field in INDUSTRY_STATE_FIELDS if field in billing),
+                Decimal("0"),
+            )
+            * len(industry_facts["state_ids"])
+        )
         balance_delta = balance_before - balance_after
         actual_cost = balance_delta if balance_delta >= 0 else None
         cache_events = tuple(getattr(api, "paid_cache_events", ()))
@@ -4679,6 +4934,22 @@ def _attempt_report(
             "misses": sum(event.get("cache") == "miss" for event in cache_events),
             "events": [dict(event) for event in cache_events],
         }
+        expected_component_requests = len(candidate_pool_ids) + int(
+            industry_facts["component_requests"]
+        )
+        component_events = [
+            event for event in cache_events
+            if event.get("endpoint") == "getComponentTicker"
+        ]
+        industry_field_prices_complete = all(
+            field in billing
+            for field in (*INDUSTRY_MEMBER_FIELDS, *INDUSTRY_STATE_FIELDS)
+        )
+        estimate_complete = (
+            len(component_events) == expected_component_requests
+            and all(event.get("cache") == "hit" for event in component_events)
+            and industry_field_prices_complete
+        )
         prior_state = rebuild_overheat_trim_projection(
             config.data_dir,
             market="CN",
@@ -4697,10 +4968,7 @@ def _attempt_report(
         strategy_snapshot = live_trend_strategy_snapshot(
             "CN",
             process_version,
-            (
-                config.trend_animals_a_share_tm_id,
-                config.trend_animals_etf_tm_id,
-            ),
+            candidate_pool_ids,
         )
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
@@ -4725,6 +4993,9 @@ def _attempt_report(
                 *_component_api_facts(api, len(component_rows)),
                 f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
                 f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
+                f"getComponentTicker eligible_industries={industry_facts['component_requests']} rows={industry_facts['component_rows']} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(INDUSTRY_MEMBER_FIELDS)} ids={len(industry_facts['member_ids'])} rows={industry_facts['member_rows']} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(INDUSTRY_STATE_FIELDS)} ids={len(industry_facts['state_ids'])} rows={industry_facts['state_rows']} cache=client-managed",
             ),
             data_sources=(
                 "Trend Animals",
@@ -4737,12 +5008,12 @@ def _attempt_report(
             position_weight=Decimal("0.04"),
             position_weight_source="fallback_4pct",
             process_version=process_version,
-            candidate_pool_ids=(
-                config.trend_animals_a_share_tm_id,
-                config.trend_animals_etf_tm_id,
-            ),
+            candidate_pool_ids=candidate_pool_ids,
             strategy_snapshot=strategy_snapshot,
             drawdown_summary=drawdown_summary,
+            industry_contexts=industry_contexts,
+            industry_context_status=industry_context_status,
+            estimated_api_cost_complete=estimate_complete,
             metadata={
                 "market": "CN",
                 "broker": "eastmoney",
@@ -4770,23 +5041,26 @@ def _attempt_report(
             prior_state=prior_state,
             watch_events=watch_events,
             query={
-                "component_pool_ids": [
-                    config.trend_animals_a_share_tm_id,
-                    config.trend_animals_etf_tm_id,
-                ],
+                "component_pool_ids": list(candidate_pool_ids),
                 "snapshot_fields": list(fields),
                 "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
+                "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
+                "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
             },
             responses={
                 "update_status": update_rows,
                 "components": component_rows,
                 "snapshots": snapshot_rows,
                 "industries": industry_rows,
+                "industry_components": [
+                    row
+                    for rows in industry_facts["component_rows_by_industry"].values()
+                    for row in rows
+                ],
+                "industry_members": industry_facts["member_response"],
+                "industry_states": industry_facts["state_response"],
             },
-            candidate_pool_ids=(
-                config.trend_animals_a_share_tm_id,
-                config.trend_animals_etf_tm_id,
-            ),
+            candidate_pool_ids=candidate_pool_ids,
             lot_sizes={},
             price_fx_to_account_currency=Decimal("1"),
             previous_attention_rows=(),
@@ -4852,6 +5126,11 @@ def _attempt_report(
             reports_dir=config.reports_dir / "trend_a_share",
             artifact_stem=artifact_stem,
         )
+        _write_frozen_industry_context_history(
+            receipt=receipt,
+            history_root=config.data_dir / "trend_industry_context",
+            market="CN",
+        )
         _notify_delivery_status(
             notifier,
             run_date=run_date,
@@ -4912,6 +5191,11 @@ def run_a_share_trend_report(
             if receipt["status"] == "sent" and _final_pair_matches(
                 receipt, base_markdown, base_json
             ):
+                _write_frozen_industry_context_history(
+                    receipt=receipt,
+                    history_root=config.data_dir / "trend_industry_context",
+                    market="CN",
+                )
                 return AShareTrendRunResult("existing", base_markdown, base_json)
         recovered = _recover_receipt_report(
             config=config,

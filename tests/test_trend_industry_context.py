@@ -343,3 +343,33 @@ def test_history_loader_skips_semantically_invalid_stored_valid_context(
     )
 
     assert set(loaded) == {700002}
+
+
+def test_history_write_is_idempotent_for_same_context_and_rejects_conflicts(
+    tmp_path: Path,
+) -> None:
+    context = _valid_context(as_of_date="2026-07-24")
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-24T18:00:00+08:00",
+        strategy_version="v8",
+        contexts=(context,),
+    )
+    original = path.read_bytes()
+    assert write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-24T19:00:00+08:00",
+        strategy_version="v8",
+        contexts=(context,),
+    ) == path
+    assert path.read_bytes() == original
+    with pytest.raises(ValueError, match="conflicting same-date"):
+        write_industry_context_history(
+            tmp_path,
+            market="CN",
+            generated_at="2026-07-24T20:00:00+08:00",
+            strategy_version="v8",
+            contexts=(replace(context, right_count=999),),
+        )
