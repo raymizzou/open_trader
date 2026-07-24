@@ -2133,9 +2133,13 @@ function cnTrendRows(items) {
     : [];
 }
 
-function renderCnTrendCell(label, value, ariaLabel = "") {
-  const display = hasValue(value) ? formatPlain(value) : "数据未提供";
+function renderCnTrendCell(label, value, ariaLabel = "", missingLabel = "—") {
+  const display = hasValue(value) ? formatPlain(value) : missingLabel;
   return `<td data-label="${escapeHtml(label)}"${ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : ""}>${escapeHtml(display)}</td>`;
+}
+
+function renderTrendBuyCell(label, value, ariaLabel = "") {
+  return renderCnTrendCell(label, value, ariaLabel, "数据未提供");
 }
 
 function cnTrendIdentity(item) {
@@ -2498,43 +2502,45 @@ function renderTrendBuyStage(report) {
     "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
   ];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
-    const targetWeight = decimalAsPercent(item.target_weight, "-");
+    const targetWeight = decimalAsPercent(item.target_weight, null);
+    const targetWeightLabel = hasValue(targetWeight) ? targetWeight : "数据未提供";
     return `<tr class="cn-trend-card">
-      ${renderCnTrendCell("标的", cnTrendIdentity(item))}
-      ${renderCnTrendCell("动作", "正式买入")}
-      ${renderCnTrendCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : item.filter_price)}
-      ${renderCnTrendCell("执行参考价（Futu 前复权）", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
-      ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
-      ${renderCnTrendCell("节气", item.phase)}
-      ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
-      ${renderCnTrendCell("行业", item.industry)}
-      ${renderCnTrendCell("行业温度", item.industry_temperature)}
-      ${renderCnTrendCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
-      ${renderCnTrendCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
-      ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
-      ${renderCnTrendCell("目标金额", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : item.target_amount)}
-      ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : "—")}
-      ${renderCnTrendCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : item.estimated_initial_line)}
+      ${renderTrendBuyCell("标的", cnTrendIdentity(item))}
+      ${renderTrendBuyCell("动作", "正式买入")}
+      ${renderTrendBuyCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : item.filter_price)}
+      ${renderTrendBuyCell("执行参考价（Futu 前复权）", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
+      ${renderTrendBuyCell("温度变化", cnTrendTemperature(item))}
+      ${renderTrendBuyCell("节气", item.phase)}
+      ${renderTrendBuyCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
+      ${renderTrendBuyCell("行业", item.industry)}
+      ${renderTrendBuyCell("行业温度", item.industry_temperature)}
+      ${renderTrendBuyCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
+      ${renderTrendBuyCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
+      ${renderTrendBuyCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeightLabel}`)}
+      ${renderTrendBuyCell("目标金额", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : item.target_amount)}
+      ${renderTrendBuyCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : null)}
+      ${renderTrendBuyCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : item.estimated_initial_line)}
     </tr>${renderTrendRiskRow(item, headings.length, "允许")}${renderTrendExecutionRow(item, headings.length)}`;
   });
   rows.push(...cnTrendRows(report.risk_skips).map((item) => {
-    const targetWeight = decimalAsPercent(item.target_weight, "-");
+    const targetWeight = decimalAsPercent(item.target_weight, null);
+    const targetWeightLabel = hasValue(targetWeight) ? targetWeight : "数据未提供";
     return `<tr class="cn-trend-card">
-      ${renderCnTrendCell("标的", cnTrendIdentity(item))}
-      ${renderCnTrendCell("动作", "跳过")}
-      ${renderCnTrendCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : item.filter_price)}
-      ${renderCnTrendCell("执行参考价（Futu 前复权）", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
-      ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
-      ${renderCnTrendCell("节气", item.phase)}
-      ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
-      ${renderCnTrendCell("行业", item.industry)}
-      ${renderCnTrendCell("行业温度", item.industry_temperature)}
-      ${renderCnTrendCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
-      ${renderCnTrendCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
-      ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
-      ${renderCnTrendCell("目标金额", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : item.target_amount)}
-      ${renderCnTrendCell("预计数量", "0 股")}
-      ${renderCnTrendCell("预计保护线", "—")}
+      ${renderTrendBuyCell("标的", cnTrendIdentity(item))}
+      ${renderTrendBuyCell("动作", "跳过")}
+      ${renderTrendBuyCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : item.filter_price)}
+      ${renderTrendBuyCell("执行参考价（Futu 前复权）", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
+      ${renderTrendBuyCell("温度变化", cnTrendTemperature(item))}
+      ${renderTrendBuyCell("节气", item.phase)}
+      ${renderTrendBuyCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
+      ${renderTrendBuyCell("行业", item.industry)}
+      ${renderTrendBuyCell("行业温度", item.industry_temperature)}
+      ${renderTrendBuyCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
+      ${renderTrendBuyCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
+      ${renderTrendBuyCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeightLabel}`)}
+      ${renderTrendBuyCell("目标金额", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : item.target_amount)}
+      ${renderTrendBuyCell("预计数量", "0 股")}
+      ${renderTrendBuyCell("预计保护线", null)}
     </tr>${renderTrendRiskRow(item, headings.length, "跳过")}`;
   }));
   return renderCnTrendTable(

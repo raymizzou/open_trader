@@ -1835,10 +1835,17 @@ const us = [
       order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
   }],risk_skips:[]}),
 ].join("");
-console.log(JSON.stringify({cn,us}));
+const missing = [
+  renderCnSellOrHoldStage("缺失", [{symbol:"600000",name:"缺失",close:null,strength:null,active_line:null}], "hold"),
+  renderMarketSellOrHoldStage("缺失", [{symbol:"EA",name:"缺失",close:null,strength:null,active_line:null}], "hold"),
+].join("");
+console.log(JSON.stringify({cn,us,missing}));
 ''')
     rendered = json.loads(output)
     combined = rendered["cn"] + rendered["us"]
+    assert '<td data-label="执行参考价（Futu 前复权）">—</td>' in rendered["missing"]
+    assert '<td data-label="执行参考价">—</td>' in rendered["missing"]
+    assert "数据未提供" not in rendered["missing"]
     for expected in (
         "1,234,567.51", "24.55", "99.88", "12,345.68", "2.35",
         "39,970.42", "8,888.89", "9,007,199,254,740,993 股", "23.43", "30.59",
@@ -4801,6 +4808,33 @@ const us = renderTrendReportWorkspace({
     reason:"holding_signal_unknown",close:null,strength:null,active_line:null}],
   audit:{account_exceptions:["现金类资产不参与趋势判断"]},
 });
+const hk = renderTrendReportWorkspace({
+  market:"HK",broker_label:"辉立",market_label:"港股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"港股常规交易时段",
+  counts:{sell:0,buy:1,hold:0,review:0},sell_actions:[],hold_actions:[],review_actions:[],
+  buy_actions:[{symbol:"02840",name:"SPDR 金",filter_price:"29.10",close:"29.20",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",industry_temperature:null,
+    market_cap:"110",amount:"6",strength:"99.8",industry:"ETF",target_weight:"0.04",
+    target_amount:"4941.49",estimated_shares:23,estimated_initial_line:"28.00"}],
+  audit:{},
+});
+const buySection = (html) => {
+  const match = html.match(/<section class="trend-stage cn-trend-stage cn-trend-buy"[^>]*>[\s\S]*?<\/section>/);
+  if (!match) throw new Error("missing buy section");
+  return match[0];
+};
+const expectedBuyHeadings = [
+  "标的", "动作", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
+  "温度变化", "节气", "强度", "行业", "行业温度", "市值（亿元）",
+  "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
+];
+for (const [market, html] of [["US", us], ["HK", hk]]) {
+  const section = buySection(html);
+  const headings = [...section.matchAll(/<th scope="col">([^<]*)<\/th>/g)].map((match) => match[1]);
+  if (JSON.stringify(headings) !== JSON.stringify(expectedBuyHeadings)) throw new Error(`${market} headings: ${section}`);
+  if (!section.includes('<td data-label="行业温度">数据未提供</td>')) throw new Error(`${market} industry temperature: ${section}`);
+}
 for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核",
   "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓",
   "正式买入 1","全部卖出 0","继续持有 0","人工复核 1",
