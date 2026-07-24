@@ -4789,7 +4789,9 @@ const us = renderTrendReportWorkspace({
   report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
   account_status:"已更新",buy_window:"美股常规交易时段",
   counts:{sell:0,buy:1,hold:0,review:1},sell_actions:[],hold_actions:[],
-  buy_actions:[{symbol:"EA",name:"艺电",close:"207.27",strength:"99.8",
+  buy_actions:[{symbol:"EA",name:"艺电",filter_price:"207.27",close:"207.27",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",industry_temperature:null,
+    market_cap:"110",amount:"6",strength:"99.8",
     industry:"通讯服务",target_weight:"0.04",target_amount:"4941.49",
     estimated_shares:23,estimated_initial_line:"205.46930",
     execution:{status:"partially_filled",filled_qty:"13",target_qty:"23",
@@ -4820,6 +4822,12 @@ if (!us.includes('class="cn-trend-report"') ||
     us.includes('class="trend-discipline"')) throw new Error(us);
 if (!us.includes('class="cn-trend-execution"') ||
     us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
+for (const text of [
+  "筛选价（Trend Animals）", "执行参考价（Futu 前复权）", "温度变化", "节气",
+  "行业温度", "市值（亿元）", "日成交额（亿元）", "数据未提供",
+]) {
+  if (!us.includes(text)) throw new Error(text + "\n" + us);
+}
 console.log("ok");
 ''')
 
