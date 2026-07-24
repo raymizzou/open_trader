@@ -35,8 +35,10 @@ cards and no frozen industry context.
   drawdown remains in the existing risk summary rather than being duplicated.
 - Rendered native `<details class="trend-discipline-card">` cards with compact
   frozen facts, affected-row counts, escaped labels/values, and full expanded
-  rows. The legacy CN-only cards remain only for payloads that predate the
-  frozen row projection.
+  rows. Every market renders the same six cards; when a report has no frozen
+  rows, each card explicitly says that current rules were not loaded. The
+  legacy CN-only renderer remains only for direct compatibility tests and is
+  not used by the report workspace.
 - Added frozen API-cost, version/status, and industry-context rendering,
   including breadth ratios, prior share/percentage-point changes, and explicit
   invalid-context reasons.
@@ -46,6 +48,25 @@ cards and no frozen industry context.
 - Added acceptance checks for current and historical frozen rows, keyboardable
   lifecycle summaries, cost labels, industry breadth facts, and invalid-context
   fallback copy.
+
+## Review follow-up
+
+- Removed the workspace's CN-only fallback so US/HK and row-less reports cannot
+  inherit current rules; the six market-neutral cards now have an explicit
+  empty state.
+- Moved compact lifecycle facts into each native `<summary>`, kept full facts in
+  the expanded body, and asserted keyboard focus, 44px targets, and mobile
+  stage ordering in acceptance coverage.
+- Added deterministic historical-selection checks, explicit missing industry
+  context copy, and canonical legacy API-cost labels (including the incomplete
+  snapshot-estimate wording).
+
+Follow-up focused checks:
+
+```text
+dashboard web lifecycle/ordering/cost selections  8 passed
+dashboard acceptance frozen lifecycle selection   1 passed
+```
 
 ## GREEN
 
@@ -58,8 +79,8 @@ Focused lifecycle tests:
 Dashboard web and acceptance suites:
 
 ```text
-tests/test_dashboard_web.py       242 passed
-tests/test_dashboard_acceptance.py 298 passed
+tests/test_dashboard_web.py + tests/test_dashboard_acceptance.py
+542 passed in 29.64s
 ```
 
 Backend projections and industry-context tests:
@@ -73,7 +94,7 @@ Repository-wide verification:
 
 ```text
 make test
-3460 passed in 74.43s (0:01:14)
+3462 passed in 74.56s (0:01:14)
 ```
 
 Static JavaScript validation:

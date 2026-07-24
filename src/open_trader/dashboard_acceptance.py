@@ -1102,10 +1102,11 @@ def _trend_context_percent(value: Any) -> str | None:
 
 def _check_frozen_trend_disciplines(
     report_root: Any, report: Mapping[str, Any], broker: str,
+    *, page: Any | None = None,
 ) -> None:
-    rows = report.get("strategy_parameter_rows")
-    if not isinstance(rows, list) or not rows:
-        return
+    raw_rows = report.get("strategy_parameter_rows")
+    rows = raw_rows if isinstance(raw_rows, list) else []
+    has_rows = bool(rows)
     cards = report_root.locator(".trend-discipline-card")
     assert cards.count() == 6, f"{broker} 冻结纪律卡数量不是 6"
     summaries = cards.locator("summary")
@@ -1130,14 +1131,30 @@ def _check_frozen_trend_disciplines(
         assert summary.evaluate("element => element === document.activeElement"), (
             f"{broker} 冻结纪律摘要不可键盘聚焦"
         )
+    evaluate_all = getattr(summaries, "evaluate_all", None)
+    if callable(evaluate_all):
+        boxes = evaluate_all(
+            "nodes => nodes.map(node => ({height: node.getBoundingClientRect().height}))"
+        )
+        assert all(box.get("height", 0) >= 44 for box in boxes), (
+            f"{broker} 冻结纪律摘要不足 44px：{boxes}"
+        )
     workspace_text = report_root.inner_text()
-    for row in rows:
-        assert isinstance(row, Mapping), f"{broker} 冻结策略参数行格式无效"
-        for key in ("group", "name", "value"):
-            value = row.get(key)
-            assert value is not None and str(value) in workspace_text, (
-                f"{broker} 冻结纪律缺少 {key}：{value}"
-            )
+    if has_rows:
+        for row in rows:
+            assert isinstance(row, Mapping), f"{broker} 冻结策略参数行格式无效"
+            for key in ("group", "name", "value"):
+                value = row.get(key)
+                assert value is not None and str(value) in workspace_text, (
+                    f"{broker} 冻结纪律缺少 {key}：{value}"
+                )
+    else:
+        assert "冻结纪律参数未提供，未加载当前规则" in workspace_text, (
+            f"{broker} 无冻结参数时缺少明确空状态"
+        )
+        assert "趋势强度不低于 95" not in workspace_text, (
+            f"{broker} 无冻结参数时泄漏当前入场规则"
+        )
     cost = report.get("api_cost")
     if isinstance(cost, Mapping) and cost.get("label"):
         assert str(cost["label"]) in workspace_text, (
@@ -1145,48 +1162,78 @@ def _check_frozen_trend_disciplines(
         )
     contexts = report.get("industry_contexts")
     status = report.get("industry_context_status")
-    if isinstance(contexts, list):
-        context_section = report_root.locator(".trend-industry-context")
-        assert context_section.count() == 1, f"{broker} 缺少行业上下文区"
-        context_text = context_section.inner_text()
-        for context in contexts:
-            assert isinstance(context, Mapping), f"{broker} 行业上下文格式无效"
-            for key in ("industry", "temperature", "strength", "warm_to_hot_count"):
-                value = context.get(key)
-                if value is not None:
-                    assert str(value) in context_text, (
-                        f"{broker} 行业上下文缺少 {key}：{value}"
-                    )
-            right_count = context.get("right_count")
-            valid_count = context.get("valid_count")
-            right_share = _trend_context_percent(context.get("right_share"))
-            if right_count is not None and valid_count is not None and right_share:
-                expected = f"{_display_number(right_count)} / {_display_number(valid_count)} = {right_share}"
-                assert expected in context_text, f"{broker} 行业右侧占比未显示：{expected}"
-            prior = _trend_context_percent(context.get("prior_right_share"))
-            change = context.get("right_share_change_pp")
-            if prior:
-                assert f"此前右侧占比 {prior}" in context_text, (
-                    f"{broker} 行业此前右侧占比未显示：{prior}"
+    context_section = report_root.locator(".trend-industry-context")
+    assert context_section.count() == 1, f"{broker} 缺少行业上下文区"
+    context_text = context_section.inner_text()
+    context_rows = contexts if isinstance(contexts, list) else []
+    if not context_rows and not has_rows:
+        assert "当前行业上下文未提供，无法确认排序" in context_text, (
+            f"{broker} 无行业上下文时缺少明确回退提示"
+        )
+    for context in context_rows:
+        assert isinstance(context, Mapping), f"{broker} 行业上下文格式无效"
+        for key in ("industry", "temperature", "strength", "warm_to_hot_count"):
+            value = context.get(key)
+            if value is not None:
+                assert str(value) in context_text, (
+                    f"{broker} 行业上下文缺少 {key}：{value}"
                 )
-            if change is not None and str(change).strip():
-                change_text = _display_number(change)
-                if not str(change_text).startswith(("-", "+")):
-                    change_text = f"+{change_text}"
-                assert f"{change_text} 个百分点" in context_text, (
-                    f"{broker} 行业右侧占比变化未显示：{change_text}"
-                )
-        if isinstance(status, Mapping) and (
-            str(status.get("ordering_mode", "")).startswith("legacy")
-            or status.get("current_complete") is False
-            or any(
-                isinstance(context, Mapping) and context.get("valid") is False
-                for context in contexts
+        right_count = context.get("right_count")
+        valid_count = context.get("valid_count")
+        right_share = _trend_context_percent(context.get("right_share"))
+        if right_count is not None and valid_count is not None and right_share:
+            expected = f"{_display_number(right_count)} / {_display_number(valid_count)} = {right_share}"
+            assert expected in context_text, f"{broker} 行业右侧占比未显示：{expected}"
+        prior = _trend_context_percent(context.get("prior_right_share"))
+        change = context.get("right_share_change_pp")
+        if prior:
+            assert f"此前右侧占比 {prior}" in context_text, (
+                f"{broker} 行业此前右侧占比未显示：{prior}"
             )
-        ):
-            assert "当前行业上下文无效" in context_text, (
-                f"{broker} 行业上下文无效时缺少回退提示"
+        if change is not None and str(change).strip():
+            change_text = _display_number(change)
+            if not str(change_text).startswith(("-", "+")):
+                change_text = f"+{change_text}"
+            assert f"{change_text} 个百分点" in context_text, (
+                f"{broker} 行业右侧占比变化未显示：{change_text}"
             )
+    if isinstance(status, Mapping) and (
+        str(status.get("ordering_mode", "")).startswith("legacy")
+        or status.get("current_complete") is False
+        or any(
+            isinstance(context, Mapping) and context.get("valid") is False
+            for context in context_rows
+        )
+    ):
+        assert "当前行业上下文无效" in context_text, (
+            f"{broker} 行业上下文无效时缺少回退提示"
+        )
+    if page is not None and (
+        getattr(page, "viewport_size", None) or {}
+    ).get("width", 0) <= 760:
+        ordered_selectors = (
+            ".cn-trend-sell", ".cn-trend-review", ".trend-discipline-workspace",
+            ".trend-industry-context", ".cn-trend-buy", ".cn-trend-hold",
+            ".trend-risk-summary", ".trend-audit",
+        )
+        boxes: list[dict[str, object]] = []
+        try:
+            for selector in ordered_selectors:
+                locator = report_root.locator(selector)
+                if locator.count() != 1:
+                    continue
+                box = locator.bounding_box()
+                if not isinstance(box, Mapping) or "y" not in box:
+                    boxes = []
+                    break
+                boxes.append(dict(box))
+        except (AssertionError, AttributeError):
+            boxes = []
+        if boxes:
+            assert all(
+                float(boxes[index]["y"]) <= float(boxes[index + 1]["y"])
+                for index in range(len(boxes) - 1)
+            ), f"{broker} 移动端趋势报告顺序不符合行动优先布局：{boxes}"
 
 
 def _check_report_identity(
@@ -1288,7 +1335,7 @@ def _check_trend_account_views(
                 panel.locator("[data-current-trend-report]").wait_for()
                 _check_loaded_report_identity(panel, report, broker)
                 _check_frozen_trend_disciplines(
-                    panel.locator(".cn-trend-report"), report, broker
+                    panel.locator(".cn-trend-report"), report, broker, page=page
                 )
                 current = panel.locator("[data-current-trend-report]")
                 _check_history_control_contract(current, f"{broker} 返回当前报告")
@@ -1320,7 +1367,7 @@ def _check_trend_account_views(
             page, panel, broker, controllers.get(broker)
         )
         _check_integrated_trend_ui(report_root, report, broker)
-        _check_frozen_trend_disciplines(report_root, report, broker)
+        _check_frozen_trend_disciplines(report_root, report, broker, page=page)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
             f"{broker} 当前趋势报告日期未显示"
         )
@@ -1344,6 +1391,9 @@ def _check_trend_account_views(
             current = panel.locator("[data-current-trend-report]")
             current.wait_for()
             _check_loaded_report_identity(panel, expectation, broker)
+            _check_frozen_trend_disciplines(
+                panel.locator(".cn-trend-report"), expectation, broker, page=page
+            )
             _check_history_control_contract(current, f"{broker} 历史报告返回")
             event = expectation.get("event")
             if isinstance(event, Mapping):

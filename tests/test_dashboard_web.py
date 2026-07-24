@@ -4754,7 +4754,7 @@ for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买�
   "需要确认 · 人工复核","盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价（Futu 前复权）",
   "温 → 热","目标仓位 4%","全部卖出","正式买入","继续持有",
   "人工复核","600036","600519","日线数据不可用","筛选价数据不可用",
-  "趋势信号不完整","行业温度数据不可用","买入纪律","卖出纪律","审计详情"]) {
+  "趋势信号不完整","行业温度数据不可用","冻结策略纪律","冻结纪律参数未提供，未加载当前规则","审计详情"]) {
   if (!cn.includes(text)) throw new Error(text + "\n" + cn);
 }
 for (const text of ["为什么没有进入买入名单", "候选 3", "通过 1", "排除 2",
@@ -4774,7 +4774,7 @@ if(stageOrder.some((index)=>index<0)||!stageOrder.every((index,i)=>i===0||stageO
 if (!cn.includes('class="cn-trend-report"') ||
     !cn.includes('class="cn-trend-table"') ||
     !cn.includes('class="cn-trend-card"')) throw new Error(cn);
-if ((cn.match(/<details class="trend-discipline" open>/g) || []).length !== 2) throw new Error(cn);
+if ((cn.match(/class="trend-discipline-card"/g) || []).length !== 6 || cn.includes('class="trend-discipline"')) throw new Error(cn);
 for (const price of ["5.46", "24.55", "27.53"]) {
   if (!cn.includes(`>${price}</td>`)) throw new Error(cn);
 }
@@ -4813,11 +4813,13 @@ const usOrder=["优先处理 · 卖出触发","需要确认 · 人工复核",
   .map((text)=>us.indexOf(`<h2>${text}</h2>`));
 if (usOrder.some((index)=>index<0) ||
     !usOrder.every((index,i)=>i===0||usOrder[i-1]<index)) throw new Error(us);
-if (!us.includes('class="cn-trend-report"') ||
+    if (!us.includes('class="cn-trend-report"') ||
     (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
     !us.includes('class="cn-trend-card"') ||
     us.includes("今日执行检查") || us.includes("筛选价（Trend Animals）") ||
-    us.includes('class="trend-discipline"')) throw new Error(us);
+    us.includes('class="trend-discipline"') ||
+    (us.match(/class="trend-discipline-card"/g) || []).length !== 6 ||
+    !us.includes("冻结纪律参数未提供，未加载当前规则")) throw new Error(us);
 if (!us.includes('class="cn-trend-execution"') ||
     us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
 console.log("ok");
@@ -4894,7 +4896,8 @@ if (html.includes("组合正常计划风险")) throw new Error(html);
 const counts = html.indexOf('class="trend-report-metrics cn-trend-counts"');
 const risk = html.indexOf('class="trend-risk-summary"');
 const sell = html.indexOf("优先处理 · 卖出触发");
-if (!(counts >= 0 && counts < risk && risk < sell)) throw new Error(html);
+const lifecycle = html.indexOf('class="trend-discipline-workspace"');
+if (!(counts >= 0 && counts < lifecycle && lifecycle < sell && sell < risk)) throw new Error(html);
 if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
     (html.match(/class="cn-trend-execution cn-trend-risk-detail"/g) || []).length !== 2) {
   throw new Error(html);
@@ -5251,13 +5254,14 @@ def test_dashboard_cn_disciplines_default_closed_only_on_mobile() -> None:
     output = run_dashboard_js(r'''
 const report={market:"CN",counts:{},sell_actions:[],buy_actions:[],hold_actions:[],audit:{}};
 const deterministic=renderTrendReportWorkspace(report);
-if ((deterministic.match(/<details class="trend-discipline" open>/g) || []).length !== 2) {
+if ((deterministic.match(/<details class="trend-discipline-card" open/g) || []).length !== 6 ||
+    !deterministic.includes("冻结纪律参数未提供，未加载当前规则")) {
   throw new Error(deterministic);
 }
 window={matchMedia:(query)=>({matches:query==="(max-width: 760px)"})};
 const mobile=renderTrendReportWorkspace(report);
-if (mobile.includes('<details class="trend-discipline" open>') ||
-    (mobile.match(/<details class="trend-discipline">/g) || []).length !== 2) {
+if (mobile.includes('<details class="trend-discipline-card" open') ||
+    (mobile.match(/<details class="trend-discipline-card"/g) || []).length !== 6) {
   throw new Error(mobile);
 }
 console.log("ok");
@@ -9352,6 +9356,7 @@ for (const market of ["CN","US","HK"]) {
       for (const title of ["入场硬门槛","确定性排序","仓位与执行","持有管理","退出纪律","其他纪律"]) {
         if (!html.includes(`<summary><span>${title}</span>`)) throw new Error(`${market}: ${title}`);
       }
+      if (!html.includes('class="trend-discipline-card-compact">趋势动物组合：冻结组合')) throw new Error(`${market}: compact summary facts missing`);
       for (const text of ["冻结组合","强度降序","账户净值的 4%","初始保护线","退出条件","未知冻结规则","策略版本 v7","实际 API 成本 1.25 单位","科技","热","8 / 10 = 80%","上升","+20 个百分点"]) {
     if (!html.includes(text)) throw new Error(`${market}: ${text}\\n${html}`);
   }
@@ -9363,6 +9368,43 @@ const oldHtml = renderTrendReportWorkspace({...report("US"),strategy_version:"v4
 if (!oldHtml.includes("旧报告冻结值") || oldHtml.includes("冻结组合")) throw new Error(oldHtml);
 console.log("ok");
 ''')
+    assert "ok" in output
+
+
+def test_dashboard_uses_market_neutral_empty_discipline_state_without_current_rules() -> None:
+    output = run_dashboard_js(r'''
+const report = (market) => ({
+  market, broker_label:market === "CN" ? "东方财富" : market === "US" ? "老虎" : "辉立",
+  market_label:market === "CN" ? "A股" : market === "US" ? "美股" : "港股",
+  report_date:"2026-07-24", data_date:"2026-07-23", generated_at:"now", account_status:"已更新",
+  counts:{sell:0,buy:0,hold:0,review:0}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+});
+for (const market of ["CN", "US", "HK"]) {
+  const html = renderTrendReportWorkspace(report(market));
+  if ((html.match(/class="trend-discipline-card"/g) || []).length !== 6) throw new Error(`${market}: ${html}`);
+  if (!html.includes("冻结纪律参数未提供，未加载当前规则")) throw new Error(`${market}: missing empty state`);
+  if (!html.includes("当前行业上下文未提供，无法确认排序；未使用当前规则")) throw new Error(`${market}: missing industry fallback`);
+  if (html.includes("买入纪律") || html.includes("卖出纪律") || html.includes("趋势强度不低于 95")) throw new Error(`${market}: current rules leaked`);
+  for (const title of ["入场硬门槛","确定性排序","仓位与执行","持有管理","退出纪律","其他纪律"]) {
+    if (!html.includes(`<summary><span>${title}</span>`)) throw new Error(`${market}: ${title}`);
+  }
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_legacy_cost_fallback_keeps_canonical_units_and_incomplete_label() -> None:
+    output = run_dashboard_js(r'''
+const base = {market:"US", broker_label:"老虎", market_label:"美股", counts:{}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{}};
+const actual = renderTrendReportWorkspace({...base, audit:{actual_api_cost:"1.2"}});
+if (!actual.includes("本报告 API 费用：实扣 1.2 Trend Animals 余额单位")) throw new Error(actual);
+const incomplete = renderTrendReportWorkspace({...base, api_cost:{estimated:"2.4",estimate_complete:false}});
+if (!incomplete.includes("本报告 API 费用：未知（快照估算 2.4 Trend Animals 余额单位；成分费用未计）")) throw new Error(incomplete);
+console.log("ok");
+''')
+
     assert "ok" in output
 
 

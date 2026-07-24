@@ -1767,6 +1767,13 @@ def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None
         },
         "eastmoney",
     )
+    empty_page = tabbed_account_page(valid_payload())
+    empty_page.trend_broker = "tiger"
+    dashboard_acceptance._check_frozen_trend_disciplines(
+        empty_page.locator("#trend-report-workspace:visible"),
+        empty_page.reports["tiger"],
+        "tiger",
+    )
 
 
 def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
@@ -2171,7 +2178,8 @@ def trend_workspace_text(
             "09:30–10:00 · 正式买入计划 "
             "盘中持续 · 已有持仓 筛选价（Trend Animals） "
             "执行参考价（Futu 前复权） 全部卖出 正式买入 继续持有 "
-            "人工复核 买入纪律 卖出纪律 审计详情"
+            "人工复核 冻结策略纪律 冻结纪律参数未提供，未加载当前规则 "
+            "当前行业上下文未提供，无法确认排序；未使用当前规则 审计详情"
         )
     if broker == "phillips":
         return (
@@ -2179,14 +2187,18 @@ def trend_workspace_text(
             "生成时间 2026-07-15T11:31:00+08:00 账户状态 已更新 "
             "正式买入 0 全部卖出 0 继续持有 0 人工复核 0 "
             "优先处理 · 卖出触发 需要确认 · 人工复核 "
-            "09:30–10:00 · 正式买入计划 无 盘中持续 · 已有持仓 审计详情"
+            "09:30–10:00 · 正式买入计划 无 盘中持续 · 已有持仓 "
+            "冻结策略纪律 冻结纪律参数未提供，未加载当前规则 "
+            "当前行业上下文未提供，无法确认排序；未使用当前规则 审计详情"
         )
     return (
         "老虎｜美股 当天趋势报告 报告日期 2026-07-15 数据截至 2026-07-14 "
         "生成时间 2026-07-15T11:30:36+08:00 账户状态 已更新 "
         "正式买入 1 全部卖出 1 继续持有 1 人工复核 1 "
         "优先处理 · 卖出触发 需要确认 · 人工复核 "
-        "美股常规交易时段 · 正式买入计划 盘中持续 · 已有持仓 审计详情"
+        "美股常规交易时段 · 正式买入计划 盘中持续 · 已有持仓 "
+        "冻结策略纪律 冻结纪律参数未提供，未加载当前规则 "
+        "当前行业上下文未提供，无法确认排序；未使用当前规则 审计详情"
     )
 
 
@@ -2606,6 +2618,14 @@ class TabbedAccountLocator:
                 self.page.trend_broker is not None
                 and self.page.trend_broker != self.page.missing_controller_broker
             )
+        if self.selector.endswith(" .trend-discipline-card"):
+            return 6 if self.page.trend_broker is not None else 0
+        if re.search(r"\.trend-discipline-card summary$", self.selector):
+            return 6 if self.page.trend_broker is not None else 0
+        if re.search(r"\.trend-discipline-card:nth\(\d+\) \.trend-discipline-card-count$", self.selector):
+            return 1 if self.page.trend_broker is not None else 0
+        if self.selector.endswith(" .trend-industry-context"):
+            return 1 if self.page.trend_broker is not None else 0
         if self.selector == "#trend-report-workspace:visible .trend-discipline[open]":
             return int(self.page.trend_broker == "eastmoney") * (
                 0 if self.page.viewport_size["width"] <= 760 else 2
@@ -2729,6 +2749,9 @@ class TabbedAccountLocator:
                     "正式买入计划" if mobile else "正式买入计划，可横向滚动"
                 ),
             }[name]
+        if re.search(r"\.trend-discipline-card:nth\(\d+\)$", self.selector):
+            assert name == "open"
+            return ""
         assert self.selector == "#trend-report-workspace:visible .trend-audit"
         assert name == "open"
         return None
@@ -2819,6 +2842,12 @@ class TabbedAccountLocator:
             ])
         if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
+        summary_match = re.search(r"\.trend-discipline-card:nth\((\d+)\) summary$", self.selector)
+        if summary_match:
+            titles = ["入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律"]
+            return f"{titles[int(summary_match.group(1))]} 影响 0 条纪律 冻结纪律参数未提供，未加载当前规则"
+        if self.selector.endswith(" .trend-industry-context"):
+            return "行业上下文 当前行业上下文未提供，无法确认排序；未使用当前规则"
         match = re.fullmatch(
             r"#account-(\w+):visible \.account-empty:visible", self.selector
         )
@@ -2971,6 +3000,11 @@ class TabbedAccountLocator:
             return ["7", "42", "1,450", "24.55", "27.8"]
         if self.selector == "#trend-report-workspace:visible .trend-audit section":
             return trend_audit_sections(broker)
+        if self.selector.endswith(" .trend-discipline-card summary"):
+            return [
+                f"{title} 影响 0 条纪律 冻结纪律参数未提供，未加载当前规则"
+                for title in ("入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律")
+            ]
         if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
         if self.selector == (
@@ -3045,6 +3079,8 @@ class TabbedAccountLocator:
         return {"x": 20, "width": 100}
 
     def evaluate_all(self, expression: str) -> list[dict[str, float]]:
+        if self.selector.endswith(" .trend-discipline-card summary") and "height" in expression:
+            return [{"height": 44}] * 6
         target_expression = (
             "nodes => nodes.map(node => ({"
             "height: node.getBoundingClientRect().height, "

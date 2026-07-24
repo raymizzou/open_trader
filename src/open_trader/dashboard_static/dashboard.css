@@ -1960,6 +1960,14 @@ table {
   overflow-wrap: anywhere;
 }
 
+.trend-discipline-card-compact {
+  flex-basis: 100%;
+  font-size: 12px;
+  font-weight: 400;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .trend-discipline-card-body {
   border-top: 1px solid var(--line);
   display: grid;

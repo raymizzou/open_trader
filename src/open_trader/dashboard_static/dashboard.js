@@ -2660,25 +2660,24 @@ function trendDisciplineLifecycle(parameterRows) {
 function renderTrendDisciplineCard(card, open) {
   const rows = card.rows || [];
   const compact = rows.slice(0, 2).map((row) => `${formatPlain(row.name)}：${formatPlain(row.value)}`).join("；");
+  const emptyLabel = "冻结纪律参数未提供，未加载当前规则";
   const countLabel = `冻结 ${rows.length} 项${compact ? ` · ${compact}` : ""}`;
+  const summaryFacts = compact || emptyLabel;
   const body = rows.length
     ? `<dl>${rows.map((row) => `<div><dt>${escapeHtml(`${formatPlain(row.group)} · ${formatPlain(row.name)}`)}</dt><dd>${escapeHtml(formatPlain(row.value))}</dd></div>`).join("")}</dl>`
-    : "<p>冻结报告未提供本组纪律数据</p>";
+    : `<p>${escapeHtml(emptyLabel)}</p>`;
   return `<details class="trend-discipline-card"${open ? " open" : ""} data-discipline="${escapeHtml(card.key)}">
-    <summary><span>${escapeHtml(card.title)}</span><small>${escapeHtml(`影响 ${rows.length} 条纪律`)}</small></summary>
+    <summary><span>${escapeHtml(card.title)}</span><small>${escapeHtml(`影响 ${rows.length} 条纪律`)}</small><span class="trend-discipline-card-compact">${escapeHtml(summaryFacts)}</span></summary>
     <div class="trend-discipline-card-body"><p class="trend-discipline-card-count">${escapeHtml(countLabel)}</p>${body}</div>
   </details>`;
 }
 
 function renderTrendDisciplineCards(report) {
   const rows = trendFrozenStrategyRows(report);
-  if (!rows.length) {
-    return String(report?.market || "").toUpperCase() === "CN" ? renderCnTrendDisciplines() : "";
-  }
   const open = !isCnTrendMobile();
   const cards = trendDisciplineLifecycle(rows);
   return `<section class="trend-discipline-workspace" aria-label="冻结趋势纪律">
-    <header><h2>冻结策略纪律</h2><p>仅展示所选报告冻结的策略参数；历史报告不会套用当前规则。</p></header>
+    <header><h2>冻结策略纪律</h2><p>${escapeHtml(rows.length ? "仅展示所选报告冻结的策略参数；历史报告不会套用当前规则。" : "冻结纪律参数未提供，未加载当前规则。")}</p></header>
     <div class="trend-discipline-grid">${cards.map((card) => renderTrendDisciplineCard(card, open)).join("")}</div>
   </section>`;
 }
@@ -2689,9 +2688,13 @@ function trendReportCostLabel(report) {
   if (cost && hasValue(cost.label)) return formatPlain(cost.label);
   const actual = cost?.actual ?? report?.audit?.actual_api_cost;
   const estimated = cost?.estimated ?? report?.audit?.estimated_api_cost;
-  if (hasValue(actual)) return `实际 API 成本 ${formatDisplayNumber(actual)}`;
-  if (hasValue(estimated)) return `估算 API 成本 ${formatDisplayNumber(estimated)}${cost?.estimate_complete === false ? "（估算不完整）" : ""}`;
-  return "API 成本未知";
+  if (hasValue(actual)) return `本报告 API 费用：实扣 ${formatDisplayNumber(actual)} Trend Animals 余额单位`;
+  if (hasValue(estimated)) {
+    return cost?.estimate_complete === false
+      ? `本报告 API 费用：未知（快照估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位；成分费用未计）`
+      : `本报告 API 费用：估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位`;
+  }
+  return "本报告 API 费用：数据未提供";
 }
 
 function trendIndustryDirection(value) {
@@ -2707,6 +2710,10 @@ function trendIndustryPercent(value) {
 }
 
 function trendIndustryContextFallback(status, contexts) {
+  if (!(contexts || []).length && !hasValue(status?.ordering_mode)
+      && status?.current_complete !== true) {
+    return '<p class="trend-industry-context-fallback">当前行业上下文未提供，无法确认排序；未使用当前规则</p>';
+  }
   const reasons = [];
   if (status && hasValue(status.fallback_reason)) reasons.push(formatPlain(status.fallback_reason));
   if (status && status.validation_reasons && typeof status.validation_reasons === "object") {
@@ -3019,7 +3026,6 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const batchError = report.execution_batch_blocking === true
     ? `<p class="trend-execution-batch-error">${escapeHtml(formatPlain(report.execution_batch_error || "执行批次无效，已阻止操作投影"))}</p>`
     : "";
-  const frozenRows = trendFrozenStrategyRows(report);
   const disciplineCards = renderTrendDisciplineCards(report);
   const industryAction = `<div class="trend-industry-action-row">
       ${renderTrendIndustryContext(report)}
@@ -3055,11 +3061,9 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${renderTrendControllerStatus(report.broker)}
     ${batchError}
     ${revisionAnomaly}
-    ${frozenRows.length ? disciplineCards : ""}
-    ${frozenRows.length ? industryAction : ""}
+    ${disciplineCards}
+    ${industryAction}
     ${riskSummary}
-    ${frozenRows.length ? "" : industryAction}
-    ${frozenRows.length ? "" : disciplineCards}
     <div class="cn-trend-actions">
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}
       ${buyStage}
