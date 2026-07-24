@@ -143,6 +143,12 @@ ALLOWED_ENTRY_PHASES = {"谷雨", "立夏", "夏至"}
 HOT_TEMPERATURES = {"热", "沸"}
 CN_ALLOWED_INDUSTRY_TEMPERATURES = {"温", "热", "沸"}
 KNOWN_TEMPERATURES = {"凉", "平", "温", "热", "沸"}
+CNY_PER_LOCAL_CURRENCY = {
+    "CN": Decimal("1"),
+    "US": Decimal("7.85") / Decimal("1.08"),
+    "HK": Decimal("1") / Decimal("1.08"),
+}
+MARKET_V5_EFFECTIVE_FROM = {"US": "2026-07-24", "HK": "2026-07-27"}
 KNOWN_TEMPERATURE_ORDER = {
     value: index for index, value in enumerate(INDUSTRY_KNOWN_TEMPERATURES)
 }
@@ -596,9 +602,20 @@ def live_trend_strategy_snapshot(
     *,
     normal_cost_rate: Decimal = NORMAL_COST_RATE,
     strategy_version: str | None = None,
+    execution_date: str | None = None,
 ) -> dict[str, object]:
     market = market.upper()
-    version = strategy_version or ("v8" if market == "CN" else "v5")
+    if strategy_version is not None:
+        version = strategy_version
+    elif market == "CN":
+        version = "v8"
+    elif market in MARKET_V5_EFFECTIVE_FROM and (
+        execution_date is None
+        or execution_date >= MARKET_V5_EFFECTIVE_FROM[market]
+    ):
+        version = "v5"
+    else:
+        version = "v4"
     if (
         version not in {"v4", "v5", "v6", "v7", "v8"}
         or version in {"v6", "v7", "v8"} and market != "CN"
