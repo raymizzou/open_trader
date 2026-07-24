@@ -3,6 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-24
+
+- Unified CN/US/HK trend entry and flat-temperature exit discipline; US/HK now
+  use frozen local-currency-to-CNY thresholds, industry snapshots, and v5
+  cold-start samples while CN retains its v4+v7 exception. Verified the full
+  test suite, real US report/evidence, and current review projections.
+
 ## 2026-07-23
 
 - Added the current CN trend rules as v7: accept warm, hot, or boiling
