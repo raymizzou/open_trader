@@ -2152,6 +2152,35 @@ function cnTrendHints(item) {
     : "数据不可用";
 }
 
+function trendIndustryBuyContext(report, item) {
+  const direct = item && item.industry_context && typeof item.industry_context === "object"
+    ? item.industry_context : null;
+  const contexts = Array.isArray(report?.industry_contexts)
+    ? report.industry_contexts : [];
+  const itemIndustryId = item?.industry_tm_id ?? item?.industry_id;
+  const context = direct || contexts.find((candidate) => candidate && typeof candidate === "object"
+    && ((hasValue(itemIndustryId) && String(candidate.industry_tm_id) === String(itemIndustryId))
+      || (hasValue(item?.industry) && String(candidate.industry) === String(item.industry))));
+  if (!context) {
+    return report?.industry_context_status?.current_complete === false
+      ? "行业上下文无效 · 当前数据不完整" : "行业上下文未提供";
+  }
+  const breadth = hasValue(context.right_count) && hasValue(context.valid_count)
+    && hasValue(context.right_share)
+    ? `${formatDisplayNumber(context.right_count)} / ${formatDisplayNumber(context.valid_count)} = ${trendIndustryPercent(context.right_share)}`
+    : "右侧占比 数据未提供";
+  const parts = [
+    hasValue(context.temperature) ? `温度 ${formatPlain(context.temperature)}` : "",
+    hasValue(context.temperature_direction) ? `方向 ${trendIndustryDirection(context.temperature_direction)}` : "",
+    breadth,
+  ].filter(Boolean);
+  if (context.valid === false) {
+    parts.push(`无效 · ${Array.isArray(context.invalid_reasons) && context.invalid_reasons.length
+      ? context.invalid_reasons.map(formatPlain).join("、") : "数据不可用"}`);
+  }
+  return parts.join(" · ") || "行业上下文未提供";
+}
+
 function renderTrendExecutionRow(item, columnCount) {
   const execution = item.execution && typeof item.execution === "object" ? item.execution : {};
   const status = String(execution.status || "pending");
@@ -2492,7 +2521,7 @@ function renderMarketSellOrHoldStage(title, items, kind) {
 }
 
 function renderMarketBuyStage(report) {
-  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "目标仓位（占净值）", "金额上限", "预计数量", "预计保护线"];
+  const headings = ["标的", "动作", "执行参考价", "强度", "行业", "行业上下文确认", "目标仓位（占净值）", "金额上限", "预计数量", "预计保护线"];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
     const targetWeight = decimalAsPercent(item.target_weight, "—");
     return `<tr class="cn-trend-card">
@@ -2501,6 +2530,7 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
+      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
       ${renderCnTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : "—")}
@@ -2515,6 +2545,7 @@ function renderMarketBuyStage(report) {
       ${renderCnTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
+      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
       ${renderCnTrendCell("金额上限", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : "—")}
       ${renderCnTrendCell("预计数量", "0 股")}
@@ -2527,7 +2558,7 @@ function renderMarketBuyStage(report) {
 function renderCnBuyStage(report) {
   const headings = [
     "标的", "动作", "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
-    "温度变化", "节气", "强度", "行业", "行业温度", "市值（亿元）",
+    "温度变化", "节气", "强度", "行业", "行业温度", "行业上下文确认", "市值（亿元）",
     "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
   ];
   const rows = cnTrendRows(report.buy_actions).map((item) => {
@@ -2542,6 +2573,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
       ${renderCnTrendCell("行业温度", item.industry_temperature)}
+      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
       ${renderCnTrendCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
@@ -2562,6 +2594,7 @@ function renderCnBuyStage(report) {
       ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
       ${renderCnTrendCell("行业", item.industry)}
       ${renderCnTrendCell("行业温度", item.industry_temperature)}
+      ${renderCnTrendCell("行业上下文确认", trendIndustryBuyContext(report, item))}
       ${renderCnTrendCell("市值（亿元）", hasValue(item.market_cap) ? formatDisplayNumber(item.market_cap) : item.market_cap)}
       ${renderCnTrendCell("日成交额（亿元）", hasValue(item.amount) ? formatDisplayNumber(item.amount) : item.amount)}
       ${renderCnTrendCell("目标仓位（占净值）", targetWeight, `目标仓位 ${targetWeight}`)}
@@ -2574,6 +2607,160 @@ function renderCnBuyStage(report) {
     `${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows,
     "价格口径：筛选价（Trend Animals）｜执行参考价（Futu 前复权）",
   );
+}
+
+const TREND_DISCIPLINE_ROW_NAMES = {
+  holding: new Set(["初始保护线", "过热跟踪", "保护线不下降", "活动保护线"]),
+  exit: new Set([
+    "退出条件", "过热止盈比例", "过热止盈信号", "过热止盈次数",
+    "过热止盈取整", "不足一手处理", "清仓优先级",
+  ]),
+};
+
+function trendFrozenStrategyRows(report) {
+  const rows = report && Array.isArray(report.strategy_parameter_rows)
+    ? report.strategy_parameter_rows
+    : [];
+  return rows.filter((row) => row && typeof row === "object" && !Array.isArray(row)
+    && hasValue(row.group) && hasValue(row.name) && hasValue(row.value));
+}
+
+function trendDisciplineLifecycle(parameterRows) {
+  const rows = Array.isArray(parameterRows)
+    ? parameterRows.filter((row) => row && typeof row === "object" && !Array.isArray(row)
+      && hasValue(row.group) && hasValue(row.name) && hasValue(row.value))
+    : [];
+  const groups = [
+    {key: "entry", title: "入场硬门槛", rows: []},
+    {key: "sort", title: "确定性排序", rows: []},
+    {key: "execution", title: "仓位与执行", rows: []},
+    {key: "holding", title: "持有管理", rows: []},
+    {key: "exit", title: "退出纪律", rows: []},
+    {key: "other", title: "其他纪律", rows: []},
+  ];
+  const byKey = Object.fromEntries(groups.map((group) => [group.key, group]));
+  rows.forEach((row) => {
+    const group = formatPlain(row.group);
+    const name = formatPlain(row.name);
+    let key = "other";
+    if (group === "候选来源" || group === "入场过滤") key = "entry";
+    else if (group === "候选排序") key = "sort";
+    else if (group === "仓位执行") key = "execution";
+    else if (group === "退出保护") {
+      key = TREND_DISCIPLINE_ROW_NAMES.holding.has(name) ? "holding"
+        : TREND_DISCIPLINE_ROW_NAMES.exit.has(name) ? "exit" : "other";
+    } else if (group === "累计回撤") {
+      return;
+    }
+    byKey[key].rows.push(row);
+  });
+  return groups;
+}
+
+function renderTrendDisciplineCard(card, open) {
+  const rows = card.rows || [];
+  const compact = rows.slice(0, 2).map((row) => `${formatPlain(row.name)}：${formatPlain(row.value)}`).join("；");
+  const countLabel = `冻结 ${rows.length} 项${compact ? ` · ${compact}` : ""}`;
+  const body = rows.length
+    ? `<dl>${rows.map((row) => `<div><dt>${escapeHtml(`${formatPlain(row.group)} · ${formatPlain(row.name)}`)}</dt><dd>${escapeHtml(formatPlain(row.value))}</dd></div>`).join("")}</dl>`
+    : "<p>冻结报告未提供本组纪律数据</p>";
+  return `<details class="trend-discipline-card"${open ? " open" : ""} data-discipline="${escapeHtml(card.key)}">
+    <summary><span>${escapeHtml(card.title)}</span><small>${escapeHtml(`影响 ${rows.length} 条纪律`)}</small></summary>
+    <div class="trend-discipline-card-body"><p class="trend-discipline-card-count">${escapeHtml(countLabel)}</p>${body}</div>
+  </details>`;
+}
+
+function renderTrendDisciplineCards(report) {
+  const rows = trendFrozenStrategyRows(report);
+  if (!rows.length) {
+    return String(report?.market || "").toUpperCase() === "CN" ? renderCnTrendDisciplines() : "";
+  }
+  const open = !isCnTrendMobile();
+  const cards = trendDisciplineLifecycle(rows);
+  return `<section class="trend-discipline-workspace" aria-label="冻结趋势纪律">
+    <header><h2>冻结策略纪律</h2><p>仅展示所选报告冻结的策略参数；历史报告不会套用当前规则。</p></header>
+    <div class="trend-discipline-grid">${cards.map((card) => renderTrendDisciplineCard(card, open)).join("")}</div>
+  </section>`;
+}
+
+function trendReportCostLabel(report) {
+  const cost = report && report.api_cost && typeof report.api_cost === "object"
+    ? report.api_cost : null;
+  if (cost && hasValue(cost.label)) return formatPlain(cost.label);
+  const actual = cost?.actual ?? report?.audit?.actual_api_cost;
+  const estimated = cost?.estimated ?? report?.audit?.estimated_api_cost;
+  if (hasValue(actual)) return `实际 API 成本 ${formatDisplayNumber(actual)}`;
+  if (hasValue(estimated)) return `估算 API 成本 ${formatDisplayNumber(estimated)}${cost?.estimate_complete === false ? "（估算不完整）" : ""}`;
+  return "API 成本未知";
+}
+
+function trendIndustryDirection(value) {
+  return ({rising: "上升", falling: "下降", unchanged: "持平"})[String(value)] || formatPlain(value);
+}
+
+function trendIndustryPercent(value) {
+  if (!hasValue(value)) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  const percent = Math.abs(number) <= 1 ? number * 100 : number;
+  return `${percent.toLocaleString("zh-CN", {maximumFractionDigits: 2})}%`;
+}
+
+function trendIndustryContextFallback(status, contexts) {
+  const reasons = [];
+  if (status && hasValue(status.fallback_reason)) reasons.push(formatPlain(status.fallback_reason));
+  if (status && status.validation_reasons && typeof status.validation_reasons === "object") {
+    Object.values(status.validation_reasons).flatMap((value) => Array.isArray(value) ? value : [value])
+      .filter(hasValue).forEach((reason) => reasons.push(formatPlain(reason)));
+  }
+  (contexts || []).filter((context) => context && context.valid === false).forEach((context) => {
+    (Array.isArray(context.invalid_reasons) ? context.invalid_reasons : ["行业上下文无效"])
+      .filter(hasValue).forEach((reason) => reasons.push(formatPlain(reason)));
+  });
+  const mode = formatPlain(status?.ordering_mode);
+  const invalid = mode.startsWith("legacy") || status?.current_complete === false
+    || (contexts || []).some((context) => context && context.valid === false);
+  if (!invalid && !reasons.length) return "";
+  const reasonText = [...new Set(reasons)].join("、") || "当前行业上下文不完整";
+  return `<p class="trend-industry-context-fallback">当前行业上下文无效，已回退旧排序：${escapeHtml(reasonText)}</p>`;
+}
+
+function renderTrendIndustryContext(report) {
+  const contexts = Array.isArray(report?.industry_contexts)
+    ? report.industry_contexts.filter((context) => context && typeof context === "object" && !Array.isArray(context))
+    : [];
+  const status = report?.industry_context_status && typeof report.industry_context_status === "object"
+    ? report.industry_context_status : {};
+  const rows = contexts.map((context) => {
+    const rightShare = trendIndustryPercent(context.right_share);
+    const priorShare = trendIndustryPercent(context.prior_right_share);
+    const change = hasValue(context.right_share_change_pp)
+      ? `${Number(context.right_share_change_pp) >= 0 ? "+" : ""}${formatDisplayNumber(context.right_share_change_pp)} 个百分点`
+      : "";
+    const breadth = hasValue(context.right_count) && hasValue(context.valid_count) && rightShare
+      ? `${formatDisplayNumber(context.right_count)} / ${formatDisplayNumber(context.valid_count)} = ${rightShare}`
+      : "数据未提供";
+    const history = [
+      priorShare ? `此前右侧占比 ${priorShare}` : "",
+      change,
+    ].filter(Boolean).join(" · ");
+    return `<article class="trend-industry-context-card${context.valid === false ? " invalid" : ""}">
+      <header><strong>${escapeHtml(formatPlain(context.industry || "行业"))}</strong><span>${escapeHtml(hasValue(context.temperature) ? `当前温度 ${formatPlain(context.temperature)}` : "当前温度 数据未提供")}</span></header>
+      <dl>
+        <div><dt>温度方向</dt><dd>${escapeHtml(hasValue(context.temperature_direction) ? trendIndustryDirection(context.temperature_direction) : "数据未提供")}</dd></div>
+        <div><dt>趋势强度</dt><dd>${escapeHtml(hasValue(context.strength) ? formatDisplayNumber(context.strength) : "数据未提供")}</dd></div>
+        <div><dt>温转热数量</dt><dd>${escapeHtml(hasValue(context.warm_to_hot_count) ? formatDisplayNumber(context.warm_to_hot_count) : "数据未提供")}</dd></div>
+        <div><dt>右侧占比</dt><dd>${escapeHtml(breadth)}</dd></div>
+      </dl>
+      ${history ? `<p>${escapeHtml(history)}</p>` : ""}
+      ${context.valid === false ? `<p class="trend-industry-context-invalid">${escapeHtml((context.invalid_reasons || []).map(formatPlain).join("、") || "数据不可用")}</p>` : ""}
+    </article>`;
+  }).join("");
+  return `<section class="trend-industry-context" aria-label="行业上下文">
+    <header><h2>行业上下文 · 行业赚钱效应</h2><span>${escapeHtml(status.current_complete === false ? "当前数据不完整" : `${contexts.length} 个行业`)}</span></header>
+    ${trendIndustryContextFallback(status, contexts)}
+    <div class="trend-industry-context-grid">${rows || "<p>行业上下文数据未提供</p>"}</div>
+  </section>`;
 }
 
 function renderCnTrendDisciplines() {
@@ -2823,7 +3010,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const sellLabel = (Array.isArray(report.sell_actions) && report.sell_actions.some((item) => item?.action === "SELL_PARTIAL"))
     ? "卖出触发" : "全部卖出";
   const strategyVersion = report.strategy_version
-    ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
+    ? `<span>版本 ${escapeHtml(formatPlain(report.strategy_version))} · 策略版本 ${escapeHtml(formatPlain(report.strategy_version))}</span>`
     : "";
   const batchSha = report.execution_batch?.report_sha256;
   const revisionAnomaly = report.revision_anomaly === true
@@ -2832,6 +3019,14 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const batchError = report.execution_batch_blocking === true
     ? `<p class="trend-execution-batch-error">${escapeHtml(formatPlain(report.execution_batch_error || "执行批次无效，已阻止操作投影"))}</p>`
     : "";
+  const frozenRows = trendFrozenStrategyRows(report);
+  const disciplineCards = renderTrendDisciplineCards(report);
+  const industryAction = `<div class="trend-industry-action-row">
+      ${renderTrendIndustryContext(report)}
+      ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
+    </div>`;
+  const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date,
+    historical ? "" : renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]));
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
@@ -2852,19 +3047,24 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span>继续持有 ${escapeHtml(formatDisplayNumber(counts.hold || 0))}</span>
         <span>人工复核 ${escapeHtml(formatDisplayNumber(counts.review || 0))}</span>
       </div>
+      <div class="trend-report-facts">
+        <span>状态 ${escapeHtml(formatPlain(report.status_text || report.data_status || report.account_status || "数据未提供"))}</span>
+        <span class="trend-report-cost">${escapeHtml(trendReportCostLabel(report))}</span>
+      </div>
     </header>
     ${renderTrendControllerStatus(report.broker)}
     ${batchError}
     ${revisionAnomaly}
-    ${renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.actual_overlay, report.report_date,
-      historical ? "" : renderTrendSimulationOverlay(report, state.trendSimulatePositions[report.broker]))}
+    ${frozenRows.length ? disciplineCards : ""}
+    ${frozenRows.length ? industryAction : ""}
+    ${riskSummary}
+    ${frozenRows.length ? "" : industryAction}
+    ${frozenRows.length ? "" : disciplineCards}
     <div class="cn-trend-actions">
-      ${sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell")}
       ${sellOrHold("需要确认 · 人工复核", report.review_actions, "review")}
       ${buyStage}
       ${sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold")}
     </div>
-    ${isCn ? renderCnTrendDisciplines() : ""}
     ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
   </${root}>`;
 }

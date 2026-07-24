@@ -9316,6 +9316,56 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
     assert "backtest_readiness" not in vixy
 
 
+def test_dashboard_renders_frozen_lifecycle_cards_and_industry_context() -> None:
+    output = run_dashboard_js(r'''
+const rows = [
+  {group:"候选来源",name:"趋势动物组合",value:"冻结组合"},
+  {group:"入场过滤",name:"趋势强度",value:"不低于 95"},
+  {group:"候选排序",name:"排序顺序",value:"强度降序"},
+  {group:"仓位执行",name:"目标仓位",value:"账户净值的 4%"},
+  {group:"退出保护",name:"初始保护线",value:"成交均价减 2 倍 ATR14"},
+  {group:"退出保护",name:"退出条件",value:"危险信号时全部卖出"},
+  {group:"其他",name:"未知冻结规则",value:"历史只读"},
+  {group:"其他",name:"未知<纪律>",value:"值<script>alert(1)</script>"},
+  {group:"累计回撤",name:"策略累计回撤暂停",value:"达到 5% 暂停"},
+];
+const context = [{
+  industry_tm_id: 1, industry:"科技", temperature:"热", strength:"97.5",
+  warm_to_hot_count: 3, right_count: 8, valid_count: 10,
+  right_share:"0.8", prior_right_share:"0.6", temperature_direction:"rising",
+  right_share_change_pp:"20", valid:true, invalid_reasons:[],
+}];
+const report = (market) => ({
+  available:true, market, broker:market === "CN" ? "eastmoney" : market === "US" ? "tiger" : "phillips",
+  broker_label:market === "CN" ? "东方财富" : market === "US" ? "老虎" : "辉立",
+  market_label:market === "CN" ? "A股" : market === "US" ? "美股" : "港股",
+  report_date:"2026-07-24", data_date:"2026-07-23", generated_at:"2026-07-24T09:00:00+08:00",
+  account_status:"已更新", strategy_version:"v7", counts:{sell:0,buy:0,hold:0,review:0},
+  sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  api_cost:{label:"实际 API 成本 1.25 单位", actual:"1.25", estimated:"1.20", estimate_complete:true, unit:"Trend Animals 余额单位"},
+  strategy_parameter_rows:rows, industry_context_status:{ordering_mode:"context_with_history",current_complete:true,history_complete:true},
+  industry_contexts:context,
+});
+for (const market of ["CN","US","HK"]) {
+      const html = renderTrendReportWorkspace(report(market));
+      if ((html.match(/class="trend-discipline-card"/g) || []).length !== 6) throw new Error(`${market}: ${html}`);
+      for (const title of ["入场硬门槛","确定性排序","仓位与执行","持有管理","退出纪律","其他纪律"]) {
+        if (!html.includes(`<summary><span>${title}</span>`)) throw new Error(`${market}: ${title}`);
+      }
+      for (const text of ["冻结组合","强度降序","账户净值的 4%","初始保护线","退出条件","未知冻结规则","策略版本 v7","实际 API 成本 1.25 单位","科技","热","8 / 10 = 80%","上升","+20 个百分点"]) {
+    if (!html.includes(text)) throw new Error(`${market}: ${text}\\n${html}`);
+  }
+      if (html.includes("趋势强度不低于 95")) throw new Error(`${market}: hard-coded rule leaked`);
+      if (!html.includes("未知&lt;纪律&gt;") || !html.includes("值&lt;script&gt;alert(1)&lt;/script&gt;") || html.includes("<script>alert(1)</script>")) throw new Error(`${market}: frozen row was not escaped`);
+  if ((html.match(/累计回撤/g) || []).length > 1) throw new Error(`${market}: drawdown duplicated`);
+}
+const oldHtml = renderTrendReportWorkspace({...report("US"),strategy_version:"v4",strategy_parameter_rows:[{group:"入场过滤",name:"旧规则",value:"旧报告冻结值"}]}, true, true);
+if (!oldHtml.includes("旧报告冻结值") || oldHtml.includes("冻结组合")) throw new Error(oldHtml);
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 

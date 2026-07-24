@@ -1662,6 +1662,113 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
     assert ".trend-risk-summary .trend-drawdown-recovery-audit summary" in clicked
 
 
+def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None:
+    rows = [
+        {"group": "候选来源", "name": "组合", "value": "冻结"},
+        {"group": "入场过滤", "name": "强度", "value": "不低于 95"},
+        {"group": "候选排序", "name": "顺序", "value": "强度降序"},
+        {"group": "仓位执行", "name": "仓位", "value": "4%"},
+        {"group": "退出保护", "name": "初始保护线", "value": "ATR14"},
+        {"group": "退出保护", "name": "退出条件", "value": "危险信号"},
+        {"group": "其他", "name": "未知", "value": "历史只读"},
+    ]
+    titles = ["入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律"]
+    workspace_text = " ".join(
+        [*(str(row[key]) for row in rows for key in ("group", "name", "value")),
+         "实际 API 成本 1.25 单位", "科技 当前温度 热 温度方向 上升 趋势强度 97.5",
+         "温转热数量 3 右侧占比 8 / 10 = 80% 此前右侧占比 60% +20 个百分点"]
+    )
+
+    class Summary:
+        def __init__(self, title: str) -> None:
+            self.title = title
+
+        def inner_text(self) -> str:
+            return f"{self.title} 影响 1 条纪律"
+
+        def focus(self) -> None:
+            return None
+
+        def evaluate(self, expression: str) -> bool:
+            assert expression == "element => element === document.activeElement"
+            return True
+
+    class Count:
+        def count(self) -> int:
+            return 1
+
+    class Card:
+        def __init__(self, title: str) -> None:
+            self.summary = Summary(title)
+
+        def locator(self, selector: str) -> Summary | Count:
+            if selector == "summary":
+                return self.summary
+            assert selector == ".trend-discipline-card-count"
+            return Count()
+
+        def get_attribute(self, name: str) -> str:
+            assert name == "open"
+            return ""
+
+    class Cards:
+        def __init__(self) -> None:
+            self.items = [Card(title) for title in titles]
+
+        def count(self) -> int:
+            return len(self.items)
+
+        def locator(self, selector: str) -> "Summaries":
+            assert selector == "summary"
+            return Summaries(self.items)
+
+        def nth(self, index: int) -> Card:
+            return self.items[index]
+
+    class Summaries:
+        def __init__(self, cards: list[Card]) -> None:
+            self.cards = cards
+
+        def all_inner_texts(self) -> list[str]:
+            return [card.summary.inner_text() for card in self.cards]
+
+    class Context:
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self) -> str:
+            return workspace_text
+
+    class Root:
+        def inner_text(self) -> str:
+            return workspace_text
+
+        def locator(self, selector: str) -> Cards | Context:
+            if selector == ".trend-discipline-card":
+                return Cards()
+            assert selector == ".trend-industry-context"
+            return Context()
+
+    dashboard_acceptance._check_frozen_trend_disciplines(
+        Root(),
+        {
+            "strategy_parameter_rows": rows,
+            "api_cost": {"label": "实际 API 成本 1.25 单位"},
+            "industry_context_status": {
+                "ordering_mode": "context_with_history",
+                "current_complete": True,
+            },
+            "industry_contexts": [{
+                "industry": "科技", "temperature": "热", "strength": "97.5",
+                "warm_to_hot_count": 3, "right_count": 8, "valid_count": 10,
+                "right_share": "0.8", "prior_right_share": "0.6",
+                "right_share_change_pp": "20", "valid": True,
+            }],
+        },
+        "eastmoney",
+    )
+
+
 def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
     dashboard_acceptance._check_visible_decimal_precision(
         "模拟持仓 485 / 1,296 成本 30.59 保护线 23.43", "模拟盘"

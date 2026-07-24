@@ -1088,6 +1088,107 @@ def _check_loaded_report_identity(
     )
 
 
+def _trend_context_percent(value: Any) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if abs(number) <= 1:
+        number *= 100
+    return f"{_display_number(str(number))}%"
+
+
+def _check_frozen_trend_disciplines(
+    report_root: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    rows = report.get("strategy_parameter_rows")
+    if not isinstance(rows, list) or not rows:
+        return
+    cards = report_root.locator(".trend-discipline-card")
+    assert cards.count() == 6, f"{broker} 冻结纪律卡数量不是 6"
+    summaries = cards.locator("summary")
+    titles = summaries.all_inner_texts()
+    for title in ("入场硬门槛", "确定性排序", "仓位与执行", "持有管理", "退出纪律", "其他纪律"):
+        assert any(title in value for value in titles), (
+            f"{broker} 冻结纪律缺少 {title}"
+        )
+    for index in range(cards.count()):
+        card = cards.nth(index)
+        summary = card.locator("summary")
+        summary_text = summary.inner_text()
+        assert re.search(r"影响\s+\d+\s+条纪律", summary_text), (
+            f"{broker} 冻结纪律卡缺少影响计数：{summary_text}"
+        )
+        if card.get_attribute("open") is None:
+            summary.click()
+        assert card.locator(".trend-discipline-card-count").count() == 1, (
+            f"{broker} 冻结纪律卡缺少紧凑事实"
+        )
+        summary.focus()
+        assert summary.evaluate("element => element === document.activeElement"), (
+            f"{broker} 冻结纪律摘要不可键盘聚焦"
+        )
+    workspace_text = report_root.inner_text()
+    for row in rows:
+        assert isinstance(row, Mapping), f"{broker} 冻结策略参数行格式无效"
+        for key in ("group", "name", "value"):
+            value = row.get(key)
+            assert value is not None and str(value) in workspace_text, (
+                f"{broker} 冻结纪律缺少 {key}：{value}"
+            )
+    cost = report.get("api_cost")
+    if isinstance(cost, Mapping) and cost.get("label"):
+        assert str(cost["label"]) in workspace_text, (
+            f"{broker} 未显示冻结 API 成本标签"
+        )
+    contexts = report.get("industry_contexts")
+    status = report.get("industry_context_status")
+    if isinstance(contexts, list):
+        context_section = report_root.locator(".trend-industry-context")
+        assert context_section.count() == 1, f"{broker} 缺少行业上下文区"
+        context_text = context_section.inner_text()
+        for context in contexts:
+            assert isinstance(context, Mapping), f"{broker} 行业上下文格式无效"
+            for key in ("industry", "temperature", "strength", "warm_to_hot_count"):
+                value = context.get(key)
+                if value is not None:
+                    assert str(value) in context_text, (
+                        f"{broker} 行业上下文缺少 {key}：{value}"
+                    )
+            right_count = context.get("right_count")
+            valid_count = context.get("valid_count")
+            right_share = _trend_context_percent(context.get("right_share"))
+            if right_count is not None and valid_count is not None and right_share:
+                expected = f"{_display_number(right_count)} / {_display_number(valid_count)} = {right_share}"
+                assert expected in context_text, f"{broker} 行业右侧占比未显示：{expected}"
+            prior = _trend_context_percent(context.get("prior_right_share"))
+            change = context.get("right_share_change_pp")
+            if prior:
+                assert f"此前右侧占比 {prior}" in context_text, (
+                    f"{broker} 行业此前右侧占比未显示：{prior}"
+                )
+            if change is not None and str(change).strip():
+                change_text = _display_number(change)
+                if not str(change_text).startswith(("-", "+")):
+                    change_text = f"+{change_text}"
+                assert f"{change_text} 个百分点" in context_text, (
+                    f"{broker} 行业右侧占比变化未显示：{change_text}"
+                )
+        if isinstance(status, Mapping) and (
+            str(status.get("ordering_mode", "")).startswith("legacy")
+            or status.get("current_complete") is False
+            or any(
+                isinstance(context, Mapping) and context.get("valid") is False
+                for context in contexts
+            )
+        ):
+            assert "当前行业上下文无效" in context_text, (
+                f"{broker} 行业上下文无效时缺少回退提示"
+            )
+
+
 def _check_report_identity(
     actual: Mapping[str, Any], expected: Mapping[str, Any], broker: str,
 ) -> None:
@@ -1186,6 +1287,9 @@ def _check_trend_account_views(
                 _check_report_identity(loaded, report, broker)
                 panel.locator("[data-current-trend-report]").wait_for()
                 _check_loaded_report_identity(panel, report, broker)
+                _check_frozen_trend_disciplines(
+                    panel.locator(".cn-trend-report"), report, broker
+                )
                 current = panel.locator("[data-current-trend-report]")
                 _check_history_control_contract(current, f"{broker} 返回当前报告")
                 current.click()
@@ -1216,6 +1320,7 @@ def _check_trend_account_views(
             page, panel, broker, controllers.get(broker)
         )
         _check_integrated_trend_ui(report_root, report, broker)
+        _check_frozen_trend_disciplines(report_root, report, broker)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
             f"{broker} 当前趋势报告日期未显示"
         )
@@ -2624,7 +2729,10 @@ def _check_account_holdings(
             status in valid_statuses
             for status in execution_rows.locator("span:first-child").all_inner_texts()
         ), f"{broker} 执行状态包含未知文案"
-        if broker == "eastmoney":
+        if broker == "eastmoney" and not (
+            isinstance(report.get("strategy_parameter_rows"), list)
+            and report.get("strategy_parameter_rows")
+        ):
             for required in (
                 "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
                 "买入纪律", "卖出纪律",
