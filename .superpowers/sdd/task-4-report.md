@@ -1,194 +1,75 @@
-# Task 4 Report: Reuse clients across controller loops
+# Task 4 Report: version continuity without resetting samples
 
 ## Status
 
-Implemented and committed as `1855a4f fix: reuse trend controller Futu connections`.
+Implemented and committed as `382dafe feat: version contextual trend selection`.
 
 ## TDD evidence
 
-### Process-lifetime reuse
+### RED
 
-RED:
+Added default-version, identity-map, Kelly sample, snapshot, and API-stats tests first.
+
+Command:
 
 ```text
-.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_controller_reuses_quote_and_account_clients_across_loops -q
-FAILED tests/test_trend_market_controller.py::test_controller_reuses_quote_and_account_clients_across_loops
-E assert 2 == 1
-1 failed in 0.35s
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'strategy_snapshot' tests/test_market_trend.py -k 'strategy_snapshot or live_strategy' tests/test_trend_kelly.py tests/test_trend_api_stats.py -k 'identity or version or inherits' -v
 ```
 
-The old controller constructed one quote client per loop and never reached the borrowed account reader.
-
-GREEN:
+Exact result before implementation:
 
 ```text
-.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_controller_reuses_quote_and_account_clients_across_loops -q
-1 passed in 1.15s
+8 failed, 39 passed, 396 deselected in 0.73s
 ```
 
-### Failed-reader rebuilds
+The failures were the new CN v8 / US v5 / HK v5 defaults, the four explicit
+identity maps, CN v8 sample selection, and CN v8 API-stat attribution.
 
-Quote reset RED before adding the protection exception reset:
+### GREEN
+
+Focused version/identity command:
 
 ```text
-.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_controller_rebuilds_shared_quote_after_quote_failure -q
-FAILED tests/test_trend_market_controller.py::test_controller_rebuilds_shared_quote_after_quote_failure
-E assert 1 == 2
-1 failed in 0.34s
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'strategy_snapshot or generated_report or report_runner_uses_cn_simulation_account' tests/test_market_trend.py -k 'strategy_snapshot or live_strategy' tests/test_trend_kelly.py -k 'identity or inherits' tests/test_trend_api_stats.py -k 'identity or inherits' -q
+36 passed, 407 deselected in 0.69s
 ```
 
-Account reset RED after extending the same regression and temporarily removing the account exception reset:
+Affected strategy/report/replay suites:
 
 ```text
-.venv/bin/python -m pytest tests/test_trend_market_controller.py::test_controller_rebuilds_shared_clients_after_reader_failures -q
-FAILED tests/test_trend_market_controller.py::test_controller_rebuilds_shared_clients_after_reader_failures
-E assert 1 == 2
-1 failed in 0.41s
-```
-
-Final GREEN for reuse plus quote/account rebuilds:
-
-```text
-.venv/bin/python -m pytest \
-  tests/test_trend_market_controller.py::test_controller_reuses_quote_and_account_clients_across_loops \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_shared_clients_after_reader_failures -q
-2 passed in 0.39s
-```
-
-## Verification
-
-Controller suite during compatibility updates:
-
-```text
-.venv/bin/python -m pytest tests/test_trend_market_controller.py -q -x
-95 passed in 3.93s
-```
-
-Final affected suites:
-
-```text
-.venv/bin/python -m pytest \
-  tests/test_futu_quote.py \
-  tests/test_a_share_trend.py \
-  tests/test_a_share_trend_watch.py \
-  tests/test_market_trend_watch.py \
-  tests/test_trend_market_controller.py \
-  -q
-476 passed in 5.97s
-```
-
-Final full suite:
-
-```text
-make test
-2975 passed in 92.31s (0:01:32)
-```
-
-`git diff --check` passed before commit. A read-only process/screen/launchd inspection found no `trend-market run` controller or matching launchd job. The pre-existing detached Dashboard screen remained untouched. Per task instruction, no live controller workflow was started or restarted.
-
-## Files changed
-
-- `src/open_trader/trend_market_controller.py`
-  - Added optional borrowed quote support to calendar derivation and reconciliation.
-  - Added optional borrowed quote/account-loader support to protection passes.
-  - Added one lazy process-lifetime quote reader and one lazy account reader to the controller.
-  - Reset failed quote/account readers and closed both on shutdown.
-  - Left order clients on the existing short-lived action paths.
-- `tests/test_trend_market_controller.py`
-  - Added multi-loop reuse/cleanup coverage.
-  - Added failed quote/account rebuild coverage.
-  - Updated controller-loop fakes for the new keyword arguments and narrowly stubbed quote construction only where both quote consumers were already mocked.
-
-## Self-review
-
-- Spec: all Task 4 interfaces and lifecycle rules are implemented; `_new_order_client`, `_execute_locked_report`, and `_run_stop` were not changed or given shared readers.
-- Ownership: standalone helpers still create and close their own clients; borrowed clients are not closed by helpers.
-- Failure semantics: only `FutuQuoteError` resets the shared quote; domain-level abnormal protection results do not. Any account read failure closes and clears the shared account reader.
-- Scope/standards: no pool/resource-manager abstraction, dependency, configuration, or unrelated behavior was added. Test stubbing is opt-in rather than autouse, preserving quote-sensitive tests.
-
-## Concerns
-
-None. Live controller behavior was intentionally not exercised because the task required controllers to remain stopped; automated and process-state verification passed.
-
-## High review fix: close-failure lifecycle safety
-
-RED:
-
-```text
-.venv/bin/python -m pytest \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_quote_when_failed_quote_close_raises \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_account_when_failed_account_close_raises \
-  tests/test_trend_market_controller.py::test_controller_shutdown_attempts_every_cleanup_after_close_failure \
-  -q
-FFF                                                                      [100%]
-E RuntimeError: quote close failed
-E RuntimeError: account close failed
-E AssertionError: assert ['account'] == ['account', 'quote', 'pool']
-3 failed in 0.52s
-```
-
-The reset close errors replaced the quote/account operation failures, retained the failed clients, and the first shutdown close error skipped the remaining cleanup.
-
-GREEN:
-
-```text
-.venv/bin/python -m pytest \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_quote_when_failed_quote_close_raises \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_account_when_failed_account_close_raises \
-  tests/test_trend_market_controller.py::test_controller_shutdown_attempts_every_cleanup_after_close_failure \
-  -q
-...                                                                      [100%]
-3 passed in 1.34s
-```
-
-Focused lifecycle regressions:
-
-```text
-.venv/bin/python -m pytest \
-  tests/test_trend_market_controller.py::test_controller_reuses_quote_and_account_clients_across_loops \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_shared_clients_after_reader_failures \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_quote_when_failed_quote_close_raises \
-  tests/test_trend_market_controller.py::test_controller_rebuilds_account_when_failed_account_close_raises \
-  tests/test_trend_market_controller.py::test_controller_shutdown_attempts_every_cleanup_after_close_failure \
-  -q
-.....                                                                    [100%]
-5 passed in 0.29s
-```
-
-Full controller suite:
-
-```text
-.venv/bin/python -m pytest tests/test_trend_market_controller.py -q
-........................................................................ [ 73%]
-..........................                                               [100%]
-98 passed in 3.91s
-```
-
-Affected suites:
-
-```text
-.venv/bin/python -m pytest \
-  tests/test_futu_quote.py \
-  tests/test_a_share_trend.py \
-  tests/test_a_share_trend_watch.py \
-  tests/test_market_trend_watch.py \
-  tests/test_trend_market_controller.py \
-  -q
-........................................................................ [ 15%]
-........................................................................ [ 30%]
-........................................................................ [ 45%]
-........................................................................ [ 60%]
-........................................................................ [ 75%]
-........................................................................ [ 90%]
-...............................................                          [100%]
-479 passed in 5.07s
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_market_trend.py tests/test_trend_kelly.py tests/test_trend_api_stats.py tests/test_trend_review.py -q
+663 passed in 3.10s
 ```
 
 Full repository suite:
 
 ```text
 make test
-2978 passed in 91.46s (0:01:31)
+3433 passed in 78.73s (0:01:18)
 ```
 
-The controllers remained stopped; no live process or service-manager action was taken for this review fix.
+Additional checks:
+
+```text
+PYTHONPATH=src .venv/bin/python -m compileall -q src/open_trader/a_share_trend.py src/open_trader/trend_kelly.py src/open_trader/trend_review.py
+git diff --check
+```
+
+Both completed with exit status 0 and no output.
+
+## Changes
+
+- Live defaults are CN v8 and US/HK v5; CN v4/v6/v7 and US/HK v4 remain valid replay versions.
+- Kelly matching uses explicit non-recursive maps: CN v7 ← CN v4/v7, CN v8 ← CN v4/v7/v8, US v5 ← US v4/v5, HK v5 ← HK v4/v5. Cross-market, wrong strategy IDs, CN v5/v6, and older unapproved identities do not match.
+- v8/v5 snapshots list approved sample identities, contextual ordering keys/fallback, industry member/state fields, and fee semantics. Existing v4/v6/v7 frozen rows remain unchanged.
+- Risk, Kelly, snapshot normalization, and report-evidence replay allowlists treat v8/v5 like the existing v4/v6/v7 machinery.
+- `纪律.md` is v2 and records the contextual ordering, whole-report fallback/omission rules, exact fee labels/unit, and approved sample continuity.
+
+No Dashboard, runner collection, or cost-calculation code was changed. `trend_api_stats` already emits a stat row for every contributing opening identity, so no schema/display change was needed.
+
+## Concerns
+
+The task brief did not list `src/open_trader/trend_review.py`, but its snapshot
+normalization and replay allowlists must accept v8/v5 or the new frozen reports
+cannot be validated/rebuilt. No live background process or Dashboard acceptance
+gate was run; the parent task owns that final gate.
