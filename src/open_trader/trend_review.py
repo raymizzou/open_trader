@@ -2608,7 +2608,7 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if version in {"v2", "v3", "v4", "v6", "v7"}:
+    if version in {"v2", "v3", "v4", "v5", "v6", "v7"}:
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -4200,7 +4200,7 @@ def normalize_trend_strategy_snapshot(
             trend_strategy_snapshot,
         )
 
-        if snapshot.get("strategy_version") in {"v4", "v6", "v7"}:
+        if snapshot.get("strategy_version") in {"v4", "v5", "v6", "v7"}:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
                 process_version,
@@ -4254,23 +4254,6 @@ def normalize_trend_strategy_snapshot(
             "strategy snapshot does not match current or known legacy rules"
         )
     return expected
-
-
-def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
-    return _canonical_json_bytes(
-        {
-            key: snapshot[key]
-            for key in (
-                "strategy_id",
-                "strategy_name",
-                "strategy_version",
-                "market",
-                "effective_from",
-                "parameters",
-                "parameter_rows",
-            )
-        }
-    )
 
 
 def _validate_benchmark(
@@ -4853,7 +4836,7 @@ def build_trend_review_projection(
         snapshot = fact.get("strategy_snapshot")
         if not isinstance(snapshot, Mapping) or snapshot.get(
             "strategy_version"
-        ) not in {"v1", "v3"}:
+        ) not in {"v1", "v3", "v4", "v5", "v6", "v7"}:
             return None
         try:
             return normalize_trend_strategy_snapshot(snapshot, market)
@@ -4886,18 +4869,60 @@ def build_trend_review_projection(
         )
         is not None
     ]
-    strategy_identities = {
-        _strategy_identity(fact["strategy_snapshot"])
-        for fact in (*discipline_facts, *actual_facts)
-        if str(fact["date"]) >= effective_from
-    }
-    if len(strategy_identities) > 1:
-        raise ValueError("strategy snapshot identity changed within version interval")
+    normalized_facts = (*discipline_facts, *actual_facts)
+    current_snapshot = (
+        dict(
+            max(normalized_facts, key=lambda fact: str(fact["date"]))[
+                "strategy_snapshot"
+            ]
+        )
+        if normalized_facts
+        else {}
+    )
+    target = (
+        (
+            market,
+            str(current_snapshot["strategy_id"]),
+            str(current_snapshot["strategy_version"]),
+        )
+        if current_snapshot
+        else None
+    )
+
+    from .trend_kelly import trend_kelly_identity_matches
+
+    def compatible(fact: Mapping[str, object]) -> bool:
+        if target is None:
+            return False
+        snapshot = fact["strategy_snapshot"]
+        return trend_kelly_identity_matches(
+            (
+                market,
+                str(snapshot["strategy_id"]),
+                str(snapshot["strategy_version"]),
+            ),
+            target,
+        )
+
+    compatible_discipline = [fact for fact in discipline_facts if compatible(fact)]
+    compatible_actual = [fact for fact in actual_facts if compatible(fact)]
+    compatible_facts = (*compatible_discipline, *compatible_actual)
+    effective_from = (
+        TREND_V1_EFFECTIVE_FROM[market]
+        if current_snapshot.get("strategy_version") == "v3"
+        else min(
+            (
+                str(fact["strategy_snapshot"]["effective_from"])
+                for fact in compatible_facts
+            ),
+            default=TREND_V1_EFFECTIVE_FROM[market],
+        )
+    )
     fills, actual_fill_coverage = _load_actual_fills(data_dir, market)
     equity_cutoff = _common_cutoff(
         effective_from,
-        {str(fact["date"]) for fact in discipline_facts},
-        {str(fact["date"]) for fact in actual_facts},
+        {str(fact["date"]) for fact in compatible_discipline},
+        {str(fact["date"]) for fact in compatible_actual},
         set(benchmark_by_date),
     )
     common_cutoff = None
@@ -4915,7 +4940,7 @@ def build_trend_review_projection(
             common_cutoff = trading_date
     interval_discipline = [
         fact
-        for fact in discipline_facts
+        for fact in compatible_discipline
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     ]
@@ -4923,7 +4948,7 @@ def build_trend_review_projection(
     snapshot_facts = sorted(
         (
             fact
-            for fact in (*discipline_facts, *actual_facts)
+            for fact in compatible_facts
             if effective_from <= str(fact["date"])
             and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
         ),
@@ -4937,8 +4962,7 @@ def build_trend_review_projection(
                 dict(fact["strategy_snapshot"])
                 for fact in sorted(
                     (
-                        fact
-                        for fact in (*discipline_facts, *actual_facts)
+                        fact for fact in compatible_facts
                         if str(fact["date"]) < effective_from
                     ),
                     key=lambda fact: str(fact["date"]),
@@ -4951,7 +4975,7 @@ def build_trend_review_projection(
     discipline_cycles = _completed_trades(interval_discipline)
     interval_actual = {
         str(fact["date"]): fact
-        for fact in actual_facts
+        for fact in compatible_actual
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     }
@@ -5108,11 +5132,11 @@ def rebuild_trend_report_from_evidence(
         "metadata",
         "price_fx_to_account_currency",
     }
-    if strategy_version in {"v2", "v3", "v4", "v6", "v7"}:
+    if strategy_version in {"v2", "v3", "v4", "v5", "v6", "v7"}:
         required.add("normal_cost_rate")
-    if strategy_version in {"v3", "v4", "v6", "v7"}:
+    if strategy_version in {"v3", "v4", "v5", "v6", "v7"}:
         required.update({"kelly_rounds", "kelly_data_reason"})
-    if strategy_version in {"v4", "v6", "v7"}:
+    if strategy_version in {"v4", "v5", "v6", "v7"}:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
     if missing:
@@ -5245,7 +5269,7 @@ def rebuild_trend_report_from_evidence(
             "invalid original input: price_fx_to_account_currency"
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
-    if strategy_version in {"v2", "v3", "v4", "v6", "v7"} and (
+    if strategy_version in {"v2", "v3", "v4", "v5", "v6", "v7"} and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
         or normal_cost_rate < 0
@@ -5312,7 +5336,7 @@ def rebuild_trend_report_from_evidence(
         kelly_data_reason=kelly_data_reason,
         drawdown_summary=(
             inputs["drawdown_summary"]
-            if strategy_version in {"v4", "v6", "v7"}
+            if strategy_version in {"v4", "v5", "v6", "v7"}
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
         ),

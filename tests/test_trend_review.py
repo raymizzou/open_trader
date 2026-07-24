@@ -64,6 +64,15 @@ def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> 
     ] == "v4"
 
 
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_normalize_current_v5_snapshot(market: str) -> None:
+    snapshot = live_trend_strategy_snapshot(
+        market, "sha", (622460,), strategy_version="v5"
+    )
+
+    assert trend_review.normalize_trend_strategy_snapshot(snapshot, market) == snapshot
+
+
 def frozen_evidence() -> dict[str, object]:
     return {
         "market": "CN",
@@ -4381,7 +4390,9 @@ def test_partial_buy_cash_below_one_lot_creates_no_attempt(tmp_path: Path) -> No
     assert len(client.requests) == 1
 
 
-@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v6", "v7"])
+@pytest.mark.parametrize(
+    "strategy_version", ["v2", "v3", "v4", "v5", "v6", "v7"]
+)
 def test_partial_buy_risk_cap_limits_retry_lots(
     tmp_path: Path, strategy_version: str
 ) -> None:
@@ -7428,6 +7439,143 @@ def test_projection_shows_current_strategy_before_first_effective_sample(
     assert projection["strategy_snapshot"] == trend_strategy_snapshot(
         "US", "test-sha", ()
     )
+
+
+@pytest.mark.parametrize(
+    ("market", "v4_date", "v5_date"),
+    [("US", "2026-07-23", "2026-07-24"), ("HK", "2026-07-26", "2026-07-27")],
+)
+def test_current_v5_projection_uses_v5_identity_and_interval(
+    tmp_path: Path,
+    market: str,
+    v4_date: str,
+    v5_date: str,
+) -> None:
+    snapshots = (
+        live_trend_strategy_snapshot(
+            market, "sha", (622460,), strategy_version="v4"
+        ),
+        live_trend_strategy_snapshot(
+            market, "sha", (622460,), strategy_version="v5"
+        ),
+    )
+    benchmark_source, benchmark_symbol = {
+        "US": ("SPY_QFQ", "US.SPY"),
+        "HK": ("HSCI_PRICE", "HK.800701"),
+    }[market]
+    for trading_date, snapshot in zip((v4_date, v5_date), snapshots):
+        trend_review.freeze_discipline_fact(
+            tmp_path, market, trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_actual_equity_fact(
+            tmp_path, market, trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_benchmark_fact(
+            tmp_path,
+            market,
+            trading_date,
+            {
+                "date": trading_date,
+                "close": "100",
+                "source_id": benchmark_source,
+                "futu_symbol": benchmark_symbol,
+            },
+        )
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir()
+    rates.write_text("DATE,DGS3MO\n2026-07-16,4.25\n", encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v5"
+    assert projection["interval"]["start"] == snapshots[1]["effective_from"]
+    assert projection["sample_counts"] == {
+        "discipline": 0,
+        "actual": 0,
+        "required": 30,
+    }
+
+
+def test_current_cn_v7_projection_inherits_only_v4_and_v7_facts(
+    tmp_path: Path,
+) -> None:
+    v4 = live_trend_strategy_snapshot(
+        "CN", "sha", (622460,), strategy_version="v4"
+    )
+    v7 = live_trend_strategy_snapshot(
+        "CN", "sha", (622460,), strategy_version="v7"
+    )
+    v6 = live_trend_strategy_snapshot(
+        "CN", "sha", (622460,), strategy_version="v6"
+    )
+    unrelated_v5 = live_trend_strategy_snapshot(
+        "US", "sha", (622460,), strategy_version="v5"
+    )
+    facts = (
+        ("2026-07-20", v4, "v4"),
+        ("2026-07-22", unrelated_v5, "v5"),
+        ("2026-07-23", v6, "v6"),
+        ("2026-07-24", v7, "v7"),
+    )
+    fills: list[TradeFill] = []
+    for index, (trading_date, snapshot, version) in enumerate(facts):
+        symbol = f"{600000 + index:06d}"
+        orders = [
+            {"side": "BUY", "status": "FILLED", "symbol": symbol, "qty": "100"},
+            {"side": "SELL", "status": "FILLED", "symbol": symbol, "qty": "100"},
+        ]
+        trend_review.freeze_discipline_fact(
+            tmp_path, "CN", trading_date, "100000", orders, snapshot
+        )
+        trend_review.freeze_actual_equity_fact(
+            tmp_path, "CN", trading_date, "100000", [], snapshot
+        )
+        if version in {"v4", "v7"}:
+            fills.extend([
+                actual_fill(
+                    f"{version}-buy", symbol, "BUY", "100", trading_date,
+                    source_sequence=index * 2,
+                ),
+                actual_fill(
+                    f"{version}-sell", symbol, "SELL", "100", trading_date,
+                    source_sequence=index * 2 + 1,
+                ),
+            ])
+    for trading_date in ("2026-07-20", "2026-07-24"):
+        trend_review.freeze_benchmark_fact(
+            tmp_path,
+            "CN",
+            trading_date,
+            {
+                "date": trading_date,
+                "close": "100",
+                "source_id": "CSI_ALL_SHARE_PRICE",
+                "futu_symbol": "SH.000985",
+            },
+        )
+    trend_review.freeze_actual_fill_batch(
+        tmp_path,
+        {"broker": "eastmoney"},
+        fills,
+        "2026-07-24",
+        coverage_start="2026-07-20",
+    )
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir()
+    rates.write_text("DATE,DGS3MO\n2026-07-16,4.25\n", encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v7"
+    assert projection["interval"] == {
+        "start": "2026-07-20",
+        "end": "2026-07-24",
+    }
+    assert projection["sample_counts"] == {
+        "discipline": 2,
+        "actual": 2,
+        "required": 30,
+    }
 
 
 @pytest.mark.parametrize(
