@@ -14,10 +14,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
-    A_SHARE_INDUSTRY_FIELDS,
     AShareTrendRunResult,
     AccountPosition,
     AccountSnapshot,
+    INDUSTRY_MEMBER_FIELDS,
+    INDUSTRY_STATE_FIELDS,
     UNIFIED_TREND_FIELDS,
     _balance,
     _billing_field,
@@ -27,7 +28,6 @@ from .a_share_trend import (
     _finalize_market_report,
     _holding_snapshot,
     _is_systemic_futu_error,
-    _optional_int,
     _process_version,
     read_delivery_receipt,
     _redact_api_key,
@@ -37,10 +37,11 @@ from .a_share_trend import (
     _unified_trend_unit_cost,
     _write_delivery_receipt,
     _freeze_receipt_report,
+    _write_frozen_industry_context_history,
     build_report,
+    collect_industry_contexts,
     evaluate_candidate,
     load_futu_simulate_trend_account,
-    load_industry_temperatures,
     live_trend_strategy_snapshot,
     load_watch_events,
     render_trend_failure_text,
@@ -60,11 +61,7 @@ from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
-from .trend_animals import (
-    TrendAnimalsClient,
-    TrendAnimalsError,
-    TrendAnimalsLookupError,
-)
+from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
 from .strategy_drawdown import observe_strategy_equity
@@ -757,6 +754,11 @@ def _recover_market_receipt(
     if receipt["status"] == "sent" and _final_pair_matches(
         receipt, markdown_path, json_path
     ):
+        _write_frozen_industry_context_history(
+            receipt=receipt,
+            history_root=paths.root.parent / "trend_industry_context",
+            market=market,
+        )
         return AShareTrendRunResult("existing", markdown_path, json_path)
     if receipt["status"] in {"prepared", "pending", "delivery_failed"}:
         if receipt["status"] == "prepared":
@@ -790,6 +792,11 @@ def _recover_market_receipt(
         receipt=receipt,
         reports_dir=paths.reports,
         artifact_stem=artifact_stem,
+    )
+    _write_frozen_industry_context_history(
+        receipt=receipt,
+        history_root=paths.root.parent / "trend_industry_context",
+        market=market,
     )
     return AShareTrendRunResult("generated", markdown_path, json_path)
 
@@ -889,10 +896,7 @@ def _attempt_market_report(
         billing = {
             _billing_field(row): row for row in api.get_snapshot_billing()
         }
-        requested_fields = tuple(
-            dict.fromkeys(UNIFIED_TREND_FIELDS + A_SHARE_INDUSTRY_FIELDS)
-        )
-        missing = [field for field in requested_fields if field not in billing]
+        missing = [field for field in UNIFIED_TREND_FIELDS if field not in billing]
         if missing:
             raise ValueError(
                 "getSnapshotColumnBilling missing requested field(s): "
@@ -913,25 +917,6 @@ def _attempt_market_report(
             raise ValueError("getTickerSnapshot returned mismatched tmIds")
         if any(row.get("asOfDate") != as_of_date for row in snapshot_rows):
             raise ValueError("getTickerSnapshot returned a stale data date")
-        industry_ids = sorted(
-            {
-                value
-                for row in snapshot_rows
-                if (value := _optional_int(row.get("industryTmId"))) is not None
-                and value > 0
-            }
-        )
-        industry_rows: list[Mapping[str, object]] = []
-        industry_temperatures: dict[int, str | None] = {}
-        industry_data_reason = ""
-        try:
-            industry_rows, industry_temperatures = load_industry_temperatures(
-                api, tm_ids=industry_ids, expected_date=as_of_date
-            )
-        except TrendAnimalsError as exc:
-            industry_data_reason = f"行业温度数据不可用，暂停新开仓：{exc}"
-        balance_after = _balance(api.get_account_balance())
-
         rows_by_id = {_row_tm_id(row): row for row in snapshot_rows}
         start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         candidates = []
@@ -953,13 +938,7 @@ def _attempt_market_report(
                 bars = None
             candidates.append(
                 evaluate_candidate(
-                    row,
-                    bars,
-                    pools=component_pools[tm_id],
-                    market=market,
-                    industry_temperature=industry_temperatures.get(
-                        _optional_int(row.get("industryTmId"))
-                    ),
+                    row, bars, pools=component_pools[tm_id], market=market
                 )
             )
         holding_snapshots = {position.symbol: None for position in account.positions}
@@ -978,15 +957,27 @@ def _attempt_market_report(
             if row is not None:
                 try:
                     holding_snapshots[symbol] = _holding_snapshot(
-                        row,
-                        market=market,
-                        industry_temperature=industry_temperatures.get(
-                            _optional_int(row.get("industryTmId"))
-                        ),
-                        bars=tuple(bars or ()),
+                        row, market=market, bars=tuple(bars or ())
                     )
                 except ValueError:
                     pass
+
+        candidate_pool_rows = [
+            rows_by_id[tm_id] for tm_id in sorted(component_ids)
+            if tm_id in rows_by_id
+        ]
+        industry_contexts, industry_context_status, industry_facts = (
+            collect_industry_contexts(
+                api=api,
+                candidates=candidates,
+                candidate_rows=candidate_pool_rows,
+                held_symbols={position.symbol for position in account.positions},
+                expected_date=as_of_date,
+                market=market,
+                history_root=paths.root.parent / "trend_industry_context",
+            )
+        )
+        balance_after = _balance(api.get_account_balance())
 
         lot_sizes: dict[str, int] = {}
         if market == "HK":
@@ -998,11 +989,42 @@ def _attempt_market_report(
             lot_sizes = {
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
             }
-        estimated_cost = unified_unit_cost * len(requested_ids) + sum(
-            (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
-            Decimal("0"),
-        ) * len(industry_ids)
+        estimated_cost = (
+            unified_unit_cost * len(requested_ids)
+            + sum(
+                (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
+                Decimal("0"),
+            )
+            * len(industry_facts["member_ids"])
+            + sum(
+                (_billing_price(billing[field]) for field in INDUSTRY_STATE_FIELDS if field in billing),
+                Decimal("0"),
+            )
+            * len(industry_facts["state_ids"])
+        )
         actual_cost = balance_before - balance_after
+        cache_events = tuple(getattr(api, "paid_cache_events", ()))
+        cache_metadata = {
+            "hits": sum(event.get("cache") == "hit" for event in cache_events),
+            "misses": sum(event.get("cache") == "miss" for event in cache_events),
+            "events": [dict(event) for event in cache_events],
+        }
+        expected_component_requests = len(pool_ids) + int(
+            industry_facts["component_requests"]
+        )
+        component_events = [
+            event for event in cache_events
+            if event.get("endpoint") == "getComponentTicker"
+        ]
+        industry_field_prices_complete = all(
+            field in billing
+            for field in (*INDUSTRY_MEMBER_FIELDS, *INDUSTRY_STATE_FIELDS)
+        )
+        estimate_complete = (
+            len(component_events) == expected_component_requests
+            and all(event.get("cache") == "hit" for event in component_events)
+            and industry_field_prices_complete
+        )
         watch_events = load_watch_events(paths.events)
         try:
             kelly_rounds = load_trend_kelly_rounds(config.data_dir)
@@ -1013,10 +1035,7 @@ def _attempt_market_report(
         process_version = _process_version(config.repo)
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
         strategy_snapshot = live_trend_strategy_snapshot(
-            market,
-            process_version,
-            pool_ids,
-            execution_date=execution_date,
+            market, process_version, pool_ids
         )
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
@@ -1040,12 +1059,9 @@ def _attempt_market_report(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
                 f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
-                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
-                *(
-                    (f"industry_data_reason={industry_data_reason}",)
-                    if industry_data_reason
-                    else ()
-                ),
+                f"getComponentTicker eligible_industries={industry_facts['component_requests']} rows={industry_facts['component_rows']} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(INDUSTRY_MEMBER_FIELDS)} ids={len(industry_facts['member_ids'])} rows={industry_facts['member_rows']} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(INDUSTRY_STATE_FIELDS)} ids={len(industry_facts['state_ids'])} rows={industry_facts['state_rows']} cache=client-managed",
             ),
             data_sources=(
                 "Trend Animals",
@@ -1064,13 +1080,16 @@ def _attempt_market_report(
             candidate_pool_ids=pool_ids,
             strategy_snapshot=strategy_snapshot,
             drawdown_summary=drawdown_summary,
+            industry_contexts=industry_contexts,
+            industry_context_status=industry_context_status,
+            estimated_api_cost_complete=estimate_complete,
             metadata={
                 "market": market,
                 "broker": settings["broker"],
                 "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "process_version": process_version,
-                "industry_data_reason": industry_data_reason,
+                "paid_response_cache": cache_metadata,
                 **(
                     {
                         "account_currency": "USD",
@@ -1081,7 +1100,7 @@ def _attempt_market_report(
                 ),
             },
             kelly_rounds=kelly_rounds,
-            kelly_data_reason=kelly_data_reason or industry_data_reason,
+            kelly_data_reason=kelly_data_reason,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         previous_attention_rows = _previous_attention_rows(
@@ -1099,13 +1118,20 @@ def _attempt_market_report(
             query={
                 "component_pool_ids": list(pool_ids),
                 "snapshot_fields": list(UNIFIED_TREND_FIELDS),
-                "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
+                "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
+                "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
             },
             responses={
                 "update_status": update_rows,
                 "components": component_rows,
                 "snapshots": snapshot_rows,
-                "industries": industry_rows,
+                "industry_components": [
+                    row
+                    for rows in industry_facts["component_rows_by_industry"].values()
+                    for row in rows
+                ],
+                "industry_members": industry_facts["member_response"],
+                "industry_states": industry_facts["state_response"],
             },
             candidate_pool_ids=pool_ids,
             lot_sizes=lot_sizes,
@@ -1113,7 +1139,7 @@ def _attempt_market_report(
             previous_attention_rows=previous_attention_rows,
             option_attention_broker_label=option_attention_broker_label,
             kelly_rounds=kelly_rounds,
-            kelly_data_reason=kelly_data_reason or industry_data_reason,
+            kelly_data_reason=kelly_data_reason,
         )
         report = replace(
             report,
@@ -1168,6 +1194,11 @@ def _attempt_market_report(
             receipt=receipt,
             reports_dir=paths.reports,
             artifact_stem=artifact_stem,
+        )
+        _write_frozen_industry_context_history(
+            receipt=receipt,
+            history_root=paths.root.parent / "trend_industry_context",
+            market=market,
         )
         send_notification_with_results(
             notifier,

@@ -177,6 +177,94 @@ def test_cn_v7_kelly_inherits_v4_and_accumulates_v7_only() -> None:
     assert state.selected_round_ids == ("round-001", "round-002")
 
 
+@pytest.mark.parametrize(
+    ("sample", "target", "expected"),
+    [
+        *[
+            (
+                ("CN", f"trend_animals_warm_to_hot/CN/{version}", version),
+                ("CN", "trend_animals_warm_to_hot/CN/v8", "v8"),
+                True,
+            )
+            for version in ("v4", "v7", "v8")
+        ],
+        *[
+            (
+                ("CN", f"trend_animals_warm_to_hot/CN/{version}", version),
+                ("CN", "trend_animals_warm_to_hot/CN/v8", "v8"),
+                False,
+            )
+            for version in ("v5", "v6")
+        ],
+        *[
+            (
+                ("US", f"trend_animals_warm_to_hot/US/{version}", version),
+                ("US", "trend_animals_warm_to_hot/US/v5", "v5"),
+                version in {"v4", "v5"},
+            )
+            for version in ("v1", "v2", "v3", "v4", "v5")
+        ],
+        *[
+            (
+                ("HK", f"trend_animals_warm_to_hot/HK/{version}", version),
+                ("HK", "trend_animals_warm_to_hot/HK/v5", "v5"),
+                version in {"v4", "v5"},
+            )
+            for version in ("v1", "v2", "v3", "v4", "v5")
+        ],
+        (
+            ("CN", "trend_animals_warm_to_hot/CN/v4", "v4"),
+            ("US", "trend_animals_warm_to_hot/US/v5", "v5"),
+            False,
+        ),
+        (
+            ("CN", "trend_animals_warm_to_hot/CN/v8", "v8"),
+            ("CN", "trend_animals_warm_to_hot/CN/v4", "v4"),
+            False,
+        ),
+        (
+            ("CN", "trend_animals_warm_to_hot/CN/v8", "v7"),
+            ("CN", "trend_animals_warm_to_hot/CN/v8", "v8"),
+            False,
+        ),
+        (
+            ("CN", "wrong-strategy", "v8"),
+            ("CN", "trend_animals_warm_to_hot/CN/v8", "v8"),
+            False,
+        ),
+    ],
+)
+def test_new_live_strategy_sample_identity_compatibility_is_explicit_and_one_way(
+    sample: tuple[str, str, str],
+    target: tuple[str, str, str],
+    expected: bool,
+) -> None:
+    assert trend_kelly_identity_matches(sample, target) is expected
+
+
+def test_cn_v8_kelly_inherits_only_v4_v7_v8() -> None:
+    rounds = [
+        _round(
+            index,
+            "0.10",
+            market="CN",
+            strategy_id=f"trend_animals_warm_to_hot/CN/{version}",
+            version=version,
+        )
+        for index, version in enumerate(("v4", "v7", "v8", "v5", "v6"), 1)
+    ]
+
+    state = calculate_trend_kelly(
+        rounds,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v8",
+        opening_strategy_version="v8",
+    )
+
+    assert state.eligible_sample_count == 3
+    assert state.selected_round_ids == ("round-001", "round-002", "round-003")
+
+
 def test_kelly_uses_latest_200_by_close_identity_not_input_order() -> None:
     rounds = [_round(index, "0.10") for index in range(201)]
     rounds[0] = _round(0, "-1")

@@ -393,8 +393,6 @@ def test_round_keeps_opening_version_and_new_version_has_empty_actual_stats() ->
 
 
 def test_cn_v7_stats_inherit_only_v4_for_both_sources() -> None:
-    cn_v4_rounds = 1
-    cn_v7_rounds = 1
     fills = [
         item
         for source in ("simulation", "actual")
@@ -425,89 +423,50 @@ def test_cn_v7_stats_inherit_only_v4_for_both_sources() -> None:
     for source in ("simulation", "actual"):
         assert stats[
             (source, "trend_animals_warm_to_hot/CN/v7", "v7")
-        ]["eligible_sample_count"] == cn_v4_rounds + cn_v7_rounds
+        ]["eligible_sample_count"] == 2
         assert stats[
             (source, "trend_animals_warm_to_hot/CN/v4", "v4")
         ]["eligible_sample_count"] == 1
 
 
-def test_v5_stats_exclude_v4_rounds_and_keep_opening_version() -> None:
-    us_buy = fill(
-        "us-v4-buy",
-        side="buy",
-        quantity="1",
-        price="10",
-        fee="0",
-        filled_at="2026-07-23T10:00:00+00:00",
-        strategy_id="trend_animals_warm_to_hot/US/v4",
-        strategy_version="v4",
-    )
-    us_sell = fill(
-        "us-v5-sell",
-        side="sell",
-        quantity="1",
-        price="11",
-        fee="0",
-        filled_at="2026-07-24T10:00:00+00:00",
-        strategy_id="trend_animals_warm_to_hot/US/v5",
-        strategy_version="v5",
-    )
-    hk_buy = fill(
-        "hk-v4-buy",
-        side="buy",
-        quantity="1",
-        price="10",
-        fee="0",
-        filled_at="2026-07-26T10:00:00+00:00",
-        strategy_id="trend_animals_warm_to_hot/HK/v4",
-        strategy_version="v4",
-        market="HK",
-        currency="HKD",
-    )
-    hk_sell = fill(
-        "hk-v5-sell",
-        side="sell",
-        quantity="1",
-        price="11",
-        fee="0",
-        filled_at="2026-07-27T10:00:00+00:00",
-        strategy_id="trend_animals_warm_to_hot/HK/v5",
-        strategy_version="v5",
-        market="HK",
-        currency="HKD",
-    )
+def test_cn_v8_stats_expose_all_approved_contributing_opening_versions() -> None:
+    fills = [
+        item
+        for source in ("simulation", "actual")
+        for version in ("v4", "v5", "v6", "v7", "v8")
+        for item in _cn_closed_pair(
+            f"{source}-{version}", version, source=source
+        )
+    ]
     payload = build_trend_api_stats_payload(
-        [us_buy, us_sell, hk_buy, hk_sell],
-        strategy_versions=[
-            {
-                "market": "US",
-                "strategy_id": "trend_animals_warm_to_hot/US/v5",
-                "strategy_version": "v5",
-            },
-            {
-                "market": "HK",
-                "strategy_id": "trend_animals_warm_to_hot/HK/v5",
-                "strategy_version": "v5",
-            },
-        ],
-        generated_at="2026-07-28T00:00:00+00:00",
-        statistics_cutoff_at="2026-07-27T23:59:59+00:00",
+        fills,
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v8",
+            "strategy_version": "v8",
+        }],
+        generated_at="2026-07-12T00:00:00+08:00",
+        statistics_cutoff_at="2026-07-11T23:59:59+08:00",
     )
     stats = {
-        (item["market"], item["strategy_id"], item["opening_strategy_version"]): item
+        (
+            item["source"],
+            item["strategy_id"],
+            item["opening_strategy_version"],
+        ): item
         for item in payload["stats"]
     }
 
-    assert stats[
-        ("US", "trend_animals_warm_to_hot/US/v5", "v5")
-    ]["eligible_sample_count"] == 0
-    assert stats[
-        ("HK", "trend_animals_warm_to_hot/HK/v5", "v5")
-    ]["eligible_sample_count"] == 0
-    assert {
-        (round_["market"], round_["opening_strategy_version"])
-        for round_ in payload["rounds"]
-    } == {("US", "v4"), ("HK", "v4")}
+    for source in ("simulation", "actual"):
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v8", "v8")
+        ]["eligible_sample_count"] == 3
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v5", "v5")
+        ]["eligible_sample_count"] == 1
+        assert stats[
+            (source, "trend_animals_warm_to_hot/CN/v6", "v6")
+        ]["eligible_sample_count"] == 1
 
 
 def test_fill_and_round_order_uses_timestamp_instants_not_iso_text() -> None:

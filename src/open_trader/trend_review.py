@@ -6,7 +6,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -17,6 +16,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from .models import TradeFill
+from .trend_kelly import trend_kelly_identity_matches
 
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
 REPLAY_SCHEMA_VERSION = "open_trader.trend_review.replay.v1"
@@ -77,6 +77,9 @@ PROTECTION_STATE_ROOTS = {
     "HK": "trend_hk_phillips",
     "US": "trend_us_tiger",
 }
+TREND_STRATEGY_VERSIONS = frozenset(
+    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"}
+)
 
 
 class TrendReplayIncompleteError(ValueError):
@@ -486,6 +489,11 @@ def freeze_report_evidence(
         "market_data": bars_by_symbol,
         "account": getattr(report, "account"),
         "strategy_snapshot": strategy_snapshot,
+        "industry_contexts": getattr(report, "industry_contexts", ()),
+        "industry_context_status": getattr(report, "industry_context_status", {}),
+        "estimated_api_cost_complete": getattr(
+            report, "estimated_api_cost_complete", True
+        ),
         "process_version": str(strategy_snapshot.get("process_version") or ""),
         "rebuild_inputs": {
             "as_of_date": getattr(report, "as_of_date"),
@@ -500,6 +508,13 @@ def freeze_report_evidence(
             "data_sources": getattr(report, "data_sources"),
             "estimated_api_cost": getattr(report, "estimated_api_cost"),
             "actual_api_cost": getattr(report, "actual_api_cost"),
+            "industry_contexts": getattr(report, "industry_contexts", ()),
+            "industry_context_status": getattr(
+                report, "industry_context_status", {}
+            ),
+            "estimated_api_cost_complete": getattr(
+                report, "estimated_api_cost_complete", True
+            ),
             "market": str(metadata.get("market") or "CN"),
             "lot_sizes": dict(lot_sizes),
             "position_weight": metadata.get("position_weight"),
@@ -1166,26 +1181,6 @@ def _action_events(root: Path) -> list[dict[str, object]]:
     return events
 
 
-def _validate_canonical_action_event_names(root: Path) -> None:
-    for path in sorted(root.glob("*.json")):
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+-[0-9a-f]{12}\.json", path.name):
-            continue
-        try:
-            body = path.read_bytes()
-            payload = json.loads(body)
-            recorded_at = payload.get("recorded_at")
-        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError) as exc:
-            raise ValueError("invalid trend action event evidence") from exc
-        if not isinstance(payload, dict) or not isinstance(recorded_at, str):
-            raise ValueError("invalid trend action event evidence")
-        expected = (
-            f"{recorded_at.replace(':', '-')}-"
-            f"{hashlib.sha256(body).hexdigest()[:12]}.json"
-        )
-        if path.name != expected:
-            raise ValueError("invalid trend action event evidence")
-
-
 def _write_uncertain_action_event_once(
     *,
     data_dir: Path,
@@ -1512,6 +1507,7 @@ def _valid_late_buy_authorization(
     )
     if not path.exists():
         return False
+    # Authorization is report-scoped; the frozen report hash binds it to every buy.
     batch_path = (
         data_dir
         / "trend_review"
@@ -1533,18 +1529,57 @@ def _valid_late_buy_authorization(
         missed_at = [
             datetime.fromisoformat(str(event["recorded_at"])) for event in missed
         ]
-        fact_times = [
-            datetime.fromisoformat(
-                str(
-                    fact[
-                        "submitted_at"
-                        if fact_path.name.endswith("-result.json")
-                        else "created_at"
-                    ]
+        fact_times: list[datetime] = []
+        for fact_path, fact, _, _ in facts:
+            fact_times.append(
+                datetime.fromisoformat(
+                    str(
+                        fact[
+                            "submitted_at"
+                            if fact_path.name.endswith("-result.json")
+                            else "created_at"
+                        ]
+                    )
                 )
             )
-            for fact_path, fact, _, _ in facts
-        ]
+            result_path = (
+                fact_path
+                if fact_path.name.endswith("-result.json")
+                else _result_path(fact_path)
+            )
+            if result_path.exists() and result_path != fact_path:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                fact_times.append(
+                    datetime.fromisoformat(str(result["submitted_at"]))
+                )
+        action_times: list[datetime] = []
+        observation_times: list[datetime] = []
+        for event in events:
+            if event.get("status") not in {"submitted", "partially_filled", "filled"}:
+                continue
+            action_times.append(datetime.fromisoformat(str(event["recorded_at"])))
+            observation_name = event.get("observation_path")
+            if observation_name is None:
+                continue
+            if (
+                not isinstance(observation_name, str)
+                or Path(observation_name).name != observation_name
+            ):
+                raise ValueError("invalid observation path")
+            observation = json.loads(
+                (
+                    data_dir
+                    / "trend_review"
+                    / "ledgers"
+                    / market
+                    / "open"
+                    / execution_date
+                    / observation_name
+                ).read_text(encoding="utf-8")
+            )
+            observation_times.append(
+                datetime.fromisoformat(str(observation["observed_at"]))
+            )
     except (
         KeyError,
         OSError,
@@ -1584,6 +1619,15 @@ def _valid_late_buy_authorization(
         or any(item > authorized_at for item in missed_at)
         or any(item.tzinfo is None or item.utcoffset() is None for item in fact_times)
         or any(item < authorized_at for item in fact_times)
+        or any(
+            item.tzinfo is None or item.utcoffset() is None for item in action_times
+        )
+        or any(item < authorized_at for item in action_times)
+        or any(
+            item.tzinfo is None or item.utcoffset() is None
+            for item in observation_times
+        )
+        or any(item < authorized_at for item in observation_times)
     ):
         raise ValueError(f"invalid late buy authorization: {path}")
     return True
@@ -1891,7 +1935,6 @@ def load_trend_action_audit(
         side=side,
     )
     events = _action_events(action_root)
-    _validate_canonical_action_event_names(action_root)
     filled_terminal = False
     for event in events:
         try:
@@ -2736,7 +2779,7 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if version in {"v2", "v3", "v4", "v5", "v6", "v7"}:
+    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8"}:
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -4328,7 +4371,7 @@ def normalize_trend_strategy_snapshot(
             trend_strategy_snapshot,
         )
 
-        if snapshot.get("strategy_version") in {"v4", "v5", "v6", "v7"}:
+        if snapshot.get("strategy_version") in {"v4", "v5", "v6", "v7", "v8"}:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
                 process_version,
@@ -4382,6 +4425,23 @@ def normalize_trend_strategy_snapshot(
             "strategy snapshot does not match current or known legacy rules"
         )
     return expected
+
+
+def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
+    return _canonical_json_bytes(
+        {
+            key: snapshot[key]
+            for key in (
+                "strategy_id",
+                "strategy_name",
+                "strategy_version",
+                "market",
+                "effective_from",
+                "parameters",
+                "parameter_rows",
+            )
+        }
+    )
 
 
 def _validate_benchmark(
@@ -4964,7 +5024,7 @@ def build_trend_review_projection(
         snapshot = fact.get("strategy_snapshot")
         if not isinstance(snapshot, Mapping) or snapshot.get(
             "strategy_version"
-        ) not in {"v1", "v3", "v4", "v5", "v6", "v7"}:
+        ) not in TREND_STRATEGY_VERSIONS:
             return None
         try:
             return normalize_trend_strategy_snapshot(snapshot, market)
@@ -4997,60 +5057,71 @@ def build_trend_review_projection(
         )
         is not None
     ]
-    normalized_facts = (*discipline_facts, *actual_facts)
-    current_snapshot = (
-        dict(
-            max(normalized_facts, key=lambda fact: str(fact["date"]))[
-                "strategy_snapshot"
-            ]
-        )
-        if normalized_facts
-        else {}
-    )
-    target = (
-        (
-            market,
-            str(current_snapshot["strategy_id"]),
-            str(current_snapshot["strategy_version"]),
-        )
-        if current_snapshot
-        else None
-    )
 
-    from .trend_kelly import trend_kelly_identity_matches
-
-    def compatible(fact: Mapping[str, object]) -> bool:
-        if target is None:
-            return False
+    def fact_identity(fact: Mapping[str, object]) -> tuple[str, str, str]:
         snapshot = fact["strategy_snapshot"]
-        return trend_kelly_identity_matches(
-            (
-                market,
-                str(snapshot["strategy_id"]),
-                str(snapshot["strategy_version"]),
-            ),
-            target,
+        assert isinstance(snapshot, Mapping)
+        return (
+            str(snapshot.get("market") or market),
+            str(snapshot.get("strategy_id") or ""),
+            str(snapshot.get("strategy_version") or ""),
         )
 
-    compatible_discipline = [fact for fact in discipline_facts if compatible(fact)]
-    compatible_actual = [fact for fact in actual_facts if compatible(fact)]
-    compatible_facts = (*compatible_discipline, *compatible_actual)
-    effective_from = (
-        TREND_V1_EFFECTIVE_FROM[market]
-        if current_snapshot.get("strategy_version") == "v3"
-        else min(
-            (
-                str(fact["strategy_snapshot"]["effective_from"])
-                for fact in compatible_facts
-            ),
-            default=TREND_V1_EFFECTIVE_FROM[market],
+    effective_facts = [
+        fact
+        for fact in (*discipline_facts, *actual_facts)
+        if str(fact["date"]) >= effective_from
+    ]
+    live_facts = [
+        fact
+        for fact in effective_facts
+        if fact_identity(fact)[2] in {"v4", "v5", "v6", "v7", "v8"}
+    ]
+    target_candidates = live_facts or effective_facts
+    if target_candidates:
+        if live_facts:
+            target_fact = max(target_candidates, key=lambda fact: str(fact["date"]))
+        else:
+            # v1-v3 have no inheritance map. Prefer the newest legacy rule
+            # version when a late malformed/old fact is mixed into the stream.
+            target_fact = max(
+                target_candidates,
+                key=lambda fact: (
+                    int(fact_identity(fact)[2][1:]),
+                    str(fact["date"]),
+                ),
+            )
+    else:
+        target_candidates = [*discipline_facts, *actual_facts]
+        target_fact = (
+            max(target_candidates, key=lambda fact: str(fact["date"]))
+            if target_candidates
+            else None
         )
-    )
+    target_identity = fact_identity(target_fact) if target_candidates else None
+
+    def is_target_identity(fact: Mapping[str, object]) -> bool:
+        if target_identity is None or str(fact["date"]) < effective_from:
+            return True
+        return trend_kelly_identity_matches(fact_identity(fact), target_identity)
+
+    discipline_facts = [fact for fact in discipline_facts if is_target_identity(fact)]
+    actual_facts = [fact for fact in actual_facts if is_target_identity(fact)]
+    identity_snapshots: dict[tuple[str, str, str], set[bytes]] = {}
+    for fact in (*discipline_facts, *actual_facts):
+        if str(fact["date"]) < effective_from:
+            continue
+        identity = fact_identity(fact)
+        identity_snapshots.setdefault(identity, set()).add(
+            _strategy_identity(fact["strategy_snapshot"])
+        )
+    if any(len(snapshots) > 1 for snapshots in identity_snapshots.values()):
+        raise ValueError("strategy snapshot identity changed within version interval")
     fills, actual_fill_coverage = _load_actual_fills(data_dir, market)
     equity_cutoff = _common_cutoff(
         effective_from,
-        {str(fact["date"]) for fact in compatible_discipline},
-        {str(fact["date"]) for fact in compatible_actual},
+        {str(fact["date"]) for fact in discipline_facts},
+        {str(fact["date"]) for fact in actual_facts},
         set(benchmark_by_date),
     )
     common_cutoff = None
@@ -5068,7 +5139,7 @@ def build_trend_review_projection(
             common_cutoff = trading_date
     interval_discipline = [
         fact
-        for fact in compatible_discipline
+        for fact in discipline_facts
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     ]
@@ -5076,7 +5147,7 @@ def build_trend_review_projection(
     snapshot_facts = sorted(
         (
             fact
-            for fact in compatible_facts
+            for fact in (*discipline_facts, *actual_facts)
             if effective_from <= str(fact["date"])
             and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
         ),
@@ -5090,7 +5161,8 @@ def build_trend_review_projection(
                 dict(fact["strategy_snapshot"])
                 for fact in sorted(
                     (
-                        fact for fact in compatible_facts
+                        fact
+                        for fact in (*discipline_facts, *actual_facts)
                         if str(fact["date"]) < effective_from
                     ),
                     key=lambda fact: str(fact["date"]),
@@ -5103,7 +5175,7 @@ def build_trend_review_projection(
     discipline_cycles = _completed_trades(interval_discipline)
     interval_actual = {
         str(fact["date"]): fact
-        for fact in compatible_actual
+        for fact in actual_facts
         if common_cutoff is not None
         and effective_from <= str(fact["date"]) <= common_cutoff
     }
@@ -5260,11 +5332,11 @@ def rebuild_trend_report_from_evidence(
         "metadata",
         "price_fx_to_account_currency",
     }
-    if strategy_version in {"v2", "v3", "v4", "v5", "v6", "v7"}:
+    if strategy_version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8"}:
         required.add("normal_cost_rate")
-    if strategy_version in {"v3", "v4", "v5", "v6", "v7"}:
+    if strategy_version in {"v3", "v4", "v5", "v6", "v7", "v8"}:
         required.update({"kelly_rounds", "kelly_data_reason"})
-    if strategy_version in {"v4", "v5", "v6", "v7"}:
+    if strategy_version in {"v4", "v5", "v6", "v7", "v8"}:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
     if missing:
@@ -5285,9 +5357,83 @@ def rebuild_trend_report_from_evidence(
         TREND_API_STATS_SCHEMA_VERSION,
         trend_kelly_rounds_from_payload,
     )
+    from .trend_industry_context import IndustryContext
 
     def decimal_or_none(value: object) -> Decimal | None:
         return None if value is None or value == "" else Decimal(str(value))
+
+    def industry_context_from_raw(raw: object) -> IndustryContext:
+        if not isinstance(raw, Mapping):
+            raise TrendReplayIncompleteError(
+                "invalid original input: industry_contexts"
+            )
+        try:
+            raw_integer_fields = {
+                field: raw[field]
+                for field in (
+                    "industry_tm_id",
+                    "component_count",
+                    "snapshot_count",
+                    "tradable_count",
+                    "valid_count",
+                    "right_count",
+                    "warm_to_hot_count",
+                )
+            }
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in raw_integer_fields.values()
+            ):
+                raise ValueError
+            integer_fields = {
+                field: int(value) for field, value in raw_integer_fields.items()
+            }
+            context = IndustryContext(
+                **integer_fields,
+                industry=str(raw["industry"]),
+                as_of_date=str(raw["as_of_date"]),
+                snapshot_coverage=Decimal(str(raw["snapshot_coverage"])),
+                right_state_coverage=Decimal(str(raw["right_state_coverage"])),
+                right_share=decimal_or_none(raw.get("right_share")),
+                temperature=(
+                    None
+                    if raw.get("temperature") is None
+                    else str(raw["temperature"])
+                ),
+                strength=decimal_or_none(raw.get("strength")),
+                valid=raw["valid"] is True,
+                invalid_reasons=tuple(str(item) for item in raw["invalid_reasons"]),
+                prior_as_of_date=(
+                    None
+                    if raw.get("prior_as_of_date") is None
+                    else str(raw["prior_as_of_date"])
+                ),
+                prior_temperature=(
+                    None
+                    if raw.get("prior_temperature") is None
+                    else str(raw["prior_temperature"])
+                ),
+                prior_right_share=decimal_or_none(raw.get("prior_right_share")),
+                temperature_direction=(
+                    None
+                    if raw.get("temperature_direction") is None
+                    else str(raw["temperature_direction"])
+                ),
+                right_share_change_pp=decimal_or_none(
+                    raw.get("right_share_change_pp")
+                ),
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            raise TrendReplayIncompleteError(
+                "invalid original input: industry_contexts"
+            ) from None
+        if not isinstance(raw.get("valid"), bool) or not isinstance(
+            raw.get("invalid_reasons"), list
+        ):
+            raise TrendReplayIncompleteError(
+                "invalid original input: industry_contexts"
+            )
+        return context
 
     account_raw = inputs["account"]
     if not isinstance(account_raw, Mapping):
@@ -5397,7 +5543,7 @@ def rebuild_trend_report_from_evidence(
             "invalid original input: price_fx_to_account_currency"
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
-    if strategy_version in {"v2", "v3", "v4", "v5", "v6", "v7"} and (
+    if strategy_version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8"} and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
         or normal_cost_rate < 0
@@ -5423,6 +5569,20 @@ def rebuild_trend_report_from_evidence(
     if not isinstance(kelly_data_reason, str):
         raise TrendReplayIncompleteError(
             "invalid original input: kelly_data_reason"
+        )
+    contexts_raw = inputs.get("industry_contexts", [])
+    if not isinstance(contexts_raw, list):
+        raise TrendReplayIncompleteError("invalid original input: industry_contexts")
+    industry_contexts = tuple(industry_context_from_raw(item) for item in contexts_raw)
+    status_raw = inputs.get("industry_context_status")
+    if status_raw is not None and not isinstance(status_raw, Mapping):
+        raise TrendReplayIncompleteError(
+            "invalid original input: industry_context_status"
+        )
+    estimated_api_cost_complete = inputs.get("estimated_api_cost_complete", True)
+    if not isinstance(estimated_api_cost_complete, bool):
+        raise TrendReplayIncompleteError(
+            "invalid original input: estimated_api_cost_complete"
         )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
@@ -5464,10 +5624,15 @@ def rebuild_trend_report_from_evidence(
         kelly_data_reason=kelly_data_reason,
         drawdown_summary=(
             inputs["drawdown_summary"]
-            if strategy_version in {"v4", "v5", "v6", "v7"}
+            if strategy_version in {"v4", "v5", "v6", "v7", "v8"}
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
         ),
+        industry_contexts=industry_contexts,
+        industry_context_status=(
+            dict(status_raw) if isinstance(status_raw, Mapping) else None
+        ),
+        estimated_api_cost_complete=estimated_api_cost_complete,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:

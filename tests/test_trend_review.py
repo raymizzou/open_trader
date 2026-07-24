@@ -28,6 +28,7 @@ from open_trader.strategy_drawdown import (
     observe_strategy_equity,
 )
 from open_trader.models import Market, TradeFill
+from open_trader.trend_industry_context import IndustryContext
 
 
 def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> None:
@@ -62,15 +63,6 @@ def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> 
     assert current["parameters"]["kelly_sample_inherits"][0][
         "opening_strategy_version"
     ] == "v4"
-
-
-@pytest.mark.parametrize("market", ["US", "HK"])
-def test_normalize_current_v5_snapshot(market: str) -> None:
-    snapshot = live_trend_strategy_snapshot(
-        market, "sha", (622460,), strategy_version="v5"
-    )
-
-    assert trend_review.normalize_trend_strategy_snapshot(snapshot, market) == snapshot
 
 
 def frozen_evidence() -> dict[str, object]:
@@ -519,6 +511,111 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
     assert corrected["process_version"] == "fixedsha"
     assert corrected["strategy_judgments"]["formal_actions"] == source_actions
     assert corrected["option_attention"] == source["option_attention"]
+
+
+def test_rebuild_preserves_frozen_industry_context_ordering_facts(tmp_path: Path) -> None:
+    context = IndustryContext(
+        industry_tm_id=621707,
+        industry="行业621707",
+        as_of_date="2026-07-16",
+        component_count=20,
+        snapshot_count=20,
+        tradable_count=20,
+        valid_count=20,
+        right_count=10,
+        snapshot_coverage=Decimal("1"),
+        right_state_coverage=Decimal("1"),
+        right_share=Decimal("0.5"),
+        warm_to_hot_count=5,
+        temperature="热",
+        strength=Decimal("90"),
+        valid=True,
+        invalid_reasons=(),
+        prior_as_of_date="2026-07-15",
+        prior_temperature="温",
+        prior_right_share=Decimal("0.4"),
+        temperature_direction="rising",
+        right_share_change_pp=Decimal("10"),
+    )
+    candidate = CandidateInput(
+        tm_id=1,
+        symbol="600001",
+        exchange="SH",
+        name="示例",
+        asset="A股",
+        industry="行业621707",
+        as_of_date="2026-07-16",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("10"),
+        atr=Decimal("0.5"),
+        industry_tm_id=621707,
+        industry_temperature="热",
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+    )
+    account = AccountSnapshot(
+        source_date="2026-07-16",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+    )
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account,
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        process_version="oldsha",
+        candidate_pool_ids=(1,),
+        industry_contexts=(context,),
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=Decimal("0.610"),
+        estimated_api_cost_complete=False,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=[],
+        query={"component_pool_ids": [1], "snapshot_fields": []},
+        responses={},
+        candidate_pool_ids=(1,),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=[],
+        option_attention_broker_label=None,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    assert rebuilt["industry_contexts"] == source["industry_contexts"]
+    assert rebuilt["industry_context_status"] == source["industry_context_status"]
+    assert rebuilt["api_cost"] == source["api_cost"]
+    assert [
+        item["symbol"] for item in rebuilt["strategy_judgments"]["top10_candidates"]
+    ] == [
+        item["symbol"] for item in source["strategy_judgments"]["top10_candidates"]
+    ]
+    assert rebuilt["strategy_judgments"]["top10_candidates"][0]["ordering_context"] == source[
+        "strategy_judgments"
+    ]["top10_candidates"][0]["ordering_context"]
 
 
 class FakeTrendSimClient:
@@ -3479,9 +3576,7 @@ def test_us_open_does_not_carry_market_order_after_close(tmp_path: Path) -> None
     } == json.loads(events[0].read_text(encoding="utf-8"))
 
 
-def test_action_audit_accepts_buy_after_bound_late_authorization(
-    tmp_path: Path,
-) -> None:
+def _late_buy_audit_fixture(tmp_path: Path) -> dict[str, Path]:
     report = cn_buy_report()
     report_path = tmp_path / "reports/2026-07-16.json"
     report_path.parent.mkdir(parents=True)
@@ -3551,7 +3646,7 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
             }
         ),
     )
-    trend_review._write_action_event(
+    event_path = trend_review._write_action_event(
         data_dir=tmp_path,
         market="CN",
         execution_date="2026-07-17",
@@ -3594,6 +3689,19 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
         ),
     )
 
+    return {
+        "authorization": authorization,
+        "intent": intent,
+        "result": trend_review._result_path(intent),
+        "event": event_path,
+    }
+
+
+def test_action_audit_accepts_buy_after_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    fixture = _late_buy_audit_fixture(tmp_path)
+
     events, _ = trend_review.load_trend_action_audit(
         tmp_path,
         market="CN",
@@ -3603,18 +3711,12 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
     )
 
     assert [event["status"] for event in events] == ["missed", "submitted"]
-    missed_path = next(
-        path
-        for path in tmp_path.glob(
-            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
-        )
-        if json.loads(path.read_text(encoding="utf-8"))["status"] == "missed"
-    )
-    original_missed = missed_path.read_bytes()
-    tampered_missed = json.loads(original_missed)
-    tampered_missed["recorded_at"] = "2026-07-17T10:00:00+08:00"
-    missed_path.write_text(json.dumps(tampered_missed), encoding="utf-8")
-    with pytest.raises(ValueError, match="invalid trend action event evidence"):
+    authorization = fixture["authorization"]
+    payload = json.loads(authorization.read_text(encoding="utf-8"))
+    payload["report_sha256"] = "0" * 64
+    authorization.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid late buy authorization"):
         trend_review.load_trend_action_audit(
             tmp_path,
             market="CN",
@@ -3622,10 +3724,33 @@ def test_action_audit_accepts_buy_after_bound_late_authorization(
             symbol="600001",
             side="buy",
         )
-    missed_path.write_bytes(original_missed)
-    payload = json.loads(authorization.read_text(encoding="utf-8"))
-    payload["report_sha256"] = "0" * 64
-    authorization.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_action_audit_rejects_result_before_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    fixture = _late_buy_audit_fixture(tmp_path)
+    result = json.loads(fixture["result"].read_text(encoding="utf-8"))
+    result["submitted_at"] = "2026-07-17T10:01:00+08:00"
+    fixture["result"].write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid late buy authorization"):
+        trend_review.load_trend_action_audit(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-17",
+            symbol="600001",
+            side="buy",
+        )
+
+
+def test_action_audit_rejects_event_before_bound_late_authorization(
+    tmp_path: Path,
+) -> None:
+    fixture = _late_buy_audit_fixture(tmp_path)
+    event = json.loads(fixture["event"].read_text(encoding="utf-8"))
+    event["recorded_at"] = "2026-07-17T10:01:00+08:00"
+    fixture["event"].write_text(json.dumps(event), encoding="utf-8")
 
     with pytest.raises(ValueError, match="invalid late buy authorization"):
         trend_review.load_trend_action_audit(
@@ -4548,9 +4673,7 @@ def test_partial_buy_cash_below_one_lot_creates_no_attempt(tmp_path: Path) -> No
     assert len(client.requests) == 1
 
 
-@pytest.mark.parametrize(
-    "strategy_version", ["v2", "v3", "v4", "v5", "v6", "v7"]
-)
+@pytest.mark.parametrize("strategy_version", ["v2", "v3", "v4", "v6", "v7"])
 def test_partial_buy_risk_cap_limits_retry_lots(
     tmp_path: Path, strategy_version: str
 ) -> None:
@@ -6009,6 +6132,95 @@ def write_separate_review_facts(
     rates = root / "rates/DGS3MO.csv"
     rates.parent.mkdir(parents=True)
     rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+
+def write_projection_strategy_facts(
+    root: Path,
+    market: str,
+    snapshots: list[dict[str, object]],
+) -> None:
+    start = date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
+    benchmark_source = {
+        "CN": ("CSI_ALL_SHARE_PRICE", "SH.000985"),
+        "US": ("SPY_QFQ", "US.SPY"),
+        "HK": ("HSCI_PRICE", "HK.800701"),
+    }[market]
+    for index, snapshot in enumerate(snapshots):
+        trading_date = (start + timedelta(days=index)).isoformat()
+        trend_review.freeze_discipline_fact(
+            root, market, trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_actual_equity_fact(
+            root, market, trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_benchmark_fact(
+            root,
+            market,
+            trading_date,
+            {
+                "date": trading_date,
+                "close": "1000",
+                "source_id": benchmark_source[0],
+                "futu_symbol": benchmark_source[1],
+            },
+        )
+    trend_review.freeze_actual_fill_batch(
+        root,
+        {
+            "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
+            "market": market,
+            "source": "test",
+        },
+        [],
+        (start + timedelta(days=len(snapshots) - 1)).isoformat(),
+        coverage_start=start.isoformat(),
+    )
+    rates = root / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("market", "strategy_version"),
+    [("CN", "v8"), ("US", "v5"), ("HK", "v5")],
+)
+def test_projection_accepts_current_live_strategy_versions(
+    tmp_path: Path, market: str, strategy_version: str,
+) -> None:
+    snapshot = live_trend_strategy_snapshot(
+        market, "test-sha", (), strategy_version=strategy_version
+    )
+    write_projection_strategy_facts(tmp_path, market, [snapshot, snapshot])
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["strategy_snapshot"]["strategy_version"] == strategy_version
+
+
+@pytest.mark.parametrize(
+    ("market", "strategy_versions"),
+    [
+        ("CN", ("v4", "v7", "v8")),
+        ("US", ("v4", "v5")),
+        ("HK", ("v4", "v5")),
+    ],
+)
+def test_projection_accepts_approved_mixed_sample_identities(
+    tmp_path: Path,
+    market: str,
+    strategy_versions: tuple[str, ...],
+) -> None:
+    snapshots = [
+        live_trend_strategy_snapshot(
+            market, "test-sha", (), strategy_version=version
+        )
+        for version in strategy_versions
+    ]
+    write_projection_strategy_facts(tmp_path, market, snapshots)
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["strategy_snapshot"]["strategy_version"] == strategy_versions[-1]
 
 
 def test_pending_sell_with_zero_live_position_records_completion(
@@ -7597,143 +7809,6 @@ def test_projection_shows_current_strategy_before_first_effective_sample(
     assert projection["strategy_snapshot"] == trend_strategy_snapshot(
         "US", "test-sha", ()
     )
-
-
-@pytest.mark.parametrize(
-    ("market", "v4_date", "v5_date"),
-    [("US", "2026-07-23", "2026-07-24"), ("HK", "2026-07-26", "2026-07-27")],
-)
-def test_current_v5_projection_uses_v5_identity_and_interval(
-    tmp_path: Path,
-    market: str,
-    v4_date: str,
-    v5_date: str,
-) -> None:
-    snapshots = (
-        live_trend_strategy_snapshot(
-            market, "sha", (622460,), strategy_version="v4"
-        ),
-        live_trend_strategy_snapshot(
-            market, "sha", (622460,), strategy_version="v5"
-        ),
-    )
-    benchmark_source, benchmark_symbol = {
-        "US": ("SPY_QFQ", "US.SPY"),
-        "HK": ("HSCI_PRICE", "HK.800701"),
-    }[market]
-    for trading_date, snapshot in zip((v4_date, v5_date), snapshots):
-        trend_review.freeze_discipline_fact(
-            tmp_path, market, trading_date, "100000", [], snapshot
-        )
-        trend_review.freeze_actual_equity_fact(
-            tmp_path, market, trading_date, "100000", [], snapshot
-        )
-        trend_review.freeze_benchmark_fact(
-            tmp_path,
-            market,
-            trading_date,
-            {
-                "date": trading_date,
-                "close": "100",
-                "source_id": benchmark_source,
-                "futu_symbol": benchmark_symbol,
-            },
-        )
-    rates = tmp_path / "rates/DGS3MO.csv"
-    rates.parent.mkdir()
-    rates.write_text("DATE,DGS3MO\n2026-07-16,4.25\n", encoding="utf-8")
-
-    projection = trend_review.build_trend_review_projection(tmp_path, market)
-
-    assert projection["strategy_snapshot"]["strategy_version"] == "v5"
-    assert projection["interval"]["start"] == snapshots[1]["effective_from"]
-    assert projection["sample_counts"] == {
-        "discipline": 0,
-        "actual": 0,
-        "required": 30,
-    }
-
-
-def test_current_cn_v7_projection_inherits_only_v4_and_v7_facts(
-    tmp_path: Path,
-) -> None:
-    v4 = live_trend_strategy_snapshot(
-        "CN", "sha", (622460,), strategy_version="v4"
-    )
-    v7 = live_trend_strategy_snapshot(
-        "CN", "sha", (622460,), strategy_version="v7"
-    )
-    v6 = live_trend_strategy_snapshot(
-        "CN", "sha", (622460,), strategy_version="v6"
-    )
-    unrelated_v5 = live_trend_strategy_snapshot(
-        "US", "sha", (622460,), strategy_version="v5"
-    )
-    facts = (
-        ("2026-07-20", v4, "v4"),
-        ("2026-07-22", unrelated_v5, "v5"),
-        ("2026-07-23", v6, "v6"),
-        ("2026-07-24", v7, "v7"),
-    )
-    fills: list[TradeFill] = []
-    for index, (trading_date, snapshot, version) in enumerate(facts):
-        symbol = f"{600000 + index:06d}"
-        orders = [
-            {"side": "BUY", "status": "FILLED", "symbol": symbol, "qty": "100"},
-            {"side": "SELL", "status": "FILLED", "symbol": symbol, "qty": "100"},
-        ]
-        trend_review.freeze_discipline_fact(
-            tmp_path, "CN", trading_date, "100000", orders, snapshot
-        )
-        trend_review.freeze_actual_equity_fact(
-            tmp_path, "CN", trading_date, "100000", [], snapshot
-        )
-        if version in {"v4", "v7"}:
-            fills.extend([
-                actual_fill(
-                    f"{version}-buy", symbol, "BUY", "100", trading_date,
-                    source_sequence=index * 2,
-                ),
-                actual_fill(
-                    f"{version}-sell", symbol, "SELL", "100", trading_date,
-                    source_sequence=index * 2 + 1,
-                ),
-            ])
-    for trading_date in ("2026-07-20", "2026-07-24"):
-        trend_review.freeze_benchmark_fact(
-            tmp_path,
-            "CN",
-            trading_date,
-            {
-                "date": trading_date,
-                "close": "100",
-                "source_id": "CSI_ALL_SHARE_PRICE",
-                "futu_symbol": "SH.000985",
-            },
-        )
-    trend_review.freeze_actual_fill_batch(
-        tmp_path,
-        {"broker": "eastmoney"},
-        fills,
-        "2026-07-24",
-        coverage_start="2026-07-20",
-    )
-    rates = tmp_path / "rates/DGS3MO.csv"
-    rates.parent.mkdir()
-    rates.write_text("DATE,DGS3MO\n2026-07-16,4.25\n", encoding="utf-8")
-
-    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
-
-    assert projection["strategy_snapshot"]["strategy_version"] == "v7"
-    assert projection["interval"] == {
-        "start": "2026-07-20",
-        "end": "2026-07-24",
-    }
-    assert projection["sample_counts"] == {
-        "discipline": 2,
-        "actual": 2,
-        "required": 30,
-    }
 
 
 @pytest.mark.parametrize(

@@ -33,7 +33,6 @@ from open_trader.a_share_trend import (
     evaluate_candidate,
     load_eastmoney_account,
     load_futu_simulate_trend_account,
-    load_industry_temperatures,
     load_protection_state,
     load_watch_events,
     render_trend_failure_text,
@@ -51,6 +50,7 @@ from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, 
 from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 from open_trader.trend_kelly import TrendKellyRound
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
+from open_trader.trend_industry_context import IndustryContext
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -409,7 +409,7 @@ def unlock_live_drawdown(
     *,
     market: str = "CN",
     equity: str = "100000",
-    strategy_version: str = "v7",
+    strategy_version: str = "v8",
 ) -> None:
     automatic_bootstrap_strategy_drawdown(
         data_dir,
@@ -560,7 +560,7 @@ def test_trend_v3_effective_date_is_shared_across_markets(market: str) -> None:
 
 def test_live_cn_strategy_snapshot_is_v7_with_v4_sample_inheritance() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
-        "CN", "abc123", (622466, 697199)
+        "CN", "abc123", (622466, 697199), strategy_version="v7"
     )
 
     assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v7"
@@ -593,282 +593,64 @@ def test_live_cn_v6_strategy_snapshot_remains_historical() -> None:
     ]
 
 
+def test_live_cn_strategy_snapshot_defaults_to_v8_with_all_approved_inheritance() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199)
+    )
+
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v8"
+    assert snapshot["strategy_version"] == "v8"
+    assert snapshot["effective_from"] == "2026-07-24"
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": "CN",
+            "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v7", "v8")
+    ]
+
+
 @pytest.mark.parametrize(
-    ("market", "execution_date", "version"),
-    [
-        ("US", "2026-07-23", "v4"),
-        ("US", "2026-07-24", "v5"),
-        ("HK", "2026-07-26", "v4"),
-        ("HK", "2026-07-27", "v5"),
-    ],
+    ("market", "expected_version"),
+    [("US", "v5"), ("HK", "v5")],
 )
-def test_market_strategy_version_follows_execution_date(
-    market: str, execution_date: str, version: str
+def test_live_non_cn_strategy_snapshot_defaults_to_v5_with_exact_inheritance(
+    market: str, expected_version: str,
 ) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
-        market, "sha", (622460,), execution_date=execution_date
+        market, "abc123", (622460,) if market == "US" else (622494,)
+    )
+
+    assert snapshot["strategy_id"] == (
+        f"trend_animals_warm_to_hot/{market}/{expected_version}"
+    )
+    assert snapshot["strategy_version"] == expected_version
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": market,
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v5")
+    ]
+
+
+@pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8"])
+def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466,), strategy_version=version
     )
     assert snapshot["strategy_version"] == version
 
 
-@pytest.mark.parametrize(
-    ("market", "rate", "currency"),
-    [
-        ("US", "7.268518518518518518518518519", "USD"),
-        ("HK", "0.9259259259259259259259259259", "HKD"),
-    ],
-)
-def test_v5_freezes_shared_entry_rules_and_cny_rate(
-    market: str, rate: str, currency: str
-) -> None:
-    snapshot = trend_module.live_trend_strategy_snapshot(
-        market, "sha", (622460,), strategy_version="v5"
-    )
-    assert snapshot["parameters"] | {
-        "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
-        "min_strength": "95",
-        "allowed_industry_temperatures": ["温", "热", "沸"],
-        "allowed_phases": ["谷雨", "立夏", "夏至"],
-        "min_market_cap_cny_100m": "100",
-        "min_amount_cny_100m": "2",
-        "market_value_currency": currency,
-        "cny_per_local_currency": rate,
-        "requires_right_side_days": True,
-    } == snapshot["parameters"]
-    assert "max_filter_price" not in snapshot["parameters"]
-    assert "max_right_side_days_exclusive" not in snapshot["parameters"]
-    assert snapshot["parameters"]["exit_reasons"] == [
-        "danger", "left_right_side", "temperature_to_flat", "protection"
-    ]
-    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
-    assert rows["退出条件"] == (
-        "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
-    )
-
-
-def test_v4_parameter_rows_keep_historical_exit_condition() -> None:
-    snapshot = trend_module.live_trend_strategy_snapshot(
-        "US", "sha", (622460,), strategy_version="v4"
-    )
-    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
-    assert rows["退出条件"] == "危险信号、离开趋势右侧或触发保护线时全部卖出"
-
-
-@pytest.mark.parametrize(
-    ("reason", "label"),
-    [
-        ("market_cap_below_100_cny", "市值折算人民币后低于 100 亿元"),
-        ("amount_below_2_cny", "日成交额折算人民币后低于 2 亿元"),
-    ],
-)
-def test_v5_cny_exclusion_reasons_have_operator_labels(
-    reason: str, label: str
-) -> None:
-    assert trend_module.REASON_LABELS[reason] == label
-    assert trend_module._reason_label(reason) == label
-
-
-@pytest.mark.parametrize(
-    ("symbol", "changes", "reason"),
-    [
-        ("620001", {"strength": Decimal("94.99")}, "strength_below_95"),
-        ("620002", {"industry_temperature": "凉"}, "industry_temperature_not_hot"),
-        ("620003", {"phase": "小暑"}, "phase_after_summer_solstice"),
-        ("620004", {"days": None}, "right_side_days_missing"),
-    ],
-)
-def test_us_v5_shared_non_currency_candidate_gates(
-    symbol: str, changes: dict[str, object], reason: str
-) -> None:
-    rate = Decimal("7.85") / Decimal("1.08")
-    item = replace(
-        candidate(
-            symbol,
-            exchange="US",
-            asset="美股",
-            market_cap=str(Decimal("100") / rate),
-            amount=str(Decimal("2") / rate),
-        ),
-        as_of_date="2026-07-23",
-        **changes,
-    )
-    decision = build_candidate_list(
-        [item],
-        held_symbols=set(),
-        expected_date="2026-07-23",
-        market="US",
-        strategy_version="v5",
-        cny_per_local_currency=rate,
-    )
-    assert decision.excluded[symbol] == [reason]
-
-
-@pytest.mark.parametrize(
-    ("symbol", "field", "value", "reason"),
-    [
-        ("620005", "market_cap", Decimal("100") / (Decimal("7.85") / Decimal("1.08")) - Decimal("0.01"), "market_cap_below_100_cny"),
-        ("620006", "amount", Decimal("2") / (Decimal("7.85") / Decimal("1.08")) - Decimal("0.01"), "amount_below_2_cny"),
-    ],
-)
-def test_us_v5_shared_currency_candidate_gates(
-    symbol: str, field: str, value: Decimal, reason: str
-) -> None:
-    rate = Decimal("7.85") / Decimal("1.08")
-    item = replace(
-        candidate(
-            symbol,
-            exchange="US",
-            asset="美股",
-            market_cap=str(Decimal("100") / rate),
-            amount=str(Decimal("2") / rate),
-        ),
-        as_of_date="2026-07-23",
-        **{field: value},
-    )
-    decision = build_candidate_list(
-        [item],
-        held_symbols=set(),
-        expected_date="2026-07-23",
-        market="US",
-        strategy_version="v5",
-        cny_per_local_currency=rate,
-    )
-    assert decision.excluded[symbol] == [reason]
-
-
-def test_v5_candidate_signal_keeps_local_values_and_adds_cny_audit() -> None:
-    rate = Decimal("7.85") / Decimal("1.08")
-    item = replace(
-        candidate(
-            "620007",
-            exchange="US",
-            asset="美股",
-            market_cap="100",
-            amount="2",
+@pytest.mark.parametrize("version", ["v4", "v5"])
+def test_live_us_hk_supported_versions_remain_replay_valid(version: str) -> None:
+    for market, pools in (("US", (622460,)), ("HK", (622494,))):
+        snapshot = trend_module.live_trend_strategy_snapshot(
+            market, "abc123", pools, strategy_version=version
         )
-    )
-    signal = trend_module._candidate_signal(
-        item,
-        market="US",
-        strategy_version="v5",
-        cny_per_local_currency=rate,
-    )
-    assert signal["market_value_currency"] == "USD"
-    assert signal["market_cap"] == Decimal("100")
-    assert signal["amount"] == Decimal("2")
-    assert signal["market_cap_cny_100m"] == Decimal("100") * rate
-    assert signal["amount_cny_100m"] == Decimal("2") * rate
-
-
-def test_us_v5_build_report_candidate_signal_freezes_cny_audit() -> None:
-    rate = Decimal("7.85") / Decimal("1.08")
-    built = build_report(
-        as_of_date="2026-07-14",
-        execution_date="2026-07-15",
-        account=account(),
-        candidates=(replace(candidate("620008"), exchange="US", asset="美股"),),
-        holding_snapshots={},
-        bars_by_symbol={},
-        market="US",
-        metadata={"market": "US", "broker": "tiger"},
-        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
-            "US", "sha", (622460,), strategy_version="v5"
-        ),
-    )
-
-    signal = built.signal_snapshots["candidates"][0]
-    assert signal["market_value_currency"] == "USD"
-    assert signal["cny_per_local_currency"] == rate
-    assert signal["market_cap_cny_100m"] == Decimal("100") * rate
-    assert signal["amount_cny_100m"] == Decimal("2") * rate
-
-
-@pytest.mark.parametrize("market", ["US", "HK"])
-@pytest.mark.parametrize("previous", ["温", "热", "沸"])
-def test_v5_holding_temperature_transition_exits_but_v4_replay_holds(
-    market: str, previous: str
-) -> None:
-    snapshot = holding(
-        "600001", temperature_prev=previous, temperature_curr="平"
-    )
-    assert trend_module._holding_action(
-        symbol="600001",
-        snapshot=snapshot,
-        triggered=set(),
-        market=market,
-        temperature_to_flat=True,
-    ) == ("SELL_ALL", "temperature_changed_to_flat")
-    assert trend_module._holding_action(
-        symbol="600001",
-        snapshot=snapshot,
-        triggered=set(),
-        market=market,
-        temperature_to_flat=False,
-    ) == ("HOLD", "trend_intact")
-
-
-def test_us_v5_build_report_temperature_transition_sells() -> None:
-    built = build_report(
-        as_of_date="2026-07-14",
-        execution_date="2026-07-15",
-        account=account("600001"),
-        candidates=(),
-        holding_snapshots={
-            "600001": holding(
-                "600001", temperature_prev="温", temperature_curr="平"
-            )
-        },
-        bars_by_symbol={"600001": bars()},
-        market="US",
-        metadata={"market": "US", "broker": "tiger"},
-        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
-            "US", "sha", (622460,), strategy_version="v5"
-        ),
-    )
-
-    assert (built.holdings[0].action, built.holdings[0].reason) == (
-        "SELL_ALL", "temperature_changed_to_flat"
-    )
-
-
-def test_us_v4_build_report_keeps_temperature_flat_as_hold() -> None:
-    built = build_report(
-        as_of_date="2026-07-14",
-        execution_date="2026-07-15",
-        account=account("600001"),
-        candidates=(),
-        holding_snapshots={
-            "600001": holding(
-                "600001", temperature_prev="温", temperature_curr="平"
-            )
-        },
-        bars_by_symbol={"600001": bars()},
-        market="US",
-        metadata={"market": "US", "broker": "tiger"},
-        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
-            "US", "sha", (622460,), strategy_version="v4"
-        ),
-    )
-
-    assert (built.holdings[0].action, built.holdings[0].reason) == (
-        "HOLD", "trend_intact"
-    )
-
-
-def test_load_industry_temperatures_deduplicates_and_validates_rows() -> None:
-    class Api:
-        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
-            assert kwargs["tm_ids"] == [700002, 700003]
-            return [
-                {"tmId": 700002, "asOfDate": "2026-07-23", "trendTemperatureCurr": "温"},
-                {"tmId": 700003, "asOfDate": "2026-07-23", "trendTemperatureCurr": "未知"},
-            ]
-
-    rows, temperatures = load_industry_temperatures(
-        Api(), tm_ids=(700003, 700002, 700002), expected_date="2026-07-23"
-    )
-    assert len(rows) == 2
-    assert temperatures == {700002: "温", 700003: None}
+        assert snapshot["strategy_version"] == version
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:
@@ -988,6 +770,347 @@ def test_candidates_filter_then_sort_deterministically() -> None:
     assert decisions.excluded["600003"] == ["already_held"]
     assert decisions.excluded["600005"] == ["strength_below_95"]
     assert decisions.excluded["600006"] == ["danger_signal"]
+
+
+def _industry_context(
+    industry_tm_id: int,
+    *,
+    temperature: str = "热",
+    strength: str = "90",
+    warm_to_hot_count: int = 5,
+    right_share: str = "0.50",
+    prior_temperature: str | None = "温",
+    prior_right_share: str | None = "0.40",
+    direction: str | None = "rising",
+    change_pp: str | None = "10",
+    valid: bool = True,
+    invalid_reasons: tuple[str, ...] = (),
+) -> IndustryContext:
+    return IndustryContext(
+        industry_tm_id=industry_tm_id,
+        industry=f"行业{industry_tm_id}",
+        as_of_date="2026-07-14",
+        component_count=20,
+        snapshot_count=20,
+        tradable_count=20,
+        valid_count=20,
+        right_count=10,
+        snapshot_coverage=Decimal("1"),
+        right_state_coverage=Decimal("1"),
+        right_share=Decimal(right_share),
+        warm_to_hot_count=warm_to_hot_count,
+        temperature=temperature,
+        strength=Decimal(strength),
+        valid=valid,
+        invalid_reasons=invalid_reasons,
+        prior_as_of_date="2026-07-13" if prior_temperature is not None else None,
+        prior_temperature=prior_temperature,
+        prior_right_share=(
+            None if prior_right_share is None else Decimal(prior_right_share)
+        ),
+        temperature_direction=direction,
+        right_share_change_pp=(
+            None if change_pp is None else Decimal(change_pp)
+        ),
+    )
+
+
+def test_candidate_industry_context_ordering_uses_report_wide_context_keys() -> None:
+    rows = [
+        candidate("600001", strength="99", days=1, amount="9", industry_tm_id=1),
+        candidate("600002", strength="98", days=1, amount="9", industry_tm_id=2),
+        candidate("600003", strength="97", days=1, amount="9", industry_tm_id=3),
+    ]
+    contexts = {
+        1: _industry_context(1, temperature="热", strength="90", direction="falling"),
+        2: _industry_context(2, temperature="沸", strength="95", direction="unchanged"),
+        3: _industry_context(3, temperature="热", strength="95", direction="rising"),
+    }
+
+    decisions = build_candidate_list(
+        rows, held_symbols=set(), industry_contexts=contexts
+    )
+
+    assert [item.symbol for item in decisions.eligible] == [
+        "600003",
+        "600002",
+        "600001",
+    ]
+
+
+def test_candidate_context_missing_prior_uses_current_only_for_every_candidate() -> None:
+    rows = [candidate("600001", industry_tm_id=1), candidate("600002", industry_tm_id=2)]
+    contexts = {
+        1: _industry_context(1, direction="rising", change_pp="10"),
+        2: _industry_context(
+            2,
+            prior_temperature=None,
+            prior_right_share=None,
+            direction=None,
+            change_pp=None,
+        ),
+    }
+
+    decisions = build_candidate_list(
+        rows, held_symbols=set(), industry_contexts=contexts
+    )
+
+    assert decisions.ordering_mode == "context_current_only"
+
+
+def test_invalid_current_industry_context_restores_legacy_order() -> None:
+    rows = [
+        candidate("600001", strength="99", days=5, amount="2", industry_tm_id=1),
+        candidate("600002", strength="98", days=1, amount="2", industry_tm_id=2),
+    ]
+    contexts = {
+        1: _industry_context(1, valid=False, invalid_reasons=("bad",)),
+        2: _industry_context(2),
+    }
+
+    decisions = build_candidate_list(
+        rows, held_symbols=set(), industry_contexts=contexts
+    )
+
+    assert decisions.ordering_mode == "legacy_invalid_current"
+    assert [item.symbol for item in decisions.eligible] == ["600001", "600002"]
+
+
+def test_missing_industry_id_triggers_report_wide_legacy_fallback() -> None:
+    item = replace(
+        candidate("600001", industry_tm_id=None),
+        asset="US stock",
+        exchange="US",
+        temperature_prev=None,
+        temperature_curr=None,
+        phase=None,
+        market_cap=None,
+    )
+    decision = build_candidate_list([item], held_symbols=set(), market="US")
+
+    assert decision.eligible == (item,)
+    assert decision.ordering_mode == "legacy_invalid_current"
+    assert decision.industry_context_status["affected_industry_ids"] == ["unknown"]
+
+
+def test_candidate_industry_context_hard_gate_still_excludes_candidate() -> None:
+    item = candidate("600001", danger=True, industry_tm_id=1)
+    decisions = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        industry_contexts={1: _industry_context(1, strength="100")},
+    )
+
+    assert decisions.eligible == ()
+    assert decisions.excluded["600001"] == ["danger_signal"]
+
+
+def test_report_payload_freezes_industry_context_and_ordering_facts() -> None:
+    contexts = (_industry_context(621707, right_share="0.278688524590"),)
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(candidate("600001", industry_tm_id=621707),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        industry_contexts=contexts,
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=Decimal("0.610"),
+        estimated_api_cost_complete=False,
+    )
+
+    payload = trend_module._report_payload(built)
+    assert payload["industry_context_status"]["ordering_mode"] == "context_with_history"
+    assert payload["industry_contexts"][0]["industry_tm_id"] == 621707
+    assert payload["industry_contexts"][0]["right_share"] == "0.278688524590"
+    assert payload["api_cost"] == {
+        "actual": "0.610",
+        "estimated": "0.479",
+        "estimate_complete": False,
+        "unit": "Trend Animals 余额单位",
+        "label": "本报告 API 费用：实扣 0.610 Trend Animals 余额单位",
+    }
+    ordering = payload["strategy_judgments"]["top10_candidates"][0]["ordering_context"]
+    assert ordering["applied"] is True
+    assert ordering["industry_tm_id"] == 621707
+    assert ordering["ordering_mode"] == "context_with_history"
+
+
+@pytest.mark.parametrize(
+    ("actual", "estimated", "estimate_complete", "expected"),
+    [
+        (
+            Decimal("0.610"),
+            Decimal("0.479"),
+            False,
+            "本报告 API 费用：实扣 0.610 Trend Animals 余额单位",
+        ),
+        (
+            None,
+            Decimal("0.479"),
+            True,
+            "本报告 API 费用：估算 0.479 Trend Animals 余额单位（实扣不可得）",
+        ),
+        (
+            None,
+            Decimal("0.479"),
+            False,
+            "本报告 API 费用：未知（快照估算 0.479 Trend Animals 余额单位；成分费用未计）",
+        ),
+        (
+            Decimal("0.000"),
+            None,
+            False,
+            "本报告 API 费用：实扣 0 Trend Animals 余额单位",
+        ),
+        (
+            Decimal("1.2000"),
+            None,
+            False,
+            "本报告 API 费用：实扣 1.2 Trend Animals 余额单位",
+        ),
+    ],
+)
+def test_trend_api_cost_label_has_one_canonical_branch(
+    actual: Decimal | None,
+    estimated: Decimal | None,
+    estimate_complete: bool,
+    expected: str,
+) -> None:
+    assert trend_module.trend_api_cost_label(
+        actual=actual,
+        estimated=estimated,
+        estimate_complete=estimate_complete,
+    ) == expected
+
+
+@pytest.mark.parametrize("raw_balance", ["-0.001", "NaN", "Infinity"])
+def test_balance_rejects_negative_or_nonfinite_values(raw_balance: str) -> None:
+    with pytest.raises(TrendAnimalsError, match="valid balance"):
+        trend_module._balance({"balance": raw_balance})
+
+
+def test_report_cost_label_is_shared_by_markdown_feishu_and_json() -> None:
+    built = replace(
+        report(),
+        estimated_api_cost=Decimal("0.479"),
+        actual_api_cost=None,
+        estimated_api_cost_complete=False,
+    )
+    expected = (
+        "本报告 API 费用：未知（快照估算 0.479 Trend Animals 余额单位；成分费用未计）"
+    )
+
+    markdown = render_markdown(built)
+    payload = trend_module._report_payload(built)
+    _, feishu = render_trend_feishu_text(
+        payload,
+        broker_label="东方财富",
+        market_label="A股",
+    )
+
+    assert markdown.count(expected) == 1
+    assert feishu.count(expected) == 1
+    assert payload["api_cost"]["label"] == expected
+    assert payload["api_cost"] == {
+        "actual": None,
+        "estimated": "0.479",
+        "estimate_complete": False,
+        "unit": "Trend Animals 余额单位",
+        "label": expected,
+    }
+
+
+def test_legacy_feishu_cost_uses_api_cost_completeness() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": serialized_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "actual_api_cost": None,
+        "estimated_api_cost": "0.479",
+        "api_cost": {
+            "actual": None,
+            "estimated": "0.479",
+            "estimate_complete": False,
+            "unit": "Trend Animals 余额单位",
+        },
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload,
+        broker_label="东方财富",
+        market_label="A股",
+    )
+
+    assert (
+        "本报告 API 费用：未知（快照估算 0.479 Trend Animals 余额单位；成分费用未计）"
+        in message
+    )
+
+
+def test_build_report_rejects_external_context_status_when_contexts_are_missing() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(candidate("600001", industry_tm_id=621707),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        industry_context_status={
+            "ordering_mode": "context_with_history",
+            "current_complete": True,
+            "history_complete": True,
+            "fallback_reason": None,
+        },
+    )
+
+    assert built.industry_context_status["ordering_mode"] == "legacy_invalid_current"
+    payload = trend_module._report_payload(built)
+    assert payload["industry_context_status"]["ordering_mode"] == (
+        "legacy_invalid_current"
+    )
+    assert payload["strategy_judgments"]["top10_candidates"][0][
+        "ordering_context"
+    ] == {
+        "applied": False,
+        "industry_tm_id": 621707,
+        "ordering_mode": "legacy_invalid_current",
+        "fallback_reason": "industry_context_missing",
+    }
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        _industry_context(2, valid=False, invalid_reasons=("bad",)),
+        _industry_context(
+            2,
+            prior_temperature=None,
+            prior_right_share=None,
+            direction=None,
+            change_pp=None,
+        ),
+    ],
+)
+def test_non_candidate_contexts_do_not_change_ordering_mode(
+    extra: IndustryContext,
+) -> None:
+    decision = build_candidate_list(
+        [candidate("600001", industry_tm_id=1)],
+        held_symbols=set(),
+        industry_contexts={
+            1: _industry_context(1),
+            extra.industry_tm_id: extra,
+        },
+    )
+
+    assert decision.ordering_mode == "context_with_history"
 
 
 @pytest.mark.parametrize("name", ["ST示例", "*ST示例", "示例ST", "退市示例"])
@@ -1656,7 +1779,7 @@ def test_cn_v7_report_keeps_v4_samples_without_admitting_v5_or_v6() -> None:
         bars_by_symbol={},
         market="CN",
         strategy_snapshot=trend_module.live_trend_strategy_snapshot(
-            "CN", "abc123", (622466, 697199)
+            "CN", "abc123", (622466, 697199), strategy_version="v7"
         ),
         kelly_rounds=rounds,
     )
@@ -1968,7 +2091,7 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
 
 def test_v7_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
     strategy_snapshot = trend_module.live_trend_strategy_snapshot(
-        "CN", "drawdown123", (622466, 697199)
+        "CN", "drawdown123", (622466, 697199), strategy_version="v7"
     )
     drawdown_summary = {
         "schema_version": "open_trader.strategy_drawdown.v1",
@@ -4277,10 +4400,6 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "close",
         "atr",
         "market_cap",
-        "market_value_currency",
-        "cny_per_local_currency",
-        "market_cap_cny_100m",
-        "amount_cny_100m",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",
@@ -4350,10 +4469,6 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "close",
         "atr",
         "market_cap",
-        "market_value_currency",
-        "cny_per_local_currency",
-        "market_cap_cny_100m",
-        "amount_cny_100m",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",
@@ -4495,6 +4610,7 @@ class ReadyApi:
         missing_industry_ids: set[int] | None = None,
         industry_error: Exception | None = None,
         industry_ids: dict[int, int] | None = None,
+        industry_state_temperature: str = "热",
         ignored_stale_components: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.calls = calls
@@ -4507,6 +4623,7 @@ class ReadyApi:
         self.missing_industry_ids = missing_industry_ids or set()
         self.industry_error = industry_error
         self.industry_ids = industry_ids or {}
+        self.industry_state_temperature = industry_state_temperature
         self.ignored_stale_components = ignored_stale_components
         self.snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
         self.balance_calls = 0
@@ -4523,6 +4640,11 @@ class ReadyApi:
 
     def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
         self.calls.append(f"api.components.{tm_id}")
+        if tm_id == 700001:
+            return [
+                {"tmId": member_id, "tickerSymbol": f"60000{member_id}.SH", "asOfDate": expected_date}
+                for member_id in range(1, 11)
+            ]
         component_id = 1 if tm_id == 622466 else 2
         return [{"tmId": component_id, "tickerSymbol": f"60000{component_id}.SH", "asOfDate": expected_date}]
 
@@ -4560,6 +4682,28 @@ class ReadyApi:
                 }
                 for tm_id in tm_ids
                 if tm_id not in self.missing_industry_ids
+            ]
+        if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "tradableFlag": True,
+                    "isTrendRightSide": True,
+                }
+                for tm_id in tm_ids
+            ]
+        if fields == trend_module.INDUSTRY_STATE_FIELDS:
+            if self.industry_error:
+                raise self.industry_error
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": self.industry_state_temperature,
+                    "trendStrengthLocalCurr": "92",
+                }
+                for tm_id in tm_ids
             ]
         rows = []
         for tm_id in self.snapshot_ids if self.snapshot_ids is not None else tm_ids:
@@ -4607,11 +4751,13 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert api.snapshot_requests == [
         ([1, 2], A_SHARE_SNAPSHOT_FIELDS),
         ([700001], A_SHARE_INDUSTRY_FIELDS),
+        (list(range(1, 11)), trend_module.INDUSTRY_MEMBER_FIELDS),
+        ([700001], trend_module.INDUSTRY_STATE_FIELDS),
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v7"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v8"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -4623,11 +4769,121 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         "cache=client-managed"
     ) in payload["api_facts"]
     assert payload["estimated_api_cost"] == "0.142"
+    assert payload["api_cost"]["estimate_complete"] is False
     evidence_path = trend_config(tmp_path).data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["query"]["component_pool_ids"] == [622466, 697199]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
+
+
+def test_cn_entry_gate_keeps_early_temperature_when_industry_state_changes(
+    tmp_path: Path,
+) -> None:
+    api = ReadyApi([], industry_state_temperature="平")
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: api,
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert [
+        item["symbol"] for item in payload["strategy_judgments"]["top10_candidates"]
+    ] == [
+        "000001",
+        "000002",
+    ]
+    assert payload["industry_contexts"][0]["temperature"] == "平"
+
+
+def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_members(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Api:
+        def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
+            calls.append(("components", tm_id))
+            assert tm_id == 700001
+            return [
+                {"tmId": member_id, "asOfDate": expected_date}
+                for member_id in range(1, 13)
+            ] + [{"tmId": 1, "asOfDate": expected_date}]
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            calls.append(("snapshots", (tm_ids, fields)))
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": member_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for member_id in tm_ids
+                ]
+            assert fields == trend_module.INDUSTRY_STATE_FIELDS
+            return [
+                {
+                    "tmId": 700001,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                }
+            ]
+
+    candidate_rows = [
+        {
+            "tmId": member_id,
+            "industryTmId": 700001,
+            "industryName": "电力",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+        }
+        for member_id in range(1, 13)
+    ]
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(
+            candidate("000001"),
+            candidate("000002", danger=True),
+        ),
+        candidate_rows=candidate_rows,
+        held_symbols=set(),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert [context.industry_tm_id for context in contexts] == [700001]
+    assert contexts[0].component_count == 12
+    assert contexts[0].warm_to_hot_count == 12
+    assert status["ordering_mode"] == "context_current_only"
+    assert facts["member_ids"] == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    assert facts["member_fields"] == trend_module.INDUSTRY_MEMBER_FIELDS
+    assert facts["state_fields"] == trend_module.INDUSTRY_STATE_FIELDS
+    assert calls == [
+        ("components", 700001),
+        (
+            "snapshots",
+            (
+                list(range(1, 13)),
+                trend_module.INDUSTRY_MEMBER_FIELDS,
+            ),
+        ),
+        (
+            "snapshots",
+            (
+                [700001],
+                trend_module.INDUSTRY_STATE_FIELDS,
+            ),
+        ),
+    ]
 
 
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
@@ -4765,13 +5021,13 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["account"]["positions"] == []
     assert payload["metadata"]["simulate_acc_id"] == 101
-    assert payload["strategy_snapshot"]["strategy_version"] == "v7"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v8"
     assert payload["drawdown_summary"]["state_status"] == "missing"
     assert payload["drawdown_summary"]["entry_allowed"] is False
     assert payload["strategy_judgments"]["formal_actions"] == []
 
 
-def test_generated_report_keeps_v7_identity_kelly_scope_and_drawdown_continuity(
+def test_generated_report_keeps_v8_identity_kelly_scope_and_drawdown_continuity(
     tmp_path: Path,
 ) -> None:
     config = trend_config(tmp_path)
@@ -4789,16 +5045,19 @@ def test_generated_report_keeps_v7_identity_kelly_scope_and_drawdown_continuity(
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     snapshot = payload["strategy_snapshot"]
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v7"
-    assert snapshot["strategy_version"] == "v7"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v8"
+    assert snapshot["strategy_version"] == "v8"
     assert snapshot["parameters"]["kelly_sample_scope"] == (
         "market+strategy_id+opening_strategy_version"
     )
-    assert snapshot["parameters"]["kelly_sample_inherits"] == [{
-        "market": "CN",
-        "strategy_id": "trend_animals_warm_to_hot/CN/v4",
-        "opening_strategy_version": "v4",
-    }]
+    assert snapshot["parameters"]["kelly_sample_inherits"] == [
+        {
+            "market": "CN",
+            "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
+            "opening_strategy_version": version,
+        }
+        for version in ("v4", "v7", "v8")
+    ]
     after = json.loads(state_path.read_text(encoding="utf-8"))
     assert after["audit_events"] == before["audit_events"]
 
@@ -4828,6 +5087,9 @@ def test_report_runner_sends_exact_broker_v7_text(tmp_path: Path) -> None:
         "futu.calendar", "api.update_status", "api.balance_before",
         "api.components.622466", "api.components.697199",
     ]
+    assert calls.index("api.balance_after") > max(
+        index for index, call in enumerate(calls) if call == "api.snapshots"
+    )
     assert calls.index("api.billing") < calls.index("api.snapshots")
     assert api_kwargs["cache_dir"] == config.data_dir / "trend_animals/cache"
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
@@ -4836,7 +5098,8 @@ def test_report_runner_sends_exact_broker_v7_text(tmp_path: Path) -> None:
             "【日报｜东方财富｜A股趋势报告｜2026-07-15】",
             "数据截至：2026-07-14\n"
             "账户状态：已更新\n"
-            "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n\n"
+            "今日动作：卖出 0｜买入 2｜持有 0｜复核 0\n"
+            "本报告 API 费用：实扣 1 Trend Animals 余额单位\n\n"
             "买入\n"
             "1. 000001 股票000001｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n"
             "2. 000002 股票000002｜09:30–10:00｜约 400 股｜金额上限 4000｜保护线 9.2\n\n"
@@ -5900,7 +6163,7 @@ def test_report_runner_keeps_files_when_feishu_delivery_fails_without_refetch(tm
     assert result.status == "generated"
     assert result.report_path.exists() and result.json_path.exists()
     assert payload["delivery_status"] == "delivery_failed"
-    assert calls.count("api.snapshots") == 2
+    assert calls.count("api.snapshots") == 4
 
 
 def test_report_runner_sends_v1_text_only_to_feishu_and_short_status_to_macos(tmp_path: Path) -> None:

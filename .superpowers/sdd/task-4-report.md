@@ -1,178 +1,147 @@
-# Task 4 implementation report
+# Task 4 Report: version continuity without resetting samples
 
-Status: BLOCKED (the final gate is FAIL until the operator chooses an audited
-drawdown migration or a strategy-version bump)
+## Status
 
-Branch: `feat/unify-trend-discipline`
-Reviewed source baseline: `94e965d`
-Changelog commit: `d78c66b` (`docs: record unified trend discipline`)
+Implemented and committed as `382dafe feat: version contextual trend selection`.
+Dashboard compatibility follow-up was committed as
+`b379658 fix: keep dashboard trend versions compatible`.
+Projection compatibility follow-up was committed as
+`60da93c fix: preserve inherited trend review identities`.
 
-## Step 1 — worktree data
+## TDD evidence
 
-Ran:
+### RED
 
-```text
-test ! -e data/trend_review
-ln -s /Users/ray/projects/open_trader/data/trend_review data/trend_review
-test -r data/trend_review/daily/CN/2026-07-16.json
-test -r data/trend_review/daily/HK/2026-07-16.json
-test -r data/trend_review/daily/US/2026-07-16.json
-git status --short
-```
+Added default-version, identity-map, Kelly sample, snapshot, and API-stats tests first.
 
-The three files were readable and `git status --short` remained empty. The
-symlink is ignored and no historical data was committed.
-
-## Step 2 — automated verification
-
-Focused command:
+Command:
 
 ```text
-PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_market_trend.py tests/test_trend_review.py tests/test_trend_api_stats.py tests/test_dashboard.py -q
-851 passed in 3.28s
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'strategy_snapshot' tests/test_market_trend.py -k 'strategy_snapshot or live_strategy' tests/test_trend_kelly.py tests/test_trend_api_stats.py -k 'identity or version or inherits' -v
 ```
 
-Full suite:
+Exact result before implementation:
+
+```text
+8 failed, 39 passed, 396 deselected in 0.73s
+```
+
+The failures were the new CN v8 / US v5 / HK v5 defaults, the four explicit
+identity maps, CN v8 sample selection, and CN v8 API-stat attribution.
+
+### GREEN
+
+Focused version/identity command:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py -k 'strategy_snapshot or generated_report or report_runner_uses_cn_simulation_account' tests/test_market_trend.py -k 'strategy_snapshot or live_strategy' tests/test_trend_kelly.py -k 'identity or inherits' tests/test_trend_api_stats.py -k 'identity or inherits' -q
+36 passed, 407 deselected in 0.69s
+```
+
+Affected strategy/report/replay suites:
+
+```text
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_market_trend.py tests/test_trend_kelly.py tests/test_trend_api_stats.py tests/test_trend_review.py -q
+663 passed in 3.10s
+```
+
+Full repository suite:
 
 ```text
 make test
-3409 passed in 93.56s (0:01:33)
+3433 passed in 78.73s (0:01:18)
 ```
 
-`git diff --check` exited 0. No source or test files were changed in this
-task; only the requested changelog entry was added.
-
-## Step 3 — real report workflow
-
-Status checks (2026-07-24 Asia/Shanghai):
+Additional checks:
 
 ```text
-trend-market status --market US: exit 0; effective_mode=execute, phase=closed,
-  last_success=2026-07-23/close_captured, pid=97302,
-  working_directory=/Users/ray/projects/open_trader/.worktrees/dashboard-main-merge,
-  git_sha=e1ec1cf9fdcd1bc0b16fe0c7026d1c03060c95aa
-trend-market status --market HK: exit 0; effective_mode=execute, phase=uncertain,
-  blocker=uncertain, last_success=2026-07-24/uncertain, pid=97186,
-  working_directory=/Users/ray/projects/open_trader/.worktrees/dashboard-main-merge,
-  git_sha=e1ec1cf9fdcd1bc0b16fe0c7026d1c03060c95aa
+PYTHONPATH=src .venv/bin/python -m compileall -q src/open_trader/a_share_trend.py src/open_trader/trend_kelly.py src/open_trader/trend_review.py
+git diff --check
 ```
 
-The US execution batch for 2026-07-24 did not exist, so the requested revision
-command was run. It created the immutable request
-`data/trend_controller/US/revision_requests/2026-07-23.json` with
-`execution_date=2026-07-24`; its controller lock conflict left the command
-waiting during executor shutdown, and it was interrupted after the request was
-durably written. The already-running old US controller then generated
-`reports/trend_us_tiger/2026-07-23-r1.json` at `2026-07-24T10:56:19+08:00`.
+Both completed with exit status 0 and no output.
 
-That artifact is explicitly not valid v5 evidence: it records
-`strategy_id=trend_animals_warm_to_hot/US/v4`,
-`strategy_version=v4`, `process_version=e1ec1cf9...`, no industry snapshot
-evidence, and `kelly_phase=cold_start` with `1` selected/eligible sample. Its
-formal actions include HST/PCG `SELL_ALL` and MEDP/DGX `BUY`; the six current
-91.0–94.9 candidates are therefore not a v5 strength-filter check. The old
-artifact was preserved; no historical report was deleted or rewritten.
+## Changes
 
-HK v5 was not forced because the effective date is 2026-07-27. Automated
-boundary tests passed in the focused and full suites.
+- Live defaults are CN v8 and US/HK v5; CN v4/v6/v7 and US/HK v4 remain valid replay versions.
+- Kelly matching uses explicit non-recursive maps: CN v7 ← CN v4/v7, CN v8 ← CN v4/v7/v8, US v5 ← US v4/v5, HK v5 ← HK v4/v5. Cross-market, wrong strategy IDs, CN v5/v6, and older unapproved identities do not match.
+- v8/v5 snapshots list approved sample identities, contextual ordering keys/fallback, industry member/state fields, and fee semantics. Existing v4/v6/v7 frozen rows remain unchanged.
+- Risk, Kelly, snapshot normalization, and report-evidence replay allowlists treat v8/v5 like the existing v4/v6/v7 machinery.
+- `纪律.md` is v2 and records the contextual ordering, whole-report fallback/omission rules, exact fee labels/unit, and approved sample continuity.
+- Dashboard risk/drawdown validation recognizes v8/v5 as strict v4-contract versions, including Kelly and drawdown constraints. Integrated Dashboard acceptance accepts the current CN v8 and US/HK v5 defaults while retaining the approved historical replay versions (CN v4/v6/v7 and US/HK v4).
 
-## Step 4 — projections
+Runner collection and cost-calculation code were not changed. `trend_api_stats` already emits a stat row for every contributing opening identity, so no schema/display change was needed.
 
-Ran the existing `build_trend_review_projection()` workflow for CN, US, and HK.
-The available facts are still pre-effective/old-controller facts, so the
-regenerated files currently report:
+## Dashboard compatibility follow-up
+
+The parent review found two remaining Dashboard backend version allowlists. Tests
+were added before the implementation:
 
 ```text
-CN: trend_animals_warm_to_hot/CN/v3, samples actual=6 discipline=0 required=30,
-    interval 2026-07-16..2026-07-17
-US: trend_animals_warm_to_hot/US/v4, samples actual=0 discipline=0 required=30,
-    no common cutoff
-HK: trend_animals_warm_to_hot/HK/v3, samples actual=0 discipline=0 required=30,
-    no common cutoff
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard.py -k 'current_live_risk' -q
+2 failed, 229 deselected in 0.46s
+
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard_acceptance.py -k 'integrated_templates_and_three_market_reports' -q
+1 failed, 296 deselected in 0.65s
 ```
 
-The current source’s canonical snapshot boundary is CN v7 (effective 2026-07-24),
-US v5 (effective 2026-07-24), and HK v5 (effective 2026-07-27); no matching
-current CN/US report exists yet, and HK is not effective today.
+The implementation then added v5/v8 to the Dashboard's strict risk/drawdown
+contract and Kelly/drawdown constraint sets, and made integrated acceptance use
+the report's version only when it is in the explicit per-market compatibility
+allowlist. This keeps historical replay validation while accepting current live
+defaults.
 
-## Step 5 — changelog
-
-Added the exact dated 2026-07-24 operator entry and committed it before the
-acceptance gate:
+Focused Dashboard suites:
 
 ```text
-d78c66b docs: record unified trend discipline
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_dashboard.py tests/test_dashboard_acceptance.py -q
+528 passed in 1.27s
 ```
 
-## Step 6 — pre-gate live process inspection
-
-Immediately before acceptance:
+Full repository suite after the Dashboard and projection follow-ups:
 
 ```text
-git status --short                 # empty
-git rev-parse HEAD                 # d78c66bad061387de3f23636a5f1f08eeb93bf06
-launchctl list | rg 'com\\.open-trader\\.trend-market-controller\\.(cn|hk|us)'
-97066  0  com.open-trader.trend-market-controller.cn
-97186  0  com.open-trader.trend-market-controller.hk
-97302  0  com.open-trader.trend-market-controller.us
-pgrep ...
-97066 ... dashboard-main-merge ... --market CN
-97186 ... dashboard-main-merge ... --market HK
-97302 ... dashboard-main-merge ... --market US
-screen -ls | rg open_trader_dashboard_8766
-97453.open_trader_dashboard_8766 (Detached)
+make test
+3442 passed in 77.00s (0:01:17)
 ```
 
-All three launchd controllers and Dashboard were old `dashboard-main-merge`
-processes; they were left running until the post-acceptance deployment step as
-required by the brief. Their exact current process SHA was recorded by the
-status command above as `e1ec1cf9...`.
+Compile and whitespace checks also completed successfully.
 
-## Step 7 — final acceptance gate
+## Projection compatibility follow-up
 
-Ran exactly once after the changelog commit:
+The final review found that trend-review projection filtering still admitted
+only v1/v3 facts and compared all frozen snapshots as one exact identity. Tests
+were added first:
 
 ```text
-make acceptance
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_trend_review.py -k 'projection_accepts_current_live_strategy_versions or projection_accepts_approved_mixed_sample_identities' -q
+6 failed, 220 deselected in 0.28s
 ```
 
-Result: `FAIL`.
+Projection normalization now considers all v1-v8 snapshots, while the existing
+market/version snapshot validator and explicit Kelly identity map remain the
+authority for legal identities. The projection selects the latest effective
+live-version target and admits only that target's approved inherited identities
+(CN v8: v4/v7/v8; US/HK v5: v4/v5). Exact identity consistency is still enforced
+within each market/version identity; unapproved or malformed facts are excluded.
+
+Regression and affected-suite verification:
 
 ```text
-3409 passed in 94.92s (0:01:34)
-drawdown preflight:
-  CN ready (v7, state_status=ok)
-  HK failed parameter_mismatch: strategy parameters changed without a version bump
-  US failed parameter_mismatch: strategy parameters changed without a version bump
-FAIL
-make: *** [acceptance] Error 1
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_trend_review.py -k 'projection_accepts_current_live_strategy_versions or projection_accepts_approved_mixed_sample_identities' -q
+6 passed, 220 deselected in 0.28s
+
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_a_share_trend.py tests/test_market_trend.py tests/test_trend_kelly.py tests/test_trend_api_stats.py tests/test_trend_review.py -q
+669 passed in 3.47s
 ```
 
-No Dashboard/browser acceptance stage ran because the preflight failed first.
+Compile and whitespace checks also completed successfully.
 
-The failure is an external immutable-audit mismatch, not a test failure. The
-current source hashes the effective v5 parameters as US
-`351da97ebaea03fbc5b854f4f4a7c0f4d610b5da675f4e6ff0db7f21f653d823` and HK
-`a6da3b625a1ad69dce589d600cfdad81776f0223aa16db36faa63c234e23255e`; existing
-v5 bootstrap events in `data/trend_drawdown/state.json` were created by
-`ad89f99e...` with hashes US `860170403d6241cd3590c02449de7a1bd11842124055587f7c4eec64b927d253`
-and HK `3b01863b51009be4047031b31df7c577a05067d67801ad67bb0bebaaa1c11918`.
-There are no v5 US/HK report artifacts matching either current hash, and the
-old v5 records have no approved compatibility event. The preflight correctly
-refuses ordinary parameter drift under an unchanged v5 identity.
+## Concerns
 
-## Blocker and required operator choice
-
-No state file was edited and no source version was bumped. Continuing requires
-one explicit, audited choice:
-
-1. Approve a one-time parameter-compatibility/reset migration that preserves
-   US/HK v5 and records the exact old/new hashes and accepted SHA; or
-2. Bump US/HK to a new strategy identity/version, update the required reports
-   and projections, and rerun the full gate; or
-3. Leave the gate `FAIL` and do not deploy/merge.
-
-Because either (1) or (2) changes durable strategy identity/audit state, this
-task stops here pending that choice. Post-acceptance exact-SHA deployment and
-PID/cwd/SHA/log/heartbeat/HTTP checks were not run because the gate did not
-return `PASS`.
+The task brief did not list `src/open_trader/trend_review.py`, but its snapshot
+normalization and replay allowlists must accept v8/v5 or the new frozen reports
+cannot be validated/rebuilt. No live background process or Dashboard acceptance
+gate was run; the parent task owns that final gate. The acceptance allowlist
+retains approved historical versions deliberately; it rejects versions outside
+the market-specific set.

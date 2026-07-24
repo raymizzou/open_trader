@@ -1847,10 +1847,13 @@ table {
 }
 
 .cn-trend-report,
-.cn-trend-actions,
 .cn-trend-disciplines {
   display: grid;
   gap: 16px;
+}
+
+.cn-trend-actions {
+  display: contents;
 }
 
 .cn-trend-report > .trend-report-header {
@@ -1866,6 +1869,186 @@ table {
   border-radius: 8px;
   padding: 12px;
   text-align: center;
+}
+
+.trend-report-facts {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.trend-report-facts span {
+  background: var(--surface-soft);
+  border-radius: 7px;
+  min-height: 44px;
+  padding: 10px;
+}
+
+.trend-report-cost {
+  font-weight: 700;
+}
+
+.trend-discipline-workspace,
+.trend-industry-context {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.trend-discipline-workspace > header,
+.trend-industry-context > header {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.trend-discipline-workspace h2,
+.trend-industry-context h2 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.trend-discipline-workspace > header p,
+.trend-industry-context > header span,
+.trend-industry-context-fallback {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-discipline-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.trend-discipline-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.trend-discipline-card > summary {
+  align-items: flex-start;
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 10px 12px;
+}
+
+.trend-discipline-card > summary:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.trend-discipline-card > summary small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.trend-discipline-card-compact {
+  flex-basis: 100%;
+  font-size: 12px;
+  font-weight: 400;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-discipline-card-body {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px 12px;
+}
+
+.trend-discipline-card-count {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-discipline-card-body dl,
+.trend-industry-context-card dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  min-width: 0;
+}
+
+.trend-discipline-card-body dl > div,
+.trend-industry-context-card dl > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.trend-discipline-card-body dt,
+.trend-industry-context-card dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-discipline-card-body dd,
+.trend-industry-context-card dd {
+  font-weight: 700;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-industry-action-row {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-width: 0;
+}
+
+.trend-industry-context-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.trend-industry-context-card header {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.trend-industry-context-card header span,
+.trend-industry-context-card p {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-industry-context-card.invalid {
+  border-left: 3px solid var(--warning);
+}
+
+.trend-industry-context-invalid {
+  color: var(--warning) !important;
 }
 
 .trend-controller-status {
@@ -4356,7 +4539,10 @@ tbody tr.active-row,
 .trend-audit-summary span,
 .trend-audit-reason-counts span,
 .option-attention-market th,
-.trend-review-comparison {
+.trend-review-comparison,
+.trend-report-facts span,
+.trend-discipline-card,
+.trend-industry-context-card {
   --muted: var(--text);
 }
 
@@ -4564,6 +4750,42 @@ table {
   .cn-trend-counts {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .trend-report-facts {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-report-facts span {
+    overflow-wrap: anywhere;
+  }
+
+  .trend-discipline-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .trend-industry-action-row {
+    display: contents;
+  }
+
+  .cn-trend-report > .trend-report-header { order: 1; }
+  .cn-trend-report > .trend-controller-status { order: 2; }
+  .cn-trend-report > .trend-execution-batch-error,
+  .cn-trend-report > .trend-revision-anomaly { order: 3; }
+  .cn-trend-report > .trend-discipline-workspace { order: 4; }
+  .trend-industry-action-row > .trend-industry-context { order: 5; }
+  .trend-industry-action-row > .cn-trend-sell,
+  .trend-industry-action-row > .trend-stage.cn-trend-sell { order: 2; }
+  .cn-trend-actions > .cn-trend-review,
+  .cn-trend-actions > .trend-stage.cn-trend-review { order: 3; }
+  .cn-trend-actions > .cn-trend-buy,
+  .cn-trend-actions > .trend-stage.cn-trend-buy { order: 6; }
+  .cn-trend-actions > .cn-trend-hold,
+  .cn-trend-actions > .trend-stage.cn-trend-hold { order: 7; }
+  .cn-trend-report > .trend-risk-summary { order: 8; }
+  .cn-trend-report > .trend-audit,
+  .cn-trend-report > .cn-trend-audit { order: 9; }
 
   .trend-risk-summary {
     padding: 12px;
