@@ -4828,6 +4828,80 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_compact_report_layout_contract_for_all_markets() -> None:
+    output = run_dashboard_js(r'''
+const base = (market) => ({
+  available:true,
+  market,
+  broker:market === "CN" ? "eastmoney" : market === "US" ? "tiger" : "phillips",
+  broker_label:market === "CN" ? "东方财富" : market === "US" ? "老虎" : "辉立",
+  market_label:market === "CN" ? "A股" : market === "US" ? "美股" : "港股",
+  report_date:"2026-07-24", data_date:"2026-07-23",
+  generated_at:"2026-07-24T09:00:00+08:00", account_status:"已更新",
+  buy_window:market === "CN" ? "09:30–10:00" : "常规交易时段",
+  counts:{sell:0,buy:0,hold:0,review:0},
+  sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+});
+const report = (market) => base(market);
+const reportOrder = (html) => [
+  '<header class="trend-report-header">',
+  "优先处理 · 卖出触发", "正式买入计划", "盘中持续 · 已有持仓",
+  "行业上下文", "<summary>纪律", "<summary>组合计划风险",
+  "<summary>策略控制器", "<summary>审计详情",
+].map((needle) => html.indexOf(needle));
+for (const market of ["CN", "US", "HK"]) {
+  const html = renderTrendReportWorkspace(report(market));
+  const order = reportOrder(html);
+  if (order.some((index) => index < 0)
+      || !order.every((index, i) => i === 0 || order[i - 1] < index)) {
+    throw new Error(market + ": report order\n" + html);
+  }
+  for (const text of ["卖出 0", "买入 0", "持有 0", "复核 0",
+    "纪律", "组合计划风险", "策略控制器", "审计详情"]) {
+    if (!html.includes(text)) throw new Error(market + ": missing " + text);
+  }
+  if (html.includes("策略参数快照") || html.includes("冻结策略纪律")
+      || html.includes('class="trend-discipline-card"')) {
+    throw new Error(market + ": retired discipline markup");
+  }
+  for (const selector of ["trend-risk-summary", "trend-controller-status", "trend-audit"]) {
+    if (html.includes('class="' + selector + '" open')) {
+      throw new Error(market + ": " + selector + " open by default");
+    }
+  }
+}
+const withReview = renderTrendReportWorkspace({
+  ...base("US"),
+  counts:{sell:0,buy:0,hold:0,review:1},
+  review_actions:[{symbol:"BOTZ",name:"Global X Robotics ETF",reason:"holding_signal_unknown"}],
+});
+if (!withReview.includes("需要确认 · 人工复核")) throw new Error("review rows missing");
+const withoutReview = renderTrendReportWorkspace({
+  ...base("US"),
+  review_actions:[],
+});
+if (withoutReview.includes("需要确认 · 人工复核")) throw new Error("empty review stage");
+const multi = renderTrendReportWorkspace({
+  ...base("CN"),
+  buy_actions:[
+    {symbol:"600036",name:"招商银行",close:"42.18",target_weight:"0.04",
+      target_amount:"37962",estimated_shares:900,estimated_initial_line:"39.46"},
+    {symbol:"600000",name:"浦发银行",close:"12.56",target_weight:"0.04",
+      target_amount:"37680",estimated_shares:3000,estimated_initial_line:"11.74"},
+  ],
+  industry_contexts:[{industry:"银行",temperature:"温"},{industry:"医药生物",temperature:"热"}],
+});
+if ((multi.match(/class="cn-trend-card"/g) || []).length < 2) {
+  throw new Error("buy rows did not append");
+}
+if ((multi.match(/class="trend-industry-context-row"/g) || []).length !== 2) {
+  throw new Error("industry rows did not append");
+}
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_dashboard_renders_frozen_risk_summary_and_candidate_detail_rows() -> None:
     output = run_dashboard_js(r'''
 const html = renderTrendReportWorkspace({
