@@ -876,6 +876,65 @@ def test_report_payload_freezes_industry_context_and_ordering_facts() -> None:
     assert ordering["ordering_mode"] == "context_with_history"
 
 
+def test_build_report_rejects_external_context_status_when_contexts_are_missing() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(candidate("600001", industry_tm_id=621707),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        industry_context_status={
+            "ordering_mode": "context_with_history",
+            "current_complete": True,
+            "history_complete": True,
+            "fallback_reason": None,
+        },
+    )
+
+    assert built.industry_context_status["ordering_mode"] == "legacy_invalid_current"
+    payload = trend_module._report_payload(built)
+    assert payload["industry_context_status"]["ordering_mode"] == (
+        "legacy_invalid_current"
+    )
+    assert payload["strategy_judgments"]["top10_candidates"][0][
+        "ordering_context"
+    ] == {
+        "applied": False,
+        "industry_tm_id": 621707,
+        "ordering_mode": "legacy_invalid_current",
+        "fallback_reason": "industry_context_missing",
+    }
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        _industry_context(2, valid=False, invalid_reasons=("bad",)),
+        _industry_context(
+            2,
+            prior_temperature=None,
+            prior_right_share=None,
+            direction=None,
+            change_pp=None,
+        ),
+    ],
+)
+def test_non_candidate_contexts_do_not_change_ordering_mode(
+    extra: IndustryContext,
+) -> None:
+    decision = build_candidate_list(
+        [candidate("600001", industry_tm_id=1)],
+        held_symbols=set(),
+        industry_contexts={
+            1: _industry_context(1),
+            extra.industry_tm_id: extra,
+        },
+    )
+
+    assert decision.ordering_mode == "context_with_history"
+
+
 @pytest.mark.parametrize("name", ["ST示例", "*ST示例", "示例ST", "退市示例"])
 def test_candidate_excludes_special_treatment_and_delisting_names(name: str) -> None:
     decisions = build_candidate_list([candidate("600001", name=name)], held_symbols=set())

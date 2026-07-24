@@ -1505,6 +1505,11 @@ def _industry_context_state(
         )
 
     contexts = dict(industry_contexts or {})
+    eligible_industry_ids = {
+        item.industry_tm_id
+        for item in eligible
+        if item.industry_tm_id is not None
+    }
     affected: set[int | str] = set()
     reasons_by_id: dict[str, list[str]] = {}
     fallback_reason: str | None = None
@@ -1534,21 +1539,6 @@ def _industry_context_state(
             else:
                 fallback_reason = fallback_reason or "industry_context_invalid"
 
-    # The context map is report-wide. An invalid context outside the current
-    # candidate set still makes the report's breadth facts incomplete.
-    for industry_id, context in contexts.items():
-        if not isinstance(industry_id, int) or isinstance(industry_id, bool):
-            continue
-        reasons = _context_current_reasons(context)
-        if isinstance(context, IndustryContext):
-            if context.industry_tm_id != industry_id:
-                reasons.append("industry_context_id_mismatch")
-            if expected_date is not None and context.as_of_date != expected_date:
-                reasons.append("industry_context_date_mismatch")
-        if reasons:
-            add_failure(industry_id, reasons)
-            fallback_reason = fallback_reason or "industry_context_invalid"
-
     if affected:
         affected_ids = sorted(
             affected,
@@ -1567,7 +1557,10 @@ def _industry_context_state(
             contexts,
         )
 
-    history_complete = all(_context_has_history(context) for context in contexts.values())
+    history_complete = all(
+        _context_has_history(contexts[industry_id])
+        for industry_id in eligible_industry_ids
+    )
     mode = "context_with_history" if history_complete else "context_current_only"
     return (
         mode,
@@ -2379,58 +2372,22 @@ def build_report(
     )
     resolved_industry_context_status = dict(
         candidate_decision.industry_context_status
-        if not candidate_decision.eligible
-        else industry_context_status or candidate_decision.industry_context_status
     )
-    if str(resolved_industry_context_status.get("ordering_mode") or "") not in INDUSTRY_ORDERING_MODES:
-        resolved_industry_context_status["ordering_mode"] = candidate_decision.ordering_mode
-    resolved_industry_context_status.setdefault(
-        "ordering_mode", candidate_decision.ordering_mode
-    )
-    resolved_industry_context_status.setdefault(
-        "current_complete",
-        candidate_decision.industry_context_status.get("current_complete", False),
-    )
-    resolved_industry_context_status.setdefault(
-        "history_complete",
-        candidate_decision.industry_context_status.get("history_complete", False),
-    )
-    resolved_industry_context_status.setdefault("fallback_reason", None)
-    requested_ordering_mode = str(
-        resolved_industry_context_status.get("ordering_mode") or ""
-    )
-    if requested_ordering_mode in INDUSTRY_ORDERING_MODES:
-        can_apply_requested_context = requested_ordering_mode in {
-            "context_with_history",
-            "context_current_only",
-        } and all(
-            not _context_current_reasons(industry_context_map.get(item.industry_tm_id))
-            for item in candidate_decision.eligible
-        ) and all(
-            not _context_current_reasons(context)
-            for context in industry_context_map.values()
+    supplied_status = dict(industry_context_status or {})
+    if supplied_status.get("ordering_mode") == candidate_decision.ordering_mode:
+        resolved_industry_context_status.update(
+            {
+                key: value
+                for key, value in supplied_status.items()
+                if key
+                not in {
+                    "ordering_mode",
+                    "current_complete",
+                    "history_complete",
+                    "fallback_reason",
+                }
+            }
         )
-        if requested_ordering_mode == "context_with_history":
-            can_apply_requested_context = can_apply_requested_context and all(
-                _context_has_history(context)
-                for context in industry_context_map.values()
-            )
-        if requested_ordering_mode not in {
-            "context_with_history",
-            "context_current_only",
-        } or can_apply_requested_context:
-            candidate_decision = replace(
-                candidate_decision,
-                eligible=tuple(
-                    _sort_candidates_for_mode(
-                        candidate_decision.eligible,
-                        mode=requested_ordering_mode,
-                        contexts=industry_context_map,
-                    )
-                ),
-                ordering_mode=requested_ordering_mode,
-                industry_context_status=resolved_industry_context_status,
-            )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
     old_positions = _state_positions(prior_state)
     holdings: list[HoldingDecision] = []
