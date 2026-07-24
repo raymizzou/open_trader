@@ -63,12 +63,17 @@ cards and no frozen industry context.
 - Closed the remaining legacy API-cost compatibility branches: complete
   estimates now include the explicit “实扣不可得” suffix, while reports with
   no cost facts use the canonical “本报告 API 费用：未知” label.
+- Legacy unlabeled cost fallbacks now normalize decimal strings without
+  two-decimal rounding, preserving canonical sub-unit values such as `0.479`
+  for both estimated and actual costs; reports carrying a canonical `label`
+  remain unchanged.
 
 Follow-up focused checks:
 
 ```text
 dashboard web lifecycle/ordering selections        7 passed
 legacy cost complete/incomplete/unknown regression 1 passed
+legacy cost sub-unit precision regression             1 passed
 dashboard acceptance frozen lifecycle selection   1 passed
 ```
 

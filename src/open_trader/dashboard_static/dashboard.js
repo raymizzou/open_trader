@@ -2682,18 +2682,31 @@ function renderTrendDisciplineCards(report) {
   </section>`;
 }
 
+function formatTrendApiCost(value) {
+  const raw = formatPlain(value).trim();
+  const match = raw.match(/^([+-]?)(\d+)(?:\.(\d+))?$/);
+  if (!match) return raw;
+  const sign = match[1];
+  const integer = match[2];
+  const fraction = match[3] || "";
+  if (/^0+$/.test(`${integer}${fraction}`)) return "0";
+  const normalizedInteger = integer.replace(/^0+(?=\d)/, "");
+  const normalizedFraction = fraction.replace(/0+$/, "");
+  return `${sign === "-" ? "-" : ""}${normalizedInteger}${normalizedFraction ? `.${normalizedFraction}` : ""}`;
+}
+
 function trendReportCostLabel(report) {
   const cost = report && report.api_cost && typeof report.api_cost === "object"
     ? report.api_cost : null;
   if (cost && hasValue(cost.label)) return formatPlain(cost.label);
   const actual = cost?.actual ?? report?.audit?.actual_api_cost;
   const estimated = cost?.estimated ?? report?.audit?.estimated_api_cost;
-  if (hasValue(actual)) return `本报告 API 费用：实扣 ${formatDisplayNumber(actual)} Trend Animals 余额单位`;
+  if (hasValue(actual)) return `本报告 API 费用：实扣 ${formatTrendApiCost(actual)} Trend Animals 余额单位`;
   if (hasValue(estimated)) {
     const estimateComplete = cost?.estimate_complete ?? report?.estimated_api_cost_complete ?? true;
     return estimateComplete === false
-      ? `本报告 API 费用：未知（快照估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位；成分费用未计）`
-      : `本报告 API 费用：估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位（实扣不可得）`;
+      ? `本报告 API 费用：未知（快照估算 ${formatTrendApiCost(estimated)} Trend Animals 余额单位；成分费用未计）`
+      : `本报告 API 费用：估算 ${formatTrendApiCost(estimated)} Trend Animals 余额单位（实扣不可得）`;
   }
   return "本报告 API 费用：未知";
 }
