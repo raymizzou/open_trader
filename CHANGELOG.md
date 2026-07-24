@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-24
 
+- Completed the unified CN/US/HK trend-display rollout; final Dashboard
+  acceptance passed with 3,423 tests and all three market controllers ready.
 - Unified CN/US/HK trend-report buy tables around one column order and explicit
   missing-value labels while preserving market-specific discipline and audit
   sections; verified the focused Dashboard web and acceptance suites.
