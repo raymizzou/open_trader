@@ -3357,7 +3357,11 @@ def _serialized_api_cost_label(payload: Mapping[str, object]) -> str | None:
         estimated_decimal = None if estimated is None else Decimal(str(estimated))
     except (InvalidOperation, TypeError, ValueError):
         return None
-    complete = payload.get("estimated_api_cost_complete", True)
+    complete = (
+        api_cost.get("estimate_complete")
+        if isinstance(api_cost, Mapping) and "estimate_complete" in api_cost
+        else payload.get("estimated_api_cost_complete", True)
+    )
     return trend_api_cost_label(
         actual=actual_decimal,
         estimated=estimated_decimal,

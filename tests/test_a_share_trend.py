@@ -1022,6 +1022,38 @@ def test_report_cost_label_is_shared_by_markdown_feishu_and_json() -> None:
     }
 
 
+def test_legacy_feishu_cost_uses_api_cost_completeness() -> None:
+    payload = {
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "account": serialized_account(fresh=True),
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "actual_api_cost": None,
+        "estimated_api_cost": "0.479",
+        "api_cost": {
+            "actual": None,
+            "estimated": "0.479",
+            "estimate_complete": False,
+            "unit": "Trend Animals 余额单位",
+        },
+        "strategy_judgments": {
+            "holding_decisions": [],
+            "formal_actions": [],
+        },
+    }
+
+    _, message = render_trend_feishu_text(
+        payload,
+        broker_label="东方财富",
+        market_label="A股",
+    )
+
+    assert (
+        "本报告 API 费用：未知（快照估算 0.479 Trend Animals 余额单位；成分费用未计）"
+        in message
+    )
+
+
 def test_build_report_rejects_external_context_status_when_contexts_are_missing() -> None:
     built = build_report(
         as_of_date="2026-07-14",

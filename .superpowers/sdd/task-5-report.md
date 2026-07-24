@@ -43,6 +43,9 @@ validation for malformed API cost facts.
 - Reused the formatter in `_report_payload`, `render_markdown`, and
   `render_trend_feishu_text`; JSON now carries the canonical label plus raw
   actual/estimated values, completeness, and unit.
+- Legacy Feishu payload fallback now prefers `api_cost.estimate_complete`,
+  falling back to the historical top-level completeness field only when the
+  nested field is absent.
 - Added strict Dashboard validation for new API-cost, industry-context, and
   parameter-row facts. Invalid new facts are unavailable; legacy payloads
   retain raw audit costs and receive empty new projections.
@@ -68,7 +71,7 @@ Affected suites:
 ```text
 PYTHONPATH=src .venv/bin/python -m pytest \
   tests/test_a_share_trend.py tests/test_market_trend.py tests/test_dashboard.py -q
-603 passed
+604 passed
 ```
 
 The full `make test` result is recorded below after the repository-wide run.
