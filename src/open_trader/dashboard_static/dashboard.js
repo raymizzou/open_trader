@@ -2690,11 +2690,12 @@ function trendReportCostLabel(report) {
   const estimated = cost?.estimated ?? report?.audit?.estimated_api_cost;
   if (hasValue(actual)) return `本报告 API 费用：实扣 ${formatDisplayNumber(actual)} Trend Animals 余额单位`;
   if (hasValue(estimated)) {
-    return cost?.estimate_complete === false
+    const estimateComplete = cost?.estimate_complete ?? report?.estimated_api_cost_complete ?? true;
+    return estimateComplete === false
       ? `本报告 API 费用：未知（快照估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位；成分费用未计）`
-      : `本报告 API 费用：估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位`;
+      : `本报告 API 费用：估算 ${formatDisplayNumber(estimated)} Trend Animals 余额单位（实扣不可得）`;
   }
-  return "本报告 API 费用：数据未提供";
+  return "本报告 API 费用：未知";
 }
 
 function trendIndustryDirection(value) {

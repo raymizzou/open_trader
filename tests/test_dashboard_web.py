@@ -9400,8 +9400,12 @@ def test_dashboard_legacy_cost_fallback_keeps_canonical_units_and_incomplete_lab
 const base = {market:"US", broker_label:"老虎", market_label:"美股", counts:{}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{}};
 const actual = renderTrendReportWorkspace({...base, audit:{actual_api_cost:"1.2"}});
 if (!actual.includes("本报告 API 费用：实扣 1.2 Trend Animals 余额单位")) throw new Error(actual);
+const complete = renderTrendReportWorkspace({...base, api_cost:{estimated:"3.1",estimate_complete:true}});
+if (!complete.includes("本报告 API 费用：估算 3.1 Trend Animals 余额单位（实扣不可得）")) throw new Error(complete);
 const incomplete = renderTrendReportWorkspace({...base, api_cost:{estimated:"2.4",estimate_complete:false}});
 if (!incomplete.includes("本报告 API 费用：未知（快照估算 2.4 Trend Animals 余额单位；成分费用未计）")) throw new Error(incomplete);
+const unknown = renderTrendReportWorkspace(base);
+if (!unknown.includes("本报告 API 费用：未知") || unknown.includes("本报告 API 费用：数据未提供")) throw new Error(unknown);
 console.log("ok");
 ''')
 

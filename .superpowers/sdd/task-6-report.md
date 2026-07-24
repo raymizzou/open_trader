@@ -60,11 +60,15 @@ cards and no frozen industry context.
 - Added deterministic historical-selection checks, explicit missing industry
   context copy, and canonical legacy API-cost labels (including the incomplete
   snapshot-estimate wording).
+- Closed the remaining legacy API-cost compatibility branches: complete
+  estimates now include the explicit “实扣不可得” suffix, while reports with
+  no cost facts use the canonical “本报告 API 费用：未知” label.
 
 Follow-up focused checks:
 
 ```text
-dashboard web lifecycle/ordering/cost selections  8 passed
+dashboard web lifecycle/ordering selections        7 passed
+legacy cost complete/incomplete/unknown regression 1 passed
 dashboard acceptance frozen lifecycle selection   1 passed
 ```
 
