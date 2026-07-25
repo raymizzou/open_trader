@@ -2477,6 +2477,7 @@ def _holding_action(
     triggered: set[str],
     market: str = "CN",
     overheat_trim_terminal: bool = False,
+    current_exit_discipline: bool = False,
 ) -> tuple[str, str]:
     if symbol in triggered:
         return "SELL_ALL", "protection_line_already_triggered"
@@ -2484,15 +2485,17 @@ def _holding_action(
         return "SELL_ALL", "danger_signal"
     if snapshot is not None and snapshot.right_side is False:
         return "SELL_ALL", "left_trend_right_side"
+    temperature_exit = market == "CN" or current_exit_discipline
     if (
-        market == "CN"
+        temperature_exit
         and snapshot is not None
         and snapshot.temperature_prev in {"温", "热", "沸"}
         and snapshot.temperature_curr == "平"
     ):
         return "SELL_ALL", "temperature_changed_to_flat"
     if (
-        snapshot is not None
+        not current_exit_discipline
+        and snapshot is not None
         and (snapshot.boiling is True or snapshot.champagne is True)
         and not overheat_trim_terminal
     ):
@@ -2502,11 +2505,16 @@ def _holding_action(
         for signal in (
             snapshot.right_side,
             snapshot.danger,
-            snapshot.boiling,
-            snapshot.champagne,
         )
     ) or (
-        market == "CN"
+        not current_exit_discipline
+        and snapshot is not None
+        and any(
+            signal is None
+            for signal in (snapshot.boiling, snapshot.champagne)
+        )
+    ) or (
+        temperature_exit
         and (
             snapshot.temperature_prev not in KNOWN_TEMPERATURES
             or snapshot.temperature_curr not in KNOWN_TEMPERATURES
@@ -2692,6 +2700,9 @@ def build_report(
             else normalized_strategy_snapshot
         )
     snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
+    current_exit_discipline = (
+        market.upper(), snapshot_version
+    ) in CURRENT_EXIT_DISCIPLINES
     snapshot_parameters = resolved_strategy_snapshot.get("parameters")
     raw_cn_weights = (
         snapshot_parameters.get("target_weight")
@@ -2803,15 +2814,18 @@ def build_report(
             triggered=triggered,
             market=market,
             overheat_trim_terminal=overheat_trim_terminal,
+            current_exit_discipline=current_exit_discipline,
         )
         initial_line = _state_decimal(old_state, "initial_line")
         active_line = _state_decimal(old_state, "active_line")
         old_atr = _state_decimal(old_state, "atr14")
         tracking_active = old_state.get("tracking_active") is True
-        if snapshot is not None and (
+        if not current_exit_discipline and snapshot is not None and (
             snapshot.boiling is True or snapshot.champagne is True
         ):
             tracking_active = True
+        if current_exit_discipline:
+            tracking_active = False
         historical = not old_state
         daily_bars = tuple(bars_by_symbol.get(symbol) or ())
         current_atr, close, lows = _kline_metrics(

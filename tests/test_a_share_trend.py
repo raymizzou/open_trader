@@ -2594,6 +2594,133 @@ def test_explicit_overheat_creates_one_partial_action(
     assert built.holdings[0].active_line == Decimal("11")
 
 
+@pytest.mark.parametrize(
+    ("market", "version"),
+    [("CN", "v9"), ("US", "v6"), ("HK", "v6")],
+)
+def test_current_exit_discipline_ignores_overheat_and_sells_on_flat(
+    market: str, version: str,
+) -> None:
+    pools = (
+        (622466, 697199)
+        if market == "CN"
+        else (622460,)
+        if market == "US"
+        else (622494,)
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        market, "abc123", pools, strategy_version=version
+    )
+    common = {
+        "as_of_date": "2026-07-14",
+        "execution_date": "2026-07-15",
+        "account": account("600001"),
+        "candidates": (),
+        "bars_by_symbol": {"600001": bars(close=12, low=11)},
+        "market": market,
+        "strategy_snapshot": strategy,
+    }
+    overheated = build_report(
+        **common,
+        holding_snapshots={
+            "600001": holding("600001", boiling=True, champagne=True)
+        },
+    )
+    flat = build_report(
+        **common,
+        holding_snapshots={
+            "600001": holding(
+                "600001", temperature_prev="热", temperature_curr="平"
+            )
+        },
+    )
+
+    assert (overheated.holdings[0].action, overheated.holdings[0].reason) == (
+        "HOLD", "trend_intact"
+    )
+    assert (flat.holdings[0].action, flat.holdings[0].reason) == (
+        "SELL_ALL", "temperature_changed_to_flat"
+    )
+
+
+def test_current_exit_discipline_preserves_existing_line_without_trailing() -> None:
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v9"
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001", boiling=True)},
+        bars_by_symbol={"600001": bars(close=12, low=11)},
+        strategy_snapshot=strategy,
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "9",
+                    "atr14": "1",
+                    "tracking_active": True,
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+    assert built.holdings[0].active_line == Decimal("9")
+    assert built.protection_state["positions"]["600001"]["tracking_active"] is False
+
+
+def test_current_exit_discipline_does_not_require_overheat_fields() -> None:
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460,), strategy_version="v6"
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={
+            "600001": holding("600001", boiling=None, champagne=None)
+        },
+        bars_by_symbol={"600001": bars()},
+        market="US",
+        strategy_snapshot=strategy,
+    )
+    assert built.holdings[0].action == "HOLD"
+
+
+@pytest.mark.parametrize(
+    ("snapshot_changes", "triggered", "reason"),
+    [
+        ({"danger": True}, set(), "danger_signal"),
+        ({"right_side": False}, set(), "left_trend_right_side"),
+        ({}, {"600001"}, "protection_line_already_triggered"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("market", "version"),
+    [("CN", "v9"), ("US", "v6"), ("HK", "v6")],
+)
+def test_current_exit_discipline_keeps_all_existing_full_exit_triggers(
+    market: str,
+    version: str,
+    snapshot_changes: dict[str, object],
+    triggered: set[str],
+    reason: str,
+) -> None:
+    snapshot = replace(holding("600001"), **snapshot_changes)
+    assert trend_module._holding_action(
+        symbol="600001",
+        snapshot=snapshot,
+        triggered=triggered,
+        market=market,
+        current_exit_discipline=True,
+    ) == ("SELL_ALL", reason)
+
+
 def test_full_exit_still_wins_over_overheat() -> None:
     snapshot = replace(holding("600001"), danger=True, boiling=True)
     assert trend_module._holding_action(
