@@ -442,15 +442,6 @@ def automatic_bootstrap_strategy_drawdown(
             )
         if event is not None:
             raise ValueError("automatic bootstrap event has no strategy record")
-        if (
-            baseline_equity is None
-            or source_date is None
-            or entry_eligible_from is None
-        ):
-            raise ValueError("completed-date frozen Futu baseline is unavailable")
-        equity = _positive_decimal(baseline_equity, "baseline_equity")
-        _canonical_date(source_date, "source_date")
-        _canonical_date(entry_eligible_from, "entry_eligible_from")
         predecessor = next(
             (
                 item for item in records
@@ -459,14 +450,48 @@ def automatic_bootstrap_strategy_drawdown(
             ),
             None,
         )
-        if predecessor_key is not None and not isinstance(predecessor, dict):
-            raise ValueError("approved predecessor drawdown state is unavailable")
+        inherited_current: Decimal | None = None
+        inherited_high: Decimal | None = None
+        inherited_paused = False
+        inherited_paused_at: str | None = None
+        if predecessor_key is not None:
+            if not isinstance(predecessor, dict):
+                raise ValueError("approved predecessor drawdown state is unavailable")
+            try:
+                inherited_current = _positive_decimal(
+                    predecessor["current_equity"], "inherited current_equity"
+                )
+                inherited_high = _positive_decimal(
+                    predecessor["high_water_mark"], "inherited high_water_mark"
+                )
+                if not isinstance(predecessor["paused"], bool):
+                    raise ValueError
+                inherited_paused = predecessor["paused"]
+                inherited_paused_at = predecessor["paused_at"]
+                if inherited_paused and not _is_canonical_timestamp(
+                    inherited_paused_at
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(
+                    "approved predecessor drawdown state is unavailable"
+                ) from None
+        if (
+            (baseline_equity is None and predecessor_key is None)
+            or source_date is None
+            or entry_eligible_from is None
+        ):
+            raise ValueError("completed-date frozen Futu baseline is unavailable")
+        equity = (
+            inherited_current
+            if baseline_equity is None
+            else _positive_decimal(baseline_equity, "baseline_equity")
+        )
+        assert equity is not None
+        _canonical_date(source_date, "source_date")
+        _canonical_date(entry_eligible_from, "entry_eligible_from")
         record = _new_record(key, equity=equity, updated_at=occurred_at)
-        if isinstance(predecessor, dict):
-            inherited_high = _positive_decimal(
-                predecessor["high_water_mark"], "inherited high_water_mark"
-            )
-            inherited_paused = predecessor["paused"] is True
+        if inherited_high is not None:
             high_water = (
                 inherited_high
                 if inherited_paused
@@ -480,7 +505,7 @@ def automatic_bootstrap_strategy_drawdown(
                 "drawdown_pct": _decimal_text(drawdown),
                 "paused": paused,
                 "paused_at": (
-                    predecessor["paused_at"]
+                    inherited_paused_at
                     if inherited_paused
                     else occurred_at if paused else None
                 ),

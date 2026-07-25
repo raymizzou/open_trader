@@ -146,11 +146,20 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
             reason="first_activation",
             entry_eligible_from="2026-07-20",
         )
+        observe_strategy_equity(
+            data_dir,
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/{version}",
+            strategy_version=version,
+            current_equity=Decimal(equities[market]) * Decimal("0.94"),
+            observed_at="2026-07-19T08:00:00+08:00",
+        )
 
     target_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
     inputs = {
         market: replace(
             market_input(market),
+            baseline_equity=None,
             strategy_snapshot={
                 "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
                 "strategy_version": version,
@@ -166,6 +175,12 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
     assert {
         item["market"]: item["high_water_mark"] for item in result["markets"]
     } == equities
+    state = json.loads((data_dir / "trend_drawdown/state.json").read_text())
+    assert {
+        record["market"]: record["current_equity"]
+        for record in state["records"]
+        if record["strategy_version"] in target_versions.values()
+    } == {"CN": "94", "HK": "188", "US": "282"}
 
 
 def test_missing_approved_predecessor_fails_closed_without_writing_state(
@@ -191,6 +206,7 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
 
     target = replace(
         market_input("CN"),
+        baseline_equity=None,
         strategy_snapshot={
             "strategy_id": "trend_animals_warm_to_hot/CN/v9",
             "strategy_version": "v9",
@@ -206,6 +222,24 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
         in result["markets"][0]["error"]
     )
     assert state_path.read_bytes() == before
+
+
+def test_first_activation_without_baseline_fails_closed(tmp_path: Path) -> None:
+    target = replace(
+        market_input("CN"),
+        baseline_equity=None,
+        strategy_snapshot={
+            "strategy_id": "trend_animals_warm_to_hot/CN/v9",
+            "strategy_version": "v9",
+            "parameters": {"drawdown_limit": "0.05", "market": "CN"},
+        },
+    )
+
+    result = run_preflight(tmp_path, {"CN": target})
+
+    assert result["status"] == "failed"
+    assert result["markets"][0]["failure_status"] == "baseline_unavailable"
+    assert not (tmp_path / "data/trend_drawdown/state.json").exists()
 
 
 def test_preflight_accepts_the_approved_v4_overheat_trim_transition(

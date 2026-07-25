@@ -81,7 +81,7 @@ def test_new_version_inherits_high_water_mark_and_pause_state(tmp_path: Path) ->
         strategy_id="trend_animals_warm_to_hot/CN/v9",
         strategy_version="v9",
         parameters={"drawdown_limit": "0.05"},
-        baseline_equity=Decimal("96"),
+        baseline_equity=None,
         source_date="2026-07-24",
         accepted_git_sha="b" * 40,
         actor="pytest",
@@ -92,7 +92,7 @@ def test_new_version_inherits_high_water_mark_and_pause_state(tmp_path: Path) ->
     )
 
     assert decision["high_water_mark"] == "100"
-    assert decision["current_equity"] == "96"
+    assert decision["current_equity"] == "94"
     assert decision["entry_allowed"] is False
     assert decision["paused_at"] == "2026-07-24T15:00:00+08:00"
 

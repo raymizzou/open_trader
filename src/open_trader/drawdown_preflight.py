@@ -179,8 +179,17 @@ def run_drawdown_preflight(
             continue
         key = (market, strategy_id, strategy_version)
         was_present = key in existing_keys
+        reason = (
+            "first_activation"
+            if first_activation or not any(row[0] == market for row in existing_keys)
+            else "new_strategy_version"
+        )
+        approved_predecessor = (
+            reason == "new_strategy_version"
+            and (market, strategy_version) in APPROVED_DRAWDOWN_PREDECESSORS
+        )
         if not was_present and (
-            item.baseline_equity is None
+            (item.baseline_equity is None and not approved_predecessor)
             or item.source_date is None
             or item.entry_eligible_from is None
         ):
@@ -191,11 +200,6 @@ def run_drawdown_preflight(
                 "error": "completed-date frozen Futu baseline is unavailable",
             })
             continue
-        reason = (
-            "first_activation"
-            if first_activation or not any(row[0] == market for row in existing_keys)
-            else "new_strategy_version"
-        )
         try:
             decision = automatic_bootstrap_strategy_drawdown(
                 data_dir,
