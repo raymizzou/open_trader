@@ -1605,21 +1605,15 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
                 "occurred_at": "2026-07-20T08:30:00+08:00",
             },
         },
-        "actual_overlay": {
-            "broker_label": "东方财富",
-            "items": [{"deviation_label": "超买"}],
-            "outside_positions": [{"deviation_label": "报告外加仓"}],
-        },
     }
     text = " ".join((
         "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
         "Kelly 阶段 当前 Kelly 上限 富途模拟盘交易统计 东方财富实盘交易统计",
-        "策略累计回撤 纪律内 实盘执行辅助 东方财富 超买 报告外加仓",
+        "策略累计回撤 纪律内",
         "基准已自动建立 回撤基准审计详情 100,000 2026-07-17 automatic-bootstrap-audit ",
         "candidate-sha parameter-hash acceptance 2026-07-20T08:00:00+08:00 2026-07-20 ",
         "状态恢复审计详情 snapshot-recovery-audit snapshot.json state-hash 2026-07-20T08:30:00+08:00",
         "5% 是风险预算目标，不是最大损失保证。",
-        "不会改写模拟建议、Kelly、模拟统计或报告哈希 不会自动交易真实账户",
     ))
 
     clicked: list[str] = []
@@ -1629,7 +1623,10 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
             self.selector = selector
 
         def count(self) -> int:
-            return 1
+            return int(self.selector not in {
+                ".trend-simulation-overlay",
+                ".trend-actual-overlay",
+            })
 
         def inner_text(self) -> str:
             return text
@@ -1805,87 +1802,6 @@ def test_acceptance_rejects_visible_numbers_over_two_decimal_places() -> None:
     with pytest.raises(AssertionError, match="超过两位小数"):
         dashboard_acceptance._check_visible_decimal_precision(
             "成本 30.594999", "模拟盘"
-        )
-
-
-def simulation_overlay_root(rendered_quantity: str) -> tuple[object, list[str]]:
-    checked: list[str] = []
-
-    class Locator:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def count(self) -> int:
-            return 1
-
-        def inner_text(self) -> str:
-            if self.name == "simulation":
-                return "模拟盘执行状态 · 富途"
-            assert self.name == "GPN"
-            return f"GPN 模拟持仓 {rendered_quantity}"
-
-        def all_inner_texts(self) -> list[str]:
-            assert self.name == "facts"
-            checked.append("facts")
-            return [f"模拟持仓 {rendered_quantity}"]
-
-        def locator(self, selector: str) -> "Locator":
-            if self.name == "simulation":
-                assert selector == '[data-simulation-symbol="GPN"]'
-                checked.append("row:GPN")
-                return Locator("GPN")
-            assert self.name == "GPN"
-            if selector == ".trend-actual-facts span":
-                return Locator("facts")
-            assert selector == "[data-deviation]"
-            return Locator("status")
-
-        def get_attribute(self, name: str) -> str | None:
-            assert self.name == "status" and name == "data-deviation"
-            checked.append(f"attribute:{self.name}")
-            return "followed"
-
-    class Root:
-        def locator(self, selector: str) -> Locator:
-            assert selector == ".trend-simulation-overlay"
-            return Locator("simulation")
-
-    return Root(), checked
-
-
-def test_acceptance_cross_checks_review_hold_simulation_overlay() -> None:
-    root, checked = simulation_overlay_root("485")
-
-    dashboard_acceptance._check_report_simulation_overlay(
-        root,
-        {
-            "hold_actions": [],
-            "review_actions": [{"action": "HOLD", "symbol": "GPN"}],
-        },
-        {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
-        "tiger",
-    )
-
-    assert "row:GPN" in checked
-    assert "facts" in checked
-    assert "attribute:status" in checked
-
-
-@pytest.mark.parametrize("rendered_quantity", ["485.1", "4850"])
-def test_acceptance_rejects_inexact_simulation_quantity(
-    rendered_quantity: str,
-) -> None:
-    root, _checked = simulation_overlay_root(rendered_quantity)
-
-    with pytest.raises(AssertionError, match="模拟盘数量未显示"):
-        dashboard_acceptance._check_report_simulation_overlay(
-            root,
-            {
-                "hold_actions": [{"action": "HOLD", "symbol": "GPN"}],
-                "review_actions": [],
-            },
-            {"positions": [{"symbol": "GPN", "quantity": "485.0"}]},
-            "tiger",
         )
 
 
@@ -2676,11 +2592,7 @@ class TabbedAccountLocator:
             "#trend-report-workspace:visible .cn-trend-execution",
             "#trend-report-workspace:visible .cn-trend-execution span:first-child",
         }:
-            report = self.page.reports.get(str(self.page.trend_broker), {})
-            return sum(
-                len(actions) if isinstance(actions, list) else 0
-                for actions in (report.get("sell_actions"), report.get("buy_actions"))
-            )
+            return 0
         if self.selector == (
             "#trend-report-workspace:visible .cn-trend-buy .cn-trend-card"
         ):
@@ -3056,31 +2968,6 @@ class TabbedAccountLocator:
             ]
         if self.selector == "#trend-report-workspace:visible .trend-discipline summary":
             return ["买入纪律", "卖出纪律"]
-        if self.selector == (
-            "#trend-report-workspace:visible .cn-trend-execution span:first-child"
-        ):
-            report = self.page.reports[broker]
-            actions = [
-                *report.get("sell_actions", []),
-                *report.get("buy_actions", []),
-            ]
-            labels = {
-                "pending": "待执行",
-                "submitted": "已提交",
-                "partially_filled": "部分成交",
-                "filled": "全部成交",
-                "failed": "失败",
-                "blocked": "受阻",
-                "uncertain": "状态不确定，禁止自动重试",
-                "conflict": "订单事实冲突，禁止提交",
-                "missed": "已错过策略窗口",
-                "incomplete": "未完成",
-                "early_revision_executed": "早期版本已执行",
-            }
-            return [
-                labels.get((action.get("execution") or {}).get("status"), "待执行")
-                for action in actions
-            ]
         match = re.fullmatch(
             r"#account-(\w+):visible \.account-holding-row:visible td:nth-child\(2\)",
             self.selector,

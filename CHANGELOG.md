@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-25
+
+- Updated Dashboard acceptance to match separated trend reports: report pages no
+  longer expect simulation/real-account overlays or execution-status rows;
+  backend payload checks remain unchanged.
+
 ## 2026-07-24
 
 - Reworked the shared CN/HK/US trend-report Dashboard layout to prioritize the

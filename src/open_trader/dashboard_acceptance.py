@@ -163,6 +163,11 @@ TREND_REASON_LABELS = {
     "atr_unavailable": "缺少 ATR 数据",
     "data_date_mismatch": "数据日期不一致",
 }
+REMOVED_TREND_EXECUTION_LABELS = (
+    "待执行", "已提交", "部分成交", "全部成交", "失败", "受阻",
+    "状态不确定，禁止自动重试", "订单事实冲突，禁止提交", "已错过策略窗口",
+    "未完成", "早期版本已执行", "不足整手，未下单",
+)
 
 
 def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
@@ -1308,17 +1313,6 @@ def _check_trend_account_views(
     *,
     screenshot_dir: Path | None = None,
 ) -> None:
-    status_labels = {
-        "submitted": "已提交",
-        "partially_filled": "部分成交",
-        "filled": "全部成交",
-        "failed": "失败",
-        "blocked": "受阻",
-        "uncertain": "状态不确定，禁止自动重试",
-        "conflict": "订单事实冲突，禁止提交",
-        "missed": "已错过策略窗口",
-        "incomplete": "未完成",
-    }
     reports = payload.get("trend_reports")
     reviews = payload.get("trend_reviews")
     controllers = payload.get("trend_controllers")
@@ -1415,7 +1409,6 @@ def _check_trend_account_views(
         assert isinstance(report, Mapping) and report.get("available") is True, (
             f"{broker} 当前趋势报告不可用"
         )
-        _check_report_simulation_overlay(report_root, report, simulated, broker)
         _check_trend_controller_status(
             page, panel, broker, controllers.get(broker)
         )
@@ -1448,13 +1441,13 @@ def _check_trend_account_views(
                 panel.locator(".cn-trend-report"), expectation, broker, page=page
             )
             _check_history_control_contract(current, f"{broker} 历史报告返回")
-            event = expectation.get("event")
-            if isinstance(event, Mapping):
-                label = status_labels.get(str(event.get("status") or ""))
-                if label:
-                    assert label in panel.inner_text(), (
-                        f"{broker} 精确历史报告缺少执行状态 {label}"
-                    )
+            historical_text = panel.inner_text()
+            assert panel.locator(".cn-trend-execution").count() == 0, (
+                f"{broker} 精确历史报告仍包含已删除的执行状态行"
+            )
+            assert not any(
+                label in historical_text for label in REMOVED_TREND_EXECUTION_LABELS
+            ), f"{broker} 精确历史报告仍包含已删除的执行状态文案"
             current.click()
             history_button = panel.locator("[data-report-history]")
             history_button.wait_for()
@@ -1816,66 +1809,14 @@ def _check_visible_decimal_precision(text: str, label: str) -> None:
     assert not offenders, f"{label} 数值超过两位小数：{offenders[:3]}"
 
 
-def _check_report_simulation_overlay(
-    report_root: Any,
-    report: Mapping[str, Any],
-    simulated: Mapping[str, Any] | None,
-    broker: str,
-) -> None:
-    simulation = report_root.locator(".trend-simulation-overlay")
-    assert simulation.count() == 1, f"{broker} 趋势报告缺少模拟盘执行状态"
-    simulation_text = simulation.inner_text()
-    assert "模拟盘执行状态" in simulation_text, f"{broker} 模拟盘状态标题缺失"
-    assert "富途" in simulation_text, f"{broker} 模拟盘来源缺失"
-
-    positions = simulated.get("positions") if simulated is not None else []
-    assert isinstance(positions, list), f"{broker} 模拟盘持仓无效"
-    by_symbol = {
-        str(position.get("symbol") or "").strip().upper(): position
-        for position in positions
-        if isinstance(position, Mapping)
-    }
-    seen: set[str] = set()
-    for key in ("hold_actions", "review_actions"):
-        actions = report.get(key) or []
-        assert isinstance(actions, list), f"{broker} {key} 列表无效"
-        for hold in actions:
-            if not isinstance(hold, Mapping) or hold.get("action") != "HOLD":
-                continue
-            symbol = str(hold.get("symbol") or "").strip().upper()
-            if not symbol or symbol in seen:
-                continue
-            seen.add(symbol)
-            position = by_symbol.get(symbol)
-            if position is None:
-                continue
-            row = simulation.locator(f'[data-simulation-symbol="{symbol}"]')
-            assert row.count() == 1, f"{broker} {symbol} 缺少模拟盘对照行"
-            quantity = f"模拟持仓 {_display_number(position['quantity'])}"
-            facts = {
-                text.strip()
-                for text in row.locator(
-                    ".trend-actual-facts span"
-                ).all_inner_texts()
-            }
-            assert quantity in facts, f"{broker} {symbol} 模拟盘数量未显示"
-            status = row.locator("[data-deviation]")
-            assert status.count() == 1, f"{broker} {symbol} 模拟盘偏差状态缺失"
-            assert status.get_attribute("data-deviation") == "followed", (
-                f"{broker} {symbol} 模拟盘偏差状态不是 followed"
-            )
-
-
 def _check_integrated_trend_ui(
     report_root: Any, report: Mapping[str, Any], broker: str,
 ) -> None:
     summary = report.get("risk_summary")
     drawdown = report.get("drawdown_summary")
-    overlay = report.get("actual_overlay")
     assert (
         isinstance(summary, Mapping)
         and isinstance(drawdown, Mapping)
-        and isinstance(overlay, Mapping)
     ), f"{broker} 趋势报告缺少集成风险视图数据"
     risk = report_root.locator(".trend-risk-summary")
     assert risk.count() == 1, f"{broker} 趋势报告缺少风险摘要"
@@ -1887,9 +1828,10 @@ def _check_integrated_trend_ui(
     assert report_root.locator(".trend-drawdown-summary").count() == 1, (
         f"{broker} 趋势报告缺少回撤状态"
     )
-    assert report_root.locator(".trend-actual-overlay").count() == 1, (
-        f"{broker} 趋势报告缺少只读实盘辅助"
-    )
+    for selector in (".trend-simulation-overlay", ".trend-actual-overlay"):
+        assert report_root.locator(selector).count() == 0, (
+            f"{broker} 趋势报告仍包含已删除的 {selector}"
+        )
     bootstrap = drawdown.get("bootstrap_event")
     if isinstance(bootstrap, Mapping):
         audit = risk.locator(".trend-drawdown-bootstrap-audit")
@@ -1913,11 +1855,8 @@ def _check_integrated_trend_ui(
         "不得用于开仓", "Kelly 阶段", "当前 Kelly 上限",
         "富途模拟盘交易统计", f"{_plain(actual_label)}实盘交易统计",
         "策略累计回撤", _plain(summary.get("status_label")),
-        _plain(drawdown.get("status_label")), "实盘执行辅助",
-        _plain(overlay.get("broker_label")),
+        _plain(drawdown.get("status_label")),
         "5% 是风险预算目标，不是最大损失保证。",
-        "不会改写模拟建议、Kelly、模拟统计或报告哈希",
-        "不会自动交易真实账户",
     )
     for value in required:
         assert value != "-" and value in text, f"{broker} 集成风险视图缺少 {value}"
@@ -1951,14 +1890,6 @@ def _check_integrated_trend_ui(
             recovery.get("occurred_at"),
         ):
             assert _plain(value) in text, f"{broker} 状态恢复审计未显示 {_plain(value)}"
-    for key in ("items", "outside_positions"):
-        items = overlay.get(key)
-        assert isinstance(items, list), f"{broker} 实盘偏差列表无效"
-        for item in items:
-            label = item.get("deviation_label") if isinstance(item, Mapping) else None
-            assert isinstance(label, str) and label and label in text, (
-                f"{broker} 实盘偏差状态未用文字表达"
-            )
     assert "本次可用风险" not in text, f"{broker} UI 仍包含 本次可用风险"
     if risk.get_attribute("open") is not None:
         risk.locator(":scope > summary").click()
@@ -2840,24 +2771,13 @@ def _check_account_holdings(
         assert workspace.locator(".cn-trend-table").count() == expected_stage_tables, (
             f"{broker} 趋势报告动作表数量与 API 不一致"
         )
-        sell_actions = report.get("sell_actions")
-        expected_execution_rows = expected_buy_count + (
-            len(sell_actions) if isinstance(sell_actions, list) else 0
-        )
         execution_rows = workspace.locator(".cn-trend-execution")
-        assert execution_rows.count() == expected_execution_rows, (
-            f"{broker} 执行状态行数量不是 {expected_execution_rows}"
+        assert execution_rows.count() == 0, (
+            f"{broker} 趋势报告仍包含已删除的执行状态行"
         )
-        valid_statuses = {
-            "待执行", "已提交", "部分成交", "全部成交", "失败",
-            "受阻", "状态不确定，禁止自动重试",
-            "订单事实冲突，禁止提交", "已错过策略窗口",
-            "未完成", "早期版本已执行",
-        }
-        assert all(
-            status in valid_statuses
-            for status in execution_rows.locator("span:first-child").all_inner_texts()
-        ), f"{broker} 执行状态包含未知文案"
+        assert not any(
+            label in workspace_text for label in REMOVED_TREND_EXECUTION_LABELS
+        ), f"{broker} 趋势报告仍包含已删除的执行状态文案"
         if broker == "eastmoney" and not (
             isinstance(report.get("strategy_parameter_rows"), list)
             and report.get("strategy_parameter_rows")
