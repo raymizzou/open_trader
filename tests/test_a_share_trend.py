@@ -3267,6 +3267,30 @@ def test_current_holding_without_state_becomes_historical_with_close_based_line(
     assert built.protection_state["positions"]["600001"]["active_line"] == "6"
 
 
+def test_new_holding_protection_line_uses_merged_average_fill() -> None:
+    held_account = account("600001")
+    held_account = replace(
+        held_account,
+        positions=(
+            replace(held_account.positions[0], avg_cost_price=Decimal("9.5")),
+        ),
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v9"
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=held_account,
+        candidates=(),
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": bars(close=10, low=9)},
+        strategy_snapshot=strategy,
+    )
+    assert built.holdings[0].initial_line == Decimal("5.5")
+    assert built.protection_state["positions"]["600001"]["initial_line"] == "5.5"
+
+
 def test_tracking_activation_persists_after_overheat_signal_clears() -> None:
     prior = {
         "schema_version": 1,

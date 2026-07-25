@@ -2833,8 +2833,15 @@ def build_report(
         )
         stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
         if active_line is None and current_atr is not None and close is not None:
+            protection_anchor = (
+                position.avg_cost_price
+                if position.avg_cost_price is not None
+                and position.avg_cost_price.is_finite()
+                and position.avg_cost_price > 0
+                else close
+            )
             initial_line = active_line = (
-                close - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
+                protection_anchor - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
             )
         if active_line is not None and tracking_active and action in {
             "HOLD", "SELL_PARTIAL"
