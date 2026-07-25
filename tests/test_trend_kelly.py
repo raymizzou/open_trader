@@ -265,6 +265,66 @@ def test_cn_v8_kelly_inherits_only_v4_v7_v8() -> None:
     assert state.selected_round_ids == ("round-001", "round-002", "round-003")
 
 
+@pytest.mark.parametrize(
+    ("market", "target_version", "inherited_versions"),
+    [
+        ("CN", "v9", ("v4", "v7", "v8", "v9")),
+        ("US", "v6", ("v4", "v5", "v6")),
+        ("HK", "v6", ("v4", "v5", "v6")),
+    ],
+)
+def test_current_strategy_versions_use_exact_inherited_kelly_samples(
+    market: str,
+    target_version: str,
+    inherited_versions: tuple[str, ...],
+) -> None:
+    target = (
+        market,
+        f"trend_animals_warm_to_hot/{market}/{target_version}",
+        target_version,
+    )
+    for version in inherited_versions:
+        sample = (
+            market,
+            f"trend_animals_warm_to_hot/{market}/{version}",
+            version,
+        )
+        assert trend_kelly_identity_matches(sample, target)
+        if version != target_version:
+            assert not trend_kelly_identity_matches(target, sample)
+    assert not trend_kelly_identity_matches(
+        (market, f"trend_animals_warm_to_hot/{market}/v3", "v3"),
+        target,
+    )
+    rounds = [
+        _round(
+            index,
+            "0.10",
+            market=market,
+            strategy_id=(
+                f"trend_animals_warm_to_hot/{market}/"
+                f"{inherited_versions[index % len(inherited_versions)]}"
+            ),
+            version=inherited_versions[index % len(inherited_versions)],
+        )
+        for index in range(30)
+    ]
+
+    state = calculate_trend_kelly(
+        rounds,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/{target_version}",
+        opening_strategy_version=target_version,
+    )
+
+    assert state.phase == "active_all_samples"
+    assert state.eligible_sample_count == 30
+    assert state.selected_sample_count == 30
+    assert state.selected_round_ids == tuple(
+        f"round-{index:03d}" for index in range(30)
+    )
+
+
 def test_kelly_uses_latest_200_by_close_identity_not_input_order() -> None:
     rounds = [_round(index, "0.10") for index in range(201)]
     rounds[0] = _round(0, "-1")

@@ -26,17 +26,26 @@ CN_V7_KELLY_IDENTITY: TrendKellyIdentity = (
 CN_V8_KELLY_IDENTITY: TrendKellyIdentity = (
     "CN", "trend_animals_warm_to_hot/CN/v8", "v8",
 )
+CN_V9_KELLY_IDENTITY: TrendKellyIdentity = (
+    "CN", "trend_animals_warm_to_hot/CN/v9", "v9",
+)
 US_V4_KELLY_IDENTITY: TrendKellyIdentity = (
     "US", "trend_animals_warm_to_hot/US/v4", "v4",
 )
 US_V5_KELLY_IDENTITY: TrendKellyIdentity = (
     "US", "trend_animals_warm_to_hot/US/v5", "v5",
 )
+US_V6_KELLY_IDENTITY: TrendKellyIdentity = (
+    "US", "trend_animals_warm_to_hot/US/v6", "v6",
+)
 HK_V4_KELLY_IDENTITY: TrendKellyIdentity = (
     "HK", "trend_animals_warm_to_hot/HK/v4", "v4",
 )
 HK_V5_KELLY_IDENTITY: TrendKellyIdentity = (
     "HK", "trend_animals_warm_to_hot/HK/v5", "v5",
+)
+HK_V6_KELLY_IDENTITY: TrendKellyIdentity = (
+    "HK", "trend_animals_warm_to_hot/HK/v6", "v6",
 )
 TREND_KELLY_SAMPLE_IDENTITIES: dict[
     TrendKellyIdentity, frozenset[TrendKellyIdentity]
@@ -50,13 +59,29 @@ TREND_KELLY_SAMPLE_IDENTITIES: dict[
         CN_V7_KELLY_IDENTITY,
         CN_V8_KELLY_IDENTITY,
     }),
+    CN_V9_KELLY_IDENTITY: frozenset({
+        CN_V4_KELLY_IDENTITY,
+        CN_V7_KELLY_IDENTITY,
+        CN_V8_KELLY_IDENTITY,
+        CN_V9_KELLY_IDENTITY,
+    }),
     US_V5_KELLY_IDENTITY: frozenset({
         US_V4_KELLY_IDENTITY,
         US_V5_KELLY_IDENTITY,
     }),
+    US_V6_KELLY_IDENTITY: frozenset({
+        US_V4_KELLY_IDENTITY,
+        US_V5_KELLY_IDENTITY,
+        US_V6_KELLY_IDENTITY,
+    }),
     HK_V5_KELLY_IDENTITY: frozenset({
         HK_V4_KELLY_IDENTITY,
         HK_V5_KELLY_IDENTITY,
+    }),
+    HK_V6_KELLY_IDENTITY: frozenset({
+        HK_V4_KELLY_IDENTITY,
+        HK_V5_KELLY_IDENTITY,
+        HK_V6_KELLY_IDENTITY,
     }),
 }
 CN_V7_KELLY_SAMPLE_IDENTITIES = TREND_KELLY_SAMPLE_IDENTITIES[CN_V7_KELLY_IDENTITY]
