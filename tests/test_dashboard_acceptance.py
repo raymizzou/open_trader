@@ -5870,6 +5870,11 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
             "strategy_version": "v1",
             "report_date": "2026-07-17",
             "audit": {"artifact": "old.json"},
+            "strategy_parameter_rows": [{
+                "group": "退出保护",
+                "name": "退出条件",
+                "value": "危险信号时全部卖出",
+            }],
             "buy_actions": [{
                 "symbol": "NDAQ",
                 "execution": {
@@ -5885,6 +5890,9 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     )
 
     assert expectations[0]["artifact"] == "old.json"
+    assert expectations[0]["strategy_parameter_rows"] == exact["old.json"][
+        "strategy_parameter_rows"
+    ]
 
 
 def test_acceptance_allows_exact_history_to_lag_a_duplicate_terminal_event(
