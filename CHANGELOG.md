@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-25
 
+- Published CN v9, US v6, and HK v6 trend discipline: A-share hot/boiling
+  entries now share the 4% ceiling; new reports no longer create 30% overheat
+  trims or trailing-line raises; danger, right-side exit, temperature-flat, and
+  2×ATR14 protection still sell all. Existing Kelly samples, drawdown state,
+  raised protection lines, and frozen partial exits remain compatible.
 - Updated Dashboard acceptance to match separated trend reports: report pages no
   longer expect simulation/real-account overlays or execution-status rows;
   backend payload checks remain unchanged. Report-page Playwright checks now run
