@@ -1842,13 +1842,12 @@ console.log(JSON.stringify({cn,us}));
     for expected in (
         "1,234,567.51", "24.55", "99.88", "12,345.68", "2.35",
         "39,970.42", "8,888.89", "9,007,199,254,740,993 股", "23.43", "30.59",
-        "90.44", "28.31", "4,941.5", "205.47", "成交 13.13 / 23.43",
-        "均价 207.19", "目标仓位 4.12%",
+        "90.44", "28.31", "4,941.5", "205.47", "目标仓位 4.12%",
     ):
         assert expected in combined
     for preserved in (
         "02840 SPDR 金", "600001 测试", "00001234 编号测试",
-        "订单 00001234", "2026-07-22T09:30:00+08:00", "编号 00001234",
+        "编号 00001234",
     ):
         assert preserved in combined
     for raw in (
@@ -3587,11 +3586,12 @@ for(const text of ["策略控制器","执行模式","execute","执行主机","ra
   "PID","4242","Git SHA","abc1234","当前阶段","monitoring","心跳",
   "最近成功","状态 &lt;script&gt;alert(1)&lt;/script&gt;","市场 US","日期 2026-07-20",
   "提交数 0","产物 无","当前阻塞","下次检查",
-  "状态不确定，禁止自动重试","订单事实冲突，禁止提交","已错过策略窗口",
   "发现后续报告版本，执行仍锁定原批次","aaaaaaaaaaaa","bbbbbbbbbbbb"]){
   if(!normal.includes(text))throw new Error(text+"\n"+normal);
 }
 if(normal.includes("[object Object]") || normal.includes("<script>"))throw new Error(normal);
+if(normal.includes("状态不确定，禁止自动重试") || normal.includes("订单事实冲突，禁止提交") ||
+   normal.includes("已错过策略窗口"))throw new Error(normal);
 state.dashboard.trend_controllers.tiger={...healthy,last_success:"report_locked"};
 if(!renderTrendReportWorkspace(report).includes("report_locked"))throw new Error("string last_success");
 state.dashboard.trend_controllers.tiger={...healthy,last_success:null};
@@ -3815,7 +3815,7 @@ console.log(JSON.stringify({
     assert rendered["symbols"] == ["GPN", "TOST", "HST"]
 
 
-def test_dashboard_report_loads_simulation_and_keeps_real_comparison() -> None:
+def test_dashboard_report_does_not_load_simulation_positions_or_render_overlays() -> None:
     output = run_dashboard_js(r'''
 function mount(){return {innerHTML:"",textContent:"",attributes:{},classList:{add(){},remove(){}},
   setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
@@ -3850,16 +3850,13 @@ console.log(JSON.stringify({urls,html:panel.innerHTML}));
 ''')
     rendered = json.loads(output)
     html = rendered["html"]
-    assert rendered["urls"] == ["/api/trend-simulate-positions/tiger"]
+    assert rendered["urls"] == []
     for text in (
-        "模拟盘执行状态", "富途", "实盘执行辅助", "老虎", "GPN",
-        "模拟持仓 485", "TOST", "模拟持仓 1,296",
+        "老虎", "GPN", "TOST", "正式买入计划",
     ):
         assert text in html
-    assert html.count('data-deviation="followed"') == 2
-    assert html.count("一致") == 2
-    assert 'data-deviation="pending">待执行' in html
-    assert "未持有" not in html
+    for text in ("模拟盘执行状态", "模拟持仓", "实盘执行辅助", "真实持仓"):
+        assert text not in html
 
 
 def test_dashboard_historical_report_omits_simulation_reconciliation() -> None:
@@ -3877,56 +3874,18 @@ state.trendSimulatePositions.tiger={available:true,broker:"tiger",positions:[
 ]};
 const current=renderTrendReportWorkspace(report,true,false);
 const historical=renderTrendReportWorkspace(report,true,true);
-const loading=renderTrendSimulationOverlay(report,{loading:true});
-const unavailable=renderTrendSimulationOverlay(report,{available:false,error:"OpenD 模拟账户不可用"});
-console.log(JSON.stringify({current,historical,loading,unavailable}));
+console.log(JSON.stringify({current,historical}));
 ''')
     rendered = json.loads(output)
     current = rendered["current"]
     historical = rendered["historical"]
-    assert 'class="trend-simulation-overlay"' in current
-    assert "模拟盘执行状态" in current
-    assert re.search(
-        r'data-simulation-symbol="EXIT".*?data-deviation="followed">一致',
-        current,
-        re.DOTALL,
-    )
-    assert re.search(
-        r'data-simulation-symbol="EXTRA".*?data-deviation="outside_report_addition">报告外持仓',
-        current,
-        re.DOTALL,
-    )
+    assert 'class="trend-simulation-overlay"' not in current
+    assert "模拟盘执行状态" not in current
+    assert "模拟持仓" not in current
     assert 'class="trend-simulation-overlay"' not in historical
     assert "模拟盘执行状态" not in historical
     assert "EXIT" in historical
-    assert "已错过策略窗口" in historical
-    for state_html in (rendered["loading"], rendered["unavailable"]):
-        assert "data-simulation-symbol" not in state_html
-        assert "未持有" not in state_html
-    assert "模拟盘持仓加载中" in rendered["loading"]
-    assert "OpenD 模拟账户不可用" in rendered["unavailable"]
-
-
-def test_dashboard_simulation_overlay_escapes_every_hostile_rendered_fact() -> None:
-    output = run_dashboard_js(r'''
-const attack='"><img src=x onerror=alert(1)>';
-const html=renderTrendSimulationOverlay({
-  sell_actions:[],hold_actions:[],review_actions:[],risk_skips:[],
-  buy_actions:[{action:"BUY",symbol:attack,name:attack,estimated_shares:attack,
-    close:attack,estimated_initial_line:attack}],
-},{available:true,positions:[{symbol:attack,name:attack,quantity:attack,
-  cost_price:attack,last_price:attack}]});
-const unavailable=renderTrendSimulationOverlay({}, {available:false,error:attack});
-console.log(JSON.stringify({html,unavailable}));
-''')
-    rendered = json.loads(output)
-    assert "<img" not in rendered["html"]
-    assert '<img' not in rendered["unavailable"]
-    assert 'data-simulation-symbol="&quot;&gt;&lt;IMG' in rendered["html"]
-    assert "&lt;img src=x onerror=alert(1)&gt;" in rendered["html"]
-    assert "报告数量 &quot;&gt;&lt;img" in rendered["html"]
-    assert "模拟持仓 &quot;&gt;&lt;img" in rendered["html"]
-    assert "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;" in rendered["unavailable"]
+    assert "已错过策略窗口" not in historical
 
 
 def test_dashboard_report_history_is_inline_exact_and_restores_scroll() -> None:
@@ -3971,7 +3930,6 @@ console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restored
 ''')
     rendered = json.loads(output)
     assert rendered["urls"] == [
-        "/api/trend-simulate-positions/tiger",
         "/api/trend-reports/tiger/history",
         "/api/trend-reports/tiger/history/2026-07-16.json",
         "/api/trend-reports/tiger/history/2026-07-16.json",
@@ -3980,7 +3938,6 @@ console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restored
     assert "历史报告" in rendered["currentHtml"]
     assert "返回持仓看板" not in rendered["currentHtml"]
     assert "2026-07-16.json" in rendered["historyHtml"]
-    assert "错过" in rendered["historicalHtml"]
     assert "返回当前报告" in rendered["historicalHtml"]
     assert "当天趋势报告" in rendered["restoredHtml"]
     assert rendered["historyRestored"] == 321
@@ -4607,7 +4564,6 @@ window.fetch=async (input)=>{{
         dashboard_acceptance._check_history_control_contract(
             return_current, "tiger 返回当前报告"
         )
-        assert "错过" in section.inner_text()
         return_current.click()
         history_button = section.locator("[data-report-history]")
         assert history_button.evaluate("node => node === document.activeElement")
@@ -4634,7 +4590,6 @@ window.fetch=async (input)=>{{
         assert cash_details.evaluate("node => node.open") is True
         section.locator('[data-history-artifact="2026-07-16.json"]').click()
         section.locator("[data-current-trend-report]").wait_for()
-        assert "错过" in section.inner_text()
         section.locator("[data-current-trend-report]").click()
         assert section.locator("[data-report-history]").evaluate(
             "node => node === document.activeElement"
@@ -4809,7 +4764,6 @@ for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核
   "买入 1","卖出 0","持有 0","复核 1",
   "EA 艺电","207.27","99.8","通讯服务","4%","4,941.49","23 股",
   "205.47","BOTZ Global X Robotics ETF","趋势信号不完整",
-  "部分成交","成交 13 / 23","均价 207.18","订单 SIM-123","2026-07-17T10:01:00-04:00",
   "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
   if (!us.includes(text)) throw new Error(text + "\n" + us);
 }
@@ -4826,8 +4780,8 @@ if (usOrder.some((index)=>index<0) ||
     (us.match(/class="trend-discipline-category"/g) || []).length !== 6 ||
     us.includes('class="trend-discipline-card"') ||
     !us.includes("本报告未提供该类纪律参数")) throw new Error(us);
-if (!us.includes('class="cn-trend-execution"') ||
-    us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
+if (us.includes('class="cn-trend-execution"') ||
+    us.includes("部分成交") || us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
 console.log("ok");
 ''')
 
@@ -4844,9 +4798,11 @@ const base = (market) => ({
   market_label:market === "CN" ? "A股" : market === "US" ? "美股" : "港股",
   report_date:"2026-07-24", data_date:"2026-07-23",
   generated_at:"2026-07-24T09:00:00+08:00", account_status:"已更新",
-  buy_window:market === "CN" ? "09:30–10:00" : "常规交易时段",
-  counts:{sell:0,buy:0,hold:0,review:0},
-  sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+      buy_window:market === "CN" ? "09:30–10:00" : "常规交易时段",
+      counts:{sell:0,buy:0,hold:0,review:0},
+      risk_summary:{status:"active",status_label:"风险预算内"},
+      drawdown_summary:{status:"active",status_label:"纪律内"},
+      sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
 });
 const report = (market) => base(market);
 const reportOrder = (html) => [
@@ -4978,9 +4934,7 @@ for (const text of ["组合计划风险","风险预算内",
   "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
   "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
   "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
-  "允许 · 建议 300 股","计划止损风险 303","正常成本 3",
-  "决定性约束 单笔风险上限","跳过 · 建议 0 股","第二候选",
-  "最小交易单位 100 股超过组合剩余风险"]) {
+  "第二候选"]) {
   if (!html.includes(text)) throw new Error(text + "\n" + html);
 }
 if (html.includes("本次可用风险") || html.includes("<th scope=\"col\">目标仓位</th>")) {
@@ -4993,7 +4947,7 @@ const sell = html.indexOf("优先处理 · 卖出触发");
 const lifecycle = html.indexOf('class="trend-discipline-workspace"');
 if (!(counts >= 0 && counts < sell && sell < lifecycle && lifecycle < risk)) throw new Error(html);
 if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
-    (html.match(/class="cn-trend-execution cn-trend-risk-detail"/g) || []).length !== 2) {
+    (html.match(/class="cn-trend-risk-detail"/g) || []).length !== 0) {
   throw new Error(html);
 }
 const historical = renderTrendRiskSummary(null, {
@@ -5003,7 +4957,7 @@ const historical = renderTrendRiskSummary(null, {
     baseline_equity:"100000",source_date:"2026-07-14",accepted_git_sha:"abc123",
     parameter_hash:"params456",actor:"acceptance",
     occurred_at:"2026-07-16T08:00:00+08:00",entry_eligible_from:"2026-07-15"}
-}, null, "2026-07-17");
+}, "2026-07-17");
 if (historical.includes("基准已自动建立") ||
     !historical.includes("回撤基准审计详情") ||
     !historical.includes("100,000") ||
@@ -5091,7 +5045,7 @@ const html = renderTrendRiskSummary(null, {
     baseline_equity:"995953.447",source_date:"2026-07-21",accepted_git_sha:"abc123",
     parameter_hash:"params456",actor:"acceptance",
     occurred_at:"2026-07-22T08:00:00+08:00",entry_eligible_from:"2026-07-23"}
-}, null, "2026-07-22");
+}, "2026-07-22");
 console.log(JSON.stringify(html));
 ''')
     rendered = json.loads(output)
@@ -5126,83 +5080,6 @@ console.log("ok");
 ''')
 
     assert "ok" in output
-
-
-def test_dashboard_renders_read_only_actual_execution_overlay() -> None:
-    output = run_dashboard_js(r'''
-const html = renderTrendReportWorkspace({
-  available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",market_label:"A股",
-  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
-  account_status:"已更新",buy_window:"09:30–10:00",counts:{},
-  risk_summary:{status:"active",status_label:"风险预算内",
-    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
-    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
-    portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
-    single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
-    abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"},
-  actual_overlay:{available:true,broker_label:"东方财富",account_nav_hkd:"108000.00",
-    status_text:"结单数据，非实时",
-    notice:"只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；系统不会自动交易真实账户。",
-    items:[
-      {symbol:"600001",name:"测试",frozen_action_label:"正式买入",target_weight:"0.04",
-       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"200",
-       actual_market_value:"2000",currency:"CNY",deviation:"underbought",deviation_label:"少买",frozen_reference_price:"10",protection_line:"9",
-       risk_note:"若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）"},
-      {symbol:"600002",name:"跳过",frozen_action_label:"正式买入",target_weight:"0.04",
-       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"0",
-       actual_market_value:"0",currency:"CNY",deviation:"skipped",deviation_label:"跳过",protection_line:"9",
-       risk_note:"暂无策略保护线，风险未纳入估算"},
-      {symbol:"600003",name:"待卖",frozen_action_label:"全部卖出",target_weight:"",
-       simulation_quantity:"",actual_reference_quantity:"0",actual_quantity:"50",
-       actual_market_value:"1000",currency:"CNY",deviation:"missed_sell",deviation_label:"漏卖",protection_line:"18",
-       risk_note:"若按策略保护线退出，预计损失 CNY 100.00"},
-      {symbol:"600004",name:"追买",frozen_action_label:"跳过",target_weight:"0.04",
-       simulation_quantity:"0",actual_reference_quantity:"0",actual_quantity:"100",
-       actual_market_value:"1000",currency:"CNY",deviation:"chased",deviation_label:"追买",protection_line:"",
-       risk_note:"暂无策略保护线，风险未纳入估算"},
-      {symbol:"600005",name:"超买",frozen_action_label:"正式买入",target_weight:"0.04",
-       simulation_quantity:"300",actual_reference_quantity:"400",actual_quantity:"500",
-       actual_market_value:"5000",currency:"CNY",deviation:"overbought",deviation_label:"超买",protection_line:"9",
-       risk_note:"若按策略保护线退出，预计损失 CNY 500.00"}
-    ],
-    outside_positions:[{symbol:"600099",name:"报告外",actual_quantity:"10",
-      actual_market_value:"500",currency:"CNY",deviation:"outside_report_addition",deviation_label:"报告外加仓",
-      attribution_status:"unconfirmed",risk_note:"风险未纳入估算"}]},
-  sell_actions:[],buy_actions:[],risk_skips:[],hold_actions:[],review_actions:[],audit:{},
-});
-for (const text of ["实盘执行辅助","东方财富","偏差 6","真实账户净值 HKD 108,000",
-  "结单数据，非实时","模拟数量 300","实盘参考数量 400","真实持仓 200",
-  "冻结参考价 CNY 10","按冻结参考价估算，不代表实时风险上限",
-  "少买","跳过","漏卖","追买","超买","报告外加仓",
-  "若按策略保护线退出，预计损失 CNY 200.00","风险未纳入估算",
-  "不会改写模拟建议、Kelly、模拟统计或报告哈希","不会自动交易真实账户"]) {
-  if (!html.includes(text)) throw new Error(text + "\n" + html);
-}
-for (const forbidden of ["真实最大风险","券商端已挂止损","已挂止损"]) {
-  if (html.includes(forbidden)) throw new Error(forbidden + "\n" + html);
-}
-if ((html.match(/class="trend-actual-row"/g) || []).length !== 6 ||
-    !html.includes('class="trend-actual-overlay" open')) throw new Error(html);
-const followed = renderTrendActualOverlay({available:true,broker_label:"老虎",status_text:"账户实时同步",account_nav_hkd:"100",
-  notice:"只读",items:[{symbol:"AAPL",name:"Apple",deviation:"followed",deviation_label:"已跟随",
-    frozen_action_label:"继续持有",actual_quantity:"1",actual_market_value:"10",currency:"USD",
-    risk_note:"若按策略保护线退出，预计损失 USD 1.00"}],outside_positions:[]});
-if (!followed.includes("偏差 0") || followed.includes('class="trend-actual-overlay" open') ||
-    !followed.includes('data-deviation="followed"')) throw new Error(followed);
-const missingFx = renderTrendActualOverlay({available:true,broker_label:"老虎",status_text:"账户实时同步",account_nav_hkd:"780000",
-  notice:"只读",items:[{symbol:"AAPL",name:"Apple",deviation:"reference_unavailable",deviation_label:"暂无法换算",
-    frozen_action_label:"正式买入",actual_reference_quantity:"",actual_quantity:"1",actual_market_value:"",currency:"USD",
-    reference_note:"实盘汇率缺失，暂无法换算",risk_note:"暂无策略保护线，风险未纳入估算"}],outside_positions:[]});
-if (!missingFx.includes("实盘汇率缺失，暂无法换算")) throw new Error(missingFx);
-console.log("ok");
-''')
-
-    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
-
-    assert "ok" in output
-    assert '.trend-actual-row header span[data-deviation="followed"]' in css
-    assert 'color: var(--ok);' in css
-    assert '.trend-actual-row header span[data-deviation="overbought"]' in css
 
 
 def test_dashboard_risk_summary_and_candidate_cards_fit_375px() -> None:
@@ -5264,21 +5141,14 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
         assert "风险预算内" in risk_text
         assert "富途模拟盘交易统计" in risk_text
         assert "东方财富实盘交易统计" in risk_text
-        assert "实盘执行辅助" in risk_text
-        assert "冻结参考价 CNY 10" in risk_text
-        assert page.locator(".trend-actual-overlay").get_attribute("open") is not None
+        assert "实盘执行辅助" not in risk_text
+        assert "冻结参考价 CNY 10" not in risk_text
         assert page.locator(".cn-trend-card").count() == 2
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
         )
         assert page.locator(".cn-trend-buy").evaluate(
             "node => node.scrollWidth <= node.clientWidth"
-        )
-        assert page.locator(".trend-actual-overlay").evaluate(
-            "node => node.scrollWidth <= node.clientWidth"
-        )
-        assert page.locator(".trend-actual-row").evaluate_all(
-            "nodes => nodes.every(node => node.scrollWidth <= node.clientWidth)"
         )
         browser.close()
 
@@ -5437,9 +5307,12 @@ const report = {
 for (const mobile of [false, true]) {
   window = {matchMedia: () => ({matches: mobile})};
   const html = renderTrendReportWorkspace(report);
-  for (const text of ["止盈减仓 30%", "全部卖出", "模拟目标数量 300", "模拟已成交 100", "模拟剩余数量 200", "模拟预计数量 0", "按实盘下单时持仓的 30% 向下取整"]) {
-    if (!html.includes(text)) throw new Error(text + "\n" + html);
-  }
+      for (const text of ["止盈减仓 30%", "全部卖出"]) {
+        if (!html.includes(text)) throw new Error(text + "\n" + html);
+      }
+      for (const text of ["模拟目标数量", "模拟已成交", "模拟剩余数量", "模拟预计数量", "按实盘下单时持仓"]) {
+        if (html.includes(text)) throw new Error(text + "\n" + html);
+      }
 }
 if (optionAttentionAction("SELL_PARTIAL") !== "止盈减仓 30%") throw new Error("partial option attention action");
 if (!renderCnTrendDisciplines().includes("Trend Animals API 未提供波动率放大字段；本地不推断")) throw new Error("missing volatility discipline");
