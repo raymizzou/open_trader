@@ -2835,7 +2835,8 @@ def build_report(
         if active_line is None and current_atr is not None and close is not None:
             protection_anchor = (
                 position.avg_cost_price
-                if position.avg_cost_price is not None
+                if current_exit_discipline
+                and position.avg_cost_price is not None
                 and position.avg_cost_price.is_finite()
                 and position.avg_cost_price > 0
                 else close
