@@ -7,7 +7,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Updated Dashboard acceptance to match separated trend reports: report pages no
   longer expect simulation/real-account overlays or execution-status rows;
-  backend payload checks remain unchanged.
+  backend payload checks remain unchanged. Report-page Playwright checks now run
+  independently of controller and simulated-holdings checks, so failures there
+  no longer suppress report validation or screenshots.
 
 ## 2026-07-24
 

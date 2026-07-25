@@ -168,6 +168,10 @@ REMOVED_TREND_EXECUTION_LABELS = (
     "状态不确定，禁止自动重试", "订单事实冲突，禁止提交", "已错过策略窗口",
     "未完成", "早期版本已执行", "不足整手，未下单",
 )
+REMOVED_TREND_REPORT_POSITION_LABELS = (
+    "允许 · 建议", "计划止损风险", "正常成本", "决定性约束",
+    "待执行", "模拟盘执行状态", "实盘执行辅助",
+)
 
 
 def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
@@ -1420,12 +1424,6 @@ def _check_trend_account_views(
         history_button = panel.locator("[data-report-history]")
         assert history_button.count() == 1, f"{broker} 当前报告缺少历史入口"
         _check_history_control_contract(history_button, f"{broker} 历史报告入口")
-        if broker == "eastmoney" and screenshot_dir is not None:
-            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
-            page.screenshot(
-                path=str(screenshot_dir / f"{width}-trend-report.png"),
-                full_page=True,
-            )
         expectations = history_expectations.get(broker) or []
         if expectations:
             history_button.click()
@@ -1483,6 +1481,43 @@ def _check_trend_account_views(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势复盘视图出现横向滚动"
         _capture_trend_review_screenshot(page, broker, screenshot_dir)
+        section.locator('[data-account-view="real"]').click()
+
+
+def _check_separated_trend_report_views(
+    page: Any,
+    payload: Mapping[str, Any],
+    *,
+    screenshot_dir: Path | None = None,
+) -> None:
+    reports = payload.get("trend_reports")
+    assert isinstance(reports, Mapping), "API 缺少趋势报告"
+    for broker in TREND_SIMULATE_MARKETS:
+        section = _select_account_tab(page, broker)
+        panel = section.locator(f"#account-{broker}-view-panel")
+        report_tab = section.locator('[data-account-view="report"]')
+        report_tab.click()
+        report_root = panel.locator(".cn-trend-report")
+        report_root.wait_for()
+        report = reports.get(broker)
+        assert isinstance(report, Mapping) and report.get("available") is True, (
+            f"{broker} 当前趋势报告不可用"
+        )
+        _check_integrated_trend_ui(report_root, report, broker)
+        visible_text = report_root.inner_text()
+        assert report_root.locator(".cn-trend-execution").count() == 0, (
+            f"{broker} 趋势报告仍包含已删除的执行状态行"
+        )
+        assert not any(
+            label in visible_text
+            for label in REMOVED_TREND_REPORT_POSITION_LABELS
+        ), f"{broker} 趋势报告仍混入持仓或执行信息"
+        if broker == "eastmoney" and screenshot_dir is not None:
+            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+            page.screenshot(
+                path=str(screenshot_dir / f"{width}-trend-report.png"),
+                full_page=True,
+            )
         section.locator('[data-account-view="real"]').click()
 
 
@@ -3805,6 +3840,14 @@ def _browser_check(
                             page,
                             payload,
                             reports_dir=reports_dir,
+                            screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
+                        )
+                    except Exception as exc:
+                        errors.append(f"{name}：{type(exc).__name__}: {exc}")
+                    try:
+                        _check_separated_trend_report_views(
+                            page,
+                            payload,
                             screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
                         )
                     except Exception as exc:

@@ -4273,7 +4273,10 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     visual_focus_evaluations: list[tuple[str, str]] = []
     geometry_evaluations: list[str] = []
     buy_overflow_evaluations: list[str] = []
-    state = {"fail_wide_desktop_navigation": True}
+    state = {
+        "fail_wide_desktop_navigation": True,
+        "fail_trend_account_views": False,
+    }
 
     class Locator(TabbedAccountLocator):
         def click(self) -> None:
@@ -4425,17 +4428,33 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         *,
         screenshot_dir: Path,
     ) -> None:
+        if state["fail_trend_account_views"]:
+            raise AssertionError("controller unavailable")
         width = page.viewport_size["width"]
-        page.screenshot(
-            path=str(screenshot_dir / f"{width}-trend-report.png"),
-            full_page=True,
-        )
         if width in {1440, 375}:
             page.screenshot(
                 path=str(screenshot_dir / f"{width}-trend-review.png"),
                 full_page=True,
             )
 
+    def check_separated_report_views(
+        page: Page,
+        _payload: object,
+        *,
+        screenshot_dir: Path,
+    ) -> None:
+        width = page.viewport_size["width"]
+        page.screenshot(
+            path=str(screenshot_dir / f"{width}-trend-report.png"),
+            full_page=True,
+        )
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_separated_trend_report_views",
+        check_separated_report_views,
+        raising=False,
+    )
     monkeypatch.setattr(
         dashboard_acceptance, "_check_trend_account_views", check_trend_views
     )
@@ -4539,6 +4558,21 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ("mobile", str(screenshot_dir / "375-trend-report.png")),
         ("mobile", str(screenshot_dir / "375-trend-review.png")),
     ]
+
+    state["fail_trend_account_views"] = True
+    screenshots.clear()
+    errors, blocker = dashboard_acceptance._browser_check(
+        "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
+    )
+
+    assert blocker is None
+    assert all(
+        not any(
+            error == f"验收截图缺失：{width}-trend-report.png"
+            for error in errors
+        )
+        for width in (1920, 1440, 760, 375)
+    )
 
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
