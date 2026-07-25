@@ -1960,6 +1960,28 @@ const TREND_REASON_LABELS = {
   data_date_mismatch: "数据日期不一致",
 };
 
+const CURRENT_TREND_EXIT_DISCIPLINES = new Set(["CN:v9", "US:v6", "HK:v6"]);
+
+function currentTrendExitDiscipline(report) {
+  const market = formatPlain(report?.market).toUpperCase();
+  const version = formatPlain(report?.strategy_version);
+  return CURRENT_TREND_EXIT_DISCIPLINES.has(`${market}:${version}`);
+}
+
+function trendReasonLabel(item, report) {
+  const reason = formatPlain(item?.reason);
+  if (reason !== "protection_line_already_triggered" || !currentTrendExitDiscipline(report)) {
+    return TREND_REASON_LABELS[reason] || "未知动作或原因，需人工确认";
+  }
+  const initial = item?.initial_line;
+  const active = item?.active_line;
+  return initial !== null && initial !== undefined
+    && active !== null && active !== undefined
+    && String(initial) === String(active)
+    ? "2×ATR14 硬止损"
+    : "既有活动保护线触发";
+}
+
 function renderTrendReportEntry(broker) {
   if (!ACCOUNT_BROKERS.includes(broker)) return "";
   const report = state.dashboard?.trend_reports?.[broker] || {};
@@ -2072,9 +2094,9 @@ function renderTrendReviewWorkspace(review, embedded = false) {
   </${root}>`;
 }
 
-function renderTrendAction(item, kind) {
+function renderTrendAction(item, kind, report) {
   const identity = [item.symbol, item.name].filter(Boolean).map(formatPlain).join(" ");
-  const reason = TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认";
+  const reason = trendReasonLabel(item, report);
   const fields = [identity];
   if (kind === "buy") {
     fields.push(`约 ${formatDisplayNumber(item.estimated_shares)} 股`);
@@ -2089,13 +2111,13 @@ function renderTrendAction(item, kind) {
   return `<li>${fields.map(escapeHtml).join("<span>｜</span>")}</li>`;
 }
 
-function renderTrendStage(title, items, kind) {
+function renderTrendStage(title, items, kind, report) {
   const rows = Array.isArray(items)
     ? items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
     : [];
   return `<section class="trend-stage">
     <h2>${escapeHtml(title)}</h2>
-    ${rows.length ? `<ol>${rows.map((item) => renderTrendAction(item, kind)).join("")}</ol>` : "<p>无</p>"}
+    ${rows.length ? `<ol>${rows.map((item) => renderTrendAction(item, kind, report)).join("")}</ol>` : "<p>无</p>"}
   </section>`;
 }
 
@@ -2330,7 +2352,7 @@ function syncCnTrendBuyAccessibility() {
   );
 }
 
-function renderCnSellOrHoldStage(title, items, kind) {
+function renderCnSellOrHoldStage(title, items, kind, report) {
   const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const headings = [
@@ -2343,14 +2365,14 @@ function renderCnSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell("执行参考价（Futu 前复权）", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
     ${renderCnTrendCell("温度变化", cnTrendTemperature(item))}
     ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
-    ${renderCnTrendCell(headings[5], TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
+    ${renderCnTrendCell(headings[5], trendReasonLabel(item, report))}
     ${renderCnTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : item.active_line)}
     ${renderCnTrendCell("持仓提示", cnTrendHints(item))}
   </tr>`);
   return renderCnTrendTable(title, kind, headings, rows);
 }
 
-function renderMarketSellOrHoldStage(title, items, kind) {
+function renderMarketSellOrHoldStage(title, items, kind, report) {
   const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const headings = ["标的", "动作", "执行参考价", "强度", reasonHeading, "活动保护线", "持仓提示"];
@@ -2359,7 +2381,7 @@ function renderMarketSellOrHoldStage(title, items, kind) {
     ${renderCnTrendCell("动作", action(item))}
     ${renderCnTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : item.close)}
     ${renderCnTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : item.strength)}
-    ${renderCnTrendCell(reasonHeading, TREND_REASON_LABELS[item.reason] || "未知动作或原因，需人工确认")}
+    ${renderCnTrendCell(reasonHeading, trendReasonLabel(item, report))}
     ${renderCnTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : item.active_line)}
     ${renderCnTrendCell("持仓提示", Array.isArray(item.entry_hints) && item.entry_hints.length ? item.entry_hints.map(formatPlain).join("；") : "—")}
   </tr>`);
@@ -2634,34 +2656,6 @@ function renderTrendIndustryContext(report) {
   </section>`;
 }
 
-function renderCnTrendDisciplines() {
-  const desktopOpen = typeof window === "undefined"
-    || typeof window.matchMedia !== "function"
-    || !window.matchMedia("(max-width: 760px)").matches;
-  const open = desktopOpen ? " open" : "";
-  return `<section class="cn-trend-disciplines">
-    <details class="trend-discipline"${open}><summary>买入纪律</summary><ol>
-      <li>仅限 A 股股票，排除基金、北交所、ST 与退市标的</li>
-      <li>个股必须由温转热或温转沸；热目标仓位 4%，沸目标仓位 2%</li>
-      <li>趋势强度不低于 95</li>
-      <li>行业温度为温、热或沸，节气不晚于夏至</li>
-      <li>市值不低于 100 亿元，日成交额不低于 2 亿元</li>
-      <li>当前可交易、未持有、处于右侧、无危险信号，执行价与 ATR 可用</li>
-      <li>正式计划还须通过现金与最多 10 个持仓席位约束</li>
-    </ol></details>
-    <details class="trend-discipline"${open}><summary>卖出纪律</summary><ol>
-      <li>活动保护线触发时全部卖出</li>
-      <li>危险信号触发时全部卖出</li>
-      <li>离开右侧趋势时全部卖出</li>
-      <li>温、热或沸转为平时全部卖出</li>
-      <li>沸腾或开香槟：每个完整持仓生命周期首次出现时止盈减仓 30%</li>
-      <li>两种信号合并为一次；模拟盘按下单时持仓向下取整为整手</li>
-      <li>剩余仓位继续受活动保护线和强制清仓条件约束</li>
-      <li>Trend Animals API 未提供波动率放大字段；本地不推断</li>
-    </ol></details>
-  </section>`;
-}
-
 function cnTrendAuditValue(value, suffix = "") {
   if (!hasValue(value)) return "数据未提供";
   if (typeof value === "boolean") return value ? "是" : "否";
@@ -2888,11 +2882,11 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const batchError = report.execution_batch_blocking === true
     ? `<p class="trend-execution-batch-error">${escapeHtml(formatPlain(report.execution_batch_error || "执行批次无效，已阻止操作投影"))}</p>`
     : "";
-  const sellStage = sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell");
+  const sellStage = sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell", report);
   const reviewStage = Array.isArray(report.review_actions) && report.review_actions.length
-    ? sellOrHold("需要确认 · 人工复核", report.review_actions, "review")
+    ? sellOrHold("需要确认 · 人工复核", report.review_actions, "review", report)
     : "";
-  const holdStage = sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold");
+  const holdStage = sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold", report);
   const disciplineCards = renderTrendDisciplineCards(report);
   const industryContext = renderTrendIndustryContext(report);
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.report_date);

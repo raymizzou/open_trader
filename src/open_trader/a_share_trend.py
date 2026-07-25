@@ -3317,6 +3317,23 @@ def _reason_label(value: str) -> str:
     return REASON_LABELS.get(value, f"未知原因（{value}）")
 
 
+def _holding_reason_label(
+    item: Mapping[str, object],
+    *,
+    current_exit_discipline: bool,
+) -> str:
+    reason = str(item.get("reason") or "")
+    if reason != "protection_line_already_triggered" or not current_exit_discipline:
+        return _reason_label(reason)
+    initial = _optional_decimal(item.get("initial_line"))
+    active = _optional_decimal(item.get("active_line"))
+    return (
+        "2×ATR14 硬止损"
+        if initial is not None and active == initial
+        else "既有活动保护线触发"
+    )
+
+
 def _component_api_facts(api: object, row_count: int) -> tuple[str, ...]:
     facts = [f"getComponentTicker rows={row_count} cache=client-managed"]
     ignored = tuple(getattr(api, "ignored_stale_components", ()))
@@ -3381,11 +3398,15 @@ def _feishu_identity(item: Mapping[str, object]) -> str:
     )
 
 
-def _feishu_reason(item: Mapping[str, object]) -> str:
+def _feishu_reason(
+    item: Mapping[str, object], *, current_exit_discipline: bool = False
+) -> str:
     reason = str(item.get("reason") or "")
     if reason not in REASON_LABELS:
         return "未知动作或原因，需人工确认"
-    return _reason_label(reason)
+    return _holding_reason_label(
+        item, current_exit_discipline=current_exit_discipline
+    )
 
 
 def _feishu_money(value: object) -> str:
@@ -3399,11 +3420,15 @@ def _append_feishu_action_sections(
     reviews: Sequence[Mapping[str, object]],
     *,
     market: str,
+    current_exit_discipline: bool = False,
 ) -> None:
     if sells:
         lines.extend(["", "卖出"])
         for index, item in enumerate(sells, 1):
-            line = f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            line = (
+                f"{index}. {_feishu_identity(item)}｜"
+                f"{_feishu_reason(item, current_exit_discipline=current_exit_discipline)}"
+            )
             if item.get("action") == "SELL_PARTIAL":
                 signals = {
                     "boiling": "沸腾",
@@ -3444,7 +3469,8 @@ def _append_feishu_action_sections(
     if reviews:
         lines.extend(["", "人工复核"])
         lines.extend(
-            f"{index}. {_feishu_identity(item)}｜{_feishu_reason(item)}"
+            f"{index}. {_feishu_identity(item)}｜"
+            f"{_feishu_reason(item, current_exit_discipline=current_exit_discipline)}"
             for index, item in enumerate(reviews, 1)
         )
 
@@ -3530,6 +3556,13 @@ def render_trend_feishu_text(
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
     market = str(metadata.get("market") or "CN").upper()
+    strategy_snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        str(strategy_snapshot.get("strategy_version") or "")
+        if isinstance(strategy_snapshot, Mapping)
+        else ""
+    )
+    current_exit_discipline = (market, strategy_version) in CURRENT_EXIT_DISCIPLINES
     judgments = payload.get("strategy_judgments")
     judgments = judgments if isinstance(judgments, dict) else {}
     holdings = [
@@ -3591,7 +3624,14 @@ def render_trend_feishu_text(
     ]
     if cost_label := _serialized_api_cost_label(payload):
         lines.append(cost_label)
-    _append_feishu_action_sections(lines, sells, buys, reviews, market=market)
+    _append_feishu_action_sections(
+        lines,
+        sells,
+        buys,
+        reviews,
+        market=market,
+        current_exit_discipline=current_exit_discipline,
+    )
     _append_feishu_attention(lines, payload.get("option_attention"), market=market)
     lines.extend(["", "请人工确认，不自动下单。"])
     return title, "\n".join(lines)
@@ -3631,6 +3671,8 @@ def render_trend_failure_text(
 
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
+    strategy_version = str(report.strategy_snapshot.get("strategy_version") or "")
+    current_exit_discipline = (market, strategy_version) in CURRENT_EXIT_DISCIPLINES
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
     account_currency = str(report.metadata.get("account_currency") or "")
     currency = (
@@ -3658,15 +3700,24 @@ def render_markdown(report: TrendReport) -> str:
         industry: (count, weight)
         for industry, count, weight in report.industry_concentration
     }
+    summary_counts = [f"全部卖出 {len(full_sells)}"]
+    if not current_exit_discipline:
+        summary_counts.append(f"止盈减仓 30% {len(partial_sells)}")
+    summary_counts.extend(
+        [
+            f"允许买入 {len(report.buy_actions)}",
+            f"继续持有 {len(holds)}",
+            f"人工复核 {len(reviews)}",
+            f"其他动作 {len(others)}",
+        ]
+    )
     lines = [
         f"# {market_label}趋势操作计划 · {report.execution_date}",
         "",
         "## 操作摘要",
         "",
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
-        f"全部卖出 {len(full_sells)}｜止盈减仓 30% {len(partial_sells)}｜"
-        f"允许买入 {len(report.buy_actions)}｜"
-        f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
+        "｜".join(summary_counts),
     ]
     if report.strategy_snapshot.get("strategy_version") in {
         "v3", "v4", "v5", "v6", "v7", "v8", "v9",
@@ -3720,9 +3771,12 @@ def render_markdown(report: TrendReport) -> str:
     lines.extend(["## 开盘前：确认卖出", ""])
     if sells:
         for item in sells:
+            reason = _holding_reason_label(
+                asdict(item), current_exit_discipline=current_exit_discipline
+            )
             line = (
                 f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
-                f"{_reason_label(item.reason)}"
+                f"{reason}"
             )
             if item.action == "SELL_PARTIAL":
                 signals = {
@@ -3789,9 +3843,12 @@ def render_markdown(report: TrendReport) -> str:
 
     lines.extend(["", "## 继续持有与人工复核", ""])
     for item in [*holds, *reviews, *others]:
+        reason = _holding_reason_label(
+            asdict(item), current_exit_discipline=current_exit_discipline
+        )
         line = (
             f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
-            f"{_reason_label(item.reason)}"
+            f"{reason}"
         )
         if item.active_line is not None:
             line += f"｜活动保护线 {_money(item.active_line)}"

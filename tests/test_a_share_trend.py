@@ -3703,6 +3703,45 @@ def test_partial_action_labels_simulated_target_signals_and_warnings() -> None:
     assert trend_module.REASON_LABELS["holding_lot_size_unavailable"] == "持仓整手信息不可用"
 
 
+def test_current_exit_copy_uses_hard_stop_and_omits_partial_count() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={"600001": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+        watch_events=({"symbol": "600001", "event_type": "protection_triggered"},),
+    )
+    current_snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v9"
+    )
+    current_payload = trend_module._report_payload(built)
+    current_payload["strategy_snapshot"] = current_snapshot
+    _, feishu = render_trend_feishu_text(
+        current_payload, broker_label="东方财富", market_label="A股"
+    )
+    markdown = render_markdown(replace(built, strategy_snapshot=current_snapshot))
+
+    for text in ("2×ATR14 硬止损",):
+        assert text in markdown
+        assert text in feishu
+    assert "止盈减仓 30%" not in markdown
+    assert "止盈减仓 30%" not in feishu
+    assert "全部卖出 1｜允许买入 0" in markdown
+
+
 def test_trend_feishu_text_uses_short_no_trade_template() -> None:
     payload = {
         "execution_date": "2026-07-15",

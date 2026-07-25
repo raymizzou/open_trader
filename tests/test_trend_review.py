@@ -6242,9 +6242,9 @@ def test_projection_prefers_v9_when_v8_and_v9_facts_are_mixed(
 @pytest.mark.parametrize(
     ("market", "strategy_versions"),
     [
-        ("CN", ("v4", "v7", "v8")),
-        ("US", ("v4", "v5")),
-        ("HK", ("v4", "v5")),
+        ("CN", ("v4", "v7", "v8", "v9")),
+        ("US", ("v4", "v5", "v6")),
+        ("HK", ("v4", "v5", "v6")),
     ],
 )
 def test_projection_accepts_approved_mixed_sample_identities(

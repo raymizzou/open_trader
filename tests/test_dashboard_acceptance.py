@@ -1139,7 +1139,7 @@ def integrated_v4_payload(
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            ("v8" if market == "CN" else "v5")
+            ("v9" if market == "CN" else "v6")
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )

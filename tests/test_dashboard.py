@@ -1912,7 +1912,7 @@ def test_dashboard_accepts_cn_v7_risk_and_drawdown_contract() -> None:
     assert dashboard_module._valid_trend_risk_summary(payload)
 
 
-@pytest.mark.parametrize("strategy_version", ["v5", "v8"])
+@pytest.mark.parametrize("strategy_version", ["v5", "v8", "v9"])
 def test_dashboard_accepts_current_live_risk_and_drawdown_contract(
     strategy_version: str,
 ) -> None:

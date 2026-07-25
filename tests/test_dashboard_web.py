@@ -5250,11 +5250,18 @@ console.log("ok");
 
 def test_dashboard_cn_disciplines_show_relaxed_current_entry_rules() -> None:
     output = run_dashboard_js(r'''
-const html = renderCnTrendDisciplines();
-for (const text of ["行业温度为温、热或沸", "强度不低于 95", "ATR 可用"]) {
+const html = renderTrendReportWorkspace({
+  market:"CN", strategy_version:"v9", counts:{}, sell_actions:[], buy_actions:[],
+  hold_actions:[], review_actions:[], audit:{}, strategy_parameter_rows:[
+    {group:"入场过滤", name:"行业温度", value:"温、热或沸"},
+    {group:"入场过滤", name:"趋势强度", value:"不低于 95"},
+    {group:"退出保护", name:"初始保护线", value:"成交均价减 2.0 倍 ATR14"},
+  ],
+});
+for (const text of ["温、热或沸", "不低于 95", "ATR14"]) {
   if (!html.includes(text)) throw new Error(text + "\n" + html);
 }
-for (const text of ["筛选价不高于 200 元", "行业温度为热或沸"]) {
+for (const text of ["筛选价不高于 200 元", "行业温度为热或沸", "沸状态仓位"]) {
   if (html.includes(text)) throw new Error(text + "\n" + html);
 }
 console.log("ok");
@@ -5326,7 +5333,48 @@ for (const mobile of [false, true]) {
       }
 }
 if (optionAttentionAction("SELL_PARTIAL") !== "止盈减仓 30%") throw new Error("partial option attention action");
-if (!renderCnTrendDisciplines().includes("Trend Animals API 未提供波动率放大字段；本地不推断")) throw new Error("missing volatility discipline");
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_current_and_historical_exit_copy() -> None:
+    output = run_dashboard_js(r'''
+const report = (market) => ({
+  market, broker_label:"测试", market_label:market, report_date:"2026-07-27",
+  data_date:"2026-07-26", generated_at:"now", account_status:"已更新", buy_window:"09:30–10:00",
+  counts:{sell:1}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], audit:{},
+});
+const current = renderTrendReportWorkspace({
+  ...report("CN"),
+  strategy_version:"v9",
+  strategy_parameter_rows:[
+    {group:"仓位执行",name:"目标仓位",value:"账户净值的 4%"},
+    {group:"退出保护",name:"退出条件",value:"危险、离开右侧、转平或保护线清仓"},
+  ],
+  sell_actions:[{
+    action:"SELL_ALL", symbol:"600001", name:"测试", reason:"protection_line_already_triggered",
+    initial_line:"8", active_line:"8",
+  }],
+});
+if (!current.includes("目标仓位") || current.includes("止盈减仓 30%")
+    || current.includes("沸状态仓位") || !current.includes("2×ATR14 硬止损")) {
+  throw new Error(current);
+}
+const historical = renderTrendReportWorkspace({
+  ...report("US"),
+  strategy_version:"v5",
+  strategy_parameter_rows:[
+    {group:"退出保护",name:"过热止盈比例",value:"沸腾或开香槟时减仓 30%"},
+  ],
+  sell_actions:[{
+    action:"SELL_PARTIAL", symbol:"AAPL", name:"Apple", reason:"overheat_take_profit",
+    estimated_shares:3,
+  }],
+});
+if (!historical.includes("止盈减仓 30%")
+    || !historical.includes("沸腾或开香槟时减仓 30%")) throw new Error(historical);
 console.log("ok");
 ''')
 

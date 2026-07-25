@@ -47,9 +47,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8"}),
-    "US": frozenset({"v4", "v5"}),
-    "HK": frozenset({"v4", "v5"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9"}),
+    "US": frozenset({"v4", "v5", "v6"}),
+    "HK": frozenset({"v4", "v5", "v6"}),
 }
 ACCOUNT_VIEW_LABELS = {
     "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
@@ -2181,6 +2181,29 @@ def _trend_table_text(value: Any) -> str:
     return "—" if value == "-" else value
 
 
+def _trend_action_reason_label(
+    item: Mapping[str, Any], report: Mapping[str, Any]
+) -> str:
+    reason = str(item.get("reason") or "")
+    market = str(report.get("market") or "").upper()
+    version = str(report.get("strategy_version") or "")
+    if reason == "protection_line_already_triggered" and (
+        market,
+        version,
+    ) in {("CN", "v9"), ("US", "v6"), ("HK", "v6")}:
+        try:
+            initial = Decimal(str(item.get("initial_line")))
+            active = Decimal(str(item.get("active_line")))
+        except (InvalidOperation, TypeError, ValueError):
+            initial = active = None
+        return (
+            "2×ATR14 硬止损"
+            if initial is not None and active == initial
+            else "既有活动保护线触发"
+        )
+    return TREND_REASON_LABELS.get(reason, "未知动作或原因，需人工确认")
+
+
 def _check_action_trend_stages(
     stage_texts: list[str], report: Mapping[str, Any], broker: str,
 ) -> None:
@@ -2239,10 +2262,7 @@ def _check_action_trend_stages(
             elif broker != "eastmoney":
                 facts = (
                     item.get("close"), item.get("strength"),
-                    TREND_REASON_LABELS.get(
-                        str(item.get("reason", "")),
-                        "未知动作或原因，需人工确认",
-                    ),
+                    _trend_action_reason_label(item, report),
                     _display_number(item.get("active_line")),
                     *(
                         item.get("entry_hints")
@@ -2254,9 +2274,7 @@ def _check_action_trend_stages(
                     item.get("close"),
                     f"{_trend_table_text(item.get('temperature_prev'))} → {_trend_table_text(item.get('temperature_curr'))}",
                     item.get("strength"),
-                    TREND_REASON_LABELS.get(
-                        str(item.get("reason", "")), "未知动作或原因，需人工确认"
-                    ),
+                    _trend_action_reason_label(item, report),
                     _display_price(item.get("active_line")),
                     *(
                         item.get("entry_hints")
