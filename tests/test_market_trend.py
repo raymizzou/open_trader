@@ -50,7 +50,9 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def unlock_live_drawdown(data_dir: Path, market: str) -> None:
-    version = "v5"
+    # These fixtures generate reports for 2026-07-16, before the market v5
+    # effective dates, so the runner must use the historical v4 drawdown key.
+    version = "v4"
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
@@ -870,6 +872,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert "禁止买入" not in message
     assert "http" not in message.lower()
     payload = __import__("json").loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert [item["symbol"] for item in payload["option_attention"]] == [
         "00700",
         "02800",
@@ -897,7 +900,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
-    assert payload["strategy_snapshot"]["strategy_version"] == "v5"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
@@ -1139,6 +1142,7 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     assert payload["account"]["fresh"] is True
     assert payload["metadata"]["simulate_acc_id"] == 102
     assert payload["account"]["source_date"] == "2026-07-14"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert payload["strategy_judgments"]["formal_actions"] == []
     assert payload["risk_summary"]["kelly_phase"] == "active_all_samples"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 30

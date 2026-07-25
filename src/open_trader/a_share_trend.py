@@ -5283,6 +5283,7 @@ def _attempt_report(
             "CN",
             process_version,
             candidate_pool_ids,
+            execution_date=execution_date,
         )
         drawdown_summary = observe_strategy_equity(
             config.data_dir,

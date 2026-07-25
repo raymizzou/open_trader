@@ -1035,7 +1035,10 @@ def _attempt_market_report(
         process_version = _process_version(config.repo)
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
         strategy_snapshot = live_trend_strategy_snapshot(
-            market, process_version, pool_ids
+            market,
+            process_version,
+            pool_ids,
+            execution_date=execution_date,
         )
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
