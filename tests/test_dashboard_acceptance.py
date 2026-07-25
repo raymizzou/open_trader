@@ -1661,7 +1661,7 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
     assert ".trend-risk-summary .trend-drawdown-recovery-audit summary" in clicked
 
 
-def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None:
+def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_context() -> None:
     rows = [
         {"group": "候选来源", "name": "组合", "value": "冻结"},
         {"group": "入场过滤", "name": "强度", "value": "不低于 95"},
@@ -1771,7 +1771,8 @@ def test_acceptance_checks_frozen_lifecycle_cards_and_industry_context() -> None
     dashboard_acceptance._check_frozen_trend_disciplines(
         Root(),
         {
-            "strategy_parameter_rows": rows,
+            "strategy_parameter_rows": [],
+            "current_strategy_parameter_rows": rows,
             "api_cost": {"label": "实际 API 成本 1.25 单位"},
             "industry_context_status": {
                 "ordering_mode": "context_with_history",

@@ -5,9 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-25
 
-- Changed the Dashboard discipline cards to show the current market strategy
-  version instead of obsolete frozen report rules, while retaining the frozen
-  parameters for historical audit and legacy action compatibility.
+- Changed the Dashboard discipline cards and acceptance checks to use the
+  current market strategy version instead of obsolete frozen report rules,
+  while retaining frozen parameters for historical audit and legacy actions.
 - Prevented once-only US/HK protection checks from sleeping until the next
   market open on weekends or holidays, so controller heartbeats and
   reconciliation continue while markets are closed.

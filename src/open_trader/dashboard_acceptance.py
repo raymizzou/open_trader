@@ -1152,7 +1152,12 @@ def _check_frozen_trend_disciplines(
     report_root: Any, report: Mapping[str, Any], broker: str,
     *, page: Any | None = None,
 ) -> None:
-    raw_rows = report.get("strategy_parameter_rows")
+    current_rows = report.get("current_strategy_parameter_rows")
+    raw_rows = (
+        current_rows
+        if isinstance(current_rows, list)
+        else report.get("strategy_parameter_rows")
+    )
     rows = raw_rows if isinstance(raw_rows, list) else []
     has_rows = bool(rows)
     workspace = report_root.locator(".trend-discipline-workspace")
@@ -1188,7 +1193,7 @@ def _check_frozen_trend_disciplines(
         )
         summary.focus()
         assert summary.evaluate("element => element === document.activeElement"), (
-            f"{broker} 冻结纪律摘要不可键盘聚焦"
+            f"{broker} 纪律摘要不可键盘聚焦"
         )
     evaluate_all = getattr(summaries, "evaluate_all", None)
     if callable(evaluate_all):
@@ -1196,23 +1201,23 @@ def _check_frozen_trend_disciplines(
             "nodes => nodes.map(node => ({height: node.getBoundingClientRect().height}))"
         )
         assert all(box.get("height", 0) >= 44 for box in boxes), (
-            f"{broker} 冻结纪律摘要不足 44px：{boxes}"
+            f"{broker} 纪律摘要不足 44px：{boxes}"
         )
     workspace_text = report_root.inner_text()
     if has_rows:
         for row in rows:
-            assert isinstance(row, Mapping), f"{broker} 冻结策略参数行格式无效"
+            assert isinstance(row, Mapping), f"{broker} 策略参数行格式无效"
             for key in ("group", "name", "value"):
                 value = row.get(key)
                 assert value is not None and str(value) in workspace_text, (
-                    f"{broker} 冻结纪律缺少 {key}：{value}"
+                    f"{broker} 纪律缺少 {key}：{value}"
                 )
     else:
         assert "本报告未提供该类纪律参数" in workspace_text, (
-            f"{broker} 无冻结参数时缺少明确空状态"
+            f"{broker} 无纪律参数时缺少明确空状态"
         )
         assert "趋势强度不低于 95" not in workspace_text, (
-            f"{broker} 无冻结参数时泄漏当前入场规则"
+            f"{broker} 无纪律参数时泄漏当前入场规则"
         )
     cost = report.get("api_cost")
     if isinstance(cost, Mapping) and cost.get("label"):
