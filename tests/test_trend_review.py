@@ -67,6 +67,29 @@ def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> 
     ] == "v4"
 
 
+@pytest.mark.parametrize("strategy_version", ["v8", "v9"])
+def test_risk_aware_buy_completion_accepts_current_and_legacy_versions(
+    strategy_version: str,
+) -> None:
+    action = {
+        "lot_size": 100,
+        "estimated_shares": 400,
+        "target_amount": "4000",
+        "atr": "0.5",
+        "planned_stop_risk": "101",
+    }
+    report = {
+        "metadata": {"price_fx_to_account_currency": "1"},
+        "risk_summary": {"normal_cost_rate": "0.001"},
+        "strategy_snapshot": {"strategy_version": strategy_version},
+    }
+    snapshot = {"available_cash": "100000"}
+
+    assert trend_review._remaining_buy_quantity(
+        action, report, snapshot, (), Decimal("10")
+    ) == 100
+
+
 def frozen_evidence() -> dict[str, object]:
     return {
         "market": "CN",
@@ -182,21 +205,22 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["account"]["net_value"] == "100000"
 
 
-def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
-    tmp_path: Path,
+@pytest.mark.parametrize("strategy_version", ["v4", "v9"])
+def test_risk_version_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
+    tmp_path: Path, strategy_version: str,
 ) -> None:
     snapshot = live_trend_strategy_snapshot(
         "CN",
         "oldsha",
         (622466, 697199),
-        strategy_version="v4",
+        strategy_version=strategy_version,
     )
     drawdown = {
         "schema_version": "open_trader.strategy_drawdown.v1",
         "market": "CN",
         "strategy_id": snapshot["strategy_id"],
-        "strategy_version": "v4",
-        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v4|v4",
+        "strategy_version": strategy_version,
+        "kelly_sample_key": f"CN|trend_animals_warm_to_hot/CN/{strategy_version}|{strategy_version}",
         "state_status": "ok",
         "status": "active",
         "status_label": "纪律内",
@@ -259,7 +283,7 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
         tmp_path,
         market="CN",
         strategy_id=str(snapshot["strategy_id"]),
-        strategy_version="v4",
+        strategy_version=strategy_version,
         parameters={"drawdown_limit": "0.05"},
         baseline_equity=Decimal("100000"),
         source_date="2026-07-16",
@@ -273,7 +297,7 @@ def test_v4_rebuild_uses_frozen_drawdown_decision_after_live_state_changes(
         tmp_path,
         market="CN",
         strategy_id=str(snapshot["strategy_id"]),
-        strategy_version="v4",
+        strategy_version=strategy_version,
         current_equity=Decimal("90000"),
         observed_at="2026-07-17T17:00:00+08:00",
     )
@@ -6184,7 +6208,7 @@ def write_projection_strategy_facts(
 
 @pytest.mark.parametrize(
     ("market", "strategy_version"),
-    [("CN", "v8"), ("US", "v5"), ("HK", "v5")],
+    [("CN", "v9"), ("US", "v6"), ("HK", "v6")],
 )
 def test_projection_accepts_current_live_strategy_versions(
     tmp_path: Path, market: str, strategy_version: str,
@@ -6197,6 +6221,22 @@ def test_projection_accepts_current_live_strategy_versions(
     projection = trend_review.build_trend_review_projection(tmp_path, market)
 
     assert projection["strategy_snapshot"]["strategy_version"] == strategy_version
+
+
+def test_projection_prefers_v9_when_v8_and_v9_facts_are_mixed(
+    tmp_path: Path,
+) -> None:
+    snapshots = [
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (), strategy_version=version
+        )
+        for version in ("v8", "v9")
+    ]
+    write_projection_strategy_facts(tmp_path, "CN", snapshots)
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v9"
 
 
 @pytest.mark.parametrize(
