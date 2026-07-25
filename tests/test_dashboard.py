@@ -1636,6 +1636,15 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
     assert projected["strategy_parameter_rows"] == payload["strategy_snapshot"][
         "parameter_rows"
     ]
+    assert projected["current_strategy_version"] == "v9"
+    current_rows = {
+        row["name"]: row["value"]
+        for row in projected["current_strategy_parameter_rows"]
+    }
+    assert current_rows["目标仓位"] == "账户净值的 4%"
+    assert "沸状态仓位" not in current_rows
+    assert "过热止盈比例" not in current_rows
+    assert "过热跟踪" not in current_rows
     assert projected["audit"]["estimated_api_cost"] == payload[
         "estimated_api_cost"
     ]

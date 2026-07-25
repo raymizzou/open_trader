@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-25
 
+- Changed the Dashboard discipline cards to show the current market strategy
+  version instead of obsolete frozen report rules, while retaining the frozen
+  parameters for historical audit and legacy action compatibility.
 - Published CN v9, US v6, and HK v6 trend discipline: A-share hot/boiling
   entries now share the 4% ceiling; new reports no longer create 30% overheat
   trims or trailing-line raises; danger, right-side exit, temperature-flat, and

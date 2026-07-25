@@ -2493,6 +2493,15 @@ function trendFrozenStrategyRows(report) {
     && hasValue(row.group) && hasValue(row.name) && hasValue(row.value));
 }
 
+function trendDisplayedStrategyRows(report) {
+  const current = report && Array.isArray(report.current_strategy_parameter_rows)
+    ? report.current_strategy_parameter_rows
+    : null;
+  return current === null ? trendFrozenStrategyRows(report)
+    : current.filter((row) => row && typeof row === "object" && !Array.isArray(row)
+      && hasValue(row.group) && hasValue(row.name) && hasValue(row.value));
+}
+
 function trendDisciplineLifecycle(parameterRows) {
   const rows = Array.isArray(parameterRows)
     ? parameterRows.filter((row) => row && typeof row === "object" && !Array.isArray(row)
@@ -2539,13 +2548,18 @@ function renderTrendDisciplineCategory(card) {
 }
 
 function renderTrendDisciplineCards(report) {
-  const rows = trendFrozenStrategyRows(report);
+  const rows = trendDisplayedStrategyRows(report);
   const cards = trendDisciplineLifecycle(rows);
-  const headline = `${cards.length} 类 · ${rows.length} 项 · 本报告生成时参数`;
+  const version = formatPlain(report?.current_strategy_version || report?.strategy_version || "-");
+  const current = Array.isArray(report?.current_strategy_parameter_rows);
+  const headline = `${cards.length} 类 · ${rows.length} 项 · ${current ? `当前版本 ${version}` : `报告版本 ${version}`}`;
+  const note = current
+    ? "展示当前生效纪律；所选报告的冻结参数仍保留在历史审计数据中。"
+    : "当前纪律不可用，展示所选报告生成时冻结的策略参数。";
   return `<details class="trend-discipline-workspace" aria-label="纪律">
     <summary>纪律 <span>${escapeHtml(headline)}</span><small>已折叠</small></summary>
     <div class="trend-discipline-workspace-body">
-      <p class="trend-discipline-note">仅展示所选报告生成时冻结的策略参数；历史报告不会套用当前规则。</p>
+      <p class="trend-discipline-note">${escapeHtml(note)}</p>
       <div class="trend-discipline-grid">${cards.map((card) => renderTrendDisciplineCategory(card)).join("")}</div>
     </div>
   </details>`;

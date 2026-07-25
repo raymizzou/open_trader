@@ -5368,13 +5368,38 @@ const historical = renderTrendReportWorkspace({
   strategy_parameter_rows:[
     {group:"退出保护",name:"过热止盈比例",value:"沸腾或开香槟时减仓 30%"},
   ],
+  current_strategy_version:"v6",
+  current_strategy_parameter_rows:[
+    {group:"仓位执行",name:"目标仓位",value:"账户净值的 4%"},
+    {group:"退出保护",name:"初始保护线",value:"成交均价减 2.0 倍 ATR14"},
+    {group:"退出保护",name:"退出条件",value:"危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"},
+  ],
   sell_actions:[{
     action:"SELL_PARTIAL", symbol:"AAPL", name:"Apple", reason:"overheat_take_profit",
     estimated_shares:3,
   }],
 });
-if (!historical.includes("止盈减仓 30%")
-    || !historical.includes("沸腾或开香槟时减仓 30%")) throw new Error(historical);
+if (!historical.includes("止盈减仓 30%")) throw new Error(historical);
+const historicalDiscipline = renderTrendDisciplineCards({
+  market:"US",
+  strategy_version:"v5",
+  strategy_parameter_rows:[
+    {group:"仓位执行",name:"目标仓位",value:"账户净值的 2%"},
+    {group:"退出保护",name:"过热止盈比例",value:"沸腾或开香槟时减仓 30%"},
+  ],
+  current_strategy_version:"v6",
+  current_strategy_parameter_rows:[
+    {group:"仓位执行",name:"目标仓位",value:"账户净值的 4%"},
+    {group:"退出保护",name:"初始保护线",value:"成交均价减 2.0 倍 ATR14"},
+    {group:"退出保护",name:"退出条件",value:"危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"},
+  ],
+});
+if (!historicalDiscipline.includes("当前版本 v6")
+    || !historicalDiscipline.includes("账户净值的 4%")
+    || !historicalDiscipline.includes("2.0 倍 ATR14")
+    || !historicalDiscipline.includes("温度转平")
+    || historicalDiscipline.includes("账户净值的 2%")
+    || historicalDiscipline.includes("减仓 30%")) throw new Error(historicalDiscipline);
 console.log("ok");
 ''')
 

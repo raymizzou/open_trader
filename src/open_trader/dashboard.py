@@ -21,6 +21,7 @@ from .a_share_trend import (
     REASON_LABELS,
     SINGLE_ENTRY_RISK_LIMIT,
     TREND_API_COST_UNIT,
+    live_trend_strategy_snapshot,
     trend_api_cost_label,
     valid_serialized_account,
     valid_v2_risk_contract,
@@ -1836,6 +1837,8 @@ def _project_broker_trend_report(
             "latest_report_sha256": "",
             "revision_anomaly": False,
             "strategy_version": "",
+            "current_strategy_version": "",
+            "current_strategy_parameter_rows": [],
             "report_date": "",
             "data_date": "",
             "generated_at": "",
@@ -1921,6 +1924,17 @@ def _project_broker_trend_report(
     )
     if not isinstance(frozen_parameter_rows, list):
         frozen_parameter_rows = []
+    candidate_pool_ids = strategy_parameters.get("candidate_pool_ids")
+    current_strategy_snapshot = (
+        live_trend_strategy_snapshot(
+            market,
+            str(strategy_snapshot.get("process_version") or ""),
+            candidate_pool_ids,
+        )
+        if isinstance(strategy_snapshot, dict)
+        and isinstance(candidate_pool_ids, list)
+        else {}
+    )
     actual_overlay = _project_trend_actual_overlay(
         broker=broker,
         market=market,
@@ -1943,6 +1957,12 @@ def _project_broker_trend_report(
         "revision_anomaly": revision_anomaly,
         "strategy_version": str(
             (payload.get("strategy_snapshot") or {}).get("strategy_version") or ""
+        ),
+        "current_strategy_version": str(
+            current_strategy_snapshot.get("strategy_version") or ""
+        ),
+        "current_strategy_parameter_rows": current_strategy_snapshot.get(
+            "parameter_rows", []
         ),
         "data_status": "current" if current else "stale",
         "broker": broker,
