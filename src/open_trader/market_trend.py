@@ -61,7 +61,7 @@ from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import to_futu_symbol
 from .parsers.base import detect_asset_class
-from .trend_animals import TrendAnimalsClient, TrendAnimalsLookupError
+from .trend_animals import TrendAnimalsClient, TrendAnimalsError, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
 from .strategy_drawdown import observe_strategy_equity
@@ -72,6 +72,12 @@ MARKET_SETTINGS = {
     "US": {"broker": "tiger", "currency": "HKD", "asset": "美股", "deadline": time(12)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
 }
+MARKET_UPDATE_ASSETS = {
+    "US": ("美股", "美国ETF"),
+    "HK": ("港股", "香港ETF"),
+}
+HK_ETF_ROOT_TM_ID = 707617
+HK_ETF_WARM_TO_HOT_NAME = "温转热(香港ETF)"
 MARKET_NOTIFICATION_LABELS = {
     "US": ("老虎", "美股", "确认 Trend Animals 与老虎账户状态后手动重跑老虎报告"),
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
@@ -498,8 +504,44 @@ def _status_date(row: Mapping[str, object]) -> str:
 def updates_ready(
     rows: Sequence[Mapping[str, object]], *, market: str, as_of_date: str
 ) -> bool:
-    asset = str(MARKET_SETTINGS[_market(market)]["asset"])
-    return any(row.get("asset") == asset and _status_date(row) == as_of_date for row in rows)
+    required = MARKET_UPDATE_ASSETS[_market(market)]
+    dates = {
+        str(row.get("asset")): _status_date(row)
+        for row in rows
+        if row.get("asset") in required
+    }
+    return all(dates.get(asset) == as_of_date for asset in required)
+
+
+def _candidate_pool_components(
+    api: object,
+    *,
+    market: str,
+    pool_id: int,
+    expected_date: str,
+) -> tuple[list[Mapping[str, object]], int | None]:
+    rows = api.get_components(  # type: ignore[attr-defined]
+        tm_id=pool_id,
+        expected_date=expected_date,
+    )
+    if market != "HK" or pool_id != HK_ETF_ROOT_TM_ID:
+        return list(rows), pool_id
+    matches = [
+        row for row in rows
+        if row.get("tickerName") == HK_ETF_WARM_TO_HOT_NAME
+    ]
+    if not matches:
+        return [], None
+    if len(matches) != 1:
+        raise TrendAnimalsError("HK ETF warm-to-hot pool is not unique")
+    resolved_id = _row_tm_id(matches[0])
+    return (
+        list(api.get_components(  # type: ignore[attr-defined]
+            tm_id=resolved_id,
+            expected_date=expected_date,
+        )),
+        resolved_id,
+    )
 
 
 def _write_log(path: Path, event: Mapping[str, object]) -> None:
@@ -879,8 +921,21 @@ def _attempt_market_report(
         )
         component_rows: list[Mapping[str, object]] = []
         component_pools: defaultdict[int, set[str]] = defaultdict(set)
+        pool_resolution_facts: list[str] = []
+        extra_component_requests = 0
         for pool_id in pool_ids:
-            rows = api.get_components(tm_id=pool_id, expected_date=as_of_date)
+            rows, resolved_pool_id = _candidate_pool_components(
+                api,
+                market=market,
+                pool_id=pool_id,
+                expected_date=as_of_date,
+            )
+            if market == "HK" and pool_id == HK_ETF_ROOT_TM_ID:
+                extra_component_requests += int(resolved_pool_id is not None)
+                pool_resolution_facts.append(
+                    "getComponentTicker configured_pool=707617 "
+                    f"resolved_pool={resolved_pool_id or 'none'}"
+                )
             component_rows.extend(rows)
             for row in rows:
                 component_pools[_row_tm_id(row)].add(str(pool_id))
@@ -1009,8 +1064,10 @@ def _attempt_market_report(
             "misses": sum(event.get("cache") == "miss" for event in cache_events),
             "events": [dict(event) for event in cache_events],
         }
-        expected_component_requests = len(pool_ids) + int(
-            industry_facts["component_requests"]
+        expected_component_requests = (
+            len(pool_ids)
+            + extra_component_requests
+            + int(industry_facts["component_requests"])
         )
         component_events = [
             event for event in cache_events
@@ -1061,6 +1118,7 @@ def _attempt_market_report(
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
                 *_component_api_facts(api, len(component_rows)),
+                *pool_resolution_facts,
                 f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
                 f"getComponentTicker eligible_industries={industry_facts['component_requests']} rows={industry_facts['component_rows']} cache=client-managed",
                 f"getTickerSnapshot fields={','.join(INDUSTRY_MEMBER_FIELDS)} ids={len(industry_facts['member_ids'])} rows={industry_facts['member_rows']} cache=client-managed",

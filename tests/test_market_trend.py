@@ -22,12 +22,14 @@ from open_trader.market_trend import (
     MARKET_NOTIFICATION_LABELS,
     MARKET_SETTINGS,
     MarketHoliday,
+    _candidate_pool_components,
     load_market_account,
     market_paths,
     resolve_market_dates,
     run_market_trend_report,
     updates_ready,
 )
+from open_trader.trend_animals import TrendAnimalsError
 from open_trader.notifications import (
     FeishuWebhookNotifier,
     NotificationError,
@@ -577,14 +579,110 @@ def test_resolve_market_dates_marks_missing_target_session_as_holiday() -> None:
         resolve_market_dates(Quote(), market="US", run_date="2026-07-15")
 
 
-def test_updates_ready_requires_the_market_base_asset_date() -> None:
-    rows = [
-        {"asset": "港股", "asOfDate": "2026-07-15"},
-        {"asset": "美股", "asOfDate": "2026-07-14"},
-    ]
-    assert updates_ready(rows, market="HK", as_of_date="2026-07-15") is True
-    assert updates_ready(rows, market="US", as_of_date="2026-07-14") is True
-    assert updates_ready(rows, market="US", as_of_date="2026-07-15") is False
+@pytest.mark.parametrize(
+    ("market", "as_of_date", "rows"),
+    [
+        (
+            "US",
+            "2026-07-24",
+            [
+                {"asset": "美股", "asOfDate": "2026-07-24"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-24"},
+            ],
+        ),
+        (
+            "HK",
+            "2026-07-24",
+            [
+                {"asset": "港股", "asOfDate": "2026-07-24"},
+                {"asset": "香港ETF", "asOfDate": "2026-07-24"},
+            ],
+        ),
+    ],
+)
+def test_updates_ready_requires_stock_and_etf_dates(
+    market: str,
+    as_of_date: str,
+    rows: list[dict[str, object]],
+) -> None:
+    assert updates_ready(rows, market=market, as_of_date=as_of_date) is True
+    assert updates_ready(rows[:-1], market=market, as_of_date=as_of_date) is False
+    rows[-1]["asOfDate"] = "2026-07-23"
+    assert updates_ready(rows, market=market, as_of_date=as_of_date) is False
+
+
+def test_hk_etf_root_missing_warm_to_hot_is_empty() -> None:
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert (tm_id, expected_date) == (707617, "2026-07-24")
+            return [{
+                "tmId": 707815,
+                "tickerName": "行业趋势龙头(香港ETF)",
+                "asOfDate": expected_date,
+            }]
+
+    assert _candidate_pool_components(
+        Api(),
+        market="HK",
+        pool_id=707617,
+        expected_date="2026-07-24",
+    ) == ([], None)
+
+
+def test_hk_etf_root_loads_unique_warm_to_hot_child() -> None:
+    security = {
+        "tmId": 708001,
+        "tickerSymbol": "02800.HK",
+        "asOfDate": "2026-07-24",
+    }
+
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return {
+                707617: [{
+                    "tmId": 707900,
+                    "tickerName": "温转热(香港ETF)",
+                    "asOfDate": expected_date,
+                }],
+                707900: [security],
+            }[tm_id]
+
+    assert _candidate_pool_components(
+        Api(),
+        market="HK",
+        pool_id=707617,
+        expected_date="2026-07-24",
+    ) == ([security], 707900)
+
+
+def test_hk_etf_root_rejects_duplicate_warm_to_hot_children() -> None:
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "tmId": child_id,
+                    "tickerName": "温转热(香港ETF)",
+                    "asOfDate": expected_date,
+                }
+                for child_id in (707900, 707901)
+            ]
+
+    with pytest.raises(
+        TrendAnimalsError,
+        match="HK ETF warm-to-hot pool is not unique",
+    ):
+        _candidate_pool_components(
+            Api(),
+            market="HK",
+            pool_id=707617,
+            expected_date="2026-07-24",
+        )
 
 
 def test_market_report_retries_every_ten_minutes_and_stops_after_success(
@@ -735,7 +833,10 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             api_instances += 1
 
         def get_update_status(self) -> list[dict[str, object]]:
-            return [{"asset": "港股", "asOfDate": "2026-07-15"}]
+            return [
+                {"asset": "港股", "asOfDate": "2026-07-15"},
+                {"asset": "香港ETF", "asOfDate": "2026-07-15"},
+            ]
 
         def get_account_balance(self) -> dict[str, object]:
             return {"balance": "100"}
@@ -1033,7 +1134,10 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             pass
 
         def get_update_status(self) -> list[dict[str, object]]:
-            return [{"asset": "美股", "asOfDate": "2026-07-14"}]
+            return [
+                {"asset": "美股", "asOfDate": "2026-07-14"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-14"},
+            ]
 
         def get_account_balance(self) -> dict[str, object]:
             return {"balance": "100"}
@@ -1231,7 +1335,10 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
             pass
 
         def get_update_status(self) -> list[dict[str, object]]:
-            return [{"asset": "美股", "asOfDate": "2026-07-14"}]
+            return [
+                {"asset": "美股", "asOfDate": "2026-07-14"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-14"},
+            ]
 
         def get_account_balance(self) -> dict[str, object]:
             return {"balance": "100"}
