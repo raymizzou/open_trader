@@ -245,10 +245,12 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
 
 
 @pytest.mark.parametrize(
-    ("market", "source_date", "entry_date"),
+    ("market", "source_date", "entry_date", "expected_version"),
     [
-        ("US", "2026-07-23", "2026-07-24"),
-        ("HK", "2026-07-26", "2026-07-27"),
+        ("CN", "2026-07-26", "2026-07-27", "v9"),
+        ("US", "2026-07-23", "2026-07-24", "v5"),
+        ("US", "2026-07-26", "2026-07-27", "v6"),
+        ("HK", "2026-07-26", "2026-07-27", "v6"),
     ],
 )
 def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
@@ -257,6 +259,7 @@ def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
     market: str,
     source_date: str,
     entry_date: str,
+    expected_version: str,
 ) -> None:
     config = SimpleNamespace(
         data_dir=tmp_path / "data",
@@ -332,8 +335,11 @@ def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
         "--repo", str(tmp_path),
         "--actor", "pytest",
     ]) == 0
-    assert (market, entry_date, "v6") in calls
-    assert market_inputs[market].strategy_snapshot["strategy_version"] == "v6"
+    assert (market, entry_date, expected_version) in calls
+    assert (
+        market_inputs[market].strategy_snapshot["strategy_version"]
+        == expected_version
+    )
 
 
 def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
