@@ -5026,6 +5026,61 @@ console.log("ok");
     assert ".cn-trend-buy {\n    overflow-x: hidden;\n  }" in mobile
 
 
+def test_dashboard_report_keeps_strategy_and_risk_but_excludes_positions() -> None:
+    output = run_dashboard_js(r'''
+state.trendSimulatePositions = {eastmoney:{available:true,positions:[{
+  market:"CN",symbol:"600001",name:"测试",quantity:"300",cost_price:"10",last_price:"10",
+}]}};
+const html = renderTrendReportWorkspace({
+  available:true,market:"CN",broker:"eastmoney",broker_label:"东方财富",market_label:"A股",
+  report_date:"2026-07-16",data_date:"2026-07-15",generated_at:"now",
+  account_status:"已更新",buy_window:"09:30–10:00",
+  counts:{sell:0,buy:1,hold:0,review:0},
+  risk_summary:{status:"active",status_label:"风险预算内",
+    portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
+    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"3697",
+    portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
+    single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+    abnormal_loss_buffer_pct:"0.01",portfolio_remaining_risk_note:"说明",
+    disclaimer:"风险提示"},
+  drawdown_summary:{status:"active",status_label:"纪律内",current_equity:"100000",
+    high_water_mark:"100000",drawdown_pct:"0",drawdown_limit_pct:"0.05"},
+  buy_actions:[{symbol:"600001",name:"测试",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"电力",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04",target_amount:"4000",estimated_shares:300,
+    estimated_initial_line:"9",planned_stop_risk:"303",planned_stop_risk_pct:"0.00303",
+    normal_cost:"3",decisive_constraint:"单笔风险上限",execution:{status:"pending"}}],
+  risk_skips:[{symbol:"600002",name:"第二候选",filter_price:"10",close:"10",
+    temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"96",
+    industry:"电力",industry_temperature:"热",market_cap:"100",amount:"2",
+    target_weight:"0.04",target_amount:"4000",estimated_shares:0,
+    reason:"最小交易单位超过组合剩余风险",decisive_constraint:"组合剩余风险"}],
+  actual_overlay:{available:true,broker_label:"东方财富",account_nav_hkd:"108000",
+    status_text:"结单数据，非实时",notice:"只读执行辅助",items:[{
+      symbol:"600001",name:"测试",frozen_action_label:"正式买入",target_weight:"0.04",
+      simulation_quantity:"300",actual_reference_quantity:"300",actual_quantity:"200",
+      actual_market_value:"2000",currency:"CNY",deviation:"underbought",deviation_label:"少买",
+      frozen_reference_price:"10",protection_line:"9",risk_note:"风险未纳入估算",
+    }],outside_positions:[]},
+  sell_actions:[],hold_actions:[],review_actions:[],audit:{},
+});
+const forbidden = [
+  "允许 · 建议", "跳过 · 建议", "计划止损风险", "正常成本", "决定性约束",
+  "待执行", "模拟盘执行状态", "模拟持仓", "实盘执行辅助", "真实持仓",
+];
+for (const text of forbidden) {
+  if (html.includes(text)) throw new Error(text + "\n" + html);
+}
+for (const text of ["正式买入计划", "组合计划风险", "策略累计回撤"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_formats_bootstrap_audit_equity_without_touching_identity() -> None:
     output = run_dashboard_js(r'''
 const html = renderTrendRiskSummary(null, {
