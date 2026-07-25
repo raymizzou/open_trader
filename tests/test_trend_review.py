@@ -59,6 +59,8 @@ def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> 
     )
     assert old["parameters"]["max_filter_price"] == "200"
     assert "kelly_sample_inherits" not in historic_v6["parameters"]
+    assert current["strategy_version"] == "v9"
+    assert "v9" in trend_review.TREND_STRATEGY_VERSIONS
     assert "max_filter_price" not in current["parameters"]
     assert current["parameters"]["kelly_sample_inherits"][0][
         "opening_strategy_version"

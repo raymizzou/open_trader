@@ -593,29 +593,100 @@ def test_live_cn_v6_strategy_snapshot_remains_historical() -> None:
     ]
 
 
-def test_live_cn_strategy_snapshot_defaults_to_v8_with_all_approved_inheritance() -> None:
+def test_live_cn_strategy_snapshot_defaults_to_v9_with_all_approved_inheritance() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199)
     )
 
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v8"
-    assert snapshot["strategy_version"] == "v8"
-    assert snapshot["effective_from"] == "2026-07-24"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v9"
+    assert snapshot["strategy_version"] == "v9"
+    assert snapshot["effective_from"] == "2026-07-27"
     assert snapshot["parameters"]["kelly_sample_inherits"] == [
         {
             "market": "CN",
             "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v7", "v8")
+        for version in ("v4", "v7", "v8", "v9")
     ]
 
 
 @pytest.mark.parametrize(
-    ("market", "expected_version"),
-    [("US", "v5"), ("HK", "v5")],
+    ("market", "version", "inherits"),
+    [
+        ("CN", "v9", ("v4", "v7", "v8", "v9")),
+        ("US", "v6", ("v4", "v5", "v6")),
+        ("HK", "v6", ("v4", "v5", "v6")),
+    ],
 )
-def test_live_non_cn_strategy_snapshot_defaults_to_v5_with_exact_inheritance(
+def test_current_live_snapshots_publish_exit_discipline_without_partial_profit(
+    market: str, version: str, inherits: tuple[str, ...],
+) -> None:
+    pools = (
+        (622466, 697199)
+        if market == "CN"
+        else (622460,)
+        if market == "US"
+        else (622494,)
+    )
+    snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
+    parameters = snapshot["parameters"]
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+
+    assert snapshot["strategy_version"] == version
+    assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/{version}"
+    assert parameters["kelly_sample_inherits"] == [
+        {
+            "market": market,
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{item}",
+            "opening_strategy_version": item,
+        }
+        for item in inherits
+    ]
+    assert parameters["exit_reasons"] == [
+        "danger", "left_right_side", "temperature_to_flat", "protection",
+    ]
+    assert not any(key.startswith("overheat_trim_") for key in parameters)
+    assert "full_exit_precedes_partial_exit" not in parameters
+    assert "trailing_low_days" not in parameters
+    assert not {
+        "过热止盈比例", "过热止盈信号", "过热止盈次数", "过热止盈取整",
+        "不足一手处理", "清仓优先级", "过热跟踪",
+    } & rows.keys()
+    assert rows["退出条件"] == "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
+    if market == "CN":
+        assert parameters["target_weight"] == {"热": "0.04", "沸": "0.04"}
+        assert rows["目标仓位"] == "账户净值的 4%"
+        assert "热状态仓位" not in rows
+        assert "沸状态仓位" not in rows
+
+
+def test_cn_v8_snapshot_and_sizing_keep_legacy_boiling_two_percent() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v8"
+    )
+    assert snapshot["parameters"]["target_weight"] == {"热": "0.04", "沸": "0.02"}
+    assert snapshot["parameters"]["overheat_trim_fraction"] == "0.30"
+    rows = {row["name"]: row["value"] for row in snapshot["parameter_rows"]}
+    assert rows["沸状态仓位"] == "账户净值的 2%"
+
+
+def test_current_cn_boiling_entry_uses_four_percent() -> None:
+    actions = estimate_buy_actions(
+        ranked=(candidate("600001", temperature_curr="沸"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+    )
+    assert actions[0].target_weight == Decimal("0.04")
+
+
+@pytest.mark.parametrize(
+    ("market", "expected_version"),
+    [("US", "v6"), ("HK", "v6")],
+)
+def test_live_non_cn_strategy_snapshot_defaults_to_v6_with_exact_inheritance(
     market: str, expected_version: str,
 ) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
@@ -632,11 +703,11 @@ def test_live_non_cn_strategy_snapshot_defaults_to_v5_with_exact_inheritance(
             "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v5")
+        for version in ("v4", "v5", "v6")
     ]
 
 
-@pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8"])
+@pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8", "v9"])
 def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466,), strategy_version=version
@@ -644,7 +715,7 @@ def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
     assert snapshot["strategy_version"] == version
 
 
-@pytest.mark.parametrize("version", ["v4", "v5"])
+@pytest.mark.parametrize("version", ["v4", "v5", "v6"])
 def test_live_us_hk_supported_versions_remain_replay_valid(version: str) -> None:
     for market, pools in (("US", (622460,)), ("HK", (622494,))):
         snapshot = trend_module.live_trend_strategy_snapshot(
@@ -1682,7 +1753,7 @@ def test_cn_buy_weight_follows_current_temperature() -> None:
         for item in actions
     ] == [
         ("600001", Decimal("0.04"), Decimal("4000.00"), 300),
-        ("600002", Decimal("0.02"), Decimal("2000.00"), 200),
+        ("600002", Decimal("0.04"), Decimal("4000.00"), 300),
     ]
 
 

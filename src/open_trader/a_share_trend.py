@@ -116,7 +116,32 @@ MARKET_MAX_RIGHT_SIDE_DAYS_EXCLUSIVE = 10
 MARKET_MIN_AMOUNT_100M = Decimal("1")
 POSITION_LIMIT = 10
 CANDIDATE_LIMIT = 10
-CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
+LEGACY_CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
+CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.04")}
+CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v9", "US": "v6", "HK": "v6"}
+CURRENT_TREND_EFFECTIVE_FROM = "2026-07-27"
+CURRENT_EXIT_DISCIPLINES = frozenset(
+    (market, version)
+    for market, version in CURRENT_TREND_STRATEGY_VERSIONS.items()
+)
+OVERHEAT_PARAMETER_NAMES = frozenset({
+    "overheat_trim_fraction",
+    "overheat_trim_once_per_position",
+    "overheat_trim_signals",
+    "overheat_trim_rounding",
+    "overheat_trim_below_lot",
+    "full_exit_precedes_partial_exit",
+    "trailing_low_days",
+})
+OVERHEAT_ROW_NAMES = frozenset({
+    "过热止盈比例",
+    "过热止盈信号",
+    "过热止盈次数",
+    "过热止盈取整",
+    "不足一手处理",
+    "清仓优先级",
+    "过热跟踪",
+})
 DEFAULT_TARGET_WEIGHT = Decimal("0.04")
 SINGLE_ENTRY_RISK_LIMIT = Decimal("0.004")
 PORTFOLIO_RISK_LIMIT = Decimal("0.04")
@@ -464,7 +489,9 @@ def trend_strategy_snapshot(
             "min_market_cap_100m": str(CN_MIN_MARKET_CAP_100M),
             "min_amount_100m": str(CN_MIN_AMOUNT_100M),
             "requires_right_side_days": True,
-            "target_weight": {key: str(value) for key, value in CN_TARGET_WEIGHTS.items()},
+            "target_weight": {
+                key: str(value) for key, value in LEGACY_CN_TARGET_WEIGHTS.items()
+            },
             "lot_size": 100,
             "buy_window": "09:30-10:00",
             "initial_protection_atr_multiple": str(INITIAL_PROTECTION_ATR_MULTIPLE),
@@ -605,20 +632,22 @@ def live_trend_strategy_snapshot(
     execution_date: str | None = None,
 ) -> dict[str, object]:
     market = market.upper()
+    if market not in {"CN", "US", "HK"}:
+        raise ValueError(f"unsupported trend review market: {market}")
     if strategy_version is not None:
         version = strategy_version
+    elif execution_date is None or execution_date >= CURRENT_TREND_EFFECTIVE_FROM:
+        version = CURRENT_TREND_STRATEGY_VERSIONS[market]
     elif market == "CN":
         version = "v8"
-    elif market in MARKET_V5_EFFECTIVE_FROM and (
-        execution_date is None
-        or execution_date >= MARKET_V5_EFFECTIVE_FROM[market]
-    ):
+    elif market in MARKET_V5_EFFECTIVE_FROM and execution_date >= MARKET_V5_EFFECTIVE_FROM[market]:
         version = "v5"
     else:
         version = "v4"
     if (
-        version not in {"v4", "v5", "v6", "v7", "v8"}
-        or version in {"v6", "v7", "v8"} and market != "CN"
+        version not in {"v4", "v5", "v6", "v7", "v8", "v9"}
+        or version in {"v7", "v8"} and market != "CN"
+        or version == "v9" and market != "CN"
         or version == "v5" and market == "CN"
     ):
         raise ValueError("unsupported live trend strategy version")
@@ -630,7 +659,7 @@ def live_trend_strategy_snapshot(
     )
     parameters = dict(snapshot["parameters"])
     rows = [dict(row) for row in snapshot["parameter_rows"]]
-    if version in {"v6", "v7", "v8"}:
+    if market == "CN" and version in {"v6", "v7", "v8", "v9"}:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
         rows = [row for row in rows if row["name"] != "筛选价格"]
@@ -661,7 +690,9 @@ def live_trend_strategy_snapshot(
             }
             for item in ("v4", "v5")
         ]
-    if version in {"v5", "v8"}:
+    if version in {"v5", "v8", "v9"} or (
+        version == "v6" and market in {"US", "HK"}
+    ):
         rows.extend(
             {
                 "group": group,
@@ -702,6 +733,58 @@ def live_trend_strategy_snapshot(
                 ("仓位执行", "费用单位", "Trend Animals 余额单位"),
             ]
         )
+    if version == "v9":
+        parameters["kelly_sample_inherits"] = [
+            {
+                "market": "CN",
+                "strategy_id": f"trend_animals_warm_to_hot/CN/{item}",
+                "opening_strategy_version": item,
+            }
+            for item in ("v4", "v7", "v8", "v9")
+        ]
+    if version == "v6" and market in {"US", "HK"}:
+        parameters["kelly_sample_inherits"] = [
+            {
+                "market": market,
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/{item}",
+                "opening_strategy_version": item,
+            }
+            for item in ("v4", "v5", "v6")
+        ]
+    current_discipline = (market, version) in CURRENT_EXIT_DISCIPLINES
+    if current_discipline:
+        for name in OVERHEAT_PARAMETER_NAMES:
+            parameters.pop(name, None)
+        parameters["exit_reasons"] = [
+            "danger",
+            "left_right_side",
+            "temperature_to_flat",
+            "protection",
+        ]
+        rows = [row for row in rows if row["name"] not in OVERHEAT_ROW_NAMES]
+        if market == "CN":
+            parameters["target_weight"] = {
+                key: str(value) for key, value in CN_TARGET_WEIGHTS.items()
+            }
+            rows = [
+                row
+                for row in rows
+                if row["name"] not in {"热状态仓位", "沸状态仓位"}
+            ]
+            buy_index = next(
+                index for index, row in enumerate(rows) if row["name"] == "买入数量"
+            )
+            rows.insert(
+                buy_index,
+                {
+                    "group": "仓位执行",
+                    "name": "目标仓位",
+                    "value": "账户净值的 4%",
+                },
+            )
+        for row in rows:
+            if row["name"] == "退出条件":
+                row["value"] = "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
     parameters.update(
         {
             "drawdown_limit": str(DRAWDOWN_LIMIT),
@@ -714,7 +797,11 @@ def live_trend_strategy_snapshot(
         "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
         "strategy_version": version,
         "effective_from": (
-            "2026-07-24" if version in {"v5", "v6", "v7", "v8"} else "2026-07-20"
+            CURRENT_TREND_EFFECTIVE_FROM
+            if current_discipline
+            else "2026-07-24"
+            if version in {"v5", "v6", "v7", "v8"}
+            else "2026-07-20"
         ),
         "parameters": parameters,
         "parameter_rows": [
@@ -739,7 +826,7 @@ def _expected_report_strategy_snapshot(
         if supplied is not None
         else ""
     )
-    if requested_version in {"v4", "v5", "v6", "v7", "v8"}:
+    if requested_version in {"v4", "v5", "v6", "v7", "v8", "v9"}:
         return live_trend_strategy_snapshot(
             market,
             process_version,
@@ -1956,7 +2043,7 @@ def _estimate_buy_actions_v1(
         if item.close is None or item.close <= 0 or item.atr is None:
             continue
         weight = (
-            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            LEGACY_CN_TARGET_WEIGHTS.get(item.temperature_curr)
             if market == "CN"
             else position_weight
         )
@@ -2128,12 +2215,13 @@ def _plan_buy_actions(
     price_fx_to_account_currency: Decimal,
     portfolio_planned_risk: Decimal | None,
     normal_cost_rate: Decimal,
+    cn_target_weights: Mapping[str, Decimal] = CN_TARGET_WEIGHTS,
     critical_data_reason: str = "",
     kelly_state: TrendKellyState | None = None,
 ) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
     def entry_weight(item: CandidateInput) -> Decimal | None:
         nominal = (
-            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            cn_target_weights.get(item.temperature_curr)
             if market == "CN"
             else position_weight
         )
@@ -2245,7 +2333,7 @@ def _plan_buy_actions(
     skips: list[dict[str, object]] = []
     for item in ranked:
         nominal_weight = (
-            CN_TARGET_WEIGHTS.get(item.temperature_curr)
+            cn_target_weights.get(item.temperature_curr)
             if market == "CN"
             else position_weight
         )
@@ -2604,6 +2692,27 @@ def build_report(
             else normalized_strategy_snapshot
         )
     snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
+    snapshot_parameters = resolved_strategy_snapshot.get("parameters")
+    raw_cn_weights = (
+        snapshot_parameters.get("target_weight")
+        if isinstance(snapshot_parameters, Mapping)
+        else None
+    )
+    try:
+        cn_target_weights = (
+            {
+                key: Decimal(str(raw_cn_weights[key]))
+                for key in ("热", "沸")
+            }
+            if market == "CN" and isinstance(raw_cn_weights, Mapping)
+            else CN_TARGET_WEIGHTS
+        )
+    except (InvalidOperation, KeyError, ValueError):
+        raise ValueError("strategy snapshot has invalid CN target weights") from None
+    if any(
+        not weight.is_finite() or weight <= 0 for weight in cn_target_weights.values()
+    ):
+        raise ValueError("strategy snapshot has invalid CN target weights")
     kelly_state = (
         TrendKellyState(
             phase="unavailable",
@@ -2616,14 +2725,14 @@ def build_report(
             last_closed_at="",
             selected_round_ids=(),
         )
-        if snapshot_version in {"v3", "v4", "v5", "v6", "v7", "v8"} and kelly_data_reason
+        if snapshot_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9"} and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
             market=market,
             strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
             opening_strategy_version=snapshot_version,
         )
-        if snapshot_version in {"v3", "v4", "v5", "v6", "v7", "v8"}
+        if snapshot_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9"}
         else None
     )
     held_symbols = {position.symbol for position in account.positions}
@@ -2884,10 +2993,11 @@ def build_report(
             price_fx_to_account_currency=price_fx_to_account_currency,
             portfolio_planned_risk=existing_planned_risk,
             normal_cost_rate=normal_cost_rate,
+            cn_target_weights=cn_target_weights,
             critical_data_reason=critical_data_reason,
             kelly_state=kelly_state,
         )
-        if snapshot_version in {"v4", "v5", "v6", "v7", "v8"} and (
+        if snapshot_version in {"v4", "v5", "v6", "v7", "v8", "v9"} and (
             not valid_drawdown_decision(
                 drawdown_summary,
                 expected_market=market,
@@ -2910,7 +3020,7 @@ def build_report(
                 _risk_skip(
                     item,
                     weight=(
-                        CN_TARGET_WEIGHTS.get(item.temperature_curr)
+                        cn_target_weights.get(item.temperature_curr)
                         if market == "CN"
                         else position_weight
                     ),
@@ -3537,7 +3647,7 @@ def render_markdown(report: TrendReport) -> str:
         f"继续持有 {len(holds)}｜人工复核 {len(reviews)}｜其他动作 {len(others)}",
     ]
     if report.strategy_snapshot.get("strategy_version") in {
-        "v3", "v4", "v5", "v6", "v7", "v8",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9",
     }:
         phase = {
             "cold_start": "冷启动",
@@ -3802,7 +3912,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     ):
         raise ValueError("strategy snapshot does not match report actions")
     version = snapshot.get("strategy_version")
-    if version not in {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"}:
+    if version not in {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"}:
         raise ValueError("strategy snapshot does not match report actions")
     expected_snapshot = _expected_report_strategy_snapshot(
         market,
@@ -3833,7 +3943,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         or parameters.get("full_exit_precedes_partial_exit") is not True
     ):
         raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8"}:
+    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"}:
         valid_contract = {
             "v2": valid_v2_risk_contract,
             "v3": valid_v3_risk_contract,
@@ -3842,6 +3952,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             "v6": valid_v4_risk_contract,
             "v7": valid_v4_risk_contract,
             "v8": valid_v4_risk_contract,
+            "v9": valid_v4_risk_contract,
         }[version]
         if not valid_contract(
             parameters,
@@ -3894,7 +4005,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             report.risk_summary.get("new_planned_risk")
         ) != new_planned_risk:
             raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v4", "v5", "v6", "v7", "v8"}:
+    if version in {"v4", "v5", "v6", "v7", "v8", "v9"}:
         if (
             not valid_drawdown_decision(
                 report.drawdown_summary,
@@ -3929,7 +4040,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             else target
         )
         expected_weight = Decimal(str(nominal_weight))
-        if version in {"v3", "v4", "v5", "v6", "v7", "v8"} and report.risk_summary.get("kelly_phase") != "cold_start":
+        if version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9"} and report.risk_summary.get("kelly_phase") != "cold_start":
             cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
             if cap is None:
                 raise ValueError("strategy snapshot does not match report actions")

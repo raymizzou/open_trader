@@ -78,7 +78,7 @@ PROTECTION_STATE_ROOTS = {
     "US": "trend_us_tiger",
 }
 TREND_STRATEGY_VERSIONS = frozenset(
-    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"}
+    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"}
 )
 
 
@@ -4371,7 +4371,7 @@ def normalize_trend_strategy_snapshot(
             trend_strategy_snapshot,
         )
 
-        if snapshot.get("strategy_version") in {"v4", "v5", "v6", "v7", "v8"}:
+        if snapshot.get("strategy_version") in {"v4", "v5", "v6", "v7", "v8", "v9"}:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
                 process_version,
