@@ -451,7 +451,6 @@ def automatic_bootstrap_strategy_drawdown(
         equity = _positive_decimal(baseline_equity, "baseline_equity")
         _canonical_date(source_date, "source_date")
         _canonical_date(entry_eligible_from, "entry_eligible_from")
-        record = _new_record(key, equity=equity, updated_at=occurred_at)
         predecessor = next(
             (
                 item for item in records
@@ -462,6 +461,7 @@ def automatic_bootstrap_strategy_drawdown(
         )
         if predecessor_key is not None and not isinstance(predecessor, dict):
             raise ValueError("approved predecessor drawdown state is unavailable")
+        record = _new_record(key, equity=equity, updated_at=occurred_at)
         if isinstance(predecessor, dict):
             inherited_high = _positive_decimal(
                 predecessor["high_water_mark"], "inherited high_water_mark"
