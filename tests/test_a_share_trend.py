@@ -609,6 +609,12 @@ def test_live_cn_strategy_snapshot_defaults_to_v9_with_all_approved_inheritance(
         }
         for version in ("v4", "v7", "v8", "v9")
     ]
+    assert snapshot["parameters"]["allowed_assets"] == ["A股", "ETF基金"]
+    assert {
+        row["value"]
+        for row in snapshot["parameter_rows"]
+        if row["name"] == "交易市场"
+    } == {"沪深 A 股及境内 ETF；排除北交所、ST、*ST 和退市标记"}
 
 
 @pytest.mark.parametrize(
@@ -819,6 +825,37 @@ def test_build_report_upgrades_exact_repository_legacy_snapshot() -> None:
     assert built.strategy_snapshot == trend_module.trend_strategy_snapshot(
         "CN", legacy["process_version"], pools
     )
+
+
+def test_cn_v9_accepts_etf_without_rewriting_v8() -> None:
+    item = candidate("511020", asset="ETF基金")
+
+    def build(version: str) -> TrendReport:
+        snapshot = trend_module.live_trend_strategy_snapshot(
+            "CN",
+            "abc123",
+            (622466, 697199),
+            strategy_version=version,
+        )
+        return build_report(
+            as_of_date="2026-07-14",
+            execution_date="2026-07-15",
+            account=account(),
+            candidates=(item,),
+            holding_snapshots={},
+            bars_by_symbol={},
+            process_version="abc123",
+            candidate_pool_ids=(622466, 697199),
+            strategy_snapshot=snapshot,
+        )
+
+    current = build("v9")
+    historical = build("v8")
+
+    assert [candidate.symbol for candidate in current.candidates] == ["511020"]
+    assert "511020" not in current.excluded
+    assert historical.candidates == ()
+    assert historical.excluded["511020"] == ["a_share_only"]
 
 
 def test_candidates_filter_then_sort_deterministically() -> None:

@@ -666,6 +666,11 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "行业温度":
                 row["value"] = "温、热或沸"
+    if market == "CN" and version == "v9":
+        parameters["allowed_assets"] = ["A股", "ETF基金"]
+        for row in rows:
+            if row["name"] == "交易市场":
+                row["value"] = "沪深 A 股及境内 ETF；排除北交所、ST、*ST 和退市标记"
     if version == "v7":
         parameters["kelly_sample_inherits"] = [{
             "market": "CN",
@@ -1560,10 +1565,12 @@ def _candidate_reasons(
     expected_date: str | None = None,
     *,
     market: str = "CN",
+    strategy_version: str | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     if market == "CN":
-        if item.asset != "A股":
+        allowed_assets = {"A股", "ETF基金"} if strategy_version == "v9" else {"A股"}
+        if item.asset not in allowed_assets:
             reasons.append("a_share_only")
         if item.temperature_prev is None or item.temperature_curr is None:
             reasons.append("temperature_missing")
@@ -1822,6 +1829,7 @@ def build_candidate_list(
     expected_date: str | None = None,
     market: str = "CN",
     industry_contexts: Mapping[int, IndustryContext] | None = None,
+    strategy_version: str | None = None,
 ) -> CandidateDecision:
     eligible: list[CandidateInput] = []
     excluded: dict[str, list[str]] = {}
@@ -1835,7 +1843,11 @@ def build_candidate_list(
                 reason
                 for item in items
                 for reason in _candidate_reasons(
-                    item, held_symbols, expected_date, market=market
+                    item,
+                    held_symbols,
+                    expected_date,
+                    market=market,
+                    strategy_version=strategy_version,
                 )
             )
         )
@@ -1866,6 +1878,7 @@ def collect_industry_contexts(
     expected_date: str,
     market: str,
     history_root: Path,
+    strategy_version: str | None = None,
 ) -> tuple[tuple[IndustryContext, ...], dict[str, object], dict[str, object]]:
     """Collect breadth/state only for industries that pass existing hard gates."""
     candidate_decision = build_candidate_list(
@@ -1873,6 +1886,7 @@ def collect_industry_contexts(
         held_symbols=held_symbols,
         expected_date=expected_date,
         market=market,
+        strategy_version=strategy_version,
     )
     eligible = candidate_decision.eligible
     eligible_industry_ids = sorted(
@@ -1974,6 +1988,7 @@ def collect_industry_contexts(
         expected_date=expected_date,
         market=market,
         industry_contexts=context_map,
+        strategy_version=strategy_version,
     )
     facts = {
         "eligible_industry_ids": tuple(eligible_industry_ids),
@@ -2757,6 +2772,7 @@ def build_report(
         expected_date=as_of_date,
         market=market,
         industry_contexts=industry_context_map,
+        strategy_version=snapshot_version,
     )
     resolved_industry_context_status = dict(
         candidate_decision.industry_context_status
@@ -3098,7 +3114,11 @@ def build_report(
             **_candidate_signal(item, market=market),
             "eligible": (item.tm_id, item.symbol) in ranks,
             "excluded_reasons": _candidate_reasons(
-                item, held_symbols, as_of_date, market=market
+                item,
+                held_symbols,
+                as_of_date,
+                market=market,
+                strategy_version=snapshot_version,
             ),
             "rank": ranks.get((item.tm_id, item.symbol)),
             "pools": list(item.pools),
@@ -5056,6 +5076,13 @@ def _attempt_report(
             config.trend_animals_a_share_tm_id,
             config.trend_animals_etf_tm_id,
         )
+        strategy_snapshot = live_trend_strategy_snapshot(
+            "CN",
+            process_version,
+            candidate_pool_ids,
+            execution_date=execution_date,
+        )
+        strategy_version = str(strategy_snapshot["strategy_version"])
         component_rows = []
         component_pools: defaultdict[int, set[str]] = defaultdict(set)
         for tm_id in candidate_pool_ids:
@@ -5218,6 +5245,7 @@ def _attempt_report(
                 expected_date=run_date,
                 market="CN",
                 history_root=config.data_dir / "trend_industry_context",
+                strategy_version=strategy_version,
             )
         )
         balance_after = _balance(api.get_account_balance())
@@ -5279,12 +5307,6 @@ def _attempt_report(
             kelly_rounds = ()
             kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
-        strategy_snapshot = live_trend_strategy_snapshot(
-            "CN",
-            process_version,
-            candidate_pool_ids,
-            execution_date=execution_date,
-        )
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
             market="CN",
