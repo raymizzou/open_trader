@@ -204,6 +204,40 @@ def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:
     assert second_transport.calls == []
 
 
+def test_snapshots_split_requests_before_the_url_is_too_large(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def transport(url: str, _timeout: float) -> dict[str, object]:
+        assert len(url) <= 3_500
+        calls.append(url)
+        tm_ids = [
+            int(value)
+            for value in parse_qs(urlparse(url).query)["tmIds"][0].split(",")
+        ]
+        return success(
+            [
+                {"tmId": tm_id, "asOfDate": "2026-07-24"}
+                for tm_id in tm_ids
+            ]
+        )
+
+    requested = list(range(100_000, 101_500))
+    rows = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=transport,
+    ).get_snapshots(
+        tm_ids=requested,
+        fields=("tmId", "asOfDate"),
+        expected_date="2026-07-24",
+    )
+
+    assert len(calls) > 1
+    assert [row["tmId"] for row in rows] == requested
+
+
 def test_paid_cache_identity_separates_dates_endpoints_and_parameters(
     tmp_path: Path,
 ) -> None:

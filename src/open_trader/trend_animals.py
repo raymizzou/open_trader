@@ -12,6 +12,7 @@ from urllib.request import urlopen
 
 
 BASE_URL = "https://www.trendtrader.cn/apiData/data"
+MAX_REQUEST_URL_LENGTH = 3_500
 Transport = Callable[[str, float], dict[str, object]]
 
 
@@ -163,14 +164,45 @@ class TrendAnimalsClient:
         unique_ids = sorted(set(tm_ids))
         unique_fields = sorted(set(fields))
         self._validate_expected_date(expected_date)
-        return self._cached_rows(
-            "getTickerSnapshot",
-            {
-                "tmIds": ",".join(map(str, unique_ids)),
+        rows: list[dict[str, object]] = []
+        batch: list[int] = []
+        for tm_id in unique_ids:
+            candidate = [*batch, tm_id]
+            params = {
+                "tmIds": ",".join(map(str, candidate)),
                 "fields": ",".join(unique_fields),
-            },
-            expected_date,
+            }
+            url = (
+                f"{BASE_URL}/getTickerSnapshot?"
+                f"{urlencode({'apiKey': self._api_key, **params})}"
+            )
+            if batch and len(url) > MAX_REQUEST_URL_LENGTH:
+                rows.extend(
+                    self._cached_rows(
+                        "getTickerSnapshot",
+                        {
+                            "tmIds": ",".join(map(str, batch)),
+                            "fields": ",".join(unique_fields),
+                        },
+                        expected_date,
+                    )
+                )
+                batch = [tm_id]
+            else:
+                if len(url) > MAX_REQUEST_URL_LENGTH:
+                    raise ValueError("snapshot request parameters exceed URL limit")
+                batch = candidate
+        rows.extend(
+            self._cached_rows(
+                "getTickerSnapshot",
+                {
+                    "tmIds": ",".join(map(str, batch)),
+                    "fields": ",".join(unique_fields),
+                },
+                expected_date,
+            )
         )
+        return rows
 
     def _get(
         self, endpoint: str, params: Mapping[str, str]

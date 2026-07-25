@@ -10,6 +10,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   backend payload checks remain unchanged. Report-page Playwright checks now run
   independently of controller and simulated-holdings checks, so failures there
   no longer suppress report validation or screenshots.
+- Split oversized Trend Animals snapshot queries into cacheable URL-safe batches;
+  US industry-context refreshes no longer fail with HTTP 414.
 
 ## 2026-07-24
 
