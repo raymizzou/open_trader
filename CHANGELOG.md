@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-25
 
+- Expanded trend selection to mainland-China, US, and Hong Kong ETFs: CN v9
+  now admits eligible ETF-fund candidates while preserving historical replay;
+  US loads the fixed ETF warm-to-hot pool; HK resolves its dynamic warm-to-hot
+  child from the stable ETF root and treats no match as an empty candidate set.
+  Verified focused/full tests and the live supplier pool resolution.
 - Changed the Dashboard discipline cards and acceptance checks to use the
   current market strategy version instead of obsolete frozen report rules,
   while retaining frozen parameters for historical audit and legacy actions.

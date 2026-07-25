@@ -73,8 +73,8 @@ def test_load_env_config_parses_required_values_and_executor_host(
                 "TREND_ANIMALS_API_KEY=trend-secret",
                 "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID=622466",
                 "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID=697199",
-                "TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS=622460, 700001",
-                "TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS=622494",
+                "TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS=622460,705013",
+                "TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS=622494,707617",
                 "OPEN_TRADER_TREND_US_SYMBOLS=AAPL, VIXY",
                 "OPEN_TRADER_TREND_HK_SYMBOLS=00700, 02800",
                 "OPEN_TRADER_TREND_REVIEW_CN_SIMULATE_ACC_ID=101",
@@ -110,8 +110,8 @@ def test_load_env_config_parses_required_values_and_executor_host(
     assert config.trend_animals_api_key == "trend-secret"
     assert config.trend_animals_a_share_tm_id == 622466
     assert config.trend_animals_etf_tm_id == 697199
-    assert config.trend_animals_us_tm_ids == (622460, 700001)
-    assert config.trend_animals_hk_tm_ids == (622494,)
+    assert config.trend_animals_us_tm_ids == (622460, 705013)
+    assert config.trend_animals_hk_tm_ids == (622494, 707617)
     assert config.trend_us_symbols == ("AAPL", "VIXY")
     assert config.trend_hk_symbols == ("00700", "02800")
     assert config.trend_review_cn_simulate_acc_id == 101
