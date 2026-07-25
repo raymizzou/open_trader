@@ -611,6 +611,41 @@ def test_updates_ready_requires_stock_and_etf_dates(
     assert updates_ready(rows, market=market, as_of_date=as_of_date) is False
 
 
+@pytest.mark.parametrize(
+    ("market", "rows"),
+    [
+        (
+            "US",
+            [
+                {"asset": "美股", "asOfDate": "2026-07-24"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-24"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-23"},
+            ],
+        ),
+        (
+            "US",
+            [
+                {"asset": "美股", "asOfDate": "2026-07-24"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-23"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-24"},
+            ],
+        ),
+        (
+            "HK",
+            [
+                {"asset": "港股", "asOfDate": "2026-07-24"},
+                {"asset": "香港ETF", "asOfDate": "not-a-date"},
+            ],
+        ),
+    ],
+)
+def test_updates_ready_rejects_duplicate_or_malformed_required_statuses(
+    market: str,
+    rows: list[dict[str, object]],
+) -> None:
+    assert updates_ready(rows, market=market, as_of_date="2026-07-24") is False
+
+
 def test_hk_etf_root_missing_warm_to_hot_is_empty() -> None:
     class Api:
         def get_components(
@@ -629,6 +664,31 @@ def test_hk_etf_root_missing_warm_to_hot_is_empty() -> None:
         pool_id=707617,
         expected_date="2026-07-24",
     ) == ([], None)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"tmId": 707815},
+        {"tmId": 0, "tickerName": "行业趋势龙头(香港ETF)"},
+    ],
+)
+def test_hk_etf_root_rejects_malformed_child_rows(
+    row: dict[str, object],
+) -> None:
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return [row]
+
+    with pytest.raises(TrendAnimalsError, match="invalid HK ETF root row"):
+        _candidate_pool_components(
+            Api(),
+            market="HK",
+            pool_id=707617,
+            expected_date="2026-07-24",
+        )
 
 
 def test_hk_etf_root_loads_unique_warm_to_hot_child() -> None:

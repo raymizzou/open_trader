@@ -505,12 +505,14 @@ def updates_ready(
     rows: Sequence[Mapping[str, object]], *, market: str, as_of_date: str
 ) -> bool:
     required = MARKET_UPDATE_ASSETS[_market(market)]
-    dates = {
-        str(row.get("asset")): _status_date(row)
-        for row in rows
-        if row.get("asset") in required
-    }
-    return all(dates.get(asset) == as_of_date for asset in required)
+    dates = {asset: [] for asset in required}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return False
+        asset = row.get("asset")
+        if asset in dates:
+            dates[asset].append(_status_date(row))
+    return all(dates[asset] == [as_of_date] for asset in required)
 
 
 def _candidate_pool_components(
@@ -526,10 +528,19 @@ def _candidate_pool_components(
     )
     if market != "HK" or pool_id != HK_ETF_ROOT_TM_ID:
         return list(rows), pool_id
-    matches = [
-        row for row in rows
-        if row.get("tickerName") == HK_ETF_WARM_TO_HOT_NAME
-    ]
+    matches: list[Mapping[str, object]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise TrendAnimalsError("Trend Animals returned an invalid HK ETF root row")
+        ticker_name = row.get("tickerName")
+        if not isinstance(ticker_name, str) or not ticker_name.strip():
+            raise TrendAnimalsError("Trend Animals returned an invalid HK ETF root row")
+        try:
+            _row_tm_id(row)
+        except TrendAnimalsError as exc:
+            raise TrendAnimalsError("Trend Animals returned an invalid HK ETF root row") from exc
+        if ticker_name == HK_ETF_WARM_TO_HOT_NAME:
+            matches.append(row)
     if not matches:
         return [], None
     if len(matches) != 1:
