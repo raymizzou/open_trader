@@ -3204,6 +3204,7 @@ function handleAccountViewTabKeydown(event) {
 }
 
 async function loadTrendSimulatePositions(broker) {
+  if (state.accountViews[broker] !== "simulate") return;
   state.trendSimulatePositions[broker] = {loading: true};
   renderAccountViewPanelOnly(broker);
   try {

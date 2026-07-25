@@ -3859,6 +3859,17 @@ console.log(JSON.stringify({urls,html:panel.innerHTML}));
         assert text not in html
 
 
+def test_dashboard_simulation_position_helper_skips_report_view() -> None:
+    output = run_dashboard_js(r'''
+state.accountViews.tiger="report";
+const urls=[];
+globalThis.fetch=async(url)=>{urls.push(url);return {ok:true,json:async()=>({available:true,positions:[]})};};
+await loadTrendSimulatePositions("tiger");
+console.log(JSON.stringify({urls,payload:state.trendSimulatePositions.tiger}));
+''')
+    assert json.loads(output) == {"urls": []}
+
+
 def test_dashboard_historical_report_omits_simulation_reconciliation() -> None:
     output = run_dashboard_js(r'''
 const report={
