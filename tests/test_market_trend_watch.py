@@ -525,6 +525,40 @@ def test_closed_us_watcher_compensates_before_waiting_for_next_open(
     assert opens == ["2026-07-17"]
 
 
+def test_once_weekend_watcher_returns_without_waiting_for_next_open(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-27"]
+
+    result = watch_market_protection(
+        market="US",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=tmp_path / "events.jsonl",
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        close_quote_client=False,
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=lambda: datetime(
+            2026, 7, 25, 10, 30, tzinfo=ZoneInfo("America/New_York")
+        ),
+        sleep_fn=lambda _seconds: pytest.fail("once market watcher slept"),
+        account_loader=lambda *_args, **_kwargs: pytest.fail(
+            "weekend account was loaded"
+        ),
+    )
+
+    assert result.status == "completed"
+    assert result.watched_symbol_count == 0
+    assert result.trigger_count == 0
+
+
 def test_next_market_open_waits_from_early_report_until_next_session() -> None:
     class Quote:
         def get_trading_days(self, **kwargs: object) -> list[str]:

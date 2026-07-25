@@ -184,6 +184,18 @@ def watch_market_protection(
             continue
         break
 
+    local_now = now.astimezone(timezone)
+    if once and opening > local_now:
+        if close_quote_client:
+            _close(client)
+        return AShareWatchResult(
+            status="completed",
+            watched_symbol_count=0,
+            trigger_count=0,
+            exception_count=0,
+            unknown_quote_count=0,
+            events_path=events_path,
+        )
     try:
         account_loader(
             portfolio_path,
@@ -199,7 +211,6 @@ def watch_market_protection(
             except Exception:
                 pass
         return _abnormal_result(events_path)
-    local_now = now.astimezone(timezone)
     if opening > local_now:
         sleep_fn((opening - local_now).total_seconds())
 
