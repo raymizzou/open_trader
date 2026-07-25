@@ -335,8 +335,27 @@ def automatic_bootstrap_strategy_drawdown(
     reason: str,
     entry_eligible_from: str | None,
     entry_date: str | None = None,
+    inherit_from: tuple[str, str] | None = None,
 ) -> dict[str, object]:
     key = _strategy_key(market, strategy_id, strategy_version)
+    predecessor_key = None
+    if inherit_from is not None:
+        if (
+            not isinstance(inherit_from, tuple)
+            or len(inherit_from) != 2
+            or not all(isinstance(part, str) for part in inherit_from)
+        ):
+            raise ValueError("inherit_from must contain a strategy id and version")
+        try:
+            predecessor_key = _strategy_key(
+                key[0], inherit_from[0], inherit_from[1]
+            )
+        except TypeError:
+            raise ValueError(
+                "inherit_from must contain a strategy id and version"
+            ) from None
+        if reason != "new_strategy_version":
+            raise ValueError("drawdown inheritance requires a new strategy version")
     parameter_hash = strategy_parameter_hash(parameters)
     if entry_date is not None:
         _canonical_date(entry_date, "entry_date")
@@ -433,6 +452,39 @@ def automatic_bootstrap_strategy_drawdown(
         _canonical_date(source_date, "source_date")
         _canonical_date(entry_eligible_from, "entry_eligible_from")
         record = _new_record(key, equity=equity, updated_at=occurred_at)
+        predecessor = next(
+            (
+                item for item in records
+                if predecessor_key is not None
+                and _record_key(item) == predecessor_key
+            ),
+            None,
+        )
+        if predecessor_key is not None and not isinstance(predecessor, dict):
+            raise ValueError("approved predecessor drawdown state is unavailable")
+        if isinstance(predecessor, dict):
+            inherited_high = _positive_decimal(
+                predecessor["high_water_mark"], "inherited high_water_mark"
+            )
+            inherited_paused = predecessor["paused"] is True
+            high_water = (
+                inherited_high
+                if inherited_paused
+                else max(inherited_high, equity)
+            )
+            drawdown = _drawdown(high_water, equity)
+            paused = inherited_paused or drawdown >= DRAWDOWN_LIMIT
+            record.update({
+                "high_water_mark": _decimal_text(high_water),
+                "current_equity": _decimal_text(equity),
+                "drawdown_pct": _decimal_text(drawdown),
+                "paused": paused,
+                "paused_at": (
+                    predecessor["paused_at"]
+                    if inherited_paused
+                    else occurred_at if paused else None
+                ),
+            })
         event = {
             "event_id": event_id,
             "event_type": "automatic_bootstrap",

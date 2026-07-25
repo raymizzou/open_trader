@@ -28,6 +28,11 @@ MARKET_TIMEZONES = {
     "HK": ZoneInfo("Asia/Hong_Kong"),
     "US": ZoneInfo("America/New_York"),
 }
+APPROVED_DRAWDOWN_PREDECESSORS = {
+    ("CN", "v9"): ("trend_animals_warm_to_hot/CN/v8", "v8"),
+    ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
+    ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
+}
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,11 @@ def run_drawdown_preflight(
                 reason=reason,
                 entry_eligible_from=item.entry_eligible_from,
                 entry_date=_market_date(market, occurred_at),
+                inherit_from=(
+                    APPROVED_DRAWDOWN_PREDECESSORS.get((market, strategy_version))
+                    if reason == "new_strategy_version"
+                    else None
+                ),
             )
         except (OSError, ValueError) as exc:
             error = str(exc)

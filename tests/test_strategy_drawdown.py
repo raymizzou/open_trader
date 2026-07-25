@@ -60,6 +60,43 @@ def test_missing_drawdown_state_fails_closed_without_creating_artifact(
     assert not (data_dir / "trend_drawdown" / "state.json").exists()
 
 
+def test_new_version_inherits_high_water_mark_and_pause_state(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    old = {
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v8",
+        "strategy_version": "v8",
+    }
+    bootstrap(data_dir, old, equity="100")
+    observe_strategy_equity(
+        data_dir,
+        **old,
+        current_equity=Decimal("94"),
+        observed_at="2026-07-24T15:00:00+08:00",
+    )
+
+    decision = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v9",
+        strategy_version="v9",
+        parameters={"drawdown_limit": "0.05"},
+        baseline_equity=Decimal("96"),
+        source_date="2026-07-24",
+        accepted_git_sha="b" * 40,
+        actor="pytest",
+        occurred_at="2026-07-25T08:00:00+08:00",
+        reason="new_strategy_version",
+        entry_eligible_from="2026-07-27",
+        inherit_from=("trend_animals_warm_to_hot/CN/v8", "v8"),
+    )
+
+    assert decision["high_water_mark"] == "100"
+    assert decision["current_equity"] == "96"
+    assert decision["entry_allowed"] is False
+    assert decision["paused_at"] == "2026-07-24T15:00:00+08:00"
+
+
 def test_legacy_missing_decision_remains_readable() -> None:
     decision = {
         "schema_version": "open_trader.strategy_drawdown.v1",

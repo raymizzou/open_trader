@@ -125,6 +125,89 @@ def test_existing_state_does_not_require_repeated_frozen_baseline(
     assert state_path.read_bytes() == before
 
 
+def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    old_versions = {"CN": "v8", "HK": "v5", "US": "v5"}
+    equities = {"CN": "100", "HK": "200", "US": "300"}
+    for market, version in old_versions.items():
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            market=market,
+            strategy_id=f"trend_animals_warm_to_hot/{market}/{version}",
+            strategy_version=version,
+            parameters={"drawdown_limit": "0.05", "market": market},
+            baseline_equity=Decimal(equities[market]),
+            source_date="2026-07-17",
+            accepted_git_sha="a" * 40,
+            actor="acceptance",
+            occurred_at="2026-07-18T08:00:00+08:00",
+            reason="first_activation",
+            entry_eligible_from="2026-07-20",
+        )
+
+    target_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
+    inputs = {
+        market: replace(
+            market_input(market),
+            strategy_snapshot={
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+                "strategy_version": version,
+                "parameters": {"drawdown_limit": "0.05", "market": market},
+            },
+        )
+        for market, version in target_versions.items()
+    }
+
+    result = run_preflight(tmp_path, inputs)
+
+    assert result["status"] == "ready"
+    assert {
+        item["market"]: item["high_water_mark"] for item in result["markets"]
+    } == equities
+
+
+def test_missing_approved_predecessor_fails_closed_without_writing_state(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v7",
+        strategy_version="v7",
+        parameters={"drawdown_limit": "0.05", "market": "CN"},
+        baseline_equity=Decimal("100"),
+        source_date="2026-07-17",
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-18T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-20",
+    )
+    state_path = data_dir / "trend_drawdown/state.json"
+    before = state_path.read_bytes()
+
+    target = replace(
+        market_input("CN"),
+        strategy_snapshot={
+            "strategy_id": "trend_animals_warm_to_hot/CN/v9",
+            "strategy_version": "v9",
+            "parameters": {"drawdown_limit": "0.05", "market": "CN"},
+        },
+    )
+    result = run_preflight(tmp_path, {"CN": target})
+
+    assert result["status"] == "failed"
+    assert result["markets"][0]["status"] == "failed"
+    assert (
+        "approved predecessor drawdown state is unavailable"
+        in result["markets"][0]["error"]
+    )
+    assert state_path.read_bytes() == before
+
+
 def test_preflight_accepts_the_approved_v4_overheat_trim_transition(
     tmp_path: Path,
 ) -> None:

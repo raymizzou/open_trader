@@ -332,8 +332,8 @@ def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
         "--repo", str(tmp_path),
         "--actor", "pytest",
     ]) == 0
-    assert (market, entry_date, "v5") in calls
-    assert market_inputs[market].strategy_snapshot["strategy_version"] == "v5"
+    assert (market, entry_date, "v6") in calls
+    assert market_inputs[market].strategy_snapshot["strategy_version"] == "v6"
 
 
 def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
