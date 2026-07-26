@@ -1,0 +1,1073 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Open Trader · 预测市场实盘 UI 原型</title>
+    <link rel="stylesheet" href="dashboard.css">
+    <style>
+      /* PROTOTYPE ONLY — selected A layout with simulated execution states. */
+      body { padding-bottom: 88px; }
+      button, select, summary { cursor: pointer; }
+      .pm-shell {
+        margin: 0 auto;
+        max-width: 1600px;
+        min-height: 100vh;
+        padding: 16px;
+      }
+      .pm-topbar {
+        align-items: center;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        display: flex;
+        gap: 18px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        min-height: 70px;
+        padding: 14px;
+      }
+      .pm-brand { align-items: baseline; display: flex; flex-wrap: wrap; gap: 9px; }
+      .pm-brand strong { font-size: 20px; letter-spacing: -0.03em; }
+      .pm-brand span { color: var(--muted); font-weight: 700; }
+      .pm-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+      .pm-nav button,
+      .pm-button {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        color: var(--text);
+        min-height: 44px;
+        padding: 9px 14px;
+      }
+      .pm-nav button[aria-current="page"] {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: var(--on-primary);
+        font-weight: 800;
+      }
+      .pm-button:hover:not(:disabled) { border-color: var(--accent); }
+      .pm-button.primary {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: var(--on-primary);
+        font-weight: 800;
+      }
+      .pm-button.danger {
+        background: var(--danger);
+        border-color: var(--danger);
+        color: white;
+        font-weight: 800;
+      }
+      .pm-button:disabled {
+        cursor: not-allowed;
+        opacity: 0.46;
+      }
+      .pm-prototype-note {
+        background: #f4eadb;
+        border: 1px dashed #c49b6b;
+        border-radius: 7px;
+        color: #68441f;
+        margin-bottom: 10px;
+        padding: 9px 12px;
+      }
+      .pm-page-head {
+        align-items: end;
+        display: flex;
+        gap: 20px;
+        justify-content: space-between;
+        margin: 18px 0 12px;
+      }
+      .pm-page-head h1 { font-size: 25px; margin: 0 0 5px; }
+      .pm-page-head p { color: var(--muted); margin: 0; }
+      .pm-updated {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+      }
+      .pm-status-line { align-items: center; display: inline-flex; gap: 7px; }
+      .pm-status-dot {
+        background: var(--success);
+        border-radius: 999px;
+        height: 8px;
+        width: 8px;
+      }
+      .pm-status-dot.warning { background: #b7791f; }
+      .pm-status-dot.danger { background: var(--danger); }
+      .pm-readiness {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        display: grid;
+        gap: 0;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        margin-bottom: 10px;
+      }
+      .pm-readiness-item {
+        border-right: 1px solid var(--line);
+        min-width: 0;
+        padding: 12px 14px;
+      }
+      .pm-readiness-item:last-child { border-right: 0; }
+      .pm-readiness-item span {
+        color: var(--muted);
+        display: block;
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+      .pm-readiness-item strong { display: block; line-height: 1.35; }
+      .pm-readiness-item small { color: var(--muted); display: block; margin-top: 4px; }
+      .pm-tone-ok { color: var(--success); }
+      .pm-tone-warning { color: #8a5a16; }
+      .pm-tone-danger { color: var(--danger); }
+      .pm-alert {
+        align-items: start;
+        border: 1px solid;
+        border-radius: 8px;
+        display: flex;
+        gap: 16px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        padding: 13px 14px;
+      }
+      .pm-alert strong { display: block; margin-bottom: 4px; }
+      .pm-alert p { margin: 0; }
+      .pm-alert.info { background: #eef6f8; border-color: #a8ccd7; color: #214f5c; }
+      .pm-alert.success { background: #edf8f1; border-color: #add4bc; color: #245b39; }
+      .pm-alert.danger { background: #fff2f0; border-color: #e7aaa4; color: #7a211a; }
+      .pm-alert-body { min-width: 0; }
+      .pm-progress {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin-top: 12px;
+      }
+      .pm-progress-step {
+        background: rgba(255, 255, 255, 0.56);
+        border: 1px solid currentColor;
+        border-radius: 6px;
+        min-height: 66px;
+        opacity: 0.58;
+        padding: 9px;
+      }
+      .pm-progress-step.done, .pm-progress-step.current { opacity: 1; }
+      .pm-progress-step span {
+        display: block;
+        font-size: 11px;
+        font-weight: 800;
+        margin-bottom: 5px;
+      }
+      .pm-progress-step strong { font-size: 13px; margin: 0; }
+      .pm-metrics {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        margin-bottom: 10px;
+      }
+      .pm-metric {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-width: 0;
+        padding: 13px;
+      }
+      .pm-metric span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 8px; }
+      .pm-metric strong { display: block; font-size: 20px; }
+      .pm-metric small { color: var(--muted); display: block; margin-top: 5px; }
+      .pm-metric.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+      .pm-metric.primary span, .pm-metric.primary small { color: #d9d5ce; }
+      .pm-policy {
+        background: #fff8e8;
+        border: 1px solid #e7cf9d;
+        border-radius: 8px;
+        color: #684816;
+        margin-bottom: 10px;
+        padding: 11px 13px;
+      }
+      .pm-policy strong { display: block; margin-bottom: 3px; }
+      .pm-policy p { margin: 0; }
+      .pm-layout {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(430px, 0.9fr) minmax(560px, 1.1fr);
+      }
+      .pm-stack { display: grid; gap: 10px; }
+      .pm-panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        min-width: 0;
+        padding: 14px;
+      }
+      .pm-panel-heading {
+        align-items: start;
+        display: flex;
+        gap: 16px;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+      .pm-panel-heading h2, .pm-panel-heading h3 { margin: 0; }
+      .pm-panel-heading p { color: var(--muted); margin: 4px 0 0; }
+      .pm-pill {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 800;
+        line-height: 1;
+        padding: 7px 9px;
+        white-space: nowrap;
+      }
+      .pm-pill.venue { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
+      .pm-pill.action { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
+      .pm-pill.watch { background: #fff4df; border-color: #e5c98f; color: #704915; }
+      .pm-event-list { display: grid; gap: 8px; }
+      .pm-event {
+        background: var(--surface-soft);
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 0;
+      }
+      .pm-event[open] { background: var(--surface); border-color: var(--line); }
+      .pm-event summary {
+        align-items: center;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        list-style: none;
+        min-height: 56px;
+        padding: 10px 12px;
+      }
+      .pm-event summary::-webkit-details-marker { display: none; }
+      .pm-event-title { font-weight: 750; line-height: 1.35; min-width: 0; }
+      .pm-event-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+      .pm-volume { font-weight: 800; text-align: right; }
+      .pm-volume span { color: var(--muted); display: block; font-size: 10px; font-weight: 600; }
+      .pm-event-state { color: var(--success); font-size: 12px; font-weight: 800; }
+      .pm-event-state.watch { color: #8a5a16; }
+      .pm-market-list {
+        border-top: 1px solid var(--line);
+        display: grid;
+        gap: 7px;
+        padding: 10px 12px 12px;
+      }
+      .pm-market-line { align-items: start; display: flex; gap: 12px; justify-content: space-between; }
+      .pm-market-line span:last-child { color: var(--muted); text-align: right; }
+      .pm-opportunity {
+        border-left: 4px solid var(--success);
+        display: grid;
+        gap: 12px;
+      }
+      .pm-opportunity.disabled { border-left-color: var(--line); }
+      .pm-opportunity-title { align-items: start; display: flex; gap: 12px; justify-content: space-between; }
+      .pm-opportunity-title h3 { font-size: 17px; line-height: 1.35; margin: 0; }
+      .pm-opportunity-title p { color: var(--muted); margin: 4px 0 0; }
+      .pm-opportunity-metrics {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        margin: 0;
+      }
+      .pm-opportunity-metrics div { background: var(--surface-soft); border-radius: 6px; padding: 10px; }
+      .pm-opportunity-metrics dt { color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+      .pm-opportunity-metrics dd { font-size: 15px; font-weight: 850; margin: 0; }
+      .pm-positive { color: var(--success); }
+      .pm-opportunity-action {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+      }
+      .pm-opportunity-action p { color: var(--muted); margin: 0; }
+      .pm-participate { min-width: 190px; }
+      .pm-empty {
+        align-items: center;
+        display: grid;
+        justify-items: center;
+        min-height: 210px;
+        padding: 30px;
+        text-align: center;
+      }
+      .pm-empty.compact { min-height: 150px; }
+      .pm-empty strong { font-size: 18px; margin-bottom: 8px; }
+      .pm-empty p { color: var(--muted); margin: 0; max-width: 520px; }
+      .pm-history-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+      .pm-history-tab {
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        color: var(--muted);
+        min-height: 44px;
+        padding: 8px 10px;
+      }
+      .pm-history-tab[aria-pressed="true"] {
+        background: var(--surface-soft);
+        border-color: var(--line);
+        color: var(--text);
+        font-weight: 800;
+      }
+      .pm-table { border-collapse: collapse; width: 100%; }
+      .pm-table th, .pm-table td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 8px;
+        text-align: left;
+        vertical-align: top;
+      }
+      .pm-table th {
+        color: var(--muted);
+        font-size: 11px;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+      }
+      .pm-table tr:last-child td { border-bottom: 0; }
+      .pm-controller {
+        align-items: center;
+        background: #171512;
+        border: 1px solid #3b3832;
+        border-radius: 12px;
+        bottom: 16px;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
+        color: white;
+        display: flex;
+        gap: 12px;
+        left: 50%;
+        max-width: calc(100vw - 24px);
+        padding: 8px 10px;
+        position: fixed;
+        transform: translateX(-50%);
+        z-index: 1000;
+      }
+      .pm-controller label { color: #bcb6ac; font-size: 12px; font-weight: 800; }
+      .pm-controller select {
+        background: #2a2723;
+        border: 1px solid #575149;
+        border-radius: 8px;
+        color: white;
+        min-height: 44px;
+        min-width: 240px;
+        padding: 8px 34px 8px 12px;
+      }
+      .pm-controller small { color: #bcb6ac; }
+      .pm-modal-layer:empty { display: none; }
+      .pm-modal-layer {
+        align-items: center;
+        background: rgba(20, 18, 15, 0.58);
+        display: flex;
+        inset: 0;
+        justify-content: center;
+        padding: 16px;
+        position: fixed;
+        z-index: 2000;
+      }
+      .pm-modal {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+        max-height: calc(100dvh - 32px);
+        max-width: 720px;
+        overflow: auto;
+        padding: 20px;
+        width: 100%;
+      }
+      .pm-modal-header { margin-bottom: 16px; }
+      .pm-modal-header h2 { font-size: 22px; margin: 0 0 5px; }
+      .pm-modal-header p { color: var(--muted); margin: 0; }
+      .pm-order-market {
+        background: var(--surface-soft);
+        border-radius: 7px;
+        margin-bottom: 12px;
+        padding: 12px;
+      }
+      .pm-order-market span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 5px; }
+      .pm-order-market strong { display: block; line-height: 1.4; }
+      .pm-order-legs {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 1fr 1fr;
+        margin-bottom: 12px;
+      }
+      .pm-order-leg { border: 1px solid var(--line); border-radius: 7px; padding: 12px; }
+      .pm-order-leg span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 5px; }
+      .pm-order-leg strong { display: block; font-size: 17px; }
+      .pm-order-leg small { color: var(--muted); display: block; margin-top: 5px; }
+      .pm-order-summary {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin-bottom: 12px;
+      }
+      .pm-order-summary div { background: var(--surface-soft); border-radius: 7px; padding: 11px; }
+      .pm-order-summary span { color: var(--muted); display: block; font-size: 11px; margin-bottom: 5px; }
+      .pm-order-summary strong { display: block; font-size: 17px; }
+      .pm-risk-note {
+        background: #fff5f3;
+        border: 1px solid #efb6af;
+        border-radius: 7px;
+        color: #7a211a;
+        margin-bottom: 12px;
+        padding: 11px 12px;
+      }
+      .pm-risk-note strong { display: block; margin-bottom: 3px; }
+      .pm-risk-note p { margin: 0; }
+      .pm-check-list { display: grid; gap: 7px; margin-bottom: 14px; }
+      .pm-check {
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        padding: 8px 0;
+      }
+      .pm-check:last-child { border-bottom: 0; }
+      .pm-check span { color: var(--muted); }
+      .pm-modal-actions {
+        align-items: center;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+      }
+      .pm-modal-actions .pm-button { min-width: 150px; }
+      @media (max-width: 1100px) {
+        .pm-readiness { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .pm-readiness-item:nth-child(3) { border-right: 0; }
+        .pm-readiness-item:nth-child(n+4) { border-top: 1px solid var(--line); }
+        .pm-layout { grid-template-columns: 1fr; }
+        .pm-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      }
+      @media (max-width: 720px) {
+        body { font-size: 16px; padding-bottom: 116px; }
+        .pm-shell { padding: 10px; }
+        .pm-topbar, .pm-page-head { align-items: stretch; display: grid; }
+        .pm-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .pm-updated { text-align: left; }
+        .pm-readiness { grid-template-columns: 1fr 1fr; }
+        .pm-readiness-item,
+        .pm-readiness-item:nth-child(3) { border-right: 1px solid var(--line); }
+        .pm-readiness-item:nth-child(even) { border-right: 0; }
+        .pm-readiness-item:nth-child(n+3) { border-top: 1px solid var(--line); }
+        .pm-readiness-item:last-child { border-right: 0; grid-column: 1 / -1; }
+        .pm-metrics { grid-template-columns: 1fr 1fr; }
+        .pm-metric.primary { grid-column: 1 / -1; }
+        .pm-progress { grid-template-columns: 1fr 1fr; }
+        .pm-panel-heading, .pm-opportunity-title, .pm-opportunity-action, .pm-alert {
+          align-items: stretch;
+          display: grid;
+        }
+        .pm-opportunity-metrics { grid-template-columns: 1fr 1fr; }
+        .pm-participate { width: 100%; }
+        .pm-event summary { grid-template-columns: minmax(0, 1fr) auto; }
+        .pm-event-state { grid-column: 1 / -1; }
+        .pm-market-line { display: grid; }
+        .pm-market-line span:last-child { text-align: left; }
+        .pm-table thead { display: none; }
+        .pm-table, .pm-table tbody, .pm-table tr, .pm-table td { display: block; width: 100%; }
+        .pm-table tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
+        .pm-table tr:last-child { border-bottom: 0; }
+        .pm-table td {
+          border: 0;
+          display: grid;
+          gap: 8px;
+          grid-template-columns: 108px minmax(0, 1fr);
+          padding: 5px 0;
+        }
+        .pm-table td::before {
+          color: var(--muted);
+          content: attr(data-label);
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .pm-controller {
+          align-items: stretch;
+          display: grid;
+          width: calc(100vw - 20px);
+        }
+        .pm-controller select { min-width: 0; width: 100%; }
+        .pm-controller small { display: none; }
+        .pm-modal { padding: 16px; }
+        .pm-order-legs, .pm-order-summary { grid-template-columns: 1fr; }
+        .pm-modal-actions { display: grid; }
+        .pm-modal-actions .pm-button { width: 100%; }
+      }
+      @media (max-width: 390px) {
+        .pm-readiness, .pm-metrics, .pm-progress, .pm-opportunity-metrics { grid-template-columns: 1fr; }
+        .pm-readiness-item, .pm-readiness-item:nth-child(3), .pm-readiness-item:nth-child(even) {
+          border-right: 0;
+          border-top: 1px solid var(--line);
+        }
+        .pm-readiness-item:first-child { border-top: 0; }
+        .pm-readiness-item:last-child, .pm-metric.primary { grid-column: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="pm-shell">
+      <header class="pm-topbar">
+        <div class="pm-brand">
+          <strong>Open Trader</strong>
+          <span>持仓实时看板</span>
+        </div>
+        <nav class="pm-nav" aria-label="一级导航">
+          <button type="button">持仓</button>
+          <button type="button" aria-current="page">预测市场</button>
+          <button type="button">策略回测</button>
+          <button type="button">凯利实验室</button>
+        </nav>
+      </header>
+      <aside class="pm-prototype-note">
+        UI 设计原型：所有价格、钱包和交易记录都是演示数据；底部场景控制器不会进入正式产品。
+      </aside>
+      <main id="pm-root"></main>
+    </div>
+
+    <div class="pm-controller" role="region" aria-label="原型场景控制器">
+      <label for="pm-scenario">演示场景</label>
+      <select id="pm-scenario">
+        <option value="ready">可参与</option>
+        <option value="quiet">当前无信号</option>
+        <option value="executing">执行中</option>
+        <option value="success">已成交并合并</option>
+        <option value="incident">事故与熔断</option>
+        <option value="degraded">连接异常</option>
+        <option value="loading">加载中</option>
+      </select>
+      <small>原型专用 · 正式产品没有底部栏</small>
+    </div>
+    <div id="pm-modal-root" class="pm-modal-layer"></div>
+
+    <script>
+      const scenarios = ["ready", "quiet", "executing", "success", "incident", "degraded", "loading"];
+      const params = new URLSearchParams(window.location.search);
+      let scenario = scenarios.includes(params.get("state")) ? params.get("state") : "ready";
+      let historyKind = ["signals", "trades", "incidents"].includes(params.get("history"))
+        ? params.get("history")
+        : "signals";
+      let modalKind = "";
+      let previousFocus = null;
+
+      const monitoredEvents = [
+        {
+          title: "以色列与伊朗停火是否持续至 8 月 31 日？",
+          volume: "$9.7M",
+          markets: "1 个普通二元市场",
+          status: "可参与",
+          kind: "action",
+          profitLabel: "预计净利润",
+          profit: "$1.20",
+          details: [
+            ["停火持续至 8 月 31 日？", "普通二元 · 免手续费 · 已订阅"],
+            ["当前执行条件", "20 组 · 最多 $18.80 · 可参与"],
+          ],
+        },
+        {
+          title: "比特币会在 8 月突破 $150,000？",
+          volume: "$12.8M",
+          markets: "2 个市场",
+          status: "仅监控 · 收费市场",
+          kind: "watch",
+          profitLabel: "毛利润上限",
+          profit: "$4.60",
+          details: [["主要二元市场", "已订阅 · 收费市场不可参与"]],
+        },
+        {
+          title: "2026 年 9 月美联储是否降息？",
+          volume: "$15.4M",
+          markets: "8 个市场",
+          status: "仅监控 · Negative Risk",
+          kind: "watch",
+          profitLabel: "毛利润上限",
+          profit: "$3.80",
+          details: [["多结果事件市场", "已订阅 · Negative Risk 暂不可参与"]],
+        },
+        {
+          title: "以太坊会在 9 月前突破 $6,000？",
+          volume: "$7.1M",
+          markets: "2 个市场",
+          status: "仅监控 · 净利润不足",
+          kind: "watch",
+          profitLabel: "毛利润上限",
+          profit: "$2.10",
+          details: [["主要二元市场", "已订阅 · $20 上限内净利润不足 $1"]],
+        },
+        {
+          title: "2026 年美国参议院控制权",
+          volume: "$6.8M",
+          markets: "12 个市场",
+          status: "仅监控 · Negative Risk",
+          kind: "watch",
+          profitLabel: "毛利润上限",
+          profit: "$1.40",
+          details: [["多结果事件市场", "已订阅 · Negative Risk 暂不可参与"]],
+        },
+        {
+          title: "下一任美联储主席人选",
+          volume: "$5.9M",
+          markets: "14 个市场",
+          status: "仅监控 · Negative Risk",
+          kind: "watch",
+          profitLabel: "毛利润上限",
+          profit: "$1.40",
+          details: [["多结果事件市场", "已订阅 · Negative Risk 暂不可参与"]],
+        },
+      ];
+
+      const signalHistory = [
+        ["今天 14:32:08", "停火持续至 8 月 31 日？", "2m 14s", "$0.060", "20 组", "$1.20"],
+        ["今天 11:08:41", "地缘事件市场示例 B", "18s", "$0.055", "20 组", "$1.10"],
+        ["昨天 22:17:04", "地缘事件市场示例 C", "41s", "$0.052", "20 组", "$1.04"],
+      ];
+
+      function isTradeBlocked() {
+        return ["executing", "incident", "degraded", "loading"].includes(scenario);
+      }
+
+      function pageHeader() {
+        const health = scenario === "degraded"
+          ? '<span class="pm-status-line"><i class="pm-status-dot danger"></i>Watcher 异常</span>'
+          : scenario === "loading"
+            ? '<span class="pm-status-line"><i class="pm-status-dot warning"></i>正在读取状态</span>'
+            : '<span class="pm-status-line"><i class="pm-status-dot"></i>Watcher 在线</span>';
+        return `
+          <header class="pm-page-head">
+            <div>
+              <h1>预测市场套利</h1>
+              <p>先看监控范围和实盘状态，再决定是否参与当前机会。</p>
+            </div>
+            <div class="pm-updated">${health}<br>最后心跳：刚刚 · Polymarket</div>
+          </header>`;
+      }
+
+      function readinessStrip() {
+        const trading = scenario === "incident"
+          ? ["熔断中", "pm-tone-danger", "等待人工解除"]
+          : scenario === "executing"
+            ? ["执行中", "pm-tone-warning", "其他按钮已锁定"]
+            : scenario === "degraded"
+              ? ["禁止交易", "pm-tone-danger", "数据连接未通过"]
+              : scenario === "loading"
+                ? ["检查中", "pm-tone-warning", "暂不可下单"]
+                : ["可以交易", "pm-tone-ok", "串行执行"];
+        const firstOrder = scenario === "success"
+          ? ["已验证", "pm-tone-ok", "今天 14:36"]
+          : scenario === "incident"
+            ? ["事故熔断", "pm-tone-danger", "已记录并通知"]
+            : ["待首单", "pm-tone-warning", "实盘链路尚未完成首单验证"];
+        const balance = scenario === "incident" ? "$49.40 pUSD" : scenario === "success" ? "$51.20 pUSD" : "$50.00 pUSD";
+        return `
+          <section class="pm-readiness" aria-label="实盘就绪状态">
+            <article class="pm-readiness-item">
+              <span>交易钱包</span><strong>0x7A4E…91C2</strong><small>独立低余额钱包 · Keychain</small>
+            </article>
+            <article class="pm-readiness-item">
+              <span>可用余额</span><strong>${balance}</strong><small>不自动充值</small>
+            </article>
+            <article class="pm-readiness-item">
+              <span>地区与连接</span><strong class="${scenario === "degraded" ? "pm-tone-danger" : "pm-tone-ok"}">${scenario === "degraded" ? "检查失败" : "允许交易"}</strong><small>官方 geoblock · 本机访问</small>
+            </article>
+            <article class="pm-readiness-item">
+              <span>实盘状态</span><strong class="${trading[1]}">${trading[0]}</strong><small>${trading[2]} · $20 / 应急 $2</small>
+            </article>
+            <article class="pm-readiness-item">
+              <span>首单验证</span><strong class="${firstOrder[1]}">${firstOrder[0]}</strong><small>${firstOrder[2]}</small>
+            </article>
+          </section>`;
+      }
+
+      function executionAlert() {
+        if (scenario === "executing") {
+          return `
+            <section class="pm-alert info" role="status" aria-live="polite">
+              <div class="pm-alert-body">
+                <strong>正在执行：停火持续至 8 月 31 日？</strong>
+                <p>本笔完成前，其他机会暂时不可参与。</p>
+                <div class="pm-progress" aria-label="订单执行进度">
+                  <div class="pm-progress-step done"><span>1 · 最终检查</span><strong>价格、余额、地区通过</strong></div>
+                  <div class="pm-progress-step done"><span>2 · 双腿提交</span><strong>2 笔 FOK 已签名</strong></div>
+                  <div class="pm-progress-step current"><span>3 · 成交核对</span><strong>正在读取两腿结果</strong></div>
+                  <div class="pm-progress-step"><span>4 · 自动合并</span><strong>等待完整代币组</strong></div>
+                </div>
+              </div>
+              <span class="pm-pill watch">请勿关闭页面</span>
+            </section>`;
+        }
+        if (scenario === "success") {
+          return `
+            <section class="pm-alert success" role="status" aria-live="polite">
+              <div class="pm-alert-body">
+                <strong>两腿已成交并自动合并</strong>
+                <p>买入 20 组实际成本 $18.80，合并收回 $20.00，本次已实现净利润 <b>+$1.20</b>。</p>
+              </div>
+              <span class="pm-pill action">已完成 · 14:36:12</span>
+            </section>`;
+        }
+        if (scenario === "incident") {
+          return `
+            <section class="pm-alert danger" role="alert">
+              <div class="pm-alert-body">
+                <strong>交易已熔断：发生单腿成交</strong>
+                <p>YES 成交、NO 被拒；系统已卖回 YES，当前不平衡持仓为 0，实际损失 $0.60。macOS 与飞书已通知。</p>
+              </div>
+              <button class="pm-button danger" type="button" data-action="open-reset">查看并解除熔断</button>
+            </section>`;
+        }
+        if (scenario === "degraded") {
+          return `
+            <section class="pm-alert danger" role="alert">
+              <div class="pm-alert-body">
+                <strong>Polymarket 数据连接异常</strong>
+                <p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p>
+              </div>
+              <span class="pm-pill watch">失败关闭</span>
+            </section>`;
+        }
+        return "";
+      }
+
+      function metricStrip() {
+        if (scenario === "loading") {
+          return `
+            <section class="pm-metrics" aria-label="监控摘要加载中" aria-busy="true">
+              ${["当前可参与", "监控事件", "市场 / Token", "WebSocket", "过去 24 小时"].map(label =>
+                `<article class="pm-metric"><span>${label}</span><strong>—</strong><small>正在读取…</small></article>`).join("")}
+            </section>`;
+        }
+        const actionable = scenario === "quiet" || scenario === "degraded" || scenario === "incident" || scenario === "executing" ? "0" : "1";
+        return `
+          <section class="pm-metrics" aria-label="监控摘要">
+            <article class="pm-metric primary"><span>当前可参与</span><strong>${actionable}</strong><small>后台检查全部通过后才显示</small></article>
+            <article class="pm-metric"><span>监控事件</span><strong>20</strong><small>按 24h 成交量动态筛选</small></article>
+            <article class="pm-metric"><span>市场 / Token</span><strong>331 / 662</strong><small>不可参与市场仍持续监控</small></article>
+            <article class="pm-metric"><span>WebSocket</span><strong>${scenario === "degraded" ? "重连中" : "正常"}</strong><small>Polymarket · 最近更新 1s</small></article>
+            <article class="pm-metric"><span>过去 24 小时</span><strong>3</strong><small>曾达到可参与条件</small></article>
+          </section>`;
+      }
+
+      function monitoredEventRows() {
+        return monitoredEvents.map((event, index) => `
+          <details class="pm-event"${index === 0 ? " open" : ""}>
+            <summary>
+              <div>
+                <div class="pm-event-title">${event.title}</div>
+                <div class="pm-event-meta">${event.markets} · ${event.profitLabel} ${event.profit} · 排名 #${index + 1}</div>
+              </div>
+              <div class="pm-volume"><span>24h 成交量</span>${event.volume}</div>
+              <div class="pm-event-state ${event.kind === "watch" ? "watch" : ""}">${event.status}</div>
+            </summary>
+            <div class="pm-market-list">
+              ${event.details.map(detail => `
+                <div class="pm-market-line"><span>${detail[0]}</span><span>${detail[1]}</span></div>
+              `).join("")}
+            </div>
+          </details>`).join("");
+      }
+
+      function opportunityPanel() {
+        if (scenario === "loading") {
+          return `<div class="pm-empty" aria-busy="true"><strong>正在读取可参与机会</strong><p>钱包、地区、费用和最新盘口完成检查后才会显示按钮。</p></div>`;
+        }
+        if (scenario === "quiet") {
+          return `<div class="pm-empty"><strong>当前没有可参与机会</strong><p>Watcher 正常运行。历史信号仍可在下方查看。</p></div>`;
+        }
+        const blocked = isTradeBlocked();
+        const buttonText = scenario === "executing"
+          ? "另一笔正在执行"
+          : scenario === "incident"
+            ? "熔断中"
+            : scenario === "degraded"
+              ? "数据异常"
+              : "参与 · 预计 +$1.20";
+        return `
+          <article class="pm-opportunity ${blocked ? "disabled" : ""}">
+            <div class="pm-opportunity-title">
+              <div>
+                <h3>以色列与伊朗停火是否持续至 2026 年 8 月 31 日？</h3>
+                <p>Polymarket · 普通二元 · 免手续费 · 1 秒前更新</p>
+              </div>
+              <span class="pm-pill ${blocked ? "watch" : "action"}">${blocked ? "暂不可参与" : "可参与"}</span>
+            </div>
+            <dl class="pm-opportunity-metrics">
+              <div><dt>YES 最高买价</dt><dd>$0.450</dd></div>
+              <div><dt>NO 最高买价</dt><dd>$0.490</dd></div>
+              <div><dt>自动数量</dt><dd>20 组</dd></div>
+              <div><dt>最大成本</dt><dd>$18.80</dd></div>
+              <div><dt>最低净利润</dt><dd class="pm-positive">+$1.20</dd></div>
+            </dl>
+            <div class="pm-opportunity-action">
+              <p>确认时会重新检查价格；不满足利润门槛就拒绝下单。</p>
+              <button class="pm-button primary pm-participate" type="button" data-action="participate"${blocked ? " disabled" : ""}>${buttonText}</button>
+            </div>
+          </article>`;
+      }
+
+      function signalHistoryTable() {
+        return `
+          <table class="pm-table">
+            <thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>峰值净边际</th><th>可执行</th><th>峰值利润</th></tr></thead>
+            <tbody>${signalHistory.map(row => `
+              <tr>
+                <td data-label="出现时间">${row[0]}</td>
+                <td data-label="市场">${row[1]}</td>
+                <td data-label="持续">${row[2]}</td>
+                <td data-label="峰值净边际">${row[3]}</td>
+                <td data-label="可执行">${row[4]}</td>
+                <td data-label="峰值利润" class="pm-positive"><strong>${row[5]}</strong></td>
+              </tr>`).join("")}</tbody>
+          </table>`;
+      }
+
+      function tradeHistory() {
+        if (scenario !== "success") {
+          return `<div class="pm-empty compact"><strong>还没有真实交易</strong><p>第一笔真实机会完成后，这里会记录两腿订单、合并交易和已实现利润。</p></div>`;
+        }
+        return `
+          <table class="pm-table">
+            <thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead>
+            <tbody><tr>
+              <td data-label="完成时间">今天 14:36:12</td>
+              <td data-label="市场">停火持续至 8 月 31 日？</td>
+              <td data-label="数量">20 组</td>
+              <td data-label="实际成本">$18.80</td>
+              <td data-label="合并收回">$20.00</td>
+              <td data-label="已实现" class="pm-positive"><strong>+$1.20</strong></td>
+            </tr></tbody>
+          </table>`;
+      }
+
+      function incidentHistory() {
+        if (scenario !== "incident") {
+          return `<div class="pm-empty compact"><strong>没有交易事故</strong><p>单腿成交、自动处置失败和合并失败会永久保留在这里。</p></div>`;
+        }
+        return `
+          <table class="pm-table">
+            <thead><tr><th>发生时间</th><th>市场</th><th>原因</th><th>自动处置</th><th>损失</th><th>状态</th></tr></thead>
+            <tbody><tr>
+              <td data-label="发生时间">今天 14:36:09</td>
+              <td data-label="市场">停火持续至 8 月 31 日？</td>
+              <td data-label="原因">YES 成交、NO 被拒</td>
+              <td data-label="自动处置">卖回 20 YES</td>
+              <td data-label="损失" class="pm-tone-danger"><strong>-$0.60</strong></td>
+              <td data-label="状态">已消除敞口 · 待解除熔断</td>
+            </tr></tbody>
+          </table>`;
+      }
+
+      function historyPanel() {
+        const content = historyKind === "signals"
+          ? signalHistoryTable()
+          : historyKind === "trades"
+            ? tradeHistory()
+            : incidentHistory();
+        return `
+          <section class="pm-panel">
+            <header class="pm-panel-heading">
+              <div>
+                <h2>历史记录</h2>
+                <p>信号、真实交易与事故分开保存；不记录原始盘口 tick。</p>
+              </div>
+              <div class="pm-history-tabs" aria-label="历史类型">
+                <button class="pm-history-tab" type="button" data-history="signals" aria-pressed="${historyKind === "signals"}">信号历史</button>
+                <button class="pm-history-tab" type="button" data-history="trades" aria-pressed="${historyKind === "trades"}">交易与合并</button>
+                <button class="pm-history-tab" type="button" data-history="incidents" aria-pressed="${historyKind === "incidents"}">事故</button>
+              </div>
+            </header>
+            ${content}
+          </section>`;
+      }
+
+      function renderPage() {
+        document.getElementById("pm-root").innerHTML = `
+          ${pageHeader()}
+          ${readinessStrip()}
+          ${executionAlert()}
+          ${metricStrip()}
+          <aside class="pm-policy">
+            <strong>V1 只对普通二元、免手续费市场开放实盘</strong>
+            <p>收费市场和 Negative Risk 市场仍监控、显示成交量和毛利润上限，但不会出现“参与”按钮。</p>
+          </aside>
+          <div class="pm-layout">
+            <section class="pm-panel">
+              <header class="pm-panel-heading">
+                <div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div>
+                <span class="pm-pill">显示 6 / 20</span>
+              </header>
+              <div class="pm-event-list">${monitoredEventRows()}</div>
+            </section>
+            <div class="pm-stack">
+              <section class="pm-panel">
+                <header class="pm-panel-heading">
+                  <div><h2>当前机会</h2><p>后台检查通过后，才允许在 Open Trader 内确认下单。</p></div>
+                  <span class="pm-pill venue">Polymarket</span>
+                </header>
+                ${opportunityPanel()}
+              </section>
+              ${historyPanel()}
+            </div>
+          </div>`;
+        document.getElementById("pm-scenario").value = scenario;
+        const url = new URL(window.location.href);
+        url.searchParams.set("state", scenario);
+        url.searchParams.set("history", historyKind);
+        window.history.replaceState({}, "", url);
+      }
+
+      function orderDialog() {
+        return `
+          <section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">
+            <header class="pm-modal-header">
+              <h2 id="pm-dialog-title">确认真实下单</h2>
+              <p>确认后由 Open Trader 使用独立钱包直接签名并执行，不跳转 Polymarket。</p>
+            </header>
+            <div class="pm-order-market">
+              <span>Polymarket · 普通二元 · 免手续费</span>
+              <strong>以色列与伊朗停火是否持续至 2026 年 8 月 31 日？</strong>
+            </div>
+            <div class="pm-order-legs">
+              <article class="pm-order-leg">
+                <span>第一腿 · BUY YES · FOK</span>
+                <strong>20 份 @ 最高 $0.450</strong>
+                <small>最大成本 $9.00 · 全成或全撤</small>
+              </article>
+              <article class="pm-order-leg">
+                <span>第二腿 · BUY NO · FOK</span>
+                <strong>20 份 @ 最高 $0.490</strong>
+                <small>最大成本 $9.80 · 全成或全撤</small>
+              </article>
+            </div>
+            <div class="pm-order-summary">
+              <div><span>正常最大成本</span><strong>$18.80</strong></div>
+              <div><span>合并收回</span><strong>$20.00</strong></div>
+              <div><span>最低净利润</span><strong class="pm-positive">+$1.20</strong></div>
+            </div>
+            <div class="pm-risk-note" role="note">
+              <strong>两笔订单不是原子交易</strong>
+              <p>可能只成交一腿。你同时授权系统最多承担 $2 预计损失进行补腿或平仓；随后会熔断并通知。</p>
+            </div>
+            <div class="pm-check-list">
+              <div class="pm-check"><span>独立钱包</span><strong>0x7A4E…91C2 · $50.00 pUSD</strong></div>
+              <div class="pm-check"><span>确认时处理</span><strong>重新检查价格、费用、余额和地区</strong></div>
+              <div class="pm-check"><span>失败规则</span><strong>净利润低于 $1 就拒绝，不追价</strong></div>
+            </div>
+            <footer class="pm-modal-actions">
+              <button class="pm-button" type="button" data-modal-action="cancel">取消</button>
+              <button class="pm-button primary" type="button" data-modal-action="confirm">确认下单 · 最多 $20</button>
+            </footer>
+          </section>`;
+      }
+
+      function resetDialog() {
+        return `
+          <section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1">
+            <header class="pm-modal-header">
+              <h2 id="pm-dialog-title">确认解除交易熔断</h2>
+              <p>事故记录会永久保留；解除后系统才重新开放“参与”按钮。</p>
+            </header>
+            <div class="pm-risk-note">
+              <strong>本次事故实际损失 $0.60</strong>
+              <p>YES 成交后 NO 被拒，系统已在 $2 授权内卖回 YES。</p>
+            </div>
+            <div class="pm-check-list">
+              <div class="pm-check"><span>不平衡持仓</span><strong class="pm-tone-ok">0</strong></div>
+              <div class="pm-check"><span>未完成订单</span><strong class="pm-tone-ok">0</strong></div>
+              <div class="pm-check"><span>当前余额</span><strong>$49.40 pUSD</strong></div>
+              <div class="pm-check"><span>通知状态</span><strong>macOS 与飞书已发送</strong></div>
+            </div>
+            <footer class="pm-modal-actions">
+              <button class="pm-button" type="button" data-modal-action="cancel">保持熔断</button>
+              <button class="pm-button danger" type="button" data-modal-action="reset">我已处理，恢复交易</button>
+            </footer>
+          </section>`;
+      }
+
+      function openModal(kind, trigger) {
+        previousFocus = trigger || document.activeElement;
+        modalKind = kind;
+        const root = document.getElementById("pm-modal-root");
+        root.innerHTML = kind === "order" ? orderDialog() : resetDialog();
+        document.body.style.overflow = "hidden";
+        requestAnimationFrame(() => root.querySelector(".pm-modal")?.focus());
+      }
+
+      function closeModal() {
+        modalKind = "";
+        document.getElementById("pm-modal-root").innerHTML = "";
+        document.body.style.overflow = "";
+        previousFocus?.focus?.();
+        previousFocus = null;
+      }
+
+      document.getElementById("pm-root").addEventListener("click", event => {
+        const participate = event.target.closest("[data-action='participate']");
+        if (participate && !participate.disabled) {
+          openModal("order", participate);
+          return;
+        }
+        const reset = event.target.closest("[data-action='open-reset']");
+        if (reset) {
+          openModal("reset", reset);
+          return;
+        }
+        const history = event.target.closest("[data-history]");
+        if (history) {
+          historyKind = history.dataset.history;
+          renderPage();
+        }
+      });
+
+      document.getElementById("pm-modal-root").addEventListener("click", event => {
+        const action = event.target.closest("[data-modal-action]")?.dataset.modalAction;
+        if (!action) return;
+        if (action === "cancel") {
+          closeModal();
+          return;
+        }
+        if (action === "confirm") {
+          closeModal();
+          scenario = "executing";
+          renderPage();
+          document.querySelector(".pm-alert")?.focus?.();
+          return;
+        }
+        if (action === "reset") {
+          closeModal();
+          scenario = "ready";
+          renderPage();
+        }
+      });
+
+      document.getElementById("pm-scenario").addEventListener("change", event => {
+        scenario = event.target.value;
+        if (scenario === "success") historyKind = "trades";
+        if (scenario === "incident") historyKind = "incidents";
+        renderPage();
+        window.scrollTo({top: 0, behavior: "smooth"});
+      });
+
+      document.addEventListener("keydown", event => {
+        if (!modalKind) return;
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeModal();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const modal = document.querySelector(".pm-modal");
+        const focusable = [...modal.querySelectorAll("button:not(:disabled), select, [href], [tabindex]:not([tabindex='-1'])")];
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      });
+
+      renderPage();
+    </script>
+  </body>
+</html>
