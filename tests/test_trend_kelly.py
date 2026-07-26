@@ -268,9 +268,9 @@ def test_cn_v8_kelly_inherits_only_v4_v7_v8() -> None:
 @pytest.mark.parametrize(
     ("market", "target_version", "inherited_versions"),
     [
-        ("CN", "v9", ("v4", "v7", "v8", "v9")),
-        ("US", "v6", ("v4", "v5", "v6")),
-        ("HK", "v6", ("v4", "v5", "v6")),
+        ("CN", "v10", ("v4", "v7", "v8", "v9", "v10")),
+        ("US", "v7", ("v4", "v5", "v6", "v7")),
+        ("HK", "v7", ("v4", "v5", "v6", "v7")),
     ],
 )
 def test_current_strategy_versions_use_exact_inherited_kelly_samples(
@@ -283,13 +283,16 @@ def test_current_strategy_versions_use_exact_inherited_kelly_samples(
         f"trend_animals_warm_to_hot/{market}/{target_version}",
         target_version,
     )
-    for version in inherited_versions:
+    for version_number in range(1, 11):
+        version = f"v{version_number}"
         sample = (
             market,
             f"trend_animals_warm_to_hot/{market}/{version}",
             version,
         )
-        assert trend_kelly_identity_matches(sample, target)
+        assert trend_kelly_identity_matches(sample, target) is (
+            version in inherited_versions
+        )
         if version != target_version:
             assert not trend_kelly_identity_matches(target, sample)
     assert not trend_kelly_identity_matches(
