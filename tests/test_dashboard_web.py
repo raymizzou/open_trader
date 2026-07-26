@@ -4469,7 +4469,18 @@ window.fetch=async (input)=>{{
         assert page.evaluate("document.activeElement.dataset.accountView") == "report"
         review_disclosure = section.locator("details.trend-review-disclosure")
         assert review_disclosure.count() == 1
+        assert review_disclosure.get_attribute("class") == "trend-audit trend-review-disclosure"
         assert review_disclosure.get_attribute("open") is None
+        assert review_disclosure.locator(":scope > summary > small").count() == 0
+        audit_summary = section.locator(
+            ".cn-trend-report > details.trend-audit:not(.trend-review-disclosure) > summary"
+        )
+        assert audit_summary.count() == 1
+        summary_style = """node => {
+          const style = getComputedStyle(node);
+          return {display: style.display, minHeight: style.minHeight, padding: style.padding};
+        }"""
+        assert review_disclosure.locator(":scope > summary").evaluate(summary_style) == audit_summary.evaluate(summary_style)
         review_disclosure.locator(":scope > summary").click()
         assert "卡玛比率" in review_disclosure.inner_text()
         assert "夏普比率" in review_disclosure.inner_text()
@@ -4651,9 +4662,9 @@ for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘
   if (account.includes(`data-account-broker="${broker}" data-account-view="review"`) || account.includes(`>${label}</button>`)) throw new Error(account);
   state.accountViews[broker]="report";
   const report=renderAccountSection(group(broker));
-  const disclosure=report.match(/<details class="trend-review-disclosure"[\s\S]*?<\/details>/)?.[0]||"";
+  const disclosure=report.match(/<details class="trend-audit trend-review-disclosure"[\s\S]*?<\/details>/)?.[0]||"";
   if (!report.includes("cn-trend-report") || !disclosure.includes("<summary>趋势复盘") || disclosure.includes(" open")) throw new Error(report);
-  if (!disclosure.includes("纪律模拟 31 笔") || !disclosure.includes("trend-review") || !disclosure.includes(label.replace("复盘","趋势复盘"))) throw new Error(disclosure);
+  if (!disclosure.includes("纪律模拟 31 笔") || !disclosure.includes("trend-review") || !disclosure.includes(label.replace("复盘","趋势复盘")) || disclosure.includes("<small>")) throw new Error(disclosure);
   state.accountViews[broker]="real";
 }
 if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");

@@ -2037,8 +2037,7 @@ table {
   color: var(--warning) !important;
 }
 
-.trend-discipline-workspace,
-.trend-review-disclosure {
+.trend-discipline-workspace {
   background: var(--surface);
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
@@ -2047,7 +2046,6 @@ table {
 }
 
 .trend-discipline-workspace > summary,
-.trend-review-disclosure > summary,
 .trend-controller-status > summary,
 .trend-risk-summary > summary {
   align-items: center;
@@ -2060,14 +2058,12 @@ table {
 }
 
 .trend-discipline-workspace > summary::marker,
-.trend-review-disclosure > summary::marker,
 .trend-controller-status > summary::marker,
 .trend-risk-summary > summary::marker {
   color: var(--accent);
 }
 
 .trend-discipline-workspace > summary span,
-.trend-review-disclosure > summary span,
 .trend-controller-status > summary span,
 .trend-risk-summary > summary span {
   color: var(--muted);
@@ -2076,7 +2072,6 @@ table {
 }
 
 .trend-discipline-workspace > summary small,
-.trend-review-disclosure > summary small,
 .trend-controller-status > summary small,
 .trend-risk-summary > summary small {
   background: var(--surface-soft);
@@ -2088,7 +2083,6 @@ table {
 }
 
 .trend-discipline-workspace > summary:focus-visible,
-.trend-review-disclosure > summary:focus-visible,
 .trend-controller-status > summary:focus-visible,
 .trend-risk-summary > summary:focus-visible {
   outline: 3px solid var(--accent);
@@ -2103,8 +2097,13 @@ table {
 }
 
 .trend-review-disclosure > .trend-review {
-  border-top: 1px solid var(--line);
-  padding: 18px;
+  margin-top: 14px;
+}
+
+.trend-review-disclosure > summary span {
+  color: var(--muted);
+  font-weight: 400;
+  overflow-wrap: anywhere;
 }
 
 .trend-discipline-note {
@@ -2369,14 +2368,16 @@ table {
 }
 
 .cn-trend-report > .trend-audit,
-.cn-trend-report > .cn-trend-audit {
+.cn-trend-report > .cn-trend-audit,
+.trend-review-disclosure {
   border-left: 3px solid var(--muted);
   border-radius: 0;
   padding: 0 12px 10px;
 }
 
 .cn-trend-report > .trend-audit > summary,
-.cn-trend-report > .cn-trend-audit > summary {
+.cn-trend-report > .cn-trend-audit > summary,
+.trend-audit.trend-review-disclosure > summary {
   min-height: 48px;
   padding: 9px 0;
 }
@@ -4693,7 +4694,6 @@ tbody tr.active-row,
 .trend-industry-context-card,
 .trend-discipline-category,
 .trend-discipline-workspace > summary small,
-.trend-review-disclosure > summary small,
 .trend-controller-status > summary small,
 .trend-risk-summary > summary small,
 .trend-industry-context-table thead th {
@@ -4950,14 +4950,12 @@ table {
   }
 
   .trend-discipline-workspace > summary,
-  .trend-review-disclosure > summary,
   .trend-controller-status > summary,
   .trend-risk-summary > summary {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .trend-discipline-workspace > summary small,
-  .trend-review-disclosure > summary small,
   .trend-controller-status > summary small,
   .trend-risk-summary > summary small {
     grid-column: 2;
@@ -4965,7 +4963,6 @@ table {
   }
 
   .trend-discipline-workspace > summary span,
-  .trend-review-disclosure > summary span,
   .trend-controller-status > summary span,
   .trend-risk-summary > summary span {
     grid-column: 1;

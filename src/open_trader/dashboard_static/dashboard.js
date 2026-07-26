@@ -3489,8 +3489,8 @@ function renderEmbeddedTrendReport(broker) {
   const report = state.dashboard?.trend_reports?.[broker] || {};
   const review = state.dashboard?.trend_reviews?.[broker];
   const reviewPanel = !review ? "" : review.available
-    ? `<details class="trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(`${formatTrendReviewSampleCount(review, "discipline", "纪律模拟")} · ${formatTrendReviewSampleCount(review, "actual", "实际执行")}`)}</span><small>已折叠</small></summary>${renderTrendReviewWorkspace(review, true)}</details>`
-    : `<details class="trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span><small>已折叠</small></summary><p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p></details>`;
+    ? `<details class="trend-audit trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(`${formatTrendReviewSampleCount(review, "discipline", "纪律模拟")} · ${formatTrendReviewSampleCount(review, "actual", "实际执行")}`)}</span></summary>${renderTrendReviewWorkspace(review, true)}</details>`
+    : `<details class="trend-audit trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span></summary><p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p></details>`;
   if (report.available) return `${renderTrendReportWorkspace(report, true)}${reviewPanel}`;
   const statusClass = report.execution_batch_blocking === true
     ? "trend-execution-batch-error"

@@ -5,9 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-26
 
-- Moved the current CN/HK/US trend review into a default-closed disclosure in
-  the Trend Report tab; the compact summary shows both sample counts, while
-  frozen historical reports still exclude current review data.
+- Moved the current CN/HK/US trend review into a default-closed, audit-style
+  disclosure in the Trend Report tab; its compact summary shows both sample
+  counts, while frozen historical reports still exclude current review data.
 - Removed the standalone CN/HK/US trend-review tabs and rendered each market's
   review metrics directly below its current trend report; keyboard, mobile, and
   Dashboard acceptance checks now enforce the three-tab account layout.
