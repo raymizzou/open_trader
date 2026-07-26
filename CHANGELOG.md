@@ -10,6 +10,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   reports now label ETF candidates and buy actions explicitly, with an audited
   compatibility transition for the expanded universes. Verified the focused
   suites and current production report projection.
+- Prevented a normal CN holiday protection pass from falsely blocking the
+  long-running trend controller during weekend Dashboard acceptance.
 
 ## 2026-07-25
 

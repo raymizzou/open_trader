@@ -51,6 +51,16 @@ def protection_success() -> SimpleNamespace:
     )
 
 
+def test_holiday_protection_pass_is_not_blocking() -> None:
+    result = SimpleNamespace(
+        status="holiday",
+        exception_count=0,
+        unknown_quote_count=0,
+    )
+
+    assert controller._protection_blocker(result) is None
+
+
 def controller_config(tmp_path: Path) -> DailyPremarketConfig:
     return DailyPremarketConfig(
         repo=tmp_path,

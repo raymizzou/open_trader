@@ -828,7 +828,7 @@ def _protection_blocker(result: object) -> str | None:
     exceptions = getattr(result, "exception_count", None)
     unknown_quotes = getattr(result, "unknown_quote_count", None)
     if (
-        status != "completed"
+        status not in {"completed", "holiday"}
         or not isinstance(exceptions, int)
         or isinstance(exceptions, bool)
         or exceptions
