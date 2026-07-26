@@ -13,7 +13,7 @@ from open_trader.drawdown_preflight import (
     market_preflight_dates,
     run_drawdown_preflight,
 )
-from open_trader.notifications import NullNotifier
+from open_trader.notifications import Notifier, NullNotifier
 from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     observe_strategy_equity,
@@ -35,7 +35,12 @@ def market_input(market: str, *, error: str = "") -> DrawdownMarketInput:
     )
 
 
-def run_preflight(root: Path, inputs: dict[str, DrawdownMarketInput]) -> dict[str, object]:
+def run_preflight(
+    root: Path,
+    inputs: dict[str, DrawdownMarketInput],
+    *,
+    notifier: Notifier | None = None,
+) -> dict[str, object]:
     return run_drawdown_preflight(
         data_dir=root / "data",
         reports_dir=root / "reports",
@@ -43,7 +48,7 @@ def run_preflight(root: Path, inputs: dict[str, DrawdownMarketInput]) -> dict[st
         accepted_git_sha="a" * 40,
         actor="acceptance",
         occurred_at="2026-07-20T08:00:00+08:00",
-        notifier=NullNotifier(),
+        notifier=notifier if notifier is not None else NullNotifier(),
     )
 
 
@@ -213,7 +218,12 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
             "parameters": {"drawdown_limit": "0.05", "market": "CN"},
         },
     )
-    result = run_preflight(tmp_path, {"CN": target})
+    notifier = RecordingNotifier()
+    result = run_preflight(
+        tmp_path,
+        {"CN": target},
+        notifier=notifier,
+    )
 
     assert result["status"] == "failed"
     assert result["markets"][0]["status"] == "failed"
@@ -222,6 +232,18 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
         in result["markets"][0]["error"]
     )
     assert state_path.read_bytes() == before
+    assert notifier.calls == [(
+        "【需处理｜系统｜累计回撤状态阻断】",
+        "\n".join([
+            "发生：新策略版本无法建立或继承累计回撤状态",
+            "影响：CN v9 暂停新开仓；卖出和保护线继续运行",
+            "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
+            "",
+            "明细：",
+            "- CN v9：回撤预检失败",
+        ]),
+    )]
+    assert "approved predecessor drawdown state is unavailable" not in notifier.calls[0][1]
 
 
 def test_first_activation_without_baseline_fails_closed(tmp_path: Path) -> None:
@@ -404,50 +426,78 @@ def test_frozen_missing_report_supplies_original_account_baseline(
     ) == Decimal("123.45")
 
 
-def test_failure_alert_is_deduplicated_and_rearmed_after_recovery(
+def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
     tmp_path: Path,
 ) -> None:
-    report = write_report(tmp_path, "US", "ok")
+    failed_inputs = {
+        market: replace(market_input(market), baseline_equity=None)
+        for market in ("CN", "HK", "US")
+    }
     notifier = RecordingNotifier()
     request = dict(
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
-        market_inputs={"US": market_input("US")},
+        market_inputs=failed_inputs,
         accepted_git_sha="a" * 40,
-        actor="acceptance",
+        actor="deployment",
         occurred_at="2026-07-20T08:00:00+08:00",
         notifier=notifier,
     )
 
-    run_drawdown_preflight(**request)
-    run_drawdown_preflight(**request)
-    assert len(notifier.calls) == 1
-    assert "高优先级" in notifier.calls[0][0]
+    assert run_drawdown_preflight(**request)["status"] == "failed"
+    assert run_drawdown_preflight(**request)["status"] == "failed"
+    expected = (
+        "【需处理｜系统｜累计回撤状态阻断】",
+        "\n".join([
+            "发生：新策略版本无法建立或继承累计回撤状态",
+            "影响：CN v4、HK v4、US v4 暂停新开仓；卖出和保护线继续运行",
+            "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
+            "",
+            "明细：",
+            "- CN v4：历史基线不可用",
+            "- HK v4：历史基线不可用",
+            "- US v4：历史基线不可用",
+        ]),
+    )
+    assert notifier.calls == [expected]
+    assert json.loads(
+        (tmp_path / "data/trend_drawdown/alerts.json").read_text()
+    )["active"] == [
+        "CN|v4|baseline_unavailable",
+        "HK|v4|baseline_unavailable",
+        "US|v4|baseline_unavailable",
+    ]
 
-    report.unlink()
+    request["market_inputs"] = {
+        market: market_input(market) for market in ("CN", "HK", "US")
+    }
     assert run_drawdown_preflight(**request)["status"] == "ready"
     state_root = tmp_path / "data/trend_drawdown"
     (state_root / "state.json").unlink()
     shutil.rmtree(state_root / "snapshots")
-    write_report(tmp_path, "US", "ok")
+    request["market_inputs"] = failed_inputs
+
     assert run_drawdown_preflight(**request)["status"] == "failed"
-    assert len(notifier.calls) == 2
+    assert notifier.calls == [expected, expected]
 
 
 def test_notification_failure_does_not_change_fail_closed_result(
     tmp_path: Path,
 ) -> None:
-    write_report(tmp_path, "HK", "ok")
-
+    notifier = RecordingNotifier(fail=True)
     result = run_drawdown_preflight(
         data_dir=tmp_path / "data",
         reports_dir=tmp_path / "reports",
-        market_inputs={"HK": market_input("HK")},
+        market_inputs={
+            market: replace(market_input(market), baseline_equity=None)
+            for market in ("CN", "HK", "US")
+        },
         accepted_git_sha="a" * 40,
-        actor="acceptance",
+        actor="deployment",
         occurred_at="2026-07-20T08:00:00+08:00",
-        notifier=RecordingNotifier(fail=True),
+        notifier=notifier,
     )
 
     assert result["status"] == "failed"
+    assert len(notifier.calls) == 1
     assert not (tmp_path / "data/trend_drawdown/alerts.json").exists()

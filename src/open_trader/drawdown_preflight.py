@@ -33,6 +33,13 @@ APPROVED_DRAWDOWN_PREDECESSORS = {
     ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
     ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
 }
+_DRAWDOWN_FAILURE_LABELS = {
+    "baseline_unavailable": "历史基线不可用",
+    "parameter_mismatch": "策略参数与已登记版本不一致",
+    "parameter_identity_missing": "策略参数身份缺失",
+    "state_missing_recovery_failed": "回撤状态丢失且恢复失败",
+    "state_corrupt_recovery_failed": "回撤状态损坏且恢复失败",
+}
 
 
 @dataclass(frozen=True)
@@ -277,6 +284,7 @@ def _sync_failure_alerts(
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         active = set()
     original = set(active)
+    pending: list[tuple[str, str, str]] = []
     for result in results:
         market = str(result["market"])
         strategy = market_inputs[market].strategy_snapshot
@@ -288,17 +296,42 @@ def _sync_failure_alerts(
         failure_status = result.get("failure_status")
         if result["status"] != "failed" or not failure_status:
             continue
-        key = prefix + str(failure_status)
+        failure_status = str(failure_status)
+        key = prefix + failure_status
         if key in active:
             continue
+        pending.append((
+            key,
+            f"{market} {version}",
+            _DRAWDOWN_FAILURE_LABELS.get(failure_status, "回撤预检失败"),
+        ))
+    if pending:
+        affected = "、".join(label for _, label, _ in pending)
+        details = "\n".join(
+            f"- {label}：{reason}" for _, label, reason in pending
+        )
         try:
             notifier.notify(
-                "高优先级：策略累计回撤状态阻断",
-                f"{market} {version}：{result.get('error', failure_status)}",
+                "【需处理｜系统｜累计回撤状态阻断】",
+                "\n".join([
+                    "发生：新策略版本无法建立或继承累计回撤状态",
+                    (
+                        f"影响：{affected} 暂停新开仓；"
+                        "卖出和保护线继续运行"
+                    ),
+                    (
+                        "现在做：让 Codex 检查回撤预检并重新部署；"
+                        "不要手动解除限制"
+                    ),
+                    "",
+                    "明细：",
+                    details,
+                ]),
             )
         except Exception:
-            continue
-        active.add(key)
+            pass
+        else:
+            active.update(key for key, _, _ in pending)
     if active == original:
         return
     content = (
