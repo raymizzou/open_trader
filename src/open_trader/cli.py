@@ -26,6 +26,7 @@ from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
     _optional_positive_tm_id,
+    _positive_tm_ids,
     _read_env_file,
     build_notifier,
     load_env_config,
@@ -2470,6 +2471,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "dashboard":
         config_values = _load_optional_env_values(args.config)
         try:
+            trend_a_share_tm_id = _optional_positive_tm_id(
+                config_values, "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID"
+            )
+            trend_etf_tm_id = _optional_positive_tm_id(
+                config_values, "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID"
+            )
+            trend_cn_candidate_pool_ids = (
+                (trend_a_share_tm_id, trend_etf_tm_id)
+                if trend_a_share_tm_id and trend_etf_tm_id
+                else ()
+            )
+            trend_us_candidate_pool_ids = _positive_tm_ids(
+                config_values.get("TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS", "")
+            )
+            trend_hk_candidate_pool_ids = _positive_tm_ids(
+                config_values.get("TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS", "")
+            )
             simulate_account_ids = {
                 market: _optional_positive_tm_id(
                     config_values,
@@ -2499,6 +2517,9 @@ def main(argv: list[str] | None = None) -> int:
             trend_executor_host=config_values.get(
                 "OPEN_TRADER_TREND_EXECUTOR_HOST", ""
             ).strip(),
+            trend_cn_candidate_pool_ids=trend_cn_candidate_pool_ids,
+            trend_us_candidate_pool_ids=trend_us_candidate_pool_ids,
+            trend_hk_candidate_pool_ids=trend_hk_candidate_pool_ids,
         )
         serve_dashboard(
             config,

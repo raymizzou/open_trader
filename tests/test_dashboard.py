@@ -178,6 +178,9 @@ def dashboard_config(
         trend_review_cn_simulate_acc_id=trend_review_cn_simulate_acc_id,
         trend_review_us_simulate_acc_id=trend_review_us_simulate_acc_id,
         trend_review_hk_simulate_acc_id=trend_review_hk_simulate_acc_id,
+        trend_cn_candidate_pool_ids=(622466, 697199),
+        trend_us_candidate_pool_ids=(622460, 705013),
+        trend_hk_candidate_pool_ids=(622494, 707617),
     )
 
 
@@ -404,8 +407,7 @@ def test_exact_historical_report_includes_its_immutable_execution(
     )
 
     report = load_historical_trend_report(
-        config.data_dir,
-        config.reports_dir,
+        config,
         broker="tiger",
         artifact="2026-07-16.json",
     )
@@ -426,8 +428,7 @@ def test_historical_report_rejects_unsafe_artifact_paths(
     config = dashboard_config(tmp_path)
     with pytest.raises(ValueError, match="unsafe trend report artifact"):
         load_historical_trend_report(
-            config.data_dir,
-            config.reports_dir,
+            config,
             broker="tiger",
             artifact=artifact,
         )
@@ -447,8 +448,7 @@ def test_historical_report_rejects_artifact_resolving_outside_broker_directory(
 
     with pytest.raises(ValueError, match="unsafe trend report artifact"):
         load_historical_trend_report(
-            config.data_dir,
-            config.reports_dir,
+            config,
             broker="tiger",
             artifact="linked.json",
         )
@@ -468,8 +468,7 @@ def test_historical_report_rejects_wrong_report_market(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="trend report artifact is unreadable"):
         load_historical_trend_report(
-            config.data_dir,
-            config.reports_dir,
+            config,
             broker="tiger",
             artifact="wrong-market.json",
         )
@@ -501,8 +500,7 @@ def test_trend_report_history_and_exact_loading_reject_missing_strategy_version(
     }]
     with pytest.raises(ValueError, match="trend report artifact is unreadable"):
         load_historical_trend_report(
-            config.data_dir,
-            config.reports_dir,
+            config,
             broker="tiger",
             artifact="missing-version.json",
         )
@@ -522,8 +520,7 @@ def test_trend_report_loaders_reject_unknown_broker(
             load_trend_report_history(tmp_path, broker="unknown")
         else:
             load_historical_trend_report(
-                tmp_path / "data",
-                tmp_path / "reports",
+                dashboard_config(tmp_path),
                 broker="unknown",
                 artifact="report.json",
             )
@@ -1590,7 +1587,12 @@ def test_dashboard_projects_frozen_strategy_parameters_into_cn_audit(
     assert report["audit"]["strategy_parameters"] is not parameters
 
 
-def _dashboard_frozen_report_payload() -> dict[str, object]:
+def _dashboard_frozen_report_payload(
+    *,
+    market: str = "CN",
+    broker: str = "eastmoney",
+    candidate_pool_ids: tuple[int, ...] = (),
+) -> dict[str, object]:
     report = trend_module.build_report(
         as_of_date="2026-07-15",
         execution_date="2026-07-15",
@@ -1606,13 +1608,17 @@ def _dashboard_frozen_report_payload() -> dict[str, object]:
         candidates=(),
         holding_snapshots={},
         bars_by_symbol={},
-        market="CN",
-        metadata={"market": "CN", "broker": "eastmoney", "run_date": "2026-07-15"},
+        market=market,
+        metadata={"market": market, "broker": broker, "run_date": "2026-07-15"},
         estimated_api_cost=Decimal("0.479"),
         actual_api_cost=None,
         estimated_api_cost_complete=False,
+        candidate_pool_ids=candidate_pool_ids,
     )
-    return trend_module._report_payload(report)
+    payload = trend_module._report_payload(report)
+    if market != "CN":
+        payload["option_attention"] = []
+    return payload
 
 
 def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
@@ -1628,6 +1634,10 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
+        current_candidate_pool_ids={
+            market: config.trend_candidate_pool_ids(market)
+            for market in ("CN", "US", "HK")
+        },
     )["eastmoney"]
 
     assert projected["api_cost"] == payload["api_cost"]
@@ -1649,6 +1659,77 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
         "estimated_api_cost"
     ]
     assert projected["audit"]["actual_api_cost"] == payload["actual_api_cost"]
+
+
+@pytest.mark.parametrize(
+    ("market", "broker", "directory", "frozen_ids", "current_ids"),
+    [
+        ("US", "tiger", "trend_us_tiger", (622460,), (622460, 705013)),
+        ("HK", "phillips", "trend_hk_phillips", (622494,), (622494, 707617)),
+    ],
+)
+def test_dashboard_current_discipline_uses_configured_etf_pools_for_old_reports(
+    tmp_path: Path,
+    market: str,
+    broker: str,
+    directory: str,
+    frozen_ids: tuple[int, ...],
+    current_ids: tuple[int, ...],
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = _dashboard_frozen_report_payload(
+        market=market,
+        broker=broker,
+        candidate_pool_ids=frozen_ids,
+    )
+    path = config.reports_dir / directory / "2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+        current_candidate_pool_ids={market: current_ids},
+    )[broker]
+
+    source = next(
+        row["value"]
+        for row in report["current_strategy_parameter_rows"]
+        if row["name"] == "趋势动物组合"
+    )
+    assert source == "、".join(str(pool_id) for pool_id in current_ids)
+    frozen_source = next(
+        row["value"]
+        for row in report["strategy_parameter_rows"]
+        if row["name"] == "趋势动物组合"
+    )
+    assert frozen_source == "、".join(str(pool_id) for pool_id in frozen_ids)
+
+
+def test_dashboard_does_not_label_frozen_pools_as_current_without_config(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = _dashboard_frozen_report_payload(
+        market="US",
+        broker="tiger",
+        candidate_pool_ids=(622460,),
+    )
+    path = config.reports_dir / "trend_us_tiger/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+        current_candidate_pool_ids={},
+    )["tiger"]
+
+    assert report["current_strategy_version"] == ""
+    assert report["current_strategy_parameter_rows"] is None
+    assert report["strategy_parameter_rows"]
 
 
 def test_dashboard_rejects_malformed_frozen_cost_projection(tmp_path: Path) -> None:

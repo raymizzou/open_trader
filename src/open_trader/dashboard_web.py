@@ -356,8 +356,7 @@ def create_dashboard_server(
                     if len(route) == 3 and route[1] == "history":
                         try:
                             report = load_historical_trend_report(
-                                config.data_dir,
-                                config.reports_dir,
+                                config,
                                 broker=route[0],
                                 artifact=unquote(route[2]),
                             )

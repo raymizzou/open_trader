@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
@@ -180,6 +180,16 @@ class DashboardConfig:
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
     trend_executor_host: str = ""
+    trend_cn_candidate_pool_ids: tuple[int, ...] = ()
+    trend_us_candidate_pool_ids: tuple[int, ...] = ()
+    trend_hk_candidate_pool_ids: tuple[int, ...] = ()
+
+    def trend_candidate_pool_ids(self, market: str) -> tuple[int, ...]:
+        return {
+            "CN": self.trend_cn_candidate_pool_ids,
+            "US": self.trend_us_candidate_pool_ids,
+            "HK": self.trend_hk_candidate_pool_ids,
+        }.get(market.upper(), ())
 
 
 @dataclass(frozen=True)
@@ -346,6 +356,10 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             config.reports_dir,
             broker_positions=broker_positions,
             cash_details=raw_cash_details,
+            current_candidate_pool_ids={
+                market: config.trend_candidate_pool_ids(market)
+                for market in ("CN", "US", "HK")
+            },
         ),
         trend_reviews=_load_trend_reviews(config.data_dir),
         trend_controllers=_load_trend_controllers(
@@ -648,6 +662,7 @@ def _load_trend_reports(
     now: datetime | None = None,
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
+    current_candidate_pool_ids: Mapping[str, tuple[int, ...]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if broker_positions is None or cash_details is None:
         broker_positions, cash_details = _latest_broker_details(data_dir)
@@ -665,6 +680,7 @@ def _load_trend_reports(
             ).isoformat(),
             broker_positions=broker_positions,
             cash_details=cash_details,
+            current_candidate_pool_ids=(current_candidate_pool_ids or {}).get(market, ()),
         )
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
@@ -775,7 +791,7 @@ def load_trend_report_history(
 
 
 def load_historical_trend_report(
-    data_dir: Path, reports_dir: Path, *, broker: str, artifact: str
+    config: DashboardConfig, *, broker: str, artifact: str
 ) -> dict[str, Any]:
     """Return the same report projection used by the current-report UI."""
     try:
@@ -784,7 +800,7 @@ def load_historical_trend_report(
         )
     except KeyError:
         raise ValueError(f"unsupported trend report broker: {broker}") from None
-    broker_dir = reports_dir / directory
+    broker_dir = config.reports_dir / directory
     selected = _validated_trend_report_artifact(
         broker_dir,
         artifact=artifact,
@@ -802,7 +818,7 @@ def load_historical_trend_report(
         generated_at,
         _,
     ) = selected
-    broker_positions, cash_details = _latest_broker_details(data_dir)
+    broker_positions, cash_details = _latest_broker_details(config.data_dir)
     return _project_broker_trend_report(
         selected=(
             path,
@@ -812,7 +828,7 @@ def load_historical_trend_report(
             freshness_date,
             generated_at,
         ),
-        data_dir=data_dir,
+        data_dir=config.data_dir,
         reports_dir=broker_dir.resolve(),
         broker=broker,
         market=market,
@@ -822,6 +838,7 @@ def load_historical_trend_report(
         report_date=_shanghai_date().isoformat(),
         broker_positions=broker_positions,
         cash_details=cash_details,
+        current_candidate_pool_ids=config.trend_candidate_pool_ids(market),
     )
 
 
@@ -1702,6 +1719,7 @@ def _load_broker_trend_report(
     report_date: str,
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
+    current_candidate_pool_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     unavailable = {
         "available": False,
@@ -1729,6 +1747,7 @@ def _load_broker_trend_report(
         report_date=report_date,
         broker_positions=broker_positions,
         cash_details=cash_details,
+        current_candidate_pool_ids=current_candidate_pool_ids,
         use_execution_batch=True,
     )
 
@@ -1746,6 +1765,7 @@ def _project_broker_trend_report(
     report_date: str,
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
+    current_candidate_pool_ids: tuple[int, ...] = (),
     use_execution_batch: bool = False,
 ) -> dict[str, Any]:
     _, latest_payload, *_ = selected
@@ -1924,16 +1944,20 @@ def _project_broker_trend_report(
     )
     if not isinstance(frozen_parameter_rows, list):
         frozen_parameter_rows = []
-    candidate_pool_ids = strategy_parameters.get("candidate_pool_ids")
     current_strategy_snapshot = (
         live_trend_strategy_snapshot(
             market,
             str(strategy_snapshot.get("process_version") or ""),
-            candidate_pool_ids,
+            current_candidate_pool_ids,
         )
         if isinstance(strategy_snapshot, dict)
-        and isinstance(candidate_pool_ids, list)
+        and current_candidate_pool_ids
         else {}
+    )
+    current_parameter_rows = (
+        current_strategy_snapshot.get("parameter_rows")
+        if current_strategy_snapshot
+        else None
     )
     actual_overlay = _project_trend_actual_overlay(
         broker=broker,
@@ -1961,9 +1985,7 @@ def _project_broker_trend_report(
         "current_strategy_version": str(
             current_strategy_snapshot.get("strategy_version") or ""
         ),
-        "current_strategy_parameter_rows": current_strategy_snapshot.get(
-            "parameter_rows", []
-        ),
+        "current_strategy_parameter_rows": current_parameter_rows,
         "data_status": "current" if current else "stale",
         "broker": broker,
         "broker_label": broker_label,

@@ -346,8 +346,7 @@ def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     )
 
     historical = load_historical_trend_report(
-        config.data_dir,
-        config.reports_dir,
+        config,
         broker="tiger",
         artifact="2026-07-17-r1.json",
     )
