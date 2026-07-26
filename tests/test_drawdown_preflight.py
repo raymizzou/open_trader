@@ -544,6 +544,8 @@ def test_load_frozen_baseline_rejects_invalid_completed_date_artifacts(
 def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
     tmp_path: Path,
 ) -> None:
+    for market in ("CN", "HK", "US"):
+        write_report(tmp_path, market, "missing")
     failed_inputs = {
         market: replace(market_input(market), baseline_equity=None)
         for market in ("CN", "HK", "US")
@@ -569,18 +571,18 @@ def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
             "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
             "",
             "明细：",
-            "- CN v4：历史基线不可用",
-            "- HK v4：历史基线不可用",
-            "- US v4：历史基线不可用",
+            "- CN v4：回撤预检失败",
+            "- HK v4：回撤预检失败",
+            "- US v4：回撤预检失败",
         ]),
     )
     assert notifier.calls == [expected]
     assert json.loads(
         (tmp_path / "data/trend_drawdown/alerts.json").read_text()
     )["active"] == [
-        "CN|v4|baseline_unavailable",
-        "HK|v4|baseline_unavailable",
-        "US|v4|baseline_unavailable",
+        "CN|v4|baseline_invalid",
+        "HK|v4|baseline_invalid",
+        "US|v4|baseline_invalid",
     ]
 
     request["market_inputs"] = {
@@ -599,6 +601,8 @@ def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
 def test_notification_failure_does_not_change_fail_closed_result(
     tmp_path: Path,
 ) -> None:
+    for market in ("CN", "HK", "US"):
+        write_report(tmp_path, market, "missing")
     notifier = RecordingNotifier(fail=True)
     result = run_drawdown_preflight(
         data_dir=tmp_path / "data",
@@ -621,6 +625,8 @@ def test_notification_failure_does_not_change_fail_closed_result(
 def test_null_notifier_does_not_record_alert_delivery(
     tmp_path: Path,
 ) -> None:
+    for market in ("CN", "HK", "US"):
+        write_report(tmp_path, market, "missing")
     result = run_preflight(
         tmp_path,
         {
