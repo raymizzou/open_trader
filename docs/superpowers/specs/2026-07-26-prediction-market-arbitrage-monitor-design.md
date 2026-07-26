@@ -1,170 +1,375 @@
-# Prediction Market Arbitrage Monitor Design
+# Prediction-Market Arbitrage Monitoring and Execution Design
 
-## Goal
+**Date:** 2026-07-26
 
-Add a read-only prediction-market arbitrage monitor to Open Trader that:
+**Status:** Approved for implementation
 
-- runs continuously on the user's Mac
-- discovers Polymarket's 20 highest-volume active events
-- watches their binary YES/NO order books in real time
-- confirms apparent opportunities with a same-batch public REST read
-- records confirmed signals and their lifetimes indefinitely
-- shows exactly what is monitored, what can produce a formal signal, what is
-  active now, and what appeared in the past
-- implements the user-approved Dashboard A prototype exactly
+**Target:** Open Trader Dashboard on the user's Mac
+**First venue:** Polymarket
 
-The first release never authenticates, reads a wallet, submits an order, or
-sends a notification.
+## 1. Goal
 
-## Product Decisions
+Add a continuously running Polymarket arbitrage workspace to Open Trader that:
 
-The user approved the following decisions:
+- monitors the 20 highest-volume active events
+- detects executable binary YES/NO bundle opportunities
+- makes the monitored universe and all past confirmed signals visible
+- labels an opportunity `可参与` only after every trade-safety check passes
+- lets the user preview and confirm one arbitrage execution inside Open Trader
+- submits exactly one equal-share YES/NO FOK pair for each confirmed click
+- automatically merges a successfully filled pair back into pUSD
+- fails closed, alerts, and locks trading after any one-leg or merge incident
+- survives restart without trusting stale local execution state
+- runs continuously through the existing macOS operating model
 
-- Platform rollout: Polymarket first, Kalshi second, Predict.fun third.
-- Strategy rollout: within-venue binary bundle monitoring first;
-  cross-platform matching only after each venue is stable.
-- Universe: top 20 active events by 24-hour volume, refreshed every 5 minutes.
-- Detection: public WebSocket updates followed by public REST `/books`
-  confirmation.
-- Formal signal thresholds:
-  - net edge at least `$0.01` per matched YES/NO pair
+The production implementation must reproduce the user-approved execution
+prototype and satisfy every scenario in Section 16.
+
+## 2. Locked Product Decisions
+
+### 2.1 Rollout
+
+- V1: Polymarket, within-market standard binary YES/NO bundles.
+- V2: Kalshi.
+- V3: Predict.fun.
+- Cross-venue matching is deferred until each individual venue is stable.
+- V1 does not introduce a generic multi-venue abstraction.
+
+### 2.2 Monitoring
+
+- Universe: top 20 active Polymarket events by 24-hour volume.
+- Universe refresh: every 5 minutes.
+- Order-book updates: public Polymarket WebSocket.
+- Candidate confirmation: same-batch public REST `/books` request.
+- Confirmed-signal thresholds:
+  - net edge at least `$0.01` for one equal-share YES/NO pair
   - estimated total net profit at least `$1.00`
-- Fee policy: markets whose fees are not proven safe remain visible and
-  monitored but cannot produce formal signals.
-- Persistence: confirmed signals are retained indefinitely in local SQLite;
-  raw order-book ticks are not retained.
-- Operation: launchd keeps the watcher running; `caffeinate -s` prevents system
-  sleep while the Mac is on AC power without preventing display sleep.
-- UI: one top-level `预测市场` destination; no bottom navigation.
-- Notifications: none in V1.
+- Raw order-book ticks are not retained.
+- Confirmed signal episodes are retained indefinitely in SQLite.
 
-## Roadmap Position
+### 2.3 Meaning of `可参与`
 
-The external roadmap recommends first building data infrastructure, a unified
-API layer, and signal observation before dry-run or execution. This design takes
-the smallest useful slice:
+`可参与` is a user-facing execution promise, not merely a mathematical signal.
+It means the backend has most recently verified all of the following:
 
-1. public live data
-2. one auditable within-market bundle rule
-3. durable signal history
-4. operational monitoring in the existing Dashboard
+- a fresh, same-batch pair of executable books exists
+- equal YES and NO shares can be bought
+- total normal-order cost is at most `$20.00`
+- estimated net profit is at least `$1.00`
+- net edge per pair is at least `$0.01`
+- depth, tick size, and minimum-order constraints are satisfied
+- the market is standard binary, not NegRisk
+- the market is explicitly verified fee-free
+- the selected wallet has sufficient balance and allowance
+- signing and relayer readiness checks pass
+- Polymarket's geoblock check explicitly allows trading
+- the global execution lock and circuit breaker are both open
+- the data and readiness checks are fresh
 
-It does not install a generic multi-exchange framework or an execution-capable
-sidecar. A unified venue interface is deferred until the second venue actually
-exists.
+The backend may perform more checks than the UI exposes. The user does not need
+to understand intermediate notions such as “REST-confirmed formal signal.”
 
-The paper's broader logical and combinatorial arbitrage taxonomy remains useful
-research context. V1 implements only the elementary binary bundle invariant:
-one YES share plus one NO share settles to `$1`.
+`可参与` is not a price guarantee. Opening the confirmation modal and pressing
+`确认下单` each trigger fresh validation. If the guaranteed net profit has
+fallen below `$1.00`, or any safety fact has changed, the request is rejected
+without submitting an order.
 
-## Approved UI Contract
+### 2.4 Execution
 
-The approved prototype is:
+- First click: open an Open Trader confirmation modal.
+- Second click: `确认下单` creates one execution request.
+- One execution request contains exactly two equal-share FOK BUY legs:
+  - one YES leg
+  - one NO leg
+- The orders are sent as one Polymarket batch request, but the design treats the
+  two responses as independently successful or rejected because the venue does
+  not guarantee atomic batch execution.
+- Only one execution may be in flight across the entire application.
+- Other `参与` controls remain disabled until the execution reaches a terminal
+  or incident state.
+- A successful equal-share pair is immediately merged into pUSD.
+- The first live click is always deliberate; there is no automated trading loop
+  and no batch submission across multiple opportunity cards.
+
+### 2.5 Risk Limits
+
+- Dedicated low-balance trading wallet.
+- Initial wallet funding cap: `$50.00` pUSD.
+- No automatic refill.
+- Maximum normal cost per confirmed click: `$20.00`, including any applicable
+  fees. V1 only enables fee-free markets.
+- Emergency authorization: at most `$2.00` estimated loss to neutralize a
+  one-leg fill by completing the missing leg or unwinding the filled leg.
+- The `$2.00` value is an expected-loss ceiling, not a permission to keep
+  chasing prices.
+- Any one-leg event, even one automatically neutralized within the ceiling,
+  opens the circuit breaker and requires manual acknowledgement.
+
+### 2.6 Alerts and Manual Recovery
+
+Normal signals do not create notifications. The following incidents must create
+both an existing macOS notification and an existing Feishu notification:
+
+- one leg fills while the other does not
+- automatic one-leg remediation fails
+- merge fails or cannot be confirmed
+- restart reconciliation finds an open order or unmatched directional position
+
+Every incident also remains visible in the Dashboard until acknowledged.
+
+The only normal way to re-enable trading is the UI action
+`我已处理，恢复交易`. The backend accepts that action only after a fresh
+reconciliation proves:
+
+- no live open order remains
+- no unresolved directional imbalance remains
+- no unconfirmed merge remains
+
+### 2.7 Deployment and Cost
+
+- Runs continuously on the user's Mac.
+- `launchd` restarts the watcher/Dashboard.
+- `caffeinate -s` prevents system sleep while connected to AC power without
+  forcing the display to remain awake.
+- The live-trading Dashboard binds only to `127.0.0.1`.
+- No mobile/LAN access is enabled in V1.
+- Expected monitoring API/cloud cost: `$0`.
+- Estimated Mac electricity cost: approximately `¥2–4/month`, dependent on the
+  user's power tariff and actual machine load.
+- Initial working capital: up to `$50` pUSD.
+- Maximum normal exposure initiated by one click: `$20`.
+- Maximum authorized emergency expected loss: `$2`.
+- V1 only trades fee-free markets.
+- Merge must use Polymarket's supported gasless relayer path. If gasless merge
+  readiness cannot be proven, opportunities remain non-actionable rather than
+  silently spending POL.
+- Slippage, single-leg remediation, or venue failure can still cause real loss;
+  the UI must not describe arbitrage as risk-free.
+
+## 3. Scope and Explicit Deferrals
+
+### In scope
+
+- public market discovery and book streaming
+- durable signal, execution, merge, and incident history
+- authenticated balance, allowance, order, trade, and position reads
+- two-leg FOK submission after explicit confirmation
+- bounded one-leg remediation
+- gasless merge
+- crash/restart reconciliation
+- local-only Dashboard controls
+- Keychain-backed wallet credentials
+- macOS and Feishu incident alerts
+
+### Deferred
+
+- Kalshi and Predict.fun adapters
+- cross-venue semantic market matching
+- automated unattended order placement
+- multi-opportunity or bulk execution
+- auto-refill
+- NegRisk execution
+- fee-enabled execution
+- browser entry of private keys
+- remote or mobile trade control
+- artificial live-money canary orders
+- a generic venue/execution framework
+
+## 4. Dependency Compatibility Gate
+
+Polymarket's official Python client ecosystem is changing, and current official
+repositories contain open issues involving wallet authentication and FOK price
+precision. Therefore implementation starts with a blocking compatibility gate.
+
+On the target Mac, using the selected dedicated wallet type and exact pinned
+official client versions, the gate must prove without submitting a live order:
+
+1. derive authenticated API credentials
+2. read balance and allowance
+3. read open orders, trades, and positions
+4. construct two equal-share FOK orders with Decimal-safe tick rounding
+5. sign both orders and serialize the batch payload
+6. prove the official client's merge capability is present and authenticate to
+   the gasless relayer path without invoking the mutate-only merge method
+7. exercise merge construction/response handling against the controlled
+   execution boundary, because the official SDK exposes merge as a
+   construct-and-submit operation rather than a public build-only operation
+8. redact all secret material from logs and exceptions
+
+The selected package names and exact versions are recorded only after this gate
+passes. No handwritten EIP-712 implementation, experimental CLI fallback, or
+unofficial signing library may be substituted merely to bypass a failed gate.
+
+If the official clients cannot safely support the selected wallet, the feature
+is `BLOCKED`: monitoring may continue, but the production `参与` control must
+not be enabled.
+
+## 5. Approved UI Contract
+
+The approved interactive design evidence is:
 
 - branch: `prototype/prediction-market-ui`
-- commit: `193fac7`
-- local source:
-  `src/open_trader/dashboard_static/prediction-market-prototype.html`
-- selected layout: Variant A, “运营控制台”
+- commit: `e0d5083`
+- source:
+  `src/open_trader/dashboard_static/prediction-market-execution-prototype.html`
+- layout: Variant A, `运营控制台`
 
-The prototype is disposable design evidence and must not be merged. Production
-HTML, CSS, and JavaScript must recreate the approved A layout in the existing
-Dashboard shell.
+The prototype is disposable design evidence and is not merged directly.
+Production HTML, CSS, and JavaScript recreate its approved behavior in the
+existing Dashboard shell.
 
-### Top Navigation
+All material future UI changes require a design artifact and user confirmation
+before production implementation.
 
-The header contains these destinations in this order:
+### 5.1 Prototype is the mandatory acceptance baseline
+
+Commit `e0d5083` is the UI source of truth, not an illustrative reference.
+Before production UI implementation, acceptance fixtures must render that exact
+commit into fixed golden screenshots for:
+
+- desktop `1440x1100`
+- mobile `375x812`
+- ready/actionable
+- quiet
+- executing
+- success/merge
+- incident/circuit-breaker
+- degraded
+- loading
+- confirmation modal
+- reset modal
+- signal, trade/merge, and incident history tabs
+
+Production is checked against those fixtures with the same browser, fonts,
+viewport, deterministic data, animation-disabled CSS, and device scale factor.
+Acceptance requires:
+
+- the same information hierarchy, component order, dimensions, spacing,
+  typography, colors, borders, states, labels, buttons, and responsive behavior
+- no unapproved component addition, removal, reordering, restyling, or copy
+  change
+- a visual diff of at most `0.1%` changed pixels per golden screenshot, with no
+  changed pixel caused by a semantic layout, component, color, or copy mismatch
+- exact interaction parity for modal, confirmation, execution, history,
+  incident detail, and reset flows
+
+Dynamic live market values are tested separately and do not replace the
+deterministic golden comparison. The prototype-only scenario selector is test
+instrumentation and is the sole approved omission from production UI.
+
+### 5.2 Top navigation
+
+The header contains these destinations in this exact order:
 
 1. `持仓`
 2. `预测市场`
 3. `策略回测`
 4. `凯利实验室`
 
-`预测市场` is the active item while the prediction workspace is open. The
-navigation remains at the top on mobile and may wrap. There is no bottom
-navigation, floating mobile navigation, or prototype state controller.
+There is no bottom navigation.
 
-### Prediction Workspace
+### 5.3 Readiness strip
+
+The prediction workspace begins with a persistent readiness strip showing:
+
+- masked wallet address
+- pUSD balance and the `$50` wallet-cap policy
+- region-check status
+- circuit-breaker/trading status
+- first-live-order validation status
+
+The UI never displays a private key, API secret, full credential, or a field
+into which one can paste a private key.
+
+Until a real order pair and merge have succeeded, the status remains
+`实盘链路尚未完成首单验证`. Deterministic tests and unsigned/unsubmitted
+previews do not change that status.
+
+### 5.4 Monitoring workspace
 
 The workspace contains, in order:
 
 1. title `预测市场套利`
-2. subtitle explaining that the user first sees what is monitored, then current
-   and historical signals
+2. explanation of what is monitored
 3. watcher health and last heartbeat
-4. five summary cards:
-   - current formal signals
-   - monitored events
-   - markets / tokens
-   - WebSocket state and venue
-   - confirmed signals in the selected history window
-5. the fee-policy warning
-6. two-column desktop content:
-   - left: monitored event list
-   - right: current signals above historical signals
-7. one-column mobile content in the same reading order
-
-The UI uses the existing warm-ledger Dashboard palette and interaction styles.
-
-### Monitored Event Rows
+4. summary cards
+5. explicit fee/risk policy
+6. monitored-event list
+7. current opportunities
+8. histories:
+   - `信号`
+   - `交易与合并`
+   - `事故`
 
 Every monitored event row visibly includes:
 
 - event title
-- number of included binary markets
 - rank
-- explicit `24h 成交量` label and value
-- either `可参与信号` or `仅监控 · 费用待核验`
-- either `最高预计净利润` or `毛利润上限`
+- number of included binary markets
+- explicit `24h 成交量` label and formatted value
+- current eligibility (`可参与` or a precise non-actionable reason)
+- `最高预计净利润` when actionable, otherwise a monitor-only upper bound
 
-Rows are expandable. Their details list the included markets and whether each
-is subscribed and signal-eligible.
+Rows may expand to show included markets and their individual eligibility
+reason.
 
-The event ordering is a product rule, not presentation-only sorting:
+### 5.5 Ordering
 
-1. events containing at least one signal-eligible market first
-2. within the same eligibility group, profit descending
-   - eligible events use highest estimated net profit from eligible markets
-   - ineligible events use highest gross-profit upper bound
-3. equal profit uses 24-hour event volume descending
-4. a stable event ID tie-break makes output deterministic
+The server returns events in this deterministic order:
 
-Missing profit sorts below a finite profit in the same eligibility group. It is
-shown as `—`, never silently converted to zero.
+1. events with at least one `可参与` opportunity first
+2. within the same participation group, profit descending
+3. equal profit: 24-hour volume descending
+4. equal volume: stable event ID ascending
 
-### Current and Historical Signals
+For non-actionable events, “profit” means the best observable gross upper bound.
+Missing profit sorts below finite profit and displays `—`, never zero.
 
-The current section shows only REST-confirmed, fee-safe formal signals. Each
-card includes:
+### 5.6 Confirmation modal
 
-- event and market question
-- venue
-- fee status
-- confirmation state and active duration
-- YES ask and NO ask
-- net edge
-- executable matched size
-- estimated net profit
+Clicking `参与` opens a modal containing:
 
-History offers `24 小时`, `7 天`, and `全部`. Rows include start time, market,
-duration, peak net edge, executable size, and peak estimated net profit.
-No-history is a valid state and must have explicit Chinese copy.
+- event and market
+- the exact equal share quantity
+- YES FOK BUY maximum price and estimated cost
+- NO FOK BUY maximum price and estimated cost
+- total normal cost, guaranteed minimum estimated net profit, and net edge
+- explicit statement that the venue's batch is not atomic
+- the `$2` one-leg remediation authorization
+- `取消`
+- `确认下单`
 
-### Four Runtime States
+The modal uses fresh server data. On confirmation, the server validates again.
+The browser cannot supply prices, quantities, wallet identifiers, or risk
+limits as trusted execution inputs.
 
-- `loading`: client has not received the first prediction API response.
-- `live`: watcher is healthy and at least one formal signal is active.
-- `quiet`: watcher is healthy and no formal signal is active.
-- `degraded`: watcher heartbeat, WebSocket, universe refresh, store, or API is
-  stale/unavailable.
+### 5.7 Execution and incident views
 
-On a refresh failure after successful loading, the UI retains last-known rows,
-marks them stale, and shows the degraded warning. It never presents stale data
-as live.
+While executing, the card and modal show the current phase without implying a
+fill before venue confirmation:
 
-## Monitoring Universe
+- validating
+- submitting both FOK legs
+- reconciling independent leg results
+- neutralizing one-leg exposure, if necessary
+- merging
+- complete
+- incident/locked
 
-Every five minutes the watcher calls the public Gamma events endpoint with:
+A circuit-breaker banner remains visible until acknowledged. Its detail view
+shows:
+
+- both intended legs
+- each venue result
+- any remediation attempt
+- current orders and position reconciliation
+- merge state
+- alert delivery state
+- the reason reset is allowed or denied
+
+## 6. Monitoring Universe and Eligibility
+
+Every five minutes, the watcher requests the top active events:
 
 ```text
 active=true
@@ -175,395 +380,557 @@ ascending=false
 ```
 
 An event is retained only when its ID, title, and finite non-negative
-`volume24hr` are valid. Its nested markets are monitored only when:
+`volume24hr` are valid. A market is monitored when:
 
-- the event and market are active and not closed
-- `acceptingOrders` and `enableOrderBook` are true
-- outcomes are exactly YES and NO, case-insensitively
-- exactly two non-empty CLOB token IDs map to YES and NO
-- market ID, condition ID, question, and slug are present
+- event and market are active and not closed
+- order book is enabled and orders are accepted
+- exactly two outcomes map case-insensitively to YES and NO
+- exactly two non-empty token IDs map to those outcomes
+- market ID, condition ID, question, and slug exist
 
-Malformed markets are counted and skipped; they do not abort the universe.
-The event remains visible when at least one valid binary market remains.
+Malformed markets are counted and skipped without aborting the universe.
 
-The watcher compares the new token set to the current set and sends documented
-subscribe/unsubscribe frames on the existing WebSocket. If the subscription
-update fails, it reconnects with the full current token set.
+A monitored market is execution-eligible only when live market facts also
+prove:
 
-## Data Flow
+- it is not NegRisk
+- its fee rate is explicitly zero and internally consistent
+- minimum size and tick-size facts are available
+- both books are fresh
+- all Section 2.3 checks pass
 
-```text
-Gamma top-20 active events (every 5 minutes)
-  -> normalize binary markets
-  -> classify explicit Gamma zero-fee markets; fail closed on missing/conflicting fields
-  -> subscribe/unsubscribe public token IDs
+NegRisk, fee-enabled, and fee-unknown markets remain visible and contribute to
+monitoring statistics, but they never show an enabled `参与` control.
 
-Polymarket market WebSocket
-  -> maintain current best asks in memory
-  -> calculate gross/eligible candidate values with Decimal
-  -> re-verify candidate fee/minimum-size facts from live CLOB market details
-  -> when thresholds appear reachable, POST both token IDs to /books
-  -> validate same-batch books and recalculate
-  -> open/update/close a formal signal in SQLite
-  -> publish a throttled runtime snapshot
+### 6.1 Freshness budgets
 
-Dashboard API
-  -> read SQLite
-  -> return runtime, sorted monitored events, current signals, and history
-  -> render approved A workspace
-```
+Freshness is objective and server-enforced:
 
-## Modules
+- a displayed actionable book confirmation is no more than 10 seconds old and
+  has not been invalidated by a newer WebSocket update
+- cached wallet, allowance, geoblock, and relayer readiness used for the
+  actionable label are no more than 60 seconds old
+- preview and final execution validation refresh all volatile facts regardless
+  of cache age
+- a preview expires after 10 seconds and is always one-use
+- watcher heartbeat older than 30 seconds is degraded
+- public WebSocket disconnected/reconnecting for more than 15 seconds is
+  degraded
+- last successful universe refresh older than 10 minutes is degraded
+- a store write failure disables action immediately
 
-The implementation uses five focused modules and existing entry points:
+An item that exceeds any applicable budget loses `可参与` before the next API
+snapshot. Last-known data may remain visible only with a stale marker.
 
-### `prediction_arbitrage.py`
+## 7. Arithmetic and Candidate Sizing
 
-Owns immutable normalized values and pure `Decimal` calculations:
+All monetary and share arithmetic uses `Decimal`; binary floating point is not
+permitted in signal, sizing, risk, or order-price calculations.
 
-- market/event identity
-- best ask
-- bundle candidate
-- formal signal threshold check
-- approved event sort key
-
-It has no network, SQLite, process, CLI, or Dashboard code.
-
-### `polymarket_public.py`
-
-Uses the Python standard library for public HTTPS:
-
-- Gamma top-event discovery
-- CLOB market details used for fee/minimum-size verification
-- same-batch `POST /books` confirmation
-
-URLs are constants, timeouts are finite, responses are size/type validated, and
-no credential field exists.
-
-### `polymarket_stream.py`
-
-Uses the directly declared `websockets` dependency and the synchronous client
-API. It owns:
-
-- connection to the public market WebSocket
-- initial token subscription with `custom_feature_enabled`
-- application `PING` every 10 seconds and `PONG` tracking
-- dynamic subscribe/unsubscribe frames
-- parsing `book`, `price_change`, and `best_bid_ask`
-- reconnect with capped exponential backoff
-
-It yields normalized top-of-book updates and contains no strategy or storage
-logic.
-
-### `prediction_arbitrage_store.py`
-
-Uses stdlib `sqlite3` in WAL mode. It owns schema creation, one current runtime
-snapshot, formal signal lifecycle records, and history queries.
-
-### `prediction_arbitrage_watch.py`
-
-Owns the continuous orchestration loop:
-
-- five-minute universe refresh
-- in-memory paired books
-- candidate episode deduplication
-- REST confirmation
-- formal signal lifecycle
-- ten-second heartbeat
-- throttled snapshot writes
-- startup and disconnect cleanup
-
-### Existing Entry Points
-
-- `cli.py`: add `prediction-arb watch` and `prediction-arb status`.
-- `dashboard_web.py`: add
-  `GET /api/prediction-arbitrage?window=24h|7d|all`.
-- existing Dashboard static files: add the approved workspace.
-- `dashboard_acceptance.py`: add live watcher, API, ordering, and exact UI
-  acceptance.
-
-No exchange interface, strategy base class, factory, event bus, ORM, task
-queue, or configuration framework is added.
-
-## Fee Policy
-
-Fee handling fails closed.
-
-A market is provisionally signal-eligible in the monitored list only when:
-
-- Gamma explicitly reports fees disabled and taker base fee exactly zero
-- no Gamma fee field is missing, malformed, or contradictory
-
-Before a candidate becomes a formal signal, the watcher rechecks live CLOB
-market details and requires:
-
-- the taker base fee is exactly zero
-- the fee curve is absent, disabled, or has an exactly zero rate
-- the market-level fee and minimum-order facts are internally consistent
-
-Any missing, malformed, non-zero, or contradictory fee field produces
-`fee_unverified`. The market remains subscribed and its gross-profit upper bound
-is shown, but it cannot become a formal signal. A CLOB contradiction immediately
-downgrades a previously Gamma-eligible market.
-
-V1 does not implement non-zero fee curves. This is deliberate: current fee
-categories and parameters can change, and a wrong fee calculation would create
-a false arbitrage alert. A later separately tested change may promote
-fee-enabled markets to `fee_verified`.
-
-## Bundle Calculation and Confirmation
-
-For YES ask `(p_yes, s_yes)` and NO ask `(p_no, s_no)`:
+For equal share quantity `q`:
 
 ```text
-executable_size = min(s_yes, s_no)
-gross_unit_edge = 1 - p_yes - p_no
-gross_profit_upper_bound = executable_size * gross_unit_edge
+yes_cost        = executable cost of q YES shares
+no_cost         = executable cost of q NO shares
+fees            = verified trading fees; zero for actionable V1 markets
+normal_cost     = yes_cost + no_cost + fees
+settlement      = q * $1.00
+estimated_profit = settlement - normal_cost
+net_edge        = estimated_profit / q
 ```
 
-For V1 signal-eligible fee-free markets:
+The backend selects the largest `q` that simultaneously:
+
+- is executable from fresh depth on both books
+- conforms to venue tick and minimum-size rules
+- produces exactly equal YES and NO requested shares after the pinned official
+  SDK's protected-BUY spend and tick rounding
+- has `normal_cost <= $20.00`
+- has `estimated_profit >= $1.00`
+- has `net_edge >= $0.01`
+- fits available balance and allowance
+
+Prices and spend amounts are rounded only in the conservative direction. The
+final order payload contains cent-denominated spend caps and stable maximum FOK
+prices; it never sends an unbounded market order. The no-submit compatibility
+gate signs both orders and compares their actual requested amounts before the
+feature can become actionable.
+
+## 8. Architecture
+
+The design adds concrete Polymarket capability to the existing process:
 
 ```text
-net_unit_edge = gross_unit_edge
-estimated_net_profit = gross_profit_upper_bound
+Gamma top-20 refresh
+  -> normalize standard binary markets
+  -> classify monitor-only vs execution-eligible
+  -> update public WebSocket subscriptions
+
+Public WebSocket books
+  -> maintain current best depth in memory
+  -> calculate Decimal candidate
+  -> same-batch REST /books confirmation
+  -> open/update/close durable signal episode
+  -> publish throttled Dashboard snapshot
+
+Dashboard
+  -> GET monitoring, readiness, execution, and history state
+  -> POST preview (fresh non-mutating validation)
+  -> POST execution (consume preview + final validation + two FOK legs)
+  -> POST circuit-breaker acknowledgement
+
+Execution state machine
+  -> persist intent
+  -> submit stable two-leg batch
+  -> reconcile both independent outcomes
+  -> merge equal pair OR neutralize bounded one-leg exposure
+  -> persist terminal result / incident
+  -> alert and lock when required
 ```
 
-All values use `Decimal`; finite prices must be in `(0, 1)` and sizes must be
-positive. The opportunity must also satisfy the CLOB minimum order size.
+### 8.1 Modules
 
-A WebSocket candidate is not a formal signal. The watcher sends exactly the
-YES and NO token IDs in one public `/books` request and:
+`prediction_arbitrage.py`
 
-- matches responses by `asset_id`, never array position
-- requires both requested books exactly once
-- selects the minimum valid ask price in each book
-- requires finite positive size
-- requires book timestamps to be no older than 10 seconds
-- requires timestamp skew no greater than 2 seconds
-- recalculates from the REST books
-- requires net unit edge at least `$0.01`
-- requires estimated net profit at least `$1.00`
+- domain types, normalization, Decimal arithmetic, sizing, eligibility, sorting
+- no networking, secrets, order submission, or notification side effects
 
-While the WebSocket candidate remains active, failed confirmation may retry at
-most once per second. This is an observation, not an atomic execution
-guarantee.
+`polymarket_monitor.py`
 
-## Signal Lifecycle
+- public Gamma/CLOB HTTP and WebSocket integration
+- universe refresh, subscription lifecycle, same-batch book reads, heartbeat
 
-A formal signal is unique per active market episode:
+`prediction_arbitrage_store.py`
 
-- `open`: first qualifying REST confirmation
-- `update`: later qualifying confirmation raises peak edge/profit facts
-- `close`: WebSocket price/size falls below threshold, the market leaves the
-  universe, the stream becomes stale, or the watcher restarts
+- SQLite migrations and narrow durable queries
+- signal episodes, executions, legs, merges, incidents, acknowledgement
 
-Startup closes any previously open signal as `watcher_restarted` before
-creating a new connection. Disconnect closes open signals as `stream_stale`.
-The next qualifying REST confirmation starts a new episode.
+`polymarket_trading.py`
 
-No notification or order is emitted at any lifecycle step.
+- the one official-client boundary
+- Keychain credential access
+- geoblock, balances, allowances, orders, trades, positions
+- signing and submitting the two FOK legs
+- gasless merge
+- never owns business policy
 
-## Persistence
+`prediction_arbitrage_execution.py`
 
-Database:
+- one concrete serialized execution state machine
+- preview lifecycle and idempotency
+- risk limits, one-leg remediation, merge, restart reconciliation
+- circuit breaker and notifications
+
+Existing Dashboard, launcher, and notification modules remain the entry points.
+No sidecar, task queue, generic exchange base class, or internal message bus is
+introduced.
+
+## 9. Credentials and Local Security
+
+One-time terminal setup uses hidden input (`getpass`) and the native macOS
+`security` command to store:
+
+- signing private key
+- relayer credential material, if required
+
+Secrets:
+
+- live only in macOS Keychain and process memory
+- never appear in repository files, `.env`, command arguments, browser storage,
+  SQLite, API responses, logs, tracebacks, or notifications
+- are redacted before any exception is logged
+
+A mode-`0600`, gitignored local file may contain only non-secret settings such
+as signer address, funder/trading address, signature type, and risk limits. The
+signer derived from the Keychain key must match the configured signer, and the
+official client must derive the configured funder/trading address for the
+selected signature type, before trading is enabled.
+
+The trading Dashboard:
+
+- binds to `127.0.0.1`
+- requires a random per-process same-origin session token
+- requires a CSRF token on all mutation requests
+- validates `Origin` and `Host`
+- accepts only server-generated opaque preview IDs as execution input
+- never trusts browser-provided price, quantity, address, or limit values
+
+## 10. Preview, Idempotency, and Serialization
+
+### 10.1 Preview
+
+`POST /api/prediction-arbitrage/preview`:
+
+1. accepts a server-issued opportunity ID
+2. re-reads both books in one REST batch
+3. rechecks market facts, fee status, geoblock, wallet, balance, allowance,
+   relayer readiness, execution lock, and breaker
+4. recalculates equal-share sizing
+5. persists a one-use opaque preview with a 10-second expiry
+6. returns display-only leg and risk details
+
+Opening a modal does not submit or sign an order.
+
+### 10.2 Execution
+
+`POST /api/prediction-arbitrage/executions`:
+
+1. atomically consumes the preview ID
+2. acquires the process-wide/file-backed execution lock
+3. repeats all volatile validation with current data
+4. persists the execution intent before any external mutation
+5. assigns two stable local leg IDs, signs both FOK legs, and submits them in
+   exactly one batch POST
+6. reconciles order/trade outcomes before deciding the next transition
+
+The preview cannot be reused, even after a browser retry. A repeated HTTP
+request with the same application idempotency key returns the existing
+execution; it does not place a second pair.
+
+Stable local leg IDs derive from execution ID plus `YES` or `NO`. The official
+Polymarket CLOB order API does not expose an application-supplied client order
+ID, so the batch POST is attempted exactly once. If its response is ambiguous,
+the service never resubmits it: it queries live orders, trades, and positions
+and keeps trading locked until the outcome is proven.
+
+Only one execution can occupy a non-terminal state. A database invariant plus
+an OS-level lock prevents multiple Dashboard processes from placing orders.
+
+Order outcomes reconcile at least once per second for up to 30 seconds using
+the injected clock in tests. A still-unknown result then becomes an incident;
+normal trading stays locked and background reconciliation may continue without
+placing a new order.
+
+## 11. Execution State Machine
 
 ```text
-data/prediction_arbitrage/prediction_arbitrage.sqlite3
+previewed
+  -> final_validating
+  -> submitting
+  -> reconciling
+
+reconciling
+  -> both_rejected                 (terminal, no breaker)
+  -> both_filled -> merging
+  -> one_leg -> breaker_open -> remediating
+  -> ambiguous -> breaker_open -> reconciling
+
+merging
+  -> complete                      (terminal)
+  -> merge_incident                (breaker remains open)
+
+remediating
+  -> neutralized_incident          (breaker remains open)
+  -> directional_incident          (breaker remains open)
 ```
 
-Minimal schema:
+All transitions are committed to SQLite before the next external action. The
+state machine records venue response IDs and timestamps but never secrets or
+full signed payloads.
+
+### 11.1 One-leg policy
+
+If exactly one leg fills:
+
+1. open the circuit breaker immediately
+2. fetch fresh books and current positions
+3. estimate both neutralization paths:
+   - complete the missing leg with a new FOK order
+   - sell/unwind the filled leg with a new FOK order
+4. choose the lower estimated-loss action that is executable and has estimated
+   loss at most `$2.00`
+5. use one FOK attempt with a stable remediation ID
+6. reconcile instead of blindly retrying
+7. send mandatory alerts and retain the incident
+
+If neither path meets the bound, place no speculative order. Preserve the
+directional position, keep trading locked, and raise an urgent incident.
+
+### 11.2 Merge policy
+
+After both equal-share legs are confirmed filled:
+
+1. reconcile actual token balances
+2. merge only the equal amount held on both sides
+3. submit through the proven gasless relayer path
+4. reconcile the transaction and resulting pUSD balance
+5. mark complete only after confirmation
+
+An ambiguous or failed merge is an incident. The balanced YES/NO pair remains
+locked and visible; the service does not claim realized profit.
+
+The foreground merge-confirmation window is 60 seconds. An unconfirmed
+transaction after that window is an ambiguous merge incident, not a failure
+proof and not permission to send a second merge blindly.
+
+## 12. Startup and Crash Recovery
+
+Trading always starts locked. Before enabling `参与`, startup reconciliation:
+
+1. loads every non-terminal local execution
+2. queries live open orders, trades, token positions, relayer transactions, and
+   balances
+3. cancels known live open execution orders
+4. recognizes already completed orders/transactions idempotently
+5. auto-merges a proven equal pair when safe
+6. never opens a new directional order merely to “repair” an old unknown state
+7. opens an incident for any imbalance or ambiguity
+8. leaves the breaker locked until the user acknowledges a clean reconciliation
+
+When there is no unfinished local execution, startup still verifies that the
+dedicated wallet has no unexplained open orders or directional positions before
+unlocking.
+
+Old processes using pre-change code must be stopped before the accepted build is
+started.
+
+## 13. Persistence and History
+
+SQLite stores:
+
+### Signals
+
+- market and event identity
+- opened/last-seen/closed timestamps
+- peak net edge, size, cost, and estimated profit
+- eligibility and close reason
+
+### Executions and legs
+
+- execution/preview/idempotency identity
+- immutable server-computed intent
+- state transitions and timestamps
+- each intended leg and venue result
+- remediation attempts
+- merge state and transaction reference
+- realized or currently estimated result
+
+### Incidents
+
+- incident type and severity
+- related execution
+- reconciled orders and positions
+- breaker state
+- macOS/Feishu delivery outcomes
+- acknowledgement time and reconciliation evidence
+
+Raw WebSocket ticks and signed order payloads are never persisted.
+
+Histories are retained indefinitely unless the user later approves a retention
+change. A restart must not erase or synthesize history.
+
+## 14. API Contract
+
+All routes are under the existing Dashboard server.
+
+- `GET /api/prediction-arbitrage/state`
+  - readiness, heartbeat, breaker, masked wallet, balances
+  - sorted monitored events and current opportunities
+  - current execution/incident summary
+- `GET /api/prediction-arbitrage/history?kind=signals|executions|incidents`
+  - paginated durable history
+- `POST /api/prediction-arbitrage/preview`
+  - non-mutating fresh validation; returns one-use preview
+- `POST /api/prediction-arbitrage/executions`
+  - consumes preview; final revalidation; submits one two-leg request
+- `POST /api/prediction-arbitrage/circuit-breaker/reset`
+  - acknowledges incident only after live clean reconciliation
+
+Mutation responses return the durable execution or incident ID. Browser
+timeouts are resolved by reading that durable state, not by blindly retrying.
+
+## 15. Acceptance Method
+
+`make acceptance` is the only final Dashboard review-readiness gate. It runs
+once after focused development tests and direct workflow checks have passed.
+
+It has two evidence phases:
+
+### Phase A: deterministic money-state scenarios
+
+An isolated acceptance server uses:
+
+- scratch SQLite
+- deterministic clocks/IDs
+- recorded public market-shaped inputs
+- a controlled execution boundary that can produce each documented venue
+  result
+- controlled macOS and Feishu delivery outcomes
+
+This phase is permitted to exercise browser mutations because it cannot sign or
+send live orders. It verifies every dangerous state-machine branch, UI state,
+durable record, lock, and forbidden side effect.
+
+The UI portion renders the fixed prototype and production pages from the same
+deterministic scenarios, captures every Section 5.1 golden state at both
+required viewports, and fails on any visual or interaction mismatch outside the
+single approved prototype-only control.
+
+### Phase B: live non-mutating integration
+
+The production-shaped process uses:
+
+- real Gamma and CLOB public APIs
+- a real WebSocket subscription and heartbeat
+- the real dedicated account for authenticated reads
+- real Keychain retrieval
+- real geoblock, balance, allowance, orders, trades, and positions reads
+- real construction and signing of an unsubmitted two-leg preview
+- real gasless-relayer authentication/readiness checks without invoking the
+  SDK's mutate-only merge method
+
+It must not submit an order or merge merely for acceptance.
+
+### Result semantics
+
+Every scenario prints:
 
 ```text
-runtime_snapshot
-  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1)
-  updated_at TEXT NOT NULL
-  payload_json TEXT NOT NULL
-
-signals
-  signal_id TEXT PRIMARY KEY
-  market_id TEXT NOT NULL
-  started_at TEXT NOT NULL
-  ended_at TEXT
-  peak_net_unit_edge TEXT NOT NULL
-  peak_estimated_profit TEXT NOT NULL
-  payload_json TEXT NOT NULL
+SCENARIO <ID> PASS|FAIL|BLOCKED <short evidence>
 ```
 
-Indexes support active-signal and `started_at` history queries. A partial unique
-index prevents two open signals for one market. JSON retains immutable event,
-market, venue, quote, size, and close-reason facts without adding speculative
-tables.
+- `PASS`: every required UI, backend, persistence, and forbidden-behavior
+  assertion passed.
+- `FAIL`: the system was available but any assertion failed.
+- `BLOCKED`: a required browser or external environment was unavailable.
 
-Raw WebSocket frames and raw order-book ticks are not stored.
+One `FAIL` makes the entire gate `FAIL`. One required `BLOCKED` makes the entire
+gate `BLOCKED`. Only an all-`PASS` report produces final `PASS`.
 
-## Dashboard API
+Fixtures, curl output, screenshots, or unit tests cannot substitute for a
+blocked required browser/live phase.
 
-`GET /api/prediction-arbitrage?window=24h|7d|all` returns:
+After `PASS`, the exact accepted Git SHA is redeployed. The handoff verifies
+fresh process PID, working directory, Git SHA, logs, heartbeat, HTTP 200, and
+the review URL.
 
-```json
-{
-  "schema_version": "open_trader.prediction_arbitrage.dashboard.v1",
-  "generated_at": "2026-07-26T18:00:00+08:00",
-  "window": "24h",
-  "status": "quiet",
-  "runtime": {
-    "pid": 123,
-    "working_directory": "/path/to/worktree",
-    "git_sha": "40-char-sha",
-    "heartbeat_at": "2026-07-26T18:00:00+08:00",
-    "universe_refreshed_at": "2026-07-26T17:58:00+08:00",
-    "websocket": "connected",
-    "last_pong_at": "2026-07-26T17:59:59+08:00",
-    "reconnects": 0,
-    "blocker": null
-  },
-  "summary": {
-    "current_signals": 0,
-    "events": 20,
-    "markets": 331,
-    "tokens": 662,
-    "history_signals": 3
-  },
-  "fee_policy": {
-    "message": "费用待核验市场仍会监控，但不会产生正式信号"
-  },
-  "events": [],
-  "current_signals": [],
-  "history": []
-}
-```
+## 16. Detailed Acceptance Scenarios
 
-The API derives `degraded` when the heartbeat or PONG is older than 30 seconds,
-the universe is older than 10 minutes, or the stored blocker is non-empty.
-Otherwise it returns `live` when current signals exist and `quiet` when they do
-not. `loading` remains a client-only pre-response state.
+Every row is a contractual scenario. “Persisted evidence” means assertions read
+back from SQLite or fresh logs after the action; an in-memory object alone is
+insufficient.
 
-Invalid history windows return HTTP 400. A missing database returns a valid
-degraded payload rather than breaking the rest of the Dashboard.
+### 16.1 Monitoring and eligibility
 
-## Reliability and Failure Handling
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `MON-01 Loading` | Start the Dashboard with no prediction snapshot yet; open `预测市场`. | Loading skeleton/status is visible; no zero-valued summary is presented as fact; top navigation order is exact. | API reports loading/not-ready; watcher start is logged with timestamp. | No `可参与` button; no stale row presented as live; no bottom navigation. |
+| `MON-02 Ready/actionable` | Feed a fresh standard, fee-free binary market whose same-batch books satisfy both thresholds and all account checks. | Event appears before non-actionable events; row visibly shows `24h 成交量`, `可参与`, profit, and enabled `参与`; health/readiness is green. | Candidate arithmetic uses Decimal; confirmed signal episode and current eligibility are queryable; source timestamps and book batch ID are recorded. | No eligibility based only on WebSocket data; no hidden volume; no order submission from monitoring alone. |
+| `MON-03 Ready/quiet` | Feed a healthy top-20 universe with no market satisfying both thresholds. | Health is ready; explicit “当前没有可参与机会” copy; monitored rows and histories remain visible. | Heartbeat and universe refresh advance; no active signal row exists. | Quiet must not be shown as degraded; no fabricated opportunity. |
+| `MON-04 Degraded/stale` | After a valid snapshot, exceed one Section 6.1 budget: heartbeat 30 seconds, WebSocket disruption 15 seconds, universe refresh 10 minutes, actionable books 10 seconds, readiness 60 seconds, or cause a store write failure. | Last-known data remains visible but is clearly marked stale; degraded reason and last successful time appear; every `参与` is disabled. | Health records the failing component and measured age; stale state survives API refresh; recovery produces a fresh timestamp. | Stale data must not be labeled live or actionable; no execution preview. |
+| `MON-05 Fee-enabled/unknown` | Present an otherwise profitable standard binary market with nonzero, missing, or conflicting fee facts. | Market remains monitored; reason says fee-enabled or fee-unverified; gross upper bound and `24h 成交量` remain visible; no enabled action. | Eligibility reason is stored; no formal actionable episode is opened. | Never assume zero fees; never hide the event solely because it cannot trade. |
+| `MON-06 NegRisk` | Present an otherwise profitable NegRisk market. | Market remains visible with `仅监控 · NegRisk`; no enabled `参与`. | `neg_risk=true` and ineligibility reason are returned/persisted. | Never send a NegRisk order or classify it as standard binary. |
+| `MON-07 Malformed market` | Include malformed IDs/outcomes/volume alongside valid markets in a refresh. | Valid events still render; diagnostics show skipped market count without exposing a stack trace. | Malformed item is counted/logged; universe refresh completes with valid items. | One malformed item must not abort or erase the whole universe. |
+| `MON-08 Sorting` | Provide actionable and non-actionable events with controlled profits, volumes, and equalities. | Actionable first; then profit descending; ties by visible 24h volume descending; final ties stable across refresh. | API order matches the product ordering and stable-ID tiebreak. | Browser-only sorting or alphabetical drift; treating missing profit as zero. |
+| `MON-09 Signal lifecycle` | Open, improve, weaken, and close one REST-confirmed signal across multiple updates. | Current card duration and values update; after close it leaves current view and appears once in signal history with peak values. | One signal episode has correct open/last/close times and peaks; restart preserves it. | Duplicate history episodes for uninterrupted signal; raw ticks stored indefinitely. |
+| `MON-10 Universe rotation` | Change top-20 membership on a five-minute refresh. | New event appears in correct order; removed event no longer appears current; history remains. | WebSocket subscribe/unsubscribe set equals the new token set; failed incremental update triggers full reconnect. | Orphan subscriptions treated as current; deletion of historical signals. |
 
-- One watcher process holds an existing-style file lock; a second watcher
-  exits with code `2`.
-- Startup records `starting` before network work.
-- Gamma, CLOB, WebSocket, parsing, and SQLite failures update the blocker and
-  heartbeat instead of killing the launchd process.
-- Reconnect delay starts at 1 second and caps at 60 seconds.
-- Runtime snapshot writes occur at most once per second plus the ten-second
-  heartbeat.
-- SQLite uses a busy timeout so a Dashboard read cannot fail a watcher write.
-- Market text is escaped by the existing Dashboard `escapeHtml` helper.
-- Signal history survives watcher and Dashboard restarts.
-- No stale snapshot is described as live.
+### 16.2 Preview and pre-trade rejection
 
-## Mac Deployment and Cost
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `PRE-01 Open preview` | With `MON-02` state, click `参与`. | Modal shows event, exact equal quantity, both FOK legs, maximum prices, leg/total costs, minimum profit, net edge, non-atomic warning, `$20` cap, and `$2` authorization; focus moves inside modal. | Fresh same-batch books, geoblock, wallet, allowance, balance, relayer, lock, and breaker are checked; one expiring one-use preview is stored. | Opening modal must not sign, submit, merge, or alert; browser values are not trusted inputs. |
+| `PRE-02 Cancel` | Open a valid preview, then click `取消` or press Escape before execution. | Modal closes and focus returns to the originating `参与`; opportunity remains available if still fresh. | Preview is canceled/allowed to expire; no execution exists. | No order, signature, balance mutation, breaker, or incident. |
+| `PRE-03 Price worsens` | Open a valid preview; before `确认下单`, worsen either book so guaranteed profit is below `$1`; confirm. | Modal/card shows rejected/stale-price explanation and refreshed values; no success animation. | Final validation is recorded; preview is consumed; zero order-submit calls; no execution intent that claims submission. | No threshold lowering, price chasing, partial submit, or reuse of the old preview. |
+| `PRE-04 Region blocked` | Geoblock returns blocked during preview or final validation. | Region status is blocked; actions disabled; explicit no-bypass copy. | Rejection reason and geoblock timestamp are logged without sensitive network detail; zero submit calls. | No order, proxy/VPN workaround, cached allow result, or optimistic fallback. |
+| `PRE-05 Region unavailable` | Geoblock endpoint times out, errors, or returns malformed data. | Region check shows unavailable and all actions are disabled. | Fail-closed rejection is recorded; later recovery requires a fresh successful check. | No use of a prior allow response beyond freshness; no order. |
+| `PRE-06 Keychain/signing unavailable` | Lock/remove required Keychain item or force derived-address mismatch; request preview/confirm. | Wallet readiness is red with safe remediation copy; no secret is displayed; action disabled/rejected. | Redacted error and mismatch category are logged; zero submit calls. | No private key in UI/API/log/SQLite/process arguments; no fallback to `.env`. |
+| `PRE-07 Balance/allowance insufficient` | Fresh books qualify but pUSD balance or allowance cannot cover the server-computed amount. | Exact safe reason appears; opportunity is temporarily non-actionable. | Fresh balance/allowance values and rejection reason are recorded; zero submit calls. | No smaller trade unless it still independently satisfies every threshold; no approval transaction silently sent. |
+| `PRE-08 Relayer unavailable` | Gasless merge readiness cannot be proven. | Market remains monitored but action is disabled with merge-readiness reason. | Readiness failure is logged; zero order-submit calls. | No paid-gas fallback and no trade that cannot follow the approved merge path. |
+| `PRE-09 Preview expiry/reuse` | Advance past the 10-second preview expiry, or submit the same consumed preview twice. | First valid request has one result; subsequent request shows expired/already-used and links to existing execution when applicable. | Exactly one durable execution/idempotency record; external submit count is at most one batch. | No duplicate pair caused by retry, double-click, reload, or network timeout. |
 
-Launchd label:
+### 16.3 Security boundary
 
-```text
-com.open-trader.prediction-arbitrage
-```
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `SEC-01 Local bind` | Start accepted production configuration and attempt local and non-loopback access. | `127.0.0.1` review URL works; no LAN trading URL is offered. | Listening socket is loopback-only; startup log records bind address. | Listening on `0.0.0.0`, LAN IP, or public interface. |
+| `SEC-02 Origin/CSRF/session` | Send mutation requests with missing/wrong Origin, Host, session, or CSRF token; then send a valid same-origin request. | Invalid browser request gets a safe refusal; valid flow works normally. | Invalid calls return 4xx and create no preview/execution; security rejection is logged without tokens. | No state mutation, signature, or external call from invalid request; no token in logs. |
+| `SEC-03 Browser tampering` | Alter modal DOM/API payload prices, quantity, wallet, `$20`, `$2`, or profit before confirm. | Result reflects server-computed values or rejects as stale; tampered values never appear as authoritative success data. | Server ignores untrusted fields and reconstructs intent from preview/opportunity IDs. | No order using browser-supplied economics or wallet identity. |
+| `SEC-04 Secret redaction` | Trigger SDK, signing, relayer, HTTP, and notification exceptions containing seeded secret sentinels. | UI shows only safe error category. | Logs, API bodies, SQLite, notifications, and acceptance artifacts contain zero sentinel matches. | Any full/partial private key, API secret, signed payload, or authorization header leakage. |
 
-The agent runs:
+### 16.4 Order execution and merge
 
-```text
-/usr/bin/caffeinate -s <repo>/.venv/bin/python -m open_trader \
-  prediction-arb watch --data-dir <shared-data-dir>
-```
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `EXE-01 Serialization/double-click` | Two actionable cards exist; double-click one confirm and attempt the other while first is in flight. | One execution progresses; all other action buttons are disabled and explain the global lock. | One execution intent, one batch call, exactly two intended legs, stable local leg IDs; second request returns existing/busy state. | More than one batch, four legs, parallel execution, or silent dropped click. |
+| `EXE-02 Both FOK rejected` | Controlled venue independently rejects both legs. | Execution shows both rejected, no position, no profit, and returns to ready after reconciliation. | Both leg responses and zero fills are stored; no merge/remediation; breaker remains closed. | Claiming a fill/profit; retrying without a new user confirmation. |
+| `EXE-03 Both filled and merged` | Controlled venue fills equal YES/NO shares; relayer confirms merge. | Progress shows submit → reconcile → merge → complete; exact cost, payout, and realized profit appear in `交易与合并`. | Exactly two equal filled legs, one merge request, confirmed pUSD delta, terminal `complete`; no incident. | Marking complete before live fill and merge confirmation; second merge; notification for normal success. |
+| `EXE-04 YES-only then complete missing NO` | YES fills, NO rejects; fresh NO completion is executable with lower expected loss and loss `<= $2`; merge succeeds. | Circuit-breaker banner appears immediately; remediation, merge, and final neutral pUSD state are visible; incident persists; reset action is gated. | One bounded NO FOK remediation, reconciled equal pair, exactly one confirmed merge, incident, and both alerts are recorded. | Continuing normal trading; more than one blind remediation; estimated loss over `$2`; hiding the one-leg event after recovery. |
+| `EXE-05 NO-only then unwind NO` | NO fills, YES rejects; unwinding NO is the lower executable path with loss `<= $2`. | Same incident/lock visibility; chosen unwind and realized loss are shown. | One bounded NO SELL FOK, zero directional position after reconciliation, incident and alert outcomes stored. | Completing the more expensive leg when unwind is lower loss; auto-reset; loss above limit. |
+| `EXE-06 One leg, no safe remedy` | One leg fills; both completion and unwind are unavailable or estimate loss `> $2`. | Urgent incident shows unmatched position and “需要人工处理”; trading stays locked. | No remediation order is sent; live position evidence, attempted estimates, breaker, and alerts are persisted. | Chasing, exceeding `$2`, pretending neutral, or enabling another trade. |
+| `EXE-07 Merge rejected/failed` | Both legs fill equally but merge returns a definite failure. | Balanced pair and unmerged amount are visible; no realized-profit claim; breaker/incident/alerts remain. | Merge attempt/failure and equal token balances are stored; trading locked. | Resubmitting indefinitely, spending POL without approval, or marking complete. |
+| `EXE-08 Ambiguous submit` | Batch request times out after the venue may have received it. | UI says reconciling, then shows discovered outcome or locked ambiguity; never says both rejected merely from timeout. | Service queries orders/trades using stable IDs before any retry; result/incident is stored. | Blind second batch; treating network timeout as proof of rejection. |
+| `EXE-09 Delayed/timeout outcome` | Venue remains delayed/pending through the 30-second reconciliation window. | Execution remains in-flight with elapsed time; other trades stay disabled; at 30 seconds it becomes an incident. | At-least-once-per-second reconciliation evidence and final breaker state are stored; alerts fire at incident transition; safe background reads may continue. | Enabling other trades while terminal state is unknown; invented fill result; second batch submission. |
+| `EXE-10 Notification degradation` | Create a mandatory incident while one or both notification channels fail. | Incident remains visible and shows each channel's delivery state; trading remains locked. | Independent delivery attempts, bounded safe retries, and errors are persisted. | Notification failure suppressing the incident, unlocking trading, or blocking risk-neutralization work. |
 
-It uses `RunAtLoad` and `KeepAlive`, writes dedicated stdout/stderr logs, and
-starts from the exact deployed worktree. The installer verifies the loaded
-label, live watcher PID, working directory, Git SHA, fresh heartbeat, and fresh
-logs.
+### 16.5 Restart recovery and reset
 
-Expected recurring software/API cost is `$0`: all V1 endpoints are public and
-there is no cloud host. Keeping the existing Mac awake is expected to add about
-`2.9–5.8 kWh/month` at a 4–8 W continuous draw, so a practical Shanghai
-electricity budget is approximately `¥2–4/month`. Actual marginal cost can be
-lower when the Mac would already be on.
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `REC-01 Clean restart` | Stop accepted process with no open execution/order/position; restart. | Startup shows locked/reconciling, then ready after fresh checks; histories remain. | Fresh authenticated reads prove clean state; new PID/start time/heartbeat are logged. | Reusing pre-restart readiness without live reconciliation; erasing history. |
+| `REC-02 Restart with open orders` | Seed non-terminal execution and live open leg orders; restart. | Locked recovery view lists open-order handling and incident. | Orders are canceled once, terminal outcomes reconciled, incident/alerts stored. | New normal order before cancellation/reconciliation; assuming cancel succeeded without confirmation. |
+| `REC-03 Restart with equal pair` | Seed both filled equal positions and no confirmed merge; restart. | Locked recovery shows balanced pair and merge progress/result; acknowledgement remains required because recovery was abnormal. | Actual balances are read; at most one idempotent merge is sent; transaction is reconciled; incident record remains. | Duplicate merge or treating local “submitted” as chain confirmation. |
+| `REC-04 Restart with imbalance` | Seed one unmatched token position; restart. | Urgent directional incident and exact current imbalance are visible; action buttons disabled. | No new directional repair order; breaker and alerts persisted from live position evidence. | Automatic speculative repair of old state; unlocking based on stale SQLite. |
+| `REC-05 Unknown external state` | Dedicated wallet has an unexplained open order/position absent from SQLite. | Startup remains locked and explains unknown external state. | External identifiers and reconciled balances are stored in a new incident. | Ignoring activity because no local execution matches it. |
+| `RST-01 Reset allowed` | Incident has been viewed; fresh reconciliation proves zero open orders, zero imbalance, and no pending merge; click `我已处理，恢复交易`. | Confirmation explains clean evidence; after confirm breaker opens to ready and actions may re-enable. | Acknowledgement user action/time and reconciliation snapshot are stored. | Reset based only on UI state or stale prior check; deleting incident history. |
+| `RST-02 Reset denied` | Any open order, imbalance, pending/ambiguous merge, failed readiness, or stale account read remains; request reset. | Modal states the exact blocking fact; breaker remains closed to trading. | Denial and fresh reconciliation evidence are logged; no readiness change. | Force reset, hidden override endpoint, or order placement. |
 
-## Security and Scope Boundaries
+### 16.6 History and durable audit
 
-- No wallet, private key, API key, signer, user channel, authenticated endpoint,
-  or order endpoint.
-- No environment variable containing prediction-market credentials.
-- No user-controlled URL.
-- Public HTTP and WebSocket payloads are untrusted and validated.
-- The Dashboard says “预计利润” and “信号”, never “已实现利润”.
-- Signal discovery does not authorize execution.
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `HIS-01 Signal history` | Create closed signal episodes, restart, select signal history and time filters. | Correct rows, duration, peak edge/size/profit and explicit empty state; older rows appear under `全部`. | SQLite rows survive restart and pagination/filter totals agree. | Raw ticks exposed; duplicate/lost episodes; retention truncation. |
+| `HIS-02 Trade/merge history` | Complete both-rejected, successful, and incident executions; restart. | `交易与合并` distinguishes rejected, complete, neutralized, directional, and unmerged outcomes; amounts never imply unrealized profit. | Execution, leg, remediation, merge, and transition rows remain linked and ordered. | Signed payload/secret display; rewriting an incident as normal success. |
+| `HIS-03 Incident history` | Create acknowledged and unacknowledged incidents with varied notification results. | `事故` shows severity, position/merge state, alerts, breaker, and acknowledgement; unacknowledged incidents are prominent. | Incident evidence survives reset/restart indefinitely. | Acknowledgement deleting/hiding the audit trail. |
 
-## Acceptance Contract
+### 16.7 UI and accessibility
 
-This is a Dashboard and long-running-process change. `make acceptance` is the
-only completion gate and must include all of the following.
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `UI-01 Desktop prototype parity` | Render every Section 5.1 state with deterministic prototype data in the fixed browser at `1440x1100`; capture production screenshots and exercise every approved interaction. | Production matches the fixed `e0d5083` golden hierarchy, component order, dimensions, spacing, typography, colors, borders, copy, and state behavior; visible volume/sorting are exact; console has no functional errors. | Per-state visual diff is `<=0.1%` changed pixels and contains no semantic mismatch; interaction assertions and screenshot paths are included in the acceptance report. | Any unapproved addition, omission, reorder, restyle, copy drift, bottom nav, clipped control, or prototype-only scenario selector in production. |
+| `UI-02 Mobile prototype parity` | Repeat every Section 5.1 state at `375x812` with the same deterministic data and browser configuration. | Production matches the mobile golden screenshots; single-column order, wrapping, modal placement, and all visible content are identical; no horizontal overflow; controls are at least `44x44`. | Per-state visual diff meets the same strict threshold; browser assertions record scroll width, hit targets, interactions, and screenshot paths. | Responsive behavior that differs from the approved prototype, bottom nav, off-screen confirm/reset, hidden volume, or hover-only information. |
+| `UI-03 Keyboard modal` | Open confirmation and reset modals using keyboard; Tab/Shift-Tab; press Escape where safe; close. | Initial focus is meaningful, focus is trapped, visible focus exists, cancel closes, focus returns to invoker; executing mutation cannot be accidentally dismissed as canceled. | Browser assertions cover focus order and restored element. | Focus escaping behind modal, background action activation, duplicate submit from Enter. |
+| `UI-04 Status semantics` | Exercise every approved prototype state with controlled data. | Colors, text, icons, stale/quiet distinction, `可参与`, and first-live-order status match the corresponding golden state exactly. | API enum-to-copy mapping is exhaustive; every state has a named screenshot comparison. | Color-only meaning, “risk-free” language, success before confirmation, or visual state not present in the approved prototype. |
+| `UI-05 Cost disclosure` | Open workspace and modal in actionable state. | Readiness/policy makes `$50` wallet cap, `$20` normal cap, `$2` emergency expected-loss cap, fee-free-only policy, and possible real loss understandable. | Values come from server policy and match enforced configuration. | UI-only limits differing from backend; promise of zero loss or guaranteed profit. |
 
-### Automated Behavior
+### 16.8 Live integration and operations
 
-- normalization and Decimal bundle calculations
-- exact formal thresholds and equality behavior
-- fee-free eligibility and fail-closed fee uncertainty
-- REST book matching by token ID and freshness/skew rules
-- candidate deduplication and complete signal lifecycle
-- SQLite restart/history behavior and deterministic event sorting
-- four UI render states: live, quiet, degraded, loading
-- history filters and explicit zero states
-- visible `24h 成交量` label/value on every event row
-- exact approved navigation order and absence of bottom navigation
+| ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
+|---|---|---|---|---|
+| `LIVE-01 Public data` | With network available, start the actual watcher and open the actual Dashboard. | Real top-20 events, explicit 24h volumes, heartbeat, venue, and current eligibility render; data source is not labeled fixture. | Real Gamma response, WebSocket subscription, same-batch CLOB read, timestamps, and SQLite signal read/write all succeed. | Fixture/mock substituted for this scenario; stale data labeled live. |
+| `LIVE-02 Authenticated non-mutating preflight` | With dedicated wallet configured, run acceptance preflight. | Only masked wallet, balance, allowance, region, relayer, and readiness appear. | Real Keychain retrieval, derived-address match, geoblock, authenticated account reads, exact two-leg construction/signing without POST, official merge-capability presence, and relayer authentication/readiness pass; controlled execution tests cover merge construction/response handling; logs are secret-clean. | Any live order/merge/approval; calling the SDK's mutate-only merge method during acceptance; secret in output; unsigned mock substituted for the two-leg signing check. |
+| `LIVE-03 First-order status` | Run acceptance before any real user trade and exercise the success path only through the controlled executor. | Live Dashboard remains `实盘链路尚未完成首单验证`; controlled success never changes it. | Code path requires durable real venue fill and merge references before the flag can change; the first later user-confirmed live success is verified operationally when it occurs. | Acceptance/test double or manual config setting the live-verified flag; automatic canary order. |
+| `OPS-01 launchd continuity` | Install/restart accepted launch configuration and inspect service/process manager. | Dashboard health becomes fresh after restart. | `launchctl` and process inspection show expected PID, loopback bind, working directory, accepted SHA, `caffeinate -s`, and fresh timestamped logs/heartbeat. | Old pre-change process still serving; wrong worktree/SHA; only unit-test evidence. |
+| `OPS-02 Crash restart` | Terminate the watcher process without corrupting storage; observe launchd. | Brief degraded/recovering state, then the correct reconciliation outcome. | launchd starts a new PID; SQLite integrity passes; startup reconciliation and fresh heartbeat appear in logs. | Silent death, duplicate concurrent process, readiness before reconciliation. |
+| `OPS-03 Exact-SHA deployment readiness` | Before the gate, deploy the committed candidate SHA using the production launchd path and open the review URL. | Review URL returns HTTP 200 and shows the candidate UI/data state. | PID, cwd, candidate SHA, start time, fresh logs, heartbeat, and HTTP 200 are captured; the installer is ready to repeat the exact-SHA restart after PASS. | Dirty source, wrong SHA, stale process, or asking the user to run acceptance. |
 
-### Live Process and Data
+## 17. Focused Development Verification
 
-- launchd label is loaded
-- watcher PID is alive
-- watcher working directory and Git SHA match the accepted checkout
-- heartbeat, universe refresh, PONG, and logs are fresh
-- public Gamma returns real active events
-- public CLOB returns real paired order books for a monitored market
-- Dashboard prediction API returns real watcher data
-- zero live signals is accepted as truthful, not treated as an error
+Before the final gate, development uses focused checks:
 
-### Live Browser Matrix
+- domain unit tests for normalization, Decimal math, sizing, sorting, and state
+  transitions
+- SQLite migration/restart/idempotency tests
+- adapter contract tests using controlled official-client responses
+- browser tests for each UI state and mutation flow
+- direct watcher command against real public data
+- direct authenticated non-mutating preflight
+- direct launchd/process/log inspection where practical
 
-At 1920×1080, 1440×1000, 760×1000, and 375×844:
+`make acceptance` is not run after intermediate changes. It is the last gate
+before review handoff.
 
-- open `预测市场` from the top navigation
-- verify the approved A sections and reading order
-- verify the active top-navigation state and no bottom navigation
-- verify event count, market/token count, current signals, and history agree
-  with the live API
-- verify DOM event order exactly matches the API order
-- independently verify the API order obeys eligibility, profit, volume, and ID
-  tie-break rules
-- verify every event visibly labels `24h 成交量`
-- expand an event and verify market detail/state rows
-- exercise `24 小时`, `7 天`, and `全部`
-- verify either real history rows or the explicit zero-history state
-- verify no horizontal page overflow, no browser/HTTP errors, keyboard focus,
-  and mobile controls at least 44 px high
-- capture a fresh full-page prediction-market screenshot at every viewport
+## 18. References
 
-The test suite deterministically covers all four UI states. The live browser
-uses only the real watcher state; it does not fabricate a market signal.
-
-After `make acceptance` returns `PASS`, redeploy the exact accepted Git SHA and
-verify the new Dashboard and watcher PIDs, working directories, Git SHAs, fresh
-logs, fresh heartbeat, and HTTP 200 review URL before asking the user to review.
-
-## Deferred Work
-
-1. Non-zero Polymarket fee curves after live formula verification.
-2. Polymarket NegRisk multi-outcome bundles.
-3. Kalshi within-venue monitor.
-4. Predict.fun within-venue monitor.
-5. Cross-platform market identity matching and dry-run.
-6. Notifications, wallet access, and execution only after separate UI, risk,
-   and safety approval.
-
-## References
-
-- [Prediction Market Arbitrage Compendium roadmap](https://github.com/Oceanjackson1/Prediction-Market-Arbitrage-Compendium/blob/main/analysis/implementation-roadmap.md)
-- [Polymarket market discovery](https://docs.polymarket.com/market-data/discover-markets)
-- [Polymarket real-time market stream](https://docs.polymarket.com/market-data/realtime-data)
-- [Polymarket batch order books](https://docs.polymarket.com/api-reference/market-data/get-order-books-request-body)
-- [Polymarket CLOB market info](https://docs.polymarket.com/api-reference/markets/get-clob-market-info)
-- [Polymarket fees](https://docs.polymarket.com/trading/fees)
-- [Unravelling the Probabilistic Forest: Arbitrage in Prediction Markets](https://arxiv.org/abs/2508.03474)
+- [Prediction Market Arbitrage Compendium implementation roadmap](https://github.com/Oceanjackson1/Prediction-Market-Arbitrage-Compendium/blob/main/analysis/implementation-roadmap.md)
+- [Polymarket place orders and FOK behavior](https://docs.polymarket.com/trading/place-orders)
+- [Polymarket authentication](https://docs.polymarket.com/api-reference/authentication)
+- [Polymarket clients and SDKs](https://docs.polymarket.com/api-reference/clients-sdks)
+- [Polymarket CTF merge](https://docs.polymarket.com/trading/ctf/merge)
+- [Polymarket gasless transactions](https://docs.polymarket.com/trading/gasless)
+- [Polymarket geoblock endpoint](https://docs.polymarket.com/api-reference/geoblock)
+- [Polymarket fee documentation](https://docs.polymarket.com/trading/fees)
+- [Official Python CLOB client v2](https://github.com/Polymarket/py-clob-client-v2)
+- [Official beta unified Python SDK](https://github.com/Polymarket/py-sdk)
+- [Open FOK precision issue](https://github.com/Polymarket/py-clob-client-v2/issues/59)
+- [Open deposit-wallet authentication issue](https://github.com/Polymarket/clob-client-v2/issues/65)

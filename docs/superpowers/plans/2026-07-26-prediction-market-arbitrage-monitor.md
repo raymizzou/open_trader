@@ -1,49 +1,71 @@
-# Prediction Market Arbitrage Monitor Implementation Plan
+# Prediction-Market Arbitrage Execution Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Do not spawn subagents unless the user explicitly selects that execution mode.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run a read-only Polymarket binary-bundle arbitrage watcher continuously on the user's Mac, preserve confirmed signal history, and add the user-approved A prediction-market workspace to the existing Dashboard.
+**Goal:** Add a continuously running, local-only Polymarket binary-arbitrage monitor and explicitly confirmed two-leg execution workflow to Open Trader, with automatic merge, bounded incident recovery, durable audit history, and the exact approved Dashboard UI.
 
-**Architecture:** A concrete watcher refreshes the top 20 events every five minutes, consumes the public market WebSocket, confirms candidates with one paired `/books` request, and writes a throttled runtime snapshot plus formal signal lifecycles to stdlib SQLite. The existing Dashboard reads that database through one new read-only API and renders the locked A prototype. One launchd job runs the watcher through `caffeinate -s`.
+**Architecture:** One in-process `PolymarketMonitor` uses the official async public client for top-20 discovery, WebSocket books, and paired REST confirmation. One concrete `PolymarketTradingClient` wraps the official secure client and macOS Keychain; one serialized `PredictionExecutionService` persists every transition in stdlib SQLite before making an external mutation. The existing stdlib Dashboard server owns those services, serves the approved vanilla UI, and is kept alive by one launchd job through `caffeinate -s`.
 
-**Tech Stack:** Python 3.12, stdlib `urllib`/`sqlite3`/`Decimal`/`fcntl`, `websockets>=15,<16` synchronous client, existing vanilla HTML/CSS/JavaScript Dashboard, pytest, Playwright-backed `make acceptance`, macOS launchd.
+**Tech Stack:** Python 3.12, official `polymarket-client==0.2.0`, stdlib `Decimal`/`sqlite3`/`fcntl`/`threading`/`secrets`/`urllib`, existing vanilla HTML/CSS/JavaScript Dashboard, pytest, existing Playwright dependency, macOS Keychain and launchd.
 
 ## Global Constraints
 
 - Work only in `/Users/ray/projects/open_trader/.worktrees/prediction-arbitrage-scanner` on branch `feat/prediction-arbitrage-scanner`, based on local `main` at `f98812d`.
-- The approved UI source of truth is prototype branch
-  `prototype/prediction-market-ui` at commit `193fac7`.
-- Implement Variant A exactly. If implementation needs any new user-visible
-  state, label, section, navigation item, or layout not present in that
-  prototype or the design, stop and obtain UI approval first.
-- Add top navigation in this exact order: `持仓`, `预测市场`, `策略回测`,
-  `凯利实验室`. Add no bottom navigation.
-- Every monitored event visibly shows `24h 成交量` and its value.
-- Event order is exact: signal-eligible first; then group-appropriate profit
-  descending; then 24-hour volume descending; then stable event ID.
-- Fee-unverified markets remain monitored and visible but never become formal
-  signals. V1 supports only fee-free formal signals.
-- Formal signal thresholds are fixed at `$0.01` net edge per pair and `$1.00`
-  estimated total net profit. Do not add configuration for them in V1.
-- Use public endpoints only. Add no credential, wallet, authentication, order,
-  notification, execution, generic exchange interface, ORM, task queue, or
-  event bus.
-- Persist formal signals indefinitely. Do not persist raw WebSocket frames or
-  raw order-book ticks.
-- Keep the implementation concrete to Polymarket. Kalshi, Predict.fun,
-  NegRisk bundles, and cross-platform matching remain deferred.
-- Use the repository-root virtual environment
-  `/Users/ray/projects/open_trader/.venv`; the isolated worktree has no local
-  `.venv`.
-- Follow red-green-refactor for every behavior. Observe the focused test fail
-  for the intended reason before changing production code.
-- Do not run `make acceptance` after intermediate changes. Run it once as the
-  final gate after focused tests, full tests, live API checks, process
-  deployment, and commits are ready.
-- Only `make acceptance` `PASS` qualifies the task as complete or ready for
-  user review. `FAIL` must be fixed; `BLOCKED` must be reported as blocked.
-- Before merging to `main`, the dated operator-facing `CHANGELOG.md` entry must
-  already be committed.
+- The approved design is
+  `docs/superpowers/specs/2026-07-26-prediction-market-arbitrage-monitor-design.md`.
+- The mandatory UI baseline is prototype commit `e0d5083`, file
+  `src/open_trader/dashboard_static/prediction-market-execution-prototype.html`.
+- Production must match the prototype at `1440x1100` and `375x812` with at
+  most `0.1%` changed pixels and no semantic layout, component, color, or copy
+  mismatch.
+- The only approved prototype omission is its scenario selector.
+- Any new user-visible state, component, copy, or layout not in the approved
+  prototype requires a new design artifact and user confirmation before coding.
+- Top navigation is exactly `持仓`, `预测市场`, `策略回测`, `凯利实验室`.
+  There is no bottom navigation.
+- Every event row visibly includes `24h 成交量`.
+- Event order is exactly: actionable first, profit descending, 24-hour volume
+  descending, stable event ID ascending.
+- `可参与` means every current data, market, wallet, region, relayer, breaker,
+  and lock check passed.
+- V1 trades only standard, explicitly fee-free binary markets. NegRisk and
+  fee-enabled/unknown markets remain monitor-only.
+- Fixed limits are code constants, not configuration:
+  - minimum net edge `$0.01`
+  - minimum estimated profit `$1.00`
+  - maximum normal cost `$20.00`
+  - wallet funding policy `$50.00`
+  - maximum emergency expected loss `$2.00`
+- One confirmation creates one batch POST containing exactly two equal-share
+  FOK BUY orders. Batch results are independent.
+- The CLOB API has no application client-order-id. Each execution attempts its
+  batch POST exactly once; an ambiguous result is reconciled and never resent.
+- Only one execution can be non-terminal across the whole app.
+- Any one-leg or merge incident opens the breaker and requires manual
+  acknowledgement after fresh clean reconciliation.
+- Private key and Builder credentials live only in macOS Keychain and process
+  memory. They never enter files, browser storage, SQLite, command arguments,
+  logs, notifications, tracebacks, or API bodies.
+- The trading Dashboard binds only to `127.0.0.1`.
+- Use the existing notification classes and result recorder. Do not build a
+  second notification framework.
+- Use the official SDK boundary only. Do not handwrite EIP-712, contract call
+  encoding, a relayer client, or a fallback CLI.
+- Use stdlib SQLite directly. Add no ORM, task queue, message bus, venue base
+  class, repository interface, or speculative Kalshi/Predict.fun structure.
+- Retain signal, execution, merge, and incident history indefinitely. Do not
+  retain raw WebSocket ticks or signed payloads.
+- Use red-green-refactor for every behavior. Observe each focused test fail for
+  the intended reason before production changes.
+- Do not run `make acceptance` during intermediate work. Run it only as the
+  final review-readiness gate.
+- Only `make acceptance` `PASS` is complete. `FAIL` must be fixed; required
+  external/browser unavailability is `BLOCKED`.
+- After `PASS`, redeploy the exact accepted SHA and verify new PID, cwd, SHA,
+  fresh logs/heartbeat, and HTTP 200 before providing the review URL.
+- Before merge, commit the dated operator-facing `CHANGELOG.md` entry.
+- Do not spawn subagents unless the user explicitly selects subagent-driven
+  execution.
 
 ---
 
@@ -51,52 +73,66 @@
 
 ### Add
 
-- `src/open_trader/prediction_arbitrage.py`: immutable domain values, Decimal
-  bundle math, thresholds, and deterministic event sorting.
-- `src/open_trader/polymarket_public.py`: public Gamma/CLOB HTTPS client and
-  response validation.
-- `src/open_trader/polymarket_stream.py`: public market WebSocket session,
-  heartbeat, subscription deltas, and message parsing.
-- `src/open_trader/prediction_arbitrage_store.py`: SQLite schema, runtime
-  snapshot, signal lifecycle, and history queries.
-- `src/open_trader/prediction_arbitrage_watch.py`: one concrete continuous
-  watcher.
-- `ops/launchd/com.open-trader.prediction-arbitrage.plist.template`: persistent
-  AC-awake launchd job.
-- `scripts/install_prediction_arbitrage_launchd.sh`: render, load, restart, and
-  verify the watcher.
-- `scripts/uninstall_prediction_arbitrage_launchd.sh`: stop and remove only the
-  prediction watcher.
+- `src/open_trader/prediction_arbitrage.py` — immutable domain values, Decimal
+  sizing, eligibility, risk calculations, and deterministic sorting.
+- `src/open_trader/polymarket_trading.py` — Keychain access, geoblock,
+  official secure-client wrapper, no-submit compatibility preflight, one-shot
+  FOK batch, reconciliation, remediation orders, and merge.
+- `src/open_trader/prediction_arbitrage_store.py` — SQLite schema and durable
+  signal, preview, execution, leg, and incident operations.
+- `src/open_trader/polymarket_monitor.py` — top-20 discovery, WebSocket books,
+  paired REST confirmation, readiness freshness, signal lifecycle, snapshot.
+- `src/open_trader/prediction_arbitrage_execution.py` — serialized execution,
+  remediation, merge, breaker, alerts, restart reconciliation, reset.
+- `src/open_trader/prediction_arbitrage_acceptance.py` — fixed scenario registry
+  and aggregation of Python, Playwright, live, and process evidence.
+- `config/prediction_arbitrage.json.example` — non-secret signer and wallet
+  address example.
+- `ops/launchd/com.open-trader.dashboard.plist.template` — loopback Dashboard,
+  `caffeinate -s`, restart, and shared logs.
+- `scripts/install_dashboard_launchd.sh` — render, install, restart, and verify
+  the exact worktree Dashboard.
+- `scripts/uninstall_dashboard_launchd.sh` — remove only that launchd job.
 - `tests/test_prediction_arbitrage.py`
-- `tests/test_polymarket_public.py`
-- `tests/test_polymarket_stream.py`
+- `tests/test_polymarket_trading.py`
 - `tests/test_prediction_arbitrage_store.py`
-- `tests/test_prediction_arbitrage_watch.py`
-- `tests/test_prediction_arbitrage_cli.py`
+- `tests/test_polymarket_monitor.py`
+- `tests/test_prediction_arbitrage_execution.py`
 - `tests/test_prediction_arbitrage_launchd.py`
+- `acceptance/test_prediction_arbitrage_scenarios.py`
+- `tests/e2e/prediction-market.spec.ts`
+- `tests/e2e/prediction-market.spec.ts-snapshots/*.png` — approved golden images.
 
 ### Modify
 
-- `pyproject.toml`: declare the direct WebSocket dependency.
-- `src/open_trader/cli.py`: add `prediction-arb watch|status`.
-- `src/open_trader/dashboard_web.py`: add the read-only prediction API.
-- `src/open_trader/dashboard_static/index.html`: add the locked top navigation
-  and prediction workspace mount.
-- `src/open_trader/dashboard_static/dashboard.js`: fetch, poll, and render the
-  approved four UI states.
-- `src/open_trader/dashboard_static/dashboard.css`: recreate approved A
-  responsive styling within the warm-ledger shell.
-- `src/open_trader/dashboard_acceptance.py`: make watcher/data/order/UI checks
-  mandatory in `make acceptance`.
-- `tests/test_dashboard_web.py`: API and exact static UI contracts.
-- `tests/test_dashboard_acceptance.py`: strict live acceptance contracts and
-  screenshot matrix.
-- `README.md` and `README.zh-CN.md`: operation, scope, cost, and status commands.
-- `CHANGELOG.md`: dated operator-facing delivery entry.
+- `.gitignore` — ignore `config/prediction_arbitrage.json`.
+- `pyproject.toml` — pin the one official SDK dependency.
+- `src/open_trader/cli.py` — wallet setup/status, no-submit preflight, status,
+  and Dashboard configuration.
+- `src/open_trader/dashboard.py` — carry the non-secret prediction config path.
+- `src/open_trader/dashboard_web.py` — service lifecycle, state/history GET,
+  protected preview/execute/reset POST routes.
+- `src/open_trader/dashboard_static/index.html` — exact approved navigation and
+  workspace mounts.
+- `src/open_trader/dashboard_static/dashboard.js` — render/poll, modal,
+  execution, breaker acknowledgement, histories.
+- `src/open_trader/dashboard_static/dashboard.css` — exact approved responsive
+  visuals.
+- `src/open_trader/dashboard_acceptance.py` — live prediction page/process
+  checks in the existing final Dashboard gate.
+- `tests/e2e/serve_dashboard_fixture.py` — deterministic prediction UI states
+  and non-live mutation responses.
+- `tests/test_dashboard_web.py`
+- `tests/test_dashboard_acceptance.py`
+- `tests/test_polymarket_trading.py` — also owns the prediction CLI contract
+  tests so no second generic CLI test module is introduced.
+- `Makefile` — call the fixed 54-scenario runner before existing Dashboard
+  acceptance.
+- `README.md`, `README.zh-CN.md`, `CHANGELOG.md`.
 
 ---
 
-### Task 1: Add Decimal Bundle Math and the Locked Sort Rule
+### Task 1: Lock Decimal Sizing, Eligibility, and Ordering
 
 **Files:**
 
@@ -106,50 +142,112 @@
 **Interfaces:**
 
 ```python
-@dataclass(frozen=True)
-class BookTop:
-    token_id: str
-    ask_price: Decimal
-    ask_size: Decimal
-    timestamp_ms: int
+@dataclass(frozen=True, slots=True)
+class BookLevel:
+    price: Decimal
+    size: Decimal
 
-@dataclass(frozen=True)
-class BundleCandidate:
-    gross_unit_edge: Decimal
-    executable_size: Decimal
-    gross_profit_upper_bound: Decimal
-    net_unit_edge: Decimal | None
-    estimated_net_profit: Decimal | None
-    formal: bool
+@dataclass(frozen=True, slots=True)
+class ConfirmedBooks:
+    yes_token_id: str
+    no_token_id: str
+    yes_asks: tuple[BookLevel, ...]
+    no_asks: tuple[BookLevel, ...]
+    confirmed_at: datetime
 
-def calculate_bundle(
-    yes: BookTop,
-    no: BookTop,
+@dataclass(frozen=True, slots=True)
+class MarketFacts:
+    event_id: str
+    market_id: str
+    condition_id: str
+    slug: str
+    question: str
+    volume_24h: Decimal
+    minimum_order_size: Decimal
+    tick_size: Decimal
+    fee_verified_zero: bool
+    neg_risk: bool
+
+@dataclass(frozen=True, slots=True)
+class PairIntent:
+    event_id: str
+    market_id: str
+    condition_id: str
+    yes_token_id: str
+    no_token_id: str
+    quantity: Decimal
+    yes_max_price: Decimal
+    no_max_price: Decimal
+    yes_max_cost: Decimal
+    no_max_cost: Decimal
+    total_max_cost: Decimal
+    minimum_profit: Decimal
+    net_edge: Decimal
+
+def build_pair_intent(
+    facts: MarketFacts,
+    books: ConfirmedBooks,
     *,
-    minimum_order_size: Decimal,
-    fee_verified_zero: bool,
-) -> BundleCandidate: ...
+    balance: Decimal,
+    allowance: Decimal,
+) -> PairIntent | None: ...
+
+def estimated_unwind_loss(
+    *,
+    filled_cost: Decimal,
+    sell_price: Decimal,
+    quantity: Decimal,
+) -> Decimal: ...
 
 def monitored_event_sort_key(event: Mapping[str, object]) -> tuple[object, ...]: ...
 ```
 
-- [ ] **Step 1: Write the failing calculation and ordering tests**
+- [ ] **Step 1: Write the failing domain tests**
 
-Cover:
+Use exact Decimal inputs:
 
-- best sizes `80` and `100` produce executable size `80`
-- YES `0.47` plus NO `0.50` produces gross/net unit edge `0.03`
-- formal threshold equality at net edge `0.01` and profit `1.00` is included
-- insufficient minimum size, edge below `0.01`, or profit below `1.00` is not
-  formal
-- an unverified-fee market exposes only gross values and is never formal
-- an eligible event sorts before an ineligible event with a larger gross profit
-- same eligibility sorts profit descending
-- equal profit sorts 24-hour volume descending
-- complete equality sorts stable event ID ascending
-- missing profit sorts after finite profit in the same eligibility group
+```python
+def test_sizes_equal_fok_pair_under_all_fixed_limits() -> None:
+    facts = market_facts(minimum_order_size="5", tick_size="0.01")
+    books = confirmed_books(
+        yes=[("0.45", "20")],
+        no=[("0.48", "20")],
+    )
 
-- [ ] **Step 2: Run the focused test and verify RED**
+    intent = build_pair_intent(
+        facts, books, balance=Decimal("50"), allowance=Decimal("50")
+    )
+
+    assert intent is not None
+    assert intent.quantity == Decimal("20")
+    assert intent.yes_max_cost == Decimal("9.00")
+    assert intent.no_max_cost == Decimal("9.60")
+    assert intent.total_max_cost == Decimal("18.60")
+    assert intent.minimum_profit == Decimal("1.40")
+    assert intent.net_edge == Decimal("0.07")
+```
+
+Add separate tests proving:
+
+- quantity is the largest common protected-BUY requested amount produced by
+  cent-denominated YES and NO spends under `$20`
+- the same quantity is available on both books
+- price caps are the worst levels required for the chosen quantity
+- all six SDK-supported tick sizes use the pinned SDK's protected-BUY requested
+  share precision and reject unsupported tick sizes
+- threshold equality at `$0.01` edge and `$1.00` profit is accepted
+- `$0.009999` edge or `$0.999999` profit is rejected
+- balance or allowance below total cost is rejected
+- minimum order size and tick-grid violations are rejected
+- fee-unverified and NegRisk markets are rejected for execution but retain a
+  gross upper bound
+- every invalid/non-finite/negative input fails closed
+- emergency loss equality at `$2.00` is allowed and `$2.000001` is not
+- actionable event first, then profit descending, volume descending, ID
+  ascending
+- missing profit sorts after a finite profit in its own group
+
+- [ ] **Step 2: Run focused tests and verify RED**
 
 ```bash
 cd /Users/ray/projects/open_trader/.worktrees/prediction-arbitrage-scanner
@@ -160,243 +258,335 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
 Expected: collection fails because `open_trader.prediction_arbitrage` does not
 exist.
 
-- [ ] **Step 3: Implement the smallest pure domain module**
+- [ ] **Step 3: Implement the minimum pure module**
 
-Use fixed constants:
+Use these exact constants:
 
 ```python
 MIN_NET_EDGE = Decimal("0.01")
 MIN_ESTIMATED_PROFIT = Decimal("1.00")
+MAX_NORMAL_COST = Decimal("20.00")
+MAX_WALLET_BALANCE = Decimal("50.00")
+MAX_EMERGENCY_LOSS = Decimal("2.00")
+COLLATERAL_SPEND_QUANTUM = Decimal("0.01")
+PROTECTED_BUY_SHARE_PRECISION = {
+    Decimal("0.1"): 3,
+    Decimal("0.01"): 4,
+    Decimal("0.005"): 5,
+    Decimal("0.0025"): 6,
+    Decimal("0.001"): 5,
+    Decimal("0.0001"): 6,
+}
 ```
 
-Validate finite positive sizes, prices in `(0, 1)`, and timezone-independent
-integer timestamps. Keep serialization out of this module.
-
-The sort key should follow:
-
-```python
-(
-    0 if event["signal_eligible"] else 1,
-    -profit if profit is not None else Decimal("Infinity"),
-    -volume_24h,
-    event_id,
-)
-```
-
-Eligible events use `estimated_net_profit`; ineligible events use
-`gross_profit_upper_bound`.
+Walk each ask book once to derive conservative maximum prices and depth. Enumerate
+at most 2,000 cent-denominated spend amounts per leg, calculate each protected
+BUY's requested shares with `Decimal` and `ROUND_CEILING` at the pinned SDK's
+tick-specific precision, intersect the two small maps, and choose the largest
+common quantity satisfying depth, minimum size, cost, balance, allowance, edge,
+and profit. The resulting `yes_max_cost` and `no_max_cost` are the exact amounts
+passed to the official client. Task 2 compares this pure calculation against
+real signed SDK orders for every supported tick size, so an SDK rounding change
+fails closed. Do not import SDK private helpers or introduce NumPy, a solver, or
+configurable strategy rules.
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
-Run the command from Step 2.
+Run the Step 2 command.
 
-Expected: all tests in `tests/test_prediction_arbitrage.py` pass.
+Expected: all domain tests pass.
 
-- [ ] **Step 5: Commit the domain rule**
+- [ ] **Step 5: Commit the domain rules**
 
 ```bash
-git add src/open_trader/prediction_arbitrage.py tests/test_prediction_arbitrage.py
+git add src/open_trader/prediction_arbitrage.py \
+  tests/test_prediction_arbitrage.py
 git diff --cached --check
-git commit -m "feat: define prediction bundle signals"
+git commit -m "feat: define prediction arbitrage rules"
 ```
 
 ---
 
-### Task 2: Read and Validate Public Polymarket REST Data
+### Task 2: Pass the Official SDK and Keychain Compatibility Gate
+
+Nothing after this task may enable execution unless the real no-submit preflight
+passes on the target Mac.
 
 **Files:**
 
-- Create: `tests/test_polymarket_public.py`
-- Create: `src/open_trader/polymarket_public.py`
-
-**Interfaces:**
-
-```python
-class PolymarketPublicError(RuntimeError): ...
-
-class PolymarketPublicClient:
-    def fetch_top_events(self, limit: int = 20) -> tuple[dict[str, object], ...]: ...
-    def fetch_market_details(self, condition_id: str) -> dict[str, object]: ...
-    def fetch_books(self, token_ids: tuple[str, str]) -> tuple[BookTop, BookTop]: ...
-```
-
-- [ ] **Step 1: Write failing fake-HTTP tests**
-
-Inject an opener callable; do not patch global networking in the implementation.
-Assert:
-
-- Gamma request uses exactly `active=true`, `closed=false`, `limit=20`,
-  `order=volume24hr`, and `ascending=false`
-- nested inactive, closed, non-order-book, non-binary, or malformed markets are
-  skipped and counted
-- JSON-encoded `outcomes` and `clobTokenIds` are mapped in YES/NO order
-- event `volume24hr` is finite and non-negative
-- CLOB details accept formal eligibility only when `tbf == 0` and fee curve
-  rate is absent/disabled/zero
-- Gamma eligibility requires explicit `feesEnabled=false` and
-  `takerBaseFee=0`; missing or contradictory Gamma fields are monitoring-only
-- missing, non-zero, malformed, or contradictory fee values return
-  `fee_unverified`
-- CLOB `mos` becomes the market minimum order size
-- `/books` sends exactly two token IDs in one POST
-- returned books are matched by `asset_id`, not response position
-- duplicate, unknown, or missing IDs fail closed
-- unsorted ask arrays choose the minimum valid ask
-- timestamps older than 10 seconds or skewed by more than 2 seconds fail
-- HTTP, JSON, and top-level type failures raise `PolymarketPublicError` with no
-  credential or response-body leakage
-
-- [ ] **Step 2: Run the REST tests and verify RED**
-
-```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_polymarket_public.py -q
-```
-
-Expected: collection fails because the client module does not exist.
-
-- [ ] **Step 3: Implement fixed public endpoints with stdlib**
-
-Use:
-
-```python
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
-CLOB_URL = "https://clob.polymarket.com"
-```
-
-Use `urllib.request.Request`, `urlopen`, `json`, and finite timeouts. Do not add
-`requests`, an SDK, credential parameters, or a generic HTTP wrapper.
-
-Return normalized dictionaries containing only fields consumed by the watcher
-and Dashboard. Serialize `Decimal` later as strings.
-
-- [ ] **Step 4: Run the REST and domain tests**
-
-```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_polymarket_public.py tests/test_prediction_arbitrage.py -q
-```
-
-Expected: both files pass.
-
-- [ ] **Step 5: Commit the public REST boundary**
-
-```bash
-git add src/open_trader/polymarket_public.py tests/test_polymarket_public.py
-git diff --cached --check
-git commit -m "feat: read public Polymarket market data"
-```
-
----
-
-### Task 3: Add the Public Market WebSocket Session
-
-**Files:**
-
-- Create: `tests/test_polymarket_stream.py`
-- Create: `src/open_trader/polymarket_stream.py`
 - Modify: `pyproject.toml`
+- Modify: `.gitignore`
+- Create: `config/prediction_arbitrage.json.example`
+- Create: `src/open_trader/polymarket_trading.py`
+- Modify: `src/open_trader/cli.py`
+- Create: `tests/test_polymarket_trading.py`
 
 **Interfaces:**
 
 ```python
-@dataclass(frozen=True)
-class MarketStreamUpdate:
-    token_id: str
-    best_ask: Decimal | None
-    ask_size: Decimal | None
-    timestamp_ms: int
+@dataclass(frozen=True, slots=True)
+class TradingConfig:
+    signer_address: str
+    wallet_address: str
 
-class PolymarketMarketStream:
-    def __enter__(self) -> "PolymarketMarketStream": ...
-    def __exit__(self, *exc: object) -> None: ...
-    def receive(self, timeout: float) -> tuple[MarketStreamUpdate, ...]: ...
-    def update_subscriptions(
-        self, *, add: set[str], remove: set[str]
-    ) -> None: ...
-    @property
-    def last_pong_at(self) -> datetime | None: ...
+@dataclass(frozen=True, slots=True)
+class AccountSnapshot:
+    wallet_address: str
+    p_usd_balance: Decimal
+    p_usd_allowance: Decimal
+    open_order_ids: tuple[str, ...]
+    positions: tuple[dict[str, str], ...]
+    checked_at: datetime
+
+@dataclass(frozen=True, slots=True)
+class LegResult:
+    leg: Literal["YES", "NO"]
+    accepted: bool
+    status: str
+    order_id: str
+    filled_quantity: Decimal
+    trade_ids: tuple[str, ...]
+    error_code: str
+
+@dataclass(frozen=True, slots=True)
+class PairSubmission:
+    yes: LegResult
+    no: LegResult
+
+class PolymarketTradingClient:
+    @classmethod
+    def from_keychain(cls, config: TradingConfig) -> "PolymarketTradingClient": ...
+    def geoblock_allowed(self) -> bool: ...
+    def account_snapshot(self) -> AccountSnapshot: ...
+    def no_submit_preflight(self, intent: PairIntent) -> dict[str, object]: ...
+    def submit_pair_once(self, intent: PairIntent) -> PairSubmission: ...
+    def reconcile(self, *, condition_id: str, since: datetime) -> dict[str, object]: ...
+    def cancel_orders(self, order_ids: tuple[str, ...]) -> tuple[str, ...]: ...
+    def submit_remediation_once(self, order: dict[str, object]) -> LegResult: ...
+    def merge_once(self, *, condition_id: str, quantity: Decimal) -> dict[str, object]: ...
+
+def store_keychain_secret(account: str, secret: str) -> None: ...
+def load_keychain_secret(account: str) -> str: ...
+def load_trading_config(path: Path) -> TradingConfig: ...
 ```
 
-- [ ] **Step 1: Write failing protocol tests with a fake socket**
+- [ ] **Step 1: Pin the current official SDK and install it**
 
-Assert:
-
-- URL is
-  `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- initial frame contains sorted token IDs, `type=market`, and
-  `custom_feature_enabled=true`
-- `PING` is sent every 10 seconds and `PONG` updates health
-- add/remove frames exactly use documented `operation=subscribe|unsubscribe`
-- JSON object and JSON array frames are accepted
-- `book` selects the minimum valid ask
-- the session seeds per-token ask levels from `book`, applies SELL
-  `price_change` updates/removals, and emits the current best ask and size
-- `best_bid_ask` without size can trigger REST recheck but cannot manufacture an
-  executable size
-- malformed, unknown, or out-of-range market frames are ignored without
-  corrupting previous state
-- connection close/error propagates as one concise stream exception
-
-- [ ] **Step 2: Run the stream test and verify RED**
-
-```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_polymarket_stream.py -q
-```
-
-Expected: collection fails because the stream module does not exist.
-
-- [ ] **Step 3: Declare and make the dependency available**
-
-Add:
+Add exactly:
 
 ```toml
-"websockets>=15,<16",
+"polymarket-client==0.2.0",
 ```
 
-to `[project].dependencies`, then run:
+Then run:
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pip install \
-  "websockets>=15,<16"
+  "polymarket-client==0.2.0"
+/Users/ray/projects/open_trader/.venv/bin/python -c \
+  'import importlib.metadata; assert importlib.metadata.version("polymarket-client") == "0.2.0"'
 ```
 
-- [ ] **Step 4: Implement one concrete synchronous session**
+Expected: import succeeds and prints no assertion failure.
 
-Use `websockets.sync.client.connect` with library protocol pings disabled;
-Polymarket's text `PING`/`PONG` is the health contract. Inject `connect_fn` and
-`monotonic_fn` only for tests.
+- [ ] **Step 2: Write failing Keychain and adapter contract tests**
 
-Do not add asyncio, a background thread, a stream interface, or a reconnect
-manager. Reconnect belongs to the watcher.
+Inject `subprocess.run`, `urlopen`, and an official-client factory. Assert:
 
-- [ ] **Step 5: Run stream and domain tests**
+```python
+def test_keychain_write_never_places_secret_in_process_arguments() -> None:
+    calls: list[tuple[list[str], str | None]] = []
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        calls.append((args, kwargs.get("input")))
+        return CompletedProcess(args, 0, "", "")
+
+    store_keychain_secret("signing-private-key", "secret-sentinel", run=run)
+
+    assert all("secret-sentinel" not in item for item in calls[0][0])
+    assert calls[0][1] == "secret-sentinel\n"
+```
+
+Also prove:
+
+- service name is exactly `com.open-trader.polymarket`
+- Keychain read captures stdout without logging it
+- config accepts only canonical 20-byte hex signer/wallet addresses
+- geoblock blocked, timeout, malformed, or error returns fail-closed
+- `no_submit_preflight` creates two signed `FOK` BUY market orders using the
+  intent's exact cent-denominated leg cost as both `amount` and `max_spend`,
+  plus the intent's `max_price`
+- both signed orders have equal requested/taker share amounts
+- each supported tick's signed requested amount matches Task 1's pure rounding
+  result; a mismatch makes readiness fail closed
+- signature/order payload never appears in the returned summary or log
+- `submit_pair_once` calls official `post_orders` exactly once with two signed
+  orders and preserves independent responses
+- it calls `post_orders`, not `place_market_order`, so the SDK cannot silently
+  send an allowance mutation
+- an exception after the POST begins is returned as ambiguous and is never
+  retried
+- account reads cover collateral balance/allowance, open orders, account
+  trades, and positions
+- merge calls the official `merge_positions` once and waits at most 60 seconds
+- official SDK exceptions are redacted to safe categories
+
+- [ ] **Step 3: Run the adapter tests and verify RED**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_polymarket_stream.py tests/test_prediction_arbitrage.py -q
+  tests/test_polymarket_trading.py -q
 ```
 
-Expected: both files pass.
+Expected: collection fails because `polymarket_trading` does not exist.
 
-- [ ] **Step 6: Commit the market stream**
+- [ ] **Step 4: Implement Keychain storage with no secret argv**
+
+Use `/usr/bin/security` directly:
+
+```python
+SECURITY = "/usr/bin/security"
+KEYCHAIN_SERVICE = "com.open-trader.polymarket"
+KEYCHAIN_ACCOUNTS = (
+    "signing-private-key",
+    "builder-key",
+    "builder-secret",
+    "builder-passphrase",
+)
+```
+
+`store_keychain_secret` runs:
+
+```python
+[
+    SECURITY, "add-generic-password", "-U",
+    "-a", account, "-s", KEYCHAIN_SERVICE, "-w",
+]
+```
+
+with `input=f"{secret}\n"`, `text=True`, `capture_output=True`, and `check=True`.
+Read with `find-generic-password -a account -s service -w`. Never include a
+`CompletedProcess` representation in exceptions.
+
+- [ ] **Step 5: Implement the one official-client boundary**
+
+Use `SecureClient.create`, `BuilderApiKey`, `get_balance_allowance`,
+`list_open_orders`, `list_account_trades`, `list_positions`,
+`create_market_order`, `post_orders`, `cancel_orders`, and `merge_positions`.
+
+For each BUY leg:
+
+```python
+amount = intent.yes_max_cost  # use no_max_cost for the NO leg
+signed = client.create_market_order(
+    token_id=token_id,
+    side="BUY",
+    amount=amount,
+    max_spend=amount,
+    max_price=max_price,
+    order_type="FOK",
+)
+```
+
+Assert each signed order's requested/taker amount equals `intent.quantity`, and
+that the two are equal, before calling `post_orders`. The adapter makes no
+second `post_orders` call on any code path.
+
+Use stdlib `urllib` only for
+`GET https://polymarket.com/api/geoblock`, with a finite timeout and explicit
+allow response. Do not cache an allow result inside final execution.
+
+- [ ] **Step 6: Add the one-time wallet CLI**
+
+Add:
+
+```text
+prediction-arb wallet setup --config config/prediction_arbitrage.json
+prediction-arb wallet status --config config/prediction_arbitrage.json
+prediction-arb preflight --config config/prediction_arbitrage.json --no-submit
+```
+
+`wallet setup` accepts non-secret signer/wallet addresses as options, prompts
+four secrets through `getpass`, writes JSON mode `0600`, and writes secrets to
+Keychain. It has no option that accepts a secret.
+
+The example file contains only:
+
+```json
+{
+  "signer_address": "0x0000000000000000000000000000000000000000",
+  "wallet_address": "0x0000000000000000000000000000000000000000"
+}
+```
+
+Add `config/prediction_arbitrage.json` to `.gitignore`.
+
+- [ ] **Step 7: Run focused tests and safe CLI checks**
 
 ```bash
-git add pyproject.toml src/open_trader/polymarket_stream.py \
-  tests/test_polymarket_stream.py
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage.py tests/test_polymarket_trading.py -q
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python \
+  -m open_trader prediction-arb wallet setup --help
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python \
+  -m open_trader prediction-arb preflight --help
+```
+
+Expected: tests pass; help contains no private-key or secret option.
+
+- [ ] **Step 8: Run the target-Mac no-submit compatibility gate**
+
+The user completes the one-time hidden-input setup. The command selects the
+highest-volume active standard binary fee-free market and constructs the
+smallest venue-valid, SDK-rounding-compatible equal-share pair solely as an
+in-memory signing probe. It does not require a live arbitrage opportunity, does
+not persist the probe, and does not call any mutation method. Then run:
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python \
+  -m open_trader prediction-arb preflight \
+  --config /Users/ray/projects/open_trader/config/prediction_arbitrage.json \
+  --no-submit
+```
+
+The command must prove and print only safe facts:
+
+```text
+sdk_version: 0.2.0
+signer_match: yes
+wallet_match: yes
+geoblock: allowed
+account_reads: pass
+fok_pair_signed_not_submitted: pass
+equal_requested_shares: pass
+merge_capability: present_not_invoked
+relayer_readiness: pass
+secret_scan: pass
+result: PASS
+```
+
+If any line fails, stop implementation and report `BLOCKED`. Do not enable an
+execution API or continue to the UI.
+
+- [ ] **Step 9: Commit the proven dependency boundary**
+
+```bash
+git add pyproject.toml .gitignore \
+  config/prediction_arbitrage.json.example \
+  src/open_trader/polymarket_trading.py src/open_trader/cli.py \
+  tests/test_polymarket_trading.py
 git diff --cached --check
-git commit -m "feat: stream Polymarket order books"
+git commit -m "feat: add safe Polymarket client boundary"
 ```
 
 ---
 
-### Task 4: Persist Runtime and Formal Signal Lifecycles in SQLite
+### Task 3: Persist Signals, Previews, Executions, Legs, and Incidents
 
 **Files:**
 
-- Create: `tests/test_prediction_arbitrage_store.py`
 - Create: `src/open_trader/prediction_arbitrage_store.py`
+- Create: `tests/test_prediction_arbitrage_store.py`
 
 **Interfaces:**
 
@@ -405,35 +595,47 @@ class PredictionArbitrageStore:
     def __init__(self, data_dir: Path) -> None: ...
     def write_runtime(self, payload: Mapping[str, object]) -> None: ...
     def load_runtime(self) -> dict[str, object] | None: ...
-    def open_signal(self, signal: Mapping[str, object]) -> None: ...
-    def update_signal(self, signal: Mapping[str, object]) -> None: ...
-    def close_signal(
-        self, market_id: str, *, ended_at: str, reason: str
+    def upsert_signal(self, payload: Mapping[str, object]) -> str: ...
+    def close_signal(self, market_id: str, *, ended_at: str, reason: str) -> None: ...
+    def signal_history(self, window: Literal["24h", "7d", "all"]) -> list[dict[str, object]]: ...
+    def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str: ...
+    def consume_preview_and_create_execution(
+        self, preview_id: str, idempotency_key: str
+    ) -> dict[str, object]: ...
+    def transition_execution(
+        self, execution_id: str, *, state: str, evidence: Mapping[str, object]
     ) -> None: ...
-    def close_all_open(self, *, ended_at: str, reason: str) -> None: ...
-    def active_signals(self) -> list[dict[str, object]]: ...
-    def history(
-        self, window: Literal["24h", "7d", "all"], *, now: datetime
-    ) -> list[dict[str, object]]: ...
+    def record_leg(self, execution_id: str, payload: Mapping[str, object]) -> None: ...
+    def open_incident(self, execution_id: str, payload: Mapping[str, object]) -> str: ...
+    def acknowledge_incident(self, incident_id: str, payload: Mapping[str, object]) -> None: ...
+    def active_execution(self) -> dict[str, object] | None: ...
+    def unacknowledged_incident(self) -> dict[str, object] | None: ...
+    def histories(self, kind: Literal["signals", "executions", "incidents"]) -> list[dict[str, object]]: ...
 ```
 
-- [ ] **Step 1: Write failing SQLite lifecycle tests**
+- [ ] **Step 1: Write failing SQLite tests**
 
-Cover:
+Create real temporary databases and assert:
 
-- schema creation under
-  `data/prediction_arbitrage/prediction_arbitrage.sqlite3`
-- WAL mode and a non-zero busy timeout
-- runtime singleton replacement
-- open, peak update, close, and restart reads
-- two open signals for one market are rejected
-- `close_all_open(..., reason="watcher_restarted")`
-- exact 24h, 7d, and all boundaries
-- history newest-first
-- JSON Decimal strings survive process/store recreation
-- no table exists for ticks or raw frames
+- file is `data/prediction_arbitrage/prediction_arbitrage.sqlite3`
+- WAL and non-zero busy timeout are enabled
+- tables are exactly `runtime`, `signals`, `previews`, `executions`,
+  `execution_legs`, and `incidents` plus SQLite internals
+- one open signal per market
+- one non-terminal execution globally
+- preview expiry is 10 seconds and consumption is atomic/one-use
+- duplicate application idempotency key returns the existing execution
+- transition evidence is appended before the next action and survives restart
+- leg identity is unique per execution plus `YES`/`NO`/remediation label
+- acknowledgement never deletes incident evidence
+- 24h/7d/all boundaries and newest-first history are exact
+- raw ticks, signed orders, signatures, API secrets, and private keys have no
+  column/table and fail a sentinel scan
 
-- [ ] **Step 2: Run the store test and verify RED**
+Use a concurrency test with two threads and two store instances; only one can
+consume the preview/create a non-terminal execution.
+
+- [ ] **Step 2: Run store tests and verify RED**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -442,25 +644,33 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
 
 Expected: collection fails because the store module does not exist.
 
-- [ ] **Step 3: Implement the two-table store**
+- [ ] **Step 3: Implement six direct SQLite tables**
 
-Use stdlib `sqlite3`, parameterized SQL, one short connection per public method,
-and explicit transactions. Store canonical JSON with sorted keys.
-
-Create:
+Use `sqlite3`, parameterized SQL, explicit transactions, canonical JSON, and
+short-lived connections. Add partial unique indexes:
 
 ```sql
 CREATE UNIQUE INDEX one_open_signal_per_market
 ON signals(market_id) WHERE ended_at IS NULL;
-CREATE INDEX signals_started_at ON signals(started_at DESC);
-CREATE INDEX signals_ended_at ON signals(ended_at);
+
+CREATE UNIQUE INDEX one_nonterminal_execution
+ON executions(singleton)
+WHERE state NOT IN (
+  'both_rejected', 'complete', 'neutralized_incident',
+  'directional_incident', 'merge_incident'
+);
+
+CREATE UNIQUE INDEX one_execution_per_idempotency_key
+ON executions(idempotency_key);
 ```
 
-Do not add migrations, an ORM, repository interfaces, or tick storage.
+Every execution row uses `singleton=1`. Store amounts as canonical decimal
+strings inside JSON. Do not add a migration framework; a `schema_version`
+PRAGMA/user_version check and explicit idempotent DDL are sufficient.
 
-- [ ] **Step 4: Run the store tests**
+- [ ] **Step 4: Run the focused store tests**
 
-Run the command from Step 2.
+Run the Step 2 command.
 
 Expected: all store tests pass.
 
@@ -470,256 +680,511 @@ Expected: all store tests pass.
 git add src/open_trader/prediction_arbitrage_store.py \
   tests/test_prediction_arbitrage_store.py
 git diff --cached --check
-git commit -m "feat: persist prediction signal history"
+git commit -m "feat: persist prediction execution state"
 ```
 
 ---
 
-### Task 5: Orchestrate Continuous Discovery, Confirmation, and History
+### Task 4: Run the Top-20 Public Monitor and Signal Lifecycle
 
 **Files:**
 
-- Create: `tests/test_prediction_arbitrage_watch.py`
-- Create: `src/open_trader/prediction_arbitrage_watch.py`
+- Create: `src/open_trader/polymarket_monitor.py`
+- Create: `tests/test_polymarket_monitor.py`
 
 **Interfaces:**
 
 ```python
-class PredictionArbitrageWatcher:
-    def refresh_universe(self) -> None: ...
-    def handle_updates(self, updates: tuple[MarketStreamUpdate, ...]) -> None: ...
-    def publish_runtime(self, *, force: bool = False) -> None: ...
-    def run(self) -> None: ...
-
-def run_prediction_arbitrage_watch(data_dir: Path) -> None: ...
+class PolymarketMonitor:
+    def __init__(
+        self,
+        *,
+        store: PredictionArbitrageStore,
+        trading: PolymarketTradingClient,
+        public_client_factory: Callable[[], object] = AsyncPublicClient,
+    ) -> None: ...
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def snapshot(self) -> dict[str, object]: ...
+    def opportunity(self, opportunity_id: str) -> dict[str, object] | None: ...
+    def run_forever(self) -> None: ...
 ```
 
-- [ ] **Step 1: Write failing deterministic watcher tests**
+- [ ] **Step 1: Write failing monitor tests with the official model shapes**
 
-Use fake public data, stream sessions, clock, and real temporary SQLite. Cover:
+Inject a fake `AsyncPublicClient`, fake stream handle, deterministic clock, real
+temporary store, and fake trading readiness. Assert:
 
-- startup closes stale open signals as `watcher_restarted`
-- first universe contains at most 20 events and all valid tokens
-- five-minute refresh sends only token deltas
-- fee-unverified markets remain in the runtime event/market counts
-- fee-unverified markets never call `/books` for a formal signal
-- paired WebSocket asks that meet thresholds trigger one same-batch REST
-  confirmation
-- every prospective formal signal first re-fetches CLOB market details and
-  requires fee/minimum-size facts to remain safe
-- a qualifying confirmation opens one signal
-- repeated qualifying updates do not duplicate the episode
-- later confirmation updates peak edge/profit
-- candidate confirmation retries no faster than once per second
-- a threshold loss closes the episode
-- universe removal closes as `universe_removed`
-- stream loss closes as `stream_stale`, records a blocker, and reconnects with
-  delays `1, 2, 4, ... 60` seconds
-- runtime snapshot is written at most once per second plus heartbeat
-- heartbeat contains PID, working directory, fixed process Git SHA,
-  `heartbeat_at`, `universe_refreshed_at`, WebSocket state, `last_pong_at`,
-  reconnect count, and blocker
-- runtime events use the locked eligibility/profit/volume/ID order
+- `list_events(closed=False, ended=False, order="volume24hr",
+  ascending=False, page_size=20)` is used
+- results are revalidated as active, not closed/ended, finite non-negative
+  volume, then limited to 20
+- only active, order-accepting, order-book-enabled, exactly YES/NO tokenized
+  markets enter subscriptions
+- malformed items are counted and skipped without aborting valid events
+- `MarketSpec` contains exactly the current sorted token IDs
+- reconnect resubscribes the full current set
+- each apparent candidate calls one `get_order_books(token_ids=[yes, no])`
+- returned books are matched by token ID, not tuple position
+- candidate/actionability confirmation is at most 10 seconds old
+- wallet/geoblock/relayer readiness is at most 60 seconds old
+- readiness is refreshed without signing or submitting
+- fee-enabled/unknown and NegRisk markets stay visible but never actionable
+- healthy/no opportunity is quiet, not degraded
+- heartbeat over 30 seconds, stream disruption over 15 seconds, universe over
+  10 minutes, or store write failure is degraded and disables action
+- open/improve/close signal episode updates peaks once and survives restart
+- event order uses the domain sort key and every event contains volume
+- runtime is written no more than once per second plus heartbeat
+- monitor-only operation never calls `submit_pair_once`, remediation, or merge
 
-- [ ] **Step 2: Run watcher tests and verify RED**
+- [ ] **Step 2: Run monitor tests and verify RED**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_prediction_arbitrage_watch.py -q
+  tests/test_polymarket_monitor.py -q
 ```
 
-Expected: collection fails because the watcher module does not exist.
+Expected: collection fails because `polymarket_monitor` does not exist.
 
-- [ ] **Step 3: Implement the concrete watcher**
+- [ ] **Step 3: Implement one async monitor thread**
 
-Use one process-lifetime `fcntl.flock` on:
+`start()` creates one daemon thread whose target is `asyncio.run(run_forever())`.
+`run_forever()` uses `AsyncPublicClient`, `MarketSpec`, one stream, and one
+five-minute universe timer. Keep current books and opportunities in dicts under
+one `threading.RLock`; return serialized copies from `snapshot()`.
 
-```text
-data/prediction_arbitrage/watcher.lock
-```
+On each relevant stream update:
 
-Keep current books and confirmation cooldowns in dictionaries keyed by market
-or token. Use a single loop; do not add threads or asyncio.
+1. update the in-memory book
+2. calculate whether thresholds might be reachable
+3. paired REST-confirm both books
+4. refresh typed market fee/tick/minimum/NegRisk facts
+5. combine latest account readiness
+6. build/remove the actionable opportunity
+7. update the durable signal episode and runtime snapshot
 
-On every runtime snapshot:
+Do not create a generic reconnect service or publish raw stream messages.
 
-- reduce each event to its best eligible net profit or ineligible gross upper
-  bound
-- apply `monitored_event_sort_key`
-- serialize every `Decimal` as a string
-- include exact participation/profit kinds so the Dashboard never guesses
-
-- [ ] **Step 4: Run all prediction core tests**
+- [ ] **Step 4: Run core monitoring tests**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_prediction_arbitrage.py \
-  tests/test_polymarket_public.py \
-  tests/test_polymarket_stream.py \
   tests/test_prediction_arbitrage_store.py \
-  tests/test_prediction_arbitrage_watch.py -q
+  tests/test_polymarket_monitor.py -q
 ```
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Commit watcher orchestration**
+- [ ] **Step 5: Run the exact one-shot public monitor diagnostic**
 
-```bash
-git add src/open_trader/prediction_arbitrage_watch.py \
-  tests/test_prediction_arbitrage_watch.py
-git diff --cached --check
-git commit -m "feat: watch prediction arbitrage continuously"
-```
-
----
-
-### Task 6: Add Watch and Status CLI Commands
-
-**Files:**
-
-- Create: `tests/test_prediction_arbitrage_cli.py`
-- Modify: `src/open_trader/cli.py`
-
-**CLI:**
-
-```text
-open-trader prediction-arb watch --data-dir PATH
-open-trader prediction-arb status --data-dir PATH
-```
-
-- [ ] **Step 1: Write failing parser and routing tests**
-
-Assert:
-
-- nested command names and help text exist
-- default data directory is `data`
-- `watch` calls `run_prediction_arbitrage_watch` once
-- an already-held watcher lock prints concise stderr and returns `2`
-- `status` prints JSON with health, PID, heartbeat, event/market/token counts,
-  current signals, and total history
-- missing/stale runtime returns `2`; healthy runtime returns `0`
-- neither command accepts credentials, wallet paths, execution flags, or
-  notification flags
-
-- [ ] **Step 2: Run CLI tests and verify RED**
-
-```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_prediction_arbitrage_cli.py -q
-```
-
-Expected: parser rejects `prediction-arb`.
-
-- [ ] **Step 3: Add the smallest nested CLI**
-
-Place the parser next to other top-level operational commands. Route expected
-watcher/public/store errors to one-line stderr and exit code `2`; allow
-programming errors to remain visible in tests.
-
-- [ ] **Step 4: Run focused CLI and existing dashboard CLI tests**
-
-```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_prediction_arbitrage_cli.py tests/test_dashboard_cli.py -q
-```
-
-Expected: both files pass.
-
-- [ ] **Step 5: Check real help output**
+Add `monitor-once` as a non-mutating operator diagnostic. It performs one
+top-20 refresh, opens the actual public WebSocket until heartbeat or timeout,
+and makes one paired REST book read for the highest-volume eligible binary
+market even when no arbitrage candidate exists:
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python \
-  -m open_trader prediction-arb --help
+  -m open_trader prediction-arb monitor-once \
+  --config /Users/ray/projects/open_trader/config/prediction_arbitrage.json \
+  --data-dir /Users/ray/projects/open_trader/data \
+  --timeout 30
 ```
 
-Expected: only `watch` and `status` are listed.
+Expected safe output:
 
-- [ ] **Step 6: Commit CLI wiring**
+```text
+event_count: 20
+volumes: present
+websocket_heartbeat: pass
+paired_book_read: pass
+mutations: 0
+result: PASS
+```
+
+The diagnostic must neither sign nor submit.
+
+- [ ] **Step 6: Commit monitoring**
 
 ```bash
-git add src/open_trader/cli.py tests/test_prediction_arbitrage_cli.py
+git add src/open_trader/polymarket_monitor.py \
+  tests/test_polymarket_monitor.py src/open_trader/cli.py
 git diff --cached --check
-git commit -m "feat: expose prediction watcher commands"
+git commit -m "feat: monitor Polymarket arbitrage signals"
 ```
 
 ---
 
-### Task 7: Add the Read-Only Dashboard API
+### Task 5: Execute One Two-Leg Request and Merge Normal Success
 
 **Files:**
 
-- Modify: `tests/test_dashboard_web.py`
-- Modify: `src/open_trader/dashboard_web.py`
+- Create: `src/open_trader/prediction_arbitrage_execution.py`
+- Create: `tests/test_prediction_arbitrage_execution.py`
 
-**Interface:**
+**Interfaces:**
 
 ```python
-def build_prediction_arbitrage_payload(
-    data_dir: Path,
-    *,
-    window: Literal["24h", "7d", "all"],
-    now: datetime | None = None,
-) -> dict[str, object]: ...
+class PredictionExecutionService:
+    def __init__(
+        self,
+        *,
+        store: PredictionArbitrageStore,
+        monitor: PolymarketMonitor,
+        trading: PolymarketTradingClient,
+        notifier: Notifier,
+        lock_path: Path,
+    ) -> None: ...
+    def preview(self, opportunity_id: str) -> dict[str, object]: ...
+    def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]: ...
+    def execution(self, execution_id: str) -> dict[str, object]: ...
+    def reconcile_startup(self) -> dict[str, object]: ...
+    def reset_breaker(self, incident_id: str) -> dict[str, object]: ...
 ```
 
-- [ ] **Step 1: Write failing payload and HTTP tests**
+- [ ] **Step 1: Write failing normal-flow and serialization tests**
 
-Assert:
+Use the real store, a fake monitor, and a fake concrete trading object. Assert:
 
-- `/api/prediction-arbitrage` defaults to `window=24h`
-- `24h`, `7d`, and `all` are accepted; any other value returns HTTP 400
-- a healthy store with current signals returns `status=live`
-- a healthy store without current signals returns `status=quiet`
-- heartbeat or PONG older than 30 seconds, universe older than 10 minutes, or a
-  blocker returns `status=degraded`
-- a missing database returns schema-valid degraded payload and HTTP 200
-- summary counts agree with arrays
-- current signals are active only
-- history respects the requested window
-- event order from the runtime snapshot is preserved
-- no endpoint mutates the store
+```python
+def test_one_confirm_posts_exactly_one_equal_fok_batch_and_merges() -> None:
+    service, trading, store = execution_fixture(result="both_filled")
+    preview = service.preview("opp-1")
 
-- [ ] **Step 2: Run focused API tests and verify RED**
+    execution = service.confirm(preview["id"], "browser-request-1")
+    wait_until_terminal(service, execution["id"])
 
-Run only the new test names, for example:
+    assert trading.batch_calls == 1
+    assert trading.batch_leg_names == ("YES", "NO")
+    assert trading.batch_quantities == (Decimal("10"), Decimal("10"))
+    assert trading.merge_calls == 1
+    assert store.execution(execution["id"])["state"] == "complete"
+```
+
+Cover:
+
+- opening preview rechecks paired books, wallet, geoblock, relayer, lock, and
+  breaker but does not sign/submit
+- preview expires at exactly 10 seconds
+- confirm consumes preview atomically and repeats all volatile checks
+- price worsening below `$1` rejects with zero external mutation
+- each execution creates local leg IDs `execution_id:YES` and
+  `execution_id:NO`
+- double-click/same idempotency key returns the same execution
+- different opportunity while active returns busy
+- two independent FOK rejections end `both_rejected`, no retry/merge/breaker
+- two fills reconcile equal actual shares before exactly one merge
+- complete is written only after merge confirmation and pUSD reconciliation
+- ambiguous POST performs zero second POST and opens reconciliation
+- delayed order polls at least once per second for 30 injected-clock seconds,
+  then locks as incident
+- browser-supplied prices, quantity, wallet, and limits are absent from the
+  service method signature
+- the OS `fcntl` lock blocks a second process/service instance
+
+- [ ] **Step 2: Run execution tests and verify RED**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_dashboard_web.py -q -k prediction_arbitrage_api
+  tests/test_prediction_arbitrage_execution.py -q
 ```
 
-Expected: HTTP 404 or missing builder failure.
+Expected: collection fails because the execution module does not exist.
 
-- [ ] **Step 3: Add the builder and GET route**
+- [ ] **Step 3: Implement preview and one-shot execution**
 
-Parse the existing `urlparse(self.path)` result once and use `parse_qs`.
-Instantiate `PredictionArbitrageStore(config.data_dir)` only for the prediction
-route.
+`preview()` stores only the server-computed intent and safe display fields.
+`confirm()`:
 
-Keep the API schema exactly
-`open_trader.prediction_arbitrage.dashboard.v1`. Do not merge prediction data
-into `/api/dashboard`.
+1. atomically consumes preview and creates execution
+2. acquires one process `threading.Lock` plus `fcntl.flock`
+3. starts one daemon execution thread
+4. final-validates with current monitor/trading data
+5. persists `submitting`
+6. calls `submit_pair_once` exactly once
+7. persists both independent leg responses
+8. reconciles actual trades/positions
+9. either ends both rejected, routes one-leg to Task 6 logic, or merges
 
-- [ ] **Step 4: Run focused and complete Dashboard web tests**
+Every transition is committed before the next external mutation. Never persist
+the signed objects returned by the SDK.
+
+- [ ] **Step 4: Implement confirmed normal merge**
+
+When equal filled quantities are proven, call:
+
+```python
+trading.merge_once(
+    condition_id=intent.condition_id,
+    quantity=actual_equal_quantity,
+)
+```
+
+Wait at most 60 seconds. Only confirmed collateral balance increase yields
+`complete`. Any other result routes to an incident implemented in Task 6.
+
+- [ ] **Step 5: Run focused normal-flow tests**
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py -q \
+  -k 'preview or serialization or both_rejected or both_filled or ambiguous or delayed'
+```
+
+Expected: selected tests pass.
+
+- [ ] **Step 6: Commit the normal state machine**
+
+```bash
+git add src/open_trader/prediction_arbitrage_execution.py \
+  tests/test_prediction_arbitrage_execution.py
+git diff --cached --check
+git commit -m "feat: execute one prediction arbitrage pair"
+```
+
+---
+
+### Task 6: Handle One-Leg Risk, Alerts, Restart Recovery, and Reset
+
+**Files:**
+
+- Modify: `src/open_trader/prediction_arbitrage_execution.py`
+- Modify: `tests/test_prediction_arbitrage_execution.py`
+- Modify: `src/open_trader/polymarket_trading.py`
+- Modify: `tests/test_polymarket_trading.py`
+
+- [ ] **Step 1: Add failing one-leg remediation tests**
+
+Table-drive these exact outcomes:
+
+| Filled state | Fresh options | Required action | Terminal state |
+|---|---|---|---|
+| YES only | complete NO loss `$1.20`; unwind YES loss `$1.50` | one NO FOK | `neutralized_incident` after merge |
+| NO only | complete YES loss `$1.80`; unwind NO loss `$0.90` | one NO SELL FOK | `neutralized_incident` |
+| YES only | both options over `$2` | no order | `directional_incident` |
+| one leg ambiguous | no proven neutral state | no second pair | incident/reconcile |
+| equal pair | merge rejected/timeout | no second merge | `merge_incident` |
+
+For every one-leg case assert:
+
+- breaker opens before remediation
+- fresh books/positions are read
+- lower-loss executable option is chosen
+- equality at `$2` is allowed; above `$2` sends no order
+- at most one remediation FOK is submitted
+- normal executions remain disabled after neutralization
+- macOS and exactly one configured Feishu channel are attempted
+- each channel result is persisted independently
+- notification failure never blocks risk work or unlocks trading
+
+- [ ] **Step 2: Add failing startup reconciliation tests**
+
+Cover:
+
+- clean account: starts locked, reads live state, then ready
+- known open orders: cancel once, confirm cancellation, open incident
+- equal pair: merge once, reconcile, remain locked until acknowledgement
+- imbalance: no directional repair order, urgent incident
+- unknown external order/position: incident
+- already-confirmed merge: mark reconciled, no duplicate merge
+- stale local state never overrides live orders/trades/positions
+- first-live-order flag changes only for a real adapter result containing venue
+  fill references plus confirmed merge transaction; controlled fakes cannot set
+  it
+
+- [ ] **Step 3: Add failing reset tests**
+
+`reset_breaker` must make fresh live reads. It succeeds only with:
+
+```python
+open_orders == ()
+directional_imbalance == Decimal("0")
+pending_merge is False
+readiness_is_fresh is True
+```
+
+Any failure returns a precise blocking reason, records the denial, keeps the
+incident/history, and sends no order.
+
+- [ ] **Step 4: Run incident tests and verify RED**
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_polymarket_trading.py -q \
+  -k 'one_leg or remediation or merge_incident or restart or reset or notification'
+```
+
+Expected: new cases fail because incident paths are absent.
+
+- [ ] **Step 5: Implement the bounded incident paths**
+
+Use existing `send_notification_with_results` and record its returned
+`NotificationAttempt` values. Build the incident notifier from the existing
+daily config with mandatory `macos` and one available `feishu` or `feishu_app`
+channel; fail readiness if no Feishu channel is configured.
+
+Remediation is one exact FOK request:
+
+- complete missing BUY: choose a cent-denominated protected spend whose signed
+  requested amount equals the proven missing quantity, then use
+  `amount=max_spend=that spend`, `max_price`, `FOK`
+- unwind filled SELL: `shares=quantity`, `min_price`, `FOK`
+
+Do not loop or fall through to the second option after an ambiguous first
+attempt.
+
+- [ ] **Step 6: Implement startup and manual reset**
+
+`reconcile_startup()` runs synchronously before the monitor can publish
+actionable opportunities. It records the current account snapshot and returns
+readiness. Old equal pairs may merge; old imbalances never cause a new
+directional order.
+
+`reset_breaker()` acknowledges rather than deletes. There is no CLI force flag
+or hidden override endpoint.
+
+- [ ] **Step 7: Run the complete execution and adapter tests**
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_polymarket_trading.py \
+  tests/test_prediction_arbitrage_execution.py -q
+```
+
+Expected: all tests pass.
+
+- [ ] **Step 8: Commit incident safety**
+
+```bash
+git add src/open_trader/polymarket_trading.py \
+  src/open_trader/prediction_arbitrage_execution.py \
+  tests/test_polymarket_trading.py \
+  tests/test_prediction_arbitrage_execution.py
+git diff --cached --check
+git commit -m "feat: contain prediction execution incidents"
+```
+
+---
+
+### Task 7: Add Local-Only Dashboard Services and Protected APIs
+
+**Files:**
+
+- Modify: `src/open_trader/dashboard.py`
+- Modify: `src/open_trader/dashboard_web.py`
+- Modify: `src/open_trader/cli.py`
+- Modify: `tests/test_dashboard_web.py`
+
+**HTTP contract:**
+
+```text
+GET  /api/prediction-arbitrage/state
+GET  /api/prediction-arbitrage/history?kind=signals|executions|incidents
+POST /api/prediction-arbitrage/preview
+POST /api/prediction-arbitrage/executions
+POST /api/prediction-arbitrage/circuit-breaker/reset
+```
+
+- [ ] **Step 1: Write failing service-lifecycle and GET tests**
+
+Inject store, monitor, execution service, and tokens into
+`create_dashboard_server`. Assert:
+
+- state includes readiness, masked wallet, policy limits, heartbeat, sorted
+  events, opportunities, current execution, breaker, and CSRF token
+- histories are separate and paginated; unknown kind is HTTP 400
+- missing/unready prediction configuration returns a schema-valid unavailable
+  state, not a server traceback
+- server startup calls `reconcile_startup` before `monitor.start`
+- shutdown calls `monitor.stop` and releases resources
+- production CLI rejects non-loopback `--host` when prediction config is
+  supplied
+- no prediction route merges data into `/api/dashboard`
+
+- [ ] **Step 2: Write failing mutation security tests**
+
+For each POST, prove HTTP 403 and zero service calls when any is wrong:
+
+- client address is non-loopback
+- `Host` differs from the actual loopback listener
+- `Origin` differs from `http://host:port`
+- HttpOnly `ot_prediction_session` cookie is missing/wrong
+- `X-CSRF-Token` is missing/wrong
+
+Then prove one valid same-origin request works. Also assert:
+
+- `SameSite=Strict`, `HttpOnly`, and `Path=/` on the random session cookie
+- request body maximum remains 1 MiB
+- preview accepts only `opportunity_id`
+- execution accepts only `preview_id` and `idempotency_key`
+- reset accepts only `incident_id`
+- any extra price/quantity/wallet/limit field returns HTTP 400
+- duplicate execution returns the existing durable execution
+
+- [ ] **Step 3: Run focused API tests and verify RED**
+
+```bash
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_dashboard_web.py -q -k prediction_arbitrage
+```
+
+Expected: routes return 404 or injected services are unsupported.
+
+- [ ] **Step 4: Add the minimum lifecycle wiring**
+
+Add `prediction_config_path: Path | None = None` to `DashboardConfig` and
+`--prediction-config` to `dashboard`.
+
+When configured, `serve_dashboard` creates:
+
+```python
+store = PredictionArbitrageStore(config.data_dir)
+trading = PolymarketTradingClient.from_keychain(load_trading_config(path))
+monitor = PolymarketMonitor(store=store, trading=trading)
+execution = PredictionExecutionService(...)
+execution.reconcile_startup()
+monitor.start()
+```
+
+Reuse existing daily config loading and notification construction. Do not add a
+sidecar process or task queue.
+
+- [ ] **Step 5: Add one process-random browser session**
+
+At server construction:
+
+```python
+session_token = secrets.token_urlsafe(32)
+csrf_token = secrets.token_urlsafe(32)
+```
+
+The state GET sets the session cookie and returns the CSRF token. Mutations
+compare using `secrets.compare_digest`, exact Host/Origin, and loopback client
+address before reading the body.
+
+- [ ] **Step 6: Run complete Dashboard web tests**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_dashboard_web.py -q
 ```
 
-Expected: all Dashboard web tests pass.
+Expected: all existing and prediction web tests pass.
 
-- [ ] **Step 5: Commit the API**
+- [ ] **Step 7: Commit the protected API**
 
 ```bash
-git add src/open_trader/dashboard_web.py tests/test_dashboard_web.py
+git add src/open_trader/dashboard.py src/open_trader/dashboard_web.py \
+  src/open_trader/cli.py tests/test_dashboard_web.py
 git diff --cached --check
-git commit -m "feat: serve prediction arbitrage status"
+git commit -m "feat: serve protected prediction execution APIs"
 ```
 
 ---
 
-### Task 8: Rebuild the Approved A UI in the Existing Dashboard
+### Task 8: Reproduce the Approved UI and Lock It with Golden Screenshots
 
 **Files:**
 
@@ -727,170 +1192,201 @@ git commit -m "feat: serve prediction arbitrage status"
 - Modify: `src/open_trader/dashboard_static/dashboard.js`
 - Modify: `src/open_trader/dashboard_static/dashboard.css`
 - Modify: `tests/test_dashboard_web.py`
-
-**Locked UI:** Prototype branch `prototype/prediction-market-ui`, commit
-`193fac7`, Variant A.
+- Modify: `tests/e2e/serve_dashboard_fixture.py`
+- Create: `tests/e2e/prediction-market.spec.ts`
+- Create: `tests/e2e/prediction-market.spec.ts-snapshots/*.png`
 
 - [ ] **Step 1: Add failing exact static-contract tests**
 
-Assert:
+Parse the production files and assert:
 
-- top buttons are exactly `持仓`, `预测市场`, `策略回测`, `凯利实验室` in
-  that order
-- `预测市场` has its own workspace mount
-- there is no bottom nav, mobile bottom nav, prototype controller, demo banner,
-  or prototype file in production
-- production contains the exact fee warning:
-  `费用待核验市场仍会监控，但不会产生正式信号`
-- required IDs/classes for summary cards, monitored list, current signals,
-  history, and history window controls exist exactly once
+- top navigation labels and order are exact
+- `预测市场` has one workspace
+- there is no bottom nav or prototype scenario selector
+- required readiness strip, summary, event list, opportunity, three histories,
+  confirmation modal, execution progress, incident detail, and reset modal
+  mounts exist exactly once
+- required visible policy values are `$50`, `$20`, `$2`, fee-free-only, and
+  possible real loss
+- every event template includes literal `24h 成交量`
+- browser private-key/API-secret input strings do not exist
 
-- [ ] **Step 2: Add failing JavaScript render-contract tests**
+- [ ] **Step 2: Add deterministic fixture routes**
 
-Use the existing Dashboard JavaScript test harness patterns in
-`tests/test_dashboard_web.py`. In one table-driven test provide deterministic
-API payloads for:
+Extend the existing fixture server with:
 
-- loading
-- healthy with a current signal
-- healthy with zero current signals
-- degraded with retained rows
-
-Assert:
-
-- exact state copy and visible sections
-- API event order is retained
-- each event contains visible `24h 成交量` plus its value
-- eligible rows say `可参与信号` and `最高预计净利润`
-- ineligible rows say `仅监控 · 费用待核验` and `毛利润上限`
-- missing profit displays `—`
-- an event expands to its market rows
-- current cards contain YES ask, NO ask, net edge, executable size, and expected
-  profit
-- `24 小时`, `7 天`, and `全部` request the matching API window
-- zero history has explicit Chinese copy
-- leaving the workspace stops only prediction polling; returning restarts it
-- selected portfolio market/broker state survives navigation
-
-- [ ] **Step 3: Run the new UI tests and verify RED**
-
-```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_dashboard_web.py -q -k prediction_market
+```text
+GET  /api/prediction-arbitrage/state?scenario=...
+GET  /api/prediction-arbitrage/history?kind=...
+POST /api/prediction-arbitrage/preview
+POST /api/prediction-arbitrage/executions
+POST /api/prediction-arbitrage/circuit-breaker/reset
 ```
 
-Expected: missing navigation/workspace/render functions.
+Support exact scenarios:
 
-- [ ] **Step 4: Modify the existing top navigation**
+```text
+loading
+ready
+quiet
+executing
+success
+incident
+degraded
+confirmation
+reset
+history-signals
+history-executions
+history-incidents
+```
 
-Reuse the current `strategy-tools` and `return-to-portfolio` click path:
+The fixture cannot import or call `PolymarketTradingClient`.
 
-- make `return-to-portfolio` the always-visible `持仓` top item
-- add `open-prediction-market`
-- keep existing strategy and Kelly buttons
-- use `aria-current="page"` and the existing active-button visual language
+- [ ] **Step 3: Write failing Playwright interaction tests**
 
-Add `prediction_market` to `WORKSPACE_VIEWS`. Do not introduce a router or
-client framework.
+For desktop and mobile:
 
-- [ ] **Step 5: Add the workspace state and polling**
+```typescript
+const viewports = [
+  { name: 'desktop', width: 1440, height: 1100 },
+  { name: 'mobile', width: 375, height: 812 },
+];
+```
 
-Add only:
+Assert:
+
+- exact top navigation and no bottom navigation
+- event DOM order equals actionable/profit/volume/ID order
+- every event visibly contains `24h 成交量` and its value
+- `参与` opens the exact confirmation modal
+- modal focus is trapped; Escape cancels; focus returns to invoker
+- one confirm sends one POST and disables every other action
+- success shows both legs, merge, realized result, and trade history
+- incident shows breaker, both leg outcomes, alert states, and reset control
+- denied reset remains locked; allowed reset returns ready
+- all three history tabs render exact empty/populated states
+- no horizontal overflow
+- all interactive mobile targets are at least `44x44`
+- no actionable console or HTTP errors
+
+- [ ] **Step 4: Run UI tests and verify RED**
+
+```bash
+OPEN_TRADER_PYTHON=/Users/ray/projects/open_trader/.venv/bin/python \
+  npx playwright test tests/e2e/prediction-market.spec.ts
+```
+
+Expected: missing workspace/selectors or screenshot failures.
+
+- [ ] **Step 5: Implement the approved production UI exactly**
+
+Port the layout and states from commit `e0d5083` into the existing three static
+files. Reuse existing warm-ledger tokens, `escapeHtml`, and workspace
+navigation. Add no framework, router, component library, chart library, or
+client state abstraction.
+
+Keep only this state:
 
 ```javascript
 predictionMarket: {
   payload: null,
+  historyKind: "signals",
   error: "",
-  historyWindow: "24h",
   pollId: null,
+  csrfToken: "",
+  activeExecutionId: "",
 }
 ```
 
-Fetch every five seconds only while the workspace is open. Before the first
-response render loading. On a later fetch failure retain the last payload and
-render degraded/stale.
+Poll only while the prediction workspace is open. Keep last-known rows and mark
+them stale on later fetch failure.
 
-- [ ] **Step 6: Recreate Variant A**
+- [ ] **Step 6: Generate the approved golden screenshots from `e0d5083`**
 
-Translate the approved prototype markup/CSS into production classes while
-reusing existing warm-ledger tokens and `escapeHtml`.
+Start the approved prototype at its worktree URL. Run the same Playwright test
+with `PREDICTION_UI_BASE_URL` pointing at the prototype and update snapshots:
 
-Desktop:
-
-```text
-monitored events | current signals
-                 | history
+```bash
+PREDICTION_UI_BASE_URL=http://127.0.0.1:8772/prediction-market-execution-prototype.html \
+  npx playwright test tests/e2e/prediction-market.spec.ts \
+  --update-snapshots
 ```
 
-At 760 px and below, stack in reading order. Keep the top navigation and allow
-it to wrap. No fixed or floating bottom controls.
+Before each prototype capture, the test injects CSS that hides only the
+prototype scenario selector. Commit 24 named images: 12 states times 2
+viewports. Record `e0d5083` in the test as the golden provenance.
 
-- [ ] **Step 7: Run the complete Dashboard static/web tests**
+- [ ] **Step 7: Compare production to the fixed goldens**
+
+Normal test execution targets the production fixture and uses:
+
+```typescript
+await expect(page).toHaveScreenshot(name, {
+  animations: 'disabled',
+  fullPage: true,
+  maxDiffPixelRatio: 0.001,
+});
+```
+
+In addition to the pixel threshold, exact DOM/copy/component assertions from
+Step 3 must pass so a small semantic change cannot hide inside the threshold.
+
+- [ ] **Step 8: Run static, browser, and accessibility checks**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_dashboard_web.py -q
+  tests/test_dashboard_web.py -q -k 'prediction or static'
+OPEN_TRADER_PYTHON=/Users/ray/projects/open_trader/.venv/bin/python \
+  npx playwright test tests/e2e/prediction-market.spec.ts
 ```
 
-Expected: all tests pass.
+Expected: all tests and all 24 golden comparisons pass.
 
-- [ ] **Step 8: Run a local browser comparison before continuing**
-
-Start a disposable Dashboard from the feature worktree on a non-production
-port with a temporary store containing the four deterministic states. Compare
-desktop 1440×1000 and mobile 375×844 against the approved prototype.
-
-Verify:
-
-- no horizontal overflow
-- no console or HTTP errors
-- 44 px mobile controls
-- event order and volume labels
-- all four state variants
-
-Do not run `make acceptance` yet.
-
-- [ ] **Step 9: Commit the locked UI**
+- [ ] **Step 9: Commit the exact UI**
 
 ```bash
 git add src/open_trader/dashboard_static/index.html \
   src/open_trader/dashboard_static/dashboard.js \
   src/open_trader/dashboard_static/dashboard.css \
-  tests/test_dashboard_web.py
+  tests/test_dashboard_web.py tests/e2e/serve_dashboard_fixture.py \
+  tests/e2e/prediction-market.spec.ts \
+  tests/e2e/prediction-market.spec.ts-snapshots
 git diff --cached --check
-git commit -m "feat: add prediction market dashboard"
+git commit -m "feat: add approved prediction execution UI"
 ```
 
 ---
 
-### Task 9: Install the Persistent AC-Awake Mac Watcher
+### Task 9: Keep the Accepted Dashboard Running on macOS
 
 **Files:**
 
+- Create: `ops/launchd/com.open-trader.dashboard.plist.template`
+- Create: `scripts/install_dashboard_launchd.sh`
+- Create: `scripts/uninstall_dashboard_launchd.sh`
 - Create: `tests/test_prediction_arbitrage_launchd.py`
-- Create: `ops/launchd/com.open-trader.prediction-arbitrage.plist.template`
-- Create: `scripts/install_prediction_arbitrage_launchd.sh`
-- Create: `scripts/uninstall_prediction_arbitrage_launchd.sh`
+- Modify: `src/open_trader/cli.py`
 
-- [ ] **Step 1: Write failing plist and dry-run installer tests**
+- [ ] **Step 1: Write failing plist and installer tests**
 
 Assert:
 
-- label is exactly `com.open-trader.prediction-arbitrage`
+- label is exactly `com.open-trader.dashboard`
 - `RunAtLoad` and `KeepAlive` are true
-- executable begins `/usr/bin/caffeinate -s`
-- Python is the repository-root `.venv/bin/python`
-- `PYTHONPATH` points at the selected worktree `src`
-- working directory is the selected worktree
-- data and logs use the shared repository root so history survives worktree
-  replacement
-- command is exactly `prediction-arb watch --data-dir ...`
-- no credential, wallet, notification, or order argument exists
-- dry-run writes no LaunchAgent and prints a parseable plist
-- install stops the old label before replacement, bootstraps the new plist,
-  kicks it, then waits for fresh healthy status
-- residual old labels or an unmatched watcher process fail closed
-- uninstall targets only the prediction label and plist
+- program begins `/usr/bin/caffeinate`, `-s`, then repository `.venv` Python
+- command is exactly `-m open_trader dashboard`
+- host is `127.0.0.1`, review port is `8766`
+- selected worktree is `WorkingDirectory` and `PYTHONPATH`
+- data/reports/config use shared repository paths
+- prediction config path is the ignored shared config
+- logs are
+  `logs/dashboard/launchd.out.log` and `logs/dashboard/launchd.err.log`
+- no secret appears in plist or environment
+- dry-run modifies no LaunchAgent and passes `plutil -lint`
+- install bootouts only the exact label, writes one plist, bootstraps,
+  kickstarts, and waits for HTTP/readiness
+- an occupied port from an unknown cwd fails without killing it
+- uninstall removes only the exact label/plist
 
 - [ ] **Step 2: Run launchd tests and verify RED**
 
@@ -899,180 +1395,211 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_prediction_arbitrage_launchd.py -q
 ```
 
-Expected: files are missing.
+Expected: files are absent.
 
-- [ ] **Step 3: Implement one small template and installer**
+- [ ] **Step 3: Implement the single Dashboard job**
 
-Resolve:
+Follow the existing launchd installer conventions for path resolution,
+XML/sed escaping, `plutil`, `launchctl bootout/bootstrap/kickstart`, and fresh
+status checks. Keep this installer separate from daily premarket jobs.
 
-```text
-worktree = git rev-parse --show-toplevel
-shared root = parent of git rev-parse --path-format=absolute --git-common-dir
-```
-
-Use explicit resolved paths in the rendered plist. Create logs under:
+Add `prediction-arb status` output with safe process/runtime facts:
 
 ```text
-logs/prediction_arbitrage/launchd.out.log
-logs/prediction_arbitrage/launchd.err.log
+health, pid, heartbeat_at, universe_refreshed_at, websocket,
+event_count, market_count, actionable_count, breaker, masked_wallet
 ```
 
-Poll status for at most 30 seconds. Do not reuse or extend the unrelated
-daily-premarket installer.
-
-- [ ] **Step 4: Run launchd tests and inspect dry-run output**
+- [ ] **Step 4: Run focused tests and inspect dry-run output**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_prediction_arbitrage_launchd.py -q
-scripts/install_prediction_arbitrage_launchd.sh --dry-run
+scripts/install_dashboard_launchd.sh --dry-run | plutil -lint -
 ```
 
-Expected: tests pass and `plutil -lint` accepts the rendered plist.
+Expected: tests pass and plist is valid.
 
-- [ ] **Step 5: Commit deployment files**
+- [ ] **Step 5: Commit macOS operation**
 
 ```bash
-git add ops/launchd/com.open-trader.prediction-arbitrage.plist.template \
-  scripts/install_prediction_arbitrage_launchd.sh \
-  scripts/uninstall_prediction_arbitrage_launchd.sh \
-  tests/test_prediction_arbitrage_launchd.py
+git add ops/launchd/com.open-trader.dashboard.plist.template \
+  scripts/install_dashboard_launchd.sh \
+  scripts/uninstall_dashboard_launchd.sh \
+  tests/test_prediction_arbitrage_launchd.py src/open_trader/cli.py
 git diff --cached --check
-git commit -m "feat: keep prediction watcher running on macOS"
+git commit -m "feat: keep prediction dashboard running"
 ```
 
 ---
 
-### Task 10: Make Exact UI and Live Watcher Checks Mandatory in Acceptance
+### Task 10: Enforce All 54 Scenarios in `make acceptance`
 
 **Files:**
 
-- Modify: `tests/test_dashboard_acceptance.py`
+- Create: `src/open_trader/prediction_arbitrage_acceptance.py`
+- Create: `acceptance/test_prediction_arbitrage_scenarios.py`
 - Modify: `src/open_trader/dashboard_acceptance.py`
+- Modify: `tests/test_dashboard_acceptance.py`
+- Modify: `Makefile`
 
-**New acceptance helpers:**
+**Fixed scenario registry:**
 
 ```python
-def validate_prediction_arbitrage_payload(
-    payload: Mapping[str, Any], *, now: datetime
-) -> list[str]: ...
-
-def _prediction_watcher_errors(
-    payload: Mapping[str, Any],
-    *,
-    expected_root: Path,
-    expected_sha: str,
-) -> list[str]: ...
-
-def _check_prediction_market(
-    page: Any,
-    payload: Mapping[str, Any],
-    *,
-    screenshot_path: Path,
-) -> None: ...
+SCENARIO_IDS = (
+    "MON-01", "MON-02", "MON-03", "MON-04", "MON-05",
+    "MON-06", "MON-07", "MON-08", "MON-09", "MON-10",
+    "PRE-01", "PRE-02", "PRE-03", "PRE-04", "PRE-05",
+    "PRE-06", "PRE-07", "PRE-08", "PRE-09",
+    "SEC-01", "SEC-02", "SEC-03", "SEC-04",
+    "EXE-01", "EXE-02", "EXE-03", "EXE-04", "EXE-05",
+    "EXE-06", "EXE-07", "EXE-08", "EXE-09", "EXE-10",
+    "REC-01", "REC-02", "REC-03", "REC-04", "REC-05",
+    "RST-01", "RST-02",
+    "HIS-01", "HIS-02", "HIS-03",
+    "UI-01", "UI-02", "UI-03", "UI-04", "UI-05",
+    "LIVE-01", "LIVE-02", "LIVE-03",
+    "OPS-01", "OPS-02", "OPS-03",
+)
 ```
 
-- [ ] **Step 1: Extend the screenshot matrix in a failing test**
+- [ ] **Step 1: Write a failing registry completeness test**
 
-Require these additional fresh non-empty screenshots:
+Parse Section 16 of the approved spec and assert the ordered IDs exactly equal
+`SCENARIO_IDS`, with length 54 and no duplicates. This prevents a scenario from
+silently disappearing from the gate.
+
+- [ ] **Step 2: Implement deterministic scenario tests**
+
+Create one pytest test per non-UI scenario under `acceptance/`. Add a
+`scenario_id` JUnit property and implement the exact precondition/action/UI or
+API result/backend evidence/forbidden behavior from the corresponding Section
+16 row.
+
+Map helpers as follows:
+
+| Scenario group | Controlled evidence |
+|---|---|
+| `MON-01`–`MON-10` | fake official public client + real monitor/store |
+| `PRE-01`–`PRE-09` | protected HTTP server + fake trading client |
+| `SEC-01`–`SEC-04` | real HTTP listener + sentinel secrets |
+| `EXE-01`–`EXE-10` | real state machine/store + controlled execution outcomes |
+| `REC-01`–`REC-05` | recreated service/store + controlled live account facts |
+| `RST-01`–`RST-02` | real reset service + fresh controlled reconciliation |
+| `HIS-01`–`HIS-03` | real SQLite restart and API/browser reads |
+| `LIVE-01`–`LIVE-03` | actual target services; skip reason begins `BLOCKED:` |
+| `OPS-01`–`OPS-03` | actual launchctl/PID/cwd/SHA/log/HTTP facts |
+
+Every deterministic test asserts both the required evidence and all “Forbidden
+behavior” assertions from the spec. Controlled execution methods count every
+external mutation.
+
+- [ ] **Step 3: Mark the five Playwright tests with UI IDs**
+
+Test titles are exactly:
 
 ```text
-wide_desktop-prediction-market.png
-desktop-prediction-market.png
-tablet-prediction-market.png
-mobile-prediction-market.png
+[UI-01] desktop prototype parity
+[UI-02] mobile prototype parity
+[UI-03] keyboard modal behavior
+[UI-04] status semantics
+[UI-05] cost disclosure
 ```
 
-Keep the existing 1920×1080, 1440×1000, 760×1000, and 375×844 viewport
-matrix.
+Each test includes its required golden comparisons and interactions from Task
+8.
 
-- [ ] **Step 2: Add failing payload/order validation tests**
+- [ ] **Step 4: Write the failing acceptance aggregator test**
 
-Cover:
+The runner:
 
-- schema, venue, runtime fields, summary/array agreement
-- heartbeat/PONG/universe freshness
-- PID, working directory, Git SHA, and live process
-- exact eligibility/profit/volume/ID sort rule
-- explicit profit kind for every event
-- visible volume fact available for every event
-- active/history signal shape and Decimal fields
-- fee-unverified market never appears in current/history formal signals
+1. executes the Python scenario file with JUnit XML output
+2. executes the one Playwright file with JSON reporter
+3. runs live Dashboard/process validation against `--url`
+4. maps pass/fail/skip to `PASS`/`FAIL`/`BLOCKED`
+5. prints every ID exactly once in registry order
 
-- [ ] **Step 3: Add failing browser-contract unit tests**
+Expected output format:
 
-Using fake page/locator objects where existing acceptance tests do, assert that
-the live browser check:
+```text
+SCENARIO MON-01 PASS loading state
+SCENARIO EXE-06 PASS unsafe remediation blocked
+SCENARIO LIVE-02 BLOCKED Keychain item unavailable
+SCENARIO UI-01 FAIL desktop golden mismatch
+```
 
-- clicks top `预测市场`
-- rejects any visible bottom navigation
-- compares all counts to API
-- compares DOM event IDs to API order
-- sees `24h 成交量` on every event
-- expands one event and sees its market rows
-- checks either real current/history rows or explicit zero states
-- clicks all three history windows
-- checks 44 px mobile targets
-- captures the prediction screenshot for every viewport
+Any missing/duplicate ID is `FAIL`. A `FAIL` dominates; otherwise a required
+`BLOCKED` makes the final result `BLOCKED`; only 54 `PASS` lines produce
+`PASS`.
 
-- [ ] **Step 4: Run focused acceptance tests and verify RED**
+- [ ] **Step 5: Run focused acceptance code and verify RED**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_dashboard_acceptance.py -q -k prediction
 ```
 
-Expected: missing constants/helpers.
+Expected: registry/runner helpers are missing.
 
-- [ ] **Step 5: Implement live API and process checks**
+- [ ] **Step 6: Extend the existing live Dashboard verifier**
 
-During acceptance:
+Add live checks for:
 
-1. fetch `/api/prediction-arbitrage?window=24h`
-2. validate payload and watcher process facts
-3. run `launchctl print gui/$UID/com.open-trader.prediction-arbitrage`
-4. inspect fresh watcher stdout/stderr from the current PID/start time
-5. call real Gamma top events
-6. call real CLOB `/books` for one monitored paired market
+- actual prediction state/history APIs
+- real top-20 data, volumes, paired book read, and WebSocket heartbeat
+- real Keychain retrieval and secret-clean no-submit signed pair
+- geoblock, balance, allowance, open orders, trades, positions, and relayer
+  readiness
+- no live POST/merge/approval during acceptance
+- prediction browser workspace and actual quiet/actionable/degraded semantics
+- launchd label, current PID, loopback bind, cwd, clean exact SHA, start time,
+  `caffeinate -s`, fresh logs, and heartbeat
 
-Classify public network/browser unavailability as `BLOCKED`. Classify stale,
-wrong-SHA, wrong-directory, missing-label, malformed-data, ordering, or UI
-problems as `FAIL`.
+External network, browser, Keychain, or account unavailability is `BLOCKED`.
+Wrong data, UI, process, SHA, cwd, logs, or security is `FAIL`.
 
-Zero current or historical signals is valid when the UI shows the exact zero
-state.
+- [ ] **Step 7: Wire the runner into the final Make target**
 
-- [ ] **Step 6: Implement the strict live browser check**
+Keep existing pytest, drawdown preflight, and Dashboard acceptance. Add before
+the existing Dashboard verifier:
 
-Call `_check_prediction_market` once in every existing viewport iteration.
-The live check must use the real watcher/API payload and must not inject a
-signal.
+```make
+cd "$(WORKTREE_ROOT)" && \
+  PYTHONPATH=src .venv/bin/python -m open_trader.prediction_arbitrage_acceptance \
+  --url "$(DASHBOARD_URL)" \
+  --expected-root "$(WORKTREE_ROOT)"
+```
 
-The pytest portion of `make acceptance` already runs the deterministic
-four-state UI tests from Task 8, so together the gate proves all states without
-pretending a live opportunity exists.
+The runner invokes only the dedicated acceptance scenario file and prediction
+Playwright file; normal `make test` remains unchanged.
 
-- [ ] **Step 7: Run focused acceptance and web tests**
+- [ ] **Step 8: Run all focused acceptance tests, not the final gate**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
-  tests/test_dashboard_acceptance.py tests/test_dashboard_web.py -q
+  tests/test_dashboard_acceptance.py \
+  tests/test_dashboard_web.py \
+  tests/test_prediction_arbitrage_execution.py -q
+OPEN_TRADER_PYTHON=/Users/ray/projects/open_trader/.venv/bin/python \
+  npx playwright test tests/e2e/prediction-market.spec.ts
 ```
 
-Expected: both files pass.
+Expected: selected tests and all goldens pass. Do not run `make acceptance`.
 
-- [ ] **Step 8: Commit the mandatory acceptance contract**
+- [ ] **Step 9: Commit the mandatory gate**
 
 ```bash
-git add src/open_trader/dashboard_acceptance.py \
-  tests/test_dashboard_acceptance.py
+git add src/open_trader/prediction_arbitrage_acceptance.py \
+  acceptance/test_prediction_arbitrage_scenarios.py \
+  src/open_trader/dashboard_acceptance.py \
+  tests/test_dashboard_acceptance.py Makefile
 git diff --cached --check
-git commit -m "test: require prediction dashboard acceptance"
+git commit -m "test: enforce prediction execution acceptance"
 ```
 
 ---
 
-### Task 11: Document, Deploy, and Run the Final Gate
+### Task 11: Document, Deploy, Run the Final Gate, and Hand Off
 
 **Files:**
 
@@ -1080,187 +1607,197 @@ git commit -m "test: require prediction dashboard acceptance"
 - Modify: `README.zh-CN.md`
 - Modify: `CHANGELOG.md`
 
-- [ ] **Step 1: Document operation and explicit non-goals**
+- [ ] **Step 1: Document setup, operation, risk, and cost**
 
-Document:
+Document exact commands for:
 
-- `prediction-arb watch|status`
+- hidden-input wallet setup/status
+- no-submit preflight
 - launchd install/uninstall
-- top-20 volume universe and five-minute refresh
-- WebSocket plus REST confirmation
-- fee-unverified monitoring-only policy
-- `$0.01` / `$1.00` thresholds
-- SQLite location and indefinite signal history
-- no wallet/orders/notifications
-- Polymarket V1; Kalshi and Predict.fun deferred
-- expected API/cloud cost `$0`
-- estimated incremental Mac electricity budget `¥2–4/month`
+- runtime status
+- UI preview/confirm/reset
+- top-20/5-minute monitoring
+- fee-free standard-binary scope
+- `$0.01`, `$1`, `$20`, `$50`, and `$2` policies
+- indefinite histories and SQLite location
+- local-only `127.0.0.1`
+- first-live-order pending status
+- no automated canary order
+- `$0` API/cloud expectation and `¥2–4/month` estimated electricity
+- possible slippage, remediation loss, and venue/merge risk
+- Kalshi/Predict.fun/cross-venue deferrals
 
-- [ ] **Step 2: Add the dated changelog entry before any merge**
+- [ ] **Step 2: Add the dated changelog entry before merge**
 
-Record:
+The 2026-07-26 entry records:
 
-- persistent Polymarket watcher
-- exact prediction Dashboard UI
-- formal fee-safe signal/history semantics
-- launchd/caffeinate deployment
-- strict acceptance coverage
+- persistent Polymarket monitor
+- exact approved UI
+- explicit two-step, one-request two-FOK execution
+- merge and bounded one-leg incident policy
+- Keychain/local-only security
+- durable signal/trade/incident history
+- launchd deployment and 54-scenario acceptance
 
 - [ ] **Step 3: Run all focused prediction tests**
 
 ```bash
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_prediction_arbitrage.py \
-  tests/test_polymarket_public.py \
-  tests/test_polymarket_stream.py \
+  tests/test_polymarket_trading.py \
   tests/test_prediction_arbitrage_store.py \
-  tests/test_prediction_arbitrage_watch.py \
-  tests/test_prediction_arbitrage_cli.py \
+  tests/test_polymarket_monitor.py \
+  tests/test_prediction_arbitrage_execution.py \
   tests/test_prediction_arbitrage_launchd.py \
   tests/test_dashboard_web.py \
   tests/test_dashboard_acceptance.py -q
 ```
 
-Expected: all selected tests pass.
+Expected: all selected tests pass. Record the exact count.
 
-- [ ] **Step 4: Run the full automated suite**
+- [ ] **Step 4: Run the complete automated suite**
 
-Make the ignored worktree-local virtualenv path point at the validated
-repository environment if it is absent:
+If the worktree-local ignored `.venv` path is absent, link it to the validated
+repository environment:
 
 ```bash
 test -e .venv || ln -s /Users/ray/projects/open_trader/.venv .venv
-```
-
-Then run:
-
-```bash
 make test
+OPEN_TRADER_PYTHON=/Users/ray/projects/open_trader/.venv/bin/python \
+  npm run test:e2e
 ```
 
-Expected: all tests pass. Record the exact count.
+Expected: all Python and browser tests pass.
 
-- [ ] **Step 5: Commit docs and ensure a clean candidate SHA**
+- [ ] **Step 5: Commit docs and create a clean candidate SHA**
 
 ```bash
 git add README.md README.zh-CN.md CHANGELOG.md
 git diff --cached --check
-git commit -m "docs: document prediction arbitrage monitor"
+git commit -m "docs: document prediction execution"
 git status --short
 git rev-parse HEAD
 ```
 
-Expected: clean status and one 40-character candidate SHA.
+Expected: clean worktree and one committed 40-character SHA.
 
-- [ ] **Step 6: Install the candidate watcher and verify the direct workflow**
+- [ ] **Step 6: Deploy the committed candidate**
 
 ```bash
-scripts/install_prediction_arbitrage_launchd.sh
+scripts/install_dashboard_launchd.sh
 PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python \
   -m open_trader prediction-arb status \
   --data-dir /Users/ray/projects/open_trader/data
 ```
 
-Inspect:
+Inspect directly:
 
 ```bash
-launchctl print "gui/$(id -u)/com.open-trader.prediction-arbitrage"
-ps -p <watcher-pid> -o pid=,ppid=,lstart=,command=
-lsof -a -p <watcher-pid> -d cwd -Fn
-tail -n 50 /Users/ray/projects/open_trader/logs/prediction_arbitrage/launchd.out.log
-tail -n 50 /Users/ray/projects/open_trader/logs/prediction_arbitrage/launchd.err.log
+launchctl print "gui/$(id -u)/com.open-trader.dashboard"
+lsof -nP -iTCP:8766 -sTCP:LISTEN
+ps -p "$(lsof -tiTCP:8766 -sTCP:LISTEN)" -o pid=,ppid=,lstart=,command=
+lsof -a -p "$(lsof -tiTCP:8766 -sTCP:LISTEN)" -d cwd -Fn
+tail -n 80 /Users/ray/projects/open_trader/logs/dashboard/launchd.out.log
+tail -n 80 /Users/ray/projects/open_trader/logs/dashboard/launchd.err.log
 ```
 
-Expected:
+Verify candidate PID, worktree cwd, exact candidate SHA, `caffeinate -s`,
+fresh startup reconciliation, real universe/books/heartbeat, loopback listener,
+and no fresh traceback/stderr.
 
-- new live PID
-- candidate worktree cwd
-- candidate Git SHA
-- fresh heartbeat/universe/PONG
-- real monitored events and books
-- no startup traceback or post-start stderr
-
-- [ ] **Step 7: Start the candidate Dashboard for review**
-
-Resolve and stop only the existing listener on review port `8766` after
-recording its PID/cwd. Start the feature-worktree Dashboard with
-`PYTHONPATH=<feature-worktree>/src`, repository-root Python, shared data, and a
-fresh log `/tmp/open_trader_dashboard_8766.log`.
-
-Verify HTTP 200:
+- [ ] **Step 7: Verify the candidate review endpoint**
 
 ```bash
-curl -fsS -o /dev/null -w '%{http_code}\n' \
-  http://127.0.0.1:8766/
-curl -fsS \
-  'http://127.0.0.1:8766/api/prediction-arbitrage?window=24h'
+curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
 ```
 
-- [ ] **Step 8: Run the final gate exactly once**
+Expected: `200`. Curl is only a direct workflow check, not a substitute for the
+browser phase.
 
-Confirm the ignored `.venv` symlink still resolves to the repository
-environment, then run:
+- [ ] **Step 8: Run the final gate**
 
 ```bash
 make acceptance
 ```
 
-Expected final line/result: `PASS`.
+Expected:
 
-On `FAIL`, fix the defect, rerun focused tests, redeploy the new committed SHA,
-and rerun `make acceptance`. On `BLOCKED`, report the unavailable browser or
-external service and do not substitute fixtures, mocks, curl-only checks, or
-screenshots.
+- exactly 54 `SCENARIO ... PASS` lines
+- existing automated/live/browser/process gates pass
+- final result `PASS`
+
+On `FAIL`, fix, run focused tests, commit, redeploy the new SHA, then rerun the
+gate. On `BLOCKED`, report the unavailable required environment and do not
+substitute mocks, fixtures, curl, or screenshots.
 
 - [ ] **Step 9: Redeploy the exact accepted SHA**
 
-Without changing source or data:
+Without modifying source or data:
 
-1. rerun the prediction launchd installer from the accepted worktree
-2. restart the Dashboard from the same accepted worktree
-3. verify new watcher and Dashboard PIDs
-4. verify both working directories and Git SHAs
-5. verify fresh watcher heartbeat/PONG/universe and fresh logs
-6. verify HTTP 200 for the Dashboard and prediction API
+```bash
+scripts/install_dashboard_launchd.sh
+```
+
+Then re-verify:
+
+- new PID
+- accepted worktree cwd
+- exact accepted Git SHA
+- fresh launchd/log start timestamp
+- fresh startup reconciliation and monitor heartbeat
+- loopback listener
+- HTTP 200
 
 This exact-SHA restart does not require a second acceptance run.
 
-- [ ] **Step 10: Hand off the review URL**
+- [ ] **Step 10: Hand off the deployed review URL**
 
-Only after `PASS` and exact-SHA redeployment, provide:
+Only after Step 9, provide:
 
 ```text
 http://127.0.0.1:8766/
 ```
 
-Ask the user to open `预测市场` and compare it with the approved A prototype.
-Do not describe the feature as merged until the user separately authorizes
-merge/integration.
+Ask the user to review `预测市场`. Do not say merged until the user separately
+authorizes integration into `main`.
 
 ---
 
 ## Self-Review Checklist
 
-Before execution begins, confirm the plan contains no unresolved placeholder:
+### Spec coverage
+
+- official SDK/Keychain/no-submit hard gate: Task 2
+- Decimal thresholds, limits, equal shares, ordering: Task 1
+- top-20/5-minute/WebSocket/paired REST/freshness: Task 4
+- indefinite signals/trades/incidents: Task 3
+- one preview, one confirmation, one two-leg batch: Tasks 5 and 7
+- both-rejected, both-filled, merge: Task 5
+- one-leg `$2` policy, alerts, breaker: Task 6
+- restart reconciliation and manual reset: Task 6
+- local-only session/CSRF/trust boundary: Task 7
+- exact approved UI and golden diff: Task 8
+- launchd/caffeinate Mac operation: Task 9
+- all 54 scenario lines and real non-mutating integration: Task 10
+- cost/risk/operator docs, changelog, exact-SHA deployment: Task 11
+
+### Placeholder scan
 
 ```bash
-rg -n "TODO|TBD|FIXME|<[^>]+>" \
+rg -n 'TODO|TBD|FIXME|implement later|fill in details|similar to Task' \
   docs/superpowers/plans/2026-07-26-prediction-market-arbitrage-monitor.md
 ```
 
-Expected: only intentional shell/document notation, no unresolved decision.
+Expected: no matches.
 
-Spec coverage:
+### Type consistency
 
-- continuous Mac runtime: Tasks 5, 9, 11
-- top-20 volume universe: Tasks 2, 5
-- WebSocket plus REST confirmation: Tasks 2, 3, 5
-- formal thresholds and fee fail-closed: Tasks 1, 2, 5
-- indefinite history: Task 4
-- exact approved A UI: Task 8
-- exact ordering and visible 24h volume: Tasks 1, 5, 8, 10
-- four UI states: Tasks 7, 8, 10
-- real process/data/browser acceptance: Tasks 10, 11
-- no execution/notification/authentication: all tasks and final docs
+- `PairIntent` is defined once in Task 1 and consumed unchanged by Tasks 2,
+  4, 5, and 6.
+- `PolymarketTradingClient` is the only official secure-client boundary.
+- `PredictionArbitrageStore` owns all durable state.
+- `PolymarketMonitor` owns only public monitoring/current opportunity state.
+- `PredictionExecutionService` owns all mutations and breaker policy.
+- Browser POSTs contain only opaque server IDs and application idempotency key.
 
 No production implementation begins until the user selects an execution mode.
