@@ -1404,16 +1404,13 @@ table {
 
 .trend-review-header h1,
 .trend-review-header p,
-.trend-review-parameters h2,
-.trend-review-parameter-list p,
 .trend-review-comparison,
 .trend-review-metric h3 {
   margin: 0;
 }
 
 .trend-review-header p,
-.trend-review-header span,
-.trend-review-parameter-list span {
+.trend-review-header span {
   color: var(--muted);
 }
 
@@ -1424,7 +1421,6 @@ table {
 
 .trend-review-header > div:first-child > *,
 .trend-review-header-side > *,
-.trend-review-parameter-list > div > *,
 .trend-review-comparison figcaption,
 .trend-review-metric h3,
 .trend-review-series > span:first-child,
@@ -1444,32 +1440,9 @@ table {
   margin: 4px 0;
 }
 
-.trend-review-parameters {
-  display: grid;
-  gap: 10px;
-}
-
-.trend-review-parameters h2,
 .trend-review-comparison figcaption {
   font-size: 17px;
   font-weight: 700;
-}
-
-.trend-review-parameter-list {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.trend-review-parameter-list > div {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: 120px 160px minmax(0, 1fr);
-  padding: 10px 12px;
-}
-
-.trend-review-parameter-list > div + div {
-  border-top: 1px solid var(--line);
 }
 
 .trend-review-comparisons {
@@ -4834,7 +4807,6 @@ table {
   }
 
   .trend-review-header,
-  .trend-review-parameter-list > div,
   .trend-review-comparisons {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -4846,10 +4818,6 @@ table {
   .trend-review-header-side button {
     min-height: 44px;
     width: 100%;
-  }
-
-  .trend-review-parameter-list > div {
-    gap: 4px;
   }
 
   .trend-report-body { grid-template-columns: minmax(0, 1fr); }

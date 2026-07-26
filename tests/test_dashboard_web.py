@@ -4650,13 +4650,20 @@ for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘
 }
 if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");
 const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);
-for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","第 1 版","当前策略参数",
-  "仓位执行","持仓上限","10 笔","退出保护","初始保护线","成交均价减 2.0 倍 ATR14",
+for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","第 1 版",
   "纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17",
   "纪律模拟与市场","实际执行与市场","期间净收益率","相对市场超额收益","最大回撤",
   "卡玛比率","夏普比率","同期市场",
   "12.6%","1.42","实际执行日终净值缺失"]) {
   if (!html.includes(text)) throw new Error(text+"\n"+html);
+}
+for (const forbidden of [
+  "当前策略参数",
+  "trend-review-parameters",
+  "trend-review-parameter-list",
+  "trend-review-parameter-table",
+]) {
+  if (html.includes(forbidden)) throw new Error(forbidden+"\n"+html);
 }
 if ((html.match(/class="trend-review-header-side"/g)||[]).length!==1) throw new Error(html);
 const side=html.match(/<div class="trend-review-header-side">([\s\S]*?)<\/div>/)?.[1]||"";
@@ -4678,6 +4685,8 @@ console.log("ok");
 ''')
 
     assert "ok" in output
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".trend-review-parameter" not in css
 
 
 def test_dashboard_renders_action_first_trend_report_for_every_market() -> None:

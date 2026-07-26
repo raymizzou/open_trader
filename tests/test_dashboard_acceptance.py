@@ -1918,45 +1918,6 @@ def test_acceptance_allows_spaced_a_share_market_name() -> None:
     )
 
 
-def test_acceptance_allows_raw_parameter_facts_with_english_abbreviations() -> None:
-    payload = valid_payload()
-    review = payload["trend_reviews"]["tiger"]
-    review["strategy_snapshot"]["parameter_rows"][0]["value"] = (  # type: ignore[index]
-        "ETF / ST / ATR14 / trend/US/v1 原始参数事实"
-    )
-    page = tabbed_account_page(payload)
-    section = dashboard_acceptance._select_account_tab(page, "tiger")
-
-    dashboard_acceptance._check_trend_review(page, section, "tiger", review)
-
-
-@pytest.mark.parametrize("forbidden", ("Backtest", "Alpha", "复盘结论"))
-def test_acceptance_rejects_forbidden_text_inside_raw_parameter_values(
-    forbidden: str,
-) -> None:
-    payload = valid_payload()
-    review = payload["trend_reviews"]["tiger"]
-    review["strategy_snapshot"]["parameter_rows"][0]["value"] = (  # type: ignore[index]
-        f"原始参数事实 {forbidden}"
-    )
-    page = tabbed_account_page(payload)
-    section = dashboard_acceptance._select_account_tab(page, "tiger")
-
-    with pytest.raises(AssertionError, match=forbidden):
-        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
-
-
-def test_acceptance_rejects_english_parameter_group_or_name() -> None:
-    payload = valid_payload()
-    review = payload["trend_reviews"]["tiger"]
-    review["strategy_snapshot"]["parameter_rows"][0]["group"] = "Ready"  # type: ignore[index]
-    page = tabbed_account_page(payload)
-    section = dashboard_acceptance._select_account_tab(page, "tiger")
-
-    with pytest.raises(AssertionError, match="拉丁界面词"):
-        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
-
-
 def test_acceptance_rejects_375_trend_review_overflow() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -2169,8 +2130,6 @@ def trend_review_workspace_text(broker: str) -> str:
         f"{review['market_label']}趋势复盘 {snapshot['strategy_name']}｜第 1 版 "
         "返回持仓看板 纪律模拟 31 笔 实际执行 29 / 30，数据不足 "
         "共同截止日 2026-07-17 "
-        "当前策略参数 仓位执行 持仓上限 10 笔 "
-        "退出保护 初始保护线 成交均价减 2.0 倍 ATR14 "
         "纪律模拟与市场 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
         "实际执行与市场 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
         "纪律模拟 实际执行 同期市场"
@@ -2528,6 +2487,8 @@ class TabbedAccountLocator:
             return int(self.page.trend_kind == "review")
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
             return 4 if self.page.trend_kind == "review" else 0
+        if self.selector == "#trend-report-workspace:visible .trend-review-parameters":
+            return 0
         if self.selector == "#trend-report-workspace:visible .trend-review-comparison":
             return 2 if self.page.trend_kind == "review" else 0
         match = re.fullmatch(
@@ -2547,11 +2508,6 @@ class TabbedAccountLocator:
                 return 2
         if self.selector == "#trend-report-workspace:visible .trend-review-chart":
             return 0
-        if self.selector == "#trend-report-workspace:visible .trend-review-parameter-table > div":
-            review = self.page.reviews.get(str(self.page.trend_broker), {})
-            snapshot = review.get("strategy_snapshot", {})
-            rows = snapshot.get("parameter_rows", []) if isinstance(snapshot, dict) else []
-            return len(rows) if self.page.trend_kind == "review" else 0
         if self.selector == ".workspace-grid:visible":
             return int(self.page.trend_broker is None)
         if self.selector == "#trend-report-workspace:visible .cn-trend-report":
@@ -2743,11 +2699,7 @@ class TabbedAccountLocator:
         if self.selector == "#trend-report-workspace:visible":
             if self.page.trend_kind == "review":
                 broker = str(self.page.trend_broker)
-                rows = self.page.reviews[broker]["strategy_snapshot"]["parameter_rows"]
-                return " ".join([
-                    trend_review_workspace_text(broker),
-                    *(str(row["value"]) for row in rows),
-                ])
+                return trend_review_workspace_text(broker)
             broker = str(self.page.trend_broker)
             return self.page.workspace_texts[broker]
         if self.selector == "#trend-report-workspace:visible .trend-controller-status":
@@ -2894,9 +2846,6 @@ class TabbedAccountLocator:
         if self.selector == "a:visible, button:visible":
             return ["刷新账户与行情", "策略回测"]
         broker = str(self.page.trend_broker)
-        if self.selector == "#trend-report-workspace:visible .trend-review-parameter-table > div":
-            rows = self.page.reviews[broker]["strategy_snapshot"]["parameter_rows"]
-            return [f"{row['group']} {row['name']} {row['value']}" for row in rows]
         if self.selector == "#trend-report-workspace:visible .trend-review-header > div:first-child > *":
             if self.page.review_header_left_texts is not None:
                 return self.page.review_header_left_texts
@@ -2912,15 +2861,6 @@ class TabbedAccountLocator:
                 "返回持仓看板", "纪律模拟 31 笔",
                 "实际执行 29 / 30，数据不足", "共同截止日 2026-07-17",
             ]
-        parameter_selectors = {
-            "#trend-report-workspace:visible .trend-review-parameter-list > div > span": "group",
-            "#trend-report-workspace:visible .trend-review-parameter-list > div > strong": "name",
-            "#trend-report-workspace:visible .trend-review-parameter-list > div > p": "value",
-        }
-        if self.selector in parameter_selectors:
-            rows = self.page.reviews[broker]["strategy_snapshot"]["parameter_rows"]
-            key = parameter_selectors[self.selector]
-            return [str(row[key]) for row in rows]
         if self.selector == "#trend-report-workspace:visible .trend-review-comparison figcaption":
             return ["纪律模拟与市场", "实际执行与市场"]
         if self.selector == "#trend-report-workspace:visible .trend-review-series strong":
@@ -3271,12 +3211,10 @@ class TabbedAccountPage:
                 "documentWidth: document.documentElement.scrollWidth",
                 ".trend-review-header > div:first-child > *",
                 ".trend-review-header-side > *",
-                ".trend-review-parameter-list > div > *",
                 ".trend-review-comparison figcaption",
                 ".trend-review-metric h3",
                 ".trend-review-series > span:first-child",
                 ".trend-review-series strong",
-                ".trend-review-parameter-list > div",
                 ".trend-review-comparison",
                 "querySelectorAll", "querySelector", "getBoundingClientRect",
                 "getComputedStyle", "clientWidth", "scrollWidth",
@@ -3286,23 +3224,11 @@ class TabbedAccountPage:
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review geometry fake 缺少真实表达式：{missing}"
             self.review_geometry_checks.append(self.trend_broker)
-            mobile = self.viewport_size["width"] == 375
             narrow = self.viewport_size["width"] <= 760
             panel_width = self.viewport_size["width"] - 28 if narrow else 680
-            review = self.reviews[str(self.trend_broker)]
-            parameter_count = len(review["strategy_snapshot"]["parameter_rows"])
-            parameter_rows = [
-                [
-                    {"x": 26, "y": 340, "width": 323, "height": 20},
-                    {"x": 26, "y": 364 if mobile else 340, "width": 323, "height": 20},
-                    {"x": 26, "y": 388 if mobile else 340, "width": 323, "height": 40},
-                ]
-                for _row in range(parameter_count)
-            ]
             text_counts = (
                 (".trend-review-header > div:first-child > *", 3),
                 (".trend-review-header-side > *", 4),
-                (".trend-review-parameter-list > div > *", parameter_count * 3),
                 (".trend-review-comparison figcaption", 2),
                 (".trend-review-metric h3", 10),
                 (".trend-review-series > span:first-child", 20),
@@ -3338,7 +3264,6 @@ class TabbedAccountPage:
                     {"x": 14, "y": 228, "width": 347, "height": 20},
                 ],
                 "button": {"x": 14, "y": 120, "width": 347, "height": 44},
-                "parameterRows": parameter_rows,
                 "panels": [
                     {"x": 14, "y": 460, "width": panel_width, "height": 600},
                     {"x": 14 if narrow else 706, "y": 1072 if narrow else 460, "width": panel_width, "height": 600},

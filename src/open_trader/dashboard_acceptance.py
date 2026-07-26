@@ -3043,9 +3043,7 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
     )
 
 
-def _check_trend_review_geometry(
-    page: Any, broker: str, *, parameter_count: int
-) -> None:
+def _check_trend_review_geometry(page: Any, broker: str) -> None:
     geometry = page.evaluate(
         r"""() => { // trend-review-geometry-contract
         const workspace = document.querySelector("#trend-report-workspace");
@@ -3057,7 +3055,6 @@ def _check_trend_review_geometry(
         const textSelectors = [
           ".trend-review-header > div:first-child > *",
           ".trend-review-header-side > *",
-          ".trend-review-parameter-list > div > *",
           ".trend-review-comparison figcaption",
           ".trend-review-metric h3",
           ".trend-review-series > span:first-child",
@@ -3067,9 +3064,6 @@ def _check_trend_review_geometry(
           documentWidth: document.documentElement.scrollWidth,
           side: rect(side), sideItems: [...side.children].map(rect),
           button: rect(side.querySelector("button")),
-          parameterRows: [...workspace.querySelectorAll(
-            ".trend-review-parameter-list > div"
-          )].map(row => [...row.children].map(rect)),
           panels: [...workspace.querySelectorAll(".trend-review-comparison")].map(rect),
           textGroups: textSelectors.map(selector => ({
             selector,
@@ -3121,24 +3115,12 @@ def _check_trend_review_geometry(
         later["y"] >= earlier["y"] + earlier["height"]
         for earlier, later in zip(side_items, side_items[1:])
     ), f"{broker} 趋势复盘 375px header side 未单列显示"
-    parameter_rows = geometry.get("parameterRows")
-    assert isinstance(parameter_rows, list) and len(parameter_rows) == parameter_count, (
-        f"{broker} 趋势复盘 375px 参数行几何数量不正确"
-    )
-    assert all(
-        isinstance(row, list) and len(row) == 3 and all(
-            later["y"] >= earlier["y"] + earlier["height"]
-            for earlier, later in zip(row, row[1:])
-        )
-        for row in parameter_rows
-    ), f"{broker} 趋势复盘 375px 参数行未纵向显示"
     assert panels[1]["y"] >= panels[0]["y"] + panels[0]["height"], (
         f"{broker} 趋势复盘 375px panel 未纵向显示"
     )
     expected_text_counts = {
         ".trend-review-header > div:first-child > *": 3,
         ".trend-review-header-side > *": 4,
-        ".trend-review-parameter-list > div > *": parameter_count * 3,
         ".trend-review-comparison figcaption": 2,
         ".trend-review-metric h3": 10,
         ".trend-review-series > span:first-child": 20,
@@ -3385,7 +3367,6 @@ def _check_trend_review(
         _plain(review.get("broker_label")),
         _plain(snapshot.get("strategy_name")),
         _trend_review_strategy_version(snapshot.get("strategy_version")),
-        "当前策略参数",
         *header_items,
         *(title for _series, _label, title in TREND_REVIEW_COMPARISONS),
         "同期市场",
@@ -3401,37 +3382,8 @@ def _check_trend_review(
     assert rendered_header_side == header_items, (
         f"{broker} 趋势复盘 header side 顺序或文字错误"
     )
-    parameters = snapshot.get("parameter_rows")
-    assert isinstance(parameters, list) and parameters, f"{broker} 策略参数为空"
-    parameter_rows = workspace.locator(
-        ".trend-review-parameter-table > div"
-    ).all_inner_texts()
-    assert len(parameter_rows) == len(parameters), f"{broker} 策略参数没有完整展示"
-    for rendered, row in zip(parameter_rows, parameters, strict=True):
-        assert isinstance(row, Mapping), f"{broker} 策略参数格式无效"
-        for key in ("group", "name", "value"):
-            assert _plain(row.get(key)) in rendered, f"{broker} 策略参数缺少 {key}"
-    parameter_groups = workspace.locator(
-        ".trend-review-parameter-list > div > span"
-    ).all_inner_texts()
-    parameter_names = workspace.locator(
-        ".trend-review-parameter-list > div > strong"
-    ).all_inner_texts()
-    parameter_values = workspace.locator(
-        ".trend-review-parameter-list > div > p"
-    ).all_inner_texts()
-    assert parameter_groups == [_plain(row.get("group")) for row in parameters], (
-        f"{broker} 策略参数分组顺序或文字错误"
-    )
-    assert parameter_names == [_plain(row.get("name")) for row in parameters], (
-        f"{broker} 策略参数名称顺序或文字错误"
-    )
-    assert parameter_values == [_plain(row.get("value")) for row in parameters], (
-        f"{broker} 策略参数值顺序或文字错误"
-    )
-    _assert_no_trend_review_latin(parameter_groups, broker, "参数分组")
-    _assert_no_trend_review_latin(
-        parameter_names, broker, "参数名称", allow_atr=True
+    assert workspace.locator(".trend-review-parameters").count() == 0, (
+        f"{broker} 趋势复盘仍重复展示当前策略参数"
     )
     assert workspace.locator(".trend-review-comparison").count() == 2, (
         f"{broker} 趋势复盘比较 panel 数量不是 2"
@@ -3492,7 +3444,7 @@ def _check_trend_review(
     ).all_inner_texts()
     assert len(metric_values) == 20, f"{broker} 趋势复盘指标值数量不是 20"
     _assert_no_trend_review_latin(
-        [*header_items, "当前策略参数", *comparison_titles, *metric_labels,
+        [*header_items, *comparison_titles, *metric_labels,
          *series_labels, *metric_values],
         broker,
         "可见界面",
@@ -3503,7 +3455,7 @@ def _check_trend_review(
     ):
         assert forbidden not in text, f"{broker} 趋势复盘包含未要求内容 {forbidden}"
     _check_trend_review_visual_contract(page, broker)
-    _check_trend_review_geometry(page, broker, parameter_count=len(parameters))
+    _check_trend_review_geometry(page, broker)
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
     if width <= 760:
         assert page.evaluate(
