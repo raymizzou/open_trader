@@ -7,6 +7,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from .notifications import Notifier
@@ -45,6 +46,13 @@ class DrawdownMarketInput:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class FrozenBaselineLookup:
+    status: Literal["available", "missing", "invalid"]
+    equity: Decimal | None = None
+    error: str = ""
+
+
 def market_preflight_dates(
     market: str, *, now: datetime, trading_days: list[str]
 ) -> tuple[str, str]:
@@ -76,6 +84,82 @@ def market_preflight_dates(
     return completed[-1].isoformat(), eligible[0].isoformat()
 
 
+def load_frozen_baseline(
+    reports_dir: Path,
+    *,
+    market: str,
+    strategy_id: str,
+    strategy_version: str,
+    source_date: str,
+) -> FrozenBaselineLookup:
+    directory = reports_dir / REPORT_DIRECTORIES[market]
+    candidates = [
+        path
+        for path in (
+            directory / f"{source_date}.json",
+            *directory.glob(f"{source_date}-r*.json"),
+        )
+        if path.is_file()
+    ]
+    if not candidates:
+        return FrozenBaselineLookup(status="missing")
+    for path in sorted(candidates, reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"unreadable frozen drawdown baseline: {path}",
+            )
+        if not isinstance(payload, dict):
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
+        metadata = payload.get("metadata")
+        strategy = payload.get("strategy_snapshot")
+        if not (
+            isinstance(metadata, dict)
+            and str(metadata.get("market") or "").upper() == market
+            and isinstance(strategy, dict)
+        ):
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
+        if (
+            strategy.get("strategy_id") != strategy_id
+            or strategy.get("strategy_version") != strategy_version
+        ):
+            continue
+        account = payload.get("account")
+        drawdown = payload.get("drawdown_summary")
+        if not (
+            isinstance(account, dict)
+            and account.get("source_date") == source_date
+            and isinstance(drawdown, dict)
+            and drawdown.get("state_status") == "missing"
+        ):
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
+        try:
+            equity = Decimal(str(account.get("net_value")))
+        except Exception:
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
+        if equity.is_finite() and equity > 0:
+            return FrozenBaselineLookup(status="available", equity=equity)
+        return FrozenBaselineLookup(
+            status="invalid",
+            error=f"invalid frozen drawdown baseline: {path}",
+        )
+    return FrozenBaselineLookup(status="missing")
+
+
 def frozen_missing_baseline(
     reports_dir: Path,
     *,
@@ -84,37 +168,14 @@ def frozen_missing_baseline(
     strategy_version: str,
     source_date: str,
 ) -> Decimal | None:
-    directory = REPORT_DIRECTORIES[market]
-    for path in sorted((reports_dir / directory).glob("*.json"), reverse=True):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        metadata = payload.get("metadata")
-        strategy = payload.get("strategy_snapshot")
-        account = payload.get("account")
-        drawdown = payload.get("drawdown_summary")
-        if not (
-            isinstance(metadata, dict)
-            and str(metadata.get("market") or "").upper() == market
-            and isinstance(strategy, dict)
-            and strategy.get("strategy_id") == strategy_id
-            and strategy.get("strategy_version") == strategy_version
-            and isinstance(account, dict)
-            and account.get("source_date") == source_date
-            and isinstance(drawdown, dict)
-            and drawdown.get("state_status") == "missing"
-        ):
-            continue
-        try:
-            equity = Decimal(str(account.get("net_value")))
-        except Exception:
-            continue
-        if equity.is_finite() and equity > 0:
-            return equity
-    return None
+    result = load_frozen_baseline(
+        reports_dir,
+        market=market,
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        source_date=source_date,
+    )
+    return result.equity if result.status == "available" else None
 
 
 def run_drawdown_preflight(

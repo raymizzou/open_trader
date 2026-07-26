@@ -7,9 +7,11 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
+import open_trader.drawdown_preflight as drawdown_preflight
 from open_trader.drawdown_preflight import (
     DrawdownMarketInput,
-    frozen_missing_baseline,
     market_preflight_dates,
     run_drawdown_preflight,
 )
@@ -375,7 +377,7 @@ def test_market_preflight_dates_move_late_bootstrap_to_next_session() -> None:
     ) == ("2026-07-17", "2026-07-20")
 
 
-def test_frozen_missing_report_supplies_original_account_baseline(
+def test_load_frozen_baseline_returns_original_account_equity(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "reports/trend_us_tiger/2026-07-17-r2.json"
@@ -395,13 +397,89 @@ def test_frozen_missing_report_supplies_original_account_baseline(
         encoding="utf-8",
     )
 
-    assert frozen_missing_baseline(
+    assert drawdown_preflight.load_frozen_baseline(
         tmp_path / "reports",
         market="US",
         strategy_id="trend_animals_warm_to_hot/US/v4",
         strategy_version="v4",
         source_date="2026-07-17",
-    ) == Decimal("123.45")
+    ) == drawdown_preflight.FrozenBaselineLookup(
+        status="available",
+        equity=Decimal("123.45"),
+    )
+
+
+def test_load_frozen_baseline_reports_missing_current_strategy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reports/trend_us_tiger/2026-07-17.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "metadata": {"market": "US"},
+            "strategy_snapshot": {
+                "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                "strategy_version": "v4",
+            },
+            "account": {"source_date": "2026-07-17", "net_value": "123.45"},
+            "drawdown_summary": {"state_status": "ok"},
+        }),
+        encoding="utf-8",
+    )
+
+    result = drawdown_preflight.load_frozen_baseline(
+        tmp_path / "reports",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v5",
+        strategy_version="v5",
+        source_date="2026-07-17",
+    )
+
+    assert result.status == "missing"
+    assert result.equity is None
+    assert result.error == ""
+
+
+@pytest.mark.parametrize(
+    ("content", "error_text"),
+    [
+        ("{", "unreadable frozen drawdown baseline"),
+        (
+            json.dumps({
+                "metadata": {"market": "US"},
+                "strategy_snapshot": {
+                    "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                    "strategy_version": "v4",
+                },
+                "account": {
+                    "source_date": "2026-07-17",
+                    "net_value": "not-a-number",
+                },
+                "drawdown_summary": {"state_status": "missing"},
+            }),
+            "invalid frozen drawdown baseline",
+        ),
+    ],
+)
+def test_load_frozen_baseline_rejects_invalid_completed_date_artifacts(
+    tmp_path: Path,
+    content: str,
+    error_text: str,
+) -> None:
+    path = tmp_path / "reports/trend_us_tiger/2026-07-17.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(content, encoding="utf-8")
+
+    result = drawdown_preflight.load_frozen_baseline(
+        tmp_path / "reports",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        source_date="2026-07-17",
+    )
+
+    assert result.status == "invalid"
+    assert error_text in result.error
 
 
 def test_failure_alert_is_deduplicated_and_rearmed_after_recovery(
