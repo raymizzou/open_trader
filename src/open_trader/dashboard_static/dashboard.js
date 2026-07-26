@@ -2872,7 +2872,7 @@ function renderCnTrendAudit(audit, report = {}) {
     + "</p></details>";
 }
 
-function renderCnTrendReportWorkspace(report, embedded = false, historical = false) {
+function renderCnTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {
   const counts = report.counts || {};
   const audit = report.audit || {};
   const isCn = String(report.market || "").toUpperCase() === "CN";
@@ -2936,6 +2936,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${riskSummary}
     ${renderTrendControllerStatus(report.broker)}
     ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
+    ${trailingContent}
   </${root}>`;
 }
 
@@ -3059,10 +3060,10 @@ function renderOptionAttentionWorkspace(report) {
   </main>`;
 }
 
-function renderTrendReportWorkspace(report, embedded = false, historical = false) {
+function renderTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {
   return String(report && report.broker || "").toLowerCase() === "futu"
     ? renderOptionAttentionWorkspace(report || {})
-    : renderCnTrendReportWorkspace(report || {}, embedded, historical);
+    : renderCnTrendReportWorkspace(report || {}, embedded, historical, trailingContent);
 }
 
 function renderHeaderSummary() {
@@ -3491,7 +3492,7 @@ function renderEmbeddedTrendReport(broker) {
   const reviewPanel = !review ? "" : review.available
     ? `<details class="trend-audit trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(`${formatTrendReviewSampleCount(review, "discipline", "纪律模拟")} · ${formatTrendReviewSampleCount(review, "actual", "实际执行")}`)}</span></summary>${renderTrendReviewWorkspace(review, true)}</details>`
     : `<details class="trend-audit trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span></summary><p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p></details>`;
-  if (report.available) return `${renderTrendReportWorkspace(report, true)}${reviewPanel}`;
+  if (report.available) return renderTrendReportWorkspace(report, true, false, reviewPanel);
   const statusClass = report.execution_batch_blocking === true
     ? "trend-execution-batch-error"
     : "account-empty";

@@ -2368,16 +2368,14 @@ table {
 }
 
 .cn-trend-report > .trend-audit,
-.cn-trend-report > .cn-trend-audit,
-.trend-review-disclosure {
+.cn-trend-report > .cn-trend-audit {
   border-left: 3px solid var(--muted);
   border-radius: 0;
   padding: 0 12px 10px;
 }
 
 .cn-trend-report > .trend-audit > summary,
-.cn-trend-report > .cn-trend-audit > summary,
-.trend-audit.trend-review-disclosure > summary {
+.cn-trend-report > .cn-trend-audit > summary {
   min-height: 48px;
   padding: 9px 0;
 }

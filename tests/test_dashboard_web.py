@@ -4470,6 +4470,7 @@ window.fetch=async (input)=>{{
         review_disclosure = section.locator("details.trend-review-disclosure")
         assert review_disclosure.count() == 1
         assert review_disclosure.get_attribute("class") == "trend-audit trend-review-disclosure"
+        assert review_disclosure.evaluate("node => node.parentElement.className") == "cn-trend-report"
         assert review_disclosure.get_attribute("open") is None
         assert review_disclosure.locator(":scope > summary > small").count() == 0
         audit_summary = section.locator(
