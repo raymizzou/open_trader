@@ -3,6 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-26
+
+- Allowed Dashboard acceptance to skip only a genuinely absent completed-date
+  frozen drawdown baseline while preserving visible market-level evidence;
+  Futu/calendar outages still block, malformed baseline artifacts still fail,
+  and runtime entry protection remains fail-closed.
+
 ## 2026-07-25
 
 - Expanded trend selection to mainland-China, US, and Hong Kong ETFs: CN v9
