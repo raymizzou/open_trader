@@ -501,3 +501,18 @@ def test_notification_failure_does_not_change_fail_closed_result(
     assert result["status"] == "failed"
     assert len(notifier.calls) == 1
     assert not (tmp_path / "data/trend_drawdown/alerts.json").exists()
+
+
+def test_null_notifier_does_not_record_alert_delivery(
+    tmp_path: Path,
+) -> None:
+    result = run_preflight(
+        tmp_path,
+        {
+            market: replace(market_input(market), baseline_equity=None)
+            for market in ("CN", "HK", "US")
+        },
+    )
+
+    assert result["status"] == "failed"
+    assert not (tmp_path / "data/trend_drawdown/alerts.json").exists()

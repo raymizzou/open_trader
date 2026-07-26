@@ -14,6 +14,7 @@
 - Add no dependency, environment variable, CLI flag, retry queue, timer, central notification service, or notifier abstraction.
 - Preserve all drawdown calculations, state inheritance, fail-closed entry blocking, sell/protection behavior, command exit codes, and Dashboard data.
 - `actor=acceptance` must suppress all external notification channels while retaining real preflight reads, legal state writes, logs, and exit status.
+- The acceptance `NullNotifier` must not create or clear the notification delivery ledger, so a silent run cannot suppress a later real alert.
 - Non-acceptance actors must retain configured notification delivery.
 - One preflight run may send at most one drawdown failure notification, while the ledger continues to track each `market|strategy_version|failure_status` key independently.
 - User-facing notification text must be Chinese and must not include internal English errors, stack traces, or local paths.
@@ -27,7 +28,7 @@
 - Modify `src/open_trader/cli.py`: choose `NullNotifier` for acceptance and the configured notifier for every other actor.
 - Modify `tests/test_strategy_drawdown_cli.py`: prove acceptance does not construct a real notifier and default deployment still does.
 - Modify `src/open_trader/drawdown_preflight.py`: translate stable failure categories, batch new alert keys, send one message, and persist keys only after delivery succeeds.
-- Modify `tests/test_drawdown_preflight.py`: cover exact grouped copy, deduplication, recovery rearming, generic fallback text, and notification failure.
+- Modify `tests/test_drawdown_preflight.py`: cover exact grouped copy, deduplication, recovery rearming, generic fallback text, notification failure, and the silent-notifier ledger guard.
 - Modify `CHANGELOG.md`: add the dated operator-facing entry after verification.
 
 ---
@@ -297,7 +298,33 @@ def test_notification_failure_does_not_change_fail_closed_result(
     assert not (tmp_path / "data/trend_drawdown/alerts.json").exists()
 ```
 
-- [ ] **Step 5: Run the notification tests and verify they fail for copy and fan-out**
+- [ ] **Step 5: Keep acceptance silence out of the delivery ledger**
+
+Add a regression test that uses the helper's default `NullNotifier` for a
+multi-market failure and proves that no `alerts.json` delivery ledger is
+created:
+
+```python
+def test_null_notifier_does_not_record_alert_delivery(
+    tmp_path: Path,
+) -> None:
+    result = run_preflight(
+        tmp_path,
+        {
+            market: replace(market_input(market), baseline_equity=None)
+            for market in ("CN", "HK", "US")
+        },
+    )
+
+    assert result["status"] == "failed"
+    assert not (tmp_path / "data/trend_drawdown/alerts.json").exists()
+```
+
+The implementation must return from `_sync_failure_alerts` when the notifier
+has the existing `records_delivery = False` marker. This keeps acceptance
+silence from changing the ledger used by real deployment notifications.
+
+- [ ] **Step 6: Run the notification tests and verify they fail for copy and fan-out**
 
 Run:
 
@@ -306,12 +333,13 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_drawdown_preflight.py::test_missing_approved_predecessor_fails_closed_without_writing_state \
   tests/test_drawdown_preflight.py::test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery \
   tests/test_drawdown_preflight.py::test_notification_failure_does_not_change_fail_closed_result \
+  tests/test_drawdown_preflight.py::test_null_notifier_does_not_record_alert_delivery \
   -q
 ```
 
-Expected: all three tests fail against the old implementation because it uses the old title/raw English, sends one call per market, or retries each market independently.
+Expected: the grouped/copy tests fail against the old implementation because it uses the old title/raw English, sends one call per market, or retries each market independently; the silent-ledger test fails because `NullNotifier` would otherwise still write `alerts.json`.
 
-- [ ] **Step 6: Add the stable Chinese failure labels**
+- [ ] **Step 7: Add the stable Chinese failure labels**
 
 Immediately after `APPROVED_DRAWDOWN_PREDECESSORS` in `src/open_trader/drawdown_preflight.py`, add:
 
@@ -327,9 +355,9 @@ _DRAWDOWN_FAILURE_LABELS = {
 
 Do not include raw exception text in this mapping or add configuration for the labels.
 
-- [ ] **Step 7: Replace per-market sends with one pending batch**
+- [ ] **Step 8: Keep silent notifiers out of the ledger and replace per-market sends with one pending batch**
 
-In `_sync_failure_alerts`, keep the existing ledger read and atomic write. Replace the per-result notify behavior from `original = set(active)` through the end of the result loop with:
+In `_sync_failure_alerts`, first return when `getattr(notifier, "records_delivery", True) is False`. Then keep the existing ledger read and atomic write. Replace the per-result notify behavior from `original = set(active)` through the end of the result loop with:
 
 ```python
 original = set(active)
@@ -386,7 +414,7 @@ if pending:
 
 Leave the existing `if active == original`, JSON serialization, temporary file, atomic replace, and cleanup code unchanged.
 
-- [ ] **Step 8: Run the notification tests and verify they pass**
+- [ ] **Step 9: Run the notification tests and verify they pass**
 
 Run:
 
@@ -395,12 +423,13 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_drawdown_preflight.py::test_missing_approved_predecessor_fails_closed_without_writing_state \
   tests/test_drawdown_preflight.py::test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery \
   tests/test_drawdown_preflight.py::test_notification_failure_does_not_change_fail_closed_result \
+  tests/test_drawdown_preflight.py::test_null_notifier_does_not_record_alert_delivery \
   -q
 ```
 
-Expected: `3 passed`.
+Expected: `4 passed`.
 
-- [ ] **Step 9: Run the complete focused preflight suites**
+- [ ] **Step 10: Run the complete focused preflight suites**
 
 Run:
 
@@ -411,9 +440,9 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   -q
 ```
 
-Expected: `26 passed`.
+Expected: `27 passed`.
 
-- [ ] **Step 10: Commit the grouped notification behavior**
+- [ ] **Step 11: Commit the grouped notification behavior**
 
 ```bash
 git add src/open_trader/drawdown_preflight.py tests/test_drawdown_preflight.py
@@ -443,7 +472,7 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   -q
 ```
 
-Expected: `26 passed`.
+Expected: `27 passed`.
 
 - [ ] **Step 2: Run the real acceptance-actor preflight directly**
 
@@ -457,7 +486,7 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m open_trader \
   --actor acceptance
 ```
 
-Expected: exit `0`, JSON result status `ready`, and no external notification because the CLI passes `NullNotifier`. If the command exits `1` or `2`, stop and diagnose the live preflight; do not replace the check with fixtures or mocks.
+Expected in a clean acceptance baseline: exit `0`, JSON result status `ready`, and no external notification because the CLI passes `NullNotifier`. If the command exits `1` or `2`, capture the real failure and report it separately; do not replace the check with fixtures or mocks or bypass a fail-closed gate.
 
 - [ ] **Step 3: Confirm no long-running process can retain the old preflight code**
 
@@ -497,8 +526,9 @@ Insert this section above `## 2026-07-25` in `CHANGELOG.md`:
 
 - Silenced external cumulative-drawdown alerts during deployment acceptance and
   consolidated real multi-market failures into one actionable Chinese message
-  without weakening fail-closed entry controls. Verified focused/full tests and
-  the live acceptance-actor preflight.
+  without weakening fail-closed entry controls. Focused/full tests pass; the
+  live acceptance-actor preflight remains subject to the repository's existing
+  parameter-version gate.
 ```
 
 - [ ] **Step 6: Commit the verified operator log**

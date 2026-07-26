@@ -275,6 +275,8 @@ def _sync_failure_alerts(
     results: list[dict[str, object]],
     notifier: Notifier,
 ) -> None:
+    if getattr(notifier, "records_delivery", True) is False:
+        return
     path = data_dir / "trend_drawdown/alerts.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
