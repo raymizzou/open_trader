@@ -47,14 +47,13 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9"}),
-    "US": frozenset({"v4", "v5", "v6"}),
-    "HK": frozenset({"v4", "v5", "v6"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10"}),
+    "US": frozenset({"v4", "v5", "v6", "v7"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7"}),
 }
 ACCOUNT_VIEW_LABELS = {
-    "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
-    "phillips": ("真实持仓", "模拟盘持仓", "趋势报告", "港股复盘"),
-    "eastmoney": ("真实持仓", "模拟盘持仓", "趋势报告", "A股复盘"),
+    broker: ("真实持仓", "模拟盘持仓", "趋势报告")
+    for broker in ("tiger", "phillips", "eastmoney")
 }
 SIMULATE_POSITIONS_READY_EXPRESSION = """
 ({broker, expected}) => {
@@ -1038,17 +1037,17 @@ def _validate_history_projection(
 
 def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
     tabs = section.locator('[role="tab"][data-account-view]')
-    assert tabs.count() == 4, f"{broker} 账户视图 Tab 数量不是 4"
-    actual_labels = tuple(tabs.nth(index).inner_text().strip() for index in range(4))
+    assert tabs.count() == 3, f"{broker} 账户视图 Tab 数量不是 3"
+    actual_labels = tuple(tabs.nth(index).inner_text().strip() for index in range(3))
     assert actual_labels == ACCOUNT_VIEW_LABELS[broker], f"{broker} 账户视图 Tab 顺序不正确"
     assert tuple(
-        tabs.nth(index).get_attribute("data-account-view") for index in range(4)
-    ) == ("real", "simulate", "report", "review"), (
+        tabs.nth(index).get_attribute("data-account-view") for index in range(3)
+    ) == ("real", "simulate", "report"), (
         f"{broker} 账户视图 Tab 身份不正确"
     )
     assert tabs.nth(0).get_attribute("aria-selected") == "true" and all(
         tabs.nth(index).get_attribute("aria-selected") == "false"
-        for index in range(1, 4)
+        for index in range(1, 3)
     ), f"{broker} 默认视图不是真实持仓"
     expression = (
         "element => { const style = getComputedStyle(element); return {"
@@ -1061,7 +1060,7 @@ def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
         "indicatorBackground: getComputedStyle(element, '::after').backgroundColor, "
         "indicatorContent: getComputedStyle(element, '::after').content}; }"
     )
-    for index in range(4):
+    for index in range(3):
         style = tabs.nth(index).evaluate(expression)
         common = {
             "borderTopWidth": "0px",
@@ -1445,6 +1444,9 @@ def _check_trend_account_views(
             current = panel.locator("[data-current-trend-report]")
             current.wait_for()
             _check_loaded_report_identity(panel, expectation, broker)
+            assert panel.locator("details.trend-review-disclosure").count() == 0, (
+                f"{broker} 历史趋势报告混入当前趋势复盘"
+            )
             _check_frozen_trend_disciplines(
                 panel.locator(".cn-trend-report"), expectation, broker, page=page
             )
@@ -1469,9 +1471,16 @@ def _check_trend_account_views(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势报告视图出现横向滚动"
 
-        review_tab = section.locator('[data-account-view="review"]')
-        review_tab.click()
-        review_root = panel.locator(".trend-review")
+        assert section.locator('[data-account-view="review"]').count() == 0, (
+            f"{broker} 仍存在独立复盘 Tab"
+        )
+        review_disclosure = panel.locator("details.trend-review-disclosure")
+        assert review_disclosure.count() == 1, f"{broker} 趋势复盘折叠栏目数量不是 1"
+        assert review_disclosure.get_attribute("open") is None, (
+            f"{broker} 趋势复盘默认未折叠"
+        )
+        review_disclosure.locator(":scope > summary").click()
+        review_root = review_disclosure.locator(".trend-review")
         review_root.wait_for()
         review = reviews.get(broker)
         assert isinstance(review, Mapping) and review.get("available") is True, (
@@ -1481,12 +1490,9 @@ def _check_trend_account_views(
         assert "卡玛比率" in text and "夏普比率" in text, (
             f"{broker} 趋势复盘指标不完整"
         )
-        assert review_tab.get_attribute("aria-selected") == "true", (
-            f"{broker} 复盘 Tab 未保持选中"
+        assert report_tab.get_attribute("aria-selected") == "true", (
+            f"{broker} 复盘未合入趋势报告 Tab"
         )
-        assert review_tab.evaluate(
-            "element => element === document.activeElement"
-        ), f"{broker} 复盘打开后焦点未保持在 Tab"
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势复盘视图出现横向滚动"
@@ -1501,7 +1507,9 @@ def _check_separated_trend_report_views(
     screenshot_dir: Path | None = None,
 ) -> None:
     reports = payload.get("trend_reports")
+    reviews = payload.get("trend_reviews")
     assert isinstance(reports, Mapping), "API 缺少趋势报告"
+    assert isinstance(reviews, Mapping), "API 缺少趋势复盘"
     for broker in TREND_SIMULATE_MARKETS:
         section = _select_account_tab(page, broker)
         panel = section.locator(f"#account-{broker}-view-panel")
@@ -1522,6 +1530,19 @@ def _check_separated_trend_report_views(
             label in visible_text
             for label in REMOVED_TREND_REPORT_POSITION_LABELS
         ), f"{broker} 趋势报告仍混入持仓或执行信息"
+        review = reviews.get(broker)
+        assert isinstance(review, Mapping) and review.get("available") is True, (
+            f"{broker} 当前趋势复盘不可用"
+        )
+        review_disclosure = panel.locator("details.trend-review-disclosure")
+        assert review_disclosure.count() == 1, f"{broker} 趋势复盘折叠栏目数量不是 1"
+        assert review_disclosure.get_attribute("open") is None, (
+            f"{broker} 趋势复盘默认未折叠"
+        )
+        review_disclosure.locator(":scope > summary").click()
+        review_root = review_disclosure.locator(".trend-review")
+        assert review_root.count() == 1, f"{broker} 趋势复盘未合入趋势报告"
+        assert f"{_plain(review.get('market_label'))}趋势复盘" in review_root.inner_text()
         if broker == "eastmoney" and screenshot_dir is not None:
             width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
             page.screenshot(
@@ -2200,7 +2221,14 @@ def _trend_action_reason_label(
     if reason == "protection_line_already_triggered" and (
         market,
         version,
-    ) in {("CN", "v9"), ("US", "v6"), ("HK", "v6")}:
+    ) in {
+        ("CN", "v9"),
+        ("CN", "v10"),
+        ("US", "v6"),
+        ("US", "v7"),
+        ("HK", "v6"),
+        ("HK", "v7"),
+    }:
         try:
             initial = Decimal(str(item.get("initial_line")))
             active = Decimal(str(item.get("active_line")))
@@ -3043,9 +3071,7 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
     )
 
 
-def _check_trend_review_geometry(
-    page: Any, broker: str, *, parameter_count: int
-) -> None:
+def _check_trend_review_geometry(page: Any, broker: str) -> None:
     geometry = page.evaluate(
         r"""() => { // trend-review-geometry-contract
         const workspace = document.querySelector("#trend-report-workspace");
@@ -3057,7 +3083,6 @@ def _check_trend_review_geometry(
         const textSelectors = [
           ".trend-review-header > div:first-child > *",
           ".trend-review-header-side > *",
-          ".trend-review-parameter-list > div > *",
           ".trend-review-comparison figcaption",
           ".trend-review-metric h3",
           ".trend-review-series > span:first-child",
@@ -3067,9 +3092,6 @@ def _check_trend_review_geometry(
           documentWidth: document.documentElement.scrollWidth,
           side: rect(side), sideItems: [...side.children].map(rect),
           button: rect(side.querySelector("button")),
-          parameterRows: [...workspace.querySelectorAll(
-            ".trend-review-parameter-list > div"
-          )].map(row => [...row.children].map(rect)),
           panels: [...workspace.querySelectorAll(".trend-review-comparison")].map(rect),
           textGroups: textSelectors.map(selector => ({
             selector,
@@ -3121,24 +3143,12 @@ def _check_trend_review_geometry(
         later["y"] >= earlier["y"] + earlier["height"]
         for earlier, later in zip(side_items, side_items[1:])
     ), f"{broker} 趋势复盘 375px header side 未单列显示"
-    parameter_rows = geometry.get("parameterRows")
-    assert isinstance(parameter_rows, list) and len(parameter_rows) == parameter_count, (
-        f"{broker} 趋势复盘 375px 参数行几何数量不正确"
-    )
-    assert all(
-        isinstance(row, list) and len(row) == 3 and all(
-            later["y"] >= earlier["y"] + earlier["height"]
-            for earlier, later in zip(row, row[1:])
-        )
-        for row in parameter_rows
-    ), f"{broker} 趋势复盘 375px 参数行未纵向显示"
     assert panels[1]["y"] >= panels[0]["y"] + panels[0]["height"], (
         f"{broker} 趋势复盘 375px panel 未纵向显示"
     )
     expected_text_counts = {
         ".trend-review-header > div:first-child > *": 3,
         ".trend-review-header-side > *": 4,
-        ".trend-review-parameter-list > div > *": parameter_count * 3,
         ".trend-review-comparison figcaption": 2,
         ".trend-review-metric h3": 10,
         ".trend-review-series > span:first-child": 20,
@@ -3385,7 +3395,6 @@ def _check_trend_review(
         _plain(review.get("broker_label")),
         _plain(snapshot.get("strategy_name")),
         _trend_review_strategy_version(snapshot.get("strategy_version")),
-        "当前策略参数",
         *header_items,
         *(title for _series, _label, title in TREND_REVIEW_COMPARISONS),
         "同期市场",
@@ -3401,37 +3410,8 @@ def _check_trend_review(
     assert rendered_header_side == header_items, (
         f"{broker} 趋势复盘 header side 顺序或文字错误"
     )
-    parameters = snapshot.get("parameter_rows")
-    assert isinstance(parameters, list) and parameters, f"{broker} 策略参数为空"
-    parameter_rows = workspace.locator(
-        ".trend-review-parameter-table > div"
-    ).all_inner_texts()
-    assert len(parameter_rows) == len(parameters), f"{broker} 策略参数没有完整展示"
-    for rendered, row in zip(parameter_rows, parameters, strict=True):
-        assert isinstance(row, Mapping), f"{broker} 策略参数格式无效"
-        for key in ("group", "name", "value"):
-            assert _plain(row.get(key)) in rendered, f"{broker} 策略参数缺少 {key}"
-    parameter_groups = workspace.locator(
-        ".trend-review-parameter-list > div > span"
-    ).all_inner_texts()
-    parameter_names = workspace.locator(
-        ".trend-review-parameter-list > div > strong"
-    ).all_inner_texts()
-    parameter_values = workspace.locator(
-        ".trend-review-parameter-list > div > p"
-    ).all_inner_texts()
-    assert parameter_groups == [_plain(row.get("group")) for row in parameters], (
-        f"{broker} 策略参数分组顺序或文字错误"
-    )
-    assert parameter_names == [_plain(row.get("name")) for row in parameters], (
-        f"{broker} 策略参数名称顺序或文字错误"
-    )
-    assert parameter_values == [_plain(row.get("value")) for row in parameters], (
-        f"{broker} 策略参数值顺序或文字错误"
-    )
-    _assert_no_trend_review_latin(parameter_groups, broker, "参数分组")
-    _assert_no_trend_review_latin(
-        parameter_names, broker, "参数名称", allow_atr=True
+    assert workspace.locator(".trend-review-parameters").count() == 0, (
+        f"{broker} 趋势复盘仍重复展示当前策略参数"
     )
     assert workspace.locator(".trend-review-comparison").count() == 2, (
         f"{broker} 趋势复盘比较 panel 数量不是 2"
@@ -3492,7 +3472,7 @@ def _check_trend_review(
     ).all_inner_texts()
     assert len(metric_values) == 20, f"{broker} 趋势复盘指标值数量不是 20"
     _assert_no_trend_review_latin(
-        [*header_items, "当前策略参数", *comparison_titles, *metric_labels,
+        [*header_items, *comparison_titles, *metric_labels,
          *series_labels, *metric_values],
         broker,
         "可见界面",
@@ -3503,7 +3483,7 @@ def _check_trend_review(
     ):
         assert forbidden not in text, f"{broker} 趋势复盘包含未要求内容 {forbidden}"
     _check_trend_review_visual_contract(page, broker)
-    _check_trend_review_geometry(page, broker, parameter_count=len(parameters))
+    _check_trend_review_geometry(page, broker)
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
     if width <= 760:
         assert page.evaluate(

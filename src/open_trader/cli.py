@@ -26,6 +26,7 @@ from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
     _optional_positive_tm_id,
+    _positive_tm_ids,
     _read_env_file,
     build_notifier,
     load_env_config,
@@ -132,13 +133,9 @@ from .trend_market_controller import (
     load_trend_market_status,
     run_trend_market_controller,
 )
-from .strategy_drawdown import (
-    manual_unlock_strategy_drawdown,
-    strategy_drawdown_state_status,
-)
+from .strategy_drawdown import manual_unlock_strategy_drawdown
 from .drawdown_preflight import (
     DrawdownMarketInput,
-    frozen_missing_baseline,
     market_preflight_dates,
     run_drawdown_preflight,
 )
@@ -1364,7 +1361,6 @@ def main(argv: list[str] | None = None) -> int:
             if now.tzinfo is None or now.utcoffset() is None:
                 raise ValueError("drawdown preflight clock must be timezone-aware")
             occurred_at = now.isoformat(timespec="seconds")
-            drawdown_state_status = strategy_drawdown_state_status(config.data_dir)
             quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
             inputs: dict[str, DrawdownMarketInput] = {}
             for market in ("CN", "HK", "US"):
@@ -1393,22 +1389,10 @@ def main(argv: list[str] | None = None) -> int:
                         pool_ids,
                         execution_date=entry_eligible_from,
                     )
-                    baseline = frozen_missing_baseline(
-                        config.reports_dir,
-                        market=market,
-                        strategy_id=str(strategy["strategy_id"]),
-                        strategy_version=str(strategy["strategy_version"]),
-                        source_date=source_date,
-                    )
-                    if baseline is None and drawdown_state_status != "ok":
-                        raise ValueError(
-                            f"{market} completed-date frozen Futu baseline "
-                            f"is unavailable for {source_date}"
-                        )
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
-                        baseline_equity=baseline,
+                        baseline_equity=None,
                         source_date=source_date,
                         entry_eligible_from=entry_eligible_from,
                     )
@@ -2474,6 +2458,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "dashboard":
         config_values = _load_optional_env_values(args.config)
         try:
+            trend_a_share_tm_id = _optional_positive_tm_id(
+                config_values, "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID"
+            )
+            trend_etf_tm_id = _optional_positive_tm_id(
+                config_values, "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID"
+            )
+            trend_cn_candidate_pool_ids = (
+                (trend_a_share_tm_id, trend_etf_tm_id)
+                if trend_a_share_tm_id and trend_etf_tm_id
+                else ()
+            )
+            trend_us_candidate_pool_ids = _positive_tm_ids(
+                config_values.get("TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS", "")
+            )
+            trend_hk_candidate_pool_ids = _positive_tm_ids(
+                config_values.get("TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS", "")
+            )
             simulate_account_ids = {
                 market: _optional_positive_tm_id(
                     config_values,
@@ -2503,6 +2504,9 @@ def main(argv: list[str] | None = None) -> int:
             trend_executor_host=config_values.get(
                 "OPEN_TRADER_TREND_EXECUTOR_HOST", ""
             ).strip(),
+            trend_cn_candidate_pool_ids=trend_cn_candidate_pool_ids,
+            trend_us_candidate_pool_ids=trend_us_candidate_pool_ids,
+            trend_hk_candidate_pool_ids=trend_hk_candidate_pool_ids,
         )
         serve_dashboard(
             config,

@@ -5,11 +5,30 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-26
 
+- Moved the current CN/HK/US trend review into a default-closed, audit-style
+  disclosure directly after audit details in the Trend Report tab; its compact
+  summary shows both sample counts, while frozen historical reports still
+  exclude current review data.
+- Removed the standalone CN/HK/US trend-review tabs and rendered each market's
+  review metrics directly below its current trend report; keyboard, mobile, and
+  Dashboard acceptance checks now enforce the three-tab account layout.
+- Published the ETF-enabled parameters under CN v10 and US/HK v7, inheriting
+  audited drawdown high-water marks and approved Kelly samples from v9/v6;
+  missing frozen baselines remain skippable while malformed baselines fail.
+- Allowed Dashboard acceptance to skip only a genuinely absent completed-date
+  frozen drawdown baseline while preserving visible market-level evidence;
+  Futu/calendar outages still block, malformed baseline artifacts still fail,
+  and runtime entry protection remains fail-closed.
 - Silenced external cumulative-drawdown alerts during deployment acceptance and
   consolidated real multi-market failures into one actionable Chinese message
   without weakening fail-closed entry controls. Focused/full tests pass; the
   live acceptance-actor preflight still fails closed on the existing
   same-version parameter-mismatch gate.
+- Removed the duplicate current-strategy parameter table from trend review
+  pages and kept the folded report discipline as the single rule surface.
+  Dashboard current discipline now uses the configured CN/HK/US stock-and-ETF
+  candidate pools even when the selected report predates ETF integration;
+  frozen historical report parameters remain unchanged.
 
 ## 2026-07-25
 

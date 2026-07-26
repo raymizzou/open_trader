@@ -31,7 +31,7 @@ from open_trader.models import Market, TradeFill
 from open_trader.trend_industry_context import IndustryContext
 
 
-def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> None:
+def test_cn_historical_and_current_snapshots_normalize_without_cross_version_rewrite() -> None:
     old = live_trend_strategy_snapshot(
         "CN",
         "abc123",
@@ -59,8 +59,8 @@ def test_cn_v4_v6_and_v7_snapshots_normalize_without_cross_version_rewrite() -> 
     )
     assert old["parameters"]["max_filter_price"] == "200"
     assert "kelly_sample_inherits" not in historic_v6["parameters"]
-    assert current["strategy_version"] == "v9"
-    assert "v9" in trend_review.TREND_STRATEGY_VERSIONS
+    assert current["strategy_version"] == "v10"
+    assert "v10" in trend_review.TREND_STRATEGY_VERSIONS
     assert "max_filter_price" not in current["parameters"]
     assert current["parameters"]["kelly_sample_inherits"][0][
         "opening_strategy_version"
@@ -6208,7 +6208,7 @@ def write_projection_strategy_facts(
 
 @pytest.mark.parametrize(
     ("market", "strategy_version"),
-    [("CN", "v9"), ("US", "v6"), ("HK", "v6")],
+    [("CN", "v10"), ("US", "v7"), ("HK", "v7")],
 )
 def test_projection_accepts_current_live_strategy_versions(
     tmp_path: Path, market: str, strategy_version: str,
@@ -6223,28 +6223,28 @@ def test_projection_accepts_current_live_strategy_versions(
     assert projection["strategy_snapshot"]["strategy_version"] == strategy_version
 
 
-def test_projection_prefers_v9_when_v8_and_v9_facts_are_mixed(
+def test_projection_prefers_v10_when_current_facts_are_mixed(
     tmp_path: Path,
 ) -> None:
     snapshots = [
         live_trend_strategy_snapshot(
             "CN", "test-sha", (), strategy_version=version
         )
-        for version in ("v8", "v9")
+        for version in ("v8", "v9", "v10")
     ]
     write_projection_strategy_facts(tmp_path, "CN", snapshots)
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["strategy_snapshot"]["strategy_version"] == "v9"
+    assert projection["strategy_snapshot"]["strategy_version"] == "v10"
 
 
 @pytest.mark.parametrize(
     ("market", "strategy_versions"),
     [
-        ("CN", ("v4", "v7", "v8", "v9")),
-        ("US", ("v4", "v5", "v6")),
-        ("HK", ("v4", "v5", "v6")),
+        ("CN", ("v4", "v7", "v8", "v9", "v10")),
+        ("US", ("v4", "v5", "v6", "v7")),
+        ("HK", ("v4", "v5", "v6", "v7")),
     ],
 )
 def test_projection_accepts_approved_mixed_sample_identities(

@@ -7,9 +7,11 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
+import open_trader.drawdown_preflight as drawdown_preflight
 from open_trader.drawdown_preflight import (
     DrawdownMarketInput,
-    frozen_missing_baseline,
     market_preflight_dates,
     run_drawdown_preflight,
 )
@@ -134,7 +136,7 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
-    old_versions = {"CN": "v8", "HK": "v5", "US": "v5"}
+    old_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
     equities = {"CN": "100", "HK": "200", "US": "300"}
     for market, version in old_versions.items():
         automatic_bootstrap_strategy_drawdown(
@@ -160,7 +162,7 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
             observed_at="2026-07-19T08:00:00+08:00",
         )
 
-    target_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
+    target_versions = {"CN": "v10", "HK": "v7", "US": "v7"}
     inputs = {
         market: replace(
             market_input(market),
@@ -195,8 +197,8 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market="CN",
-        strategy_id="trend_animals_warm_to_hot/CN/v7",
-        strategy_version="v7",
+        strategy_id="trend_animals_warm_to_hot/CN/v8",
+        strategy_version="v8",
         parameters={"drawdown_limit": "0.05", "market": "CN"},
         baseline_equity=Decimal("100"),
         source_date="2026-07-17",
@@ -213,8 +215,8 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
         market_input("CN"),
         baseline_equity=None,
         strategy_snapshot={
-            "strategy_id": "trend_animals_warm_to_hot/CN/v9",
-            "strategy_version": "v9",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v10",
+            "strategy_version": "v10",
             "parameters": {"drawdown_limit": "0.05", "market": "CN"},
         },
     )
@@ -236,31 +238,68 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
         "【需处理｜系统｜累计回撤状态阻断】",
         "\n".join([
             "发生：累计回撤状态未通过部署预检",
-            "影响：CN v9 暂停新开仓；卖出和保护线继续运行",
+            "影响：CN v10 暂停新开仓；卖出和保护线继续运行",
             "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
             "",
             "明细：",
-            "- CN v9：回撤预检失败",
+            "- CN v10：回撤预检失败",
         ]),
     )]
     assert "approved predecessor drawdown state is unavailable" not in notifier.calls[0][1]
 
 
-def test_first_activation_without_baseline_fails_closed(tmp_path: Path) -> None:
-    target = replace(
-        market_input("CN"),
-        baseline_equity=None,
-        strategy_snapshot={
-            "strategy_id": "trend_animals_warm_to_hot/CN/v9",
-            "strategy_version": "v9",
-            "parameters": {"drawdown_limit": "0.05", "market": "CN"},
-        },
-    )
+def test_first_activation_without_matching_baseline_is_skipped(
+    tmp_path: Path,
+) -> None:
+    target = replace(market_input("CN"), baseline_equity=None)
 
     result = run_preflight(tmp_path, {"CN": target})
 
+    assert result == {
+        "status": "ready",
+        "markets": [{
+            "market": "CN",
+            "status": "skipped",
+            "reason": "baseline_missing",
+            "source_date": "2026-07-17",
+        }],
+    }
+    assert not (tmp_path / "data/trend_drawdown/state.json").exists()
+
+
+def test_skipped_market_does_not_block_other_market_bootstrap(
+    tmp_path: Path,
+) -> None:
+    result = run_preflight(
+        tmp_path,
+        {
+            "CN": replace(market_input("CN"), baseline_equity=None),
+            "US": market_input("US"),
+        },
+    )
+
+    assert result["status"] == "ready"
+    assert [item["status"] for item in result["markets"]] == [
+        "skipped", "bootstrapped"
+    ]
+    state = json.loads(
+        (tmp_path / "data/trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    assert [record["market"] for record in state["records"]] == ["US"]
+
+
+def test_invalid_matching_baseline_fails(tmp_path: Path) -> None:
+    path = tmp_path / "reports/trend_a_share/2026-07-17.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{", encoding="utf-8")
+
+    result = run_preflight(
+        tmp_path,
+        {"CN": replace(market_input("CN"), baseline_equity=None)},
+    )
+
     assert result["status"] == "failed"
-    assert result["markets"][0]["failure_status"] == "baseline_unavailable"
+    assert result["markets"][0]["failure_status"] == "baseline_invalid"
     assert not (tmp_path / "data/trend_drawdown/state.json").exists()
 
 
@@ -397,7 +436,7 @@ def test_market_preflight_dates_move_late_bootstrap_to_next_session() -> None:
     ) == ("2026-07-17", "2026-07-20")
 
 
-def test_frozen_missing_report_supplies_original_account_baseline(
+def test_load_frozen_baseline_returns_original_account_equity(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "reports/trend_us_tiger/2026-07-17-r2.json"
@@ -417,18 +456,96 @@ def test_frozen_missing_report_supplies_original_account_baseline(
         encoding="utf-8",
     )
 
-    assert frozen_missing_baseline(
+    assert drawdown_preflight.load_frozen_baseline(
         tmp_path / "reports",
         market="US",
         strategy_id="trend_animals_warm_to_hot/US/v4",
         strategy_version="v4",
         source_date="2026-07-17",
-    ) == Decimal("123.45")
+    ) == drawdown_preflight.FrozenBaselineLookup(
+        status="available",
+        equity=Decimal("123.45"),
+    )
+
+
+def test_load_frozen_baseline_reports_missing_current_strategy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reports/trend_us_tiger/2026-07-17.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "metadata": {"market": "US"},
+            "strategy_snapshot": {
+                "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                "strategy_version": "v4",
+            },
+            "account": {"source_date": "2026-07-17", "net_value": "123.45"},
+            "drawdown_summary": {"state_status": "ok"},
+        }),
+        encoding="utf-8",
+    )
+
+    result = drawdown_preflight.load_frozen_baseline(
+        tmp_path / "reports",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v5",
+        strategy_version="v5",
+        source_date="2026-07-17",
+    )
+
+    assert result.status == "missing"
+    assert result.equity is None
+    assert result.error == ""
+
+
+@pytest.mark.parametrize(
+    ("content", "error_text"),
+    [
+        ("{", "unreadable frozen drawdown baseline"),
+        (
+            json.dumps({
+                "metadata": {"market": "US"},
+                "strategy_snapshot": {
+                    "strategy_id": "trend_animals_warm_to_hot/US/v4",
+                    "strategy_version": "v4",
+                },
+                "account": {
+                    "source_date": "2026-07-17",
+                    "net_value": "not-a-number",
+                },
+                "drawdown_summary": {"state_status": "missing"},
+            }),
+            "invalid frozen drawdown baseline",
+        ),
+    ],
+)
+def test_load_frozen_baseline_rejects_invalid_completed_date_artifacts(
+    tmp_path: Path,
+    content: str,
+    error_text: str,
+) -> None:
+    path = tmp_path / "reports/trend_us_tiger/2026-07-17.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(content, encoding="utf-8")
+
+    result = drawdown_preflight.load_frozen_baseline(
+        tmp_path / "reports",
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v4",
+        strategy_version="v4",
+        source_date="2026-07-17",
+    )
+
+    assert result.status == "invalid"
+    assert error_text in result.error
 
 
 def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
     tmp_path: Path,
 ) -> None:
+    for market in ("CN", "HK", "US"):
+        write_report(tmp_path, market, "missing")
     failed_inputs = {
         market: replace(market_input(market), baseline_equity=None)
         for market in ("CN", "HK", "US")
@@ -454,18 +571,18 @@ def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
             "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
             "",
             "明细：",
-            "- CN v4：历史基线不可用",
-            "- HK v4：历史基线不可用",
-            "- US v4：历史基线不可用",
+            "- CN v4：回撤预检失败",
+            "- HK v4：回撤预检失败",
+            "- US v4：回撤预检失败",
         ]),
     )
     assert notifier.calls == [expected]
     assert json.loads(
         (tmp_path / "data/trend_drawdown/alerts.json").read_text()
     )["active"] == [
-        "CN|v4|baseline_unavailable",
-        "HK|v4|baseline_unavailable",
-        "US|v4|baseline_unavailable",
+        "CN|v4|baseline_invalid",
+        "HK|v4|baseline_invalid",
+        "US|v4|baseline_invalid",
     ]
 
     request["market_inputs"] = {
@@ -484,6 +601,8 @@ def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
 def test_notification_failure_does_not_change_fail_closed_result(
     tmp_path: Path,
 ) -> None:
+    for market in ("CN", "HK", "US"):
+        write_report(tmp_path, market, "missing")
     notifier = RecordingNotifier(fail=True)
     result = run_drawdown_preflight(
         data_dir=tmp_path / "data",
@@ -506,6 +625,8 @@ def test_notification_failure_does_not_change_fail_closed_result(
 def test_null_notifier_does_not_record_alert_delivery(
     tmp_path: Path,
 ) -> None:
+    for market in ("CN", "HK", "US"):
+        write_report(tmp_path, market, "missing")
     result = run_preflight(
         tmp_path,
         {

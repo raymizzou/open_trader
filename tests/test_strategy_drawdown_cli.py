@@ -250,10 +250,10 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
 @pytest.mark.parametrize(
     ("market", "source_date", "entry_date", "expected_version"),
     [
-        ("CN", "2026-07-26", "2026-07-27", "v9"),
+        ("CN", "2026-07-26", "2026-07-27", "v10"),
         ("US", "2026-07-23", "2026-07-24", "v5"),
-        ("US", "2026-07-26", "2026-07-27", "v6"),
-        ("HK", "2026-07-26", "2026-07-27", "v6"),
+        ("US", "2026-07-26", "2026-07-27", "v7"),
+        ("HK", "2026-07-26", "2026-07-27", "v7"),
     ],
 )
 def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
@@ -327,7 +327,6 @@ def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
         "_drawdown_preflight_now",
         lambda: datetime.fromisoformat("2026-07-24T08:00:00+08:00"),
     )
-    monkeypatch.setattr(cli, "strategy_drawdown_state_status", lambda path: "ok")
     monkeypatch.setattr(cli, "market_preflight_dates", preflight_dates)
     monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
     monkeypatch.setattr(cli, "run_drawdown_preflight", run_preflight)
@@ -343,9 +342,10 @@ def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
         market_inputs[market].strategy_snapshot["strategy_version"]
         == expected_version
     )
+    assert market_inputs[market].baseline_equity is None
 
 
-def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
+def test_trend_drawdown_preflight_skips_missing_frozen_baseline_without_live_nav(
     tmp_path: Path, capsys, monkeypatch,
 ) -> None:
     config = SimpleNamespace(
@@ -398,9 +398,78 @@ def test_trend_drawdown_preflight_does_not_relabel_live_nav_as_historical(
         "--repo", str(tmp_path),
     ])
 
-    assert result == 2
-    assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ready"
+    assert [item["status"] for item in output["markets"]] == [
+        "skipped", "skipped", "skipped"
+    ]
+    assert {item["reason"] for item in output["markets"]} == {
+        "baseline_missing"
+    }
     assert account_calls == []
+    assert not (config.data_dir / "trend_drawdown/state.json").exists()
+
+
+def test_trend_drawdown_preflight_blocks_when_futu_calendar_is_unavailable(
+    tmp_path: Path, capsys, monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+
+    class UnavailableQuote:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(self, **_: object) -> list[str]:
+            raise RuntimeError("Futu trading calendar unavailable")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", UnavailableQuote)
+    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-07-20T08:00:00+08:00"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "live_trend_strategy_snapshot",
+        lambda market, process_version, pool_ids, **kwargs: {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+            "strategy_version": "v4",
+            "parameters": {"market": market},
+        },
+    )
+
+    result = cli.main([
+        "trend-drawdown-preflight",
+        "--config", str(tmp_path / "daily.env"),
+        "--repo", str(tmp_path),
+    ])
+
+    assert result == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "unavailable"
+    assert [item["status"] for item in output["markets"]] == [
+        "unavailable", "unavailable", "unavailable"
+    ]
+    assert all(
+        "Futu trading calendar unavailable" in item["error"]
+        for item in output["markets"]
+    )
 
 
 def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_baseline(

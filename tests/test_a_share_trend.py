@@ -593,13 +593,13 @@ def test_live_cn_v6_strategy_snapshot_remains_historical() -> None:
     ]
 
 
-def test_live_cn_strategy_snapshot_defaults_to_v9_with_all_approved_inheritance() -> None:
+def test_live_cn_strategy_snapshot_defaults_to_v10_with_all_approved_inheritance() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199)
     )
 
-    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v9"
-    assert snapshot["strategy_version"] == "v9"
+    assert snapshot["strategy_id"] == "trend_animals_warm_to_hot/CN/v10"
+    assert snapshot["strategy_version"] == "v10"
     assert snapshot["effective_from"] == "2026-07-27"
     assert snapshot["parameters"]["kelly_sample_inherits"] == [
         {
@@ -607,7 +607,7 @@ def test_live_cn_strategy_snapshot_defaults_to_v9_with_all_approved_inheritance(
             "strategy_id": f"trend_animals_warm_to_hot/CN/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v7", "v8", "v9")
+        for version in ("v4", "v7", "v8", "v9", "v10")
     ]
     assert snapshot["parameters"]["allowed_assets"] == ["A股", "ETF基金"]
     assert {
@@ -620,9 +620,9 @@ def test_live_cn_strategy_snapshot_defaults_to_v9_with_all_approved_inheritance(
 @pytest.mark.parametrize(
     ("market", "version", "inherits"),
     [
-        ("CN", "v9", ("v4", "v7", "v8", "v9")),
-        ("US", "v6", ("v4", "v5", "v6")),
-        ("HK", "v6", ("v4", "v5", "v6")),
+        ("CN", "v10", ("v4", "v7", "v8", "v9", "v10")),
+        ("US", "v7", ("v4", "v5", "v6", "v7")),
+        ("HK", "v7", ("v4", "v5", "v6", "v7")),
     ],
 )
 def test_current_live_snapshots_publish_exit_discipline_without_partial_profit(
@@ -690,9 +690,9 @@ def test_current_cn_boiling_entry_uses_four_percent() -> None:
 
 @pytest.mark.parametrize(
     ("market", "expected_version"),
-    [("US", "v6"), ("HK", "v6")],
+    [("US", "v7"), ("HK", "v7")],
 )
-def test_live_non_cn_strategy_snapshot_defaults_to_v6_with_exact_inheritance(
+def test_live_non_cn_strategy_snapshot_defaults_to_v7_with_exact_inheritance(
     market: str, expected_version: str,
 ) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
@@ -709,11 +709,11 @@ def test_live_non_cn_strategy_snapshot_defaults_to_v6_with_exact_inheritance(
             "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v5", "v6")
+        for version in ("v4", "v5", "v6", "v7")
     ]
 
 
-@pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8", "v9"])
+@pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8", "v9", "v10"])
 def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466,), strategy_version=version
@@ -721,13 +721,39 @@ def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
     assert snapshot["strategy_version"] == version
 
 
-@pytest.mark.parametrize("version", ["v4", "v5", "v6"])
+@pytest.mark.parametrize("version", ["v4", "v5", "v6", "v7"])
 def test_live_us_hk_supported_versions_remain_replay_valid(version: str) -> None:
     for market, pools in (("US", (622460,)), ("HK", (622494,))):
         snapshot = trend_module.live_trend_strategy_snapshot(
             market, "abc123", pools, strategy_version=version
         )
         assert snapshot["strategy_version"] == version
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "pools"),
+    [
+        ("CN", "v9", (622466, 697199)),
+        ("US", "v6", (622460,)),
+        ("HK", "v6", (622494,)),
+    ],
+)
+def test_replaced_strategy_versions_keep_published_behavior(
+    market: str,
+    version: str,
+    pools: tuple[int, ...],
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market, "abc123", pools, strategy_version=version
+    )
+
+    assert snapshot["effective_from"] == "2026-07-27"
+    assert snapshot["parameters"]["candidate_pool_ids"] == list(pools)
+    assert snapshot["parameters"]["exit_reasons"] == [
+        "danger", "left_right_side", "temperature_to_flat", "protection",
+    ]
+    if market == "CN":
+        assert snapshot["parameters"]["allowed_assets"] == ["A股", "ETF基金"]
 
 
 def test_report_rejects_strategy_snapshot_action_mismatch() -> None:

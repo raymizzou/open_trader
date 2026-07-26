@@ -211,7 +211,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     )
     live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
     assert (live["strategy_id"], live["strategy_version"]) == (
-        f"trend_animals_warm_to_hot/{market}/v6", "v6"
+        f"trend_animals_warm_to_hot/{market}/v7", "v7"
     )
     assert "overheat_trim_fraction" not in live["parameters"]
     assert not {
@@ -226,21 +226,21 @@ def test_market_strategy_snapshot_matches_runtime_rules(
 
 
 @pytest.mark.parametrize("market", ["US", "HK"])
-def test_live_market_strategy_snapshot_defaults_to_v6_with_exact_inheritance(
+def test_live_market_strategy_snapshot_defaults_to_v7_with_exact_inheritance(
     market: str,
 ) -> None:
     pools = (622460,) if market == "US" else (622494,)
     snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
 
-    assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/v6"
-    assert snapshot["strategy_version"] == "v6"
+    assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/v7"
+    assert snapshot["strategy_version"] == "v7"
     assert snapshot["parameters"]["kelly_sample_inherits"] == [
         {
             "market": market,
             "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v5", "v6")
+        for version in ("v4", "v5", "v6", "v7")
     ]
 
 

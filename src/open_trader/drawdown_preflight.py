@@ -7,6 +7,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from .notifications import Notifier
@@ -30,8 +31,11 @@ MARKET_TIMEZONES = {
 }
 APPROVED_DRAWDOWN_PREDECESSORS = {
     ("CN", "v9"): ("trend_animals_warm_to_hot/CN/v8", "v8"),
+    ("CN", "v10"): ("trend_animals_warm_to_hot/CN/v9", "v9"),
     ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
+    ("US", "v7"): ("trend_animals_warm_to_hot/US/v6", "v6"),
     ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
+    ("HK", "v7"): ("trend_animals_warm_to_hot/HK/v6", "v6"),
 }
 _DRAWDOWN_FAILURE_LABELS = {
     "baseline_unavailable": "历史基线不可用",
@@ -49,6 +53,13 @@ class DrawdownMarketInput:
     baseline_equity: Decimal | None
     source_date: str | None
     entry_eligible_from: str | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class FrozenBaselineLookup:
+    status: Literal["available", "missing", "invalid"]
+    equity: Decimal | None = None
     error: str = ""
 
 
@@ -83,45 +94,80 @@ def market_preflight_dates(
     return completed[-1].isoformat(), eligible[0].isoformat()
 
 
-def frozen_missing_baseline(
+def load_frozen_baseline(
     reports_dir: Path,
     *,
     market: str,
     strategy_id: str,
     strategy_version: str,
     source_date: str,
-) -> Decimal | None:
-    directory = REPORT_DIRECTORIES[market]
-    for path in sorted((reports_dir / directory).glob("*.json"), reverse=True):
+) -> FrozenBaselineLookup:
+    directory = reports_dir / REPORT_DIRECTORIES[market]
+    candidates = [
+        path
+        for path in (
+            directory / f"{source_date}.json",
+            *directory.glob(f"{source_date}-r*.json"),
+        )
+        if path.is_file()
+    ]
+    if not candidates:
+        return FrozenBaselineLookup(status="missing")
+    for path in sorted(candidates, reverse=True):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"unreadable frozen drawdown baseline: {path}",
+            )
         if not isinstance(payload, dict):
-            continue
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
         metadata = payload.get("metadata")
         strategy = payload.get("strategy_snapshot")
-        account = payload.get("account")
-        drawdown = payload.get("drawdown_summary")
         if not (
             isinstance(metadata, dict)
             and str(metadata.get("market") or "").upper() == market
             and isinstance(strategy, dict)
-            and strategy.get("strategy_id") == strategy_id
-            and strategy.get("strategy_version") == strategy_version
-            and isinstance(account, dict)
+        ):
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
+        if (
+            strategy.get("strategy_id") != strategy_id
+            or strategy.get("strategy_version") != strategy_version
+        ):
+            continue
+        account = payload.get("account")
+        drawdown = payload.get("drawdown_summary")
+        if not (
+            isinstance(account, dict)
             and account.get("source_date") == source_date
             and isinstance(drawdown, dict)
             and drawdown.get("state_status") == "missing"
         ):
-            continue
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
         try:
             equity = Decimal(str(account.get("net_value")))
         except Exception:
-            continue
+            return FrozenBaselineLookup(
+                status="invalid",
+                error=f"invalid frozen drawdown baseline: {path}",
+            )
         if equity.is_finite() and equity > 0:
-            return equity
-    return None
+            return FrozenBaselineLookup(status="available", equity=equity)
+        return FrozenBaselineLookup(
+            status="invalid",
+            error=f"invalid frozen drawdown baseline: {path}",
+        )
+    return FrozenBaselineLookup(status="missing")
 
 
 def run_drawdown_preflight(
@@ -196,17 +242,46 @@ def run_drawdown_preflight(
             and (market, strategy_version) in APPROVED_DRAWDOWN_PREDECESSORS
         )
         if not was_present and (
-            (item.baseline_equity is None and not approved_predecessor)
-            or item.source_date is None
-            or item.entry_eligible_from is None
+            item.source_date is None or item.entry_eligible_from is None
         ):
             results.append({
                 "market": market,
                 "status": "failed",
                 "failure_status": "baseline_unavailable",
-                "error": "completed-date frozen Futu baseline is unavailable",
+                "error": "completed-date frozen Futu baseline date is unavailable",
             })
             continue
+        baseline_equity = item.baseline_equity
+        if (
+            not was_present
+            and baseline_equity is None
+            and not approved_predecessor
+        ):
+            assert item.source_date is not None
+            baseline = load_frozen_baseline(
+                reports_dir,
+                market=market,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+                source_date=item.source_date,
+            )
+            if baseline.status == "missing":
+                results.append({
+                    "market": market,
+                    "status": "skipped",
+                    "reason": "baseline_missing",
+                    "source_date": item.source_date,
+                })
+                continue
+            if baseline.status == "invalid":
+                results.append({
+                    "market": market,
+                    "status": "failed",
+                    "failure_status": "baseline_invalid",
+                    "error": baseline.error,
+                })
+                continue
+            baseline_equity = baseline.equity
         try:
             decision = automatic_bootstrap_strategy_drawdown(
                 data_dir,
@@ -214,7 +289,7 @@ def run_drawdown_preflight(
                 strategy_id=strategy_id,
                 strategy_version=strategy_version,
                 parameters=parameters,
-                baseline_equity=item.baseline_equity,
+                baseline_equity=baseline_equity,
                 source_date=item.source_date,
                 accepted_git_sha=accepted_git_sha,
                 actor=actor,

@@ -61,7 +61,7 @@ const ACCOUNT_STRATEGY_PROFILES = {
 
 const ACCOUNT_BROKERS = Object.keys(ACCOUNT_STRATEGY_PROFILES);
 const TREND_ACCOUNT_BROKERS = ["tiger", "phillips", "eastmoney"];
-const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report", "review"];
+const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report"];
 
 const DECISION_TABS = [
   { key: "final", label: "最终决策" },
@@ -2071,7 +2071,6 @@ function formatTrendReviewStrategyVersion(value) {
 
 function renderTrendReviewWorkspace(review, embedded = false) {
   const snapshot = review.strategy_snapshot || {};
-  const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
   const root = embedded ? "div" : "main";
   return `<${root} class="trend-review">
     <header class="trend-review-header">
@@ -2085,9 +2084,6 @@ function renderTrendReviewWorkspace(review, embedded = false) {
         <span>共同截止日 ${escapeHtml(review.common_cutoff ? formatPlain(review.common_cutoff) : "暂无")}</span>
       </div>
     </header>
-    <section class="trend-review-parameters"><h2>当前策略参数</h2>
-      <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
-    </section>
     <div class="trend-review-comparisons">
       ${TREND_REVIEW_COMPARISONS.map((comparison) => renderTrendReviewComparison(review, comparison)).join("")}
     </div>
@@ -2876,7 +2872,7 @@ function renderCnTrendAudit(audit, report = {}) {
     + "</p></details>";
 }
 
-function renderCnTrendReportWorkspace(report, embedded = false, historical = false) {
+function renderCnTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {
   const counts = report.counts || {};
   const audit = report.audit || {};
   const isCn = String(report.market || "").toUpperCase() === "CN";
@@ -2940,6 +2936,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${riskSummary}
     ${renderTrendControllerStatus(report.broker)}
     ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
+    ${trailingContent}
   </${root}>`;
 }
 
@@ -3063,10 +3060,10 @@ function renderOptionAttentionWorkspace(report) {
   </main>`;
 }
 
-function renderTrendReportWorkspace(report, embedded = false, historical = false) {
+function renderTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {
   return String(report && report.broker || "").toLowerCase() === "futu"
     ? renderOptionAttentionWorkspace(report || {})
-    : renderCnTrendReportWorkspace(report || {}, embedded, historical);
+    : renderCnTrendReportWorkspace(report || {}, embedded, historical, trailingContent);
 }
 
 function renderHeaderSummary() {
@@ -3168,8 +3165,7 @@ function handleBrokerTabKeydown(event) {
 function accountViewLabel(broker, view) {
   if (view === "real") return "真实持仓";
   if (view === "simulate") return "模拟盘持仓";
-  if (view === "report") return "趋势报告";
-  return `${{tiger: "美股", phillips: "港股", eastmoney: "A股"}[broker] || "市场"}复盘`;
+  return "趋势报告";
 }
 
 function renderAccountViewTabs(broker) {
@@ -3446,12 +3442,6 @@ function renderAccountViewPanel(group) {
   const view = state.accountViews[group.broker] || "real";
   if (view === "simulate") return renderSimulatedAccountView(group.broker);
   if (view === "report") return renderEmbeddedTrendReport(group.broker);
-  if (view === "review") {
-    const review = state.dashboard?.trend_reviews?.[group.broker] || {};
-    return review.available
-      ? renderTrendReviewWorkspace(review, true)
-      : `<p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p>`;
-  }
   return group.rows.length
     ? renderAccountTable(group.rows)
     : '<p class="account-empty">当前筛选下没有持仓</p>';
@@ -3498,11 +3488,15 @@ function renderEmbeddedTrendReport(broker) {
   const history = state.trendReportHistories[broker];
   if (history?.open) return renderTrendReportHistory(broker, history);
   const report = state.dashboard?.trend_reports?.[broker] || {};
-  if (report.available) return renderTrendReportWorkspace(report, true);
+  const review = state.dashboard?.trend_reviews?.[broker];
+  const reviewPanel = !review ? "" : review.available
+    ? `<details class="trend-audit trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(`${formatTrendReviewSampleCount(review, "discipline", "纪律模拟")} · ${formatTrendReviewSampleCount(review, "actual", "实际执行")}`)}</span></summary>${renderTrendReviewWorkspace(review, true)}</details>`
+    : `<details class="trend-audit trend-review-disclosure"><summary>趋势复盘 <span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span></summary><p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p></details>`;
+  if (report.available) return renderTrendReportWorkspace(report, true, false, reviewPanel);
   const statusClass = report.execution_batch_blocking === true
     ? "trend-execution-batch-error"
     : "account-empty";
-  return `${renderTrendControllerStatus(broker)}<p class="${statusClass}">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
+  return `${renderTrendControllerStatus(broker)}<p class="${statusClass}">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>${reviewPanel}`;
 }
 
 function renderTrendReportHistory(broker, history) {
