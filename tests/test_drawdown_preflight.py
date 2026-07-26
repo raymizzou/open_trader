@@ -235,7 +235,7 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
     assert notifier.calls == [(
         "【需处理｜系统｜累计回撤状态阻断】",
         "\n".join([
-            "发生：新策略版本无法建立或继承累计回撤状态",
+            "发生：累计回撤状态未通过部署预检",
             "影响：CN v9 暂停新开仓；卖出和保护线继续运行",
             "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
             "",
@@ -449,7 +449,7 @@ def test_failure_alert_is_grouped_deduplicated_and_rearmed_after_recovery(
     expected = (
         "【需处理｜系统｜累计回撤状态阻断】",
         "\n".join([
-            "发生：新策略版本无法建立或继承累计回撤状态",
+            "发生：累计回撤状态未通过部署预检",
             "影响：CN v4、HK v4、US v4 暂停新开仓；卖出和保护线继续运行",
             "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
             "",
