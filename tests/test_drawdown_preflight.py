@@ -136,7 +136,7 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
-    old_versions = {"CN": "v8", "HK": "v5", "US": "v5"}
+    old_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
     equities = {"CN": "100", "HK": "200", "US": "300"}
     for market, version in old_versions.items():
         automatic_bootstrap_strategy_drawdown(
@@ -162,7 +162,7 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
             observed_at="2026-07-19T08:00:00+08:00",
         )
 
-    target_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
+    target_versions = {"CN": "v10", "HK": "v7", "US": "v7"}
     inputs = {
         market: replace(
             market_input(market),
@@ -197,8 +197,8 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market="CN",
-        strategy_id="trend_animals_warm_to_hot/CN/v7",
-        strategy_version="v7",
+        strategy_id="trend_animals_warm_to_hot/CN/v8",
+        strategy_version="v8",
         parameters={"drawdown_limit": "0.05", "market": "CN"},
         baseline_equity=Decimal("100"),
         source_date="2026-07-17",
@@ -215,8 +215,8 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
         market_input("CN"),
         baseline_equity=None,
         strategy_snapshot={
-            "strategy_id": "trend_animals_warm_to_hot/CN/v9",
-            "strategy_version": "v9",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v10",
+            "strategy_version": "v10",
             "parameters": {"drawdown_limit": "0.05", "market": "CN"},
         },
     )
@@ -238,11 +238,11 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
         "【需处理｜系统｜累计回撤状态阻断】",
         "\n".join([
             "发生：累计回撤状态未通过部署预检",
-            "影响：CN v9 暂停新开仓；卖出和保护线继续运行",
+            "影响：CN v10 暂停新开仓；卖出和保护线继续运行",
             "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
             "",
             "明细：",
-            "- CN v9：回撤预检失败",
+            "- CN v10：回撤预检失败",
         ]),
     )]
     assert "approved predecessor drawdown state is unavailable" not in notifier.calls[0][1]
