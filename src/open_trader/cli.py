@@ -1418,7 +1418,11 @@ def main(argv: list[str] | None = None) -> int:
                 accepted_git_sha=accepted_git_sha,
                 actor=args.actor,
                 occurred_at=occurred_at,
-                notifier=build_notifier(config),
+                notifier=(
+                    NullNotifier()
+                    if args.actor == "acceptance"
+                    else build_notifier(config)
+                ),
             )
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)

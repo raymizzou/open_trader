@@ -9,6 +9,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   frozen drawdown baseline while preserving visible market-level evidence;
   Futu/calendar outages still block, malformed baseline artifacts still fail,
   and runtime entry protection remains fail-closed.
+- Silenced external cumulative-drawdown alerts during deployment acceptance and
+  consolidated real multi-market failures into one actionable Chinese message
+  without weakening fail-closed entry controls. Focused/full tests pass; the
+  live acceptance-actor preflight still fails closed on the existing
+  same-version parameter-mismatch gate.
 
 ## 2026-07-25
 
