@@ -748,9 +748,6 @@ def live_trend_strategy_snapshot(
             for item in ("v4", "v7", "v8", "v9")
         ]
     if version == "v6" and market in {"US", "HK"}:
-        parameters["allowed_assets"] = (
-            ["美股", "美国ETF"] if market == "US" else ["港股", "香港ETF"]
-        )
         for row in rows:
             if row["name"] == "交易市场":
                 row["value"] = (

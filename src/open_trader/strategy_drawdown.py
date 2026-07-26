@@ -17,6 +17,7 @@ DECISION_SCHEMA_VERSION = "open_trader.strategy_drawdown.v1"
 DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
+ETF_UNIVERSE_COMPATIBILITY_REVISION = "trend_etf_universe_v1"
 UNIFIED_TREND_V5_PARAMETER_HASHES = {
     "US": (
         "860170403d6241cd3590c02449de7a1bd11842124055587f7c4eec64b927d253",
@@ -27,6 +28,21 @@ UNIFIED_TREND_V5_PARAMETER_HASHES = {
         "674b4f167fac35a5af142b0d9cda1442e430777887f0618c9fa120869886a6d3",
     ),
 }
+ETF_UNIVERSE_PARAMETER_HASHES = {
+    "CN": (
+        "ed65702b9b9fc4310cb3e0caf367e946e4eb1e96a018a8e26a1ed1363e2d02a3",
+        "ceb2264ebd272f3a30763651f327c1aa36f0c770da3c799b9adbef388def184d",
+    ),
+    "US": (
+        "5230dca5a19119a416a8fe6fff475fc8bfa8c6c6c4b3646c02fe783d364bb11b",
+        "400b3071c626a59a6791e21fb24af141a4450104f4354480529aef585be2b565",
+    ),
+    "HK": (
+        "76feec3ad233995e1d6d257dd53cf437900aa31e71da62200963dfe61832b2e6",
+        "776ea47535165cf0b92d910b234d15cc1c05b72fcf77bb3f37b803fe6d27410a",
+    ),
+}
+ETF_UNIVERSE_STRATEGY_VERSIONS = {"CN": "v9", "US": "v6", "HK": "v6"}
 OVERHEAT_TRIM_COMPATIBILITY_PARAMETERS = {
     "overheat_trim_fraction": "0.30",
     "overheat_trim_once_per_position": True,
@@ -1000,6 +1016,19 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
                 and (old_hash, new_hash)
                 == UNIFIED_TREND_V5_PARAMETER_HASHES[key[0]]
             )
+            or (
+                key[0] in ETF_UNIVERSE_PARAMETER_HASHES
+                and key[1]
+                == (
+                    f"trend_animals_warm_to_hot/{key[0]}/"
+                    f"{ETF_UNIVERSE_STRATEGY_VERSIONS[key[0]]}"
+                )
+                and key[2] == ETF_UNIVERSE_STRATEGY_VERSIONS[key[0]]
+                and value["compatibility_revision"]
+                == ETF_UNIVERSE_COMPATIBILITY_REVISION
+                and (old_hash, new_hash)
+                == ETF_UNIVERSE_PARAMETER_HASHES[key[0]]
+            )
         )
         and _is_sha1(value["accepted_git_sha"])
     )
@@ -1051,6 +1080,23 @@ def _approved_unified_trend_v5_transition(
     )
 
 
+def _approved_etf_universe_transition(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> bool:
+    version = ETF_UNIVERSE_STRATEGY_VERSIONS.get(key[0])
+    expected = ETF_UNIVERSE_PARAMETER_HASHES.get(key[0])
+    return (
+        version is not None
+        and expected is not None
+        and key[1] == f"trend_animals_warm_to_hot/{key[0]}/{version}"
+        and key[2] == version
+        and old_hash == expected[0]
+        and strategy_parameter_hash(parameters) == expected[1]
+    )
+
+
 def _compatibility_transition_revision(
     key: tuple[str, str, str],
     parameters: Mapping[str, object],
@@ -1060,6 +1106,8 @@ def _compatibility_transition_revision(
         return OVERHEAT_TRIM_COMPATIBILITY_REVISION
     if _approved_unified_trend_v5_transition(key, parameters, old_hash):
         return UNIFIED_TREND_V5_COMPATIBILITY_REVISION
+    if _approved_etf_universe_transition(key, parameters, old_hash):
+        return ETF_UNIVERSE_COMPATIBILITY_REVISION
     return None
 
 

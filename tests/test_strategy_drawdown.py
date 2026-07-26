@@ -181,6 +181,91 @@ def _seed_legacy_v5_state(
     return data_dir
 
 
+@pytest.mark.parametrize(
+    ("market", "version", "pool_ids", "old_hash"),
+    [
+        (
+            "CN",
+            "v9",
+            (622466, 697199),
+            "ed65702b9b9fc4310cb3e0caf367e946e4eb1e96a018a8e26a1ed1363e2d02a3",
+        ),
+        (
+            "US",
+            "v6",
+            (622460, 705013),
+            "5230dca5a19119a416a8fe6fff475fc8bfa8c6c6c4b3646c02fe783d364bb11b",
+        ),
+        (
+            "HK",
+            "v6",
+            (622494, 707617),
+            "76feec3ad233995e1d6d257dd53cf437900aa31e71da62200963dfe61832b2e6",
+        ),
+    ],
+)
+def test_etf_universe_compatibility_transition_is_audited(
+    tmp_path: Path,
+    market: str,
+    version: str,
+    pool_ids: tuple[int, ...],
+    old_hash: str,
+) -> None:
+    data_dir = _seed_legacy_v5_state(
+        tmp_path,
+        market=market,
+        strategy_version=version,
+        parameter_hash=old_hash,
+    )
+    snapshot = live_trend_strategy_snapshot(
+        market, "verify", pool_ids, strategy_version=version
+    )
+    parameters = dict(snapshot["parameters"])
+
+    decision = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/{version}",
+        strategy_version=version,
+        parameters=parameters,
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha="c" * 40,
+        actor="acceptance",
+        occurred_at="2026-07-26T09:00:00+08:00",
+        reason="new_strategy_version",
+        entry_eligible_from=None,
+    )
+
+    event = decision["parameter_compatibility_event"]
+    assert event["old_parameter_hash"] == old_hash
+    assert event["new_parameter_hash"] == strategy_parameter_hash(parameters)
+    assert event["compatibility_revision"] == "trend_etf_universe_v1"
+    state_after_transition = (
+        data_dir / "trend_drawdown/state.json"
+    ).read_bytes()
+
+    replay = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        market=market,
+        strategy_id=f"trend_animals_warm_to_hot/{market}/{version}",
+        strategy_version=version,
+        parameters=parameters,
+        baseline_equity=None,
+        source_date=None,
+        accepted_git_sha="d" * 40,
+        actor="acceptance-replay",
+        occurred_at="2026-07-26T09:01:00+08:00",
+        reason="new_strategy_version",
+        entry_eligible_from=None,
+    )
+
+    assert replay == decision
+    assert (data_dir / "trend_drawdown/state.json").read_bytes() == (
+        state_after_transition
+    )
+
+
 @pytest.mark.parametrize("market", ["US", "HK"])
 def test_unified_v5_compatibility_transition_is_audited(
     tmp_path: Path, market: str

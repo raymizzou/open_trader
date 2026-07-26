@@ -226,18 +226,16 @@ def test_market_strategy_snapshot_matches_runtime_rules(
 
 
 @pytest.mark.parametrize(
-    ("market", "pools", "assets", "market_label"),
+    ("market", "pools", "market_label"),
     [
         (
             "US",
             (622460, 705013),
-            ["美股", "美国ETF"],
             "美股正股及美国 ETF",
         ),
         (
             "HK",
             (622494, 707617),
-            ["港股", "香港ETF"],
             "港股正股及香港 ETF",
         ),
     ],
@@ -245,14 +243,12 @@ def test_market_strategy_snapshot_matches_runtime_rules(
 def test_live_market_strategy_snapshot_defaults_to_v6_with_exact_inheritance(
     market: str,
     pools: tuple[int, ...],
-    assets: list[str],
     market_label: str,
 ) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
 
     assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/v6"
     assert snapshot["strategy_version"] == "v6"
-    assert snapshot["parameters"]["allowed_assets"] == assets
     assert {
         row["name"]: row["value"] for row in snapshot["parameter_rows"]
     }["交易市场"] == market_label
