@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-26
 
+- Published the ETF-enabled parameters under CN v10 and US/HK v7, inheriting
+  audited drawdown high-water marks and approved Kelly samples from v9/v6;
+  missing frozen baselines remain skippable while malformed baselines fail.
 - Allowed Dashboard acceptance to skip only a genuinely absent completed-date
   frozen drawdown baseline while preserving visible market-level evidence;
   Futu/calendar outages still block, malformed baseline artifacts still fail,
