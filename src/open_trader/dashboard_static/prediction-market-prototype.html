@@ -146,6 +146,17 @@
       .event-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
       .event-volume { font-variant-numeric: tabular-nums; font-weight: 800; text-align: right; }
       .event-state { color: var(--success); font-size: 12px; font-weight: 800; }
+      .event-state.warning { color: #8a5a16; }
+      .fee-policy-note {
+        background: #fff8e8;
+        border: 1px solid #e7cf9d;
+        border-radius: 8px;
+        color: #684816;
+        margin-bottom: 10px;
+        padding: 11px 13px;
+      }
+      .fee-policy-note strong { display: block; margin-bottom: 3px; }
+      .fee-policy-note p { margin: 0; }
       .event-markets {
         border-top: 1px solid var(--line);
         display: grid;
@@ -374,17 +385,17 @@
         C: "审计工作台",
       };
       const events = [
-        ["2026 年 9 月美联储是否降息？", "$15.4M", "8 个市场", "订阅正常"],
-        ["比特币会在 8 月突破 $150,000？", "$12.8M", "2 个市场", "订阅正常"],
-        ["美国 2026 年第三季度 GDP 增速区间", "$9.7M", "7 个市场", "订阅正常"],
-        ["以太坊会在 9 月前突破 $6,000？", "$7.1M", "2 个市场", "订阅正常"],
-        ["2026 年美国参议院控制权", "$6.8M", "12 个市场", "订阅正常"],
-        ["下一任美联储主席人选", "$5.9M", "14 个市场", "订阅正常"],
+        ["2026 年 9 月美联储是否降息？", "$15.4M", "8 个市场", "仅监控 · 费用待核验", "watch"],
+        ["比特币会在 8 月突破 $150,000？", "$12.8M", "2 个市场", "仅监控 · 费用待核验", "watch"],
+        ["以色列与伊朗停火是否持续至 8 月 31 日？", "$9.7M", "6 个市场", "可参与信号", "eligible"],
+        ["以太坊会在 9 月前突破 $6,000？", "$7.1M", "2 个市场", "仅监控 · 费用待核验", "watch"],
+        ["2026 年美国参议院控制权", "$6.8M", "12 个市场", "仅监控 · 费用待核验", "watch"],
+        ["下一任美联储主席人选", "$5.9M", "14 个市场", "仅监控 · 费用待核验", "watch"],
       ];
       const historyRows = [
-        ["今天 14:32:08", "美联储 9 月前降息？", "2m 14s", "$0.024", "80", "$1.92"],
-        ["今天 11:08:41", "BTC 8 月突破 $150k？", "18s", "$0.018", "120", "$2.16"],
-        ["昨天 22:17:04", "美国 Q3 GDP ≥ 3%？", "41s", "$0.013", "100", "$1.30"],
+        ["今天 14:32:08", "停火持续至 8 月 31 日？", "2m 14s", "$0.024", "80", "$1.92"],
+        ["今天 11:08:41", "地缘事件市场示例 B", "18s", "$0.018", "120", "$2.16"],
+        ["昨天 22:17:04", "地缘事件市场示例 C", "41s", "$0.013", "100", "$1.30"],
       ];
 
       function pageHead(subtitle, state) {
@@ -424,7 +435,7 @@
           <section class="metric-strip" aria-label="监控摘要">
             <article class="metric-card primary"><span>当前正式信号</span><strong>${signalCount}</strong><small>门槛：净边际 ≥ $0.01 且利润 ≥ $1</small></article>
             <article class="metric-card"><span>监控事件</span><strong>20</strong><small>按 24h 交易量动态筛选</small></article>
-            <article class="metric-card"><span>市场 / Token</span><strong>331 / 662</strong><small>5 分钟前刷新范围</small></article>
+            <article class="metric-card"><span>市场 / Token</span><strong>331 / 662</strong><small>包含“费用待核验”的仅监控市场</small></article>
             <article class="metric-card"><span>WebSocket</span><strong>${wsText}</strong><small><span class="health-pill ${wsClass}">Polymarket</span></small></article>
             <article class="metric-card"><span>过去 24 小时</span><strong>3</strong><small>历史确认信号</small></article>
           </section>`;
@@ -436,11 +447,11 @@
             <summary>
               <div><div class="event-title">${event[0]}</div><div class="event-meta">${event[2]} · 排名 #${index + 1}</div></div>
               <div class="event-volume">${event[1]}</div>
-              <div class="event-state">${event[3]}</div>
+              <div class="event-state ${event[4] === "watch" ? "warning" : ""}">${event[3]}</div>
             </summary>
             <div class="event-markets">
-              <div class="event-market-line"><span>${index === 0 ? "9 月 17 日前降息？" : "主要二元市场"}</span><span>YES / NO 已订阅</span></div>
-              <div class="event-market-line"><span>${index === 0 ? "9 月会议降息至少 25bp？" : "关联二元市场"}</span><span>YES / NO 已订阅</span></div>
+              <div class="event-market-line"><span>${index === 0 ? "9 月 17 日前降息？" : "主要二元市场"}</span><span>${event[4] === "watch" ? "已订阅 · 不产生正式信号" : "已订阅 · 可参与信号"}</span></div>
+              <div class="event-market-line"><span>${index === 0 ? "9 月会议降息至少 25bp？" : "关联二元市场"}</span><span>${event[4] === "watch" ? "费用规则待核验" : "费用为零或已核验"}</span></div>
             </div>
           </details>`).join("");
       }
@@ -460,7 +471,7 @@
             <section class="variant-b-hero">
               <div>
                 <span class="signal-pill">REST 已确认 · 持续 38 秒</span>
-                <h2>美联储会在 2026 年 9 月会议前降息吗？</h2>
+                <h2>以色列与伊朗停火是否持续至 2026 年 8 月 31 日？</h2>
                 <p>Polymarket · 同一市场 YES + NO 组合套利</p>
                 <div class="variant-b-facts">
                   <div><span>YES 最优卖价</span><strong>$0.470</strong></div>
@@ -475,7 +486,7 @@
         return `
           <article class="panel signal-card">
             <div class="signal-title-row">
-              <div><h3>美联储会在 2026 年 9 月会议前降息吗？</h3><p>Polymarket · REST 已确认 · 持续 38 秒</p></div>
+              <div><h3>以色列与伊朗停火是否持续至 2026 年 8 月 31 日？</h3><p>Polymarket · 费用为零 · REST 已确认 · 持续 38 秒</p></div>
               <span class="signal-pill">正式信号</span>
             </div>
             <dl class="signal-metrics">
@@ -517,6 +528,7 @@
           ${pageHead("先确认系统在监控什么，再查看当前与历史信号。", state)}
           ${degradedAlert(state)}
           ${metricStrip(state)}
+          <aside class="fee-policy-note"><strong>费用待核验市场仍会监控，但不会产生正式信号</strong><p>这样可以看到完整监控范围，同时避免把费用计算不确定的价差误报为套利。</p></aside>
           <div class="layout-a">
             <section class="panel">
               <header class="panel-heading"><div><h2>当前监控范围</h2><p>完整 Top 20 事件；展开查看具体市场。</p></div><span class="count-pill">显示 6 / 20</span></header>
