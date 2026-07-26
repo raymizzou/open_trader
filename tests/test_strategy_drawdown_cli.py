@@ -186,7 +186,10 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
 
     monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
     monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
-    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    def unexpected_build_notifier(config: object) -> object:
+        raise AssertionError("acceptance must not build an external notifier")
+
+    monkeypatch.setattr(cli, "build_notifier", unexpected_build_notifier)
     monkeypatch.setattr(cli, "require_trend_review_config", lambda cfg, market: 101)
     monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
     monkeypatch.setattr(
@@ -426,7 +429,13 @@ def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_base
 
     monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
     monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
-    monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
+    built_notifiers: list[object] = []
+
+    def build_recording_notifier(current_config: object) -> cli.NullNotifier:
+        built_notifiers.append(current_config)
+        return cli.NullNotifier()
+
+    monkeypatch.setattr(cli, "build_notifier", build_recording_notifier)
     monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
     monkeypatch.setattr(
         cli,
@@ -470,3 +479,4 @@ def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_base
     assert [item["status"] for item in output["markets"]] == [
         "ready", "ready", "ready"
     ]
+    assert built_notifiers == [config]
