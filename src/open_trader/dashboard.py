@@ -180,6 +180,17 @@ class DashboardConfig:
     trend_review_us_simulate_acc_id: int = 0
     trend_review_hk_simulate_acc_id: int = 0
     trend_executor_host: str = ""
+    trend_cn_candidate_pool_ids: tuple[int, ...] = ()
+    trend_us_candidate_pool_ids: tuple[int, ...] = ()
+    trend_hk_candidate_pool_ids: tuple[int, ...] = ()
+
+    @property
+    def trend_candidate_pool_ids(self) -> dict[str, tuple[int, ...]]:
+        return {
+            "CN": self.trend_cn_candidate_pool_ids,
+            "US": self.trend_us_candidate_pool_ids,
+            "HK": self.trend_hk_candidate_pool_ids,
+        }
 
 
 @dataclass(frozen=True)
@@ -346,6 +357,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             config.reports_dir,
             broker_positions=broker_positions,
             cash_details=raw_cash_details,
+            current_candidate_pool_ids=config.trend_candidate_pool_ids,
         ),
         trend_reviews=_load_trend_reviews(config.data_dir),
         trend_controllers=_load_trend_controllers(
@@ -648,6 +660,7 @@ def _load_trend_reports(
     now: datetime | None = None,
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
+    current_candidate_pool_ids: dict[str, tuple[int, ...]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if broker_positions is None or cash_details is None:
         broker_positions, cash_details = _latest_broker_details(data_dir)
@@ -665,6 +678,9 @@ def _load_trend_reports(
             ).isoformat(),
             broker_positions=broker_positions,
             cash_details=cash_details,
+            current_candidate_pool_ids=(
+                current_candidate_pool_ids or {}
+            ).get(market, ()),
         )
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
@@ -775,7 +791,12 @@ def load_trend_report_history(
 
 
 def load_historical_trend_report(
-    data_dir: Path, reports_dir: Path, *, broker: str, artifact: str
+    data_dir: Path,
+    reports_dir: Path,
+    *,
+    broker: str,
+    artifact: str,
+    current_candidate_pool_ids: dict[str, tuple[int, ...]] | None = None,
 ) -> dict[str, Any]:
     """Return the same report projection used by the current-report UI."""
     try:
@@ -822,6 +843,9 @@ def load_historical_trend_report(
         report_date=_shanghai_date().isoformat(),
         broker_positions=broker_positions,
         cash_details=cash_details,
+        current_candidate_pool_ids=(
+            current_candidate_pool_ids or {}
+        ).get(market, ()),
     )
 
 
@@ -1702,6 +1726,7 @@ def _load_broker_trend_report(
     report_date: str,
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
+    current_candidate_pool_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     unavailable = {
         "available": False,
@@ -1730,6 +1755,7 @@ def _load_broker_trend_report(
         broker_positions=broker_positions,
         cash_details=cash_details,
         use_execution_batch=True,
+        current_candidate_pool_ids=current_candidate_pool_ids,
     )
 
 
@@ -1747,6 +1773,7 @@ def _project_broker_trend_report(
     broker_positions: list[dict[str, str]] | None = None,
     cash_details: list[dict[str, str]] | None = None,
     use_execution_batch: bool = False,
+    current_candidate_pool_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     _, latest_payload, *_ = selected
     latest_report_sha256 = _report_hash(latest_payload)
@@ -1925,14 +1952,19 @@ def _project_broker_trend_report(
     if not isinstance(frozen_parameter_rows, list):
         frozen_parameter_rows = []
     candidate_pool_ids = strategy_parameters.get("candidate_pool_ids")
+    projected_candidate_pool_ids = (
+        list(current_candidate_pool_ids)
+        if current_candidate_pool_ids
+        else candidate_pool_ids
+    )
     current_strategy_snapshot = (
         live_trend_strategy_snapshot(
             market,
             str(strategy_snapshot.get("process_version") or ""),
-            candidate_pool_ids,
+            projected_candidate_pool_ids,
         )
         if isinstance(strategy_snapshot, dict)
-        and isinstance(candidate_pool_ids, list)
+        and isinstance(projected_candidate_pool_ids, list)
         else {}
     )
     actual_overlay = _project_trend_actual_overlay(

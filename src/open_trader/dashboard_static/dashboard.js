@@ -2095,7 +2095,7 @@ function renderTrendReviewWorkspace(review, embedded = false) {
 }
 
 function renderTrendAction(item, kind, report) {
-  const identity = [item.symbol, item.name].filter(Boolean).map(formatPlain).join(" ");
+  const identity = cnTrendIdentity(item);
   const reason = trendReasonLabel(item, report);
   const fields = [identity];
   if (kind === "buy") {
@@ -2133,7 +2133,7 @@ function renderTrendAudit(audit) {
   const dataSources = Array.isArray(audit.data_sources) ? audit.data_sources : [];
   return `<details class="trend-audit"><summary>审计详情</summary>
     <section><h3>候选榜</h3><ol>${candidates.length
-      ? candidates.map((item) => `<li>${escapeHtml([item.symbol, item.name, `强度 ${formatDisplayNumber(item.strength)}`].filter(Boolean).map(formatPlain).join("｜"))}</li>`).join("")
+      ? candidates.map((item) => `<li>${escapeHtml([cnTrendIdentity(item), `强度 ${formatDisplayNumber(item.strength)}`].filter(Boolean).map(formatPlain).join("｜"))}</li>`).join("")
       : "<li>无</li>"}</ol></section>
     <section><h3>排除项</h3><ul>${Object.entries(excluded).length
       ? Object.entries(excluded).map(([symbol, reasons]) => `<li>${escapeHtml(formatPlain(symbol))}｜${escapeHtml((Array.isArray(reasons) ? reasons : []).map((reason) => TREND_REASON_LABELS[reason] || "未知原因").join("、"))}</li>`).join("")
@@ -2161,7 +2161,10 @@ function renderCnTrendCell(label, value, ariaLabel = "") {
 }
 
 function cnTrendIdentity(item) {
-  return [item.symbol, item.name].filter(hasValue).map(formatPlain).join(" ") || "-";
+  const identity = [item.symbol, item.name].filter(hasValue).map(formatPlain).join(" ") || "-";
+  return String(item.asset || item.asset_class || "").toUpperCase().includes("ETF")
+    ? `${identity}（ETF）`
+    : identity;
 }
 
 function cnTrendTemperature(item) {

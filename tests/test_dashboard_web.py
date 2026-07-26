@@ -9481,6 +9481,32 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_explicitly_labels_etfs_in_actions_and_candidate_audit() -> None:
+    output = run_dashboard_js(r'''
+const etf = {symbol:"SCHD",name:"Schwab 美国红利股ETF",asset:"美国ETF"};
+const stock = {symbol:"AAPL",name:"苹果",asset:"美股"};
+console.log(JSON.stringify({
+  actions: renderMarketBuyStage({
+    buy_actions: [
+      {...etf,estimated_shares:1,target_amount:"100",estimated_initial_line:"90"},
+      {...stock,estimated_shares:1,target_amount:"100",estimated_initial_line:"90"},
+    ],
+    risk_skips: [],
+  }),
+  audit: renderTrendAudit({
+    candidates: [{...etf,strength:"96"},{...stock,strength:"95"}],
+    excluded: {},
+  }),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "SCHD Schwab 美国红利股ETF（ETF）" in rendered["actions"]
+    assert "SCHD Schwab 美国红利股ETF（ETF）" in rendered["audit"]
+    assert "AAPL 苹果（ETF）" not in rendered["actions"]
+    assert "AAPL 苹果（ETF）" not in rendered["audit"]
+
+
 def test_dashboard_uses_market_neutral_empty_discipline_state_without_current_rules() -> None:
     output = run_dashboard_js(r'''
 const report = (market) => ({

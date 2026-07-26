@@ -1651,6 +1651,44 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
     assert projected["audit"]["actual_api_cost"] == payload["actual_api_cost"]
 
 
+def test_dashboard_current_discipline_uses_configured_multi_pool_universe(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-24.json",
+        execution_date="2026-07-24",
+        generated_at="2026-07-24T09:00:00+08:00",
+    )
+    payload["strategy_snapshot"] = {
+        "strategy_version": "v1",
+        "process_version": "old-report",
+        "parameters": {"candidate_pool_ids": [622460]},
+    }
+    (
+        config.reports_dir / "trend_us_tiger/2026-07-24.json"
+    ).write_text(json.dumps(payload), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 24),
+        current_candidate_pool_ids={
+            "US": (622460, 705013),
+            "HK": (622494, 707617),
+            "CN": (622466, 697199),
+        },
+    )["tiger"]
+    current_rows = {
+        row["name"]: row["value"]
+        for row in projected["current_strategy_parameter_rows"]
+    }
+
+    assert current_rows["趋势动物组合"] == "622460、705013"
+    assert current_rows["交易市场"] == "美股正股及美国 ETF"
+
+
 def test_dashboard_rejects_malformed_frozen_cost_projection(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_a_share/2026-07-15.json"

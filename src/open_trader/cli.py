@@ -26,6 +26,7 @@ from .backtest import run_backtest
 from .daily_premarket import (
     DailyPremarketRunner,
     _optional_positive_tm_id,
+    _positive_tm_ids,
     _read_env_file,
     build_notifier,
     load_env_config,
@@ -2484,6 +2485,32 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "trend review simulate account IDs must be distinct"
                 )
+            candidate_pool_ids = {
+                "CN": tuple(
+                    item
+                    for item in (
+                        _optional_positive_tm_id(
+                            config_values,
+                            "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID",
+                        ),
+                        _optional_positive_tm_id(
+                            config_values,
+                            "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID",
+                        ),
+                    )
+                    if item
+                ),
+                "US": _positive_tm_ids(
+                    config_values.get(
+                        "TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS", ""
+                    )
+                ),
+                "HK": _positive_tm_ids(
+                    config_values.get(
+                        "TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS", ""
+                    )
+                ),
+            }
         except ValueError as exc:
             parser.error(str(exc))
         config = DashboardConfig(
@@ -2499,6 +2526,9 @@ def main(argv: list[str] | None = None) -> int:
             trend_executor_host=config_values.get(
                 "OPEN_TRADER_TREND_EXECUTOR_HOST", ""
             ).strip(),
+            trend_cn_candidate_pool_ids=candidate_pool_ids["CN"],
+            trend_us_candidate_pool_ids=candidate_pool_ids["US"],
+            trend_hk_candidate_pool_ids=candidate_pool_ids["HK"],
         )
         serve_dashboard(
             config,

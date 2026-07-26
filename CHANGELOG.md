@@ -3,6 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-26
+
+- Fixed trend-report source universes to use the configured CN/US/HK stock and
+  ETF pools instead of stale frozen-report pool IDs; Dashboard and Markdown
+  reports now label ETF candidates and buy actions explicitly. Verified the
+  focused suites and current production report projection.
+
 ## 2026-07-25
 
 - Expanded trend selection to mainland-China, US, and Hong Kong ETFs: CN v9

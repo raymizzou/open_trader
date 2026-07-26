@@ -360,6 +360,9 @@ def create_dashboard_server(
                                 config.reports_dir,
                                 broker=route[0],
                                 artifact=unquote(route[2]),
+                                current_candidate_pool_ids=(
+                                    config.trend_candidate_pool_ids
+                                ),
                             )
                         except FileNotFoundError as exc:
                             self._send_error_json(exc, HTTPStatus.NOT_FOUND)

@@ -748,6 +748,16 @@ def live_trend_strategy_snapshot(
             for item in ("v4", "v7", "v8", "v9")
         ]
     if version == "v6" and market in {"US", "HK"}:
+        parameters["allowed_assets"] = (
+            ["美股", "美国ETF"] if market == "US" else ["港股", "香港ETF"]
+        )
+        for row in rows:
+            if row["name"] == "交易市场":
+                row["value"] = (
+                    "美股正股及美国 ETF"
+                    if market == "US"
+                    else "港股正股及香港 ETF"
+                )
         parameters["kelly_sample_inherits"] = [
             {
                 "market": market,
@@ -1019,6 +1029,7 @@ class BuyAction:
     planned_stop_risk_pct: Decimal
     normal_cost: Decimal
     decisive_constraint: str
+    asset: str = ""
 
 
 @dataclass(frozen=True)
@@ -2104,6 +2115,7 @@ def _estimate_buy_actions_v1(
                 planned_stop_risk_pct=Decimal("0"),
                 normal_cost=Decimal("0"),
                 decisive_constraint="",
+                asset=item.asset,
             )
         )
         remaining_cash -= amount
@@ -2444,6 +2456,7 @@ def _plan_buy_actions(
                     and sized.decisive_constraint == "名义仓位上限"
                     else sized.decisive_constraint
                 ),
+                asset=item.asset,
             )
         )
         remaining_cash -= sized.cash_required
@@ -3699,6 +3712,11 @@ def render_markdown(report: TrendReport) -> str:
         {"CNY": "元", "USD": "美元", "HKD": "港元"}.get(account_currency)
         or {"CN": "元", "US": "美元", "HK": "港元"}.get(market, "")
     )
+
+    def identity(item: CandidateInput | BuyAction) -> str:
+        suffix = "（ETF）" if "ETF" in item.asset.upper() else ""
+        return f"{item.symbol} {item.name}{suffix}"
+
     freshness = (
         "已更新"
         if report.account.fresh is True
@@ -3832,7 +3850,7 @@ def render_markdown(report: TrendReport) -> str:
         for index, item in enumerate(report.buy_actions, 1):
             if market == "CN":
                 lines.append(
-                    f"- {index}. {item.symbol} {item.name}｜"
+                    f"- {index}. {identity(item)}｜"
                     f"筛选价 {_money(item.filter_price)} 元（Trend Animals）｜"  # type: ignore[arg-type]
                     f"执行参考价 {_money(item.close)} 元（富途前复权日线）｜"
                     f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
@@ -3845,7 +3863,7 @@ def render_markdown(report: TrendReport) -> str:
                 )
             else:
                 lines.append(
-                    f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
+                    f"- {index}. {identity(item)}｜约 {item.estimated_shares} 股｜"
                     f"金额上限 {_money(item.target_amount)} {currency}｜"
                     f"预计保护线 {_money(item.estimated_initial_line)}"
                 )
@@ -3892,7 +3910,7 @@ def render_markdown(report: TrendReport) -> str:
                 item.industry, (0, Decimal("0"))
             )
             lines.append(
-                f"- {index}. {item.symbol} {item.name}｜强度 {item.strength}｜"
+                f"- {index}. {identity(item)}｜强度 {item.strength}｜"
                 f"右侧 {item.days} 天｜成交额 {item.amount} 亿元｜"
                 + (
                     f"筛选价 {item.filter_price} 元｜执行参考价 {item.close} 元｜"

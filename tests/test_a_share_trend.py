@@ -3593,6 +3593,40 @@ def test_markdown_prioritizes_actions_before_source_summary() -> None:
     assert "## API 原始事实" not in markdown
 
 
+def test_markdown_explicitly_labels_etf_candidates_and_buy_actions() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v9"
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(
+            candidate("511020", name="国债ETF平安", asset="ETF基金"),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        process_version="abc123",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=snapshot,
+    )
+    built = replace(
+        built,
+        buy_actions=tuple(
+            estimate_buy_actions(
+                ranked=built.candidates,
+                net_value=built.account.net_value,
+                available_cash=built.account.available_cash,
+                current_position_count=0,
+                position_weight=Decimal("0.04"),
+            )
+        ),
+    )
+
+    assert built.buy_actions[0].asset == "ETF基金"
+    assert "511020 国债ETF平安（ETF）" in render_markdown(built)
+
+
 def test_trend_feishu_text_lists_actions_but_only_counts_holds() -> None:
     payload = {
         "execution_date": "2026-07-15",
