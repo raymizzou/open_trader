@@ -1636,7 +1636,7 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
     assert projected["strategy_parameter_rows"] == payload["strategy_snapshot"][
         "parameter_rows"
     ]
-    assert projected["current_strategy_version"] == "v9"
+    assert projected["current_strategy_version"] == "v10"
     current_rows = {
         row["name"]: row["value"]
         for row in projected["current_strategy_parameter_rows"]
@@ -1921,7 +1921,7 @@ def test_dashboard_accepts_cn_v7_risk_and_drawdown_contract() -> None:
     assert dashboard_module._valid_trend_risk_summary(payload)
 
 
-@pytest.mark.parametrize("strategy_version", ["v5", "v8", "v9"])
+@pytest.mark.parametrize("strategy_version", ["v5", "v8", "v9", "v10"])
 def test_dashboard_accepts_current_live_risk_and_drawdown_contract(
     strategy_version: str,
 ) -> None:

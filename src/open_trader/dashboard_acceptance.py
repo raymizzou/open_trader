@@ -47,9 +47,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9"}),
-    "US": frozenset({"v4", "v5", "v6"}),
-    "HK": frozenset({"v4", "v5", "v6"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10"}),
+    "US": frozenset({"v4", "v5", "v6", "v7"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7"}),
 }
 ACCOUNT_VIEW_LABELS = {
     "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
@@ -2200,7 +2200,14 @@ def _trend_action_reason_label(
     if reason == "protection_line_already_triggered" and (
         market,
         version,
-    ) in {("CN", "v9"), ("US", "v6"), ("HK", "v6")}:
+    ) in {
+        ("CN", "v9"),
+        ("CN", "v10"),
+        ("US", "v6"),
+        ("US", "v7"),
+        ("HK", "v6"),
+        ("HK", "v7"),
+    }:
         try:
             initial = Decimal(str(item.get("initial_line")))
             active = Decimal(str(item.get("active_line")))
