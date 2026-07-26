@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Open Trader · 预测市场 UI 原型</title>
+    <link rel="stylesheet" href="dashboard.css">
+    <style>
+      /* PROTOTYPE ONLY — compare UI structures; do not promote this file to production. */
+      body { padding-bottom: 88px; }
+      button { cursor: pointer; }
+      .prototype-shell { margin: 0 auto; max-width: 1600px; min-height: 100vh; padding: 16px; }
+      .prototype-topbar {
+        align-items: center;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        display: flex;
+        gap: 18px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        min-height: 70px;
+        padding: 14px;
+      }
+      .prototype-brand { align-items: baseline; display: flex; flex-wrap: wrap; gap: 9px; }
+      .prototype-brand strong { font-size: 20px; letter-spacing: -0.03em; }
+      .prototype-brand span { color: var(--muted); font-weight: 700; }
+      .prototype-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+      .prototype-nav button,
+      .prototype-tab,
+      .prototype-state-button {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        color: var(--text);
+        min-height: 40px;
+        padding: 8px 13px;
+      }
+      .prototype-nav button[aria-current="page"],
+      .prototype-tab.active {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: var(--on-primary);
+        font-weight: 800;
+      }
+      .prototype-page-head {
+        align-items: end;
+        display: flex;
+        gap: 20px;
+        justify-content: space-between;
+        margin: 18px 0 12px;
+      }
+      .prototype-page-head h1 { font-size: 25px; margin: 0 0 5px; }
+      .prototype-page-head p { color: var(--muted); margin: 0; }
+      .prototype-updated { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+      .status-line { align-items: center; display: inline-flex; gap: 7px; }
+      .status-dot { background: var(--success); border-radius: 999px; height: 8px; width: 8px; }
+      .status-dot.warning { background: #b7791f; }
+      .status-dot.danger { background: var(--danger); }
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        min-width: 0;
+        padding: 14px;
+      }
+      .panel h2, .panel h3 { margin: 0; }
+      .panel-heading {
+        align-items: start;
+        display: flex;
+        gap: 16px;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+      .panel-heading p { color: var(--muted); margin: 4px 0 0; }
+      .count-pill, .venue-pill, .signal-pill, .health-pill {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 800;
+        line-height: 1;
+        padding: 7px 9px;
+        white-space: nowrap;
+      }
+      .venue-pill { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
+      .signal-pill { background: #f5eadf; border-color: #dfc4aa; color: #73451f; }
+      .health-pill.ok { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
+      .health-pill.bad { background: #fbe9e7; border-color: #efb6af; color: #8b221a; }
+      .metric-strip {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        margin-bottom: 10px;
+      }
+      .metric-card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-width: 0;
+        padding: 13px;
+      }
+      .metric-card span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 8px; }
+      .metric-card strong { display: block; font-size: 20px; }
+      .metric-card small { color: var(--muted); display: block; margin-top: 5px; }
+      .metric-card.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+      .metric-card.primary span, .metric-card.primary small { color: #d9d5ce; }
+      .alert {
+        align-items: start;
+        background: #fff5f3;
+        border: 1px solid #efb6af;
+        border-radius: 8px;
+        color: #7a211a;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        padding: 13px 14px;
+      }
+      .alert strong { display: block; margin-bottom: 3px; }
+      .alert p { margin: 0; }
+      .layout-a { display: grid; gap: 10px; grid-template-columns: minmax(430px, 0.9fr) minmax(560px, 1.1fr); }
+      .stack { display: grid; gap: 10px; }
+      .event-list { display: grid; gap: 8px; }
+      .event-row {
+        background: var(--surface-soft);
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 0;
+      }
+      .event-row[open] { background: var(--surface); border-color: var(--line); }
+      .event-row summary {
+        align-items: center;
+        cursor: pointer;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        list-style: none;
+        min-height: 52px;
+        padding: 10px 12px;
+      }
+      .event-row summary::-webkit-details-marker { display: none; }
+      .event-title { font-weight: 750; min-width: 0; }
+      .event-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+      .event-volume { font-variant-numeric: tabular-nums; font-weight: 800; text-align: right; }
+      .event-state { color: var(--success); font-size: 12px; font-weight: 800; }
+      .event-markets {
+        border-top: 1px solid var(--line);
+        display: grid;
+        gap: 7px;
+        padding: 10px 12px 12px;
+      }
+      .event-market-line { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
+      .event-market-line span:last-child { color: var(--muted); white-space: nowrap; }
+      .signal-card {
+        border-left: 4px solid var(--success);
+        display: grid;
+        gap: 12px;
+      }
+      .signal-title-row { align-items: start; display: flex; gap: 12px; justify-content: space-between; }
+      .signal-title-row h3 { font-size: 17px; line-height: 1.35; }
+      .signal-title-row p { color: var(--muted); margin: 4px 0 0; }
+      .signal-metrics { display: grid; gap: 8px; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .signal-metrics div { background: var(--surface-soft); border-radius: 6px; padding: 10px; }
+      .signal-metrics dt { color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+      .signal-metrics dd { font-size: 15px; font-weight: 850; margin: 0; }
+      .positive { color: var(--success); }
+      .empty-state {
+        align-items: center;
+        display: grid;
+        justify-items: center;
+        min-height: 210px;
+        padding: 30px;
+        text-align: center;
+      }
+      .empty-state strong { font-size: 18px; margin-bottom: 8px; }
+      .empty-state p { color: var(--muted); margin: 0; max-width: 520px; }
+      .data-table { border-collapse: collapse; width: 100%; }
+      .data-table th, .data-table td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; vertical-align: top; }
+      .data-table th { color: var(--muted); font-size: 11px; letter-spacing: 0.03em; text-transform: uppercase; }
+      .data-table td { font-variant-numeric: tabular-nums; }
+      .data-table tr:last-child td { border-bottom: 0; }
+      .history-filter { display: flex; gap: 6px; }
+      .history-filter button {
+        background: transparent;
+        border: 0;
+        border-radius: 5px;
+        color: var(--muted);
+        min-height: 34px;
+        padding: 6px 9px;
+      }
+      .history-filter button.active { background: var(--surface-soft); color: var(--text); font-weight: 800; }
+      .variant-b-hero {
+        background: var(--primary);
+        border-radius: 10px;
+        color: var(--on-primary);
+        display: grid;
+        gap: 24px;
+        grid-template-columns: minmax(0, 1.25fr) minmax(340px, 0.75fr);
+        margin-bottom: 10px;
+        padding: 24px;
+      }
+      .variant-b-hero h2 { font-size: 24px; line-height: 1.25; margin: 8px 0 6px; }
+      .variant-b-hero p { color: #d9d5ce; margin: 0; }
+      .hero-profit { align-content: center; display: grid; justify-items: end; }
+      .hero-profit span { color: #d9d5ce; }
+      .hero-profit strong { color: #9ce0b6; font-size: 42px; letter-spacing: -0.04em; margin: 5px 0; }
+      .hero-profit small { color: #d9d5ce; }
+      .variant-b-facts { display: grid; gap: 8px; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 18px; }
+      .variant-b-facts div { border-left: 1px solid #5d5953; padding-left: 12px; }
+      .variant-b-facts span { color: #bbb6ae; display: block; font-size: 11px; }
+      .variant-b-facts strong { display: block; margin-top: 4px; }
+      .layout-b { display: grid; gap: 10px; grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr); }
+      .compact-event-list { display: grid; gap: 0; }
+      .compact-event {
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        display: grid;
+        gap: 8px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding: 10px 0;
+      }
+      .compact-event:last-child { border-bottom: 0; }
+      .compact-event span { color: var(--muted); font-size: 12px; }
+      .variant-c-layout { display: grid; gap: 10px; grid-template-columns: 220px minmax(480px, 1fr) 360px; }
+      .status-rail { align-content: start; display: grid; gap: 8px; }
+      .rail-section { border-bottom: 1px solid var(--line); padding: 2px 0 12px; }
+      .rail-section:last-child { border-bottom: 0; }
+      .rail-section span { color: var(--muted); display: block; font-size: 11px; margin-bottom: 5px; }
+      .rail-section strong { display: block; line-height: 1.35; }
+      .audit-stream { display: grid; gap: 8px; }
+      .audit-entry {
+        border-left: 3px solid var(--line);
+        display: grid;
+        gap: 10px;
+        grid-template-columns: 92px minmax(0, 1fr) auto;
+        padding: 9px 0 9px 12px;
+      }
+      .audit-entry.signal { border-left-color: var(--success); }
+      .audit-entry.warning { border-left-color: #b7791f; }
+      .audit-entry time { color: var(--muted); font-variant-numeric: tabular-nums; }
+      .audit-entry p { color: var(--muted); margin: 4px 0 0; }
+      .audit-entry strong:last-child { font-variant-numeric: tabular-nums; }
+      .monitor-queue { display: grid; gap: 7px; }
+      .monitor-queue article { background: var(--surface-soft); border-radius: 6px; padding: 10px; }
+      .monitor-queue article strong { display: block; line-height: 1.35; }
+      .monitor-queue article div { color: var(--muted); display: flex; font-size: 12px; gap: 10px; justify-content: space-between; margin-top: 6px; }
+      .prototype-controller {
+        align-items: center;
+        background: #171512;
+        border: 1px solid #3b3832;
+        border-radius: 12px;
+        bottom: 16px;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
+        color: white;
+        display: flex;
+        gap: 12px;
+        left: 50%;
+        max-width: calc(100vw - 24px);
+        padding: 8px;
+        position: fixed;
+        transform: translateX(-50%);
+        z-index: 1000;
+      }
+      .prototype-controller-label { min-width: 210px; padding: 0 6px; }
+      .prototype-controller-label small { color: #bcb6ac; display: block; margin-bottom: 3px; }
+      .prototype-controller-label strong { display: block; }
+      .prototype-arrow {
+        background: #34302b;
+        border: 1px solid #575149;
+        border-radius: 8px;
+        color: white;
+        font-size: 20px;
+        height: 44px;
+        width: 44px;
+      }
+      .prototype-states { display: flex; gap: 6px; }
+      .prototype-state-button { background: #2a2723; border-color: #4b463f; color: #ddd7cd; min-height: 38px; }
+      .prototype-state-button.active { background: #f3eee6; border-color: #f3eee6; color: #201d18; font-weight: 800; }
+      .prototype-note {
+        background: #f4eadb;
+        border: 1px dashed #c49b6b;
+        border-radius: 7px;
+        color: #68441f;
+        margin-bottom: 10px;
+        padding: 9px 12px;
+      }
+      @media (max-width: 1050px) {
+        .metric-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .layout-a, .layout-b, .variant-b-hero { grid-template-columns: 1fr; }
+        .hero-profit { justify-items: start; }
+        .variant-c-layout { grid-template-columns: 190px minmax(0, 1fr); }
+        .variant-c-layout > :last-child { grid-column: 1 / -1; }
+      }
+      @media (max-width: 720px) {
+        body { padding-bottom: 142px; }
+        .prototype-shell { padding: 10px; }
+        .prototype-topbar, .prototype-page-head { align-items: stretch; display: grid; }
+        .prototype-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .prototype-nav button { min-height: 44px; }
+        .prototype-updated { text-align: left; }
+        .metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .metric-card.primary { grid-column: 1 / -1; }
+        .signal-metrics, .variant-b-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .event-row summary { grid-template-columns: minmax(0, 1fr) auto; }
+        .event-state { display: none; }
+        .variant-b-hero { padding: 18px; }
+        .hero-profit strong { font-size: 34px; }
+        .variant-c-layout { grid-template-columns: 1fr; }
+        .variant-c-layout > :last-child { grid-column: auto; }
+        .status-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .audit-entry { grid-template-columns: 75px minmax(0, 1fr); }
+        .audit-entry > strong:last-child { grid-column: 2; }
+        .data-table thead { display: none; }
+        .data-table, .data-table tbody, .data-table tr, .data-table td { display: block; width: 100%; }
+        .data-table tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
+        .data-table tr:last-child { border-bottom: 0; }
+        .data-table td { border: 0; display: grid; gap: 8px; grid-template-columns: 88px minmax(0, 1fr); padding: 5px 0; }
+        .data-table td::before { color: var(--muted); content: attr(data-label); font-size: 11px; font-weight: 800; }
+        .prototype-controller { align-items: stretch; display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; width: calc(100vw - 20px); }
+        .prototype-controller-label { min-width: 0; text-align: center; }
+        .prototype-states { grid-column: 1 / -1; justify-content: center; }
+      }
+      @media (max-width: 390px) {
+        .metric-strip, .status-rail { grid-template-columns: 1fr; }
+        .metric-card.primary { grid-column: auto; }
+        .signal-metrics, .variant-b-facts { grid-template-columns: 1fr 1fr; }
+        .event-volume { font-size: 12px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="prototype-shell">
+      <header class="prototype-topbar">
+        <div class="prototype-brand">
+          <strong>Open Trader</strong>
+          <span>持仓实时看板</span>
+        </div>
+        <nav class="prototype-nav" aria-label="一级导航">
+          <button type="button">持仓</button>
+          <button type="button" aria-current="page">预测市场</button>
+          <button type="button">策略回测</button>
+          <button type="button">凯利实验室</button>
+        </nav>
+      </header>
+      <aside class="prototype-note">
+        UI 设计原型：所有数据均为演示数据；底部控制器不会进入正式产品。
+      </aside>
+      <main id="prototype-root" aria-live="polite"></main>
+    </div>
+
+    <div class="prototype-controller" role="region" aria-label="原型切换器">
+      <button id="previous-variant" class="prototype-arrow" type="button" aria-label="上一套设计">←</button>
+      <div class="prototype-controller-label">
+        <small>UI 结构方案</small>
+        <strong id="variant-label">A — 运营控制台</strong>
+      </div>
+      <button id="next-variant" class="prototype-arrow" type="button" aria-label="下一套设计">→</button>
+      <div class="prototype-states" aria-label="演示状态">
+        <button class="prototype-state-button" type="button" data-state="live">有信号</button>
+        <button class="prototype-state-button" type="button" data-state="quiet">无信号</button>
+        <button class="prototype-state-button" type="button" data-state="degraded">连接异常</button>
+        <button class="prototype-state-button" type="button" data-state="loading">加载中</button>
+      </div>
+    </div>
+
+    <script>
+      const variants = ["A", "B", "C"];
+      const names = {
+        A: "运营控制台",
+        B: "信号优先",
+        C: "审计工作台",
+      };
+      const events = [
+        ["2026 年 9 月美联储是否降息？", "$15.4M", "8 个市场", "订阅正常"],
+        ["比特币会在 8 月突破 $150,000？", "$12.8M", "2 个市场", "订阅正常"],
+        ["美国 2026 年第三季度 GDP 增速区间", "$9.7M", "7 个市场", "订阅正常"],
+        ["以太坊会在 9 月前突破 $6,000？", "$7.1M", "2 个市场", "订阅正常"],
+        ["2026 年美国参议院控制权", "$6.8M", "12 个市场", "订阅正常"],
+        ["下一任美联储主席人选", "$5.9M", "14 个市场", "订阅正常"],
+      ];
+      const historyRows = [
+        ["今天 14:32:08", "美联储 9 月前降息？", "2m 14s", "$0.024", "80", "$1.92"],
+        ["今天 11:08:41", "BTC 8 月突破 $150k？", "18s", "$0.018", "120", "$2.16"],
+        ["昨天 22:17:04", "美国 Q3 GDP ≥ 3%？", "41s", "$0.013", "100", "$1.30"],
+      ];
+
+      function pageHead(subtitle, state) {
+        const health = state === "degraded"
+          ? '<span class="status-line"><i class="status-dot danger"></i>Watcher 异常</span>'
+          : state === "loading"
+            ? '<span class="status-line"><i class="status-dot warning"></i>正在读取状态</span>'
+            : '<span class="status-line"><i class="status-dot"></i>Watcher 在线</span>';
+        return `
+          <header class="prototype-page-head">
+            <div><h1>预测市场套利</h1><p>${subtitle}</p></div>
+            <div class="prototype-updated">${health}<br>最后心跳：刚刚 · v0.1.0</div>
+          </header>`;
+      }
+
+      function degradedAlert(state) {
+        if (state !== "degraded") return "";
+        return `
+          <section class="alert" role="alert">
+            <div><strong>Polymarket WebSocket 已断开 2 分 18 秒</strong><p>REST 快照仍可用，当前不会产生正式信号；系统正在第 4 次重连。</p></div>
+            <span class="health-pill bad">数据不完整</span>
+          </section>`;
+      }
+
+      function metricStrip(state) {
+        if (state === "loading") {
+          return `
+            <section class="metric-strip" aria-label="监控摘要加载中" aria-busy="true">
+              ${["当前正式信号", "监控事件", "市场 / Token", "WebSocket", "过去 24 小时"].map(label =>
+                `<article class="metric-card"><span>${label}</span><strong>—</strong><small>正在读取…</small></article>`).join("")}
+            </section>`;
+        }
+        const signalCount = state === "live" ? "1" : "0";
+        const wsText = state === "degraded" ? "重连中" : "正常";
+        const wsClass = state === "degraded" ? "bad" : "ok";
+        return `
+          <section class="metric-strip" aria-label="监控摘要">
+            <article class="metric-card primary"><span>当前正式信号</span><strong>${signalCount}</strong><small>门槛：净边际 ≥ $0.01 且利润 ≥ $1</small></article>
+            <article class="metric-card"><span>监控事件</span><strong>20</strong><small>按 24h 交易量动态筛选</small></article>
+            <article class="metric-card"><span>市场 / Token</span><strong>331 / 662</strong><small>5 分钟前刷新范围</small></article>
+            <article class="metric-card"><span>WebSocket</span><strong>${wsText}</strong><small><span class="health-pill ${wsClass}">Polymarket</span></small></article>
+            <article class="metric-card"><span>过去 24 小时</span><strong>3</strong><small>历史确认信号</small></article>
+          </section>`;
+      }
+
+      function eventDetails() {
+        return events.map((event, index) => `
+          <details class="event-row"${index === 0 ? " open" : ""}>
+            <summary>
+              <div><div class="event-title">${event[0]}</div><div class="event-meta">${event[2]} · 排名 #${index + 1}</div></div>
+              <div class="event-volume">${event[1]}</div>
+              <div class="event-state">${event[3]}</div>
+            </summary>
+            <div class="event-markets">
+              <div class="event-market-line"><span>${index === 0 ? "9 月 17 日前降息？" : "主要二元市场"}</span><span>YES / NO 已订阅</span></div>
+              <div class="event-market-line"><span>${index === 0 ? "9 月会议降息至少 25bp？" : "关联二元市场"}</span><span>YES / NO 已订阅</span></div>
+            </div>
+          </details>`).join("");
+      }
+
+      function liveSignal(state, hero = false) {
+        if (state === "loading") {
+          return `<div class="empty-state" aria-busy="true"><strong>正在读取预测市场状态</strong><p>正在加载 watcher 心跳、监控范围和最近信号。</p></div>`;
+        }
+        if (state === "degraded") {
+          return `<div class="empty-state"><strong>暂停确认新信号</strong><p>连接恢复并完成 REST 快照校验后，才会重新产生正式信号。</p></div>`;
+        }
+        if (state === "quiet") {
+          return `<div class="empty-state"><strong>当前没有正式信号</strong><p>Watcher 正常运行。过去 24 小时发现 47 次候选波动，其中 3 次通过二次确认。</p></div>`;
+        }
+        if (hero) {
+          return `
+            <section class="variant-b-hero">
+              <div>
+                <span class="signal-pill">REST 已确认 · 持续 38 秒</span>
+                <h2>美联储会在 2026 年 9 月会议前降息吗？</h2>
+                <p>Polymarket · 同一市场 YES + NO 组合套利</p>
+                <div class="variant-b-facts">
+                  <div><span>YES 最优卖价</span><strong>$0.470</strong></div>
+                  <div><span>NO 最优卖价</span><strong>$0.500</strong></div>
+                  <div><span>扣费后净边际</span><strong>$0.024 / 组</strong></div>
+                  <div><span>可成交量</span><strong>80 组</strong></div>
+                </div>
+              </div>
+              <div class="hero-profit"><span>预计可执行利润</span><strong>$1.92</strong><small>按两侧当前最优档位</small></div>
+            </section>`;
+        }
+        return `
+          <article class="panel signal-card">
+            <div class="signal-title-row">
+              <div><h3>美联储会在 2026 年 9 月会议前降息吗？</h3><p>Polymarket · REST 已确认 · 持续 38 秒</p></div>
+              <span class="signal-pill">正式信号</span>
+            </div>
+            <dl class="signal-metrics">
+              <div><dt>YES 卖价</dt><dd>$0.470</dd></div>
+              <div><dt>NO 卖价</dt><dd>$0.500</dd></div>
+              <div><dt>净边际</dt><dd class="positive">$0.024</dd></div>
+              <div><dt>可成交</dt><dd>80 组</dd></div>
+              <div><dt>预计利润</dt><dd class="positive">$1.92</dd></div>
+            </dl>
+          </article>`;
+      }
+
+      function historyTable() {
+        return `
+          <table class="data-table">
+            <thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>净边际</th><th>可成交</th><th>预计利润</th></tr></thead>
+            <tbody>${historyRows.map(row => `
+              <tr>
+                <td data-label="出现时间">${row[0]}</td><td data-label="市场">${row[1]}</td>
+                <td data-label="持续">${row[2]}</td><td data-label="净边际">${row[3]}</td>
+                <td data-label="可成交">${row[4]}</td><td data-label="预计利润" class="positive"><strong>${row[5]}</strong></td>
+              </tr>`).join("")}</tbody>
+          </table>`;
+      }
+
+      function historyPanel() {
+        return `
+          <section class="panel">
+            <header class="panel-heading">
+              <div><h2>历史信号</h2><p>只记录通过 REST 二次确认的正式信号。</p></div>
+              <div class="history-filter"><button class="active" type="button">24 小时</button><button type="button">7 天</button><button type="button">全部</button></div>
+            </header>
+            ${historyTable()}
+          </section>`;
+      }
+
+      function variantA(state) {
+        return `
+          ${pageHead("先确认系统在监控什么，再查看当前与历史信号。", state)}
+          ${degradedAlert(state)}
+          ${metricStrip(state)}
+          <div class="layout-a">
+            <section class="panel">
+              <header class="panel-heading"><div><h2>当前监控范围</h2><p>完整 Top 20 事件；展开查看具体市场。</p></div><span class="count-pill">显示 6 / 20</span></header>
+              <div class="event-list">${eventDetails()}</div>
+            </section>
+            <div class="stack">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>当前信号</h2><p>WebSocket 发现，REST 同批盘口确认。</p></div><span class="venue-pill">Polymarket</span></header>
+                ${liveSignal(state)}
+              </section>
+              ${historyPanel()}
+            </div>
+          </div>`;
+      }
+
+      function variantB(state) {
+        return `
+          ${pageHead("第一屏直接回答：现在有没有可以执行的套利。", state)}
+          ${degradedAlert(state)}
+          ${liveSignal(state, true)}
+          <div class="layout-b">
+            <section class="panel">
+              <header class="panel-heading"><div><h2>监控范围</h2><p>Top 20 · 每 5 分钟更新</p></div><span class="venue-pill">Polymarket</span></header>
+              <div class="compact-event-list">${events.map((event, index) => `
+                <article class="compact-event"><div><strong>#${index + 1} ${event[0]}</strong><span>${event[2]} · ${event[3]}</span></div><strong>${event[1]}</strong></article>`).join("")}</div>
+            </section>
+            <div class="stack">
+              ${metricStrip(state)}
+              ${historyPanel()}
+            </div>
+          </div>`;
+      }
+
+      function auditEntries(state) {
+        const current = state === "loading"
+          ? `<article class="audit-entry warning"><time>现在</time><div><strong>正在读取运行记录</strong><p>正在加载 watcher 心跳与最近信号。</p></div><strong>读取中</strong></article>`
+          : state === "live"
+          ? `<article class="audit-entry signal"><time>14:32:08</time><div><strong>正式信号出现</strong><p>美联储 9 月前降息？ · REST 二次确认通过</p></div><strong class="positive">+$1.92</strong></article>`
+          : state === "degraded"
+            ? `<article class="audit-entry warning"><time>14:35:11</time><div><strong>连接中断</strong><p>WebSocket 关闭；暂停确认信号并开始重连</p></div><strong>第 4 次</strong></article>`
+            : `<article class="audit-entry"><time>14:35:11</time><div><strong>候选未通过确认</strong><p>两侧盘口恢复，净边际低于 $0.01</p></div><strong>已忽略</strong></article>`;
+        return `${current}
+          <article class="audit-entry signal"><time>11:09:00</time><div><strong>正式信号消失</strong><p>BTC 8 月突破 $150k？ · 持续 18 秒</p></div><strong class="positive">+$2.16</strong></article>
+          <article class="audit-entry"><time>10:00:01</time><div><strong>监控范围刷新</strong><p>按 24h 交易量选中 20 个事件、331 个市场</p></div><strong>662 tokens</strong></article>
+          <article class="audit-entry"><time>09:55:01</time><div><strong>连接健康</strong><p>Polymarket WebSocket 心跳与 REST 快照正常</p></div><strong>32 ms</strong></article>`;
+      }
+
+      function variantC(state) {
+        return `
+          ${pageHead("把连接、监控变化和信号生命周期放在一条可审计时间线上。", state)}
+          ${degradedAlert(state)}
+          <div class="variant-c-layout">
+            <aside class="panel status-rail" aria-label="运行状态">
+              <div class="rail-section"><span>WATCHER</span><strong>${state === "degraded" ? "异常 · 重连中" : "在线 · PID 48211"}</strong></div>
+              <div class="rail-section"><span>代码版本</span><strong>v0.1.0 · a1b2c3d</strong></div>
+              <div class="rail-section"><span>数据源</span><strong>Polymarket</strong></div>
+              <div class="rail-section"><span>监控范围</span><strong>20 事件<br>331 市场</strong></div>
+              <div class="rail-section"><span>信号门槛</span><strong>≥ $0.01 / 组<br>总利润 ≥ $1</strong></div>
+              <div class="rail-section"><span>最近范围刷新</span><strong>5 分钟前</strong></div>
+            </aside>
+            <section class="panel">
+              <header class="panel-heading"><div><h2>运行与信号时间线</h2><p>信号出现、消失、连接变化和范围刷新。</p></div><span class="count-pill">今天</span></header>
+              <div class="audit-stream">${auditEntries(state)}</div>
+              <div style="margin-top:16px">${historyTable()}</div>
+            </section>
+            <section class="panel">
+              <header class="panel-heading"><div><h2>监控清单</h2><p>按 24h 交易量排序</p></div><span class="count-pill">6 / 20</span></header>
+              <div class="monitor-queue">${events.map((event, index) => `
+                <article><strong>#${index + 1} ${event[0]}</strong><div><span>${event[2]}</span><span>${event[1]}</span></div></article>`).join("")}</div>
+            </section>
+          </div>`;
+      }
+
+      const renderers = {A: variantA, B: variantB, C: variantC};
+      const params = new URLSearchParams(window.location.search);
+      let variant = variants.includes(params.get("variant")) ? params.get("variant") : "A";
+      let state = ["live", "quiet", "degraded", "loading"].includes(params.get("state")) ? params.get("state") : "live";
+
+      function render() {
+        document.getElementById("prototype-root").innerHTML = renderers[variant](state);
+        document.getElementById("variant-label").textContent = `${variant} — ${names[variant]}`;
+        document.querySelectorAll("[data-state]").forEach(button => {
+          button.classList.toggle("active", button.dataset.state === state);
+          button.setAttribute("aria-pressed", button.dataset.state === state ? "true" : "false");
+        });
+        const url = new URL(window.location.href);
+        url.searchParams.set("variant", variant);
+        url.searchParams.set("state", state);
+        window.history.replaceState({}, "", url);
+      }
+      function cycle(direction) {
+        const index = variants.indexOf(variant);
+        variant = variants[(index + direction + variants.length) % variants.length];
+        render();
+        window.scrollTo({top: 0, behavior: "smooth"});
+      }
+      document.getElementById("previous-variant").addEventListener("click", () => cycle(-1));
+      document.getElementById("next-variant").addEventListener("click", () => cycle(1));
+      document.querySelectorAll("[data-state]").forEach(button => {
+        button.addEventListener("click", () => { state = button.dataset.state; render(); });
+      });
+      document.addEventListener("keydown", event => {
+        if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+        if (event.key === "ArrowLeft") cycle(-1);
+        if (event.key === "ArrowRight") cycle(1);
+      });
+      render();
+    </script>
+  </body>
+</html>
