@@ -4467,8 +4467,12 @@ window.fetch=async (input)=>{{
         assert section.locator('[aria-selected="true"]').inner_text().strip() == "趋势报告"
         assert header.get_attribute("data-view-stable") == "yes"
         assert page.evaluate("document.activeElement.dataset.accountView") == "report"
-        assert "卡玛比率" in section.inner_text()
-        assert "夏普比率" in section.inner_text()
+        review_disclosure = section.locator("details.trend-review-disclosure")
+        assert review_disclosure.count() == 1
+        assert review_disclosure.get_attribute("open") is None
+        review_disclosure.locator(":scope > summary").click()
+        assert "卡玛比率" in review_disclosure.inner_text()
+        assert "夏普比率" in review_disclosure.inner_text()
         assert page.locator(".workspace-grid").is_visible()
         section.locator('[data-account-view="simulate"]').click()
         section.get_by_text("模拟盘持仓加载中", exact=True).wait_for()

@@ -1444,6 +1444,9 @@ def _check_trend_account_views(
             current = panel.locator("[data-current-trend-report]")
             current.wait_for()
             _check_loaded_report_identity(panel, expectation, broker)
+            assert panel.locator("details.trend-review-disclosure").count() == 0, (
+                f"{broker} 历史趋势报告混入当前趋势复盘"
+            )
             _check_frozen_trend_disciplines(
                 panel.locator(".cn-trend-report"), expectation, broker, page=page
             )
@@ -1471,7 +1474,13 @@ def _check_trend_account_views(
         assert section.locator('[data-account-view="review"]').count() == 0, (
             f"{broker} 仍存在独立复盘 Tab"
         )
-        review_root = panel.locator(".trend-review")
+        review_disclosure = panel.locator("details.trend-review-disclosure")
+        assert review_disclosure.count() == 1, f"{broker} 趋势复盘折叠栏目数量不是 1"
+        assert review_disclosure.get_attribute("open") is None, (
+            f"{broker} 趋势复盘默认未折叠"
+        )
+        review_disclosure.locator(":scope > summary").click()
+        review_root = review_disclosure.locator(".trend-review")
         review_root.wait_for()
         review = reviews.get(broker)
         assert isinstance(review, Mapping) and review.get("available") is True, (
@@ -1525,7 +1534,13 @@ def _check_separated_trend_report_views(
         assert isinstance(review, Mapping) and review.get("available") is True, (
             f"{broker} 当前趋势复盘不可用"
         )
-        review_root = panel.locator(".trend-review")
+        review_disclosure = panel.locator("details.trend-review-disclosure")
+        assert review_disclosure.count() == 1, f"{broker} 趋势复盘折叠栏目数量不是 1"
+        assert review_disclosure.get_attribute("open") is None, (
+            f"{broker} 趋势复盘默认未折叠"
+        )
+        review_disclosure.locator(":scope > summary").click()
+        review_root = review_disclosure.locator(".trend-review")
         assert review_root.count() == 1, f"{broker} 趋势复盘未合入趋势报告"
         assert f"{_plain(review.get('market_label'))}趋势复盘" in review_root.inner_text()
         if broker == "eastmoney" and screenshot_dir is not None:
