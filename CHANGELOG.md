@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-26
+
+- Removed the duplicate current-strategy parameter table from trend review pages and kept the folded report discipline as the single rule surface. Dashboard current discipline now uses the configured CN/HK/US stock-and-ETF candidate pools even when the selected report predates ETF integration; frozen historical report parameters remain unchanged.
+
 ## 2026-07-25
 
 - Expanded trend selection to mainland-China, US, and Hong Kong ETFs: CN v9
