@@ -250,17 +250,46 @@ def run_drawdown_preflight(
             and (market, strategy_version) in APPROVED_DRAWDOWN_PREDECESSORS
         )
         if not was_present and (
-            (item.baseline_equity is None and not approved_predecessor)
-            or item.source_date is None
-            or item.entry_eligible_from is None
+            item.source_date is None or item.entry_eligible_from is None
         ):
             results.append({
                 "market": market,
                 "status": "failed",
                 "failure_status": "baseline_unavailable",
-                "error": "completed-date frozen Futu baseline is unavailable",
+                "error": "completed-date frozen Futu baseline date is unavailable",
             })
             continue
+        baseline_equity = item.baseline_equity
+        if (
+            not was_present
+            and baseline_equity is None
+            and not approved_predecessor
+        ):
+            assert item.source_date is not None
+            baseline = load_frozen_baseline(
+                reports_dir,
+                market=market,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+                source_date=item.source_date,
+            )
+            if baseline.status == "missing":
+                results.append({
+                    "market": market,
+                    "status": "skipped",
+                    "reason": "baseline_missing",
+                    "source_date": item.source_date,
+                })
+                continue
+            if baseline.status == "invalid":
+                results.append({
+                    "market": market,
+                    "status": "failed",
+                    "failure_status": "baseline_invalid",
+                    "error": baseline.error,
+                })
+                continue
+            baseline_equity = baseline.equity
         try:
             decision = automatic_bootstrap_strategy_drawdown(
                 data_dir,
@@ -268,7 +297,7 @@ def run_drawdown_preflight(
                 strategy_id=strategy_id,
                 strategy_version=strategy_version,
                 parameters=parameters,
-                baseline_equity=item.baseline_equity,
+                baseline_equity=baseline_equity,
                 source_date=item.source_date,
                 accepted_git_sha=accepted_git_sha,
                 actor=actor,

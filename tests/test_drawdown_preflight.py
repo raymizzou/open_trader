@@ -226,21 +226,58 @@ def test_missing_approved_predecessor_fails_closed_without_writing_state(
     assert state_path.read_bytes() == before
 
 
-def test_first_activation_without_baseline_fails_closed(tmp_path: Path) -> None:
-    target = replace(
-        market_input("CN"),
-        baseline_equity=None,
-        strategy_snapshot={
-            "strategy_id": "trend_animals_warm_to_hot/CN/v9",
-            "strategy_version": "v9",
-            "parameters": {"drawdown_limit": "0.05", "market": "CN"},
-        },
-    )
+def test_first_activation_without_matching_baseline_is_skipped(
+    tmp_path: Path,
+) -> None:
+    target = replace(market_input("CN"), baseline_equity=None)
 
     result = run_preflight(tmp_path, {"CN": target})
 
+    assert result == {
+        "status": "ready",
+        "markets": [{
+            "market": "CN",
+            "status": "skipped",
+            "reason": "baseline_missing",
+            "source_date": "2026-07-17",
+        }],
+    }
+    assert not (tmp_path / "data/trend_drawdown/state.json").exists()
+
+
+def test_skipped_market_does_not_block_other_market_bootstrap(
+    tmp_path: Path,
+) -> None:
+    result = run_preflight(
+        tmp_path,
+        {
+            "CN": replace(market_input("CN"), baseline_equity=None),
+            "US": market_input("US"),
+        },
+    )
+
+    assert result["status"] == "ready"
+    assert [item["status"] for item in result["markets"]] == [
+        "skipped", "bootstrapped"
+    ]
+    state = json.loads(
+        (tmp_path / "data/trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    assert [record["market"] for record in state["records"]] == ["US"]
+
+
+def test_invalid_matching_baseline_fails(tmp_path: Path) -> None:
+    path = tmp_path / "reports/trend_a_share/2026-07-17.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{", encoding="utf-8")
+
+    result = run_preflight(
+        tmp_path,
+        {"CN": replace(market_input("CN"), baseline_equity=None)},
+    )
+
     assert result["status"] == "failed"
-    assert result["markets"][0]["failure_status"] == "baseline_unavailable"
+    assert result["markets"][0]["failure_status"] == "baseline_invalid"
     assert not (tmp_path / "data/trend_drawdown/state.json").exists()
 
 
