@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-26
 
+- Removed the standalone CN/HK/US trend-review tabs and rendered each market's
+  review metrics directly below its current trend report; keyboard, mobile, and
+  Dashboard acceptance checks now enforce the three-tab account layout.
 - Published the ETF-enabled parameters under CN v10 and US/HK v7, inheriting
   audited drawdown high-water marks and approved Kelly samples from v9/v6;
   missing frozen baselines remain skippable while malformed baselines fail.

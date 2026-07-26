@@ -3700,8 +3700,8 @@ const labels=[...tiger.matchAll(/data-account-view="[^"]+"[^>]*>([^<]+)/g)].map(
 console.log(JSON.stringify({tiger,futu,labels}));
 ''')
     rendered = json.loads(output)
-    assert rendered["labels"] == ["真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"]
-    assert rendered["tiger"].count('role="tab"') == 4
+    assert rendered["labels"] == ["真实持仓", "模拟盘持仓", "趋势报告"]
+    assert rendered["tiger"].count('role="tab"') == 3
     assert 'data-account-view="real" aria-selected="true" tabindex="0"' in rendered["tiger"]
     assert 'role="tabpanel"' in rendered["tiger"]
     assert "trend-report-entry" not in rendered["tiger"]
@@ -4007,13 +4007,13 @@ state.brokerFilter="tiger";
 for(const id of ["account-tabs","visible-count","workspace-grid","symbol-detail-panel"]){elements[id]={innerHTML:"",textContent:"",
   classList:{add(){},remove(){}},setAttribute(){},removeAttribute(){}};}
 const press=(view,key)=>{let prevented=false;handleAccountViewTabKeydown({key,target:{closest(){return {dataset:{accountBroker:"tiger",accountView:view}};}},preventDefault(){prevented=true;}});return {view:state.accountViews.tiger,focused,prevented};};
-console.log(JSON.stringify({left:press("real","ArrowLeft"),right:press("real","ArrowRight"),home:press("review","Home"),end:press("real","End")}));
+console.log(JSON.stringify({left:press("real","ArrowLeft"),right:press("real","ArrowRight"),home:press("report","Home"),end:press("real","End")}));
 ''')
     rendered = json.loads(output)
-    assert rendered["left"] == {"view": "review", "focused": '[data-account-view="review"]', "prevented": True}
+    assert rendered["left"] == {"view": "report", "focused": '[data-account-view="report"]', "prevented": True}
     assert rendered["right"] == {"view": "simulate", "focused": '[data-account-view="simulate"]', "prevented": True}
     assert rendered["home"] == {"view": "real", "focused": '[data-account-view="real"]', "prevented": True}
-    assert rendered["end"] == {"view": "review", "focused": '[data-account-view="review"]', "prevented": True}
+    assert rendered["end"] == {"view": "report", "focused": '[data-account-view="report"]', "prevented": True}
 
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     tabs = css.split(".account-view-tabs {", 1)[1].split("}", 1)[0]
@@ -4086,7 +4086,7 @@ const renderPanel=renderAccountViewPanelOnly;
 let panelRenders=0;
 renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
 const results=[];
-for(const view of ["real","simulate","review"]){
+for(const view of ["real","simulate"]){
   state.accountViews.tiger="report";
   delete state.trendReportHistories.tiger;
   const request=openTrendReportHistory("tiger");
@@ -4100,7 +4100,7 @@ for(const view of ["real","simulate","review"]){
 console.log(JSON.stringify(results));
 ''')
     rendered = json.loads(output)
-    assert [entry["view"] for entry in rendered] == ["real", "simulate", "review"]
+    assert [entry["view"] for entry in rendered] == ["real", "simulate"]
     for entry in rendered:
         assert entry["history"]["open"] is True
         assert entry["history"]["loading"] is False
@@ -4128,7 +4128,7 @@ const renderPanel=renderAccountViewPanelOnly;
 let panelRenders=0;
 renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
 const results=[];
-for(const [view,ok] of [["real",true],["simulate",false],["review",true]]){
+for(const [view,ok] of [["real",true],["simulate",false]]){
   state.accountViews.tiger="report";
   state.trendReportHistories.tiger={open:true,scrollY:100};
   delete state.trendHistoricalReports.tiger;
@@ -4143,10 +4143,9 @@ for(const [view,ok] of [["real",true],["simulate",false],["review",true]]){
 console.log(JSON.stringify(results));
 ''')
     rendered = json.loads(output)
-    assert [entry["view"] for entry in rendered] == ["real", "simulate", "review"]
+    assert [entry["view"] for entry in rendered] == ["real", "simulate"]
     assert rendered[0]["exact"]["report"]["artifact"] == "real.json"
     assert rendered[1]["exact"]["error"] == "historical report 500"
-    assert rendered[2]["exact"]["report"]["artifact"] == "review.json"
     for entry in rendered:
         assert entry["panelRenders"] == 0
         assert entry["scrolls"] == []
@@ -4217,7 +4216,7 @@ const renderPanel=renderAccountViewPanelOnly;
 let panelRenders=0;
 renderAccountViewPanelOnly=(broker)=>{panelRenders+=1;return renderPanel(broker);};
 const results=[];
-for(const [view,ok] of [["real",true],["review",false]]){
+for(const [view,ok] of [["real",true],["report",false]]){
   state.accountViews.tiger="real";
   delete state.trendSimulatePositions.tiger;
   const request=setAccountView("tiger","simulate");
@@ -4235,7 +4234,7 @@ console.log(JSON.stringify(results));
         "payload": {"available": True, "positions": [{"symbol": "AAPL"}]},
         "panelRenders": 0,
     }
-    assert rendered[1]["view"] == "review"
+    assert rendered[1]["view"] == "report"
     assert rendered[1]["payload"]["available"] is False
     assert rendered[1]["payload"]["positions"] == []
     assert rendered[1]["payload"]["error"] == "simulate positions 500"
@@ -4457,7 +4456,7 @@ window.fetch=async (input)=>{{
 
         dashboard_acceptance._check_account_view_contract(page, section, "tiger")
         assert [label.strip() for label in tabs.all_text_contents()] == [
-            "真实持仓", "模拟盘持仓", "趋势报告", "美股复盘",
+            "真实持仓", "模拟盘持仓", "趋势报告",
         ]
         assert all((tab.bounding_box() or {})["height"] >= 44 for tab in tabs.all())
         assert section.locator('[aria-selected="true"]').inner_text().strip() == "真实持仓"
@@ -4465,9 +4464,9 @@ window.fetch=async (input)=>{{
         header.evaluate("node => { node.dataset.viewStable = 'yes'; }")
         tabs.first.focus()
         tabs.first.press("End")
-        assert section.locator('[aria-selected="true"]').inner_text().strip() == "美股复盘"
+        assert section.locator('[aria-selected="true"]').inner_text().strip() == "趋势报告"
         assert header.get_attribute("data-view-stable") == "yes"
-        assert page.evaluate("document.activeElement.dataset.accountView") == "review"
+        assert page.evaluate("document.activeElement.dataset.accountView") == "report"
         assert "卡玛比率" in section.inner_text()
         assert "夏普比率" in section.inner_text()
         assert page.locator(".workspace-grid").is_visible()
@@ -4645,8 +4644,11 @@ state.dashboard={trend_reports:{
 const group=(broker)=>({broker,profile:ACCOUNT_STRATEGY_PROFILES[broker],rows:[],summary:{broker,display_name:broker,portfolio_value_hkd:"1000",holding_value_hkd:"700",cash_like_value_hkd:"300",holding_count:"1"}});
 for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘"],["eastmoney","A股复盘"]]) {
   const account=renderAccountSection(group(broker));
-  if (!account.includes(`data-account-broker="${broker}" data-account-view="review"`) || !account.includes(label)) throw new Error(account);
-  if (account.indexOf("趋势报告") > account.indexOf(label)) throw new Error("entry order");
+  if (account.includes(`data-account-broker="${broker}" data-account-view="review"`) || account.includes(`>${label}</button>`)) throw new Error(account);
+  state.accountViews[broker]="report";
+  const report=renderAccountSection(group(broker));
+  if (!report.includes("cn-trend-report") || !report.includes("trend-review") || !report.includes(label.replace("复盘","趋势复盘"))) throw new Error(report);
+  state.accountViews[broker]="real";
 }
 if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");
 const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);

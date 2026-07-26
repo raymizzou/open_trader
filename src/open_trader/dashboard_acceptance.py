@@ -52,9 +52,8 @@ TREND_ACCEPTED_STRATEGY_VERSIONS = {
     "HK": frozenset({"v4", "v5", "v6", "v7"}),
 }
 ACCOUNT_VIEW_LABELS = {
-    "tiger": ("真实持仓", "模拟盘持仓", "趋势报告", "美股复盘"),
-    "phillips": ("真实持仓", "模拟盘持仓", "趋势报告", "港股复盘"),
-    "eastmoney": ("真实持仓", "模拟盘持仓", "趋势报告", "A股复盘"),
+    broker: ("真实持仓", "模拟盘持仓", "趋势报告")
+    for broker in ("tiger", "phillips", "eastmoney")
 }
 SIMULATE_POSITIONS_READY_EXPRESSION = """
 ({broker, expected}) => {
@@ -1038,17 +1037,17 @@ def _validate_history_projection(
 
 def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
     tabs = section.locator('[role="tab"][data-account-view]')
-    assert tabs.count() == 4, f"{broker} 账户视图 Tab 数量不是 4"
-    actual_labels = tuple(tabs.nth(index).inner_text().strip() for index in range(4))
+    assert tabs.count() == 3, f"{broker} 账户视图 Tab 数量不是 3"
+    actual_labels = tuple(tabs.nth(index).inner_text().strip() for index in range(3))
     assert actual_labels == ACCOUNT_VIEW_LABELS[broker], f"{broker} 账户视图 Tab 顺序不正确"
     assert tuple(
-        tabs.nth(index).get_attribute("data-account-view") for index in range(4)
-    ) == ("real", "simulate", "report", "review"), (
+        tabs.nth(index).get_attribute("data-account-view") for index in range(3)
+    ) == ("real", "simulate", "report"), (
         f"{broker} 账户视图 Tab 身份不正确"
     )
     assert tabs.nth(0).get_attribute("aria-selected") == "true" and all(
         tabs.nth(index).get_attribute("aria-selected") == "false"
-        for index in range(1, 4)
+        for index in range(1, 3)
     ), f"{broker} 默认视图不是真实持仓"
     expression = (
         "element => { const style = getComputedStyle(element); return {"
@@ -1061,7 +1060,7 @@ def _check_account_view_contract(page: Any, section: Any, broker: str) -> None:
         "indicatorBackground: getComputedStyle(element, '::after').backgroundColor, "
         "indicatorContent: getComputedStyle(element, '::after').content}; }"
     )
-    for index in range(4):
+    for index in range(3):
         style = tabs.nth(index).evaluate(expression)
         common = {
             "borderTopWidth": "0px",
@@ -1469,8 +1468,9 @@ def _check_trend_account_views(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势报告视图出现横向滚动"
 
-        review_tab = section.locator('[data-account-view="review"]')
-        review_tab.click()
+        assert section.locator('[data-account-view="review"]').count() == 0, (
+            f"{broker} 仍存在独立复盘 Tab"
+        )
         review_root = panel.locator(".trend-review")
         review_root.wait_for()
         review = reviews.get(broker)
@@ -1481,12 +1481,9 @@ def _check_trend_account_views(
         assert "卡玛比率" in text and "夏普比率" in text, (
             f"{broker} 趋势复盘指标不完整"
         )
-        assert review_tab.get_attribute("aria-selected") == "true", (
-            f"{broker} 复盘 Tab 未保持选中"
+        assert report_tab.get_attribute("aria-selected") == "true", (
+            f"{broker} 复盘未合入趋势报告 Tab"
         )
-        assert review_tab.evaluate(
-            "element => element === document.activeElement"
-        ), f"{broker} 复盘打开后焦点未保持在 Tab"
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 趋势复盘视图出现横向滚动"
@@ -1501,7 +1498,9 @@ def _check_separated_trend_report_views(
     screenshot_dir: Path | None = None,
 ) -> None:
     reports = payload.get("trend_reports")
+    reviews = payload.get("trend_reviews")
     assert isinstance(reports, Mapping), "API 缺少趋势报告"
+    assert isinstance(reviews, Mapping), "API 缺少趋势复盘"
     for broker in TREND_SIMULATE_MARKETS:
         section = _select_account_tab(page, broker)
         panel = section.locator(f"#account-{broker}-view-panel")
@@ -1522,6 +1521,13 @@ def _check_separated_trend_report_views(
             label in visible_text
             for label in REMOVED_TREND_REPORT_POSITION_LABELS
         ), f"{broker} 趋势报告仍混入持仓或执行信息"
+        review = reviews.get(broker)
+        assert isinstance(review, Mapping) and review.get("available") is True, (
+            f"{broker} 当前趋势复盘不可用"
+        )
+        review_root = panel.locator(".trend-review")
+        assert review_root.count() == 1, f"{broker} 趋势复盘未合入趋势报告"
+        assert f"{_plain(review.get('market_label'))}趋势复盘" in review_root.inner_text()
         if broker == "eastmoney" and screenshot_dir is not None:
             width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
             page.screenshot(

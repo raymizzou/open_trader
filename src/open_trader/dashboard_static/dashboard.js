@@ -61,7 +61,7 @@ const ACCOUNT_STRATEGY_PROFILES = {
 
 const ACCOUNT_BROKERS = Object.keys(ACCOUNT_STRATEGY_PROFILES);
 const TREND_ACCOUNT_BROKERS = ["tiger", "phillips", "eastmoney"];
-const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report", "review"];
+const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report"];
 
 const DECISION_TABS = [
   { key: "final", label: "最终决策" },
@@ -3164,8 +3164,7 @@ function handleBrokerTabKeydown(event) {
 function accountViewLabel(broker, view) {
   if (view === "real") return "真实持仓";
   if (view === "simulate") return "模拟盘持仓";
-  if (view === "report") return "趋势报告";
-  return `${{tiger: "美股", phillips: "港股", eastmoney: "A股"}[broker] || "市场"}复盘`;
+  return "趋势报告";
 }
 
 function renderAccountViewTabs(broker) {
@@ -3442,12 +3441,6 @@ function renderAccountViewPanel(group) {
   const view = state.accountViews[group.broker] || "real";
   if (view === "simulate") return renderSimulatedAccountView(group.broker);
   if (view === "report") return renderEmbeddedTrendReport(group.broker);
-  if (view === "review") {
-    const review = state.dashboard?.trend_reviews?.[group.broker] || {};
-    return review.available
-      ? renderTrendReviewWorkspace(review, true)
-      : `<p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p>`;
-  }
   return group.rows.length
     ? renderAccountTable(group.rows)
     : '<p class="account-empty">当前筛选下没有持仓</p>';
@@ -3494,11 +3487,15 @@ function renderEmbeddedTrendReport(broker) {
   const history = state.trendReportHistories[broker];
   if (history?.open) return renderTrendReportHistory(broker, history);
   const report = state.dashboard?.trend_reports?.[broker] || {};
-  if (report.available) return renderTrendReportWorkspace(report, true);
+  const review = state.dashboard?.trend_reviews?.[broker];
+  const reviewPanel = !review ? "" : review.available
+    ? renderTrendReviewWorkspace(review, true)
+    : `<p class="account-empty">${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</p>`;
+  if (report.available) return `${renderTrendReportWorkspace(report, true)}${reviewPanel}`;
   const statusClass = report.execution_batch_blocking === true
     ? "trend-execution-batch-error"
     : "account-empty";
-  return `${renderTrendControllerStatus(broker)}<p class="${statusClass}">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>`;
+  return `${renderTrendControllerStatus(broker)}<p class="${statusClass}">${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</p>${reviewPanel}`;
 }
 
 function renderTrendReportHistory(broker, history) {
