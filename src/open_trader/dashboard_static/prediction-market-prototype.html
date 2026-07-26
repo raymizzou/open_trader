@@ -145,6 +145,7 @@
       .event-title { font-weight: 750; min-width: 0; }
       .event-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
       .event-volume { font-variant-numeric: tabular-nums; font-weight: 800; text-align: right; }
+      .event-volume span { color: var(--muted); display: block; font-size: 10px; font-weight: 600; }
       .event-state { color: var(--success); font-size: 12px; font-weight: 800; }
       .event-state.warning { color: #8a5a16; }
       .fee-policy-note {
@@ -446,7 +447,7 @@
           <details class="event-row"${index === 0 ? " open" : ""}>
             <summary>
               <div><div class="event-title">${event[0]}</div><div class="event-meta">${event[2]} · ${event[4] === "watch" ? "毛利润上限" : "最高预计净利润"} ${event[5]} · 排名 #${index + 1}</div></div>
-              <div class="event-volume">${event[1]}</div>
+              <div class="event-volume"><span>24h 成交量</span>${event[1]}</div>
               <div class="event-state ${event[4] === "watch" ? "warning" : ""}">${event[3]}</div>
             </summary>
             <div class="event-markets">
