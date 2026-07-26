@@ -160,24 +160,6 @@ def load_frozen_baseline(
     return FrozenBaselineLookup(status="missing")
 
 
-def frozen_missing_baseline(
-    reports_dir: Path,
-    *,
-    market: str,
-    strategy_id: str,
-    strategy_version: str,
-    source_date: str,
-) -> Decimal | None:
-    result = load_frozen_baseline(
-        reports_dir,
-        market=market,
-        strategy_id=strategy_id,
-        strategy_version=strategy_version,
-        source_date=source_date,
-    )
-    return result.equity if result.status == "available" else None
-
-
 def run_drawdown_preflight(
     *,
     data_dir: Path,
