@@ -385,12 +385,12 @@
         C: "审计工作台",
       };
       const events = [
-        ["2026 年 9 月美联储是否降息？", "$15.4M", "8 个市场", "仅监控 · 费用待核验", "watch"],
-        ["比特币会在 8 月突破 $150,000？", "$12.8M", "2 个市场", "仅监控 · 费用待核验", "watch"],
-        ["以色列与伊朗停火是否持续至 8 月 31 日？", "$9.7M", "6 个市场", "可参与信号", "eligible"],
-        ["以太坊会在 9 月前突破 $6,000？", "$7.1M", "2 个市场", "仅监控 · 费用待核验", "watch"],
-        ["2026 年美国参议院控制权", "$6.8M", "12 个市场", "仅监控 · 费用待核验", "watch"],
-        ["下一任美联储主席人选", "$5.9M", "14 个市场", "仅监控 · 费用待核验", "watch"],
+        ["以色列与伊朗停火是否持续至 8 月 31 日？", "$9.7M", "6 个市场", "可参与信号", "eligible", "$1.92"],
+        ["比特币会在 8 月突破 $150,000？", "$12.8M", "2 个市场", "仅监控 · 费用待核验", "watch", "$4.60"],
+        ["2026 年 9 月美联储是否降息？", "$15.4M", "8 个市场", "仅监控 · 费用待核验", "watch", "$3.80"],
+        ["以太坊会在 9 月前突破 $6,000？", "$7.1M", "2 个市场", "仅监控 · 费用待核验", "watch", "$2.10"],
+        ["2026 年美国参议院控制权", "$6.8M", "12 个市场", "仅监控 · 费用待核验", "watch", "$1.40"],
+        ["下一任美联储主席人选", "$5.9M", "14 个市场", "仅监控 · 费用待核验", "watch", "$1.40"],
       ];
       const historyRows = [
         ["今天 14:32:08", "停火持续至 8 月 31 日？", "2m 14s", "$0.024", "80", "$1.92"],
@@ -445,7 +445,7 @@
         return events.map((event, index) => `
           <details class="event-row"${index === 0 ? " open" : ""}>
             <summary>
-              <div><div class="event-title">${event[0]}</div><div class="event-meta">${event[2]} · 排名 #${index + 1}</div></div>
+              <div><div class="event-title">${event[0]}</div><div class="event-meta">${event[2]} · ${event[4] === "watch" ? "毛利润上限" : "最高预计净利润"} ${event[5]} · 排名 #${index + 1}</div></div>
               <div class="event-volume">${event[1]}</div>
               <div class="event-state ${event[4] === "watch" ? "warning" : ""}">${event[3]}</div>
             </summary>
@@ -531,7 +531,7 @@
           <aside class="fee-policy-note"><strong>费用待核验市场仍会监控，但不会产生正式信号</strong><p>这样可以看到完整监控范围，同时避免把费用计算不确定的价差误报为套利。</p></aside>
           <div class="layout-a">
             <section class="panel">
-              <header class="panel-heading"><div><h2>当前监控范围</h2><p>完整 Top 20 事件；展开查看具体市场。</p></div><span class="count-pill">显示 6 / 20</span></header>
+              <header class="panel-heading"><div><h2>当前监控范围</h2><p>可参与优先，其次按利润，利润相同再按 24h 成交量。</p></div><span class="count-pill">显示 6 / 20</span></header>
               <div class="event-list">${eventDetails()}</div>
             </section>
             <div class="stack">
@@ -553,7 +553,7 @@
             <section class="panel">
               <header class="panel-heading"><div><h2>监控范围</h2><p>Top 20 · 每 5 分钟更新</p></div><span class="venue-pill">Polymarket</span></header>
               <div class="compact-event-list">${events.map((event, index) => `
-                <article class="compact-event"><div><strong>#${index + 1} ${event[0]}</strong><span>${event[2]} · ${event[3]}</span></div><strong>${event[1]}</strong></article>`).join("")}</div>
+                <article class="compact-event"><div><strong>#${index + 1} ${event[0]}</strong><span>${event[2]} · ${event[3]} · ${event[4] === "watch" ? "毛利润上限" : "预计净利润"} ${event[5]}</span></div><strong>${event[1]}</strong></article>`).join("")}</div>
             </section>
             <div class="stack">
               ${metricStrip(state)}
@@ -597,7 +597,7 @@
             <section class="panel">
               <header class="panel-heading"><div><h2>监控清单</h2><p>按 24h 交易量排序</p></div><span class="count-pill">6 / 20</span></header>
               <div class="monitor-queue">${events.map((event, index) => `
-                <article><strong>#${index + 1} ${event[0]}</strong><div><span>${event[2]}</span><span>${event[1]}</span></div></article>`).join("")}</div>
+                <article><strong>#${index + 1} ${event[0]}</strong><div><span>${event[4] === "watch" ? "毛利润上限" : "预计净利润"} ${event[5]}</span><span>${event[1]}</span></div></article>`).join("")}</div>
             </section>
           </div>`;
       }
