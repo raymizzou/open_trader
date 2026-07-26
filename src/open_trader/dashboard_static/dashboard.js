@@ -2071,7 +2071,6 @@ function formatTrendReviewStrategyVersion(value) {
 
 function renderTrendReviewWorkspace(review, embedded = false) {
   const snapshot = review.strategy_snapshot || {};
-  const rows = Array.isArray(snapshot.parameter_rows) ? snapshot.parameter_rows : [];
   const root = embedded ? "div" : "main";
   return `<${root} class="trend-review">
     <header class="trend-review-header">
@@ -2085,9 +2084,6 @@ function renderTrendReviewWorkspace(review, embedded = false) {
         <span>共同截止日 ${escapeHtml(review.common_cutoff ? formatPlain(review.common_cutoff) : "暂无")}</span>
       </div>
     </header>
-    <section class="trend-review-parameters"><h2>当前策略参数</h2>
-      <div class="trend-review-parameter-list trend-review-parameter-table">${rows.map((row) => `<div><span>${escapeHtml(formatPlain(row.group))}</span><strong>${escapeHtml(formatPlain(row.name))}</strong><p>${escapeHtml(formatPlain(row.value))}</p></div>`).join("")}</div>
-    </section>
     <div class="trend-review-comparisons">
       ${TREND_REVIEW_COMPARISONS.map((comparison) => renderTrendReviewComparison(review, comparison)).join("")}
     </div>
