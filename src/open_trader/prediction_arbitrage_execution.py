@@ -387,6 +387,21 @@ class PredictionExecutionService:
             self._breaker_open = True
             reason = reasons[0]
             active_id = str(incident.get("execution_id", ""))
+            update_incident = getattr(self._store, "update_incident", None)
+            if callable(update_incident):
+                try:
+                    update_incident(
+                        str(incident_id),
+                        {
+                            "last_reset_denial": {
+                                "reason": reason,
+                                "blocking_reasons": reasons,
+                                "at": _timestamp(_utc_now()),
+                            }
+                        },
+                    )
+                except Exception:
+                    pass
             if active_id:
                 self._transition(
                     active_id,
@@ -843,6 +858,8 @@ class PredictionExecutionService:
             if not isinstance(value, Mapping):
                 return None
             if value.get("fresh") is False:
+                return None
+            if "fresh" not in value and "checked_at" not in value:
                 return None
             if "checked_at" in value:
                 age = _age_seconds(value.get("checked_at"))
