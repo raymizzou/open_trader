@@ -34,6 +34,7 @@ Futu simulated orders from one explicitly designated executor host.
 - View a local realtime portfolio dashboard with live quote refresh and stale
   data warnings.
 - Run the daily premarket workflow automatically on macOS with `launchd`.
+- Monitor Polymarket binary-market arbitrage locally, with one explicit confirmation, two FOK legs, and merge handling.
 
 ## Safety Notice
 
@@ -45,6 +46,54 @@ Ordinary workflows and the Dashboard do not submit orders. The Trend Animals
 controller may submit Futu simulated orders only from the configured executor;
 it never places real-money orders. Review the executor hostname and controller
 status before enabling that automation.
+
+## Prediction-market arbitrage (V1 Polymarket)
+
+V1 is local and manually confirmed. The monitor refreshes the top 20 events every
+five minutes, subscribes to books, and performs paired REST confirmation. The UI
+sorts actionable rows first, then profit and 24-hour volume, and shows that
+volume on every row. A `参与` action appears only after wallet, region, balance,
+relayer, breaker, lock, fee-free standard-binary, and Negative Risk checks pass.
+Fee-enabled, Negative Risk, and degraded markets remain monitor-only.
+
+Set up the wallet (private keys and Builder credentials are entered into macOS
+Keychain only; they are never written to config, SQLite, logs, or browser state):
+
+```bash
+.venv/bin/python -m open_trader prediction-arb wallet setup \
+  --config config/prediction_arbitrage.json \
+  --signer-address 0x... --wallet-address 0x...
+.venv/bin/python -m open_trader prediction-arb wallet status \
+  --config config/prediction_arbitrage.json
+.venv/bin/python -m open_trader prediction-arb preflight \
+  --config config/prediction_arbitrage.json --no-submit
+```
+
+The preflight signs an in-memory probe but never submits it or places a canary
+order. After it passes, install the persistent macOS service:
+
+```bash
+scripts/install_dashboard_launchd.sh
+.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
+scripts/uninstall_dashboard_launchd.sh
+```
+
+Open `http://127.0.0.1:8766/` and choose `预测市场`. Clicking `参与` creates one
+short-lived preview. After your confirmation Open Trader sends exactly one batch
+request containing equal-share BUY YES/BUY NO FOK legs; it does not open
+Polymarket or submit other targets. Confirmation rechecks the quote. Edge below
+`$0.01`, estimated profit below `$1.00`, or normal cost above `$20.00` is
+rejected. The wallet funding policy is `$50.00`; bounded one-leg remediation is
+limited to `$2.00` expected loss, otherwise the breaker stays open for manual
+acknowledgement. Signal, execution, merge, and incident history is retained in
+`data/prediction_arbitrage/prediction_arbitrage.sqlite3`; raw book ticks and
+signed payloads are not retained.
+
+Expected Open Trader cloud/API cost is `$0`; an always-on Mac is estimated at
+about `¥2–4/month` of electricity (depending on tariff, sleep, and load). This
+is not a profit guarantee: slippage, one-leg fills, merge failure, venue risk,
+and geoblocking remain possible. V1 does not automate a first live order.
+Kalshi, Predict.fun, and cross-venue arbitrage are deferred.
 
 ## Quick Start
 

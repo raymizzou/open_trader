@@ -28,6 +28,7 @@ Futu OpenD 检查实时行情并写出报告。趋势动物控制器还可以从
 - 在仪表盘中把富途展示为只读的美股/港股期权关注聚合入口。
 - 查看本地实时持仓仪表盘，支持实时行情刷新和陈旧数据警告。
 - 在 macOS 上通过 `launchd` 自动运行每日盘前流程。
+- 监控 Polymarket 预测市场套利：只展示通过全部检查的可参与机会，并在本机完成一次确认、两腿 FOK 下单与合并。
 
 ## 安全说明
 
@@ -35,6 +36,45 @@ Futu OpenD 检查实时行情并写出报告。趋势动物控制器还可以从
 
 普通流程和仪表盘不会提交订单。趋势动物控制器只允许在配置的执行主机上提交富途模拟
 订单，绝不会提交真实资金订单。启用自动化前必须核对执行主机名和控制器状态。
+
+## 预测市场套利（V1 Polymarket）
+
+这是本地、人工确认的 V1。监控器每 5 分钟刷新一次前 20 个事件，同时订阅盘口并做配对 REST
+复核；页面按照“可参与优先、利润、24h 成交量”排序，并在每一行显示成交量。只有普通二元、明确
+免手续费、Negative Risk 为 false 且钱包、地区、余额、relayer、断路器和锁检查全部通过时，才会出现
+“参与”。收费市场、Negative Risk 和数据异常只保留监控记录。
+
+准备钱包（私钥、Builder 凭证只进 macOS Keychain，不写入配置、SQLite、日志或浏览器）：
+
+```bash
+.venv/bin/python -m open_trader prediction-arb wallet setup \
+  --config config/prediction_arbitrage.json \
+  --signer-address 0x... --wallet-address 0x...
+.venv/bin/python -m open_trader prediction-arb wallet status \
+  --config config/prediction_arbitrage.json
+.venv/bin/python -m open_trader prediction-arb preflight \
+  --config config/prediction_arbitrage.json --no-submit
+```
+
+预检查不会向交易所提交订单，也不会自动执行首单。通过后安装持续运行的 macOS 服务：
+
+```bash
+scripts/install_dashboard_launchd.sh
+.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
+scripts/uninstall_dashboard_launchd.sh
+```
+
+浏览器打开 `http://127.0.0.1:8766/` 后进入“预测市场”。点击“参与”只创建一个短时预览；
+你确认后，Open Trader 发送一次包含等量 YES/NO FOK 的批量请求，不跳转 Polymarket，也不会批量
+提交多个标的。确认时会再次检查价格，净边际低于 `$0.01`、预计净利润低于 `$1.00` 或正常成本
+超过 `$20.00` 就拒绝。钱包资金上限是 `$50.00`；单腿处置预期损失最多 `$2.00`，无法确认时保持
+熔断并要求人工解除。信号、真实交易、合并和事故永久保存在
+`data/prediction_arbitrage/prediction_arbitrage.sqlite3`，不保存原始盘口 tick 或签名 payload。
+
+费用和风险：Polymarket API、监控和本机部署不收 Open Trader 云费，预期云/API 成本为 `$0`；Mac
+常开耗电估算约 `¥2–4/月`（取决于电价、睡眠与负载）。这不是收益保证，仍可能遇到滑点、盘口变化、
+单腿成交、合并失败、地区限制或 venue 风险；V1 不自动下首单。Kalshi、Predict.fun 和跨 venue
+套利暂不在本期范围内。
 
 ## 快速开始
 

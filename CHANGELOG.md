@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-26
 
+- Added the local Polymarket prediction-market monitor and exact approved
+  execution UI: top-20/5-minute discovery, visible 24h volume, one confirmed
+  two-FOK request, merge handling, bounded one-leg incidents, Keychain and
+  loopback-only protection, durable signal/trade/incident history, macOS
+  launchd deployment, and the fixed 54-scenario acceptance registry. Verified
+  with the prediction focused tests and desktop/mobile golden screens; live
+  venue/Keychain checks remain explicitly BLOCKED until configured.
 - Moved the current CN/HK/US trend review into a default-closed, audit-style
   disclosure directly after audit details in the Trend Report tab; its compact
   summary shows both sample counts, while frozen historical reports still
