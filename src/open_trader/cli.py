@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 from getpass import getpass
 import os
@@ -1284,6 +1285,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_parser.add_argument("--futu-host", default="127.0.0.1")
     dashboard_parser.add_argument("--futu-port", type=positive_int, default=11111)
+    dashboard_parser.add_argument(
+        "--prediction-config",
+        type=Path,
+        default=None,
+        help="Non-secret Polymarket prediction-arbitrage config",
+    )
 
     prediction_parser = subparsers.add_parser(
         "prediction-arb",
@@ -2616,6 +2623,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dashboard":
+        if args.prediction_config is not None:
+            try:
+                prediction_loopback = ipaddress.ip_address(args.host).is_loopback
+            except ValueError:
+                prediction_loopback = args.host == "localhost"
+            if not prediction_loopback:
+                parser.error("--prediction-config requires a loopback --host")
         config_values = _load_optional_env_values(args.config)
         try:
             trend_a_share_tm_id = _optional_positive_tm_id(
@@ -2667,7 +2681,20 @@ def main(argv: list[str] | None = None) -> int:
             trend_cn_candidate_pool_ids=trend_cn_candidate_pool_ids,
             trend_us_candidate_pool_ids=trend_us_candidate_pool_ids,
             trend_hk_candidate_pool_ids=trend_hk_candidate_pool_ids,
+            prediction_config_path=(
+                args.prediction_config.expanduser()
+                if args.prediction_config is not None
+                else None
+            ),
         )
+        prediction_notifier = None
+        if args.prediction_config is not None:
+            try:
+                prediction_notifier = build_notifier(
+                    load_env_config(args.config, dry_run=False)
+                )
+            except (FileNotFoundError, ValueError):
+                prediction_notifier = NullNotifier()
         serve_dashboard(
             config,
             host=args.host,
@@ -2675,6 +2702,11 @@ def main(argv: list[str] | None = None) -> int:
             eastmoney_password=config_values.get(
                 "OPEN_TRADER_EASTMONEY_PDF_PASSWORD", ""
             ).strip(),
+            **(
+                {"prediction_notifier": prediction_notifier}
+                if args.prediction_config is not None
+                else {}
+            ),
         )
         return 0
 

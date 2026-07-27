@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import ipaddress
 import os
+import secrets
 import subprocess
 import threading
 from datetime import date, datetime
 from decimal import Decimal
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
-from urllib.parse import unquote, urlparse
+from typing import Any, Mapping
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
@@ -27,6 +29,19 @@ from .dashboard import (
 from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .futu_quote import FutuQuoteClient
+from .polymarket_monitor import PolymarketMonitor
+from .polymarket_trading import PolymarketTradingClient, load_trading_config
+from .daily_premarket import build_notifier
+from .notifications import NullNotifier
+from .prediction_arbitrage import (
+    MAX_EMERGENCY_LOSS,
+    MAX_NORMAL_COST,
+    MAX_WALLET_BALANCE,
+    MIN_ESTIMATED_PROFIT,
+    MIN_NET_EDGE,
+)
+from .prediction_arbitrage_execution import PredictionExecutionService
+from .prediction_arbitrage_store import PredictionArbitrageStore
 from .research_chat import ResearchChatError, ResearchChatService
 from .standard_strategies import strategy_catalog
 from .statement_import import StatementImportService
@@ -55,6 +70,221 @@ class RequestBodyTooLargeError(Exception):
 
 class StandardBacktestExecutionError(RuntimeError):
     pass
+
+
+PREDICTION_HISTORY_KINDS = {"signals", "executions", "incidents"}
+PREDICTION_HISTORY_DEFAULT_LIMIT = 100
+PREDICTION_HISTORY_MAX_LIMIT = 500
+
+
+def _prediction_safe_value(value: object, *, key: str = "") -> object:
+    """Convert monitor/store values to JSON without exposing credentials."""
+
+    lowered = key.casefold()
+    if any(part in lowered for part in ("private", "secret", "password", "credential", "signature")):
+        return None
+    if lowered in {"intent", "raw", "raw_markets", "raw_payload", "signed_order"}:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone().isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for name, item in value.items():
+            field = str(name)
+            safe = _prediction_safe_value(item, key=field)
+            if safe is not None:
+                result[field] = safe
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_prediction_safe_value(item, key=key) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _prediction_mask_wallet(value: object) -> str:
+    wallet = str(value or "").strip()
+    if len(wallet) < 10:
+        return ""
+    return f"{wallet[:6]}…{wallet[-4:]}"
+
+
+def _prediction_decimal_sort(value: object) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return Decimal("-Infinity")
+    return parsed if parsed.is_finite() else Decimal("-Infinity")
+
+
+def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Decimal, str]:
+    opportunities = item.get("opportunities")
+    actionable = bool(item.get("actionable"))
+    nested_profits: list[Decimal] = []
+    nested_volumes: list[Decimal] = []
+    if isinstance(opportunities, (list, tuple)):
+        for row in opportunities:
+            if not isinstance(row, Mapping):
+                continue
+            actionable = actionable or row.get("actionable") is True
+            nested_profits.append(
+                _prediction_decimal_sort(row.get("profit", row.get("minimum_profit")))
+            )
+            nested_volumes.append(_prediction_decimal_sort(row.get("volume_24h")))
+    profit = item.get("profit", item.get("gross_upper_bound"))
+    volume = item.get("volume_24h")
+    if profit is None and nested_profits:
+        profit = max(nested_profits)
+    if volume is None and nested_volumes:
+        volume = max(nested_volumes)
+    return (
+        not actionable,
+        -_prediction_decimal_sort(profit),
+        -_prediction_decimal_sort(volume),
+        str(item.get("event_id") or ""),
+    )
+
+
+def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_unavailable") -> dict[str, object]:
+    return {
+        "status": "unavailable",
+        "readiness": {"status": "unavailable", "reason": reason},
+        "wallet": {"address": "", "masked_address": ""},
+        "masked_wallet": "",
+        "balances": {"p_usd": None, "allowance": None},
+        "policy_limits": {
+            "max_wallet_balance": format(MAX_WALLET_BALANCE, "f"),
+            "max_normal_cost": format(MAX_NORMAL_COST, "f"),
+            "min_estimated_profit": format(MIN_ESTIMATED_PROFIT, "f"),
+            "min_net_edge": format(MIN_NET_EDGE, "f"),
+            "max_emergency_loss": format(MAX_EMERGENCY_LOSS, "f"),
+        },
+        "heartbeat": None,
+        "heartbeat_at": None,
+        "events": [],
+        "opportunities": [],
+        "current_execution": None,
+        "breaker": {"open": True, "status": "locked", "incident": None},
+        "csrf_token": csrf_token,
+    }
+
+
+def _prediction_state_payload(
+    *,
+    store: PredictionArbitrageStore | None,
+    monitor: object | None,
+    execution: object | None,
+    csrf_token: str,
+) -> dict[str, object]:
+    if monitor is None and store is None and execution is None:
+        return _prediction_unavailable_state(csrf_token)
+    snapshot: Mapping[str, object] = {}
+    if monitor is not None:
+        try:
+            value = monitor.snapshot()
+            if isinstance(value, Mapping):
+                snapshot = value
+        except Exception:
+            snapshot = {}
+    safe_snapshot = _prediction_safe_value(snapshot)
+    if not isinstance(safe_snapshot, Mapping):
+        safe_snapshot = {}
+    readiness = safe_snapshot.get("readiness")
+    if not isinstance(readiness, Mapping):
+        readiness = {"status": "unavailable", "reason": "readiness_unavailable"}
+    else:
+        readiness = dict(readiness)
+        for field in ("wallet_address", "wallet"):
+            value = readiness.get(field)
+            if isinstance(value, str) and value.startswith("0x"):
+                readiness[field] = _prediction_mask_wallet(value)
+    raw_readiness = snapshot.get("readiness")
+    wallet_address = ""
+    if isinstance(raw_readiness, Mapping):
+        wallet_address = str(
+            raw_readiness.get("wallet_address")
+            or raw_readiness.get("wallet")
+            or ""
+        )
+    if not wallet_address and execution is not None:
+        trading = getattr(execution, "_trading", None)
+        config = getattr(trading, "config", None)
+        wallet_address = str(getattr(config, "wallet_address", "") or "")
+    masked_wallet = _prediction_mask_wallet(wallet_address)
+    try:
+        active = store.active_execution() if store is not None else None
+    except Exception:
+        active = None
+    try:
+        incident = store.unacknowledged_incident() if store is not None else None
+    except Exception:
+        incident = None
+    breaker_open = True
+    breaker_method = getattr(execution, "_breaker_is_open", None)
+    if callable(breaker_method):
+        try:
+            breaker_open = bool(breaker_method())
+        except Exception:
+            breaker_open = True
+    elif execution is not None:
+        breaker_open = bool(getattr(execution, "_breaker_open", True))
+    events = safe_snapshot.get("events")
+    opportunities = safe_snapshot.get("opportunities")
+    event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
+    opportunity_rows = [row for row in opportunities if isinstance(row, Mapping)] if isinstance(opportunities, (list, tuple)) else []
+    event_rows = sorted(event_rows, key=_prediction_sort_key)
+    opportunity_rows = sorted(opportunity_rows, key=_prediction_sort_key)
+    status = str(safe_snapshot.get("status") or "unavailable")
+    if not snapshot:
+        status = "unavailable"
+    policy = _prediction_unavailable_state(csrf_token)["policy_limits"]
+    balances = {
+        "p_usd": readiness.get("p_usd_balance", readiness.get("balance")),
+        "allowance": readiness.get("p_usd_allowance", readiness.get("allowance")),
+    }
+    return {
+        "status": status,
+        "readiness": dict(readiness),
+        "wallet": {"address": "", "masked_address": masked_wallet},
+        "masked_wallet": masked_wallet,
+        "balances": balances,
+        "policy_limits": policy,
+        "heartbeat": safe_snapshot.get("heartbeat_at"),
+        "heartbeat_at": safe_snapshot.get("heartbeat_at"),
+        "events": event_rows,
+        "opportunities": opportunity_rows,
+        "current_execution": _prediction_safe_value(active),
+        "breaker": {
+            "open": breaker_open,
+            "status": "locked" if breaker_open else "ready",
+            "incident": _prediction_safe_value(incident),
+        },
+        "csrf_token": csrf_token,
+    }
+
+
+def _prediction_history_payload(
+    store: PredictionArbitrageStore | None,
+    *,
+    kind: str,
+    limit: int,
+    offset: int,
+) -> dict[str, object]:
+    if kind not in PREDICTION_HISTORY_KINDS:
+        raise ValueError("kind must be signals, executions, or incidents")
+    rows = store.histories(kind) if store is not None else []
+    safe_rows = [_prediction_safe_value(row) for row in rows]
+    items = safe_rows[offset : offset + limit]
+    return {
+        "kind": kind,
+        "items": items,
+        "total": len(safe_rows),
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(items) < len(safe_rows),
+    }
 
 
 def build_standard_backtest_options_payload(config: DashboardConfig) -> dict[str, Any]:
@@ -290,6 +520,11 @@ def create_dashboard_server(
     statement_import_service: StatementImportService | None = None,
     trend_simulate_position_service: TrendSimulatePositionService | None = None,
     eastmoney_password: str = "",
+    prediction_store: PredictionArbitrageStore | None = None,
+    prediction_monitor: object | None = None,
+    prediction_execution_service: object | None = None,
+    prediction_session_token: str | None = None,
+    prediction_csrf_token: str | None = None,
 ) -> ThreadingHTTPServer:
     service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
@@ -300,10 +535,13 @@ def create_dashboard_server(
         eastmoney_password=eastmoney_password,
     )
     portfolio_update_lock = threading.Lock()
+    prediction_session = prediction_session_token or secrets.token_urlsafe(32)
+    prediction_csrf = prediction_csrf_token or secrets.token_urlsafe(32)
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path == "/":
                 self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
                 return
@@ -320,6 +558,26 @@ def create_dashboard_server(
                 try:
                     self._send_json(
                         build_dashboard_payload(config)
+                    )
+                except Exception as exc:
+                    self._send_error_json(exc)
+                return
+            if path == "/api/prediction-arbitrage/state":
+                self._send_prediction_state()
+                return
+            if path == "/api/prediction-arbitrage/history":
+                try:
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    kind = str(query.get("kind", [""])[0]).strip()
+                    limit = self._prediction_query_int(query, "limit", PREDICTION_HISTORY_DEFAULT_LIMIT)
+                    offset = self._prediction_query_int(query, "offset", 0)
+                    self._send_json(
+                        _prediction_history_payload(
+                            prediction_store,
+                            kind=kind,
+                            limit=limit,
+                            offset=offset,
+                        )
                     )
                 except Exception as exc:
                     self._send_error_json(exc)
@@ -396,6 +654,30 @@ def create_dashboard_server(
             path = urlparse(self.path).path
             try:
                 if path in {
+                    "/api/prediction-arbitrage/preview",
+                    "/api/prediction-arbitrage/executions",
+                    "/api/prediction-arbitrage/circuit-breaker/reset",
+                }:
+                    self._require_prediction_mutation()
+                    payload = self._read_json_body()
+                    if prediction_execution_service is None:
+                        raise RuntimeError("prediction execution service is unavailable")
+                    if path.endswith("/preview"):
+                        self._require_prediction_schema(payload, {"opportunity_id"})
+                        opportunity_id = self._required_prediction_string(payload, "opportunity_id")
+                        result = prediction_execution_service.preview(opportunity_id)
+                    elif path.endswith("/executions"):
+                        self._require_prediction_schema(payload, {"preview_id", "idempotency_key"})
+                        preview_id = self._required_prediction_string(payload, "preview_id")
+                        idempotency_key = self._required_prediction_string(payload, "idempotency_key")
+                        result = prediction_execution_service.confirm(preview_id, idempotency_key)
+                    else:
+                        self._require_prediction_schema(payload, {"incident_id"})
+                        incident_id = self._required_prediction_string(payload, "incident_id")
+                        result = prediction_execution_service.reset_breaker(incident_id)
+                    self._send_json(_prediction_safe_value(result))
+                    return
+                if path in {
                     "/api/statements/phillips",
                     "/api/statements/eastmoney",
                 }:
@@ -457,6 +739,89 @@ def create_dashboard_server(
                 self._send_error_json(exc)
                 return
             self._send_not_found()
+
+        def _send_prediction_state(self) -> None:
+            payload = _prediction_state_payload(
+                store=prediction_store,
+                monitor=prediction_monitor,
+                execution=prediction_execution_service,
+                csrf_token=prediction_csrf,
+            )
+            self.send_response(HTTPStatus.OK)
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Set-Cookie",
+                f"ot_prediction_session={prediction_session}; SameSite=Strict; HttpOnly; Path=/",
+            )
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+        @staticmethod
+        def _prediction_query_int(
+            query: Mapping[str, list[str]], key: str, default: int
+        ) -> int:
+            raw = str(query.get(key, [str(default)])[0] or str(default))
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{key} must be a non-negative integer") from exc
+            if value < 0 or (key == "limit" and value > PREDICTION_HISTORY_MAX_LIMIT):
+                raise ValueError(f"{key} is outside the allowed range")
+            if key == "limit" and value == 0:
+                raise ValueError("limit must be positive")
+            return value
+
+        @staticmethod
+        def _require_prediction_schema(
+            payload: dict[str, Any], expected: set[str]
+        ) -> None:
+            if set(payload) != expected:
+                raise ValueError("prediction request fields are invalid")
+
+        @staticmethod
+        def _required_prediction_string(payload: dict[str, Any], key: str) -> str:
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{key} is required")
+            return value.strip()
+
+        def _prediction_listener_host_header(self) -> str:
+            address = self.server.server_address
+            bound_host = str(address[0])
+            bound_port = int(address[1])
+            if ":" in bound_host and not bound_host.startswith("["):
+                bound_host = f"[{bound_host}]"
+            return f"{bound_host}:{bound_port}"
+
+        def _require_prediction_mutation(self) -> None:
+            try:
+                if not _is_loopback_address(str(self.client_address[0])):
+                    raise PermissionError("prediction mutations require loopback")
+            except ValueError as exc:
+                raise PermissionError("prediction mutations require loopback") from exc
+            expected_host = self._prediction_listener_host_header()
+            if self.headers.get("Host", "") != expected_host:
+                raise PermissionError("prediction mutation Host is invalid")
+            if self.headers.get("Origin", "") != f"http://{expected_host}":
+                raise PermissionError("prediction mutation Origin is invalid")
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get("Cookie", ""))
+            except Exception as exc:
+                raise PermissionError("prediction session is invalid") from exc
+            provided_session = cookie.get("ot_prediction_session")
+            if provided_session is None or not secrets.compare_digest(
+                provided_session.value, prediction_session
+            ):
+                raise PermissionError("prediction session is invalid")
+            provided_csrf = self.headers.get("X-CSRF-Token", "")
+            if not secrets.compare_digest(provided_csrf, prediction_csrf):
+                raise PermissionError("prediction CSRF token is invalid")
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -614,6 +979,7 @@ def serve_dashboard(
     host: str,
     port: int,
     eastmoney_password: str = "",
+    prediction_notifier: object | None = None,
 ) -> None:
     account_sync_service = DashboardAccountSyncService(config=config)
     trend_simulate_position_service = TrendSimulatePositionService(
@@ -628,6 +994,57 @@ def serve_dashboard(
         data_dir=config.data_dir,
         reports_dir=config.reports_dir,
     )
+    prediction_store: PredictionArbitrageStore | None = None
+    prediction_monitor: object | None = None
+    prediction_execution: object | None = None
+    prediction_trading: object | None = None
+    if config.prediction_config_path is not None:
+        prediction_path = config.prediction_config_path.expanduser()
+        try:
+            prediction_store = PredictionArbitrageStore(config.data_dir)
+            prediction_trading = PolymarketTradingClient.from_keychain(
+                load_trading_config(prediction_path)
+            )
+            prediction_monitor = PolymarketMonitor(
+                store=prediction_store,
+                trading=prediction_trading,
+            )
+            prediction_execution = PredictionExecutionService(
+                store=prediction_store,
+                monitor=prediction_monitor,
+                trading=prediction_trading,
+                notifier=prediction_notifier or NullNotifier(),
+                lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
+            )
+        except Exception:
+            # A missing Keychain/config must leave a visible, schema-valid locked
+            # Dashboard rather than aborting the existing portfolio surface.
+            if prediction_monitor is not None:
+                try:
+                    prediction_monitor.stop()
+                except Exception:
+                    pass
+            for resource in (prediction_execution, prediction_trading, prediction_store):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            prediction_store = None
+            prediction_monitor = None
+            prediction_execution = None
+            prediction_trading = None
+        else:
+            try:
+                # Reconcile authenticated state before any public monitor heartbeat.
+                prediction_execution.reconcile_startup()
+            except Exception:
+                # Keep the service visible and locked so the state API can expose
+                # the failed startup rather than silently dropping its ledger.
+                pass
+            else:
+                prediction_monitor.start()
     server = create_dashboard_server(
         config=config,
         host=host,
@@ -635,6 +1052,9 @@ def serve_dashboard(
         account_sync_service=account_sync_service,
         trend_simulate_position_service=trend_simulate_position_service,
         eastmoney_password=eastmoney_password,
+        prediction_store=prediction_store,
+        prediction_monitor=prediction_monitor,
+        prediction_execution_service=prediction_execution,
     )
     _, actual_port = server.server_address
     try:
@@ -649,4 +1069,16 @@ def serve_dashboard(
         print(f"account_sync_seconds: {account_sync_service.interval_seconds}")
         server.serve_forever()
     finally:
+        if prediction_monitor is not None:
+            try:
+                prediction_monitor.stop()
+            except Exception:
+                pass
+        for resource in (prediction_execution, prediction_trading, prediction_store):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         server.server_close()

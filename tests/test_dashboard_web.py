@@ -1735,6 +1735,473 @@ def read_text_error(url: str) -> tuple[int, str, str]:
     raise AssertionError("expected HTTPError")
 
 
+def test_prediction_arbitrage_state_is_schema_valid_when_unavailable(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        request = urllib.request.Request(
+            f"http://{host}:{port}/api/prediction-arbitrage/state"
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            cookie = response.headers.get("Set-Cookie", "")
+        assert response.status == 200
+        assert "ot_prediction_session=" in cookie
+        assert "HttpOnly" in cookie
+        assert "SameSite=Strict" in cookie
+        assert "Path=/" in cookie
+        assert payload["readiness"]["status"] == "unavailable"
+        assert payload["events"] == []
+        assert payload["opportunities"] == []
+        assert payload["current_execution"] is None
+        assert payload["csrf_token"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_mutation_rejects_before_reading_body(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def preview(self, opportunity_id: str) -> dict[str, object]:
+            self.calls.append(opportunity_id)
+            return {"preview_id": "p-1"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_execution_service=execution,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        with urllib.request.urlopen(f"{base}/api/prediction-arbitrage/state") as response:
+            state = json.loads(response.read().decode("utf-8"))
+            session = response.headers["Set-Cookie"].split(";", 1)[0]
+        body = b"not-json"
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview",
+            data=body,
+            headers={"Content-Length": str(len(body)), "Cookie": session},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 403
+        assert execution.calls == []
+
+        valid = json.dumps({"opportunity_id": "opp-1"}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview",
+            data=valid,
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": session,
+                "Origin": base,
+                "X-CSRF-Token": state["csrf_token"],
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+        assert execution.calls == ["opp-1"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            return [{"kind": kind, "id": "one"}, {"kind": kind, "id": "two"}]
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "heartbeat_at": "2026-07-27T10:00:00Z",
+                "readiness": {
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "balance": "12.00",
+                    "geoblock": "allowed",
+                    "relayer": "ready",
+                },
+                "events": [
+                    {"event_id": "b", "actionable": False, "volume_24h": "900"},
+                    {"event_id": "a", "actionable": True, "profit": "1.00", "volume_24h": "1"},
+                ],
+                "opportunities": [{"opportunity_id": "opp-1", "actionable": True}],
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def preview(self, opportunity_id: str) -> dict[str, object]:
+            self.calls.append(("preview", opportunity_id))
+            return {"preview_id": "preview-1"}
+
+        def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
+            self.calls.append(("confirm", preview_id, idempotency_key))
+            return {"execution_id": "execution-1"}
+
+        def reset_breaker(self, incident_id: str) -> dict[str, object]:
+            self.calls.append(("reset", incident_id))
+            return {"status": "reset"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_store=FakeStore(),
+        prediction_monitor=FakeMonitor(),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        state = read_json(f"{base}/api/prediction-arbitrage/state")
+        assert state["masked_wallet"] == "0x1234…5678"
+        assert state["events"][0]["event_id"] == "a"
+        assert state["events"][1]["event_id"] == "b"
+        assert read_json(f"{base}/api/prediction-arbitrage/history?kind=signals&limit=1")["items"] == [
+            {"kind": "signals", "id": "one"}
+        ]
+        assert read_error_json(f"{base}/api/prediction-arbitrage/history?kind=unknown")[0] == 400
+
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        body = json.dumps({"opportunity_id": "opp-1", "price": "0.01"}).encode()
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview", data=body, headers=headers, method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 400
+        assert execution.calls == []
+
+        body = json.dumps({"opportunity_id": "opp-1"}).encode()
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview", data=body, headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+        assert execution.calls == [("preview", "opp-1")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("failure", ["host", "origin", "cookie", "csrf", "address"])
+def test_prediction_arbitrage_mutation_security_matrix_rejects_before_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    class FakeExecution:
+        calls = 0
+
+        def preview(self, opportunity_id: str) -> dict[str, object]:
+            self.calls += 1
+            return {"preview_id": opportunity_id}
+
+    execution = FakeExecution()
+    server = dashboard_web.create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        if failure == "host":
+            headers["Host"] = "not-the-listener"
+        elif failure == "origin":
+            headers["Origin"] = "http://127.0.0.1:9999"
+        elif failure == "cookie":
+            headers["Cookie"] = "ot_prediction_session=wrong"
+        elif failure == "csrf":
+            headers["X-CSRF-Token"] = "wrong"
+        elif failure == "address":
+            monkeypatch.setattr(dashboard_web, "_is_loopback_address", lambda _value: False)
+        body = b"not-json"
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 403
+        assert execution.calls == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_mutation_body_cap_and_idempotency_are_server_owned(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
+            self.calls.append((preview_id, idempotency_key))
+            return {"execution_id": "durable-1", "idempotency_key": idempotency_key}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        connection.putrequest("POST", "/api/prediction-arbitrage/executions")
+        for key, value in headers.items():
+            connection.putheader(key, value)
+        connection.putheader("Content-Length", str(1024 * 1024 + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        assert response.status == 413
+        response.read()
+        connection.close()
+        assert execution.calls == []
+
+        body = json.dumps({"preview_id": "p", "idempotency_key": "k"}).encode()
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/executions", data=body, headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            first = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=5) as response:
+            second = json.loads(response.read().decode("utf-8"))
+        assert first == second == {"execution_id": "durable-1", "idempotency_key": "k"}
+        assert execution.calls == [("p", "k"), ("p", "k")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    order: list[str] = []
+    config = replace(
+        dashboard_config(tmp_path),
+        prediction_config_path=tmp_path / "prediction.json",
+    )
+    config.prediction_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeTrading:
+        def close(self) -> None:
+            order.append("trading.close")
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            order.append("monitor.start")
+
+        def stop(self) -> None:
+            order.append("monitor.stop")
+
+    class FakeExecution:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            order.append("execution.reconcile")
+            return {"status": "ready"}
+
+        def close(self) -> None:
+            order.append("execution.close")
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self) -> None:
+            order.append("server.serve")
+
+        def server_close(self) -> None:
+            order.append("server.close")
+
+    monkeypatch.setattr(dashboard_web, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(
+        dashboard_web.PolymarketTradingClient,
+        "from_keychain",
+        classmethod(lambda _cls, _config: FakeTrading()),
+    )
+    monkeypatch.setattr(dashboard_web, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
+
+    dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+    assert order.index("execution.reconcile") < order.index("monitor.start")
+    assert order.index("monitor.start") < order.index("server.serve")
+    assert order.index("monitor.stop") < order.index("server.close")
+    assert "execution.close" in order
+    assert "trading.close" in order
+
+
+def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls: list[str] = []
+
+        def reset_breaker(self, incident_id: str) -> dict[str, object]:
+            self.calls.append(incident_id)
+            return {"incident_id": incident_id, "status": "reset"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        for payload in (
+            {"incident_id": "incident-1", "wallet": "0xabc"},
+            {"incident_id": "incident-1", "limit": "2"},
+        ):
+            request = urllib.request.Request(
+                f"{base}/api/prediction-arbitrage/circuit-breaker/reset",
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            assert error.value.code == 400
+        assert execution.calls == []
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/circuit-breaker/reset",
+            data=b'{"incident_id":"incident-1"}',
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert json.loads(response.read().decode("utf-8"))["status"] == "reset"
+        assert execution.calls == ["incident-1"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_cli_rejects_non_loopback_prediction_listener(
+    tmp_path: Path,
+) -> None:
+    import open_trader.cli as cli
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(
+            [
+                "dashboard",
+                "--host",
+                "0.0.0.0",
+                "--prediction-config",
+                str(tmp_path / "prediction.json"),
+            ]
+        )
+    assert error.value.code == 2
+
+
 def run_dashboard_js(script: str) -> str:
     node = shutil.which("node")
     if node is None:
