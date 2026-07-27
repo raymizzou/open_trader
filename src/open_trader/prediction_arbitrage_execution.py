@@ -395,6 +395,8 @@ class PredictionExecutionService:
                 reasons.append("account_stale")
             if "open_order_ids" not in snapshot or "positions" not in snapshot:
                 reasons.append("account_malformed")
+            elif not self._snapshot_collections_valid(snapshot):
+                reasons.append("account_malformed")
             open_orders = self._order_ids(snapshot.get("open_order_ids", ()))
             if open_orders:
                 reasons.append("open_orders")
@@ -778,14 +780,22 @@ class PredictionExecutionService:
             return None
         if "open_order_ids" not in snapshot or "positions" not in snapshot:
             return None
-        if not isinstance(
-            snapshot.get("open_order_ids"),
-            (list, tuple, set, frozenset, Mapping),
-        ):
-            return None
-        if not isinstance(snapshot.get("positions"), (list, tuple)):
+        if not self._snapshot_collections_valid(snapshot):
             return None
         return snapshot
+
+    @staticmethod
+    def _snapshot_collections_valid(snapshot: Mapping[str, object]) -> bool:
+        open_order_ids = snapshot.get("open_order_ids")
+        if isinstance(open_order_ids, Mapping):
+            if any(not isinstance(key, str) for key in open_order_ids):
+                return False
+        elif isinstance(open_order_ids, (list, tuple, set, frozenset)):
+            if any(not isinstance(item, str) for item in open_order_ids):
+                return False
+        else:
+            return False
+        return isinstance(snapshot.get("positions"), (list, tuple))
 
     @staticmethod
     def _order_ids(value: object) -> tuple[str, ...]:
@@ -899,7 +909,7 @@ class PredictionExecutionService:
         if not active:
             return False
         state = str(active.get("state", ""))
-        if state == "merging":
+        if state in {"merging", "merge_incident"}:
             return True
         evidence = active.get("evidence", ())
         if not isinstance(evidence, (list, tuple)):

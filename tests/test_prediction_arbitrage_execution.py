@@ -985,6 +985,27 @@ def test_stale_account_snapshot_blocks_reset(tmp_path: Path) -> None:
     assert result["reason"] == "account_stale"
 
 
+def test_malformed_account_collections_block_reset(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "malformed-reset")
+    incident_id = store.open_incident(str(execution["execution_id"]), {"state": "directional_incident"})
+    trading.account_snapshot = lambda: {  # type: ignore[method-assign]
+        "wallet_address": "0x" + "1" * 40,
+        "p_usd_balance": Decimal("20"),
+        "p_usd_allowance": Decimal("20"),
+        "open_order_ids": "not-a-collection",
+        "positions": "not-a-collection",
+        "checked_at": datetime.now(UTC),
+    }
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "account_malformed"
+    assert store.unacknowledged_incident() is not None
+
+
 def test_remediation_rejects_wrong_token_or_quantity_candidate(tmp_path: Path) -> None:
     service, trading, _, _ = incident_fixture(tmp_path, result="yes_only")
 
