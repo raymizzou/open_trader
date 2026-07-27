@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-27
+
+- Corrected the fixed CN/HK/US Futu stock-simulation account deployment,
+  archived the previous HK option-account report and ledger generation without
+  rewriting history, and restarted HK from an account-bound no-replay cycle.
+  Verified all three configured accounts with real SIMULATE submit/cancel
+  orders; order IDs `7606013`, `7606014`, and `7606015` all finished
+  `CANCELLED_ALL` with zero fills.
+
 ## 2026-07-26
 
 - Moved the current CN/HK/US trend review into a default-closed, audit-style
