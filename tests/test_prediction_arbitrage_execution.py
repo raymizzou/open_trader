@@ -251,6 +251,17 @@ def test_preview_rechecks_without_signing_and_serializes_only_safe_intent(tmp_pa
     assert not {"prices", "quantity", "wallet", "limits"} & set(inspect.signature(service.preview).parameters)
 
 
+def test_preview_returns_busy_when_execution_is_active(tmp_path: Path) -> None:
+    service, _, store, _ = execution_fixture(tmp_path)
+    preview = service.preview("opp-1")
+    store.consume_preview_and_create_execution(str(preview["id"]), "active-request")
+
+    result = service.preview("opp-1")
+
+    assert result["state"] == "busy"
+    assert result["reason"] == "active_execution"
+
+
 def test_browser_economics_are_not_service_inputs(tmp_path: Path) -> None:
     service, _, _, _ = execution_fixture(tmp_path)
     assert set(inspect.signature(service.preview).parameters) == {"opportunity_id"}
