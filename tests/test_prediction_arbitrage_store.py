@@ -191,8 +191,20 @@ def test_leg_identity_is_unique_per_execution_and_allows_remediation_labels(tmp_
     with pytest.raises((ValueError, sqlite3.IntegrityError), match="label|unique"):
         db.record_leg(execution_id, {"label": "YES", "status": "duplicate"})
 
+    PredictionArbitrageStore(tmp_path / "data")
     with sqlite3.connect(tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3") as connection:
         assert connection.execute("SELECT COUNT(*) FROM execution_legs").fetchone()[0] == 3
+        leg_ids = {
+            row[0]
+            for row in connection.execute(
+                "SELECT leg_id FROM execution_legs ORDER BY leg_label"
+            )
+        }
+    assert leg_ids == {
+        f"{execution_id}:YES",
+        f"{execution_id}:NO",
+        f"{execution_id}:remediation:SELL",
+    }
 
 
 def test_acknowledgement_is_durable_and_never_deletes_incident_evidence(tmp_path: Path) -> None:
@@ -261,8 +273,11 @@ def test_sensitive_ticks_signed_orders_and_secrets_never_reach_sqlite(tmp_path: 
         {
             "raw_ticks": [{"price": "0.45", "size": "20", "sentinel": "raw-tick-secret"}],
             "api_secret": "api-secret-sentinel",
+            "api_token": "api-token-sentinel",
             "private_key": "private-key-sentinel",
             "signed_order": "signed-payload-sentinel",
+            "raw_websocket_message": "raw-websocket-sentinel",
+            "order_payload": "order-payload-sentinel",
             "safe": "kept",
         }
     )
@@ -284,7 +299,10 @@ def test_sensitive_ticks_signed_orders_and_secrets_never_reach_sqlite(tmp_path: 
         "signed-payload-sentinel",
         "signature-sentinel",
         "api-secret-sentinel",
+        "api-token-sentinel",
         "private-key-sentinel",
+        "raw-websocket-sentinel",
+        "order-payload-sentinel",
     ):
         assert sentinel not in stored
     for forbidden in ("raw_ticks", "signed_order", "signature", "private_key", "api_secret"):

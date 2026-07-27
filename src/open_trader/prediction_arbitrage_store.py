@@ -30,14 +30,24 @@ _TERMINAL_EXECUTION_STATES = (
 _PRIVATE_FIELD_PARTS = (
     "api_key",
     "apikey",
+    "api_token",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "token",
     "credential",
     "private_key",
     "privatekey",
+    "password",
+    "passphrase",
     "secret",
     "signature",
     "signed",
+    "raw_",
     "raw_tick",
     "ticks",
+    "websocket",
+    "order_payload",
 )
 
 
@@ -536,14 +546,19 @@ class PredictionArbitrageStore:
     def record_leg(self, execution_id: str, payload: Mapping[str, object]) -> None:
         encoded = _dump_payload(payload)
         clean = _load_payload(encoded)
-        label = str(clean.get("label", clean.get("leg", clean.get("local_leg", "")))).strip()
+        label = str(
+            clean.get(
+                "label",
+                clean.get("leg", clean.get("local_leg", clean.get("leg_label", ""))),
+            )
+        ).strip()
         if not label:
             raise ValueError("leg label is required")
         with self._transaction() as connection:
             try:
                 connection.execute(
                     "INSERT INTO execution_legs(leg_id, execution_id, leg_label, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (_new_id(), execution_id, label, encoded, _utc_now()),
+                    (f"{execution_id}:{label}", execution_id, label, encoded, _utc_now()),
                 )
             except sqlite3.IntegrityError as exc:
                 if "UNIQUE constraint failed" in str(exc):
