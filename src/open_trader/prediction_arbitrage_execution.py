@@ -907,22 +907,72 @@ class PredictionExecutionService:
         if active is None or intent is None:
             return {"merge": "blocked", "merge_reason": "unknown_pair"}
         evidence = active.get("evidence", ())
+        startup_attempts: list[Mapping[str, object]] = []
+        fresh_merge_attempt = False
         if isinstance(evidence, (list, tuple)):
             merge_evidence = [
                 item
                 for item in evidence
                 if isinstance(item, Mapping) and item.get("phase") == "merge_result"
             ]
+            startup_attempts = [
+                item
+                for item in evidence
+                if isinstance(item, Mapping)
+                and item.get("phase") == "startup_merge_attempt"
+            ]
             if merge_evidence:
                 if self._merge_confirmed(merge_evidence[-1]):
                     result: object = merge_evidence[-1]
                 else:
-                    return {"merge": "pending", "reconciled": False}
+                    return {
+                        "merge": "pending",
+                        "reconciled": False,
+                        "merge_reason": "merge_attempt_unconfirmed",
+                        "merge_result": self._safe_mapping(merge_evidence[-1]),
+                    }
             else:
                 result = None
         else:
             result = None
+        if result is None and (startup_attempts or str(active.get("state", "")) == "merging"):
+            return {
+                "merge": "pending",
+                "reconciled": False,
+                "merge_reason": "merge_attempt_in_flight",
+                **(
+                    {"startup_merge_attempt": self._safe_mapping(startup_attempts[-1])}
+                    if startup_attempts
+                    else {}
+                ),
+            }
         if result is None:
+            fresh_merge_attempt = True
+            execution_id = str(active.get("execution_id", "")).strip()
+            if not execution_id:
+                return {
+                    "merge": "incident",
+                    "reconciled": False,
+                    "merge_reason": "execution_identity_unavailable",
+                }
+            idempotency_key = f"startup-merge:{execution_id}:{quantity:f}"
+            try:
+                self._transition(
+                    execution_id,
+                    "merging",
+                    {
+                        "phase": "startup_merge_attempt",
+                        "idempotency_key": idempotency_key,
+                        "condition_id": intent.condition_id,
+                        "quantity": quantity,
+                    },
+                )
+            except Exception:
+                return {
+                    "merge": "incident",
+                    "reconciled": False,
+                    "merge_reason": "merge_attempt_persistence_failed",
+                }
             merge = getattr(self._trading, "merge_once", None)
             try:
                 result = _call(merge, condition_id=intent.condition_id, quantity=quantity)
@@ -937,6 +987,23 @@ class PredictionExecutionService:
             if isinstance(result, Mapping)
             else {"status": self._result_status(result)}
         )
+        merge_evidence = {"phase": "merge_result", **merge_result}
+        if not self._merge_confirmed(result):
+            merge_evidence["confirmed"] = False
+        if fresh_merge_attempt:
+            try:
+                self._transition(
+                    str(active.get("execution_id", "")),
+                    "merging",
+                    merge_evidence,
+                )
+            except Exception:
+                return {
+                    "merge": "incident",
+                    "reconciled": False,
+                    "merge_result": merge_result,
+                    "merge_reason": "merge_result_persistence_failed",
+                }
         if not self._merge_confirmed(result):
             return {
                 "merge": "incident",

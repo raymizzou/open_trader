@@ -999,6 +999,32 @@ def test_startup_confirmed_merge_requires_fresh_neutral_post_state(tmp_path: Pat
     assert incident["execution_id"] == execution["execution_id"]
 
 
+def test_startup_merge_attempt_evidence_blocks_duplicate_merge_after_restart(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="equal_pair")
+    trading.account_mode = "equal_pair"
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "startup-merge-attempt")
+    store.transition_execution(
+        str(execution["execution_id"]),
+        state="merging",
+        evidence={
+            "phase": "startup_merge_attempt",
+            "idempotency_key": f"startup-merge:{execution['execution_id']}:10",
+            "condition_id": "condition-1",
+            "quantity": "10",
+        },
+    )
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "equal_pair"
+    assert result["merge"] == "pending"
+    assert result["reconciled"] is False
+    assert result["merge_reason"] == "merge_attempt_in_flight"
+    assert trading.merge_calls == 0
+
+
 def test_clean_startup_becomes_ready_only_after_fresh_reconciliation(tmp_path: Path) -> None:
     service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
 
