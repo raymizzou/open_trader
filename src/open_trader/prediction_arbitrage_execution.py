@@ -133,6 +133,8 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "circuit_breaker_open"}
         active = self._store.active_execution()
         if active is not None:
+            if str(active.get("idempotency_key", "")) == key:
+                return self._decorate_execution(active)
             return {
                 "state": "busy",
                 "reason": "active_execution",
@@ -181,6 +183,9 @@ class PredictionExecutionService:
         if existing is not None:
             return existing
         if self._breaker_is_open():
+            existing = self._execution_for_idempotency(key)
+            if existing is not None:
+                return existing
             return {"state": "locked", "reason": "circuit_breaker_open"}
         active = self._store.active_execution()
         if active is not None:
