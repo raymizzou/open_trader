@@ -1392,22 +1392,22 @@ def main(argv: list[str] | None = None) -> int:
                 code = getattr(exc, "error_code", "unavailable")
                 print(f"result: BLOCKED\nerror_code: {code}")
                 return 2
-            try:
-                client.account_snapshot()
-            except PolymarketTradingError as exc:
-                print(f"account_reads: fail\nerror_code: {exc.error_code}\nresult: BLOCKED")
-                return 2
-            if not client.geoblock_allowed():
-                print("geoblock: blocked\nresult: BLOCKED")
-                return 2
-            # Market discovery belongs to the monitor task. Keep this command
-            # fail-closed until that task supplies a real in-memory PairIntent.
-            print("geoblock: allowed")
-            print("account_reads: pass")
-            print("fok_pair_signed_not_submitted: blocked")
-            print("error_code: market_probe_unavailable")
-            print("result: BLOCKED")
-            return 2
+            report = client.preflight_report()
+            for key in (
+                "sdk_version",
+                "signer_match",
+                "wallet_match",
+                "geoblock",
+                "account_reads",
+                "fok_pair_signed_not_submitted",
+                "equal_requested_shares",
+                "merge_capability",
+                "relayer_readiness",
+                "secret_scan",
+                "result",
+            ):
+                print(f"{key}: {report.get(key, 'BLOCKED')}")
+            return 0 if report.get("result") == "PASS" else 2
 
     if args.command == "trend-market":
         if args.trend_market_command == "resolve":

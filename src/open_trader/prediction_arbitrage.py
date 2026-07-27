@@ -96,8 +96,8 @@ def build_pair_intent(
     if yes_segments is None or no_segments is None:
         return None
 
-    yes_candidates = _protected_buy_candidates(yes_segments, precision)
-    no_candidates = _protected_buy_candidates(no_segments, precision)
+    yes_candidates = _protected_buy_candidates(yes_segments, facts.tick_size)
+    no_candidates = _protected_buy_candidates(no_segments, facts.tick_size)
     for quantity in sorted(yes_candidates.keys() & no_candidates.keys(), reverse=True):
         if quantity < facts.minimum_order_size or quantity <= 0:
             continue
@@ -262,21 +262,42 @@ def _book_segments(
 
 
 def _protected_buy_candidates(
-    segments: list[tuple[Decimal, Decimal, Decimal]],
-    precision: int,
+    segments: list[tuple[Decimal, Decimal, Decimal]], tick_size: Decimal
 ) -> dict[Decimal, Decimal]:
-    quantum = Decimal(1).scaleb(-precision)
     candidates: dict[Decimal, Decimal] = {}
     for cents in range(1, 2001):
         spend = COLLATERAL_SPEND_QUANTUM * cents
         for price, previous_depth, total_depth in segments:
-            quantity = (spend / price).quantize(quantum, rounding=ROUND_CEILING)
+            quantity = protected_buy_quantity(
+                spend=spend,
+                price=price,
+                tick_size=tick_size,
+            )
+            if quantity is None:
+                break
             if previous_depth < quantity <= total_depth:
                 old_spend = candidates.get(quantity)
                 if old_spend is None or spend < old_spend:
                     candidates[quantity] = spend
                 break
     return candidates
+
+
+def protected_buy_quantity(
+    *, spend: Decimal, price: Decimal, tick_size: Decimal
+) -> Decimal | None:
+    """Return the protected-BUY share amount for a supported tick size."""
+
+    if not all(
+        isinstance(value, Decimal) and value.is_finite() and value > 0
+        for value in (spend, price, tick_size)
+    ):
+        return None
+    precision = PROTECTED_BUY_SHARE_PRECISION.get(tick_size)
+    if precision is None or price > Decimal("1") or price % tick_size != 0:
+        return None
+    quantum = Decimal(1).scaleb(-precision)
+    return (spend / price).quantize(quantum, rounding=ROUND_CEILING)
 
 
 def _worst_price(

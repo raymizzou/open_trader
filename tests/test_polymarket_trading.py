@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -145,18 +145,81 @@ def test_from_keychain_uses_official_factory_without_redacted_credentials(
     assert "builder-secret-sentinel" not in repr(captured["api_key"])
 
 
+@pytest.mark.parametrize("identity", (False,))
+def test_from_keychain_rejects_missing_client_identity(
+    monkeypatch: pytest.MonkeyPatch, identity: bool
+) -> None:
+    secrets = {
+        "signing-private-key": "private-sentinel",
+        "builder-key": "builder-key-sentinel",
+        "builder-secret": "builder-secret-sentinel",
+        "builder-passphrase": "builder-passphrase-sentinel",
+    }
+
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.load_keychain_secret",
+        lambda account, **kwargs: secrets[account],
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        PolymarketTradingClient.from_keychain(
+            TradingConfig(SIGNER, WALLET),
+            client_factory=lambda **kwargs: FakeClient(identity=identity),
+        )
+    assert getattr(exc_info.value, "error_code", None) == "auth"
+
+
+def test_from_keychain_rejects_mismatched_client_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {
+        "signing-private-key": "private-sentinel",
+        "builder-key": "builder-key-sentinel",
+        "builder-secret": "builder-secret-sentinel",
+        "builder-passphrase": "builder-passphrase-sentinel",
+    }
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.load_keychain_secret",
+        lambda account, **kwargs: secrets[account],
+    )
+
+    def factory(**kwargs: object) -> FakeClient:
+        client = FakeClient()
+        client.signer = "0x4444444444444444444444444444444444444444"
+        return client
+
+    with pytest.raises(Exception) as exc_info:
+        PolymarketTradingClient.from_keychain(
+            TradingConfig(SIGNER, WALLET), client_factory=factory
+        )
+    assert getattr(exc_info.value, "error_code", None) == "auth"
+
+
 @dataclass
 class FakeSignedOrder:
     token_id: str
     taker_amount: int
+    maker_amount: int = 20_000_000
     order_type: str = "FOK"
     side: str = "BUY"
     signature: str = "signature-sentinel"
 
 
 class FakeClient:
-    def __init__(self, *, taker_scale: int = 1_000_000) -> None:
+    def __init__(
+        self,
+        *,
+        taker_scale: int = 1_000_000,
+        forced_quantity: Decimal | None = None,
+        identity: bool = True,
+    ) -> None:
         self.taker_scale = taker_scale
+        if identity:
+            self.signer = SIGNER
+            self.wallet = WALLET
+        self.environment = SimpleNamespace(
+            standard_exchange="0x3333333333333333333333333333333333333333"
+        )
         self.create_calls: list[dict[str, object]] = []
         self.post_calls: list[tuple[object, ...]] = []
         self.read_calls: list[str] = []
@@ -164,15 +227,32 @@ class FakeClient:
         self.merge_calls: list[dict[str, object]] = []
         self.post_error: Exception | None = None
         self.bad_taker = False
+        self.forced_quantity = forced_quantity
 
     def create_market_order(self, **kwargs: object) -> FakeSignedOrder:
         self.create_calls.append(kwargs)
+        if kwargs["side"] == "SELL":
+            shares = kwargs["shares"]
+            assert isinstance(shares, Decimal)
+            quantity = shares
+            return FakeSignedOrder(
+                token_id=str(kwargs["token_id"]),
+                taker_amount=int(quantity * kwargs["min_price"] * self.taker_scale),
+                maker_amount=int(quantity * self.taker_scale),
+                side="SELL",
+            )
         amount = kwargs["amount"]
         assert isinstance(amount, Decimal)
-        quantity = Decimal("20") if not self.bad_taker else Decimal("19")
+        if self.forced_quantity is not None:
+            quantity = self.forced_quantity
+        else:
+            quantity = amount / kwargs["max_price"]
+            if self.bad_taker:
+                quantity -= Decimal("1")
         return FakeSignedOrder(
             token_id=str(kwargs["token_id"]),
             taker_amount=int(quantity * self.taker_scale),
+            maker_amount=int(amount * self.taker_scale),
         )
 
     def post_orders(self, orders: tuple[FakeSignedOrder, ...]) -> tuple[object, ...]:
@@ -196,7 +276,13 @@ class FakeClient:
 
     def get_balance_allowance(self, **kwargs: object) -> object:
         self.read_calls.append("balance")
-        return SimpleNamespace(balance=20_000_000, allowances={"spender": 18_600_000})
+        return SimpleNamespace(
+            balance=20_000_000,
+            allowances={
+                self.environment.standard_exchange: 18_600_000,
+                "0x9999999999999999999999999999999999999999": 999_000_000,
+            },
+        )
 
     def list_open_orders(self, **kwargs: object) -> list[object]:
         self.read_calls.append("orders")
@@ -239,6 +325,28 @@ def make_adapter(fake: FakeClient | None = None) -> tuple[PolymarketTradingClien
     return PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=fake), fake
 
 
+def make_probe_intent(
+    *, quantity: Decimal, yes_price: Decimal = Decimal("0.45"), no_price: Decimal = Decimal("0.48")
+) -> PairIntent:
+    yes_cost = (quantity * yes_price).quantize(Decimal("0.01"))
+    no_cost = (quantity * no_price).quantize(Decimal("0.01"))
+    return PairIntent(
+        event_id="event-probe",
+        market_id="market-probe",
+        condition_id="condition-probe",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        quantity=quantity,
+        yes_max_price=yes_price,
+        no_max_price=no_price,
+        yes_max_cost=yes_cost,
+        no_max_cost=no_cost,
+        total_max_cost=yes_cost + no_cost,
+        minimum_profit=Decimal("1.00"),
+        net_edge=Decimal("0.01"),
+    )
+
+
 @pytest.mark.parametrize("payload", ({"blocked": True}, {"blocked": "false"}, [], None))
 def test_geoblock_fails_closed_for_blocked_or_malformed_responses(
     monkeypatch: pytest.MonkeyPatch, payload: object
@@ -259,6 +367,23 @@ def test_geoblock_timeout_and_error_fail_closed(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("open_trader.polymarket_trading.urlopen", fail)
     assert adapter.geoblock_allowed() is False
+
+
+def test_no_submit_identity_missing_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter(FakeClient(identity=False))
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    summary = adapter.no_submit_preflight(intent())
+
+    assert summary["result"] == "BLOCKED"
+    assert summary["error_code"] == "auth"
+    assert fake.create_calls == []
+    assert fake.post_calls == []
 
 
 def test_no_submit_preflight_signs_exact_costs_without_posting(
@@ -317,6 +442,78 @@ def test_no_submit_preflight_mismatched_signed_shares_fails_closed(
     assert fake.post_calls == []
 
 
+@pytest.mark.parametrize(
+    ("tick_size", "price"),
+    (
+        (Decimal("0.1"), Decimal("0.5")),
+        (Decimal("0.01"), Decimal("0.45")),
+        (Decimal("0.005"), Decimal("0.45")),
+        (Decimal("0.0025"), Decimal("0.45")),
+        (Decimal("0.001"), Decimal("0.451")),
+        (Decimal("0.0001"), Decimal("0.4501")),
+    ),
+)
+def test_no_submit_preflight_checks_task1_rounding_for_every_supported_tick(
+    monkeypatch: pytest.MonkeyPatch, tick_size: Decimal, price: Decimal
+) -> None:
+    from open_trader.prediction_arbitrage import protected_buy_quantity
+
+    spend = Decimal("1.00")
+    quantity = protected_buy_quantity(
+        spend=spend, price=price, tick_size=tick_size
+    )
+    assert quantity is not None
+    pair = make_probe_intent(quantity=quantity, yes_price=price, no_price=price)
+    adapter, fake = make_adapter(FakeClient(forced_quantity=quantity))
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    summary = adapter.no_submit_preflight(pair, tick_size=tick_size)
+
+    assert summary["result"] == "PASS"
+    assert fake.post_calls == []
+
+
+def test_submit_pair_requires_current_successful_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter()
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    blocked = adapter.submit_pair_once(intent())
+    assert blocked.yes.error_code == "preflight_required"
+    assert fake.post_calls == []
+
+    assert adapter.no_submit_preflight(intent())["result"] == "PASS"
+    result = adapter.submit_pair_once(intent())
+    assert len(fake.post_calls) == 1
+    assert result.yes.accepted is True
+
+
+def test_high_cost_or_malformed_intent_is_rejected_before_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter()
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+    too_expensive = replace(
+        intent(), yes_max_cost=Decimal("20.01"), total_max_cost=Decimal("29.61")
+    )
+
+    summary = adapter.no_submit_preflight(too_expensive)
+    assert summary["result"] == "BLOCKED"
+    assert summary["error_code"] == "invalid"
+    assert fake.create_calls == []
+    assert fake.post_calls == []
+
+
 def test_submit_pair_posts_two_signed_orders_once_and_preserves_responses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,6 +523,7 @@ def test_submit_pair_posts_two_signed_orders_once_and_preserves_responses(
         lambda *args, **kwargs: FakeResponse({"blocked": False}),
     )
 
+    assert adapter.no_submit_preflight(intent())["result"] == "PASS"
     result = adapter.submit_pair_once(intent())
 
     assert len(fake.post_calls) == 1
@@ -348,6 +546,7 @@ def test_submit_pair_post_exception_is_ambiguous_without_retry(
         lambda *args, **kwargs: FakeResponse({"blocked": False}),
     )
 
+    assert adapter.no_submit_preflight(intent())["result"] == "PASS"
     result = adapter.submit_pair_once(intent())
 
     assert len(fake.post_calls) == 1
@@ -370,6 +569,14 @@ def test_account_reads_cover_balance_orders_trades_and_positions() -> None:
     assert snapshot.positions == ({"condition_id": "condition-1", "size": "20"},)
 
 
+def test_account_snapshot_uses_only_standard_exchange_allowance() -> None:
+    adapter, _ = make_adapter()
+
+    snapshot = adapter.account_snapshot()
+
+    assert snapshot.p_usd_allowance == Decimal("18.6")
+
+
 def test_cancel_and_merge_use_official_methods_once() -> None:
     adapter, fake = make_adapter()
 
@@ -379,6 +586,170 @@ def test_cancel_and_merge_use_official_methods_once() -> None:
     assert fake.cancel_calls == [("one", "two")]
     assert fake.merge_calls == [{"condition_id": "condition-1", "amount": 20_000_000}]
     assert merged["status"] == "confirmed"
+
+
+def test_remediation_supports_sell_unwind_with_single_post() -> None:
+    adapter, fake = make_adapter()
+
+    result = adapter.submit_remediation_once(
+        {
+            "leg": "YES",
+            "side": "SELL",
+            "token_id": "yes-token",
+            "shares": Decimal("2"),
+            "quantity": Decimal("2"),
+            "min_price": Decimal("0.40"),
+        }
+    )
+
+    assert result.leg == "YES"
+    assert len(fake.post_calls) == 1
+    assert fake.create_calls[-1] == {
+        "token_id": "yes-token",
+        "side": "SELL",
+        "shares": Decimal("2"),
+        "min_price": Decimal("0.40"),
+        "order_type": "FOK",
+    }
+
+
+@pytest.mark.parametrize(
+    "order",
+    (
+        {"leg": "MAYBE", "side": "BUY"},
+        {"leg": "YES", "side": "BUY", "token_id": "yes-token", "amount": Decimal("0"), "max_price": Decimal("0.4")},
+        {"leg": "YES", "side": "SELL", "token_id": "yes-token", "shares": Decimal("0"), "min_price": Decimal("0.4")},
+    ),
+)
+def test_remediation_rejects_invalid_leg_or_zero_order_without_post(
+    order: dict[str, object],
+) -> None:
+    adapter, fake = make_adapter()
+
+    result = adapter.submit_remediation_once(order)
+
+    assert result.status == "blocked"
+    assert result.error_code == "invalid"
+    assert fake.create_calls == []
+    assert fake.post_calls == []
+
+
+class FakePublicClient:
+    def __init__(self) -> None:
+        self.markets = [
+            SimpleNamespace(
+                id="eligible",
+                condition_id="condition-eligible",
+                state=SimpleNamespace(
+                    active=True,
+                    closed=False,
+                    archived=False,
+                    accepting_orders=True,
+                    enable_order_book=True,
+                    neg_risk=False,
+                ),
+                outcomes=SimpleNamespace(
+                    yes=SimpleNamespace(token_id="yes-token"),
+                    no=SimpleNamespace(token_id="no-token"),
+                ),
+                metrics=SimpleNamespace(volume_24hr=Decimal("100")),
+                trading=SimpleNamespace(
+                    minimum_order_size=Decimal("1"),
+                    minimum_tick_size=Decimal("0.01"),
+                    fees_enabled=False,
+                ),
+            ),
+            SimpleNamespace(
+                id="neg-risk",
+                condition_id="condition-neg-risk",
+                state=SimpleNamespace(
+                    active=True,
+                    closed=False,
+                    archived=False,
+                    accepting_orders=True,
+                    enable_order_book=True,
+                    neg_risk=True,
+                ),
+                outcomes=SimpleNamespace(
+                    yes=SimpleNamespace(token_id="neg-yes"),
+                    no=SimpleNamespace(token_id="neg-no"),
+                ),
+                metrics=SimpleNamespace(volume_24hr=Decimal("1000")),
+                trading=SimpleNamespace(
+                    minimum_order_size=Decimal("1"),
+                    minimum_tick_size=Decimal("0.01"),
+                    fees_enabled=False,
+                ),
+            ),
+        ]
+
+    def list_markets(self, **kwargs: object) -> list[object]:
+        return self.markets
+
+    def get_order_book(self, *, token_id: str) -> object:
+        return SimpleNamespace(
+            asks=(SimpleNamespace(price=Decimal("0.45" if token_id == "yes-token" else "0.48"), size=Decimal("100")),),
+            min_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+        )
+
+
+def test_preflight_report_discovers_standard_fee_free_probe_without_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter(FakeClient())
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=fake,
+        public_client_factory=FakePublicClient,
+    )
+    report = adapter.preflight_report()
+
+    assert report["signer_match"] == "yes"
+    assert report["wallet_match"] == "yes"
+    assert report["geoblock"] == "allowed"
+    assert report["account_reads"] == "pass"
+    assert report["fok_pair_signed_not_submitted"] == "pass"
+    assert report["equal_requested_shares"] == "pass"
+    assert report["merge_capability"] == "present_not_invoked"
+    assert report["relayer_readiness"] == "pass"
+    assert report["secret_scan"] == "pass"
+    assert report["result"] == "PASS"
+    assert fake.post_calls == []
+
+
+def test_cli_preflight_prints_safe_report(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"signer_address": SIGNER, "wallet_address": WALLET}), encoding="utf-8")
+    report = {
+        "sdk_version": "0.2.0",
+        "signer_match": "yes",
+        "wallet_match": "yes",
+        "geoblock": "allowed",
+        "account_reads": "pass",
+        "fok_pair_signed_not_submitted": "pass",
+        "equal_requested_shares": "pass",
+        "merge_capability": "present_not_invoked",
+        "relayer_readiness": "pass",
+        "secret_scan": "pass",
+        "result": "PASS",
+    }
+
+    class FakeAdapter:
+        def preflight_report(self) -> dict[str, object]:
+            return report
+
+    monkeypatch.setattr(cli.PolymarketTradingClient, "from_keychain", lambda config: FakeAdapter())
+    monkeypatch.setattr(cli, "load_trading_config", lambda path: TradingConfig(SIGNER, WALLET))
+
+    assert cli.main(["prediction-arb", "preflight", "--config", str(config), "--no-submit"]) == 0
+    output = capsys.readouterr().out.strip().splitlines()
+    assert output == [f"{key}: {value}" for key, value in report.items()]
 
 
 def test_prediction_wallet_help_has_no_secret_options(

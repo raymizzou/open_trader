@@ -7,6 +7,7 @@ never handle private keys, builder credentials, or signed order payloads.
 from __future__ import annotations
 
 import json
+import importlib.metadata
 import re
 import subprocess
 import threading
@@ -18,9 +19,16 @@ from typing import Callable, Literal, Mapping, Sequence, cast
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from polymarket import BuilderApiKey, SecureClient
+from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 
-from .prediction_arbitrage import PairIntent
+from .prediction_arbitrage import (
+    MAX_NORMAL_COST,
+    MAX_WALLET_BALANCE,
+    MIN_ESTIMATED_PROFIT,
+    MIN_NET_EDGE,
+    PairIntent,
+    protected_buy_quantity,
+)
 
 
 SECURITY = "/usr/bin/security"
@@ -35,6 +43,8 @@ GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 GEOBLOCK_TIMEOUT_SECONDS = 5.0
 MERGE_WAIT_TIMEOUT_SECONDS = 60.0
 COLLATERAL_BASE_UNITS = Decimal("1000000")
+DEFAULT_TICK_SIZE = Decimal("0.01")
+CENT = Decimal("0.01")
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 _SAFE_ERROR_CODES = {
     "ambiguous",
@@ -47,6 +57,9 @@ _SAFE_ERROR_CODES = {
     "network",
     "order_amount_mismatch",
     "order_shape_mismatch",
+    "preflight_required",
+    "market_probe_unavailable",
+    "account_insufficient",
     "rejected",
     "sdk_error",
     "signing",
@@ -68,8 +81,13 @@ class KeychainError(RuntimeError):
     """A redacted Keychain operation failure."""
 
     def __init__(self, error_code: str = "keychain_unavailable") -> None:
-        self.error_code = error_code
-        super().__init__(f"keychain error: {error_code}")
+        safe_code = (
+            error_code
+            if error_code in {"keychain_empty", "keychain_unavailable"}
+            else "keychain_unavailable"
+        )
+        self.error_code = safe_code
+        super().__init__(f"keychain error: {safe_code}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,10 +316,13 @@ class PolymarketTradingClient:
         client: object,
         *,
         urlopen_fn: Callable[..., object] | None = None,
+        public_client_factory: Callable[[], object] | None = None,
     ) -> None:
         self.config = config
         self._client = client
         self._urlopen_fn = urlopen_fn
+        self._public_client_factory = public_client_factory or PublicClient
+        self._readiness_key: tuple[PairIntent, Decimal] | None = None
 
     @classmethod
     def from_keychain(
@@ -310,6 +331,7 @@ class PolymarketTradingClient:
         *,
         client_factory: Callable[..., object] | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        public_client_factory: Callable[[], object] | None = None,
     ) -> "PolymarketTradingClient":
         private_key = load_keychain_secret("signing-private-key", run=run)
         builder_key = load_keychain_secret("builder-key", run=run)
@@ -332,11 +354,11 @@ class PolymarketTradingClient:
             raise PolymarketTradingError(code) from None
         signer = _address_from_client(client, "signer")
         wallet = _address_from_client(client, "wallet")
-        if signer is not None and signer.lower() != config.signer_address.lower():
+        if signer is None or signer.lower() != config.signer_address.lower():
             raise PolymarketTradingError("auth")
-        if wallet is not None and wallet.lower() != config.wallet_address.lower():
+        if wallet is None or wallet.lower() != config.wallet_address.lower():
             raise PolymarketTradingError("auth")
-        return cls(config, client)
+        return cls(config, client, public_client_factory=public_client_factory)
 
     def geoblock_allowed(self) -> bool:
         """Return true only for an explicit ``{"blocked": false}`` response."""
@@ -362,13 +384,20 @@ class PolymarketTradingClient:
             positions = _collect(self._client.list_positions())
             p_usd_balance = _decimal(_field(balance, "balance"), base_units=True)
             allowances = _field(balance, "allowances", {})
-            allowance_values = (
-                allowances.values() if isinstance(allowances, Mapping) else ()
-            )
-            p_usd_allowance = max(
-                (_decimal(value, base_units=True) for value in allowance_values),
-                default=Decimal("0"),
-            )
+            environment = getattr(self._client, "environment", PRODUCTION)
+            spender = getattr(environment, "standard_exchange", None)
+            if not isinstance(spender, str) or not isinstance(allowances, Mapping):
+                p_usd_allowance = Decimal("0")
+            else:
+                selected = next(
+                    (
+                        value
+                        for key, value in allowances.items()
+                        if isinstance(key, str) and key.lower() == spender.lower()
+                    ),
+                    0,
+                )
+                p_usd_allowance = _decimal(selected, base_units=True)
             open_order_ids = tuple(
                 _safe_string(order_id)
                 for order in orders
@@ -398,8 +427,8 @@ class PolymarketTradingClient:
     def _identity_summary(self) -> tuple[str, str]:
         signer = _address_from_client(self._client, "signer")
         wallet = _address_from_client(self._client, "wallet")
-        signer_match = "yes" if signer is None or signer.lower() == self.config.signer_address.lower() else "no"
-        wallet_match = "yes" if wallet is None or wallet.lower() == self.config.wallet_address.lower() else "no"
+        signer_match = "yes" if signer is not None and signer.lower() == self.config.signer_address.lower() else "no"
+        wallet_match = "yes" if wallet is not None and wallet.lower() == self.config.wallet_address.lower() else "no"
         return signer_match, wallet_match
 
     def _sign_leg(
@@ -419,21 +448,139 @@ class PolymarketTradingClient:
         )
 
     @staticmethod
+    def _field_alias(value: object, *names: str, default: object = None) -> object:
+        for name in names:
+            found = _field(value, name, None)
+            if found is not None:
+                return found
+        return default
+
+    @staticmethod
+    def _positive_decimal(value: object) -> Decimal | None:
+        if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+            return None
+        return value
+
+    def _validate_intent(
+        self,
+        intent: PairIntent,
+        *,
+        account: AccountSnapshot,
+        tick_size: Decimal,
+        require_economics: bool = True,
+    ) -> str | None:
+        if not isinstance(intent, PairIntent):
+            return "invalid"
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                intent.event_id,
+                intent.market_id,
+                intent.condition_id,
+                intent.yes_token_id,
+                intent.no_token_id,
+            )
+        ):
+            return "invalid"
+        decimal_fields = (
+            intent.quantity,
+            intent.yes_max_price,
+            intent.no_max_price,
+            intent.yes_max_cost,
+            intent.no_max_cost,
+            intent.total_max_cost,
+            intent.minimum_profit,
+            intent.net_edge,
+        )
+        if not all(isinstance(value, Decimal) and value.is_finite() for value in decimal_fields):
+            return "invalid"
+        if any(
+            self._positive_decimal(value) is None
+            for value in (
+                intent.quantity,
+                intent.yes_max_price,
+                intent.no_max_price,
+                intent.yes_max_cost,
+                intent.no_max_cost,
+                intent.total_max_cost,
+            )
+        ):
+            return "invalid"
+        if intent.yes_token_id == intent.no_token_id:
+            return "invalid"
+        if intent.yes_max_price > 1 or intent.no_max_price > 1:
+            return "invalid"
+        if intent.yes_max_cost % CENT or intent.no_max_cost % CENT:
+            return "invalid"
+        if intent.total_max_cost != intent.yes_max_cost + intent.no_max_cost:
+            return "invalid"
+        if intent.total_max_cost > MAX_NORMAL_COST:
+            return "invalid"
+        if require_economics and (
+            intent.minimum_profit < MIN_ESTIMATED_PROFIT
+            or intent.net_edge < MIN_NET_EDGE
+        ):
+            return "invalid"
+        if account.p_usd_balance < 0 or account.p_usd_allowance < 0:
+            return "account_insufficient"
+        if account.p_usd_balance > MAX_WALLET_BALANCE:
+            return "account_insufficient"
+        if intent.total_max_cost > account.p_usd_balance or intent.total_max_cost > account.p_usd_allowance:
+            return "account_insufficient"
+        yes_expected = protected_buy_quantity(
+            spend=intent.yes_max_cost,
+            price=intent.yes_max_price,
+            tick_size=tick_size,
+        )
+        no_expected = protected_buy_quantity(
+            spend=intent.no_max_cost,
+            price=intent.no_max_price,
+            tick_size=tick_size,
+        )
+        if yes_expected is None or no_expected is None:
+            return "order_amount_mismatch"
+        if yes_expected != intent.quantity or no_expected != intent.quantity:
+            return "order_amount_mismatch"
+        return None
+
+    @staticmethod
     def _signed_quantity(signed: object, expected: Decimal) -> Decimal | None:
-        raw = _field(signed, "taker_amount")
-        if raw is None:
-            raw = _field(signed, "requested_amount")
+        raw_values = [
+            value
+            for value in (
+                _field(signed, "taker_amount"),
+                _field(signed, "requested_amount"),
+            )
+            if value is not None
+        ]
+        if not raw_values:
+            return None
+        quantities: list[Decimal] = []
+        for raw in raw_values:
+            try:
+                parsed = _decimal(raw)
+            except ValueError:
+                return None
+            # The SDK serializes shares as six-decimal base units. Accept a
+            # direct Decimal/int in test doubles only when it is exact.
+            quantities.append(
+                parsed if parsed == expected else parsed / COLLATERAL_BASE_UNITS
+            )
+        return quantities[0] if all(quantity == quantities[0] for quantity in quantities) else None
+
+    @staticmethod
+    def _signed_quantity_base_units(raw: object, expected: Decimal) -> Decimal | None:
         try:
             parsed = _decimal(raw)
         except ValueError:
             return None
-        # The SDK serializes shares as six-decimal base units. Accept a direct
-        # Decimal/int in test doubles only when it is exactly the expected value.
         if parsed == expected:
             return parsed
         return parsed / COLLATERAL_BASE_UNITS
 
-    def _signed_pair(self, intent: PairIntent) -> tuple[object, object, str | None]:
+    def _signed_pair(
+        self, intent: PairIntent, *, tick_size: Decimal
+    ) -> tuple[object, object, str | None]:
         try:
             yes = self._sign_leg(
                 token_id=intent.yes_token_id,
@@ -461,12 +608,21 @@ class PolymarketTradingClient:
             return yes, no, "order_amount_mismatch"
         return yes, no, None
 
-    def no_submit_preflight(self, intent: PairIntent) -> dict[str, object]:
+    def no_submit_preflight(
+        self,
+        intent: PairIntent,
+        *,
+        tick_size: Decimal = DEFAULT_TICK_SIZE,
+        account: AccountSnapshot | None = None,
+        require_economics: bool = True,
+    ) -> dict[str, object]:
+        self._readiness_key = None
         signer_match, wallet_match = self._identity_summary()
         summary: dict[str, object] = {
             "signer_match": signer_match,
             "wallet_match": wallet_match,
             "posted": False,
+            "account_reads": "fail",
             "fok_pair_signed_not_submitted": "fail",
             "equal_requested_shares": "fail",
             "error_code": "none",
@@ -475,19 +631,225 @@ class PolymarketTradingClient:
         if signer_match != "yes" or wallet_match != "yes":
             summary["error_code"] = "auth"
             return summary
+        if account is None:
+            try:
+                account = self.account_snapshot()
+            except PolymarketTradingError as exc:
+                summary["error_code"] = exc.error_code
+                return summary
+        summary["account_reads"] = "pass"
         if not self.geoblock_allowed():
             summary["geoblock"] = "blocked"
             summary["error_code"] = "geoblock_blocked"
             return summary
         summary["geoblock"] = "allowed"
-        _, _, error_code = self._signed_pair(intent)
+        error_code = self._validate_intent(
+            intent,
+            account=account,
+            tick_size=tick_size,
+            require_economics=require_economics,
+        )
+        if error_code is None:
+            _, _, error_code = self._signed_pair(intent, tick_size=tick_size)
         if error_code is not None:
             summary["error_code"] = error_code
             return summary
         summary["fok_pair_signed_not_submitted"] = "pass"
         summary["equal_requested_shares"] = "pass"
         summary["result"] = "PASS"
+        self._readiness_key = (intent, tick_size)
         return summary
+
+    def _probe_candidates(
+        self,
+        *,
+        price: Decimal,
+        size: Decimal,
+        minimum: Decimal,
+        tick_size: Decimal,
+    ) -> dict[Decimal, Decimal]:
+        candidates: dict[Decimal, Decimal] = {}
+        for cents in range(1, int(MAX_NORMAL_COST / CENT) + 1):
+            spend = CENT * cents
+            quantity = protected_buy_quantity(
+                spend=spend, price=price, tick_size=tick_size
+            )
+            if quantity is None or quantity < minimum or quantity > size:
+                continue
+            candidates.setdefault(quantity, spend)
+        return candidates
+
+    def _discover_probe(self) -> tuple[PairIntent, Decimal]:
+        try:
+            public = self._public_client_factory()
+            markets = _collect(
+                public.list_markets(closed=False, order="volume24hr", page_size=100)
+            )
+            eligible: list[tuple[Decimal, str, object]] = []
+            for market in markets:
+                state = _field(market, "state")
+                trading = _field(market, "trading")
+                outcomes = _field(market, "outcomes")
+                metrics = _field(market, "metrics")
+                if not (
+                    _field(state, "active") is True
+                    and _field(state, "closed") is False
+                    and _field(state, "archived") is False
+                    and _field(state, "accepting_orders") is True
+                    and _field(state, "enable_order_book") is True
+                    and _field(state, "neg_risk") is False
+                    and _field(trading, "fees_enabled") is False
+                ):
+                    continue
+                volume = self._field_alias(metrics, "volume_24hr", "volume24hr")
+                market_id = self._field_alias(market, "id", default="")
+                try:
+                    volume_decimal = _decimal(volume)
+                except ValueError:
+                    continue
+                if volume_decimal < 0 or not isinstance(market_id, str):
+                    continue
+                eligible.append((volume_decimal, market_id, market))
+            if not eligible:
+                raise PolymarketTradingError("market_probe_unavailable")
+            _, market_id, market = max(eligible, key=lambda item: (item[0], item[1]))
+            outcomes = _field(market, "outcomes")
+            yes = _field(outcomes, "yes")
+            no = _field(outcomes, "no")
+            yes_token = self._field_alias(yes, "token_id", "tokenId")
+            no_token = self._field_alias(no, "token_id", "tokenId")
+            condition_id = self._field_alias(market, "condition_id", "conditionId", default="")
+            trading = _field(market, "trading")
+            tick_value = self._field_alias(trading, "minimum_tick_size", "minimumTickSize")
+            minimum_value = self._field_alias(trading, "minimum_order_size", "minimumOrderSize")
+            if not isinstance(yes_token, str) or not isinstance(no_token, str) or not isinstance(condition_id, str):
+                raise PolymarketTradingError("market_probe_unavailable")
+            yes_book = public.get_order_book(token_id=yes_token)
+            no_book = public.get_order_book(token_id=no_token)
+            yes_asks = _collect(_field(yes_book, "asks"))
+            no_asks = _collect(_field(no_book, "asks"))
+            if not yes_asks or not no_asks:
+                raise PolymarketTradingError("market_probe_unavailable")
+            yes_level = min(yes_asks, key=lambda level: _decimal(_field(level, "price")))
+            no_level = min(no_asks, key=lambda level: _decimal(_field(level, "price")))
+            yes_price = _decimal(_field(yes_level, "price"))
+            no_price = _decimal(_field(no_level, "price"))
+            yes_size = _decimal(_field(yes_level, "size"))
+            no_size = _decimal(_field(no_level, "size"))
+            if not isinstance(tick_value, Decimal):
+                tick_value = _field(yes_book, "tick_size")
+            if not isinstance(minimum_value, Decimal):
+                minimum_value = _field(yes_book, "min_order_size")
+            if not isinstance(tick_value, Decimal) or not isinstance(minimum_value, Decimal):
+                raise PolymarketTradingError("market_probe_unavailable")
+            yes_candidates = self._probe_candidates(
+                price=yes_price, size=yes_size, minimum=minimum_value, tick_size=tick_value
+            )
+            no_candidates = self._probe_candidates(
+                price=no_price, size=no_size, minimum=minimum_value, tick_size=tick_value
+            )
+            common = sorted(
+                quantity
+                for quantity in set(yes_candidates) & set(no_candidates)
+                if yes_candidates[quantity] + no_candidates[quantity] <= MAX_NORMAL_COST
+            )
+            if not common:
+                raise PolymarketTradingError("market_probe_unavailable")
+            quantity = common[0]
+            yes_cost = yes_candidates[quantity]
+            no_cost = no_candidates[quantity]
+            return (
+                PairIntent(
+                    event_id=market_id,
+                    market_id=market_id,
+                    condition_id=condition_id,
+                    yes_token_id=yes_token,
+                    no_token_id=no_token,
+                    quantity=quantity,
+                    yes_max_price=yes_price,
+                    no_max_price=no_price,
+                    yes_max_cost=yes_cost,
+                    no_max_cost=no_cost,
+                    total_max_cost=yes_cost + no_cost,
+                    minimum_profit=quantity - yes_cost - no_cost,
+                    net_edge=(quantity - yes_cost - no_cost) / quantity,
+                ),
+                tick_value,
+            )
+        except PolymarketTradingError:
+            raise
+        except Exception as exc:
+            del exc
+            raise PolymarketTradingError("market_probe_unavailable") from None
+
+    def preflight_report(self) -> dict[str, object]:
+        report: dict[str, object] = {
+            "sdk_version": "unknown",
+            "signer_match": "no",
+            "wallet_match": "no",
+            "geoblock": "blocked",
+            "account_reads": "fail",
+            "fok_pair_signed_not_submitted": "fail",
+            "equal_requested_shares": "fail",
+            "merge_capability": "unavailable",
+            "relayer_readiness": "fail",
+            "secret_scan": "pass",
+            "result": "BLOCKED",
+        }
+        try:
+            report["sdk_version"] = importlib.metadata.version("polymarket-client")
+        except importlib.metadata.PackageNotFoundError:
+            pass
+        signer_match, wallet_match = self._identity_summary()
+        report["signer_match"] = signer_match
+        report["wallet_match"] = wallet_match
+        if signer_match != "yes" or wallet_match != "yes":
+            return report
+        try:
+            account = self.account_snapshot()
+        except PolymarketTradingError:
+            return report
+        report["account_reads"] = "pass"
+        report["merge_capability"] = (
+            "present_not_invoked"
+            if callable(getattr(self._client, "merge_positions", None))
+            else "unavailable"
+        )
+        report["relayer_readiness"] = (
+            "pass" if report["merge_capability"] == "present_not_invoked" else "fail"
+        )
+        try:
+            intent, tick_size = self._discover_probe()
+        except PolymarketTradingError:
+            return report
+        summary = self.no_submit_preflight(
+            intent,
+            tick_size=tick_size,
+            account=account,
+            require_economics=False,
+        )
+        report["signer_match"] = summary["signer_match"]
+        report["wallet_match"] = summary["wallet_match"]
+        report["geoblock"] = summary.get("geoblock", "blocked")
+        report["fok_pair_signed_not_submitted"] = summary[
+            "fok_pair_signed_not_submitted"
+        ]
+        report["equal_requested_shares"] = summary["equal_requested_shares"]
+        if (
+            report["sdk_version"] == "0.2.0"
+            and
+            report["signer_match"] == "yes"
+            and report["wallet_match"] == "yes"
+            and report["geoblock"] == "allowed"
+            and report["account_reads"] == "pass"
+            and report["fok_pair_signed_not_submitted"] == "pass"
+            and report["equal_requested_shares"] == "pass"
+            and report["merge_capability"] == "present_not_invoked"
+            and report["relayer_readiness"] == "pass"
+            and report["secret_scan"] == "pass"
+        ):
+            report["result"] = "PASS"
+        return report
 
     @staticmethod
     def _ambiguous_pair() -> PairSubmission:
@@ -527,10 +889,26 @@ class PolymarketTradingClient:
         trade_ids = tuple(item for item in trades if isinstance(item, str)) if isinstance(trades, (tuple, list)) else ()
         return LegResult(leg, accepted, status, order_id, filled_quantity, trade_ids, error_code)
 
-    def submit_pair_once(self, intent: PairIntent) -> PairSubmission:
+    def submit_pair_once(
+        self, intent: PairIntent, *, tick_size: Decimal = DEFAULT_TICK_SIZE
+    ) -> PairSubmission:
+        if self._readiness_key != (intent, tick_size):
+            return self._blocked_pair("preflight_required")
+        signer_match, wallet_match = self._identity_summary()
+        if signer_match != "yes" or wallet_match != "yes":
+            return self._blocked_pair("auth")
         if not self.geoblock_allowed():
             return self._blocked_pair("geoblock_blocked")
-        yes, no, error_code = self._signed_pair(intent)
+        try:
+            account = self.account_snapshot()
+        except PolymarketTradingError as exc:
+            return self._blocked_pair(exc.error_code)
+        error_code = self._validate_intent(
+            intent, account=account, tick_size=tick_size, require_economics=True
+        )
+        if error_code is not None:
+            return self._blocked_pair(error_code)
+        yes, no, error_code = self._signed_pair(intent, tick_size=tick_size)
         if error_code is not None:
             return self._blocked_pair(error_code)
         try:
@@ -577,15 +955,65 @@ class PolymarketTradingClient:
 
     def submit_remediation_once(self, order: dict[str, object]) -> LegResult:
         raw_leg = order.get("leg")
-        leg: Literal["YES", "NO"] = "YES" if raw_leg == "YES" else "NO"
+        if raw_leg not in ("YES", "NO"):
+            return LegResult("YES", False, "blocked", "", Decimal("0"), (), "invalid")
+        leg: Literal["YES", "NO"] = cast(Literal["YES", "NO"], raw_leg)
+        side = order.get("side")
         token_id = order.get("token_id")
-        amount = order.get("amount", order.get("max_spend"))
-        max_price = order.get("max_price")
-        if not isinstance(token_id, str) or not isinstance(amount, Decimal) or not isinstance(max_price, Decimal):
+        if side not in ("BUY", "SELL") or not isinstance(token_id, str) or not token_id:
+            return LegResult(leg, False, "blocked", "", Decimal("0"), (), "invalid")
+        quantity = order.get("quantity")
+        if side == "SELL" and not isinstance(quantity, Decimal):
+            quantity = order.get("shares") if side == "SELL" else None
+        if isinstance(quantity, Decimal) and self._positive_decimal(quantity) is None:
             return LegResult(leg, False, "blocked", "", Decimal("0"), (), "invalid")
         try:
-            signed = self._sign_leg(token_id=token_id, amount=amount, max_price=max_price)
-            if _field(signed, "order_type") != "FOK" or _field(signed, "side") != "BUY":
+            if side == "BUY":
+                amount = order.get("amount", order.get("max_spend"))
+                max_spend = order.get("max_spend", amount)
+                max_price = order.get("max_price")
+                if (
+                    not isinstance(amount, Decimal)
+                    or self._positive_decimal(amount) is None
+                    or not isinstance(max_spend, Decimal)
+                    or self._positive_decimal(max_spend) is None
+                    or max_spend != amount
+                    or not isinstance(max_price, Decimal)
+                    or self._positive_decimal(max_price) is None
+                    or max_price > 1
+                ):
+                    return LegResult(leg, False, "blocked", "", Decimal("0"), (), "invalid")
+                if not isinstance(quantity, Decimal):
+                    quantity = amount / max_price
+                signed = self._sign_leg(
+                    token_id=token_id, amount=amount, max_price=max_price
+                )
+                signed_quantity = self._signed_quantity(signed, quantity)
+            else:
+                shares = order.get("shares")
+                min_price = order.get("min_price")
+                if (
+                    not isinstance(shares, Decimal)
+                    or self._positive_decimal(shares) is None
+                    or not isinstance(min_price, Decimal)
+                    or self._positive_decimal(min_price) is None
+                    or min_price > 1
+                ):
+                    return LegResult(leg, False, "blocked", "", Decimal("0"), (), "invalid")
+                signed = self._client.create_market_order(
+                    token_id=token_id,
+                    side="SELL",
+                    shares=shares,
+                    min_price=min_price,
+                    order_type="FOK",
+                )
+                raw_shares = _field(signed, "maker_amount")
+                signed_quantity = self._signed_quantity_base_units(raw_shares, quantity)
+            if (
+                _field(signed, "order_type") != "FOK"
+                or _field(signed, "side") != side
+                or signed_quantity != quantity
+            ):
                 return LegResult(leg, False, "blocked", "", Decimal("0"), (), "order_shape_mismatch")
             responses = tuple(self._client.post_orders((signed,)))
         except Exception:
