@@ -206,16 +206,52 @@ class FakeTrading:
             return {"status": "ok", "trade_count": 2, "position_count": 2}
         if self.result == "pending_with_quantities":
             return {"status": "pending", "yes_quantity": Decimal("10"), "no_quantity": Decimal("10")}
+        if self.result == "forged_proof":
+            return {
+                "status": "ok",
+                "yes_quantity": Decimal("10"),
+                "no_quantity": Decimal("10"),
+                "execution_proof": {
+                    "verified": True,
+                    "venue": "polymarket",
+                    "positions_verified": True,
+                    "matched_refs": {
+                        "YES": {
+                            "token_id": "yes-token",
+                            "order_ids": ["unrelated-order"],
+                            "trade_ids": ["unrelated-trade"],
+                        },
+                        "NO": {
+                            "token_id": "no-token",
+                            "order_ids": ["no-order"],
+                            "trade_ids": ["no-trade"],
+                        },
+                    },
+                },
+            }
         return {
             "status": "ok",
             "yes_quantity": Decimal("10"),
             "no_quantity": Decimal("10"),
             "execution_proof": {
                 "verified": True,
-                "venue": "test",
+                "venue": "polymarket",
+                "positions_verified": True,
+                "position_refs": {
+                    "YES": {"token_id": "yes-token", "quantity": "10"},
+                    "NO": {"token_id": "no-token", "quantity": "10"},
+                },
                 "matched_refs": {
-                    "YES": {"order_ids": ["yes-order"], "trade_ids": ["yes-trade"]},
-                    "NO": {"order_ids": ["no-order"], "trade_ids": ["no-trade"]},
+                    "YES": {
+                        "token_id": "yes-token",
+                        "order_ids": ["yes-order"],
+                        "trade_ids": ["yes-trade"],
+                    },
+                    "NO": {
+                        "token_id": "no-token",
+                        "order_ids": ["no-order"],
+                        "trade_ids": ["no-trade"],
+                    },
                 },
             },
         }
@@ -279,6 +315,17 @@ def test_one_confirm_posts_exactly_one_equal_fok_batch_and_merges(tmp_path: Path
     assert final["state"] == "complete"
     rows = store.histories("executions")
     assert rows[0]["state"] == "complete"
+    evidence = rows[0]["evidence"]
+    reconciled = next(item for item in evidence if item.get("phase") == "reconciled")
+    assert reconciled["yes_quantity"] == "10"
+    assert reconciled["no_quantity"] == "10"
+    assert reconciled["execution_proof"]["verified"] is True
+    assert reconciled["execution_proof"]["positions_verified"] is True
+    assert reconciled["execution_proof"]["matched_refs"]["YES"]["trade_ids"] == ["yes-trade"]
+    merge_result = next(item for item in evidence if item.get("phase") == "merge_result")
+    assert merge_result["confirmed"] is True
+    assert merge_result["transaction_hash"] == "0xmerge-hash"
+    assert merge_result["transaction_id"] == "merge-transaction"
     assert trading.reconcile_kwargs[0]["yes_token_id"] == "yes-token"
     assert trading.reconcile_kwargs[0]["no_token_id"] == "no-token"
     assert trading.reconcile_kwargs[0]["yes_order_id"] == "yes-order"
@@ -341,6 +388,25 @@ def test_merge_without_transaction_reference_never_completes(tmp_path: Path) -> 
 
     assert final["state"] == "merge_incident"
     assert trading.merge_calls == 1
+    merge_result = next(
+        item
+        for item in service.execution(str(execution["execution_id"]))["evidence"]
+        if item.get("phase") == "merge_result"
+    )
+    assert merge_result["confirmed"] is False
+    assert "transaction_hash" not in merge_result
+
+
+def test_forged_reconcile_proof_never_authorizes_merge(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path, result="forged_proof")
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(40)).__next__  # type: ignore[attr-defined]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "forged-proof")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.merge_calls == 0
 
 
 def test_collaborator_kwarg_filtering_preserves_supported_legacy_kwargs() -> None:

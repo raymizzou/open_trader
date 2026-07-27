@@ -468,13 +468,19 @@ class PolymarketTradingClient:
 
         checked_at = datetime.now(UTC)
         merge_capable = callable(getattr(self._client, "merge_positions", None))
-        gasless_method = getattr(self._client, "is_gasless_ready", None)
-        gasless_ready = False
-        if callable(gasless_method):
-            try:
-                gasless_ready = gasless_method() is True
-            except Exception:
-                gasless_ready = False
+        if isinstance(self._client, SecureClient):
+            gasless_ready = self._authenticated_relayer_probe()
+        else:
+            # Test/dry-run collaborators may expose an explicit readiness fact.
+            # The real SecureClient path above never trusts its deprecated,
+            # unconditional is_gasless_ready() implementation.
+            gasless_method = getattr(self._client, "is_gasless_ready", None)
+            gasless_ready = False
+            if callable(gasless_method):
+                try:
+                    gasless_ready = gasless_method() is True
+                except Exception:
+                    gasless_ready = False
         merge_ready = merge_capable and gasless_ready
         return {
             "checked_at": checked_at,
@@ -485,6 +491,41 @@ class PolymarketTradingClient:
             "relayer": "ready" if gasless_ready else "unavailable",
             "ready": merge_ready,
         }
+
+    def _authenticated_relayer_probe(self) -> bool:
+        """Prove the configured non-EOA wallet can read relayer parameters."""
+
+        try:
+            context = self._client._ctx  # type: ignore[attr-defined]
+            wallet_type = str(getattr(context, "wallet_type", ""))
+            if wallet_type == "EOA":
+                return False
+            relay_type = {
+                "POLY_PROXY": "PROXY",
+                "GNOSIS_SAFE": "SAFE",
+                "DEPOSIT_WALLET": "WALLET",
+            }.get(wallet_type)
+            relayer = getattr(context, "relayer", None)
+            wallet = str(getattr(context, "wallet", ""))
+            if relay_type is None or not wallet or not callable(getattr(relayer, "get_json", None)):
+                return False
+            payload = relayer.get_json(
+                "/v1/account/transactions/params",
+                params={"address": wallet, "type": relay_type},
+            )
+            if not isinstance(payload, Mapping):
+                return False
+            address = payload.get("address")
+            nonce = payload.get("nonce")
+            return (
+                isinstance(address, str)
+                and address.lower() == wallet.lower()
+                and isinstance(nonce, str)
+                and bool(nonce)
+                and nonce.isdigit()
+            )
+        except Exception:
+            return False
 
     def _identity_summary(self) -> tuple[str, str]:
         signer = _address_from_client(self._client, "signer")
@@ -1002,11 +1043,17 @@ class PolymarketTradingClient:
     ) -> dict[str, object]:
         """Prove one execution's fills from fresh, reference-matched trades."""
 
-        empty_refs: dict[str, object] = {"order_ids": [], "trade_ids": []}
+        empty_refs: dict[str, object] = {
+            "token_id": "",
+            "order_ids": [],
+            "trade_ids": [],
+        }
         proof: dict[str, object] = {
             "verified": False,
             "venue": "polymarket",
+            "positions_verified": False,
             "matched_refs": {"YES": dict(empty_refs), "NO": dict(empty_refs)},
+            "position_refs": {},
         }
         try:
             yes_orders = _string_refs(yes_order_ids) | _string_refs(yes_order_id)
@@ -1032,17 +1079,12 @@ class PolymarketTradingClient:
                 )
             )
             quantities = {"YES": Decimal("0"), "NO": Decimal("0")}
-            matched: dict[str, dict[str, list[str]]] = {
-                "YES": {"order_ids": [], "trade_ids": []},
-                "NO": {"order_ids": [], "trade_ids": []},
+            matched: dict[str, dict[str, object]] = {
+                "YES": {"token_id": str(yes_token_id or ""), "order_ids": [], "trade_ids": []},
+                "NO": {"token_id": str(no_token_id or ""), "order_ids": [], "trade_ids": []},
             }
             seen: set[tuple[str, str]] = set()
-            accepted_statuses = {
-                "MATCHED",
-                "MATCHED_NOT_BROADCASTED",
-                "MINED",
-                "CONFIRMED",
-            }
+            accepted_statuses = {"CONFIRMED"}
             for trade in trades:
                 matched_at = _trade_timestamp(trade)
                 if matched_at is None or matched_at < since_utc:
@@ -1054,6 +1096,8 @@ class PolymarketTradingClient:
                     continue
                 status = _safe_string(_field(trade, "status", "")).upper()
                 if status not in accepted_statuses:
+                    continue
+                if _safe_string(_field(trade, "side", "")).upper() != "BUY":
                     continue
                 raw_trade_id = _field(trade, "id", _field(trade, "trade_id", ""))
                 raw_order_id = _field(
@@ -1108,8 +1152,55 @@ class PolymarketTradingClient:
                     "error_code": "reconciliation_unverified",
                     "execution_proof": proof,
                 }
-            proof["verified"] = True
+            positions = _collect(self._client.list_positions(market=[condition_id]))
+            position_quantities = {"YES": Decimal("0"), "NO": Decimal("0")}
+            position_refs: dict[str, dict[str, str]] = {}
+            for position in positions:
+                position_condition = _field(
+                    position, "condition_id", _field(position, "market", "")
+                )
+                if position_condition not in (None, "", condition_id):
+                    continue
+                token_id = _field(
+                    position,
+                    "token_id",
+                    _field(position, "tokenId", _field(position, "asset_id", "")),
+                )
+                if not isinstance(token_id, str) or token_id not in (
+                    yes_token_id,
+                    no_token_id,
+                ):
+                    continue
+                position_timestamp = _trade_timestamp(position)
+                if position_timestamp is not None and position_timestamp < since_utc:
+                    continue
+                size = None
+                for name in ("size", "quantity", "shares"):
+                    size = _decimal(_field(position, name))
+                    if size is not None:
+                        break
+                if size is None or size <= 0:
+                    continue
+                leg = "YES" if token_id == yes_token_id else "NO"
+                position_quantities[leg] += size
+                position_refs[leg] = {
+                    "token_id": token_id,
+                    "quantity": format(position_quantities[leg], "f"),
+                }
+            positions_verified = (
+                position_quantities["YES"] >= quantities["YES"]
+                and position_quantities["NO"] >= quantities["NO"]
+            )
             proof["matched_refs"] = matched
+            proof["position_refs"] = position_refs
+            proof["positions_verified"] = positions_verified
+            if not positions_verified:
+                return {
+                    "status": "blocked",
+                    "error_code": "reconciliation_unverified",
+                    "execution_proof": proof,
+                }
+            proof["verified"] = True
             return {
                 "status": "ok",
                 "yes_quantity": quantities["YES"],

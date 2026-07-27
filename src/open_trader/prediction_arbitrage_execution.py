@@ -359,14 +359,30 @@ class PredictionExecutionService:
             if known is None:
                 self._finish_incident(execution_id, "reconciliation_timeout")
                 return
-            yes_quantity, no_quantity = known
+            yes_quantity, no_quantity, execution_proof = known
             if yes_quantity <= 0 or no_quantity <= 0 or yes_quantity != no_quantity:
                 self._finish_incident(execution_id, "directional_imbalance")
                 return
             self._transition(
                 execution_id,
+                "reconciling",
+                {
+                    "phase": "reconciled",
+                    "yes_quantity": yes_quantity,
+                    "no_quantity": no_quantity,
+                    "execution_proof": execution_proof,
+                },
+            )
+            self._transition(
+                execution_id,
                 "merging",
-                {"phase": "merging", "quantity": _safe_decimal(yes_quantity)},
+                {
+                    "phase": "merging",
+                    "quantity": _safe_decimal(yes_quantity),
+                    "yes_quantity": yes_quantity,
+                    "no_quantity": no_quantity,
+                    "execution_proof": execution_proof,
+                },
             )
             merge = getattr(self._trading, "merge_once", None)
             try:
@@ -376,11 +392,24 @@ class PredictionExecutionService:
                     quantity=yes_quantity,
                 )
             except Exception:
-                merge_result = {"status": "blocked", "error_code": "merge_error"}
+                merge_result = {
+                    "status": "blocked",
+                    "confirmed": False,
+                    "error_code": "merge_error",
+                }
+            merge_evidence: dict[str, object] = {"phase": "merge_result"}
+            if isinstance(merge_result, Mapping):
+                merge_evidence.update(self._safe_mapping(merge_result))
+                if not self._merge_confirmed(merge_result):
+                    merge_evidence["confirmed"] = False
+            else:
+                merge_evidence.update(
+                    {"status": self._result_status(merge_result), "confirmed": False}
+                )
             self._transition(
                 execution_id,
                 "merging",
-                {"phase": "merge_result", "status": self._result_status(merge_result)},
+                merge_evidence,
             )
             if not self._merge_confirmed(merge_result):
                 self._finish_incident(execution_id, "merge_not_confirmed", state="merge_incident")
@@ -717,6 +746,17 @@ class PredictionExecutionService:
                 result[key] = format(item, "f")
             elif isinstance(item, Mapping):
                 result[key] = PredictionExecutionService._safe_mapping(item)
+            elif isinstance(item, (list, tuple)):
+                result[key] = [
+                    PredictionExecutionService._safe_mapping(value)
+                    if isinstance(value, Mapping)
+                    else format(value, "f")
+                    if isinstance(value, Decimal)
+                    else value
+                    if isinstance(value, (str, int, bool)) or value is None
+                    else str(value)
+                    for value in item
+                ]
             elif isinstance(item, (str, int, bool)) or item is None:
                 result[key] = item
             else:
@@ -821,7 +861,7 @@ class PredictionExecutionService:
         since: datetime,
         yes: LegResult,
         no: LegResult,
-    ) -> tuple[Decimal, Decimal] | None:
+    ) -> tuple[Decimal, Decimal, dict[str, object]] | None:
         started = self._clock()
         for attempt in range(MAX_RECONCILIATION_SECONDS + 1):
             reconcile = getattr(self._trading, "reconcile", None)
@@ -839,9 +879,14 @@ class PredictionExecutionService:
                 )
             except Exception:
                 value = None
-            quantities = self._reconciled_quantities(value, intent=intent)
+            quantities = self._reconciled_quantities(
+                value, intent=intent, yes=yes, no=no
+            )
             if quantities is not None and quantities[0] > 0 and quantities[1] > 0:
                 return quantities
+            if self._proof_claims_success(value):
+                proof = value.get("execution_proof")
+                return Decimal("0"), Decimal("0"), dict(proof)
             if attempt >= MAX_RECONCILIATION_SECONDS:
                 break
             if self._clock() - started >= MAX_RECONCILIATION_SECONDS:
@@ -851,8 +896,12 @@ class PredictionExecutionService:
 
     @staticmethod
     def _reconciled_quantities(
-        value: object, *, intent: PairIntent
-    ) -> tuple[Decimal, Decimal] | None:
+        value: object,
+        *,
+        intent: PairIntent,
+        yes: LegResult,
+        no: LegResult,
+    ) -> tuple[Decimal, Decimal, dict[str, object]] | None:
         if not isinstance(value, Mapping):
             return None
         if str(value.get("status", "")).lower() not in {
@@ -862,12 +911,13 @@ class PredictionExecutionService:
         proof = value.get("execution_proof")
         if not isinstance(proof, Mapping) or proof.get("verified") is not True:
             return None
+        if proof.get("venue") != "polymarket" or proof.get("positions_verified") is not True:
+            return None
         matched_refs = proof.get("matched_refs")
-        if not isinstance(matched_refs, Mapping):
+        position_refs = proof.get("position_refs")
+        if not isinstance(matched_refs, Mapping) or not isinstance(position_refs, Mapping):
             return None
-        if not matched_refs.get("YES") or not matched_refs.get("NO"):
-            return None
-        yes = next(
+        yes_quantity = next(
             (
                 _decimal(value.get(key))
                 for key in ("yes_quantity", "yes_filled_quantity", "actual_yes", "yes_shares")
@@ -875,7 +925,7 @@ class PredictionExecutionService:
             ),
             None,
         )
-        no = next(
+        no_quantity = next(
             (
                 _decimal(value.get(key))
                 for key in ("no_quantity", "no_filled_quantity", "actual_no", "no_shares")
@@ -883,9 +933,55 @@ class PredictionExecutionService:
             ),
             None,
         )
-        if yes is None or no is None:
+        if yes_quantity is None or no_quantity is None:
             return None
-        return yes, no
+        for label, token_id, leg, quantity in (
+            ("YES", intent.yes_token_id, yes, yes_quantity),
+            ("NO", intent.no_token_id, no, no_quantity),
+        ):
+            refs = matched_refs.get(label)
+            positions = position_refs.get(label)
+            if not isinstance(refs, Mapping) or not isinstance(positions, Mapping):
+                return None
+            if refs.get("token_id") != token_id or positions.get("token_id") != token_id:
+                return None
+            order_ids = refs.get("order_ids")
+            trade_ids = refs.get("trade_ids")
+            if not isinstance(order_ids, (list, tuple)) or not isinstance(trade_ids, (list, tuple)):
+                return None
+            if not order_ids or not trade_ids:
+                return None
+            order_refs = tuple(order_ids)
+            trade_refs = tuple(trade_ids)
+            if any(
+                not isinstance(item, str) or not item.strip()
+                for item in order_refs + trade_refs
+            ):
+                return None
+            if len(set(order_refs)) != len(order_refs) or len(set(trade_refs)) != len(trade_refs):
+                return None
+            expected_orders = {leg.order_id} if leg.order_id else set()
+            expected_trades = set(leg.trade_ids)
+            if (
+                not expected_orders
+                or not expected_trades
+                or not set(order_refs) <= expected_orders
+                or not set(trade_refs) <= expected_trades
+                or not set(order_refs) & expected_orders
+                or not set(trade_refs) & expected_trades
+            ):
+                return None
+            position_quantity = _decimal(positions.get("quantity"))
+            if position_quantity is None or position_quantity < quantity:
+                return None
+        return yes_quantity, no_quantity, dict(proof)
+
+    @staticmethod
+    def _proof_claims_success(value: object) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        proof = value.get("execution_proof")
+        return isinstance(proof, Mapping) and proof.get("verified") is True
 
     def _finish_rejected(self, execution_id: str, reason: str) -> None:
         self._transition(execution_id, "both_rejected", {"phase": "validation_rejected", "reason": reason})

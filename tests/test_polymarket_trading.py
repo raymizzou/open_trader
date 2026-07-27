@@ -9,6 +9,7 @@ from subprocess import CompletedProcess
 from types import SimpleNamespace
 
 import pytest
+from polymarket import SecureClient
 
 import open_trader.cli as cli
 from open_trader.polymarket_trading import (
@@ -232,6 +233,9 @@ class FakeClient:
         self.gasless_ready = gasless_ready
         self.gasless_calls = 0
         self.trade_rows: list[object] = [SimpleNamespace(id="trade")]
+        self.position_rows: list[object] = [
+            {"condition_id": "condition-1", "size": "20"}
+        ]
         self.merge_wait_value: object = SimpleNamespace(
             transaction_hash="0xmerge-hash", transaction_id="merge-transaction"
         )
@@ -301,7 +305,7 @@ class FakeClient:
 
     def list_positions(self, **kwargs: object) -> list[object]:
         self.read_calls.append("positions")
-        return [{"condition_id": "condition-1", "size": "20"}]
+        return list(self.position_rows)
 
     def cancel_orders(self, **kwargs: object) -> object:
         order_ids = tuple(kwargs["order_ids"])
@@ -599,6 +603,7 @@ def test_reconcile_returns_execution_scoped_verified_trade_proof() -> None:
             taker_order_id="yes-order",
             size=Decimal("10"),
             status="CONFIRMED",
+            side="BUY",
             matched_at=matched_at,
         ),
         SimpleNamespace(
@@ -608,8 +613,23 @@ def test_reconcile_returns_execution_scoped_verified_trade_proof() -> None:
             taker_order_id="no-order",
             size=Decimal("10"),
             status="CONFIRMED",
+            side="BUY",
             matched_at=matched_at,
         ),
+    ]
+    fake.position_rows = [
+        {
+            "condition_id": "condition-1",
+            "token_id": "yes-token",
+            "size": Decimal("10"),
+            "updated_at": matched_at,
+        },
+        {
+            "condition_id": "condition-1",
+            "token_id": "no-token",
+            "size": Decimal("10"),
+            "updated_at": matched_at,
+        },
     ]
 
     result = adapter.reconcile(
@@ -630,6 +650,7 @@ def test_reconcile_returns_execution_scoped_verified_trade_proof() -> None:
     assert isinstance(proof, dict)
     assert proof["verified"] is True
     assert proof["venue"] == "polymarket"
+    assert proof["positions_verified"] is True
     assert proof["matched_refs"]["YES"]["trade_ids"] == ["yes-trade"]
     assert proof["matched_refs"]["NO"]["trade_ids"] == ["no-trade"]
 
@@ -655,6 +676,120 @@ def test_reconcile_count_only_or_unmatched_positions_never_proves_fills() -> Non
     proof = result["execution_proof"]
     assert isinstance(proof, dict)
     assert proof["verified"] is False
+
+
+def test_reconcile_requires_confirmed_trades_and_current_positions() -> None:
+    adapter, fake = make_adapter()
+    matched_at = datetime.now(UTC)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="yes-trade",
+            condition_id="condition-1",
+            token_id="yes-token",
+            taker_order_id="yes-order",
+            size=Decimal("10"),
+            status="MATCHED",
+            side="BUY",
+            matched_at=matched_at,
+        ),
+        SimpleNamespace(
+            id="no-trade",
+            condition_id="condition-1",
+            token_id="no-token",
+            taker_order_id="no-order",
+            size=Decimal("10"),
+            status="CONFIRMED",
+            side="BUY",
+            matched_at=matched_at,
+        ),
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
+    ]
+
+    result = adapter.reconcile(
+        condition_id="condition-1",
+        since=matched_at - timedelta(seconds=1),
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        yes_order_id="yes-order",
+        no_order_id="no-order",
+        yes_trade_ids=("yes-trade",),
+        no_trade_ids=("no-trade",),
+    )
+
+    assert result["status"] in {"blocked", "ambiguous"}
+    assert result["execution_proof"]["verified"] is False
+    assert result["execution_proof"]["positions_verified"] is False
+
+
+def test_reconcile_existing_positions_without_matching_trades_stays_unverified() -> None:
+    adapter, fake = make_adapter()
+    now = datetime.now(UTC)
+    fake.trade_rows = []
+    fake.position_rows = [
+        {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")},
+        {"condition_id": "condition-1", "token_id": "no-token", "size": Decimal("10")},
+    ]
+
+    result = adapter.reconcile(
+        condition_id="condition-1",
+        since=now - timedelta(seconds=1),
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        yes_order_id="yes-order",
+        no_order_id="no-order",
+        yes_trade_ids=("yes-trade",),
+        no_trade_ids=("no-trade",),
+    )
+
+    assert result["status"] in {"blocked", "ambiguous"}
+    assert result["execution_proof"]["verified"] is False
+
+
+def test_secure_client_readiness_does_not_trust_deprecated_gasless_flag() -> None:
+    client = object.__new__(SecureClient)
+    client._ended = False
+    client._ctx_inner = SimpleNamespace(
+        wallet_type="EOA",
+        wallet=WALLET,
+        relayer=SimpleNamespace(get_json=lambda *args, **kwargs: {"address": WALLET, "nonce": "1"}),
+    )
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=client)
+
+    result = adapter.readiness_snapshot()
+
+    assert result["relayer_ready"] is False
+    assert result["merge_ready"] is False
+
+
+def test_secure_client_readiness_uses_authenticated_relayer_probe() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class Relayer:
+        def get_json(self, path: str, *, params: dict[str, object]) -> dict[str, object]:
+            calls.append((path, params))
+            return {"address": WALLET, "nonce": "1"}
+
+    client = object.__new__(SecureClient)
+    client._ended = False
+    client._ctx_inner = SimpleNamespace(
+        wallet_type="POLY_PROXY",
+        wallet=WALLET,
+        relayer=Relayer(),
+    )
+    adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=client)
+
+    result = adapter.readiness_snapshot()
+
+    assert result["relayer_ready"] is True
+    assert result["merge_ready"] is True
+    assert calls == [
+        (
+            "/v1/account/transactions/params",
+            {"address": WALLET, "type": "PROXY"},
+        )
+    ]
 
 
 def test_readiness_snapshot_requires_fresh_gasless_and_merge_capabilities() -> None:
