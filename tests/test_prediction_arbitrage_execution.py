@@ -269,6 +269,172 @@ class FakeTrading:
         }
 
 
+class IncidentTrading(FakeTrading):
+    """Controlled venue for bounded one-leg and restart tests."""
+
+    def __init__(self, *, result: str) -> None:
+        super().__init__(result=result)
+        self.remediation_calls: list[dict[str, object]] = []
+        self.account_mode = "clean"
+        self.cancel_calls: list[tuple[str, ...]] = []
+        self._remediated = False
+
+    def account_snapshot(self) -> AccountSnapshot:
+        base = super().account_snapshot()
+        positions: tuple[dict[str, str], ...] = ()
+        if self.account_mode == "yes_only":
+            positions = ({"condition_id": "condition-1", "token_id": "yes-token", "size": "10"},)
+        elif self.account_mode == "no_only":
+            positions = ({"condition_id": "condition-1", "token_id": "no-token", "size": "10"},)
+        elif self.account_mode == "equal_pair":
+            positions = (
+                {"condition_id": "condition-1", "token_id": "yes-token", "size": "10"},
+                {"condition_id": "condition-1", "token_id": "no-token", "size": "10"},
+            )
+        elif self.account_mode == "open_order":
+            return AccountSnapshot(
+                wallet_address=base.wallet_address,
+                p_usd_balance=base.p_usd_balance,
+                p_usd_allowance=base.p_usd_allowance,
+                open_order_ids=("open-order",),
+                positions=positions,
+                checked_at=datetime.now(UTC),
+            )
+        return AccountSnapshot(
+            wallet_address=base.wallet_address,
+            p_usd_balance=base.p_usd_balance,
+            p_usd_allowance=base.p_usd_allowance,
+            open_order_ids=base.open_order_ids,
+            positions=positions,
+            checked_at=datetime.now(UTC),
+        )
+
+    def reconcile(self, **kwargs: object) -> dict[str, object]:
+        self.reconcile_calls += 1
+        yes_order = str(kwargs.get("yes_order_id") or "yes-order")
+        no_order = str(kwargs.get("no_order_id") or "no-order")
+        yes_trades = tuple(kwargs.get("yes_trade_ids") or ("yes-trade",))
+        no_trades = tuple(kwargs.get("no_trade_ids") or ("no-trade",))
+        if self._remediated or self.result == "equal_pair":
+            return {
+                "status": "ok",
+                "yes_quantity": Decimal("10"),
+                "no_quantity": Decimal("10"),
+                "execution_proof": {
+                    "verified": True,
+                    "venue": "polymarket",
+                    "positions_verified": True,
+                    "position_refs": {
+                        "YES": {"token_id": "yes-token", "quantity": "10"},
+                        "NO": {"token_id": "no-token", "quantity": "10"},
+                    },
+                    "matched_refs": {
+                        "YES": {"token_id": "yes-token", "order_ids": [yes_order], "trade_ids": list(yes_trades)},
+                        "NO": {"token_id": "no-token", "order_ids": [no_order], "trade_ids": list(no_trades)},
+                    },
+                },
+            }
+        filled = "YES" if self.result == "yes_only" else "NO"
+        return {
+            "status": "ok",
+            "yes_quantity": Decimal("10") if filled == "YES" else Decimal("0"),
+            "no_quantity": Decimal("10") if filled == "NO" else Decimal("0"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "polymarket",
+                "positions_verified": True,
+                "position_refs": {
+                    filled: {
+                        "token_id": "yes-token" if filled == "YES" else "no-token",
+                        "quantity": "10",
+                    }
+                },
+                "matched_refs": {
+                    "YES": {
+                        "token_id": "yes-token",
+                        "order_ids": [yes_order] if filled == "YES" else [],
+                        "trade_ids": list(yes_trades) if filled == "YES" else [],
+                    },
+                    "NO": {
+                        "token_id": "no-token",
+                        "order_ids": [no_order] if filled == "NO" else [],
+                        "trade_ids": list(no_trades) if filled == "NO" else [],
+                    },
+                },
+            },
+        }
+
+    def remediation_options(self, **kwargs: object) -> dict[str, object]:
+        del kwargs
+        if self.result == "yes_only":
+            return {
+                "fresh": True,
+                "complete": {
+                    "leg": "NO", "side": "BUY", "token_id": "no-token",
+                    "quantity": Decimal("10"), "amount": Decimal("1.20"),
+                    "max_spend": Decimal("1.20"), "max_price": Decimal("0.12"),
+                    "loss": Decimal("1.20"),
+                },
+                "unwind": {
+                    "leg": "YES", "side": "SELL", "token_id": "yes-token",
+                    "shares": Decimal("10"), "quantity": Decimal("10"),
+                    "min_price": Decimal("0.15"), "loss": Decimal("1.50"),
+                },
+            }
+        if self.result == "no_only":
+            return {
+                "fresh": True,
+                "complete": {
+                    "leg": "YES", "side": "BUY", "token_id": "yes-token",
+                    "quantity": Decimal("10"), "amount": Decimal("1.80"),
+                    "max_spend": Decimal("1.80"), "max_price": Decimal("0.18"),
+                    "loss": Decimal("1.80"),
+                },
+                "unwind": {
+                    "leg": "NO", "side": "SELL", "token_id": "no-token",
+                    "shares": Decimal("10"), "quantity": Decimal("10"),
+                    "min_price": Decimal("0.09"), "loss": Decimal("0.90"),
+                },
+            }
+        return {
+            "fresh": True,
+            "complete": {"loss": Decimal("2.01")},
+            "unwind": {"loss": Decimal("2.01")},
+        }
+
+    def submit_remediation_once(self, order: dict[str, object]) -> LegResult:
+        self.remediation_calls.append(dict(order))
+        self._remediated = True
+        return LegResult(
+            str(order.get("leg", "NO")), True, "filled", "remediation-order",
+            Decimal(str(order.get("quantity", order.get("shares", "10")))),
+            ("remediation-trade",), "none",
+        )
+
+    def cancel_orders(self, order_ids: tuple[str, ...]) -> tuple[str, ...]:
+        self.cancel_calls.append(order_ids)
+        self.account_mode = "clean"
+        return order_ids
+
+
+class ChannelNotifier:
+    def __init__(self, channel: str, *, fail: bool = False) -> None:
+        self.channel = channel
+        self.fail = fail
+        self.calls = 0
+
+    def notify(self, title: str, message: str) -> None:
+        del title, message
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("delivery failed")
+
+
+class CompositeTestNotifier:
+    def __init__(self, *notifiers: ChannelNotifier) -> None:
+        self._notifiers = list(notifiers)
+
+
 def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
     store = PredictionArbitrageStore(tmp_path / "data")
     trading = FakeTrading(result=result)
@@ -280,6 +446,24 @@ def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
         notifier=FakeNotifier(),
         lock_path=tmp_path / "execution.lock",
     )
+    return service, trading, store, monitor
+
+
+def incident_fixture(tmp_path: Path, *, result: str, notifier: object | None = None):
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = IncidentTrading(result=result)
+    monitor = FakeMonitor(_intent())
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=notifier or CompositeTestNotifier(
+            ChannelNotifier("macos"), ChannelNotifier("feishu")
+        ),
+        lock_path=tmp_path / "execution.lock",
+    )
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(200)).__next__  # type: ignore[attr-defined]
     return service, trading, store, monitor
 
 
@@ -583,3 +767,120 @@ def test_second_service_cannot_submit_while_file_lock_is_held(tmp_path: Path) ->
         assert trading.batch_calls == 0
     finally:
         first._process_lock.release()  # type: ignore[attr-defined]
+
+
+def test_yes_only_chooses_lower_loss_completion_and_keeps_breaker_open(tmp_path: Path) -> None:
+    notifier = CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu"))
+    service, trading, store, _ = incident_fixture(
+        tmp_path, result="yes_only", notifier=notifier
+    )
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "yes-only-remediation")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "neutralized_incident"
+    assert len(trading.remediation_calls) == 1
+    assert trading.remediation_calls[0]["leg"] == "NO"
+    assert trading.remediation_calls[0]["side"] == "BUY"
+    assert trading.merge_calls == 1
+    assert service.preview("opp-1")["state"] == "locked"
+    incident = store.unacknowledged_incident()
+    assert incident is not None
+    assert incident["state"] == "neutralized_incident"
+
+
+def test_no_only_chooses_lower_loss_unwind_without_merge(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="no_only")
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "no-only-remediation")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "neutralized_incident"
+    assert len(trading.remediation_calls) == 1
+    assert trading.remediation_calls[0]["leg"] == "NO"
+    assert trading.remediation_calls[0]["side"] == "SELL"
+    assert trading.merge_calls == 0
+
+
+def test_one_leg_above_two_dollars_sends_no_remediation(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "unsafe-remediation")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.remediation_calls == []
+    assert trading.merge_calls == 0
+
+
+def test_notification_failure_does_not_block_one_leg_risk_work(tmp_path: Path) -> None:
+    notifier = CompositeTestNotifier(
+        ChannelNotifier("macos", fail=True), ChannelNotifier("feishu", fail=True)
+    )
+    service, trading, store, _ = incident_fixture(
+        tmp_path, result="yes_only", notifier=notifier
+    )
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "notification-failure")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "neutralized_incident"
+    assert len(trading.remediation_calls) == 1
+    evidence = final["evidence"]
+    attempts = next(item["attempts"] for item in evidence if item.get("phase") == "incident_open")
+    assert {attempt["channel"] for attempt in attempts} == {"macos", "feishu"}
+    assert store.unacknowledged_incident() is not None
+
+
+def test_startup_reconciliation_cancels_known_orders_once_and_stays_locked(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
+    trading.account_mode = "open_order"
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert trading.cancel_calls == [("open-order",)]
+    assert service.preview("opp-1")["state"] == "locked"
+
+
+def test_clean_startup_becomes_ready_only_after_fresh_reconciliation(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "ready"
+    assert result["readiness"] == "fresh"
+    assert service.preview("opp-1")["state"] == "previewed"
+    assert trading.batch_calls == 0
+
+
+def test_reset_breaker_denies_directional_imbalance_without_orders(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    # Seed a durable execution/incident without a venue mutation.
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "reset-seed")
+    incident_id = store.open_incident(str(execution["execution_id"]), {"state": "directional_incident"})
+    service._breaker_open = True  # type: ignore[attr-defined]
+    trading.account_mode = "yes_only"
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "directional_imbalance"
+    assert service.preview("opp-1")["state"] == "locked"
+    assert trading.batch_calls == 0
+
+
+def test_reset_breaker_requires_fresh_clean_account_and_acknowledges_incident(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "reset-clean")
+    incident_id = store.open_incident(str(execution["execution_id"]), {"state": "directional_incident"})
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "ready"
+    assert result["reason"] == "reset_confirmed"
+    assert store.unacknowledged_incident() is None
+    assert service.preview("opp-1")["state"] == "previewed"
+    assert trading.batch_calls == 0

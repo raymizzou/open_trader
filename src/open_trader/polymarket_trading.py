@@ -1141,10 +1141,7 @@ class PolymarketTradingClient:
                         matched[leg]["trade_ids"].append(trade_id)
                     break
             if not (
-                quantities["YES"] > 0
-                and quantities["NO"] > 0
-                and (matched["YES"]["trade_ids"] or matched["YES"]["order_ids"])
-                and (matched["NO"]["trade_ids"] or matched["NO"]["order_ids"])
+                quantities["YES"] > 0 or quantities["NO"] > 0
             ):
                 proof["matched_refs"] = matched
                 return {
@@ -1152,6 +1149,16 @@ class PolymarketTradingClient:
                     "error_code": "reconciliation_unverified",
                     "execution_proof": proof,
                 }
+            for leg in ("YES", "NO"):
+                if quantities[leg] > 0 and not (
+                    matched[leg]["trade_ids"] or matched[leg]["order_ids"]
+                ):
+                    proof["matched_refs"] = matched
+                    return {
+                        "status": "blocked",
+                        "error_code": "reconciliation_unverified",
+                        "execution_proof": proof,
+                    }
             positions = _collect(self._client.list_positions(market=[condition_id]))
             position_quantities = {"YES": Decimal("0"), "NO": Decimal("0")}
             position_refs: dict[str, dict[str, str]] = {}
@@ -1187,9 +1194,9 @@ class PolymarketTradingClient:
                     "token_id": token_id,
                     "quantity": format(position_quantities[leg], "f"),
                 }
-            positions_verified = (
-                position_quantities["YES"] >= quantities["YES"]
-                and position_quantities["NO"] >= quantities["NO"]
+            positions_verified = all(
+                quantities[leg] <= 0 or position_quantities[leg] >= quantities[leg]
+                for leg in ("YES", "NO")
             )
             proof["matched_refs"] = matched
             proof["position_refs"] = position_refs
@@ -1198,6 +1205,14 @@ class PolymarketTradingClient:
                 return {
                     "status": "blocked",
                     "error_code": "reconciliation_unverified",
+                    "execution_proof": proof,
+                }
+            if quantities["YES"] <= 0 or quantities["NO"] <= 0:
+                proof["partial_verified"] = True
+                return {
+                    "status": "partial",
+                    "yes_quantity": quantities["YES"],
+                    "no_quantity": quantities["NO"],
                     "execution_proof": proof,
                 }
             proof["verified"] = True

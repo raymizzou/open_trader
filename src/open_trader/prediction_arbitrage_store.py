@@ -604,6 +604,24 @@ class PredictionArbitrageStore:
                 (encoded, now, now, incident_id),
             )
 
+    def update_incident(self, incident_id: str, payload: Mapping[str, object]) -> None:
+        """Append final incident facts without erasing its original evidence."""
+
+        encoded = _dump_payload(payload)
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT payload FROM incidents WHERE incident_id=?", (incident_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(incident_id)
+            previous = _load_payload(str(row["payload"]))
+            previous.update(_load_payload(encoded))
+            connection.execute(
+                "UPDATE incidents SET payload=?, updated_at=? WHERE incident_id=?",
+                (_dump_payload(previous), now, incident_id),
+            )
+
     def active_execution(self) -> dict[str, object] | None:
         placeholders = ",".join("?" for _ in _TERMINAL_EXECUTION_STATES)
         with self._read_connection() as connection:

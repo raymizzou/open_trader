@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 
+from .daily_premarket import send_notification_with_results
 from .notifications import Notifier
 from .polymarket_trading import LegResult, PairSubmission
 from .prediction_arbitrage import (
@@ -282,17 +283,150 @@ class PredictionExecutionService:
         raise KeyError(execution_id)
 
     def reconcile_startup(self) -> dict[str, object]:
-        # Task 6 owns startup reconciliation; remaining locked is deliberate.
+        """Reconcile live account state before allowing a new opportunity."""
         self._breaker_open = True
-        return {"state": "locked", "reason": "startup_reconciliation_deferred"}
+        snapshot = self._account_snapshot()
+        if snapshot is None:
+            return {"state": "locked", "reason": "account_unavailable"}
+
+        active = self._store.active_execution()
+        active_id = str(active.get("execution_id", "")) if active else ""
+        open_orders = self._order_ids(snapshot.get("open_order_ids", ()))
+        if open_orders:
+            cancel = getattr(self._trading, "cancel_orders", None)
+            try:
+                canceled = _call(cancel, tuple(open_orders))
+            except Exception:
+                canceled = ()
+            after_cancel = self._account_snapshot()
+            remaining = self._order_ids(
+                after_cancel.get("open_order_ids", ()) if after_cancel else open_orders
+            )
+            evidence = {
+                "phase": "startup_open_orders",
+                "open_orders": open_orders,
+                "canceled": self._safe_sequence(canceled),
+                "remaining": remaining,
+            }
+            self._startup_incident(
+                active_id,
+                "startup_open_orders",
+                evidence,
+            )
+            return {"state": "locked", "reason": "open_orders", **evidence}
+
+        active_intent = self._intent_from_payload(active.get("intent")) if active else None
+        totals = self._position_totals(snapshot, active_intent)
+        if totals["unknown"]:
+            evidence = {"phase": "startup_unknown_state", "positions": totals["unknown"]}
+            self._startup_incident(active_id, "unknown_external_state", evidence)
+            return {"state": "locked", "reason": "unknown_external_state", **evidence}
+        if totals["yes"] > 0 and totals["no"] > 0 and totals["yes"] == totals["no"]:
+            merge = self._startup_merge(active, active_intent, totals["yes"])
+            evidence = {
+                "phase": "startup_equal_pair",
+                "yes_quantity": _safe_decimal(totals["yes"]),
+                "no_quantity": _safe_decimal(totals["no"]),
+                **merge,
+            }
+            self._startup_incident(active_id, "startup_equal_pair", evidence)
+            return {"state": "locked", "reason": "equal_pair", **evidence}
+        if totals["yes"] > 0 or totals["no"] > 0:
+            evidence = {
+                "phase": "startup_directional_imbalance",
+                "yes_quantity": _safe_decimal(totals["yes"]),
+                "no_quantity": _safe_decimal(totals["no"]),
+            }
+            self._startup_incident(active_id, "startup_directional_imbalance", evidence)
+            return {"state": "locked", "reason": "directional_imbalance", **evidence}
+        if active is not None:
+            evidence = {"phase": "startup_local_pending", "execution_id": active_id}
+            self._startup_incident(active_id, "stale_local_execution", evidence)
+            return {"state": "locked", "reason": "stale_local_execution", **evidence}
+        if not self._relayer_ready():
+            return {"state": "locked", "reason": "readiness_unavailable"}
+        self._breaker_open = False
+        self._store.write_runtime(
+            {"prediction_arbitrage": "ready", "reconciled_at": _timestamp(_utc_now())}
+        )
+        return {"state": "ready", "readiness": "fresh"}
 
     def reset_breaker(self, incident_id: str) -> dict[str, object]:
-        # Task 6 owns fresh live reconciliation and acknowledgement semantics.
-        return {
-            "state": "locked",
-            "reason": "breaker_reset_deferred",
+        incident = next(
+            (
+                row
+                for row in self._store.histories("incidents")
+                if str(row.get("incident_id", "")) == str(incident_id)
+                and row.get("acknowledged") is not True
+            ),
+            None,
+        )
+        if incident is None:
+            self._breaker_open = True
+            return {"state": "locked", "reason": "incident_not_found", "incident_id": str(incident_id)}
+        snapshot = self._account_snapshot()
+        reasons: list[str] = []
+        if snapshot is None:
+            reasons.append("account_unavailable")
+        else:
+            open_orders = self._order_ids(snapshot.get("open_order_ids", ()))
+            if open_orders:
+                reasons.append("open_orders")
+            active = self._store.active_execution()
+            intent = self._intent_from_payload(active.get("intent")) if active else None
+            totals = self._position_totals(snapshot, intent)
+            if totals["unknown"]:
+                reasons.append("unknown_external_state")
+            if totals["yes"] != 0 or totals["no"] != 0:
+                reasons.append("directional_imbalance")
+            if self._pending_merge(active):
+                reasons.append("pending_merge")
+        if not self._relayer_ready():
+            reasons.append("readiness_unavailable")
+        if reasons:
+            self._breaker_open = True
+            reason = reasons[0]
+            active_id = str(incident.get("execution_id", ""))
+            if active_id:
+                self._transition(
+                    active_id,
+                    "reset_denied",
+                    {
+                        "phase": "reset_denied",
+                        "incident_id": str(incident_id),
+                        "reason": reason,
+                    },
+                )
+            return {
+                "state": "locked",
+                "reason": reason,
+                "blocking_reasons": reasons,
+                "incident_id": str(incident_id),
+            }
+        payload = {
             "incident_id": str(incident_id),
+            "acknowledged_by": "operator",
+            "acknowledged_at": _timestamp(_utc_now()),
+            "reconciliation": "fresh_clean",
         }
+        try:
+            self._store.acknowledge_incident(str(incident_id), payload)
+        except Exception:
+            self._breaker_open = True
+            return {"state": "locked", "reason": "acknowledgement_failed", "incident_id": str(incident_id)}
+        active = self._store.active_execution()
+        if active is not None and str(active.get("execution_id", "")) == str(incident.get("execution_id", "")):
+            try:
+                self._transition(
+                    str(active["execution_id"]),
+                    "directional_incident",
+                    {"phase": "reset_acknowledged", "incident_id": str(incident_id)},
+                )
+            except Exception:
+                self._breaker_open = True
+                return {"state": "locked", "reason": "execution_close_failed", "incident_id": str(incident_id)}
+        self._breaker_open = False
+        return {"state": "ready", "reason": "reset_confirmed", "incident_id": str(incident_id)}
 
     def _run_execution(self, execution_id: str, lock: tuple[threading.Lock, Any]) -> None:
         try:
@@ -360,8 +494,35 @@ class PredictionExecutionService:
                 self._finish_incident(execution_id, "reconciliation_timeout")
                 return
             yes_quantity, no_quantity, execution_proof = known
+            if yes_quantity > 0 and no_quantity <= 0:
+                self._handle_one_leg(
+                    execution_id,
+                    intent,
+                    filled_leg="YES",
+                    filled_quantity=yes_quantity,
+                    yes=yes,
+                    no=no,
+                    proof=execution_proof,
+                    since=submitted_at,
+                )
+                return
+            if no_quantity > 0 and yes_quantity <= 0:
+                self._handle_one_leg(
+                    execution_id,
+                    intent,
+                    filled_leg="NO",
+                    filled_quantity=no_quantity,
+                    yes=yes,
+                    no=no,
+                    proof=execution_proof,
+                    since=submitted_at,
+                )
+                return
             if yes_quantity <= 0 or no_quantity <= 0 or yes_quantity != no_quantity:
                 self._finish_incident(execution_id, "directional_imbalance")
+                return
+            if not execution_proof.get("verified") is True:
+                self._finish_incident(execution_id, "equal_fill_proof_unverified")
                 return
             self._transition(
                 execution_id,
@@ -547,6 +708,356 @@ class PredictionExecutionService:
             if hasattr(value, name):
                 result[name] = getattr(value, name)
         return result or None
+
+    @staticmethod
+    def _order_ids(value: object) -> tuple[str, ...]:
+        if isinstance(value, Mapping):
+            value = value.keys()
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return ()
+        return tuple(item.strip() for item in value if isinstance(item, str) and item.strip())
+
+    @staticmethod
+    def _safe_sequence(value: object) -> list[object]:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [item if isinstance(item, (str, int, bool)) or item is None else str(item) for item in value]
+        return []
+
+    @staticmethod
+    def _position_totals(
+        snapshot: Mapping[str, object], intent: PairIntent | None
+    ) -> dict[str, object]:
+        positions = snapshot.get("positions", ())
+        totals: dict[str, object] = {"yes": Decimal("0"), "no": Decimal("0"), "unknown": []}
+        if not isinstance(positions, (list, tuple)):
+            return totals
+        yes_token = intent.yes_token_id if intent else None
+        no_token = intent.no_token_id if intent else None
+        for position in positions:
+            if not isinstance(position, Mapping):
+                totals["unknown"].append(str(position))
+                continue
+            token = position.get("token_id", position.get("tokenId", position.get("asset_id", "")))
+            quantity = _decimal(position.get("size", position.get("quantity", position.get("shares"))))
+            if not isinstance(token, str) or quantity is None or quantity < 0:
+                totals["unknown"].append(PredictionExecutionService._safe_mapping(position))
+                continue
+            if yes_token and token == yes_token:
+                totals["yes"] = totals["yes"] + quantity
+            elif no_token and token == no_token:
+                totals["no"] = totals["no"] + quantity
+            elif quantity > 0:
+                totals["unknown"].append(PredictionExecutionService._safe_mapping(position))
+        return totals
+
+    def _startup_incident(
+        self, execution_id: str, reason: str, evidence: Mapping[str, object]
+    ) -> str | None:
+        if not execution_id:
+            self._store.write_runtime(
+                {
+                    "prediction_arbitrage": "incident",
+                    "incident_reason": reason,
+                    "incident_evidence": self._safe_mapping(evidence),
+                    "breaker": "open",
+                    "recorded_at": _timestamp(_utc_now()),
+                }
+            )
+            return None
+        return self._record_incident(
+            execution_id,
+            reason,
+            state="directional_incident",
+            evidence=evidence,
+        )
+
+    def _startup_merge(
+        self,
+        active: Mapping[str, object] | None,
+        intent: PairIntent | None,
+        quantity: Decimal,
+    ) -> dict[str, object]:
+        if active is None or intent is None:
+            return {"merge": "blocked", "merge_reason": "unknown_pair"}
+        evidence = active.get("evidence", ())
+        if isinstance(evidence, (list, tuple)):
+            merge_evidence = [
+                item
+                for item in evidence
+                if isinstance(item, Mapping) and item.get("phase") == "merge_result"
+            ]
+            if merge_evidence:
+                if self._merge_confirmed(merge_evidence[-1]):
+                    return {"merge": "already_confirmed", "reconciled": True}
+                return {"merge": "pending", "reconciled": False}
+        merge = getattr(self._trading, "merge_once", None)
+        try:
+            result = _call(merge, condition_id=intent.condition_id, quantity=quantity)
+        except Exception:
+            result = {"status": "blocked", "confirmed": False, "error_code": "merge_error"}
+        return {
+            "merge": "confirmed" if self._merge_confirmed(result) else "incident",
+            "merge_result": self._safe_mapping(result) if isinstance(result, Mapping) else {"status": self._result_status(result)},
+        }
+
+    def _pending_merge(self, active: Mapping[str, object] | None) -> bool:
+        if not active:
+            return False
+        state = str(active.get("state", ""))
+        if state == "merging":
+            return True
+        evidence = active.get("evidence", ())
+        if not isinstance(evidence, (list, tuple)):
+            return False
+        return any(
+            isinstance(item, Mapping)
+            and item.get("phase") == "merge_result"
+            and item.get("confirmed") is not True
+            for item in evidence
+        )
+
+    def _fresh_remediation_options(
+        self,
+        intent: PairIntent,
+        *,
+        filled_leg: str,
+        filled_quantity: Decimal,
+        since: datetime,
+    ) -> dict[str, object] | None:
+        for name in ("remediation_options", "fresh_remediation_options", "incident_snapshot"):
+            method = getattr(self._trading, name, None)
+            if not callable(method):
+                continue
+            try:
+                value = _call(
+                    method,
+                    condition_id=intent.condition_id,
+                    yes_token_id=intent.yes_token_id,
+                    no_token_id=intent.no_token_id,
+                    filled_leg=filled_leg,
+                    filled_quantity=filled_quantity,
+                    since=since,
+                )
+            except Exception:
+                return None
+            if not isinstance(value, Mapping):
+                return None
+            if value.get("fresh") is False:
+                return None
+            if "checked_at" in value:
+                age = _age_seconds(value.get("checked_at"))
+                if age is None or age > float(BOOK_FRESHNESS_SECONDS):
+                    return None
+            return dict(value)
+        # The authenticated account read is still mandatory when a test/dry-run
+        # collaborator does not expose a richer order-book method.
+        if self._account_snapshot() is None:
+            return None
+        return None
+
+    @staticmethod
+    def _option(options: Mapping[str, object], name: str) -> dict[str, object] | None:
+        value = options.get(name)
+        if isinstance(value, Mapping):
+            return dict(value)
+        for candidate in options.get("candidates", ()) if isinstance(options.get("candidates"), (list, tuple)) else ():
+            if isinstance(candidate, Mapping) and str(candidate.get("kind", candidate.get("action", ""))) == name:
+                return dict(candidate)
+        return None
+
+    @staticmethod
+    def _option_loss(option: Mapping[str, object]) -> Decimal | None:
+        value = option.get("loss", option.get("estimated_loss", option.get("expected_loss")))
+        parsed = _decimal(value)
+        return parsed if parsed is not None and parsed >= 0 else None
+
+    def _choose_remediation(
+        self,
+        options: Mapping[str, object],
+        *,
+        filled_leg: str,
+    ) -> dict[str, object] | None:
+        complete = self._option(options, "complete")
+        unwind = self._option(options, "unwind")
+        candidates: list[tuple[Decimal, int, dict[str, object]]] = []
+        for priority, option in enumerate((complete, unwind)):
+            if option is None:
+                continue
+            loss = self._option_loss(option)
+            if loss is None or loss > Decimal("2"):
+                continue
+            side = option.get("side")
+            expected_side = "BUY" if option is complete else "SELL"
+            if side != expected_side:
+                continue
+            expected_leg = "NO" if filled_leg == "YES" else "YES"
+            if option.get("leg") != (expected_leg if option is complete else filled_leg):
+                continue
+            candidate = dict(option)
+            candidate["loss"] = format(loss, "f")
+            candidates.append((loss, priority, candidate))
+        if not candidates:
+            return None
+        _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
+        return chosen
+
+    def _handle_one_leg(
+        self,
+        execution_id: str,
+        intent: PairIntent,
+        *,
+        filled_leg: str,
+        filled_quantity: Decimal,
+        yes: LegResult,
+        no: LegResult,
+        proof: Mapping[str, object],
+        since: datetime,
+    ) -> None:
+        # Open the breaker before any remediation-capable collaborator is called.
+        self._breaker_open = True
+        options = self._fresh_remediation_options(
+            intent,
+            filled_leg=filled_leg,
+            filled_quantity=filled_quantity,
+            since=since,
+        )
+        chosen = self._choose_remediation(options or {}, filled_leg=filled_leg)
+        incident_id = self._record_incident(
+            execution_id,
+            "one_leg_fill",
+            state="remediating" if chosen is not None else "directional_incident",
+            evidence={
+                "phase": "one_leg",
+                "filled_leg": filled_leg,
+                "filled_quantity": _safe_decimal(filled_quantity),
+                "execution_proof": proof,
+                "remediation_options": options or {},
+            },
+        )
+        if chosen is None:
+            self._finish_incident(
+                execution_id,
+                "no_safe_remediation",
+                state="directional_incident",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
+        self._transition(
+            execution_id,
+            "remediating",
+            {"phase": "remediation_selected", "order": chosen},
+        )
+        submit = getattr(self._trading, "submit_remediation_once", None)
+        try:
+            result = _call(submit, chosen)
+        except Exception:
+            result = LegResult(
+                str(chosen.get("leg", filled_leg)), False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            )
+        self._store.record_leg(execution_id, {**self._leg_payload(result), "label": "remediation"})
+        self._transition(execution_id, "remediating", {"phase": "remediation_result", **self._leg_payload(result)})
+        expected_quantity = _decimal(
+            chosen.get("quantity", chosen.get("shares"))
+        )
+        if (
+            not result.accepted
+            or result.filled_quantity <= 0
+            or expected_quantity is None
+            or result.filled_quantity != expected_quantity
+            or self._ambiguous(result)
+        ):
+            self._finish_incident(
+                execution_id,
+                "remediation_unverified",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
+        if chosen.get("side") == "SELL":
+            if self._verify_unwound(intent, filled_leg):
+                self._finish_incident(
+                    execution_id,
+                    "one_leg_unwound",
+                    state="neutralized_incident",
+                    incident_id=incident_id,
+                    notify=False,
+                )
+            else:
+                self._finish_incident(
+                    execution_id,
+                    "unwind_unverified",
+                    incident_id=incident_id,
+                    notify=False,
+                )
+            return
+        repaired_yes = yes if filled_leg == "YES" else result
+        repaired_no = no if filled_leg == "NO" else result
+        known = self._reconcile_until(
+            intent,
+            since=since,
+            yes=repaired_yes,
+            no=repaired_no,
+        )
+        if known is None or known[0] <= 0 or known[1] <= 0 or known[0] != known[1]:
+            self._finish_incident(
+                execution_id,
+                "remediation_reconciliation_failed",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
+        merge = getattr(self._trading, "merge_once", None)
+        try:
+            merge_result = _call(
+                merge, condition_id=intent.condition_id, quantity=known[0]
+            )
+        except Exception:
+            merge_result = {"status": "blocked", "confirmed": False, "error_code": "merge_error"}
+        self._transition(
+            execution_id,
+            "merging",
+            {
+                "phase": "remediation_merge_result",
+                **(self._safe_mapping(merge_result) if isinstance(merge_result, Mapping) else {"status": self._result_status(merge_result)}),
+            },
+        )
+        if not self._merge_confirmed(merge_result):
+            self._finish_incident(
+                execution_id,
+                "remediation_merge_not_confirmed",
+                state="merge_incident",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
+        self._finish_incident(
+            execution_id,
+            "one_leg_neutralized",
+            state="neutralized_incident",
+            incident_id=incident_id,
+            notify=False,
+        )
+
+    def _verify_unwound(self, intent: PairIntent, filled_leg: str) -> bool:
+        method = getattr(self._trading, "reconcile_neutralization", None)
+        if callable(method):
+            try:
+                value = _call(
+                    method,
+                    condition_id=intent.condition_id,
+                    token_id=intent.yes_token_id if filled_leg == "YES" else intent.no_token_id,
+                    expected_quantity=Decimal("0"),
+                )
+                if isinstance(value, Mapping):
+                    return value.get("verified") is True or value.get("directional_imbalance") in (False, Decimal("0"), "0")
+            except Exception:
+                return False
+        snapshot = self._account_snapshot()
+        if snapshot is None:
+            return False
+        totals = self._position_totals(snapshot, intent)
+        return totals["yes"] == 0 and totals["no"] == 0 and not totals["unknown"]
 
     def _relayer_ready(self) -> bool:
         method = getattr(self._trading, "readiness_snapshot", None)
@@ -882,11 +1393,8 @@ class PredictionExecutionService:
             quantities = self._reconciled_quantities(
                 value, intent=intent, yes=yes, no=no
             )
-            if quantities is not None and quantities[0] > 0 and quantities[1] > 0:
+            if quantities is not None and (quantities[0] > 0 or quantities[1] > 0):
                 return quantities
-            if self._proof_claims_success(value):
-                proof = value.get("execution_proof")
-                return Decimal("0"), Decimal("0"), dict(proof)
             if attempt >= MAX_RECONCILIATION_SECONDS:
                 break
             if self._clock() - started >= MAX_RECONCILIATION_SECONDS:
@@ -905,11 +1413,13 @@ class PredictionExecutionService:
         if not isinstance(value, Mapping):
             return None
         if str(value.get("status", "")).lower() not in {
-            "ok", "confirmed", "filled", "complete"
+            "ok", "partial", "confirmed", "filled", "complete"
         }:
             return None
         proof = value.get("execution_proof")
-        if not isinstance(proof, Mapping) or proof.get("verified") is not True:
+        if not isinstance(proof, Mapping) or not (
+            proof.get("verified") is True or proof.get("partial_verified") is True
+        ):
             return None
         if proof.get("venue") != "polymarket" or proof.get("positions_verified") is not True:
             return None
@@ -941,6 +1451,8 @@ class PredictionExecutionService:
         ):
             refs = matched_refs.get(label)
             positions = position_refs.get(label)
+            if quantity <= 0:
+                continue
             if not isinstance(refs, Mapping) or not isinstance(positions, Mapping):
                 return None
             if refs.get("token_id") != token_id or positions.get("token_id") != token_id:
@@ -962,6 +1474,8 @@ class PredictionExecutionService:
                 return None
             expected_orders = {leg.order_id} if leg.order_id else set()
             expected_trades = set(leg.trade_ids)
+            if quantity <= 0 and not expected_orders and not expected_trades:
+                continue
             if (
                 not expected_orders
                 or not expected_trades
@@ -987,22 +1501,156 @@ class PredictionExecutionService:
         self._transition(execution_id, "both_rejected", {"phase": "validation_rejected", "reason": reason})
 
     def _finish_incident(
-        self, execution_id: str, reason: str, *, state: str = "directional_incident"
+        self,
+        execution_id: str,
+        reason: str,
+        *,
+        state: str = "directional_incident",
+        incident_id: str | None = None,
+        notify: bool = True,
     ) -> None:
         self._breaker_open = True
-        payload = {"reason": reason, "breaker": "open", "state": state}
+        if incident_id is None:
+            incident_id = self._record_incident(
+                execution_id,
+                reason,
+                state=state,
+                evidence={"phase": "incident", "reason": reason},
+                notify=notify,
+            )
+        payload = {
+            "phase": "incident_final",
+            "reason": reason,
+            "breaker": "open",
+            "state": state,
+            **({"incident_id": incident_id} if incident_id else {}),
+        }
+        try:
+            update_incident = getattr(self._store, "update_incident", None)
+            if incident_id and callable(update_incident):
+                update_incident(
+                    str(incident_id),
+                    {"state": state, "reason": reason, "final": True},
+                )
+            self._transition(execution_id, state, payload)
+        except Exception:
+            self._breaker_open = True
+
+    def _record_incident(
+        self,
+        execution_id: str,
+        reason: str,
+        *,
+        state: str,
+        evidence: Mapping[str, object],
+        notify: bool = True,
+    ) -> str | None:
+        self._breaker_open = True
+        attempts = self._notify_incident(reason) if notify else []
+        payload = {
+            "reason": reason,
+            "breaker": "open",
+            "state": state,
+            **self._safe_mapping(evidence),
+            "notification_attempts": attempts,
+        }
         try:
             incident_id = self._store.open_incident(execution_id, payload)
-            payload["incident_id"] = incident_id
-            self._transition(execution_id, state, payload)
-            try:
-                self._notifier.notify("预测市场执行事故", reason)
-            except Exception:
-                pass
+            self._transition(
+                execution_id,
+                state,
+                {
+                    "phase": "incident_open",
+                    "incident_id": incident_id,
+                    "reason": reason,
+                    "attempts": attempts,
+                },
+            )
+            return incident_id
         except Exception:
             # A persistence failure must not unlock the process; leave the
             # breaker open even when an incident row cannot be written.
             self._breaker_open = True
+            return None
+
+    def _notify_incident(self, reason: str) -> list[dict[str, object]]:
+        title = "预测市场执行事故"
+        targets = getattr(self._notifier, "_notifiers", None)
+        if isinstance(targets, (list, tuple)):
+            candidates = list(targets)
+        else:
+            candidates = [self._notifier]
+        selected: list[object] = []
+        feishu_selected = False
+        for target in candidates:
+            channel = self._notification_channel(target)
+            if channel == "macos":
+                if not any(self._notification_channel(item) == "macos" for item in selected):
+                    selected.append(target)
+            elif channel in {"feishu", "feishu_app"} and not feishu_selected:
+                selected.append(target)
+                feishu_selected = True
+        attempts: list[dict[str, object]] = []
+        for target in selected:
+            channel = self._notification_channel(target)
+            try:
+                raw_attempts = send_notification_with_results(
+                    target, title, reason, channels=None
+                )
+                if raw_attempts:
+                    for attempt in raw_attempts:
+                        attempts.append(
+                            {
+                                "channel": channel if channel not in {"unknown", ""} else attempt.channel,
+                                "success": attempt.success,
+                                "error_type": attempt.error_type,
+                                "error": attempt.error,
+                                "suppressed": attempt.suppressed,
+                            }
+                        )
+                else:
+                    attempts.append({"channel": channel, "success": False, "error_type": "not_attempted"})
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "channel": channel,
+                        "success": False,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+        selected_channels = {self._notification_channel(target) for target in selected}
+        if "macos" not in selected_channels:
+            attempts.append(
+                {
+                    "channel": "macos",
+                    "success": False,
+                    "error_type": "not_configured",
+                }
+            )
+        if not feishu_selected:
+            attempts.append(
+                {
+                    "channel": "feishu",
+                    "success": False,
+                    "error_type": "not_configured",
+                }
+            )
+        return attempts
+
+    @staticmethod
+    def _notification_channel(target: object) -> str:
+        explicit = getattr(target, "channel", None)
+        if isinstance(explicit, str) and explicit in {"macos", "feishu", "feishu_app"}:
+            return explicit
+        name = target.__class__.__name__.lower()
+        if "macos" in name or "mac" in name:
+            return "macos"
+        if "feishuapp" in name or "feishu_app" in name:
+            return "feishu_app"
+        if "feishu" in name:
+            return "feishu"
+        return "unknown"
 
     def _breaker_is_open(self) -> bool:
         if self._breaker_open:

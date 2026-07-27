@@ -723,6 +723,49 @@ def test_reconcile_requires_confirmed_trades_and_current_positions() -> None:
     assert result["execution_proof"]["positions_verified"] is False
 
 
+def test_reconcile_exposes_verified_partial_fill_without_authorizing_merge() -> None:
+    adapter, fake = make_adapter()
+    matched_at = datetime.now(UTC)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="yes-trade",
+            condition_id="condition-1",
+            token_id="yes-token",
+            taker_order_id="yes-order",
+            size=Decimal("10"),
+            status="CONFIRMED",
+            side="BUY",
+            matched_at=matched_at,
+        )
+    ]
+    fake.position_rows = [
+        {
+            "condition_id": "condition-1",
+            "token_id": "yes-token",
+            "size": Decimal("10"),
+            "updated_at": matched_at,
+        }
+    ]
+
+    result = adapter.reconcile(
+        condition_id="condition-1",
+        since=matched_at - timedelta(seconds=1),
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        yes_order_id="yes-order",
+        no_order_id="no-order",
+        yes_trade_ids=("yes-trade",),
+        no_trade_ids=("no-trade",),
+    )
+
+    assert result["status"] == "partial"
+    assert result["yes_quantity"] == Decimal("10")
+    assert result["no_quantity"] == Decimal("0")
+    proof = result["execution_proof"]
+    assert proof["partial_verified"] is True
+    assert proof["verified"] is False
+
+
 def test_reconcile_existing_positions_without_matching_trades_stays_unverified() -> None:
     adapter, fake = make_adapter()
     now = datetime.now(UTC)
