@@ -428,7 +428,10 @@ def _trend_report_is_current_or_recent_weekend_snapshot(
     if report.get("data_status") != "stale":
         return False
     now = now or datetime.now(SHANGHAI)
-    if now.weekday() < 5:
+    operator_date = now.astimezone(SHANGHAI).date()
+    if report.get("report_date") == operator_date.isoformat():
+        return True
+    if operator_date.weekday() < 5:
         return False
     try:
         generated_at = datetime.fromisoformat(str(report.get("generated_at") or ""))
@@ -436,7 +439,7 @@ def _trend_report_is_current_or_recent_weekend_snapshot(
         return False
     if generated_at.tzinfo is None or generated_at.utcoffset() is None:
         return False
-    age = (now.date() - generated_at.astimezone(SHANGHAI).date()).days
+    age = (operator_date - generated_at.astimezone(SHANGHAI).date()).days
     return 0 <= age <= 3
 
 

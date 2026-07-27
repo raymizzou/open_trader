@@ -4521,6 +4521,22 @@ def test_acceptance_allows_recent_frozen_report_after_friday_close() -> None:
     )
 
 
+def test_acceptance_allows_stale_us_report_for_current_shanghai_execution_date() -> None:
+    report = {
+        "data_status": "stale",
+        "report_date": "2026-07-27",
+        "generated_at": "2026-07-25T12:42:27+08:00",
+    }
+    monday_morning = datetime(
+        2026, 7, 27, 10, 0, tzinfo=dashboard_acceptance.SHANGHAI
+    )
+
+    assert dashboard_acceptance._trend_report_is_current_or_recent_weekend_snapshot(
+        report,
+        now=monday_morning,
+    )
+
+
 def test_validate_dashboard_payload_rejects_retired_tiger_strategy_payload() -> None:
     payload = valid_payload()
     payload["tiger_" + "long_term_strategy"] = {"status": "shadow"}

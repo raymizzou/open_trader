@@ -10,7 +10,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   rewriting history, and restarted HK from an account-bound no-replay cycle.
   Verified all three configured accounts with real SIMULATE submit/cancel
   orders; order IDs `7606013`, `7606014`, and `7606015` all finished
-  `CANCELLED_ALL` with zero fills.
+  `CANCELLED_ALL` with zero fills. Refreshed the account-bound trade statistics
+  and made Dashboard acceptance recognize a frozen US report whose execution
+  date is already the current Shanghai operator date.
 
 ## 2026-07-26
 
