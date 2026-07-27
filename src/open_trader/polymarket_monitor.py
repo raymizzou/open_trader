@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import math
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -81,11 +82,24 @@ def _items(value: object) -> tuple[object, ...]:
 async def _collect(value: object) -> tuple[object, ...]:
     if inspect.isawaitable(value):
         value = await value
+    # The official AsyncPublicClient returns AsyncPaginator.  Its async
+    # iterator yields Page objects, while iter_items() yields the actual
+    # Event/Market models we need.
+    iter_items = getattr(value, "iter_items", None)
+    if callable(iter_items):
+        return await _collect(iter_items())
     if hasattr(value, "__aiter__"):
         result: list[object] = []
         async for item in value:  # type: ignore[union-attr]
-            result.append(item)
+            page_items = _value(item, "items", default=None)
+            if page_items is not None and _value(item, "has_more", default=None) is not None:
+                result.extend(_items(page_items))
+            else:
+                result.append(item)
         return tuple(result)
+    page_items = _value(value, "items", default=None)
+    if page_items is not None and _value(value, "has_more", default=None) is not None:
+        return _items(page_items)
     return _items(value)
 
 
@@ -109,10 +123,17 @@ def _decimal(value: object) -> Decimal | None:
 
 
 def _timestamp(value: object, *, fallback: datetime) -> datetime:
+    parsed = _timestamp_or_none(value)
+    return fallback if parsed is None else parsed
+
+
+def _timestamp_or_none(value: object) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
         number = float(value)
+        if not number == number or number in (float("inf"), float("-inf")):
+            return None
         # CLOB timestamps are epoch milliseconds; small values are seconds.
         parsed = datetime.fromtimestamp(number / (1000 if number > 10_000_000_000 else 1), UTC)
     elif isinstance(value, str):
@@ -122,9 +143,9 @@ def _timestamp(value: object, *, fallback: datetime) -> datetime:
         try:
             parsed = datetime.fromisoformat(text)
         except ValueError:
-            return fallback
+            return None
     else:
-        return fallback
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
@@ -134,6 +155,10 @@ def _age(now: datetime, then: datetime | None) -> float:
     if then is None:
         return float("inf")
     return max(0.0, (now - then).total_seconds())
+
+
+def _display_age(value: float) -> float | None:
+    return value if math.isfinite(value) else None
 
 
 def _state_flag(model: object, name: str, default: object = None) -> object:
@@ -216,6 +241,8 @@ class PolymarketMonitor:
         self._stream_disconnected_at: datetime | None = None
         self._last_runtime_write: datetime | None = None
         self._store_failed = False
+        self._universe_failed = False
+        self._stream_message_at: datetime | None = None
         self._diagnostics: dict[str, object] = {
             "malformed_events": 0,
             "malformed_markets": 0,
@@ -259,11 +286,17 @@ class PolymarketMonitor:
                 copy.deepcopy(value)
                 for value in sorted(
                     self._opportunities.values(),
-                    key=lambda item: str(item.get("opportunity_id", "")),
+                    key=monitored_event_sort_key,
                 )
             ]
-            if health["status"] == "degraded":
-                for opportunity in opportunities:
+            for opportunity in opportunities:
+                confirmed_at = opportunity.get("confirmed_at")
+                age = _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None)
+                opportunity["confirmed_age_seconds"] = age
+                if age > BOOK_FRESHNESS_SECONDS:
+                    opportunity["actionable"] = False
+                    opportunity["eligibility_reason"] = "book_stale"
+                if health["status"] == "degraded":
                     opportunity["actionable"] = False
                     opportunity["eligibility_reason"] = "monitor_degraded"
             return {
@@ -283,7 +316,14 @@ class PolymarketMonitor:
             if value is None:
                 return None
             result = copy.deepcopy(value)
-            if self._health(self._now())["status"] == "degraded":
+            now = self._now()
+            confirmed_at = result.get("confirmed_at")
+            age = _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None)
+            result["confirmed_age_seconds"] = age
+            if age > BOOK_FRESHNESS_SECONDS:
+                result["actionable"] = False
+                result["eligibility_reason"] = "book_stale"
+            if self._health(now)["status"] == "degraded":
                 result["actionable"] = False
                 result["eligibility_reason"] = "monitor_degraded"
             return result
@@ -301,6 +341,9 @@ class PolymarketMonitor:
             self._client = client
         try:
             await self._refresh_universe(client)
+            return self.snapshot()
+        except Exception as exc:
+            self._record_error(exc, "universe")
             return self.snapshot()
         finally:
             if owned_client and self._stop_event.is_set():
@@ -343,7 +386,8 @@ class PolymarketMonitor:
                     self._disconnect_stream(exc)
                     await asyncio.sleep(0)
                     continue
-                self._heartbeat_at = self._now()
+                self._stream_message_at = self._now()
+                self._heartbeat_at = self._stream_message_at
                 try:
                     await self._process_stream_event(client, message)
                 except Exception as exc:
@@ -382,7 +426,6 @@ class PolymarketMonitor:
         with self._lock:
             token_ids = sorted(self._market_by_token)
         if not token_ids:
-            self._heartbeat_at = self._now()
             return
         await self._close_stream()
         subscribe = getattr(client, "subscribe", None)
@@ -392,7 +435,6 @@ class PolymarketMonitor:
         self._stream_handle = handle
         self._stream_connected_at = self._now()
         self._stream_disconnected_at = None
-        self._heartbeat_at = self._now()
 
     async def _refresh_universe(self, client: object) -> None:
         list_events = getattr(client, "list_events", None)
@@ -442,6 +484,7 @@ class PolymarketMonitor:
             self._market_by_token = token_map
             self._diagnostics["malformed_events"] = malformed_events
             self._universe_at = self._now()
+            self._universe_failed = False
         await self._subscribe(client)
         await self._refresh_readiness()
         current_opportunities: dict[str, dict[str, object]] = {}
@@ -460,7 +503,6 @@ class PolymarketMonitor:
             market_id = opportunity_id.split(":", 1)[-1]
             self._close_signal(market_id, "opportunity_closed")
         self._sync_event_rows()
-        self._heartbeat_at = self._now()
         self._write_runtime(force=True)
 
     def _normalize_event(self, value: object) -> dict[str, object] | None:
@@ -562,12 +604,21 @@ class PolymarketMonitor:
                 readiness = self._object_dict(account)
                 geoblock = await _call(getattr(self._trading, "geoblock_allowed"))
                 readiness["geoblock"] = "allowed" if geoblock is True else "blocked"
-            checked_at = _timestamp(readiness.get("checked_at"), fallback=now)
+                if readiness.get("wallet_address"):
+                    readiness["wallet"] = "ready"
+                readiness["relayer"] = self._derive_relayer_readiness()
+            checked_at = _timestamp_or_none(readiness.get("checked_at"))
             readiness["checked_at"] = checked_at
             self._readiness = readiness
         except Exception as exc:
-            self._readiness = {"status": "unavailable", "checked_at": now, "error": type(exc).__name__}
+            self._readiness = {"status": "unavailable", "checked_at": None, "error": type(exc).__name__}
             self._record_error(exc, "readiness")
+
+    def _derive_relayer_readiness(self) -> str:
+        """Use Task 2's safe merge-capability fact without signing."""
+
+        client = getattr(self._trading, "_client", None)
+        return "ready" if callable(getattr(client, "merge_positions", None)) else "unavailable"
 
     @staticmethod
     def _object_dict(value: object) -> dict[str, object]:
@@ -622,10 +673,12 @@ class PolymarketMonitor:
             market_row["eligibility_reason"] = "book_unavailable"
             return None
         now = self._now()
-        confirmed_at = max(
-            _timestamp(_value(yes_book, "timestamp", default=None), fallback=now),
-            _timestamp(_value(no_book, "timestamp", default=None), fallback=now),
-        )
+        yes_timestamp = _timestamp_or_none(_value(yes_book, "timestamp", default=None))
+        no_timestamp = _timestamp_or_none(_value(no_book, "timestamp", default=None))
+        if yes_timestamp is None or no_timestamp is None:
+            market_row["eligibility_reason"] = "book_timestamp_missing"
+            return None
+        confirmed_at = max(yes_timestamp, no_timestamp)
         books = ConfirmedBooks(
             yes_token_id=yes_token,
             no_token_id=no_token,
@@ -637,6 +690,10 @@ class PolymarketMonitor:
         age = _age(now, confirmed_at)
         market_row["confirmed_at"] = confirmed_at
         market_row["confirmed_age_seconds"] = age
+        market_row["gross_upper_bound"] = max(
+            Decimal("0"),
+            Decimal("1") - min(yes_asks, key=lambda level: level.price).price - min(no_asks, key=lambda level: level.price).price,
+        )
         if age > BOOK_FRESHNESS_SECONDS:
             market_row["eligibility_reason"] = "books_stale"
             return None
@@ -726,6 +783,8 @@ class PolymarketMonitor:
         return "balance" in readiness or "p_usd_balance" in readiness
 
     async def _process_stream_event(self, client: object, message: object) -> None:
+        self._stream_message_at = self._now()
+        self._heartbeat_at = self._stream_message_at
         payload = _value(message, "payload", default=message)
         token = _value(payload, "token_id", "asset_id", "assetId", default=None)
         if not isinstance(token, str):
@@ -733,7 +792,6 @@ class PolymarketMonitor:
         market_id = self._market_by_token.get(token)
         if market_id is None:
             return
-        self._heartbeat_at = self._now()
         market_row = self._markets.get(market_id)
         if market_row is None:
             return
@@ -787,6 +845,10 @@ class PolymarketMonitor:
                 (row.get("profit") for row in actionable if isinstance(row.get("profit"), Decimal)),
                 default=None,
             )
+            event_row["gross_upper_bound"] = max(
+                (row.get("gross_upper_bound") for row in markets if isinstance(row.get("gross_upper_bound"), Decimal)),
+                default=None,
+            )
 
     def _upsert_signal(self, opportunity: Mapping[str, object]) -> None:
         market_id = str(opportunity["market_id"])
@@ -829,12 +891,16 @@ class PolymarketMonitor:
 
     @staticmethod
     def _max_decimal(left: object, right: object) -> object:
-        if isinstance(left, Decimal) and isinstance(right, Decimal):
-            return max(left, right)
-        return left if isinstance(left, Decimal) else right
+        left_decimal = _decimal(left)
+        right_decimal = _decimal(right)
+        if left_decimal is not None and right_decimal is not None:
+            return max(left_decimal, right_decimal)
+        return left_decimal if left_decimal is not None else right_decimal
 
     def _record_error(self, exc: BaseException, component: str) -> None:
         self._diagnostics["last_error"] = f"{component}:{type(exc).__name__}"
+        if component == "universe":
+            self._universe_failed = True
 
     def _write_runtime(self, *, force: bool = False) -> None:
         now = self._now()
@@ -863,14 +929,21 @@ class PolymarketMonitor:
             reasons.append("universe_unavailable")
         elif _age(now, self._universe_at) > UNIVERSE_STALE_SECONDS:
             reasons.append("universe_stale")
-        if self._heartbeat_at is None:
-            reasons.append("heartbeat_missing")
-        elif _age(now, self._heartbeat_at) > HEARTBEAT_FRESHNESS_SECONDS:
+        if self._universe_failed:
+            reasons.append("universe_refresh_failed")
+        if self._heartbeat_at is not None and _age(now, self._heartbeat_at) > HEARTBEAT_FRESHNESS_SECONDS:
             reasons.append("heartbeat_stale")
+        elif (
+            self._heartbeat_at is None
+            and self._stream_connected_at is not None
+            and _age(now, self._stream_connected_at) > STREAM_DISCONNECT_SECONDS
+        ):
+            reasons.append("heartbeat_missing")
         if self._stream_disconnected_at is not None and _age(now, self._stream_disconnected_at) > STREAM_DISCONNECT_SECONDS:
             reasons.append("stream_disconnected")
         for opportunity in self._opportunities.values():
-            if float(opportunity.get("confirmed_age_seconds", float("inf"))) > BOOK_FRESHNESS_SECONDS:
+            confirmed_at = opportunity.get("confirmed_at")
+            if _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None) > BOOK_FRESHNESS_SECONDS:
                 reasons.append("books_stale")
                 break
         readiness_at = self._readiness.get("checked_at") if self._readiness else None
@@ -883,9 +956,9 @@ class PolymarketMonitor:
             "degraded_reasons": sorted(set(reasons)),
             "actionable": status == "healthy" and bool(self._opportunities),
             "opportunity_count": len(self._opportunities),
-            "heartbeat_age_seconds": _age(now, self._heartbeat_at),
-            "universe_age_seconds": _age(now, self._universe_at),
-            "readiness_age_seconds": _age(now, readiness_at if isinstance(readiness_at, datetime) else None),
+            "heartbeat_age_seconds": _display_age(_age(now, self._heartbeat_at)),
+            "universe_age_seconds": _display_age(_age(now, self._universe_at)),
+            "readiness_age_seconds": _display_age(_age(now, readiness_at if isinstance(readiness_at, datetime) else None)),
         }
 
     def _now(self) -> datetime:
@@ -992,9 +1065,19 @@ def monitor_once_diagnostic(
     timeout: float = 30.0,
     public_client_factory: Callable[[], object] = AsyncPublicClient,
 ) -> dict[str, object]:
-    return asyncio.run(
-        _monitor_once_diagnostic_async(
-            timeout=timeout,
-            public_client_factory=public_client_factory,
+    try:
+        return asyncio.run(
+            _monitor_once_diagnostic_async(
+                timeout=timeout,
+                public_client_factory=public_client_factory,
+            )
         )
-    )
+    except Exception:
+        return {
+            "event_count": "BLOCKED",
+            "volumes": "BLOCKED",
+            "websocket_heartbeat": "BLOCKED",
+            "paired_book_read": "BLOCKED",
+            "mutations": 0,
+            "result": "BLOCKED",
+        }

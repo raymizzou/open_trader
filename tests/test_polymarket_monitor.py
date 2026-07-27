@@ -113,12 +113,18 @@ class FakePublicClient:
     list_events_calls: list[dict[str, object]] = []
     book_calls: list[list[str]] = []
     subscribe_specs: list[object] = []
+    page_mode = False
+    fail_list_events = False
 
     def __init__(self) -> None:
         self.stream = self.streams.pop(0) if self.streams else FakeStream()
 
     async def list_events(self, **kwargs: object) -> list[object]:
         self.list_events_calls.append(kwargs)
+        if self.fail_list_events:
+            raise ConnectionError("sentinel network failure")
+        if self.page_mode:
+            return PagePaginator(list(self.events))  # type: ignore[return-value]
         return list(self.events)
 
     async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
@@ -129,6 +135,28 @@ class FakePublicClient:
     def subscribe(self, spec: object) -> FakeStream:
         self.subscribe_specs.append(spec)
         return self.stream
+
+
+@dataclass
+class Page:
+    items: tuple[object, ...]
+    has_more: bool = False
+
+
+class PagePaginator:
+    def __init__(self, items: list[object]) -> None:
+        self.pages = [Page(tuple(items[:12]), True), Page(tuple(items[12:]), False)]
+
+    def __aiter__(self) -> "PagePaginator":
+        self._index = 0
+        return self
+
+    async def __anext__(self) -> Page:
+        if self._index >= len(self.pages):
+            raise StopAsyncIteration
+        page = self.pages[self._index]
+        self._index += 1
+        return page
 
 
 @dataclass
@@ -175,6 +203,8 @@ def setup_public(event_rows: list[object]) -> None:
     FakePublicClient.list_events_calls = []
     FakePublicClient.book_calls = []
     FakePublicClient.subscribe_specs = []
+    FakePublicClient.page_mode = False
+    FakePublicClient.fail_list_events = False
 
 
 def make_monitor(tmp_path: Path, *, trading: FakeTrading | None = None):
@@ -216,6 +246,17 @@ def test_refresh_uses_official_event_query_and_limits_valid_top_twenty(tmp_path:
     assert len(snapshot["events"]) == 20
     assert snapshot["events"][0]["volume_24h"] == Decimal("1000")
     assert snapshot["diagnostics"]["malformed_events"] == 4
+
+
+def test_refresh_drains_official_page_shaped_async_paginator(tmp_path: Path) -> None:
+    setup_public([event(f"event-{i:02d}", volume=str(1000 - i), markets=(market(f"m-{i:02d}"),)) for i in range(21)])
+    FakePublicClient.page_mode = True
+
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+
+    assert len(monitor.snapshot()["events"]) == 20
+    assert monitor.snapshot()["events"][0]["event_id"] == "event-00"
 
 
 def test_only_exact_active_binary_markets_are_subscribed_and_books_match_by_token_id(
@@ -260,6 +301,61 @@ def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path
     assert monitor.snapshot()["health"]["actionable"] is False
 
 
+def test_task2_account_and_merge_capability_readiness_is_actionable(tmp_path: Path) -> None:
+    class Task2ReadyTrading:
+        _client = ns(merge_positions=lambda **kwargs: None)
+
+        def account_snapshot(self) -> object:
+            return ns(
+                wallet_address="0xwallet",
+                p_usd_balance=Decimal("50"),
+                p_usd_allowance=Decimal("50"),
+                checked_at=NOW,
+            )
+
+        def geoblock_allowed(self) -> bool:
+            return True
+
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path, trading=Task2ReadyTrading())
+    monitor.refresh_once()
+    assert monitor.opportunity("e:m")["actionable"] is True  # type: ignore[index]
+
+
+def test_candidate_age_is_recomputed_after_confirmation(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    now = [NOW]
+    monitor = make_monitor(tmp_path)
+    monitor._clock = lambda: now[0]
+    monitor.refresh_once()
+    assert monitor.opportunity("e:m") is not None
+
+    now[0] = NOW + timedelta(seconds=11)
+    stale = monitor.opportunity("e:m")
+    assert stale is not None
+    assert stale["actionable"] is False
+    assert stale["eligibility_reason"] == "monitor_degraded"
+    assert monitor.snapshot()["health"]["status"] == "degraded"
+
+
+@pytest.mark.parametrize("field_value", [None, "not-a-timestamp"])
+def test_missing_or_invalid_book_timestamp_fails_closed(tmp_path: Path, field_value: object) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    FakePublicClient.books["yes-1"].timestamp = field_value
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    assert monitor.opportunity("e:m") is None
+    assert monitor.snapshot()["events"][0]["markets"][0]["eligibility_reason"] == "book_timestamp_missing"
+
+
+def test_missing_readiness_timestamp_fails_closed(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path, trading=FakeTrading(checked_at=None))  # type: ignore[arg-type]
+    monitor.refresh_once()
+    assert monitor.opportunity("e:m") is None
+    assert monitor.snapshot()["health"]["status"] == "degraded"
+
+
 def test_signal_episode_peaks_close_and_restart(tmp_path: Path) -> None:
     setup_public([event("e", markets=(market("m"),))])
     monitor = make_monitor(tmp_path)
@@ -283,6 +379,22 @@ def test_signal_episode_peaks_close_and_restart(tmp_path: Path) -> None:
     assert restarted._store.signal_history("all") == history
 
 
+def test_signal_peak_strings_are_parsed_and_not_overwritten_by_lower_update(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    first = monitor._store.signal_history("all")[0]
+    assert first["peak_estimated_profit"] == "1.4000"
+
+    FakePublicClient.books["yes-1"] = order_book("yes-1")
+    FakePublicClient.books["yes-1"].asks = [ns(price=Decimal("0.46"), size=Decimal("20"))]
+    monitor.refresh_once()
+    assert monitor._store.signal_history("all")[0]["peak_estimated_profit"] == "1.4000"
+    restarted = make_monitor(tmp_path)
+    restarted.refresh_once()
+    assert restarted._store.signal_history("all")[0]["peak_estimated_profit"] == "1.4000"
+
+
 def test_healthy_quiet_is_distinct_from_degraded_and_runtime_is_throttled(tmp_path: Path) -> None:
     setup_public([event("e", markets=(market("m", volume="100"),))])
     monitor = make_monitor(tmp_path)
@@ -293,6 +405,47 @@ def test_healthy_quiet_is_distinct_from_degraded_and_runtime_is_throttled(tmp_pa
     monitor.refresh_once()
     assert monitor.snapshot()["health"]["status"] == "healthy"
     assert monitor.snapshot()["health"]["opportunity_count"] == 0
+
+
+def test_no_stream_message_for_over_fifteen_seconds_is_degraded(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    now = [NOW]
+    monitor = make_monitor(tmp_path)
+    monitor._clock = lambda: now[0]
+    monitor.refresh_once()
+    now[0] = NOW + timedelta(seconds=16)
+    assert monitor.snapshot()["health"]["status"] == "degraded"
+
+
+def test_universe_failure_degrades_prior_snapshot(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    FakePublicClient.fail_list_events = True
+    monitor.refresh_once()
+    snapshot = monitor.snapshot()
+    assert snapshot["events"]
+    assert snapshot["health"]["status"] == "degraded"
+    assert snapshot["health"]["actionable"] is False
+
+
+def test_monitor_only_rows_keep_gross_upper_bound(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("fee", fees_enabled=True), market("neg", neg_risk=True)))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    rows = {row["market_id"]: row for row in monitor.snapshot()["events"][0]["markets"]}
+    assert isinstance(rows["fee"]["gross_upper_bound"], Decimal)
+    assert isinstance(rows["neg"]["gross_upper_bound"], Decimal)
+
+
+def test_opportunities_use_domain_profit_volume_order(tmp_path: Path) -> None:
+    high = market("high", yes="yes-high", no="no-high")
+    low = market("low", yes="yes-low", no="no-low")
+    setup_public([event("z", markets=(high,)), event("a", markets=(low,))])
+    FakePublicClient.books["yes-low"].asks = [ns(price=Decimal("0.46"), size=Decimal("20"))]
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    assert [item["opportunity_id"] for item in monitor.snapshot()["opportunities"]] == ["z:high", "a:low"]
 
 
 def test_start_stop_owns_one_daemon_async_thread(tmp_path: Path) -> None:
@@ -320,3 +473,13 @@ def test_monitor_once_diagnostic_is_public_and_non_mutating() -> None:
         "mutations": 0,
         "result": "PASS",
     }
+
+
+def test_monitor_once_diagnostic_converts_public_failures_to_blocked() -> None:
+    from open_trader.polymarket_monitor import monitor_once_diagnostic
+
+    setup_public([])
+    FakePublicClient.fail_list_events = True
+    report = monitor_once_diagnostic(timeout=0.1, public_client_factory=FakePublicClient)
+    assert report["result"] == "BLOCKED"
+    assert report["mutations"] == 0
