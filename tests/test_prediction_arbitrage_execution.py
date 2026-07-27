@@ -443,7 +443,9 @@ def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
         store=store,
         monitor=monitor,
         trading=trading,
-        notifier=FakeNotifier(),
+        notifier=CompositeTestNotifier(
+            ChannelNotifier("macos"), ChannelNotifier("feishu")
+        ),
         lock_path=tmp_path / "execution.lock",
     )
     return service, trading, store, monitor
@@ -884,3 +886,136 @@ def test_reset_breaker_requires_fresh_clean_account_and_acknowledges_incident(tm
     assert store.unacknowledged_incident() is None
     assert service.preview("opp-1")["state"] == "previewed"
     assert trading.batch_calls == 0
+
+
+def test_startup_incident_without_local_execution_is_durable_and_resettable(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    trading.account_mode = "open_order"
+
+    locked = service.reconcile_startup()
+
+    assert locked["state"] == "locked"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    incident_id = str(incidents[0]["incident_id"])
+    trading.account_mode = "clean"
+    reset = service.reset_breaker(incident_id)
+    assert reset["state"] == "ready"
+
+
+def test_startup_does_not_unlock_with_existing_unacknowledged_terminal_incident(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "terminal-incident")
+    store.transition_execution(
+        str(execution["execution_id"]),
+        state="merge_incident",
+        evidence={"phase": "merge_result", "confirmed": False},
+    )
+    store.open_incident(str(execution["execution_id"]), {"state": "merge_incident"})
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "unacknowledged_incident"
+    assert trading.batch_calls == 0
+
+
+def test_reset_denies_terminal_unconfirmed_merge_from_incident_evidence(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "terminal-merge")
+    store.transition_execution(
+        str(execution["execution_id"]),
+        state="merge_incident",
+        evidence={"phase": "merge_result", "confirmed": False},
+    )
+    incident_id = store.open_incident(
+        str(execution["execution_id"]), {"state": "merge_incident"}
+    )
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "pending_merge"
+    assert trading.batch_calls == 0
+
+
+def test_missing_feishu_or_macos_blocks_preview_readiness(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = IncidentTrading(result="unsafe")
+    monitor = FakeMonitor(_intent())
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=ChannelNotifier("macos"),
+        lock_path=tmp_path / "execution.lock",
+    )
+
+    result = service.preview("opp-1")
+
+    assert result["state"] == "rejected"
+    assert result["reason"] == "notification_config_unavailable"
+    assert trading.batch_calls == 0
+
+
+def test_stale_account_snapshot_blocks_reset(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "stale-reset")
+    incident_id = store.open_incident(str(execution["execution_id"]), {"state": "directional_incident"})
+    original = trading.account_snapshot
+
+    def stale_snapshot() -> AccountSnapshot:
+        value = original()
+        return AccountSnapshot(
+            wallet_address=value.wallet_address,
+            p_usd_balance=value.p_usd_balance,
+            p_usd_allowance=value.p_usd_allowance,
+            open_order_ids=value.open_order_ids,
+            positions=value.positions,
+            checked_at=datetime.now(UTC) - timedelta(seconds=61),
+        )
+
+    trading.account_snapshot = stale_snapshot  # type: ignore[method-assign]
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "account_stale"
+
+
+def test_remediation_rejects_wrong_token_or_quantity_candidate(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="yes_only")
+
+    def wrong_options(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "fresh": True,
+            "complete": {
+                "leg": "NO", "side": "BUY", "token_id": "yes-token",
+                "quantity": Decimal("9"), "amount": Decimal("1.08"),
+                "max_spend": Decimal("1.08"), "max_price": Decimal("0.12"),
+                "loss": Decimal("1.08"),
+            },
+            "unwind": {"loss": Decimal("3")},
+        }
+
+    trading.remediation_options = wrong_options  # type: ignore[method-assign]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "wrong-remedy")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.remediation_calls == []
+
+
+def test_one_leg_neutralization_does_not_mark_first_live_order_validated(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="yes_only")
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "one-leg-runtime")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "neutralized_incident"
+    runtime = store.load_runtime() or {}
+    assert runtime.get("first_live_order") != "validated"

@@ -15,11 +15,12 @@ from typing import Any, Mapping
 
 from .daily_premarket import send_notification_with_results
 from .notifications import Notifier
-from .polymarket_trading import LegResult, PairSubmission
+from .polymarket_trading import LegResult, PairSubmission, PolymarketTradingClient
 from .prediction_arbitrage import (
     MAX_WALLET_BALANCE,
     PROTECTED_BUY_SHARE_PRECISION,
     PairIntent,
+    protected_buy_quantity,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
 
@@ -286,9 +287,11 @@ class PredictionExecutionService:
     def reconcile_startup(self) -> dict[str, object]:
         """Reconcile live account state before allowing a new opportunity."""
         self._breaker_open = True
-        snapshot = self._account_snapshot()
+        snapshot = self._fresh_account_snapshot()
         if snapshot is None:
             return {"state": "locked", "reason": "account_unavailable"}
+        if self._store.unacknowledged_incident() is not None:
+            return {"state": "locked", "reason": "unacknowledged_incident"}
 
         active = self._store.active_execution()
         active_id = str(active.get("execution_id", "")) if active else ""
@@ -299,7 +302,11 @@ class PredictionExecutionService:
                 canceled = _call(cancel, tuple(open_orders))
             except Exception:
                 canceled = ()
-            after_cancel = self._account_snapshot()
+            # A cancel response is not proof that the venue has settled the
+            # account.  Re-read the complete account snapshot with freshness
+            # validation before deciding whether the startup incident is
+            # contained.
+            after_cancel = self._fresh_account_snapshot()
             remaining = self._order_ids(
                 after_cancel.get("open_order_ids", ()) if after_cancel else open_orders
             )
@@ -346,6 +353,8 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "stale_local_execution", **evidence}
         if not self._relayer_ready():
             return {"state": "locked", "reason": "readiness_unavailable"}
+        if not self._notification_channels_ready():
+            return {"state": "locked", "reason": "notification_config_unavailable"}
         self._breaker_open = False
         self._store.write_runtime(
             {"prediction_arbitrage": "ready", "reconciled_at": _timestamp(_utc_now())}
@@ -367,9 +376,25 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "incident_not_found", "incident_id": str(incident_id)}
         snapshot = self._account_snapshot()
         reasons: list[str] = []
+        incident_execution = next(
+            (
+                row
+                for row in self._store.histories("executions")
+                if str(row.get("execution_id", ""))
+                == str(incident.get("execution_id", ""))
+            ),
+            None,
+        )
+        if self._pending_merge_for_incident(incident, incident_execution):
+            reasons.append("pending_merge")
         if snapshot is None:
             reasons.append("account_unavailable")
         else:
+            checked_age = _age_seconds(snapshot.get("checked_at"))
+            if checked_age is None or checked_age > 60:
+                reasons.append("account_stale")
+            if "open_order_ids" not in snapshot or "positions" not in snapshot:
+                reasons.append("account_malformed")
             open_orders = self._order_ids(snapshot.get("open_order_ids", ()))
             if open_orders:
                 reasons.append("open_orders")
@@ -380,10 +405,12 @@ class PredictionExecutionService:
                 reasons.append("unknown_external_state")
             if totals["yes"] != 0 or totals["no"] != 0:
                 reasons.append("directional_imbalance")
-            if self._pending_merge(active):
+            if self._pending_merge(active) or self._pending_merge_for_incident(incident, incident_execution):
                 reasons.append("pending_merge")
         if not self._relayer_ready():
             reasons.append("readiness_unavailable")
+        if not self._notification_channels_ready():
+            reasons.append("notification_config_unavailable")
         if reasons:
             self._breaker_open = True
             reason = reasons[0]
@@ -520,6 +547,7 @@ class PredictionExecutionService:
                     no=no,
                     proof=execution_proof,
                     since=submitted_at,
+                    tick_size=tick_size,
                 )
                 return
             if no_quantity > 0 and yes_quantity <= 0:
@@ -532,6 +560,7 @@ class PredictionExecutionService:
                     no=no,
                     proof=execution_proof,
                     since=submitted_at,
+                    tick_size=tick_size,
                 )
                 return
             if yes_quantity <= 0 or no_quantity <= 0 or yes_quantity != no_quantity:
@@ -591,7 +620,9 @@ class PredictionExecutionService:
             if not self._merge_confirmed(merge_result):
                 self._finish_incident(execution_id, "merge_not_confirmed", state="merge_incident")
                 return
-            after = self._account_snapshot()
+            # Merge confirmation must be followed by a fresh complete account
+            # read; a stale local snapshot cannot unlock the breaker.
+            after = self._fresh_account_snapshot()
             before_balance = _decimal(account.get("p_usd_balance"))
             after_balance = _decimal(after.get("p_usd_balance")) if after else None
             if (
@@ -679,6 +710,8 @@ class PredictionExecutionService:
     def _volatile_checks(
         self, intent: PairIntent
     ) -> tuple[dict[str, object] | None, str | None]:
+        if not self._notification_channels_ready():
+            return None, "notification_config_unavailable"
         geoblock = getattr(self._trading, "geoblock_allowed", None)
         if not callable(geoblock):
             return None, "geoblock_unavailable"
@@ -687,7 +720,7 @@ class PredictionExecutionService:
                 return None, "geoblock_blocked"
         except Exception:
             return None, "geoblock_unavailable"
-        account = self._account_snapshot()
+        account = self._fresh_account_snapshot()
         if account is None:
             return None, "account_unavailable"
         wallet = str(account.get("wallet_address", "")).strip()
@@ -734,6 +767,26 @@ class PredictionExecutionService:
                 result[name] = getattr(value, name)
         return result or None
 
+    def _fresh_account_snapshot(self) -> dict[str, object] | None:
+        snapshot = self._account_snapshot()
+        if snapshot is None:
+            return None
+        if "checked_at" not in snapshot:
+            return None
+        age = _age_seconds(snapshot.get("checked_at"))
+        if age is None or age > 60:
+            return None
+        if "open_order_ids" not in snapshot or "positions" not in snapshot:
+            return None
+        if not isinstance(
+            snapshot.get("open_order_ids"),
+            (list, tuple, set, frozenset, Mapping),
+        ):
+            return None
+        if not isinstance(snapshot.get("positions"), (list, tuple)):
+            return None
+        return snapshot
+
     @staticmethod
     def _order_ids(value: object) -> tuple[str, ...]:
         if isinstance(value, Mapping):
@@ -779,16 +832,33 @@ class PredictionExecutionService:
         self, execution_id: str, reason: str, evidence: Mapping[str, object]
     ) -> str | None:
         if not execution_id:
-            self._store.write_runtime(
-                {
-                    "prediction_arbitrage": "incident",
-                    "incident_reason": reason,
-                    "incident_evidence": self._safe_mapping(evidence),
-                    "breaker": "open",
-                    "recorded_at": _timestamp(_utc_now()),
-                }
-            )
-            return None
+            attempts = self._notify_incident(reason)
+            recovery = getattr(self._store, "create_recovery_execution", None)
+            if not callable(recovery):
+                return None
+            payload = {
+                "recovery": True,
+                "reason": reason,
+                "state": "directional_incident",
+                "breaker": "open",
+                **self._safe_mapping(evidence),
+                "notification_attempts": attempts,
+            }
+            try:
+                execution = recovery(
+                    payload,
+                    idempotency_key=f"startup:{reason}:{_timestamp(_utc_now())[:19]}",
+                )
+                execution_id = str(execution.get("execution_id", ""))
+                return self._record_incident(
+                    execution_id,
+                    reason,
+                    state="directional_incident",
+                    evidence={**payload, "notification_attempts": attempts},
+                    notify=False,
+                )
+            except Exception:
+                return None
         return self._record_incident(
             execution_id,
             reason,
@@ -841,6 +911,17 @@ class PredictionExecutionService:
             for item in evidence
         )
 
+    def _pending_merge_for_incident(
+        self,
+        incident: Mapping[str, object],
+        execution: Mapping[str, object] | None,
+    ) -> bool:
+        if str(incident.get("state", "")) == "merge_incident":
+            return True
+        if execution is None:
+            return False
+        return self._pending_merge(execution)
+
     def _fresh_remediation_options(
         self,
         intent: PairIntent,
@@ -878,7 +959,7 @@ class PredictionExecutionService:
             return dict(value)
         # The authenticated account read is still mandatory when a test/dry-run
         # collaborator does not expose a richer order-book method.
-        if self._account_snapshot() is None:
+        if self._fresh_account_snapshot() is None:
             return None
         return None
 
@@ -903,12 +984,17 @@ class PredictionExecutionService:
         options: Mapping[str, object],
         *,
         filled_leg: str,
+        filled_quantity: Decimal,
+        intent: PairIntent,
+        tick_size: Decimal,
     ) -> dict[str, object] | None:
         complete = self._option(options, "complete")
         unwind = self._option(options, "unwind")
         candidates: list[tuple[Decimal, int, dict[str, object]]] = []
         for priority, option in enumerate((complete, unwind)):
             if option is None:
+                continue
+            if option.get("executable") is False:
                 continue
             loss = self._option_loss(option)
             if loss is None or loss > Decimal("2"):
@@ -920,6 +1006,42 @@ class PredictionExecutionService:
             expected_leg = "NO" if filled_leg == "YES" else "YES"
             if option.get("leg") != (expected_leg if option is complete else filled_leg):
                 continue
+            token_id = option.get("token_id")
+            expected_token = (
+                intent.no_token_id
+                if option is complete
+                else intent.yes_token_id
+                if filled_leg == "YES"
+                else intent.no_token_id
+            )
+            if token_id != expected_token:
+                continue
+            quantity = _decimal(option.get("quantity", option.get("shares")))
+            if quantity != filled_quantity:
+                continue
+            if option is complete:
+                amount = _decimal(option.get("amount"))
+                max_spend = _decimal(option.get("max_spend"))
+                max_price = _decimal(option.get("max_price"))
+                if (
+                    amount is None
+                    or max_spend is None
+                    or max_price is None
+                    or amount <= 0
+                    or amount > Decimal("2")
+                    or amount != max_spend
+                    or max_price <= 0
+                    or max_price > 1
+                    or protected_buy_quantity(
+                        spend=amount, price=max_price, tick_size=tick_size
+                    )
+                    != filled_quantity
+                ):
+                    continue
+            else:
+                min_price = _decimal(option.get("min_price"))
+                if min_price is None or min_price <= 0 or min_price > 1:
+                    continue
             candidate = dict(option)
             candidate["loss"] = format(loss, "f")
             candidates.append((loss, priority, candidate))
@@ -939,6 +1061,7 @@ class PredictionExecutionService:
         no: LegResult,
         proof: Mapping[str, object],
         since: datetime,
+        tick_size: Decimal,
     ) -> None:
         # Open the breaker before any remediation-capable collaborator is called.
         self._breaker_open = True
@@ -948,7 +1071,13 @@ class PredictionExecutionService:
             filled_quantity=filled_quantity,
             since=since,
         )
-        chosen = self._choose_remediation(options or {}, filled_leg=filled_leg)
+        chosen = self._choose_remediation(
+            options or {},
+            filled_leg=filled_leg,
+            filled_quantity=filled_quantity,
+            intent=intent,
+            tick_size=tick_size,
+        )
         incident_id = self._record_incident(
             execution_id,
             "one_leg_fill",
@@ -1058,15 +1187,6 @@ class PredictionExecutionService:
                 notify=False,
             )
             return
-        if self._real_live_success(known[2], merge_result):
-            self._first_live_order_verified = True
-            self._store.write_runtime(
-                {
-                    "prediction_arbitrage": "ready",
-                    "first_live_order": "validated",
-                    "validated_at": _timestamp(_utc_now()),
-                }
-            )
         self._finish_incident(
             execution_id,
             "one_leg_neutralized",
@@ -1075,12 +1195,12 @@ class PredictionExecutionService:
             notify=False,
         )
 
-    @staticmethod
     def _real_live_success(
-        proof: Mapping[str, object], merge_result: object
+        self, proof: Mapping[str, object], merge_result: object
     ) -> bool:
         return (
-            proof.get("adapter_verified") is True
+            isinstance(self._trading, PolymarketTradingClient)
+            and proof.get("adapter_verified") is True
             and proof.get("venue") == "polymarket"
             and isinstance(proof.get("matched_refs"), Mapping)
             and isinstance(merge_result, Mapping)
@@ -1102,7 +1222,7 @@ class PredictionExecutionService:
                     return value.get("verified") is True or value.get("directional_imbalance") in (False, Decimal("0"), "0")
             except Exception:
                 return False
-        snapshot = self._account_snapshot()
+        snapshot = self._fresh_account_snapshot()
         if snapshot is None:
             return False
         totals = self._position_totals(snapshot, intent)
@@ -1700,6 +1820,14 @@ class PredictionExecutionService:
         if "feishu" in name:
             return "feishu"
         return "unknown"
+
+    def _notification_channels_ready(self) -> bool:
+        targets = getattr(self._notifier, "_notifiers", None)
+        candidates = list(targets) if isinstance(targets, (list, tuple)) else [self._notifier]
+        channels = [self._notification_channel(target) for target in candidates]
+        return channels.count("macos") == 1 and sum(
+            channel in {"feishu", "feishu_app"} for channel in channels
+        ) == 1
 
     def _breaker_is_open(self) -> bool:
         if self._breaker_open:

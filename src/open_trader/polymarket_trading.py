@@ -1242,6 +1242,123 @@ class PolymarketTradingClient:
             del exc
             raise PolymarketTradingError(code) from None
 
+    def remediation_options(
+        self,
+        *,
+        condition_id: str,
+        yes_token_id: str,
+        no_token_id: str,
+        filled_leg: str,
+        filled_quantity: Decimal,
+        since: datetime,
+    ) -> dict[str, object]:
+        """Return fresh, bounded completion and unwind choices without posting."""
+
+        del condition_id, since
+        if (
+            filled_leg not in {"YES", "NO"}
+            or not isinstance(filled_quantity, Decimal)
+            or not filled_quantity.is_finite()
+            or filled_quantity <= 0
+        ):
+            return {"fresh": False}
+        try:
+            account = self.account_snapshot()
+            if account.open_order_ids:
+                return {"fresh": False}
+            positions = account.positions
+            filled_token = yes_token_id if filled_leg == "YES" else no_token_id
+            position_quantity = Decimal("0")
+            for position in positions:
+                token = position.get("token_id", position.get("tokenId", position.get("asset_id", "")))
+                if token != filled_token:
+                    continue
+                size = _decimal(position.get("size", position.get("quantity", position.get("shares"))))
+                if size is not None and size > 0:
+                    position_quantity += size
+            if position_quantity < filled_quantity:
+                return {"fresh": False}
+            public = self._public_client_factory()
+            token_by_leg = {"YES": yes_token_id, "NO": no_token_id}
+            books = {
+                leg: public.get_order_book(token_id=token)
+                for leg, token in token_by_leg.items()
+            }
+
+            def best(book: object, side: str) -> tuple[Decimal, Decimal, Decimal] | None:
+                rows = _collect(_field(book, side, ()))
+                levels: list[tuple[Decimal, Decimal]] = []
+                for row in rows:
+                    price = _decimal(_field(row, "price"))
+                    size = _decimal(_field(row, "size"))
+                    if price is None or size is None or price <= 0 or size < filled_quantity or price > 1:
+                        continue
+                    levels.append((price, size))
+                if not levels:
+                    return None
+                price, size = (
+                    min(levels, key=lambda item: item[0])
+                    if side == "asks"
+                    else max(levels, key=lambda item: item[0])
+                )
+                tick = _decimal(_field(book, "tick_size", _field(book, "minimum_tick_size")))
+                if tick not in {
+                    Decimal("0.1"), Decimal("0.01"), Decimal("0.005"),
+                    Decimal("0.0025"), Decimal("0.001"), Decimal("0.0001"),
+                }:
+                    return None
+                return price, size, tick
+
+            missing_leg = "NO" if filled_leg == "YES" else "YES"
+            ask = best(books[missing_leg], "asks")
+            bid = best(books[filled_leg], "bids")
+            if ask is None or bid is None:
+                return {"fresh": False}
+            amount: Decimal | None = None
+            # Emergency completion is deliberately bounded to the approved
+            # two-dollar loss ceiling; an over-cap book yields no executable
+            # option and therefore no signed order attempt.
+            for cents in range(1, 201):
+                candidate = Decimal("0.01") * cents
+                if protected_buy_quantity(
+                    spend=candidate,
+                    price=ask[0],
+                    tick_size=ask[2],
+                ) == filled_quantity:
+                    amount = candidate
+                    break
+            if amount is None:
+                return {"fresh": False}
+            return {
+                "fresh": True,
+                "checked_at": datetime.now(UTC),
+                "complete": {
+                    "leg": missing_leg,
+                    "side": "BUY",
+                    "token_id": token_by_leg[missing_leg],
+                    "quantity": filled_quantity,
+                    "amount": amount,
+                    "max_spend": amount,
+                    "max_price": ask[0],
+                    # Completion spends the bounded amount of collateral.  A
+                    # $1.20 order is therefore a $1.20 emergency cost for the
+                    # safety policy, even though the resulting pair may later
+                    # redeem for $1.00.
+                    "loss": amount,
+                },
+                "unwind": {
+                    "leg": filled_leg,
+                    "side": "SELL",
+                    "token_id": token_by_leg[filled_leg],
+                    "shares": filled_quantity,
+                    "quantity": filled_quantity,
+                    "min_price": bid[0],
+                    "loss": max(Decimal("0"), filled_quantity * (Decimal("1") - bid[0])),
+                },
+            }
+        except Exception:
+            return {"fresh": False}
+
     def submit_remediation_once(self, order: dict[str, object]) -> LegResult:
         raw_leg = order.get("leg")
         if raw_leg not in ("YES", "NO"):

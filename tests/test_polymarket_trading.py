@@ -983,6 +983,17 @@ class FakePublicClient:
         )
 
 
+class FakeRemediationPublicClient(FakePublicClient):
+    def get_order_book(self, *, token_id: str) -> object:
+        price = Decimal("0.12" if token_id == "no-token" else "0.15")
+        return SimpleNamespace(
+            asks=(SimpleNamespace(price=price, size=Decimal("100")),),
+            bids=(SimpleNamespace(price=price, size=Decimal("100")),),
+            min_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+        )
+
+
 def test_preflight_report_discovers_standard_fee_free_probe_without_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1009,6 +1020,37 @@ def test_preflight_report_discovers_standard_fee_free_probe_without_post(
     assert report["relayer_readiness"] == "pass"
     assert report["secret_scan"] == "pass"
     assert report["result"] == "PASS"
+    assert fake.post_calls == []
+
+
+def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
+    adapter, fake = make_adapter()
+    fake.position_rows = [
+        {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
+    ]
+    fake.list_open_orders = lambda **kwargs: []  # type: ignore[method-assign]
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=fake,
+        public_client_factory=FakeRemediationPublicClient,
+    )
+
+    result = adapter.remediation_options(
+        condition_id="condition-1",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        filled_leg="YES",
+        filled_quantity=Decimal("10"),
+        since=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert result["fresh"] is True
+    complete = result["complete"]
+    assert complete["leg"] == "NO"
+    assert complete["side"] == "BUY"
+    assert complete["quantity"] == Decimal("10")
+    assert complete["amount"] == complete["max_spend"]
+    assert complete["loss"] <= Decimal("2")
     assert fake.post_calls == []
 
 

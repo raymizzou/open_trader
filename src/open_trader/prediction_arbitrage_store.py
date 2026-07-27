@@ -523,6 +523,50 @@ class PredictionArbitrageStore:
             assert row is not None
             return self._execution_result(row)
 
+    def create_recovery_execution(
+        self, payload: Mapping[str, object], *, idempotency_key: str
+    ) -> dict[str, object]:
+        """Persist a terminal, non-trading execution for external recovery state."""
+
+        key = str(idempotency_key).strip()
+        if not key:
+            raise ValueError("recovery idempotency_key is required")
+        encoded = _dump_payload(payload)
+        now = _parse_timestamp(_utc_now())
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM executions WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if existing is not None:
+                return self._execution_result(existing)
+            preview_id = _new_id()
+            execution_id = _new_id()
+            created = _canonical_timestamp(now)
+            connection.execute(
+                "INSERT INTO previews(preview_id, payload, created_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?)",
+                (preview_id, encoded, created, created, created),
+            )
+            evidence = json.dumps(
+                [_load_payload(encoded)],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                """
+                INSERT INTO executions(
+                    execution_id, preview_id, idempotency_key, singleton,
+                    state, payload, evidence, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, 'directional_incident', ?, ?, ?, ?)
+                """,
+                (execution_id, preview_id, key, encoded, evidence, created, created),
+            )
+            row = connection.execute(
+                "SELECT * FROM executions WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            assert row is not None
+            return self._execution_result(row)
+
     def transition_execution(
         self, execution_id: str, *, state: str, evidence: Mapping[str, object]
     ) -> None:
