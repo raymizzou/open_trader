@@ -316,3 +316,22 @@ def test_decimal_strings_are_stored_without_exponents(tmp_path: Path) -> None:
     assert restored == {"amount": "100", "negative": "-0.50"}
     raw = json.dumps(restored, sort_keys=True)
     assert "E" not in raw
+
+
+def test_public_pair_token_ids_persist_but_camel_case_order_payload_is_redacted(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    db.write_runtime(
+        {
+            "yes_token_id": "yes-public-token-123",
+            "no_token_id": "no-public-token-456",
+            "orderPayload": "signed-order-payload-sentinel",
+        }
+    )
+
+    restored = db.load_runtime()
+    assert restored is not None
+    assert restored["yes_token_id"] == "yes-public-token-123"
+    assert restored["no_token_id"] == "no-public-token-456"
+    assert "orderPayload" not in restored

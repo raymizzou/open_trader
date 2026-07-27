@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -34,7 +35,10 @@ _PRIVATE_FIELD_PARTS = (
     "access_token",
     "refresh_token",
     "auth_token",
-    "token",
+    "session_token",
+    "builder_key",
+    "builder_secret",
+    "builder_passphrase",
     "credential",
     "private_key",
     "privatekey",
@@ -95,8 +99,9 @@ def _safe_value(value: Any, *, key: str | None = None) -> Any:
     """Return JSON-safe data while dropping credential/tick-shaped fields."""
 
     if key is not None:
-        normalized = key.lower().replace("-", "_")
-        if any(part in normalized for part in _PRIVATE_FIELD_PARTS):
+        normalized = _normalise_field_name(key)
+        sensitive_name = normalized in {"token", "auth", "authorization", "bearer"}
+        if sensitive_name or any(part in normalized for part in _PRIVATE_FIELD_PARTS):
             return _DROPPED
     from decimal import Decimal
 
@@ -133,6 +138,12 @@ class _Dropped:
 
 
 _DROPPED = _Dropped()
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _normalise_field_name(key: str) -> str:
+    return _CAMEL_BOUNDARY.sub("_", key).lower().replace("-", "_")
 
 
 def _dump_payload(payload: Mapping[str, object]) -> str:
