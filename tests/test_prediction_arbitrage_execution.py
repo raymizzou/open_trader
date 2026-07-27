@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from open_trader.prediction_arbitrage import PairIntent
-from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.polymarket_trading import AccountSnapshot, LegResult, PairSubmission
 
@@ -104,6 +104,7 @@ class FakeTrading:
         self.batch_quantities: tuple[Decimal, ...] = ()
         self.merge_calls = 0
         self.reconcile_calls = 0
+        self.reconcile_kwargs: list[dict[str, object]] = []
         self._account_reads = 0
         self._post_started = threading.Event()
         self._release_post = threading.Event()
@@ -129,6 +130,9 @@ class FakeTrading:
             "wallet": "ready",
             "geoblock": "allowed",
             "relayer": "ready",
+            "relayer_ready": True,
+            "merge": "ready",
+            "merge_ready": True,
             "checked_at": datetime.now(UTC)
             if self.relayer_fresh
             else datetime.now(UTC) - timedelta(seconds=61),
@@ -169,8 +173,31 @@ class FakeTrading:
             no=LegResult("NO", True, "filled", "no-order", intent.quantity, ("no-trade",), "none"),
         )
 
-    def reconcile(self, *, condition_id: str, since: datetime) -> dict[str, object]:
+    def reconcile(
+        self,
+        *,
+        condition_id: str,
+        since: datetime,
+        yes_token_id: str | None = None,
+        no_token_id: str | None = None,
+        yes_order_id: str | None = None,
+        no_order_id: str | None = None,
+        yes_trade_ids: tuple[str, ...] = (),
+        no_trade_ids: tuple[str, ...] = (),
+    ) -> dict[str, object]:
         self.reconcile_calls += 1
+        self.reconcile_kwargs.append(
+            {
+                "condition_id": condition_id,
+                "since": since,
+                "yes_token_id": yes_token_id,
+                "no_token_id": no_token_id,
+                "yes_order_id": yes_order_id,
+                "no_order_id": no_order_id,
+                "yes_trade_ids": yes_trade_ids,
+                "no_trade_ids": no_trade_ids,
+            }
+        )
         if self.result == "delayed":
             return {"status": "pending", "yes_quantity": Decimal("0"), "no_quantity": Decimal("0")}
         if self.result == "ambiguous":
@@ -183,11 +210,27 @@ class FakeTrading:
             "status": "ok",
             "yes_quantity": Decimal("10"),
             "no_quantity": Decimal("10"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "test",
+                "matched_refs": {
+                    "YES": {"order_ids": ["yes-order"], "trade_ids": ["yes-trade"]},
+                    "NO": {"order_ids": ["no-order"], "trade_ids": ["no-trade"]},
+                },
+            },
         }
 
     def merge_once(self, *, condition_id: str, quantity: Decimal) -> dict[str, object]:
         self.merge_calls += 1
-        return {"status": "confirmed", "quantity": quantity}
+        if self.result == "merge_missing_ref":
+            return {"status": "confirmed", "confirmed": True}
+        return {
+            "status": "confirmed",
+            "confirmed": True,
+            "quantity": quantity,
+            "transaction_hash": "0xmerge-hash",
+            "transaction_id": "merge-transaction",
+        }
 
 
 def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
@@ -236,6 +279,12 @@ def test_one_confirm_posts_exactly_one_equal_fok_batch_and_merges(tmp_path: Path
     assert final["state"] == "complete"
     rows = store.histories("executions")
     assert rows[0]["state"] == "complete"
+    assert trading.reconcile_kwargs[0]["yes_token_id"] == "yes-token"
+    assert trading.reconcile_kwargs[0]["no_token_id"] == "no-token"
+    assert trading.reconcile_kwargs[0]["yes_order_id"] == "yes-order"
+    assert trading.reconcile_kwargs[0]["no_order_id"] == "no-order"
+    assert trading.reconcile_kwargs[0]["yes_trade_ids"] == ("yes-trade",)
+    assert trading.reconcile_kwargs[0]["no_trade_ids"] == ("no-trade",)
 
 
 def test_preview_rechecks_without_signing_and_serializes_only_safe_intent(tmp_path: Path) -> None:
@@ -282,6 +331,33 @@ def test_both_rejected_is_terminal_without_merge_or_breaker(tmp_path: Path) -> N
         "SELECT leg_id FROM execution_legs ORDER BY leg_id"
     ).fetchall()
     assert [row[0].rsplit(":", 1)[-1] for row in legs] == ["NO", "YES"]
+
+
+def test_merge_without_transaction_reference_never_completes(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path, result="merge_missing_ref")
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "merge-no-ref")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "merge_incident"
+    assert trading.merge_calls == 1
+
+
+def test_collaborator_kwarg_filtering_preserves_supported_legacy_kwargs() -> None:
+    captured: dict[str, object] = {}
+
+    def legacy(*, condition_id: str, since: datetime) -> dict[str, object]:
+        captured.update(condition_id=condition_id, since=since)
+        return {"status": "ok"}
+
+    moment = datetime.now(UTC)
+    assert _call(
+        legacy,
+        condition_id="condition-1",
+        since=moment,
+        yes_token_id="yes-token",
+    ) == {"status": "ok"}
+    assert captured == {"condition_id": "condition-1", "since": moment}
 
 
 def test_same_idempotency_key_returns_same_execution_and_other_request_is_busy(tmp_path: Path) -> None:

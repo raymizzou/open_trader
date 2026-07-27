@@ -307,6 +307,45 @@ def _model_dict(value: object) -> Mapping[str, object] | None:
     return None
 
 
+def _venue_timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        try:
+            moment = datetime.fromtimestamp(float(value), UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
+
+
+def _trade_timestamp(value: object) -> datetime | None:
+    for name in ("matched_at", "match_time", "updated_at", "last_update", "timestamp"):
+        timestamp = _venue_timestamp(_field(value, name))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _string_refs(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {value} if value.strip() else set()
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {item for item in value if isinstance(item, str) and item.strip()}
+    return set()
+
+
 class PolymarketTradingClient:
     """A narrow, redacted wrapper around the official synchronous SDK."""
 
@@ -423,6 +462,29 @@ class PolymarketTradingClient:
             code = _safe_error_code(exc)
             del exc
             raise PolymarketTradingError(code) from None
+
+    def readiness_snapshot(self) -> dict[str, object]:
+        """Return a fresh, explicit gasless-relayer and merge capability fact."""
+
+        checked_at = datetime.now(UTC)
+        merge_capable = callable(getattr(self._client, "merge_positions", None))
+        gasless_method = getattr(self._client, "is_gasless_ready", None)
+        gasless_ready = False
+        if callable(gasless_method):
+            try:
+                gasless_ready = gasless_method() is True
+            except Exception:
+                gasless_ready = False
+        merge_ready = merge_capable and gasless_ready
+        return {
+            "checked_at": checked_at,
+            "merge_capability": merge_capable,
+            "merge_ready": merge_ready,
+            "merge": "ready" if merge_ready else "unavailable",
+            "relayer_ready": gasless_ready,
+            "relayer": "ready" if gasless_ready else "unavailable",
+            "ready": merge_ready,
+        }
 
     def _identity_summary(self) -> tuple[str, str]:
         signer = _address_from_client(self._client, "signer")
@@ -810,14 +872,15 @@ class PolymarketTradingClient:
         except PolymarketTradingError:
             return report
         report["account_reads"] = "pass"
+        readiness = self.readiness_snapshot()
         report["merge_capability"] = (
-            "present_not_invoked"
-            if callable(getattr(self._client, "merge_positions", None))
-            else "unavailable"
+            "present_not_invoked" if readiness.get("merge_capability") is True else "unavailable"
         )
         report["relayer_readiness"] = (
-            "pass" if report["merge_capability"] == "present_not_invoked" else "fail"
+            "pass" if readiness.get("ready") is True else "fail"
         )
+        if report["relayer_readiness"] != "pass":
+            return report
         try:
             intent, tick_size = self._discover_probe()
         except PolymarketTradingError:
@@ -923,25 +986,144 @@ class PolymarketTradingClient:
             no=self._leg_result("NO", responses[1]),
         )
 
-    def reconcile(self, *, condition_id: str, since: datetime) -> dict[str, object]:
+    def reconcile(
+        self,
+        *,
+        condition_id: str,
+        since: datetime,
+        yes_token_id: str | None = None,
+        no_token_id: str | None = None,
+        yes_order_id: str | None = None,
+        no_order_id: str | None = None,
+        yes_trade_ids: Sequence[str] = (),
+        no_trade_ids: Sequence[str] = (),
+        yes_order_ids: Sequence[str] | None = None,
+        no_order_ids: Sequence[str] | None = None,
+    ) -> dict[str, object]:
+        """Prove one execution's fills from fresh, reference-matched trades."""
+
+        empty_refs: dict[str, object] = {"order_ids": [], "trade_ids": []}
+        proof: dict[str, object] = {
+            "verified": False,
+            "venue": "polymarket",
+            "matched_refs": {"YES": dict(empty_refs), "NO": dict(empty_refs)},
+        }
         try:
-            orders = _collect(self._client.list_open_orders(market=condition_id))
+            yes_orders = _string_refs(yes_order_ids) | _string_refs(yes_order_id)
+            no_orders = _string_refs(no_order_ids) | _string_refs(no_order_id)
+            yes_trades = _string_refs(yes_trade_ids)
+            no_trades = _string_refs(no_trade_ids)
+            if not (yes_orders or yes_trades) or not (no_orders or no_trades):
+                return {
+                    "status": "blocked",
+                    "error_code": "reconciliation_unverified",
+                    "execution_proof": proof,
+                }
+            if not isinstance(since, datetime):
+                return {
+                    "status": "blocked",
+                    "error_code": "reconciliation_unverified",
+                    "execution_proof": proof,
+                }
+            since_utc = since.astimezone(UTC) if since.tzinfo else since.replace(tzinfo=UTC)
             trades = _collect(
                 self._client.list_account_trades(
-                    market=condition_id, after=since.isoformat()
+                    market=condition_id, after=since_utc.isoformat()
                 )
             )
-            positions = _collect(self._client.list_positions(market=[condition_id]))
+            quantities = {"YES": Decimal("0"), "NO": Decimal("0")}
+            matched: dict[str, dict[str, list[str]]] = {
+                "YES": {"order_ids": [], "trade_ids": []},
+                "NO": {"order_ids": [], "trade_ids": []},
+            }
+            seen: set[tuple[str, str]] = set()
+            accepted_statuses = {
+                "MATCHED",
+                "MATCHED_NOT_BROADCASTED",
+                "MINED",
+                "CONFIRMED",
+            }
+            for trade in trades:
+                matched_at = _trade_timestamp(trade)
+                if matched_at is None or matched_at < since_utc:
+                    continue
+                trade_condition = _field(
+                    trade, "condition_id", _field(trade, "market", "")
+                )
+                if trade_condition not in (None, "", condition_id):
+                    continue
+                status = _safe_string(_field(trade, "status", "")).upper()
+                if status not in accepted_statuses:
+                    continue
+                raw_trade_id = _field(trade, "id", _field(trade, "trade_id", ""))
+                raw_order_id = _field(
+                    trade,
+                    "taker_order_id",
+                    _field(trade, "order_id", _field(trade, "orderId", "")),
+                )
+                raw_token_id = _field(
+                    trade,
+                    "token_id",
+                    _field(trade, "tokenId", _field(trade, "asset_id", "")),
+                )
+                trade_id = raw_trade_id.strip() if isinstance(raw_trade_id, str) else ""
+                order_id = raw_order_id.strip() if isinstance(raw_order_id, str) else ""
+                token_id = raw_token_id.strip() if isinstance(raw_token_id, str) else ""
+                if not trade_id and not order_id:
+                    continue
+                quantity = None
+                for name in ("size", "quantity", "shares", "taking_amount"):
+                    quantity = _decimal(_field(trade, name))
+                    if quantity is not None:
+                        break
+                if quantity is None or quantity <= 0:
+                    continue
+                for leg, token, order_refs, trade_refs in (
+                    ("YES", yes_token_id, yes_orders, yes_trades),
+                    ("NO", no_token_id, no_orders, no_trades),
+                ):
+                    if token and token_id and token_id != token:
+                        continue
+                    if not ((order_id and order_id in order_refs) or (trade_id and trade_id in trade_refs)):
+                        continue
+                    identity = (leg, trade_id or f"{order_id}:{matched_at.isoformat()}")
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    quantities[leg] += quantity
+                    if order_id and order_id not in matched[leg]["order_ids"]:
+                        matched[leg]["order_ids"].append(order_id)
+                    if trade_id and trade_id not in matched[leg]["trade_ids"]:
+                        matched[leg]["trade_ids"].append(trade_id)
+                    break
+            if not (
+                quantities["YES"] > 0
+                and quantities["NO"] > 0
+                and (matched["YES"]["trade_ids"] or matched["YES"]["order_ids"])
+                and (matched["NO"]["trade_ids"] or matched["NO"]["order_ids"])
+            ):
+                proof["matched_refs"] = matched
+                return {
+                    "status": "blocked",
+                    "error_code": "reconciliation_unverified",
+                    "execution_proof": proof,
+                }
+            proof["verified"] = True
+            proof["matched_refs"] = matched
             return {
                 "status": "ok",
-                "open_order_count": len(orders),
-                "trade_count": len(trades),
-                "position_count": len(positions),
+                "yes_quantity": quantities["YES"],
+                "no_quantity": quantities["NO"],
+                "execution_proof": proof,
             }
         except Exception as exc:
             code = _safe_error_code(exc)
             del exc
-            return {"status": "blocked", "error_code": code}
+            return {
+                "status": "blocked",
+                "error_code": code,
+                "execution_proof": proof,
+            }
 
     def cancel_orders(self, order_ids: tuple[str, ...]) -> tuple[str, ...]:
         try:
@@ -1049,7 +1231,34 @@ class PolymarketTradingClient:
             return {"status": "timeout", "error_code": "timeout"}
         if error:
             return {"status": "blocked", "error_code": _safe_error_code(error[0])}
-        return {"status": "confirmed", "error_code": "none"}
+        outcome = result.get("value")
+        transaction_hash = _field(
+            outcome, "transaction_hash", _field(outcome, "tx_hash", None)
+        )
+        transaction_id = _field(outcome, "transaction_id", None)
+        if not isinstance(transaction_hash, str) or not transaction_hash.strip():
+            return {
+                "status": "ambiguous",
+                "confirmed": False,
+                "error_code": "transaction_unconfirmed",
+            }
+        if transaction_id is not None and (
+            not isinstance(transaction_id, str) or not transaction_id.strip()
+        ):
+            return {
+                "status": "ambiguous",
+                "confirmed": False,
+                "error_code": "transaction_unconfirmed",
+            }
+        response: dict[str, object] = {
+            "status": "confirmed",
+            "confirmed": True,
+            "error_code": "none",
+            "transaction_hash": transaction_hash,
+        }
+        if transaction_id is not None:
+            response["transaction_id"] = transaction_id
+        return response
 
 
 __all__ = [

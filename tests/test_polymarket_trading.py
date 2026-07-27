@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -212,6 +212,7 @@ class FakeClient:
         taker_scale: int = 1_000_000,
         forced_quantity: Decimal | None = None,
         identity: bool = True,
+        gasless_ready: bool = True,
     ) -> None:
         self.taker_scale = taker_scale
         if identity:
@@ -228,6 +229,12 @@ class FakeClient:
         self.post_error: Exception | None = None
         self.bad_taker = False
         self.forced_quantity = forced_quantity
+        self.gasless_ready = gasless_ready
+        self.gasless_calls = 0
+        self.trade_rows: list[object] = [SimpleNamespace(id="trade")]
+        self.merge_wait_value: object = SimpleNamespace(
+            transaction_hash="0xmerge-hash", transaction_id="merge-transaction"
+        )
 
     def create_market_order(self, **kwargs: object) -> FakeSignedOrder:
         self.create_calls.append(kwargs)
@@ -290,7 +297,7 @@ class FakeClient:
 
     def list_account_trades(self, **kwargs: object) -> list[object]:
         self.read_calls.append("trades")
-        return [SimpleNamespace(id="trade")]
+        return list(self.trade_rows)
 
     def list_positions(self, **kwargs: object) -> list[object]:
         self.read_calls.append("positions")
@@ -303,7 +310,11 @@ class FakeClient:
 
     def merge_positions(self, **kwargs: object) -> object:
         self.merge_calls.append(kwargs)
-        return SimpleNamespace(wait=lambda: "confirmed")
+        return SimpleNamespace(wait=lambda: self.merge_wait_value)
+
+    def is_gasless_ready(self) -> bool:
+        self.gasless_calls += 1
+        return self.gasless_ready
 
 
 class FakeResponse:
@@ -577,6 +588,93 @@ def test_account_snapshot_uses_only_standard_exchange_allowance() -> None:
     assert snapshot.p_usd_allowance == Decimal("18.6")
 
 
+def test_reconcile_returns_execution_scoped_verified_trade_proof() -> None:
+    adapter, fake = make_adapter()
+    matched_at = datetime.now(UTC)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="yes-trade",
+            condition_id="condition-1",
+            token_id="yes-token",
+            taker_order_id="yes-order",
+            size=Decimal("10"),
+            status="CONFIRMED",
+            matched_at=matched_at,
+        ),
+        SimpleNamespace(
+            id="no-trade",
+            condition_id="condition-1",
+            token_id="no-token",
+            taker_order_id="no-order",
+            size=Decimal("10"),
+            status="CONFIRMED",
+            matched_at=matched_at,
+        ),
+    ]
+
+    result = adapter.reconcile(
+        condition_id="condition-1",
+        since=matched_at - timedelta(seconds=1),
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        yes_order_id="yes-order",
+        no_order_id="no-order",
+        yes_trade_ids=("yes-trade",),
+        no_trade_ids=("no-trade",),
+    )
+
+    assert result["status"] == "ok"
+    assert result["yes_quantity"] == Decimal("10")
+    assert result["no_quantity"] == Decimal("10")
+    proof = result["execution_proof"]
+    assert isinstance(proof, dict)
+    assert proof["verified"] is True
+    assert proof["venue"] == "polymarket"
+    assert proof["matched_refs"]["YES"]["trade_ids"] == ["yes-trade"]
+    assert proof["matched_refs"]["NO"]["trade_ids"] == ["no-trade"]
+
+
+def test_reconcile_count_only_or_unmatched_positions_never_proves_fills() -> None:
+    adapter, fake = make_adapter()
+    fake.trade_rows = [SimpleNamespace(id="unrelated", size=Decimal("20"), status="CONFIRMED")]
+
+    result = adapter.reconcile(
+        condition_id="condition-1",
+        since=datetime.now(UTC) - timedelta(seconds=1),
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        yes_order_id="yes-order",
+        no_order_id="no-order",
+        yes_trade_ids=("yes-trade",),
+        no_trade_ids=("no-trade",),
+    )
+
+    assert result["status"] in {"blocked", "ambiguous"}
+    assert "yes_quantity" not in result
+    assert "no_quantity" not in result
+    proof = result["execution_proof"]
+    assert isinstance(proof, dict)
+    assert proof["verified"] is False
+
+
+def test_readiness_snapshot_requires_fresh_gasless_and_merge_capabilities() -> None:
+    adapter, fake = make_adapter()
+
+    result = adapter.readiness_snapshot()
+
+    assert isinstance(result["checked_at"], datetime)
+    assert result["relayer_ready"] is True
+    assert result["merge_ready"] is True
+    assert result["relayer"] == "ready"
+    assert result["merge"] == "ready"
+    assert fake.gasless_calls == 1
+
+    fake.gasless_ready = False
+    blocked = adapter.readiness_snapshot()
+    assert blocked["relayer_ready"] is False
+    assert blocked["merge_ready"] is False
+
+
 def test_cancel_and_merge_use_official_methods_once() -> None:
     adapter, fake = make_adapter()
 
@@ -586,6 +684,19 @@ def test_cancel_and_merge_use_official_methods_once() -> None:
     assert fake.cancel_calls == [("one", "two")]
     assert fake.merge_calls == [{"condition_id": "condition-1", "amount": 20_000_000}]
     assert merged["status"] == "confirmed"
+    assert merged["confirmed"] is True
+    assert merged["transaction_hash"] == "0xmerge-hash"
+    assert merged["transaction_id"] == "merge-transaction"
+
+
+def test_merge_without_transaction_reference_is_not_confirmed() -> None:
+    adapter, fake = make_adapter()
+    fake.merge_wait_value = SimpleNamespace(transaction_hash="", transaction_id="merge-transaction")
+
+    result = adapter.merge_once(condition_id="condition-1", quantity=Decimal("20"))
+
+    assert result["status"] in {"blocked", "ambiguous"}
+    assert result.get("confirmed") is not True
 
 
 def test_remediation_supports_sell_unwind_with_single_post() -> None:
@@ -720,6 +831,22 @@ def test_preflight_report_discovers_standard_fee_free_probe_without_post(
     assert report["relayer_readiness"] == "pass"
     assert report["secret_scan"] == "pass"
     assert report["result"] == "PASS"
+    assert fake.post_calls == []
+
+
+def test_preflight_report_uses_explicit_readiness_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, fake = make_adapter(FakeClient(gasless_ready=False))
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    report = adapter.preflight_report()
+
+    assert report["merge_capability"] == "present_not_invoked"
+    assert report["relayer_readiness"] == "fail"
+    assert report["result"] == "BLOCKED"
+    assert fake.gasless_calls == 1
     assert fake.post_calls == []
 
 

@@ -91,10 +91,14 @@ def _call(method: object, *args: object, **kwargs: object) -> object:
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in signature.parameters.values()
             )
-            if not accepts_kwargs and not all(
-                name in signature.parameters for name in kwargs
-            ):
-                kwargs = {}
+            if not accepts_kwargs:
+                kwargs = {
+                    name: value
+                    for name, value in kwargs.items()
+                    if name in signature.parameters
+                    and signature.parameters[name].kind
+                    is not inspect.Parameter.POSITIONAL_ONLY
+                }
         except (TypeError, ValueError):
             pass
     value = method(*args, **kwargs)
@@ -349,6 +353,8 @@ class PredictionExecutionService:
             known = self._reconcile_until(
                 intent,
                 since=submitted_at,
+                yes=yes,
+                no=no,
             )
             if known is None:
                 self._finish_incident(execution_id, "reconciliation_timeout")
@@ -376,7 +382,7 @@ class PredictionExecutionService:
                 "merging",
                 {"phase": "merge_result", "status": self._result_status(merge_result)},
             )
-            if self._result_status(merge_result) != "confirmed":
+            if not self._merge_confirmed(merge_result):
                 self._finish_incident(execution_id, "merge_not_confirmed", state="merge_incident")
                 return
             after = self._account_snapshot()
@@ -527,10 +533,24 @@ class PredictionExecutionService:
                         return False
                 else:
                     return False
-                for key in ("relayer", "relayer_readiness", "merge"):
-                    if key in value:
-                        return value[key] in (True, "ready", "allowed", "pass", "confirmed")
-                return False
+                relayer = next(
+                    (
+                        value[key]
+                        for key in ("relayer_ready", "relayer", "relayer_readiness")
+                        if key in value
+                    ),
+                    None,
+                )
+                merge = next(
+                    (
+                        value[key]
+                        for key in ("merge_ready", "merge", "merge_capability")
+                        if key in value
+                    ),
+                    None,
+                )
+                accepted = (True, "ready", "allowed", "pass", "confirmed")
+                return relayer in accepted and merge in accepted
         for name in ("relayer_ready", "relayer_readiness"):
             value = getattr(self._trading, name, None)
             if callable(value):
@@ -542,13 +562,10 @@ class PredictionExecutionService:
                 checked_age = _age_seconds(value.get("checked_at"))
                 if checked_age is None or checked_age > 60:
                     return False
-                return value.get("ready", value.get("relayer")) in (
-                    True,
-                    "ready",
-                    "allowed",
-                    "pass",
-                    "confirmed",
-                )
+                relayer = value.get("ready", value.get("relayer_ready", value.get("relayer")))
+                merge = value.get("merge_ready", value.get("merge"))
+                accepted = (True, "ready", "allowed", "pass", "confirmed")
+                return relayer in accepted and merge in accepted
             return False
         return False
 
@@ -719,6 +736,24 @@ class PredictionExecutionService:
         return str(getattr(value, "status", "blocked")).strip().lower()
 
     @staticmethod
+    def _merge_confirmed(value: object) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        if str(value.get("status", "")).strip().lower() != "confirmed":
+            return False
+        if value.get("confirmed") is not True:
+            return False
+        transaction_hash = value.get("transaction_hash", value.get("tx_hash"))
+        if not isinstance(transaction_hash, str) or not transaction_hash.strip():
+            return False
+        transaction_id = value.get("transaction_id")
+        if transaction_id is not None and (
+            not isinstance(transaction_id, str) or not transaction_id.strip()
+        ):
+            return False
+        return True
+
+    @staticmethod
     def _ambiguous_submission() -> PairSubmission:
         return PairSubmission(
             yes=LegResult("YES", False, "ambiguous", "", Decimal("0"), (), "ambiguous"),
@@ -784,13 +819,23 @@ class PredictionExecutionService:
         intent: PairIntent,
         *,
         since: datetime,
+        yes: LegResult,
+        no: LegResult,
     ) -> tuple[Decimal, Decimal] | None:
         started = self._clock()
         for attempt in range(MAX_RECONCILIATION_SECONDS + 1):
             reconcile = getattr(self._trading, "reconcile", None)
             try:
                 value = _call(
-                    reconcile, condition_id=intent.condition_id, since=since
+                    reconcile,
+                    condition_id=intent.condition_id,
+                    since=since,
+                    yes_token_id=intent.yes_token_id,
+                    no_token_id=intent.no_token_id,
+                    yes_order_id=yes.order_id,
+                    no_order_id=no.order_id,
+                    yes_trade_ids=yes.trade_ids,
+                    no_trade_ids=no.trade_ids,
                 )
             except Exception:
                 value = None
@@ -814,6 +859,14 @@ class PredictionExecutionService:
             "ok", "confirmed", "filled", "complete"
         }:
             return None
+        proof = value.get("execution_proof")
+        if not isinstance(proof, Mapping) or proof.get("verified") is not True:
+            return None
+        matched_refs = proof.get("matched_refs")
+        if not isinstance(matched_refs, Mapping):
+            return None
+        if not matched_refs.get("YES") or not matched_refs.get("NO"):
+            return None
         yes = next(
             (
                 _decimal(value.get(key))
@@ -830,25 +883,6 @@ class PredictionExecutionService:
             ),
             None,
         )
-        positions = value.get("positions")
-        if isinstance(positions, (list, tuple)) and (yes is None or no is None):
-            found: dict[str, Decimal] = {}
-            for position in positions:
-                if not isinstance(position, Mapping):
-                    continue
-                token = str(
-                    position.get(
-                        "leg",
-                        position.get("token_id", position.get("asset_id", "")),
-                    )
-                ).upper()
-                quantity = _decimal(
-                    position.get("quantity", position.get("shares", position.get("size")))
-                )
-                if token and quantity is not None:
-                    found[token] = quantity
-            yes = yes if yes is not None else found.get("YES", found.get(intent.yes_token_id.upper()))
-            no = no if no is not None else found.get("NO", found.get(intent.no_token_id.upper()))
         if yes is None or no is None:
             return None
         return yes, no
