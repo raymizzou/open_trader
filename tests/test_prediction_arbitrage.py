@@ -7,6 +7,7 @@ import pytest
 
 from open_trader.prediction_arbitrage import (
     MAX_EMERGENCY_LOSS,
+    MAX_WALLET_BALANCE,
     PROTECTED_BUY_SHARE_PRECISION,
     BookLevel,
     ConfirmedBooks,
@@ -135,6 +136,13 @@ def test_unsupported_tick_size_is_rejected() -> None:
     assert build_pair_intent(facts, books, balance=Decimal("50"), allowance=Decimal("50")) is None
 
 
+def test_signaling_nan_tick_size_fails_closed() -> None:
+    facts = market_facts(tick_size="sNaN")
+    books = confirmed_books(yes=[("0.45", "20")], no=[("0.48", "20")])
+
+    assert build_pair_intent(facts, books, balance=Decimal("50"), allowance=Decimal("50")) is None
+
+
 def test_threshold_equality_is_accepted() -> None:
     facts = market_facts(minimum_order_size="1")
     books = confirmed_books(yes=[("0.09", "100")], no=[("0.10", "100")])
@@ -170,6 +178,18 @@ def test_balance_or_allowance_below_total_cost_is_rejected() -> None:
 
     assert build_pair_intent(facts, books, balance=Decimal("18.59"), allowance=Decimal("50")) is None
     assert build_pair_intent(facts, books, balance=Decimal("50"), allowance=Decimal("18.59")) is None
+
+
+def test_wallet_balance_above_funding_cap_is_rejected() -> None:
+    facts = market_facts(minimum_order_size="5")
+    books = confirmed_books(yes=[("0.45", "20")], no=[("0.48", "20")])
+
+    assert build_pair_intent(
+        facts,
+        books,
+        balance=MAX_WALLET_BALANCE + Decimal("0.01"),
+        allowance=Decimal("50"),
+    ) is None
 
 
 def test_minimum_size_and_book_tick_grid_violations_are_rejected() -> None:
@@ -254,4 +274,16 @@ def test_missing_profit_sorts_after_finite_profit_in_its_group() -> None:
     assert [event["event_id"] for event in sorted(events, key=monitored_event_sort_key)] == [
         "finite",
         "missing",
+    ]
+
+
+def test_negative_finite_profit_sorts_before_missing_profit() -> None:
+    events = [
+        {"event_id": "z", "actionable": False, "profit": Decimal("-1"), "volume_24h": Decimal("1")},
+        {"event_id": "a", "actionable": False, "volume_24h": Decimal("1")},
+    ]
+
+    assert [event["event_id"] for event in sorted(events, key=monitored_event_sort_key)] == [
+        "z",
+        "a",
     ]

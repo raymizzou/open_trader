@@ -84,7 +84,11 @@ def build_pair_intent(
         return None
     available_balance = _nonnegative_decimal(balance)
     available_allowance = _nonnegative_decimal(allowance)
-    if available_balance is None or available_allowance is None:
+    if (
+        available_balance is None
+        or available_allowance is None
+        or available_balance > MAX_WALLET_BALANCE
+    ):
         return None
 
     yes_segments = _book_segments(books.yes_asks, facts.tick_size)
@@ -169,8 +173,6 @@ def monitored_event_sort_key(event: Mapping[str, object]) -> tuple[object, ...]:
         "gross_upper_bound",
         "profit_upper_bound",
     )
-    if profit is not None and profit < 0:
-        profit = None
     volume = _first_event_decimal(event, "volume_24h", "volume", "volume24hr")
     if volume is None or volume < 0:
         volume = Decimal("0")
@@ -206,8 +208,10 @@ def _validated_facts(facts: MarketFacts) -> int | None:
         return None
     if not isinstance(facts.tick_size, Decimal):
         return None
+    if not facts.tick_size.is_finite() or facts.tick_size <= 0:
+        return None
     precision = PROTECTED_BUY_SHARE_PRECISION.get(facts.tick_size)
-    if precision is None or not facts.tick_size.is_finite() or facts.tick_size <= 0:
+    if precision is None:
         return None
     if facts.fee_verified_zero is not True or facts.neg_risk is not False:
         return None
