@@ -4,7 +4,8 @@ import inspect
 import sqlite3
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 
@@ -48,6 +49,9 @@ class FakeMonitor:
         self.actionable = True
         self.refresh_calls = 0
         self.opportunity_calls = 0
+        self.include_freshness = True
+        self.include_tick = True
+        self.tick_size = Decimal("0.01")
 
     def refresh_once(self) -> dict[str, object]:
         self.refresh_calls += 1
@@ -57,7 +61,7 @@ class FakeMonitor:
         self.opportunity_calls += 1
         if opportunity_id != "opp-1":
             return None
-        return {
+        result: dict[str, object] = {
             "opportunity_id": opportunity_id,
             "event_id": self.intent.event_id,
             "market_id": self.intent.market_id,
@@ -79,14 +83,22 @@ class FakeMonitor:
             "net_edge": self.intent.net_edge,
             "yes_token_id": self.intent.yes_token_id,
             "no_token_id": self.intent.no_token_id,
-            "tick_size": Decimal("0.01"),
         }
+        if self.include_freshness:
+            result["confirmed_at"] = datetime.now(UTC)
+            result["confirmed_age_seconds"] = Decimal("1")
+        else:
+            result.pop("confirmed_age_seconds", None)
+        if self.include_tick:
+            result["tick_size"] = self.tick_size
+        return result
 
 
 class FakeTrading:
     def __init__(self, *, result: str = "both_filled") -> None:
         self.result = result
         self.preflight_calls = 0
+        self.preflight_ticks: list[Decimal] = []
         self.batch_calls = 0
         self.batch_leg_names: tuple[str, ...] = ()
         self.batch_quantities: tuple[Decimal, ...] = ()
@@ -95,6 +107,7 @@ class FakeTrading:
         self._account_reads = 0
         self._post_started = threading.Event()
         self._release_post = threading.Event()
+        self.relayer_fresh = True
 
     def account_snapshot(self) -> AccountSnapshot:
         self._account_reads += 1
@@ -116,11 +129,14 @@ class FakeTrading:
             "wallet": "ready",
             "geoblock": "allowed",
             "relayer": "ready",
-            "checked_at": datetime.now(UTC),
+            "checked_at": datetime.now(UTC)
+            if self.relayer_fresh
+            else datetime.now(UTC) - timedelta(seconds=61),
         }
 
     def no_submit_preflight(self, intent: PairIntent, *, tick_size: Decimal = Decimal("0.01")) -> dict[str, object]:
         self.preflight_calls += 1
+        self.preflight_ticks.append(tick_size)
         return {"result": "PASS", "intent": intent, "tick_size": tick_size}
 
     def submit_pair_once(self, intent: PairIntent, *, tick_size: Decimal = Decimal("0.01")) -> PairSubmission:
@@ -138,6 +154,11 @@ class FakeTrading:
                 yes=LegResult("YES", False, "ambiguous", "", Decimal("0"), (), "ambiguous"),
                 no=LegResult("NO", False, "ambiguous", "", Decimal("0"), (), "ambiguous"),
             )
+        if self.result == "count_only":
+            return PairSubmission(
+                yes=LegResult("YES", True, "filled", "yes-order", intent.quantity, ("yes-trade",), "none"),
+                no=LegResult("NO", True, "filled", "no-order", intent.quantity, ("no-trade",), "none"),
+            )
         if self.result == "both_rejected":
             return PairSubmission(
                 yes=LegResult("YES", False, "rejected", "", Decimal("0"), (), "rejected"),
@@ -154,6 +175,10 @@ class FakeTrading:
             return {"status": "pending", "yes_quantity": Decimal("0"), "no_quantity": Decimal("0")}
         if self.result == "ambiguous":
             return {"status": "pending", "yes_quantity": Decimal("0"), "no_quantity": Decimal("0")}
+        if self.result == "count_only":
+            return {"status": "ok", "trade_count": 2, "position_count": 2}
+        if self.result == "pending_with_quantities":
+            return {"status": "pending", "yes_quantity": Decimal("10"), "no_quantity": Decimal("10")}
         return {
             "status": "ok",
             "yes_quantity": Decimal("10"),
@@ -297,6 +322,101 @@ def test_delayed_result_polls_and_locks_after_deadline(tmp_path: Path) -> None:
     assert trading.batch_calls == 1
     assert trading.reconcile_calls >= 30
     assert final["state"] == "directional_incident"
+
+
+def test_count_only_reconcile_never_proves_equal_fills(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path, result="count_only")
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(40)).__next__  # type: ignore[attr-defined]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "count-only")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.merge_calls == 0
+
+
+def test_pending_quantities_never_prove_fills(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path, result="pending_with_quantities")
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(40)).__next__  # type: ignore[attr-defined]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "pending-quantities")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.merge_calls == 0
+
+
+def test_whitespace_idempotency_returns_existing_execution(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path, result="both_filled")
+    preview = service.preview("opp-1")
+    first = service.confirm(str(preview["id"]), "  normalized-request  ")
+    wait_until_terminal(service, str(first["execution_id"]))
+    second = service.confirm(str(preview["id"]), "normalized-request")
+
+    assert second["execution_id"] == first["execution_id"]
+    assert trading.batch_calls == 1
+    assert trading.merge_calls == 1
+
+
+def test_concurrent_same_idempotency_returns_same_execution(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path, result="delayed")
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(200)).__next__  # type: ignore[attr-defined]
+    preview = service.preview("opp-1")
+
+    def confirm() -> dict[str, object]:
+        return service.confirm(str(preview["id"]), "concurrent-request")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: confirm(), (0, 1)))
+    assert len({response.get("execution_id") for response in responses}) == 1
+    wait_until_terminal(service, str(responses[0]["execution_id"]))
+    assert trading.batch_calls == 1
+
+
+def test_stale_relayer_readiness_is_rejected_before_submit(tmp_path: Path) -> None:
+    service, trading, _, _ = execution_fixture(tmp_path)
+    trading.relayer_fresh = False
+
+    result = service.preview("opp-1")
+
+    assert result["state"] == "rejected"
+    assert result["reason"] == "relayer_unavailable"
+    assert trading.batch_calls == 0
+
+
+def test_missing_freshness_is_rejected_before_submit(tmp_path: Path) -> None:
+    service, trading, _, monitor = execution_fixture(tmp_path)
+    monitor.include_freshness = False
+
+    result = service.preview("opp-1")
+
+    assert result["state"] == "rejected"
+    assert trading.batch_calls == 0
+
+
+def test_missing_tick_size_is_rejected_before_submit(tmp_path: Path) -> None:
+    service, trading, _, monitor = execution_fixture(tmp_path)
+    monitor.include_tick = False
+
+    result = service.preview("opp-1")
+
+    assert result["state"] == "rejected"
+    assert trading.batch_calls == 0
+
+
+def test_supported_non_default_tick_is_forwarded_without_defaulting(tmp_path: Path) -> None:
+    service, trading, store, monitor = execution_fixture(tmp_path)
+    monitor.tick_size = Decimal("0.005")
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "tick-005")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "complete"
+    assert trading.preflight_ticks == [Decimal("0.005")]
+    assert store.histories("executions")[0]["tick_size"] == "0.005"
 
 
 def test_second_service_cannot_submit_while_file_lock_is_held(tmp_path: Path) -> None:

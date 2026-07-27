@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import inspect
+import sqlite3
 import threading
 import time
 from dataclasses import fields
@@ -14,7 +15,11 @@ from typing import Any, Mapping
 
 from .notifications import Notifier
 from .polymarket_trading import LegResult, PairSubmission
-from .prediction_arbitrage import MAX_WALLET_BALANCE, PairIntent
+from .prediction_arbitrage import (
+    MAX_WALLET_BALANCE,
+    PROTECTED_BUY_SHARE_PRECISION,
+    PairIntent,
+)
 from .prediction_arbitrage_store import PredictionArbitrageStore
 
 
@@ -171,7 +176,8 @@ class PredictionExecutionService:
     def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         """Consume one preview and start exactly one daemon execution thread."""
 
-        existing = self._execution_for_idempotency(str(idempotency_key))
+        key = str(idempotency_key).strip()
+        existing = self._execution_for_idempotency(key)
         if existing is not None:
             return existing
         if self._breaker_is_open():
@@ -185,11 +191,37 @@ class PredictionExecutionService:
             }
         lock = self._acquire_global_lock()
         if lock is None:
+            active = self._store.active_execution()
+            if active is not None:
+                if str(active.get("idempotency_key", "")) == key:
+                    return self._decorate_execution(active)
+                return {
+                    "state": "busy",
+                    "reason": "active_execution",
+                    "execution_id": active["execution_id"],
+                }
+            existing = self._wait_for_idempotency(key)
+            if existing is not None:
+                return existing
             return {"state": "busy", "reason": "execution_lock"}
         try:
+            existing = self._execution_for_idempotency(key)
+            if existing is not None:
+                self._release_global_lock(lock)
+                return existing
+            active = self._store.active_execution()
+            if active is not None:
+                self._release_global_lock(lock)
+                if str(active.get("idempotency_key", "")) == key:
+                    return self._decorate_execution(active)
+                return {
+                    "state": "busy",
+                    "reason": "active_execution",
+                    "execution_id": active["execution_id"],
+                }
             try:
                 execution = self._store.consume_preview_and_create_execution(
-                    str(preview_id), str(idempotency_key)
+                    str(preview_id), key
                 )
             except ValueError as exc:
                 message = str(exc)
@@ -203,7 +235,26 @@ class PredictionExecutionService:
                     }
                 self._release_global_lock(lock)
                 return {"state": "rejected", "reason": message}
+            except sqlite3.IntegrityError:
+                existing = self._execution_for_idempotency(key)
+                active = self._store.active_execution()
+                self._release_global_lock(lock)
+                if existing is not None:
+                    return existing
+                return {
+                    "state": "busy",
+                    "reason": "active_execution",
+                    **({"execution_id": active["execution_id"]} if active else {}),
+                }
             execution_id = str(execution["execution_id"])
+            # A store implementation may return an idempotency hit instead of
+            # raising.  Never start a second worker for that durable row.
+            if (
+                str(execution.get("state", "")) != "validating"
+                or str(execution.get("preview_id", "")) != str(preview_id)
+            ):
+                self._release_global_lock(lock)
+                return self._decorate_execution(execution)
             thread = threading.Thread(
                 target=self._run_execution,
                 args=(execution_id, lock),
@@ -260,6 +311,9 @@ class PredictionExecutionService:
             # preview economics never reach the authenticated client.
             intent = current_intent
             tick_size = self._tick_size(opportunity)
+            if tick_size is None:
+                self._finish_rejected(execution_id, "tick_size_unavailable")
+                return
             self._transition(execution_id, "submitting", {"phase": "submitting"})
             submitted_at = _utc_now()
             preflight = getattr(self._trading, "no_submit_preflight", None)
@@ -292,7 +346,6 @@ class PredictionExecutionService:
             known = self._reconcile_until(
                 intent,
                 since=submitted_at,
-                fallback=(yes.filled_quantity, no.filled_quantity),
             )
             if known is None:
                 self._finish_incident(execution_id, "reconciliation_timeout")
@@ -386,6 +439,19 @@ class PredictionExecutionService:
                 return dict(value)
         return None
 
+    def _wait_for_idempotency(self, key: str) -> dict[str, object] | None:
+        if not key:
+            return None
+        for _ in range(200):
+            existing = self._execution_for_idempotency(key)
+            if existing is not None:
+                return existing
+            # Yield to the request that currently owns the process lock; this
+            # wait is only the duplicate-idempotency race window, not venue
+            # reconciliation time.
+            time.sleep(0.005)
+        return self._execution_for_idempotency(key)
+
     def _volatile_checks(
         self, intent: PairIntent
     ) -> tuple[dict[str, object] | None, str | None]:
@@ -456,12 +522,12 @@ class PredictionExecutionService:
                     checked_age = _age_seconds(value.get("checked_at"))
                     if checked_age is None or checked_age > 60:
                         return False
+                else:
+                    return False
                 for key in ("relayer", "relayer_readiness", "merge"):
                     if key in value:
                         return value[key] in (True, "ready", "allowed", "pass", "confirmed")
-                status = value.get("status")
-                if status in ("blocked", "unavailable", "failed", "fail"):
-                    return False
+                return False
         for name in ("relayer_ready", "relayer_readiness"):
             value = getattr(self._trading, name, None)
             if callable(value):
@@ -469,18 +535,36 @@ class PredictionExecutionService:
                     value = _call(value)
                 except Exception:
                     return False
-            if value is not None:
-                return value in (True, "ready", "allowed", "pass", "confirmed")
-        return callable(getattr(self._trading, "merge_once", None))
+            if isinstance(value, Mapping):
+                checked_age = _age_seconds(value.get("checked_at"))
+                if checked_age is None or checked_age > 60:
+                    return False
+                return value.get("ready", value.get("relayer")) in (
+                    True,
+                    "ready",
+                    "allowed",
+                    "pass",
+                    "confirmed",
+                )
+            return False
+        return False
 
     def _validate_opportunity(
         self, opportunity: Mapping[str, object], intent: PairIntent
     ) -> str | None:
         if opportunity.get("actionable") is not True:
             return str(opportunity.get("eligibility_reason", "opportunity_not_actionable"))
+        if "confirmed_age_seconds" not in opportunity or "confirmed_at" not in opportunity:
+            return "book_freshness_unavailable"
         age = _decimal(opportunity.get("confirmed_age_seconds"))
-        if age is not None and age > BOOK_FRESHNESS_SECONDS:
+        timestamp_age = _age_seconds(opportunity.get("confirmed_at"))
+        if age is None or timestamp_age is None:
+            return "book_freshness_invalid"
+        if age > BOOK_FRESHNESS_SECONDS or timestamp_age > float(BOOK_FRESHNESS_SECONDS):
             return "books_stale"
+        tick_size = self._tick_size(opportunity)
+        if tick_size is None:
+            return "tick_size_unavailable"
         if any(
             value <= 0
             for value in (
@@ -508,9 +592,9 @@ class PredictionExecutionService:
         return None
 
     @staticmethod
-    def _tick_size(opportunity: Mapping[str, object]) -> Decimal:
+    def _tick_size(opportunity: Mapping[str, object]) -> Decimal | None:
         value = _decimal(opportunity.get("tick_size"))
-        return value if value is not None else Decimal("0.01")
+        return value if value in PROTECTED_BUY_SHARE_PRECISION else None
 
     def _preview_payload(
         self,
@@ -530,6 +614,7 @@ class PredictionExecutionService:
             "question": str(opportunity.get("question", "")),
             "volume_24h": _safe_decimal(opportunity.get("volume_24h")) or "0",
             "intent": self._intent_payload(intent),
+            "tick_size": _safe_decimal(self._tick_size(opportunity)) or "",
             "quantity": format(intent.quantity, "f"),
             "yes_max_price": format(intent.yes_max_price, "f"),
             "no_max_price": format(intent.no_max_price, "f"),
@@ -696,7 +781,6 @@ class PredictionExecutionService:
         intent: PairIntent,
         *,
         since: datetime,
-        fallback: tuple[Decimal, Decimal],
     ) -> tuple[Decimal, Decimal] | None:
         started = self._clock()
         for attempt in range(MAX_RECONCILIATION_SECONDS + 1):
@@ -707,7 +791,7 @@ class PredictionExecutionService:
                 )
             except Exception:
                 value = None
-            quantities = self._reconciled_quantities(value, fallback=fallback)
+            quantities = self._reconciled_quantities(value, intent=intent)
             if quantities is not None and quantities[0] > 0 and quantities[1] > 0:
                 return quantities
             if attempt >= MAX_RECONCILIATION_SECONDS:
@@ -719,9 +803,13 @@ class PredictionExecutionService:
 
     @staticmethod
     def _reconciled_quantities(
-        value: object, *, fallback: tuple[Decimal, Decimal]
+        value: object, *, intent: PairIntent
     ) -> tuple[Decimal, Decimal] | None:
         if not isinstance(value, Mapping):
+            return None
+        if str(value.get("status", "")).lower() not in {
+            "ok", "confirmed", "filled", "complete"
+        }:
             return None
         yes = next(
             (
@@ -756,10 +844,10 @@ class PredictionExecutionService:
                 )
                 if token and quantity is not None:
                     found[token] = quantity
-            yes = yes if yes is not None else found.get("YES")
-            no = no if no is not None else found.get("NO")
+            yes = yes if yes is not None else found.get("YES", found.get(intent.yes_token_id.upper()))
+            no = no if no is not None else found.get("NO", found.get(intent.no_token_id.upper()))
         if yes is None or no is None:
-            return fallback if value.get("status") == "ok" and fallback[0] > 0 and fallback[1] > 0 else None
+            return None
         return yes, no
 
     def _finish_rejected(self, execution_id: str, reason: str) -> None:
