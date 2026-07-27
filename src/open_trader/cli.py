@@ -7,6 +7,7 @@ from getpass import getpass
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import replace
@@ -15,6 +16,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
@@ -1338,6 +1341,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prediction_monitor_once.add_argument("--data-dir", type=Path, default=Path("data"))
     prediction_monitor_once.add_argument("--timeout", type=positive_float, default=30.0)
+    prediction_status = prediction_commands.add_parser(
+        "status", help="Show safe local Dashboard prediction runtime facts"
+    )
+    prediction_status.add_argument("--url", default="http://127.0.0.1:8766")
+    prediction_status.add_argument("--timeout", type=positive_float, default=5.0)
 
     return parser
 
@@ -1448,6 +1456,62 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 print(f"{key}: {report.get(key, 'BLOCKED')}")
             return 0 if report.get("result") == "PASS" else 2
+
+        if args.prediction_command == "status":
+            endpoint = args.url.rstrip("/") + "/api/prediction-arbitrage/state"
+            try:
+                with urlopen(endpoint, timeout=args.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("Dashboard state must be an object")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {exc}")
+                return 2
+            status = str(payload.get("status") or "unavailable")
+            readiness = payload.get("readiness")
+            readiness = readiness if isinstance(readiness, dict) else {}
+            breaker = payload.get("breaker")
+            breaker = breaker if isinstance(breaker, dict) else {}
+            current_execution = payload.get("current_execution")
+            current_execution = current_execution if isinstance(current_execution, dict) else {}
+            active_states = {"running", "executing", "pending", "submitted", "reconciling", "validating", "final_validating", "submitting", "merging"}
+            execution_state = str(current_execution.get("status") or current_execution.get("state") or "").lower()
+            active = any(value in execution_state for value in active_states)
+            actionable = 0
+            opportunities = payload.get("opportunities")
+            if isinstance(opportunities, list) and not payload.get("stale") and not breaker.get("open") and not active:
+                actionable = sum(1 for item in opportunities if isinstance(item, dict) and item.get("actionable") is True)
+            port = urlparse(args.url).port or 8766
+            pid = "unknown"
+            try:
+                process_rows = subprocess.run(
+                    ["ps", "-axo", "pid=,command="],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                for row in process_rows:
+                    candidate, _, command = row.strip().partition(" ")
+                    if candidate.isdigit() and "open_trader" in command and " dashboard" in command and f"--port {port}" in command:
+                        pid = candidate
+                        break
+            except OSError:
+                pass
+            health = "degraded" if status in {"degraded", "unavailable", "error"} else status
+            print(f"health: {health}")
+            print(f"pid: {pid}")
+            print(f"heartbeat_at: {payload.get('heartbeat_at') or payload.get('heartbeat') or 'unknown'}")
+            print(f"universe_refreshed_at: {payload.get('universe_refreshed_at') or 'unknown'}")
+            print(f"websocket: {'degraded' if payload.get('stale') else 'normal'}")
+            print(f"event_count: {payload.get('event_count', len(payload.get('events', [])) if isinstance(payload.get('events'), list) else 0)}")
+            print(f"market_count: {payload.get('market_count', 'unknown')}")
+            print(f"actionable_count: {actionable}")
+            print(f"breaker: {'open' if breaker.get('open') else 'ready'}")
+            print(f"masked_wallet: {payload.get('masked_wallet') or readiness.get('masked_address') or 'unknown'}")
+            print(f"result: {'PASS' if status not in {'unavailable', 'error'} else 'BLOCKED'}")
+            return 0 if status not in {"unavailable", "error"} else 2
 
     if args.command == "trend-market":
         if args.trend_market_command == "resolve":

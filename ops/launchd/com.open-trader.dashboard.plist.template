@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.open-trader.dashboard</string>
+
+  <key>WorkingDirectory</key>
+  <string>OPEN_TRADER_REPO</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>OPEN_TRADER_REPO/src</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>OPEN_TRADER_PYTHON</string>
+    <string>-m</string>
+    <string>open_trader</string>
+    <string>dashboard</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8766</string>
+    <string>--portfolio</string>
+    <string>OPEN_TRADER_REPO/data/latest/portfolio.csv</string>
+    <string>--data-dir</string>
+    <string>OPEN_TRADER_DATA_DIR</string>
+    <string>--reports-dir</string>
+    <string>OPEN_TRADER_REPORTS_DIR</string>
+    <string>--config</string>
+    <string>OPEN_TRADER_REPO/config/daily_premarket.env</string>
+    <string>--prediction-config</string>
+    <string>OPEN_TRADER_PREDICTION_CONFIG</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>OPEN_TRADER_REPO/logs/dashboard/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>OPEN_TRADER_REPO/logs/dashboard/launchd.err.log</string>
+</dict>
+</plist>
