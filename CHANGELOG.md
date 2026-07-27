@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-27
 
+- Allowed the Dashboard to show a newer validated trend-report revision when
+  its formal actions exactly match the execution-locked report, while keeping
+  execution events bound to the original batch SHA. Verified both same-action
+  display and changed-action fallback paths plus invalid-batch/history
+  regressions.
 - Corrected the fixed CN/HK/US Futu stock-simulation account deployment,
   archived the previous HK option-account report and ledger generation without
   rewriting history, and restarted HK from an account-bound no-replay cycle.

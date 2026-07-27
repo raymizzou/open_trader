@@ -367,6 +367,72 @@ def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     assert current_without_batch["buy_actions"][0]["symbol"] == "REVISION"
 
 
+def test_dashboard_displays_latest_revision_when_formal_actions_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import load_dashboard_state
+    from open_trader.trend_review import _report_hash
+
+    config = replace(dashboard_config(tmp_path), trend_executor_host="")
+    base = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:00:00+08:00",
+    )
+    revised = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-17-r1.json",
+        execution_date="2026-07-20",
+        generated_at="2026-07-18T09:30:00+08:00",
+    )
+    revised["strategy_judgments"]["holding_decisions"] = [{
+        "symbol": "VIXY",
+        "name": "ProShares VIX",
+        "action": "HOLD",
+        "reason": "trend_intact",
+        "strength": "96.1",
+        "active_protection_line": "8.42",
+    }]
+    revision_path = config.reports_dir / "trend_us_tiger/2026-07-17-r1.json"
+    revision_path.write_text(json.dumps(revised), encoding="utf-8")
+    base_path = config.reports_dir / "trend_us_tiger/2026-07-17.json"
+    batch = config.data_dir / "trend_review/ledgers/US/batches/2026-07-20.json"
+    batch.parent.mkdir(parents=True)
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1",
+        "market": "US",
+        "execution_date": "2026-07-20",
+        "report_path": str(base_path),
+        "report_sha256": _report_hash(base),
+        "locked_at": "2026-07-20T09:30:00-04:00",
+    }), encoding="utf-8")
+    event = (
+        config.data_dir
+        / "trend_review/ledgers/US/actions/2026-07-20/key/event.json"
+    )
+    event.parent.mkdir(parents=True)
+    event.write_text(json.dumps({
+        "report_sha256": _report_hash(base),
+        "symbol": "VIXY",
+        "side": "buy",
+        "status": "missed",
+        "recorded_at": "2026-07-20T16:00:00-04:00",
+    }), encoding="utf-8")
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["tiger"]
+
+    assert report["artifact"] == "2026-07-17-r1.json"
+    assert report["report_sha256"] == _report_hash(revised)
+    assert report["execution_batch"]["report_sha256"] == _report_hash(base)
+    assert report["latest_report_sha256"] == _report_hash(revised)
+    assert report["revision_anomaly"] is True
+    assert report["buy_actions"][0]["execution"]["status"] == "missed"
+    assert report["counts"]["hold"] == 1
+    assert report["counts"]["review"] == 0
+    assert report["hold_actions"][0]["active_protection_line"] == "8.42"
+
+
 @pytest.mark.parametrize(
     "corruption",
     ["bad-json", "wrong-sha", "missing-artifact", "invalid-report"],
