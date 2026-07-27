@@ -106,6 +106,7 @@ from .polymarket_trading import (
     load_trading_config,
     store_keychain_secret,
 )
+from .polymarket_monitor import monitor_once_diagnostic
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .tiger_account import (
     TigerAccountClient,
@@ -1322,6 +1323,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required: sign the in-memory probe without posting it",
     )
 
+    prediction_monitor_once = prediction_commands.add_parser(
+        "monitor-once", help="Run one non-mutating public monitor diagnostic"
+    )
+    prediction_monitor_once.add_argument(
+        "--config", type=Path, default=Path("config/prediction_arbitrage.json")
+    )
+    prediction_monitor_once.add_argument("--data-dir", type=Path, default=Path("data"))
+    prediction_monitor_once.add_argument("--timeout", type=positive_float, default=30.0)
+
     return parser
 
 
@@ -1404,6 +1414,29 @@ def main(argv: list[str] | None = None) -> int:
                 "merge_capability",
                 "relayer_readiness",
                 "secret_scan",
+                "result",
+            ):
+                print(f"{key}: {report.get(key, 'BLOCKED')}")
+            return 0 if report.get("result") == "PASS" else 2
+
+        if args.prediction_command == "monitor-once":
+            try:
+                config = load_trading_config(args.config.expanduser())
+                # Constructing the authenticated adapter verifies the configured
+                # Keychain boundary; the diagnostic itself only uses its public
+                # client and never calls a mutating adapter method.
+                PolymarketTradingClient.from_keychain(config)
+                report = monitor_once_diagnostic(timeout=args.timeout)
+            except (FileNotFoundError, ValueError, KeychainError, PolymarketTradingError) as exc:
+                code = getattr(exc, "error_code", "unavailable")
+                print(f"event_count: BLOCKED\nvolumes: BLOCKED\nwebsocket_heartbeat: BLOCKED\npaired_book_read: BLOCKED\nmutations: 0\nresult: BLOCKED\nerror_code: {code}")
+                return 2
+            for key in (
+                "event_count",
+                "volumes",
+                "websocket_heartbeat",
+                "paired_book_read",
+                "mutations",
                 "result",
             ):
                 print(f"{key}: {report.get(key, 'BLOCKED')}")

@@ -1,0 +1,1000 @@
+"""Concrete, read-only Polymarket event and order-book monitor."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import inspect
+import threading
+import time
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable
+
+from polymarket import AsyncPublicClient
+from polymarket.streams import MarketSpec
+
+from .prediction_arbitrage import (
+    BookLevel,
+    ConfirmedBooks,
+    MarketFacts,
+    build_pair_intent,
+    monitored_event_sort_key,
+)
+from .prediction_arbitrage_store import PredictionArbitrageStore
+
+
+TOP_EVENT_LIMIT = 20
+UNIVERSE_REFRESH_SECONDS = 5 * 60
+BOOK_FRESHNESS_SECONDS = 10
+READINESS_FRESHNESS_SECONDS = 60
+HEARTBEAT_FRESHNESS_SECONDS = 30
+STREAM_DISCONNECT_SECONDS = 15
+UNIVERSE_STALE_SECONDS = 10 * 60
+RUNTIME_WRITE_SECONDS = 1
+
+
+def _value(value: object, *names: str, default: object = None) -> object:
+    """Read model, mapping, and official-client alias fields."""
+
+    if value is None:
+        return default
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+    for name in names:
+        try:
+            result = getattr(value, name)
+        except Exception:
+            continue
+        return result
+    # Pydantic models used by polymarket expose model_dump but keep snake_case
+    # fields.  Calling it is only a fallback for test doubles and older SDKs.
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(by_alias=True)
+            if isinstance(dumped, Mapping):
+                for name in names:
+                    if name in dumped:
+                        return dumped[name]
+        except Exception:
+            pass
+    return default
+
+
+def _items(value: object) -> tuple[object, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, Mapping):
+        return tuple(value.values())
+    if isinstance(value, (str, bytes)):
+        return (value,)
+    try:
+        return tuple(value)  # type: ignore[arg-type]
+    except TypeError:
+        return (value,)
+
+
+async def _collect(value: object) -> tuple[object, ...]:
+    if inspect.isawaitable(value):
+        value = await value
+    if hasattr(value, "__aiter__"):
+        result: list[object] = []
+        async for item in value:  # type: ignore[union-attr]
+            result.append(item)
+        return tuple(result)
+    return _items(value)
+
+
+async def _call(value: object, *args: object, **kwargs: object) -> object:
+    if not callable(value):
+        return value
+    result = value(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return result if result.is_finite() else None
+
+
+def _timestamp(value: object, *, fallback: datetime) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        number = float(value)
+        # CLOB timestamps are epoch milliseconds; small values are seconds.
+        parsed = datetime.fromtimestamp(number / (1000 if number > 10_000_000_000 else 1), UTC)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return fallback
+    else:
+        return fallback
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _age(now: datetime, then: datetime | None) -> float:
+    if then is None:
+        return float("inf")
+    return max(0.0, (now - then).total_seconds())
+
+
+def _state_flag(model: object, name: str, default: object = None) -> object:
+    return _value(model, name, _camel(name), default=default)
+
+
+def _camel(name: str) -> str:
+    head, *tail = name.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in tail)
+
+
+def _outcome_pairs(outcomes: object) -> dict[str, str] | None:
+    if outcomes is None:
+        return None
+    if not isinstance(outcomes, (Mapping, list, tuple)) and not isinstance(outcomes, str):
+        values = []
+        for name in ("yes", "no"):
+            item = _value(outcomes, name, default=None)
+            if item is not None:
+                values.append(item)
+    elif isinstance(outcomes, Mapping):
+        values = list(outcomes.values())
+    else:
+        values = list(outcomes)  # type: ignore[arg-type]
+    mapped: dict[str, str] = {}
+    for outcome in values:
+        label = _value(outcome, "label", "name", default=None)
+        token = _value(outcome, "token_id", "tokenId", "asset_id", "assetId", default=None)
+        if not isinstance(label, str) or not isinstance(token, str) or not token.strip():
+            return None
+        key = label.strip().casefold()
+        if key not in {"yes", "no"} or key in mapped:
+            return None
+        mapped[key] = token.strip()
+    if set(mapped) != {"yes", "no"} or len(mapped) != 2 or mapped["yes"] == mapped["no"]:
+        return None
+    return mapped
+
+
+def _asks(value: object) -> tuple[BookLevel, ...] | None:
+    levels: list[BookLevel] = []
+    for level in _items(value):
+        price = _decimal(_value(level, "price", default=None))
+        size = _decimal(_value(level, "size", "quantity", default=None))
+        if price is None or size is None or price <= 0 or size <= 0 or price > 1:
+            return None
+        levels.append(BookLevel(price=price, size=size))
+    return tuple(levels) if levels else None
+
+
+class PolymarketMonitor:
+    """One async public monitor with a serialized in-memory snapshot."""
+
+    def __init__(
+        self,
+        *,
+        store: PredictionArbitrageStore,
+        trading: object,
+        public_client_factory: Callable[[], object] = AsyncPublicClient,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._store = store
+        self._trading = trading
+        self._public_client_factory = public_client_factory
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._client: object | None = None
+        self._stream_handle: object | None = None
+        self._events: dict[str, dict[str, object]] = {}
+        self._markets: dict[str, dict[str, object]] = {}
+        self._market_by_token: dict[str, str] = {}
+        self._opportunities: dict[str, dict[str, object]] = {}
+        self._books: dict[str, ConfirmedBooks] = {}
+        self._readiness: dict[str, object] | None = None
+        self._universe_at: datetime | None = None
+        self._heartbeat_at: datetime | None = None
+        self._stream_connected_at: datetime | None = None
+        self._stream_disconnected_at: datetime | None = None
+        self._last_runtime_write: datetime | None = None
+        self._store_failed = False
+        self._diagnostics: dict[str, object] = {
+            "malformed_events": 0,
+            "malformed_markets": 0,
+            "last_error": None,
+        }
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=lambda: asyncio.run(self.run_forever()),
+                name="polymarket-monitor",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            now = self._now()
+            health = self._health(now)
+            events = sorted(
+                (copy.deepcopy(event) for event in self._events.values()),
+                key=monitored_event_sort_key,
+            )
+            if health["status"] == "degraded":
+                for event in events:
+                    event["actionable"] = False
+                    for market in event.get("markets", []):
+                        if isinstance(market, Mapping) and market.get("actionable") is True:
+                            market["actionable"] = False
+                            market["eligibility_reason"] = "monitor_degraded"
+            opportunities = [
+                copy.deepcopy(value)
+                for value in sorted(
+                    self._opportunities.values(),
+                    key=lambda item: str(item.get("opportunity_id", "")),
+                )
+            ]
+            if health["status"] == "degraded":
+                for opportunity in opportunities:
+                    opportunity["actionable"] = False
+                    opportunity["eligibility_reason"] = "monitor_degraded"
+            return {
+                "status": health["status"],
+                "health": health,
+                "events": events,
+                "opportunities": opportunities,
+                "diagnostics": copy.deepcopy(self._diagnostics),
+                "heartbeat_at": self._heartbeat_at,
+                "universe_refreshed_at": self._universe_at,
+                "readiness": copy.deepcopy(self._readiness),
+            }
+
+    def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        with self._lock:
+            value = self._opportunities.get(str(opportunity_id))
+            if value is None:
+                return None
+            result = copy.deepcopy(value)
+            if self._health(self._now())["status"] == "degraded":
+                result["actionable"] = False
+                result["eligibility_reason"] = "monitor_degraded"
+            return result
+
+    def refresh_once(self) -> dict[str, object]:
+        """Perform one public refresh; useful to diagnostics and local checks."""
+
+        return asyncio.run(self._refresh_once())
+
+    async def _refresh_once(self) -> dict[str, object]:
+        client = self._client
+        owned_client = client is None
+        if client is None:
+            client = self._public_client_factory()
+            self._client = client
+        try:
+            await self._refresh_universe(client)
+            return self.snapshot()
+        finally:
+            if owned_client and self._stop_event.is_set():
+                self._client = None
+
+    async def run_forever(self) -> None:
+        client = self._public_client_factory()
+        self._client = client
+        next_refresh = 0.0
+        try:
+            while not self._stop_event.is_set():
+                current = time.monotonic()
+                if self._universe_at is None or current >= next_refresh:
+                    try:
+                        await self._refresh_universe(client)
+                    except Exception as exc:
+                        self._record_error(exc, "universe")
+                    next_refresh = current + UNIVERSE_REFRESH_SECONDS
+                if self._stream_handle is None:
+                    try:
+                        await self._subscribe(client)
+                    except Exception as exc:
+                        self._record_error(exc, "stream")
+                        await asyncio.sleep(0.2)
+                        continue
+                try:
+                    message = await asyncio.wait_for(
+                        self._stream_next(self._stream_handle), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    self._write_runtime()
+                    continue
+                except (StopAsyncIteration, ConnectionError, OSError) as exc:
+                    await self._close_stream()
+                    self._disconnect_stream(exc)
+                    await asyncio.sleep(0)
+                    continue
+                except Exception as exc:
+                    await self._close_stream()
+                    self._disconnect_stream(exc)
+                    await asyncio.sleep(0)
+                    continue
+                self._heartbeat_at = self._now()
+                try:
+                    await self._process_stream_event(client, message)
+                except Exception as exc:
+                    self._record_error(exc, "stream_event")
+                self._write_runtime()
+        finally:
+            await self._close_stream()
+            self._client = None
+
+    async def _stream_next(self, handle: object) -> object:
+        iterator = getattr(handle, "__anext__", None)
+        if not callable(iterator):
+            raise ConnectionError("public stream is not async iterable")
+        return await iterator()
+
+    async def _close_stream(self) -> None:
+        handle = self._stream_handle
+        self._stream_handle = None
+        if handle is None:
+            return
+        close = getattr(handle, "close", None)
+        if callable(close):
+            try:
+                await _call(close)
+            except Exception:
+                pass
+
+    def _disconnect_stream(self, exc: BaseException) -> None:
+        self._stream_disconnected_at = self._now()
+        self._diagnostics["last_error"] = f"stream:{type(exc).__name__}"
+        # The handle is closed by the next event-loop pass.  We deliberately do
+        # not retain stream messages in the store.
+        self._stream_handle = None
+
+    async def _subscribe(self, client: object) -> None:
+        with self._lock:
+            token_ids = sorted(self._market_by_token)
+        if not token_ids:
+            self._heartbeat_at = self._now()
+            return
+        await self._close_stream()
+        subscribe = getattr(client, "subscribe", None)
+        if not callable(subscribe):
+            raise ConnectionError("public client has no market stream")
+        handle = await _call(subscribe, MarketSpec(token_ids=token_ids))
+        self._stream_handle = handle
+        self._stream_connected_at = self._now()
+        self._stream_disconnected_at = None
+        self._heartbeat_at = self._now()
+
+    async def _refresh_universe(self, client: object) -> None:
+        list_events = getattr(client, "list_events", None)
+        if not callable(list_events):
+            raise RuntimeError("public client has no list_events")
+        raw = await _call(
+            list_events,
+            closed=False,
+            ended=False,
+            order="volume24hr",
+            ascending=False,
+            page_size=TOP_EVENT_LIMIT,
+        )
+        rows = await _collect(raw)
+        normalized: list[dict[str, object]] = []
+        malformed_events = 0
+        for row in rows:
+            parsed = self._normalize_event(row)
+            if parsed is None:
+                malformed_events += 1
+                continue
+            normalized.append(parsed)
+        normalized.sort(key=lambda item: (-item["volume_24h"], str(item["event_id"])))  # type: ignore[operator]
+        normalized = normalized[:TOP_EVENT_LIMIT]
+        markets: dict[str, dict[str, object]] = {}
+        token_map: dict[str, str] = {}
+        self._diagnostics["malformed_markets"] = 0
+        for event_row in normalized:
+            valid_markets: list[dict[str, object]] = []
+            for raw_market in _items(event_row.pop("_raw_markets", ())):
+                market_row = self._normalize_market(event_row, raw_market)
+                if market_row is None:
+                    self._diagnostics["malformed_markets"] = int(self._diagnostics["malformed_markets"]) + 1
+                    continue
+                valid_markets.append(market_row)
+                market_id = str(market_row["market_id"])
+                markets[market_id] = market_row
+                token_map[str(market_row["yes_token_id"])] = market_id
+                token_map[str(market_row["no_token_id"])] = market_id
+            event_row["markets"] = valid_markets
+            event_row["market_count"] = len(valid_markets)
+            event_row.pop("_raw_markets", None)
+        with self._lock:
+            previous_opportunities = set(self._opportunities)
+            self._events = {str(item["event_id"]): item for item in normalized}
+            self._markets = markets
+            self._market_by_token = token_map
+            self._diagnostics["malformed_events"] = malformed_events
+            self._universe_at = self._now()
+        await self._subscribe(client)
+        await self._refresh_readiness()
+        current_opportunities: dict[str, dict[str, object]] = {}
+        for market_row in markets.values():
+            try:
+                opportunity = await self._confirm_market(client, market_row)
+            except Exception as exc:
+                self._record_error(exc, "books")
+                opportunity = None
+            if opportunity is not None:
+                current_opportunities[str(opportunity["opportunity_id"])] = opportunity
+        with self._lock:
+            self._opportunities = current_opportunities
+            missing = previous_opportunities - set(current_opportunities)
+        for opportunity_id in missing:
+            market_id = opportunity_id.split(":", 1)[-1]
+            self._close_signal(market_id, "opportunity_closed")
+        self._sync_event_rows()
+        self._heartbeat_at = self._now()
+        self._write_runtime(force=True)
+
+    def _normalize_event(self, value: object) -> dict[str, object] | None:
+        event_id = _value(value, "id", "event_id", "eventId", default=None)
+        state = _value(value, "state", default=None)
+        active = _state_flag(state, "active", default=_value(value, "active", default=None))
+        closed = _state_flag(state, "closed", default=_value(value, "closed", default=None))
+        ended = _state_flag(state, "ended", default=_value(value, "ended", default=None))
+        title = _value(value, "title", "name", default=None)
+        slug = _value(value, "slug", default=None)
+        metrics = _value(value, "metrics", default=None)
+        volume = _decimal(_value(metrics, "volume_24hr", "volume24hr", default=_value(value, "volume_24hr", "volume24hr", default=None)))
+        if (
+            not isinstance(event_id, (str, int))
+            or not str(event_id).strip()
+            or not isinstance(title, str)
+            or not title.strip()
+            or active is not True
+            or closed is True
+            or ended is True
+            or volume is None
+            or volume < 0
+        ):
+            return None
+        return {
+            "event_id": str(event_id),
+            "title": title,
+            "slug": str(slug or ""),
+            "volume_24h": volume,
+            "profit": None,
+            "actionable": False,
+            "markets": [],
+            "_raw_markets": _value(value, "markets", default=()),
+        }
+
+    def _normalize_market(
+        self, event_row: Mapping[str, object], value: object
+    ) -> dict[str, object] | None:
+        market_id = _value(value, "id", "market_id", "marketId", default=None)
+        condition_id = _value(value, "condition_id", "conditionId", "condition", default=None)
+        question = _value(value, "question", default=None)
+        slug = _value(value, "slug", default=None)
+        state = _value(value, "state", default=None)
+        active = _state_flag(state, "active", default=_value(value, "active", default=None))
+        closed = _state_flag(state, "closed", default=_value(value, "closed", default=None))
+        accepting = _state_flag(state, "accepting_orders", default=_value(value, "accepting_orders", "acceptingOrders", default=None))
+        order_book_enabled = _state_flag(state, "enable_order_book", default=_value(value, "enable_order_book", "enableOrderBook", default=None))
+        if active is not True or closed is True or accepting is not True or order_book_enabled is not True:
+            return None
+        outcomes = _outcome_pairs(_value(value, "outcomes", default=None))
+        if (
+            not isinstance(market_id, (str, int))
+            or not str(market_id).strip()
+            or not isinstance(condition_id, str)
+            or not condition_id.strip()
+            or not isinstance(question, str)
+            or not question.strip()
+            or not isinstance(slug, str)
+            or not slug.strip()
+            or outcomes is None
+        ):
+            return None
+        trading = _value(value, "trading", default=None)
+        fees_enabled = _value(trading, "fees_enabled", "feesEnabled", default=_value(value, "fees_enabled", "feesEnabled", default=None))
+        neg_risk = _value(state, "neg_risk", "negRisk", default=_value(trading, "neg_risk", "negRisk", default=None))
+        if neg_risk is True:
+            reason = "neg_risk"
+        elif fees_enabled is not False:
+            reason = "fee_unverified_or_enabled"
+        else:
+            reason = "pending_confirmation"
+        return {
+            "event_id": event_row["event_id"],
+            "market_id": str(market_id),
+            "condition_id": condition_id,
+            "slug": slug,
+            "question": question,
+            "volume_24h": event_row["volume_24h"],
+            "yes_token_id": outcomes["yes"],
+            "no_token_id": outcomes["no"],
+            "fees_enabled": fees_enabled,
+            "neg_risk": neg_risk,
+            "minimum_order_size": _decimal(_value(trading, "minimum_order_size", "minimumOrderSize", default=None)),
+            "tick_size": _decimal(_value(trading, "minimum_tick_size", "minimumTickSize", default=None)),
+            "eligibility_reason": reason,
+            "actionable": False,
+            "gross_upper_bound": None,
+        }
+
+    async def _refresh_readiness(self) -> None:
+        now = self._now()
+        try:
+            method = getattr(self._trading, "readiness_snapshot", None)
+            if callable(method):
+                value = await _call(method)
+                readiness = dict(value) if isinstance(value, Mapping) else self._object_dict(value)
+            else:
+                account = await _call(getattr(self._trading, "account_snapshot"))
+                readiness = self._object_dict(account)
+                geoblock = await _call(getattr(self._trading, "geoblock_allowed"))
+                readiness["geoblock"] = "allowed" if geoblock is True else "blocked"
+            checked_at = _timestamp(readiness.get("checked_at"), fallback=now)
+            readiness["checked_at"] = checked_at
+            self._readiness = readiness
+        except Exception as exc:
+            self._readiness = {"status": "unavailable", "checked_at": now, "error": type(exc).__name__}
+            self._record_error(exc, "readiness")
+
+    @staticmethod
+    def _object_dict(value: object) -> dict[str, object]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        result: dict[str, object] = {}
+        for name in (
+            "wallet",
+            "wallet_address",
+            "geoblock",
+            "relayer",
+            "relayer_readiness",
+            "balance",
+            "allowance",
+            "p_usd_balance",
+            "p_usd_allowance",
+            "checked_at",
+        ):
+            item = _value(value, name, default=None)
+            if item is not None:
+                result[name] = item
+        return result
+
+    async def _confirm_market(self, client: object, market_row: dict[str, object]) -> dict[str, object] | None:
+        market_id = str(market_row["market_id"])
+        if market_row.get("fees_enabled") is not False:
+            market_row["eligibility_reason"] = "fee_unverified_or_enabled"
+        if market_row.get("neg_risk") is True:
+            market_row["eligibility_reason"] = "neg_risk"
+        get_books = getattr(client, "get_order_books", None)
+        if not callable(get_books):
+            raise RuntimeError("public client has no paired order-book read")
+        yes_token = str(market_row["yes_token_id"])
+        no_token = str(market_row["no_token_id"])
+        raw_books = await _call(get_books, token_ids=[yes_token, no_token])
+        books_by_token: dict[str, object] = {}
+        if isinstance(raw_books, Mapping):
+            books_by_token = {str(key): item for key, item in raw_books.items()}
+        else:
+            for item in _items(raw_books):
+                token = _value(item, "token_id", "asset_id", "assetId", default=None)
+                if isinstance(token, str):
+                    books_by_token[token] = item
+        yes_book = books_by_token.get(yes_token)
+        no_book = books_by_token.get(no_token)
+        if yes_book is None or no_book is None:
+            market_row["eligibility_reason"] = "book_token_mismatch"
+            return None
+        yes_asks = _asks(_value(yes_book, "asks", default=()))
+        no_asks = _asks(_value(no_book, "asks", default=()))
+        if yes_asks is None or no_asks is None:
+            market_row["eligibility_reason"] = "book_unavailable"
+            return None
+        now = self._now()
+        confirmed_at = max(
+            _timestamp(_value(yes_book, "timestamp", default=None), fallback=now),
+            _timestamp(_value(no_book, "timestamp", default=None), fallback=now),
+        )
+        books = ConfirmedBooks(
+            yes_token_id=yes_token,
+            no_token_id=no_token,
+            yes_asks=yes_asks,
+            no_asks=no_asks,
+            confirmed_at=confirmed_at,
+        )
+        self._books[market_id] = books
+        age = _age(now, confirmed_at)
+        market_row["confirmed_at"] = confirmed_at
+        market_row["confirmed_age_seconds"] = age
+        if age > BOOK_FRESHNESS_SECONDS:
+            market_row["eligibility_reason"] = "books_stale"
+            return None
+        if market_row.get("fees_enabled") is not False:
+            return None
+        if market_row.get("neg_risk") is True:
+            return None
+        minimum = market_row.get("minimum_order_size")
+        tick = market_row.get("tick_size")
+        if not isinstance(minimum, Decimal):
+            minimum = _decimal(_value(yes_book, "min_order_size", "minimum_order_size", default=None))
+        if not isinstance(tick, Decimal):
+            tick = _decimal(_value(yes_book, "tick_size", "minimum_tick_size", default=None))
+        if minimum is None or tick is None:
+            market_row["eligibility_reason"] = "market_facts_unavailable"
+            return None
+        readiness = self._readiness or {}
+        readiness_age = _age(now, readiness.get("checked_at") if isinstance(readiness.get("checked_at"), datetime) else None)
+        if readiness_age > READINESS_FRESHNESS_SECONDS:
+            market_row["eligibility_reason"] = "readiness_stale"
+            return None
+        if not self._readiness_ready(readiness):
+            market_row["eligibility_reason"] = "readiness_unavailable"
+            return None
+        balance = _decimal(readiness.get("balance", readiness.get("p_usd_balance"))) or Decimal("0")
+        allowance = _decimal(readiness.get("allowance", readiness.get("p_usd_allowance"))) or Decimal("0")
+        facts = MarketFacts(
+            event_id=str(market_row["event_id"]),
+            market_id=market_id,
+            condition_id=str(market_row["condition_id"]),
+            slug=str(market_row["slug"]),
+            question=str(market_row["question"]),
+            volume_24h=market_row["volume_24h"],  # type: ignore[arg-type]
+            minimum_order_size=minimum,
+            tick_size=tick,
+            fee_verified_zero=True,
+            neg_risk=False,
+        )
+        intent = build_pair_intent(facts, books, balance=balance, allowance=allowance)
+        if intent is None:
+            market_row["eligibility_reason"] = "no_threshold_candidate"
+            return None
+        opportunity_id = f"{market_row['event_id']}:{market_id}"
+        opportunity = {
+            "opportunity_id": opportunity_id,
+            "event_id": market_row["event_id"],
+            "market_id": market_id,
+            "condition_id": market_row["condition_id"],
+            "question": market_row["question"],
+            "volume_24h": market_row["volume_24h"],
+            "actionable": True,
+            "eligibility": "actionable",
+            "eligibility_reason": "actionable",
+            "confirmed_at": confirmed_at,
+            "confirmed_age_seconds": age,
+            "profit": intent.minimum_profit,
+            "estimated_profit": intent.minimum_profit,
+            "net_edge": intent.net_edge,
+            "quantity": intent.quantity,
+            "yes_token_id": intent.yes_token_id,
+            "no_token_id": intent.no_token_id,
+            "yes_max_price": intent.yes_max_price,
+            "no_max_price": intent.no_max_price,
+            "yes_max_cost": intent.yes_max_cost,
+            "no_max_cost": intent.no_max_cost,
+            "total_max_cost": intent.total_max_cost,
+            "intent": intent,
+        }
+        market_row.update({"actionable": True, "eligibility_reason": "actionable", "profit": intent.minimum_profit})
+        self._upsert_signal(opportunity)
+        return opportunity
+
+    @staticmethod
+    def _readiness_ready(readiness: Mapping[str, object]) -> bool:
+        for key in ("wallet", "wallet_ready"):
+            if key in readiness and readiness[key] not in (True, "ready", "allowed", "pass"):
+                return False
+        for key in ("geoblock", "relayer", "relayer_readiness"):
+            if key in readiness and readiness[key] not in (True, "ready", "allowed", "pass"):
+                return False
+        if "geoblock" not in readiness:
+            return False
+        if "relayer" not in readiness and "relayer_readiness" not in readiness:
+            return False
+        if str(readiness.get("status", "ready")).casefold() in {"unavailable", "blocked", "fail", "failed"}:
+            return False
+        return "balance" in readiness or "p_usd_balance" in readiness
+
+    async def _process_stream_event(self, client: object, message: object) -> None:
+        payload = _value(message, "payload", default=message)
+        token = _value(payload, "token_id", "asset_id", "assetId", default=None)
+        if not isinstance(token, str):
+            return
+        market_id = self._market_by_token.get(token)
+        if market_id is None:
+            return
+        self._heartbeat_at = self._now()
+        market_row = self._markets.get(market_id)
+        if market_row is None:
+            return
+        self._update_stream_book(market_id, token, payload)
+        opportunity = await self._confirm_market(client, market_row)
+        with self._lock:
+            if opportunity is None:
+                previous = self._opportunities.pop(f"{market_row['event_id']}:{market_id}", None)
+            else:
+                self._opportunities[str(opportunity["opportunity_id"])] = opportunity
+                previous = None
+        if opportunity is None and previous is not None:
+            self._close_signal(market_id, "threshold_or_freshness")
+        self._sync_event_rows()
+
+    def _update_stream_book(self, market_id: str, token: str, payload: object) -> None:
+        asks = _asks(_value(payload, "asks", default=()))
+        if asks is None:
+            return
+        current = self._books.get(market_id)
+        if current is None:
+            return
+        if token == current.yes_token_id:
+            self._books[market_id] = ConfirmedBooks(
+                yes_token_id=current.yes_token_id,
+                no_token_id=current.no_token_id,
+                yes_asks=asks,
+                no_asks=current.no_asks,
+                confirmed_at=self._now(),
+            )
+        elif token == current.no_token_id:
+            self._books[market_id] = ConfirmedBooks(
+                yes_token_id=current.yes_token_id,
+                no_token_id=current.no_token_id,
+                yes_asks=current.yes_asks,
+                no_asks=asks,
+                confirmed_at=self._now(),
+            )
+
+    def _sync_event_rows(self) -> None:
+        by_event: dict[str, list[dict[str, object]]] = {}
+        for market_row in self._markets.values():
+            by_event.setdefault(str(market_row["event_id"]), []).append(market_row)
+        for event_id, event_row in self._events.items():
+            markets = by_event.get(event_id, [])
+            actionable = [row for row in markets if row.get("actionable") is True]
+            event_row["markets"] = copy.deepcopy(markets)
+            event_row["market_count"] = len(markets)
+            event_row["actionable"] = bool(actionable)
+            event_row["profit"] = max(
+                (row.get("profit") for row in actionable if isinstance(row.get("profit"), Decimal)),
+                default=None,
+            )
+
+    def _upsert_signal(self, opportunity: Mapping[str, object]) -> None:
+        market_id = str(opportunity["market_id"])
+        peak_edge = opportunity.get("net_edge")
+        peak_quantity = opportunity.get("quantity")
+        peak_profit = opportunity.get("estimated_profit")
+        try:
+            for row in self._store.signal_history("all"):
+                if row.get("market_id") == market_id and row.get("ended_at") is None:
+                    peak_edge = self._max_decimal(peak_edge, row.get("peak_net_edge", row.get("net_edge")))
+                    peak_quantity = self._max_decimal(peak_quantity, row.get("peak_quantity", row.get("quantity")))
+                    peak_profit = self._max_decimal(peak_profit, row.get("peak_estimated_profit", row.get("estimated_profit")))
+                    break
+            self._store.upsert_signal(
+                {
+                    "event_id": opportunity["event_id"],
+                    "market_id": market_id,
+                    "question": opportunity["question"],
+                    "started_at": self._now(),
+                    "last_seen_at": self._now(),
+                    "net_edge": opportunity.get("net_edge"),
+                    "quantity": opportunity.get("quantity"),
+                    "estimated_profit": opportunity.get("estimated_profit"),
+                    "peak_net_edge": peak_edge,
+                    "peak_quantity": peak_quantity,
+                    "peak_estimated_profit": peak_profit,
+                    "volume_24h": opportunity.get("volume_24h"),
+                }
+            )
+        except Exception as exc:
+            self._store_failed = True
+            self._record_error(exc, "store")
+
+    def _close_signal(self, market_id: str, reason: str) -> None:
+        try:
+            self._store.close_signal(market_id, ended_at=self._now(), reason=reason)
+        except Exception as exc:
+            self._store_failed = True
+            self._record_error(exc, "store")
+
+    @staticmethod
+    def _max_decimal(left: object, right: object) -> object:
+        if isinstance(left, Decimal) and isinstance(right, Decimal):
+            return max(left, right)
+        return left if isinstance(left, Decimal) else right
+
+    def _record_error(self, exc: BaseException, component: str) -> None:
+        self._diagnostics["last_error"] = f"{component}:{type(exc).__name__}"
+
+    def _write_runtime(self, *, force: bool = False) -> None:
+        now = self._now()
+        if not force and self._last_runtime_write is not None and _age(now, self._last_runtime_write) < RUNTIME_WRITE_SECONDS:
+            return
+        payload = self.snapshot()
+        payload.pop("readiness", None)
+        # PairIntent is an in-process execution input, not a JSON/store value.
+        payload["opportunities"] = [
+            {key: value for key, value in item.items() if key != "intent"}
+            for item in payload.get("opportunities", [])
+            if isinstance(item, Mapping)
+        ]
+        try:
+            self._store.write_runtime(payload)
+            self._last_runtime_write = now
+        except Exception as exc:
+            self._store_failed = True
+            self._record_error(exc, "store")
+
+    def _health(self, now: datetime) -> dict[str, object]:
+        reasons: list[str] = []
+        if self._store_failed:
+            reasons.append("store_write_failed")
+        if self._universe_at is None:
+            reasons.append("universe_unavailable")
+        elif _age(now, self._universe_at) > UNIVERSE_STALE_SECONDS:
+            reasons.append("universe_stale")
+        if self._heartbeat_at is None:
+            reasons.append("heartbeat_missing")
+        elif _age(now, self._heartbeat_at) > HEARTBEAT_FRESHNESS_SECONDS:
+            reasons.append("heartbeat_stale")
+        if self._stream_disconnected_at is not None and _age(now, self._stream_disconnected_at) > STREAM_DISCONNECT_SECONDS:
+            reasons.append("stream_disconnected")
+        for opportunity in self._opportunities.values():
+            if float(opportunity.get("confirmed_age_seconds", float("inf"))) > BOOK_FRESHNESS_SECONDS:
+                reasons.append("books_stale")
+                break
+        readiness_at = self._readiness.get("checked_at") if self._readiness else None
+        if not isinstance(readiness_at, datetime) or _age(now, readiness_at) > READINESS_FRESHNESS_SECONDS:
+            reasons.append("readiness_stale")
+        status = "loading" if self._universe_at is None else ("degraded" if reasons else "healthy")
+        return {
+            "status": status,
+            "degraded": status == "degraded",
+            "degraded_reasons": sorted(set(reasons)),
+            "actionable": status == "healthy" and bool(self._opportunities),
+            "opportunity_count": len(self._opportunities),
+            "heartbeat_age_seconds": _age(now, self._heartbeat_at),
+            "universe_age_seconds": _age(now, self._universe_at),
+            "readiness_age_seconds": _age(now, readiness_at if isinstance(readiness_at, datetime) else None),
+        }
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+
+__all__ = ["PolymarketMonitor"]
+
+
+async def _monitor_once_diagnostic_async(
+    *,
+    timeout: float,
+    public_client_factory: Callable[[], object] = AsyncPublicClient,
+) -> dict[str, object]:
+    """Run the operator's public, non-mutating integration probe."""
+
+    client = public_client_factory()
+    raw = await _call(
+        getattr(client, "list_events"),
+        closed=False,
+        ended=False,
+        order="volume24hr",
+        ascending=False,
+        page_size=TOP_EVENT_LIMIT,
+    )
+    probe = object.__new__(PolymarketMonitor)
+    rows: list[dict[str, object]] = []
+    for item in await _collect(raw):
+        normalized = probe._normalize_event(item)
+        if normalized is not None:
+            rows.append(normalized)
+    rows.sort(key=lambda item: (-item["volume_24h"], str(item["event_id"])))  # type: ignore[operator]
+    rows = rows[:TOP_EVENT_LIMIT]
+    markets: list[dict[str, object]] = []
+    for row in rows:
+        for item in _items(row.get("_raw_markets", ())):
+            normalized_market = probe._normalize_market(row, item)
+            if normalized_market is not None:
+                markets.append(normalized_market)
+    markets.sort(key=lambda item: (-item["volume_24h"], str(item["market_id"])))  # type: ignore[operator]
+    selected = next(
+        (
+            item
+            for item in markets
+            if item.get("fees_enabled") is False and item.get("neg_risk") is not True
+        ),
+        markets[0] if markets else None,
+    )
+    result: dict[str, object] = {
+        "event_count": len(rows),
+        "volumes": "present" if rows and all(isinstance(row.get("volume_24h"), Decimal) for row in rows) else "missing",
+        "websocket_heartbeat": "fail",
+        "paired_book_read": "fail",
+        "mutations": 0,
+        "result": "BLOCKED",
+    }
+    if selected is not None:
+        get_books = getattr(client, "get_order_books", None)
+        yes = str(selected["yes_token_id"])
+        no = str(selected["no_token_id"])
+        if callable(get_books):
+            try:
+                books = await _call(get_books, token_ids=[yes, no])
+                tokens = {
+                    str(_value(book, "token_id", "asset_id", "assetId", default=""))
+                    for book in _items(books)
+                }
+                result["paired_book_read"] = "pass" if {yes, no} <= tokens else "fail"
+            except Exception:
+                result["paired_book_read"] = "fail"
+        subscribe = getattr(client, "subscribe", None)
+        if callable(subscribe):
+            handle: object | None = None
+            try:
+                handle = await _call(subscribe, MarketSpec(token_ids=sorted({yes, no})))
+                next_message = getattr(handle, "__anext__", None)
+                if callable(next_message):
+                    await asyncio.wait_for(next_message(), timeout=max(0.1, timeout))
+                    result["websocket_heartbeat"] = "pass"
+            except Exception:
+                result["websocket_heartbeat"] = "fail"
+            finally:
+                close = getattr(handle, "close", None)
+                if callable(close):
+                    try:
+                        await _call(close)
+                    except Exception:
+                        pass
+    if (
+        result["event_count"] == TOP_EVENT_LIMIT
+        and result["volumes"] == "present"
+        and result["websocket_heartbeat"] == "pass"
+        and result["paired_book_read"] == "pass"
+    ):
+        result["result"] = "PASS"
+    return result
+
+
+def monitor_once_diagnostic(
+    *,
+    timeout: float = 30.0,
+    public_client_factory: Callable[[], object] = AsyncPublicClient,
+) -> dict[str, object]:
+    return asyncio.run(
+        _monitor_once_diagnostic_async(
+            timeout=timeout,
+            public_client_factory=public_client_factory,
+        )
+    )
