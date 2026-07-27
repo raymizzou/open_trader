@@ -127,6 +127,7 @@ class PredictionExecutionService:
         self._lock_path = Path(lock_path)
         self._process_lock = _PROCESS_LOCK
         self._breaker_open = False
+        self._first_live_order_verified = False
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
@@ -600,6 +601,15 @@ class PredictionExecutionService:
             ):
                 self._finish_incident(execution_id, "collateral_reconciliation_failed", state="merge_incident")
                 return
+            if self._real_live_success(execution_proof, merge_result):
+                self._first_live_order_verified = True
+                self._store.write_runtime(
+                    {
+                        "prediction_arbitrage": "ready",
+                        "first_live_order": "validated",
+                        "validated_at": _timestamp(_utc_now()),
+                    }
+                )
             self._transition(
                 execution_id,
                 "complete",
@@ -1048,12 +1058,34 @@ class PredictionExecutionService:
                 notify=False,
             )
             return
+        if self._real_live_success(known[2], merge_result):
+            self._first_live_order_verified = True
+            self._store.write_runtime(
+                {
+                    "prediction_arbitrage": "ready",
+                    "first_live_order": "validated",
+                    "validated_at": _timestamp(_utc_now()),
+                }
+            )
         self._finish_incident(
             execution_id,
             "one_leg_neutralized",
             state="neutralized_incident",
             incident_id=incident_id,
             notify=False,
+        )
+
+    @staticmethod
+    def _real_live_success(
+        proof: Mapping[str, object], merge_result: object
+    ) -> bool:
+        return (
+            proof.get("adapter_verified") is True
+            and proof.get("venue") == "polymarket"
+            and isinstance(proof.get("matched_refs"), Mapping)
+            and isinstance(merge_result, Mapping)
+            and merge_result.get("adapter_confirmed") is True
+            and PredictionExecutionService._merge_confirmed(merge_result)
         )
 
     def _verify_unwound(self, intent: PairIntent, filled_leg: str) -> bool:

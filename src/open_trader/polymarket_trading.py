@@ -1050,6 +1050,7 @@ class PolymarketTradingClient:
         }
         proof: dict[str, object] = {
             "verified": False,
+            "adapter_verified": True,
             "venue": "polymarket",
             "positions_verified": False,
             "matched_refs": {"YES": dict(empty_refs), "NO": dict(empty_refs)},
@@ -1359,6 +1360,7 @@ class PolymarketTradingClient:
         response: dict[str, object] = {
             "status": "confirmed",
             "confirmed": True,
+            "adapter_confirmed": True,
             "error_code": "none",
             "transaction_hash": transaction_hash,
         }
