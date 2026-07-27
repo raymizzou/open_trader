@@ -2202,6 +2202,132 @@ def test_prediction_arbitrage_cli_rejects_non_loopback_prediction_listener(
     assert error.value.code == 2
 
 
+def test_prediction_arbitrage_localhost_host_and_origin_are_accepted(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls: list[str] = []
+
+        def preview(self, opportunity_id: str) -> dict[str, object]:
+            self.calls.append(opportunity_id)
+            return {"preview_id": "preview-1"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="localhost",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = int(server.server_address[1])
+        base = f"http://localhost:{port}"
+        request = urllib.request.Request(f"{base}/api/prediction-arbitrage/state")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            state = json.loads(response.read().decode("utf-8"))
+            cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        body = b'{"opportunity_id":"opp-1"}'
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookie,
+                "Origin": base,
+                "X-CSRF-Token": state["csrf_token"],
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+        assert execution.calls == ["opp-1"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_json_redacts_nested_secret_keys(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def histories(self, _kind: str) -> list[dict[str, object]]:
+            return [{"api_key": "SECRET", "nested": {"access_token": "SECRET"}}]
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "readiness": {
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "api_key": "SECRET",
+                    "access_token": "SECRET",
+                    "token": "SECRET",
+                    "token_id": "public-token-id",
+                },
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+
+        def preview(self, _opportunity_id: str) -> dict[str, object]:
+            return {"preview_id": "preview-1", "authorization": "SECRET"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+        prediction_store=FakeStore(),
+        prediction_monitor=FakeMonitor(),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        state = read_json(f"{base}/api/prediction-arbitrage/state")
+        history = read_json(f"{base}/api/prediction-arbitrage/history?kind=signals")
+        assert "SECRET" not in json.dumps(state, ensure_ascii=False)
+        assert "SECRET" not in json.dumps(history, ensure_ascii=False)
+        assert state["readiness"]["token_id"] == "public-token-id"
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/preview",
+            data=b'{"opportunity_id":"opp-1"}',
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": "ot_prediction_session=session-token",
+                "Origin": base,
+                "X-CSRF-Token": "csrf-token",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        assert "SECRET" not in json.dumps(result, ensure_ascii=False)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def run_dashboard_js(script: str) -> str:
     node = shutil.which("node")
     if node is None:

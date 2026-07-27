@@ -81,7 +81,33 @@ def _prediction_safe_value(value: object, *, key: str = "") -> object:
     """Convert monitor/store values to JSON without exposing credentials."""
 
     lowered = key.casefold()
-    if any(part in lowered for part in ("private", "secret", "password", "credential", "signature")):
+    if (
+        any(
+            part in lowered
+            for part in (
+                "private",
+                "secret",
+                "password",
+                "credential",
+                "signature",
+                "mnemonic",
+                "seed",
+            )
+        )
+        or lowered in {
+            "api_key",
+            "apikey",
+            "api_token",
+            "access_token",
+            "refresh_token",
+            "auth_token",
+            "authorization",
+            "bearer",
+            "bearer_token",
+            "token",
+            "csrf_token",
+        }
+    ):
         return None
     if lowered in {"intent", "raw", "raw_markets", "raw_payload", "signed_order"}:
         return None
@@ -792,7 +818,9 @@ def create_dashboard_server(
 
         def _prediction_listener_host_header(self) -> str:
             address = self.server.server_address
-            bound_host = str(address[0])
+            # Preserve the configured loopback name (notably ``localhost``)
+            # so browser Host/Origin headers match the URL the operator used.
+            bound_host = str(host)
             bound_port = int(address[1])
             if ":" in bound_host and not bound_host.startswith("["):
                 bound_host = f"[{bound_host}]"
