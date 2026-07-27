@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from getpass import getpass
+import os
 import re
 import socket
 import sys
@@ -97,6 +98,14 @@ from .notifications import NullNotifier
 from .parsers.phillips import PhillipsStatementParser
 from .parsers.eastmoney import EastmoneyStatementParser
 from .pipeline import run_import, validate_month
+from .polymarket_trading import (
+    KEYCHAIN_ACCOUNTS,
+    KeychainError,
+    PolymarketTradingClient,
+    PolymarketTradingError,
+    load_trading_config,
+    store_keychain_secret,
+)
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .tiger_account import (
     TigerAccountClient,
@@ -1275,12 +1284,130 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument("--futu-host", default="127.0.0.1")
     dashboard_parser.add_argument("--futu-port", type=positive_int, default=11111)
 
+    prediction_parser = subparsers.add_parser(
+        "prediction-arb",
+        help="Run the guarded prediction-market wallet diagnostics",
+    )
+    prediction_commands = prediction_parser.add_subparsers(
+        dest="prediction_command", required=True
+    )
+    wallet_parser = prediction_commands.add_parser("wallet", help="Manage wallet setup")
+    wallet_commands = wallet_parser.add_subparsers(
+        dest="wallet_command", required=True
+    )
+    wallet_setup = wallet_commands.add_parser(
+        "setup", help="Store wallet addresses and hidden credentials"
+    )
+    wallet_setup.add_argument(
+        "--config", type=Path, default=Path("config/prediction_arbitrage.json")
+    )
+    wallet_setup.add_argument("--signer-address", required=True)
+    wallet_setup.add_argument("--wallet-address", required=True)
+    wallet_status = wallet_commands.add_parser(
+        "status", help="Show safe wallet readiness facts"
+    )
+    wallet_status.add_argument(
+        "--config", type=Path, default=Path("config/prediction_arbitrage.json")
+    )
+
+    prediction_preflight = prediction_commands.add_parser(
+        "preflight", help="Run the no-submit compatibility diagnostic"
+    )
+    prediction_preflight.add_argument(
+        "--config", type=Path, default=Path("config/prediction_arbitrage.json")
+    )
+    prediction_preflight.add_argument(
+        "--no-submit",
+        action="store_true",
+        help="Required: sign the in-memory probe without posting it",
+    )
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "prediction-arb":
+        if args.prediction_command == "wallet" and args.wallet_command == "setup":
+            config_path = args.config.expanduser()
+            try:
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "signer_address": args.signer_address,
+                            "wallet_address": args.wallet_address,
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.chmod(config_path, 0o600)
+                config = load_trading_config(config_path)
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            for account in KEYCHAIN_ACCOUNTS:
+                try:
+                    secret = getpass(f"{account}: ")
+                    store_keychain_secret(account, secret)
+                except (KeyboardInterrupt, EOFError):
+                    print("wallet setup cancelled", file=sys.stderr)
+                    return 2
+                except (ValueError, KeychainError) as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 2
+            del config
+            print(f"config: {config_path}")
+            print("keychain: configured")
+            return 0
+
+        if args.prediction_command == "wallet" and args.wallet_command == "status":
+            try:
+                config = load_trading_config(args.config.expanduser())
+                client = PolymarketTradingClient.from_keychain(config)
+                snapshot = client.account_snapshot()
+                geoblock = client.geoblock_allowed()
+                print(f"wallet: {config.wallet_address[:6]}...{config.wallet_address[-4:]}")
+                print(f"geoblock: {'allowed' if geoblock else 'blocked'}")
+                print(f"account_reads: pass ({len(snapshot.positions)} positions)")
+                print(f"result: {'PASS' if geoblock else 'BLOCKED'}")
+                return 0 if geoblock else 2
+            except (FileNotFoundError, ValueError, KeychainError, PolymarketTradingError) as exc:
+                code = getattr(exc, "error_code", "unavailable")
+                print(f"result: BLOCKED\nerror_code: {code}", file=sys.stderr)
+                return 2
+
+        if args.prediction_command == "preflight":
+            if not args.no_submit:
+                print("preflight requires --no-submit", file=sys.stderr)
+                return 2
+            try:
+                config = load_trading_config(args.config.expanduser())
+                client = PolymarketTradingClient.from_keychain(config)
+            except (FileNotFoundError, ValueError, KeychainError, PolymarketTradingError) as exc:
+                code = getattr(exc, "error_code", "unavailable")
+                print(f"result: BLOCKED\nerror_code: {code}")
+                return 2
+            try:
+                client.account_snapshot()
+            except PolymarketTradingError as exc:
+                print(f"account_reads: fail\nerror_code: {exc.error_code}\nresult: BLOCKED")
+                return 2
+            if not client.geoblock_allowed():
+                print("geoblock: blocked\nresult: BLOCKED")
+                return 2
+            # Market discovery belongs to the monitor task. Keep this command
+            # fail-closed until that task supplies a real in-memory PairIntent.
+            print("geoblock: allowed")
+            print("account_reads: pass")
+            print("fok_pair_signed_not_submitted: blocked")
+            print("error_code: market_probe_unavailable")
+            print("result: BLOCKED")
+            return 2
 
     if args.command == "trend-market":
         if args.trend_market_command == "resolve":

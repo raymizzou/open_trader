@@ -10,6 +10,7 @@ logs/
 __pycache__/
 *.py[cod]
 config/daily_premarket.env
+config/prediction_arbitrage.json
 .superpowers/
 node_modules/
 test-results/
