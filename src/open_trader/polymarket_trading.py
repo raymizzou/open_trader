@@ -42,6 +42,7 @@ KEYCHAIN_ACCOUNTS = (
 GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 GEOBLOCK_TIMEOUT_SECONDS = 5.0
 MERGE_WAIT_TIMEOUT_SECONDS = 60.0
+REMEDIATION_BOOK_FRESHNESS_SECONDS = 10.0
 COLLATERAL_BASE_UNITS = Decimal("1000000")
 DEFAULT_TICK_SIZE = Decimal("0.01")
 CENT = Decimal("0.01")
@@ -312,7 +313,13 @@ def _venue_timestamp(value: object) -> datetime | None:
         moment = value
     elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
         try:
-            moment = datetime.fromtimestamp(float(value), UTC)
+            number = Decimal(str(value))
+            if not number.is_finite():
+                return None
+            # CLOB order-book timestamps are epoch milliseconds; trade
+            # collaborators have historically supplied epoch seconds.
+            divisor = Decimal("1000") if abs(number) > Decimal("10000000000") else Decimal("1")
+            moment = datetime.fromtimestamp(float(number / divisor), UTC)
         except (OverflowError, OSError, ValueError):
             return None
     elif isinstance(value, str):
@@ -322,7 +329,17 @@ def _venue_timestamp(value: object) -> datetime | None:
         try:
             moment = datetime.fromisoformat(text)
         except ValueError:
-            return None
+            try:
+                number = Decimal(text)
+            except (InvalidOperation, ValueError):
+                return None
+            if not number.is_finite():
+                return None
+            divisor = Decimal("1000") if abs(number) > Decimal("10000000000") else Decimal("1")
+            try:
+                moment = datetime.fromtimestamp(float(number / divisor), UTC)
+            except (OverflowError, OSError, ValueError):
+                return None
     else:
         return None
     if moment.tzinfo is None:
@@ -1266,6 +1283,13 @@ class PolymarketTradingClient:
             account = self.account_snapshot()
             if account.open_order_ids:
                 return {"fresh": False}
+            checked_at = _venue_timestamp(account.checked_at)
+            if checked_at is None:
+                return {"fresh": False}
+            account_now = datetime.now(UTC)
+            account_age = (account_now - checked_at).total_seconds()
+            if account_age < 0 or account_age > REMEDIATION_BOOK_FRESHNESS_SECONDS:
+                return {"fresh": False}
             positions = account.positions
             filled_token = yes_token_id if filled_leg == "YES" else no_token_id
             position_quantity = Decimal("0")
@@ -1284,6 +1308,16 @@ class PolymarketTradingClient:
                 leg: public.get_order_book(token_id=token)
                 for leg, token in token_by_leg.items()
             }
+            now = datetime.now(UTC)
+            book_timestamps: dict[str, datetime] = {}
+            for leg, book in books.items():
+                timestamp = _venue_timestamp(_field(book, "timestamp"))
+                if timestamp is None:
+                    return {"fresh": False}
+                age = (now - timestamp).total_seconds()
+                if age < 0 or age > REMEDIATION_BOOK_FRESHNESS_SECONDS:
+                    return {"fresh": False}
+                book_timestamps[leg] = timestamp
 
             def best(book: object, side: str) -> tuple[Decimal, Decimal, Decimal] | None:
                 rows = _collect(_field(book, side, ()))
@@ -1331,7 +1365,9 @@ class PolymarketTradingClient:
                 return {"fresh": False}
             return {
                 "fresh": True,
-                "checked_at": datetime.now(UTC),
+                # The combined read is only as fresh as its oldest venue
+                # snapshot; never replace it with a local wall-clock marker.
+                "checked_at": min(book_timestamps.values()),
                 "complete": {
                     "leg": missing_leg,
                     "side": "BUY",

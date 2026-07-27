@@ -991,7 +991,43 @@ class FakeRemediationPublicClient(FakePublicClient):
             bids=(SimpleNamespace(price=price, size=Decimal("100")),),
             min_order_size=Decimal("1"),
             tick_size=Decimal("0.01"),
+            timestamp=datetime.now(UTC),
         )
+
+
+class StaleRemediationPublicClient(FakeRemediationPublicClient):
+    def get_order_book(self, *, token_id: str) -> object:
+        book = super().get_order_book(token_id=token_id)
+        book.timestamp = datetime.now(UTC) - timedelta(seconds=11)  # type: ignore[attr-defined]
+        return book
+
+
+class MissingRemediationTimestampPublicClient(FakeRemediationPublicClient):
+    def get_order_book(self, *, token_id: str) -> object:
+        book = super().get_order_book(token_id=token_id)
+        delattr(book, "timestamp")
+        return book
+
+
+class MalformedRemediationTimestampPublicClient(FakeRemediationPublicClient):
+    def get_order_book(self, *, token_id: str) -> object:
+        book = super().get_order_book(token_id=token_id)
+        book.timestamp = "not-a-timestamp"  # type: ignore[attr-defined]
+        return book
+
+
+class FutureRemediationTimestampPublicClient(FakeRemediationPublicClient):
+    def get_order_book(self, *, token_id: str) -> object:
+        book = super().get_order_book(token_id=token_id)
+        book.timestamp = datetime.now(UTC) + timedelta(seconds=1)  # type: ignore[attr-defined]
+        return book
+
+
+class NumericRemediationTimestampPublicClient(FakeRemediationPublicClient):
+    def get_order_book(self, *, token_id: str) -> object:
+        book = super().get_order_book(token_id=token_id)
+        book.timestamp = str(int(datetime.now(UTC).timestamp() * 1000))  # type: ignore[attr-defined]
+        return book
 
 
 def test_preflight_report_discovers_standard_fee_free_probe_without_post(
@@ -1051,6 +1087,69 @@ def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
     assert complete["quantity"] == Decimal("10")
     assert complete["amount"] == complete["max_spend"]
     assert complete["loss"] <= Decimal("2")
+    assert fake.post_calls == []
+
+
+@pytest.mark.parametrize(
+    "public_factory",
+    [
+        StaleRemediationPublicClient,
+        MissingRemediationTimestampPublicClient,
+        MalformedRemediationTimestampPublicClient,
+        FutureRemediationTimestampPublicClient,
+    ],
+)
+def test_remediation_options_reject_stale_or_invalid_book_timestamps(
+    public_factory: type[object],
+) -> None:
+    adapter, fake = make_adapter()
+    fake.position_rows = [
+        {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
+    ]
+    fake.list_open_orders = lambda **kwargs: []  # type: ignore[method-assign]
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=fake,
+        public_client_factory=public_factory,
+    )
+
+    result = adapter.remediation_options(
+        condition_id="condition-1",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        filled_leg="YES",
+        filled_quantity=Decimal("10"),
+        since=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert result == {"fresh": False}
+    assert fake.post_calls == []
+
+
+def test_remediation_options_accepts_fresh_numeric_string_book_timestamps() -> None:
+    adapter, fake = make_adapter()
+    fake.position_rows = [
+        {"condition_id": "condition-1", "token_id": "yes-token", "size": Decimal("10")}
+    ]
+    fake.list_open_orders = lambda **kwargs: []  # type: ignore[method-assign]
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET),
+        client=fake,
+        public_client_factory=NumericRemediationTimestampPublicClient,
+    )
+
+    result = adapter.remediation_options(
+        condition_id="condition-1",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        filled_leg="YES",
+        filled_quantity=Decimal("10"),
+        since=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert result["fresh"] is True
+    assert isinstance(result["checked_at"], datetime)
+    assert (datetime.now(UTC) - result["checked_at"]).total_seconds() < 10
     assert fake.post_calls == []
 
 

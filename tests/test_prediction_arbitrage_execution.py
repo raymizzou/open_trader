@@ -804,6 +804,142 @@ def test_no_only_chooses_lower_loss_unwind_without_merge(tmp_path: Path) -> None
     assert trading.merge_calls == 0
 
 
+def test_unwind_quantity_mismatch_is_rejected_without_order(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="no_only")
+
+    def mismatched_options(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "fresh": True,
+            "complete": {"loss": Decimal("2.01")},
+            "unwind": {
+                "leg": "NO",
+                "side": "SELL",
+                "token_id": "no-token",
+                "shares": Decimal("9"),
+                "quantity": Decimal("10"),
+                "min_price": Decimal("0.09"),
+                "loss": Decimal("0.90"),
+            },
+        }
+
+    trading.remediation_options = mismatched_options  # type: ignore[method-assign]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "mismatched-unwind")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.remediation_calls == []
+    assert trading.merge_calls == 0
+
+
+def test_unwind_without_explicit_shares_is_rejected_without_order(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="no_only")
+
+    def missing_shares_options(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "fresh": True,
+            "complete": {"loss": Decimal("2.01")},
+            "unwind": {
+                "leg": "NO",
+                "side": "SELL",
+                "token_id": "no-token",
+                "quantity": Decimal("10"),
+                "min_price": Decimal("0.09"),
+                "loss": Decimal("0.90"),
+            },
+        }
+
+    trading.remediation_options = missing_shares_options  # type: ignore[method-assign]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "missing-unwind-shares")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.remediation_calls == []
+
+
+def test_string_remediation_amounts_are_rejected_without_order(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="yes_only")
+
+    def string_options(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "fresh": True,
+            "complete": {
+                "leg": "NO",
+                "side": "BUY",
+                "token_id": "no-token",
+                "quantity": "10",
+                "amount": "1.20",
+                "max_spend": "1.20",
+                "max_price": "0.12",
+                "loss": "1.20",
+            },
+            "unwind": {"loss": Decimal("3")},
+        }
+
+    trading.remediation_options = string_options  # type: ignore[method-assign]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "string-remediation-fields")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.remediation_calls == []
+
+
+def test_complete_shares_only_candidate_is_rejected_without_order(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="yes_only")
+
+    def shares_only_options(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "fresh": True,
+            "complete": {
+                "leg": "NO",
+                "side": "BUY",
+                "token_id": "no-token",
+                "shares": Decimal("10"),
+                "amount": Decimal("1.20"),
+                "max_spend": Decimal("1.20"),
+                "max_price": Decimal("0.12"),
+                "loss": Decimal("1.20"),
+            },
+            "unwind": {"loss": Decimal("3")},
+        }
+
+    trading.remediation_options = shares_only_options  # type: ignore[method-assign]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "shares-only-completion")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.remediation_calls == []
+
+
+def test_completion_requires_strict_verified_reconciliation_proof(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="yes_only")
+    original_reconcile = trading.reconcile
+
+    def partial_reconcile(**kwargs: object) -> dict[str, object]:
+        result = original_reconcile(**kwargs)
+        if trading._remediated:
+            proof = dict(result["execution_proof"])
+            proof["verified"] = False
+            proof["partial_verified"] = True
+            result["execution_proof"] = proof
+        return result
+
+    trading.reconcile = partial_reconcile  # type: ignore[method-assign]
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "partial-remediation-proof")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert trading.merge_calls == 0
+
+
 def test_one_leg_above_two_dollars_sends_no_remediation(tmp_path: Path) -> None:
     service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
     preview = service.preview("opp-1")
@@ -843,6 +979,24 @@ def test_startup_reconciliation_cancels_known_orders_once_and_stays_locked(tmp_p
     assert result["state"] == "locked"
     assert trading.cancel_calls == [("open-order",)]
     assert service.preview("opp-1")["state"] == "locked"
+
+
+def test_startup_confirmed_merge_requires_fresh_neutral_post_state(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="equal_pair")
+    trading.account_mode = "equal_pair"
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "startup-stale-merge")
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "equal_pair"
+    assert result["merge"] == "incident"
+    assert result["reconciled"] is False
+    incident = store.unacknowledged_incident()
+    assert incident is not None
+    assert incident["state"] == "merge_incident"
+    assert incident["execution_id"] == execution["execution_id"]
 
 
 def test_clean_startup_becomes_ready_only_after_fresh_reconciliation(tmp_path: Path) -> None:

@@ -330,14 +330,29 @@ class PredictionExecutionService:
             self._startup_incident(active_id, "unknown_external_state", evidence)
             return {"state": "locked", "reason": "unknown_external_state", **evidence}
         if totals["yes"] > 0 and totals["no"] > 0 and totals["yes"] == totals["no"]:
-            merge = self._startup_merge(active, active_intent, totals["yes"])
+            merge = self._startup_merge(
+                active,
+                active_intent,
+                totals["yes"],
+                before=snapshot,
+            )
             evidence = {
                 "phase": "startup_equal_pair",
                 "yes_quantity": _safe_decimal(totals["yes"]),
                 "no_quantity": _safe_decimal(totals["no"]),
                 **merge,
             }
-            self._startup_incident(active_id, "startup_equal_pair", evidence)
+            incident_state = (
+                "merge_incident"
+                if merge.get("reconciled") is not True
+                else "directional_incident"
+            )
+            self._startup_incident(
+                active_id,
+                "startup_equal_pair",
+                evidence,
+                state=incident_state,
+            )
             return {"state": "locked", "reason": "equal_pair", **evidence}
         if totals["yes"] > 0 or totals["no"] > 0:
             evidence = {
@@ -839,7 +854,12 @@ class PredictionExecutionService:
         return totals
 
     def _startup_incident(
-        self, execution_id: str, reason: str, evidence: Mapping[str, object]
+        self,
+        execution_id: str,
+        reason: str,
+        evidence: Mapping[str, object],
+        *,
+        state: str = "directional_incident",
     ) -> str | None:
         if not execution_id:
             attempts = self._notify_incident(reason)
@@ -849,7 +869,7 @@ class PredictionExecutionService:
             payload = {
                 "recovery": True,
                 "reason": reason,
-                "state": "directional_incident",
+                "state": state,
                 "breaker": "open",
                 **self._safe_mapping(evidence),
                 "notification_attempts": attempts,
@@ -863,7 +883,7 @@ class PredictionExecutionService:
                 return self._record_incident(
                     execution_id,
                     reason,
-                    state="directional_incident",
+                    state=state,
                     evidence={**payload, "notification_attempts": attempts},
                     notify=False,
                 )
@@ -872,7 +892,7 @@ class PredictionExecutionService:
         return self._record_incident(
             execution_id,
             reason,
-            state="directional_incident",
+            state=state,
             evidence=evidence,
         )
 
@@ -881,6 +901,8 @@ class PredictionExecutionService:
         active: Mapping[str, object] | None,
         intent: PairIntent | None,
         quantity: Decimal,
+        *,
+        before: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         if active is None or intent is None:
             return {"merge": "blocked", "merge_reason": "unknown_pair"}
@@ -893,16 +915,70 @@ class PredictionExecutionService:
             ]
             if merge_evidence:
                 if self._merge_confirmed(merge_evidence[-1]):
-                    return {"merge": "already_confirmed", "reconciled": True}
-                return {"merge": "pending", "reconciled": False}
-        merge = getattr(self._trading, "merge_once", None)
-        try:
-            result = _call(merge, condition_id=intent.condition_id, quantity=quantity)
-        except Exception:
-            result = {"status": "blocked", "confirmed": False, "error_code": "merge_error"}
+                    result: object = merge_evidence[-1]
+                else:
+                    return {"merge": "pending", "reconciled": False}
+            else:
+                result = None
+        else:
+            result = None
+        if result is None:
+            merge = getattr(self._trading, "merge_once", None)
+            try:
+                result = _call(merge, condition_id=intent.condition_id, quantity=quantity)
+            except Exception:
+                result = {
+                    "status": "blocked",
+                    "confirmed": False,
+                    "error_code": "merge_error",
+                }
+        merge_result = (
+            self._safe_mapping(result)
+            if isinstance(result, Mapping)
+            else {"status": self._result_status(result)}
+        )
+        if not self._merge_confirmed(result):
+            return {
+                "merge": "incident",
+                "reconciled": False,
+                "merge_result": merge_result,
+                "merge_reason": "merge_not_confirmed",
+            }
+        after = self._fresh_account_snapshot()
+        if after is None:
+            return {
+                "merge": "incident",
+                "reconciled": False,
+                "merge_result": merge_result,
+                "merge_reason": "post_merge_account_unavailable",
+            }
+        after_totals = self._position_totals(after, intent)
+        before_balance = _decimal(before.get("p_usd_balance")) if before else None
+        after_balance = _decimal(after.get("p_usd_balance"))
+        if (
+            after_totals["unknown"]
+            or after_totals["yes"] != 0
+            or after_totals["no"] != 0
+            or before_balance is None
+            or after_balance is None
+            or after_balance <= before_balance
+        ):
+            return {
+                "merge": "incident",
+                "reconciled": False,
+                "merge_result": merge_result,
+                "merge_reason": "post_merge_state_unverified",
+                "post_merge_checked_at": after.get("checked_at"),
+                "post_merge_positions": after.get("positions", ()),
+                "post_merge_p_usd_balance": after_balance,
+            }
         return {
-            "merge": "confirmed" if self._merge_confirmed(result) else "incident",
-            "merge_result": self._safe_mapping(result) if isinstance(result, Mapping) else {"status": self._result_status(result)},
+            "merge": "confirmed",
+            "reconciled": True,
+            "merge_result": merge_result,
+            "post_merge_checked_at": after.get("checked_at"),
+            "post_merge_positions": after.get("positions", ()),
+            "post_merge_p_usd_balance": after_balance,
         }
 
     def _pending_merge(self, active: Mapping[str, object] | None) -> bool:
@@ -1026,17 +1102,23 @@ class PredictionExecutionService:
             )
             if token_id != expected_token:
                 continue
-            quantity = _decimal(option.get("quantity", option.get("shares")))
+            raw_quantity = option.get("quantity")
+            if not isinstance(raw_quantity, Decimal) or not raw_quantity.is_finite():
+                continue
+            quantity = raw_quantity
             if quantity != filled_quantity:
                 continue
             if option is complete:
-                amount = _decimal(option.get("amount"))
-                max_spend = _decimal(option.get("max_spend"))
-                max_price = _decimal(option.get("max_price"))
+                amount = option.get("amount")
+                max_spend = option.get("max_spend")
+                max_price = option.get("max_price")
                 if (
-                    amount is None
-                    or max_spend is None
-                    or max_price is None
+                    not isinstance(amount, Decimal)
+                    or not amount.is_finite()
+                    or not isinstance(max_spend, Decimal)
+                    or not max_spend.is_finite()
+                    or not isinstance(max_price, Decimal)
+                    or not max_price.is_finite()
                     or amount <= 0
                     or amount > Decimal("2")
                     or amount != max_spend
@@ -1049,8 +1131,21 @@ class PredictionExecutionService:
                 ):
                     continue
             else:
-                min_price = _decimal(option.get("min_price"))
-                if min_price is None or min_price <= 0 or min_price > 1:
+                shares = option.get("shares")
+                if (
+                    not isinstance(shares, Decimal)
+                    or not shares.is_finite()
+                    or shares <= 0
+                    or shares != quantity
+                ):
+                    continue
+                min_price = option.get("min_price")
+                if (
+                    not isinstance(min_price, Decimal)
+                    or not min_price.is_finite()
+                    or min_price <= 0
+                    or min_price > 1
+                ):
                     continue
             candidate = dict(option)
             candidate["loss"] = format(loss, "f")
@@ -1165,10 +1260,17 @@ class PredictionExecutionService:
             yes=repaired_yes,
             no=repaired_no,
         )
-        if known is None or known[0] <= 0 or known[1] <= 0 or known[0] != known[1]:
+        if (
+            known is None
+            or known[0] <= 0
+            or known[1] <= 0
+            or known[0] != known[1]
+            or not isinstance(known[2], Mapping)
+            or known[2].get("verified") is not True
+        ):
             self._finish_incident(
                 execution_id,
-                "remediation_reconciliation_failed",
+                "remediation_reconciliation_unverified",
                 incident_id=incident_id,
                 notify=False,
             )
