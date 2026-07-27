@@ -1124,7 +1124,11 @@ class PredictionExecutionService:
             phase = item.get("phase")
             if phase in {"startup_merge_attempt", "remediation_merge_attempt"}:
                 return None
-            if phase not in {"merge_result", "remediation_merge_result"}:
+            # A remediation merge still needs its post-merge account/balance
+            # proof; a restart must not treat its transaction marker alone as
+            # neutralized.  The startup recovery branch only auto-reconciles
+            # the ordinary confirmed merge result.
+            if phase != "merge_result":
                 continue
             return dict(item) if PredictionExecutionService._merge_confirmed(item) else None
         return None
