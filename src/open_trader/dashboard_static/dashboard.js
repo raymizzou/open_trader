@@ -46,11 +46,19 @@ const state = {
     error: "",
     result: null,
   },
+  predictionMarket: {
+    payload: null,
+    historyKind: "signals",
+    error: "",
+    pollId: null,
+    csrfToken: "",
+    activeExecutionId: "",
+  },
 };
 
 const elements = {};
 
-const WORKSPACE_VIEWS = new Set(["portfolio", "kelly_lab", "standard_backtest", "trend_report"]);
+const WORKSPACE_VIEWS = new Set(["portfolio", "prediction_market", "kelly_lab", "standard_backtest", "trend_report"]);
 
 const ACCOUNT_STRATEGY_PROFILES = {
   futu: {horizon: "期权增强", strategy: "跨市场期权关注"},
@@ -147,6 +155,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
 function bindElements() {
   [
+    "main-topbar",
+    "main-navigation",
+    "dashboard-header",
     "quote-status",
     "last-refresh",
     "refresh-quotes",
@@ -160,6 +171,9 @@ function bindElements() {
     "source-status-list",
     "dashboard-shell",
     "workspace-grid",
+    "prediction-market-workspace",
+    "prediction-market-root",
+    "prediction-market-modal-root",
     "kelly-lab-panel",
     "holdings-panel",
     "open-kelly-lab",
@@ -222,6 +236,14 @@ function bindElements() {
 }
 
 function bindEvents() {
+  elements["main-navigation"].addEventListener("click", (event) => {
+    const button = event.target.closest("[data-workspace]");
+    if (!button) return;
+    setWorkspaceView(button.dataset.workspace || "portfolio");
+  });
+  elements["prediction-market-root"].addEventListener("click", handlePredictionMarketClick);
+  elements["prediction-market-modal-root"].addEventListener("click", handlePredictionModalClick);
+  document.addEventListener("keydown", handlePredictionModalKeydown);
   if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
     window.matchMedia("(max-width: 760px)").addEventListener?.(
       "change",
@@ -938,21 +960,41 @@ function setWorkspaceView(view) {
   state.workspaceView = WORKSPACE_VIEWS.has(view) ? view : "portfolio";
   renderWorkspaceChrome();
   if (state.workspaceView === "kelly_lab") renderKellyLab();
+  if (state.workspaceView === "prediction_market") {
+    renderPredictionMarket();
+    fetchPredictionState();
+    startPredictionPolling();
+  } else {
+    stopPredictionPolling();
+  }
 }
 
 function renderWorkspaceChrome() {
   const view = state.workspaceView;
+  document.body?.classList?.toggle?.("prediction-market-active", view === "prediction_market");
   const toolView = view !== "portfolio";
   elements["dashboard-shell"].classList.toggle("tool-workspace-view", toolView);
   elements["return-to-portfolio"].hidden = !toolView;
   elements["return-to-portfolio"].classList.toggle("hidden", !toolView);
-  elements["workspace-grid"].classList.toggle("hidden", view === "standard_backtest" || view === "trend_report");
+  elements["dashboard-header"]?.classList.toggle("hidden", view === "prediction_market");
+  elements["workspace-grid"].classList.toggle("hidden", view === "standard_backtest" || view === "trend_report" || view === "prediction_market");
   elements["holdings-panel"].classList.toggle("hidden", view !== "portfolio");
   elements["kelly-lab-panel"].classList.toggle("hidden", view !== "kelly_lab");
+  if (elements["prediction-market-workspace"]) {
+    elements["prediction-market-workspace"].hidden = view !== "prediction_market";
+    elements["prediction-market-workspace"].classList.toggle("hidden", view !== "prediction_market");
+  }
   elements["standard-backtest-workspace"].hidden = view !== "standard_backtest";
   elements["standard-backtest-workspace"].classList.toggle("hidden", view !== "standard_backtest");
   elements["trend-report-workspace"].hidden = view !== "trend_report";
   elements["trend-report-workspace"].classList.toggle("hidden", view !== "trend_report");
+  const navigationButtons = typeof elements["main-navigation"]?.querySelectorAll === "function"
+    ? elements["main-navigation"].querySelectorAll("[data-workspace]")
+    : [];
+  navigationButtons.forEach((button) => {
+    const active = button.dataset.workspace === view;
+    button.setAttribute("aria-current", active ? "page" : "false");
+  });
 }
 
 function renderKellyLab() {
@@ -1878,6 +1920,550 @@ function renderKellyParameterDerivation(stats) {
       <p>f* = p - (1 - p) / b</p>
     </section>
   `;
+}
+
+let predictionModal = {kind: "", previousFocus: null, busy: false, data: null};
+
+function predictionValue(value, fallback = "-") {
+  return value === null || value === undefined || value === "" ? fallback : String(value);
+}
+
+function predictionNumber(value, fallback = "-") {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString("en-US", {maximumFractionDigits: 2}) : fallback;
+}
+
+function predictionMoney(value, fallback = "-") {
+  const number = Number(value);
+  return Number.isFinite(number) ? `$${number.toFixed(2)}` : (String(value || fallback));
+}
+
+function predictionPrice(value, fallback = "-") {
+  const number = Number(value);
+  return Number.isFinite(number) ? `$${number.toFixed(3)}` : (String(value || fallback));
+}
+
+function predictionSignedMoney(value, fallback = "-") {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number >= 0 ? "+" : "-"}$${Math.abs(number).toFixed(2)}` : fallback;
+}
+
+function predictionVolume(value, fallback = "-") {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value || fallback);
+  if (Math.abs(number) >= 1000000) return `$${(number / 1000000).toFixed(number % 1000000 ? 1 : 0)}M`;
+  if (Math.abs(number) >= 1000) return `$${(number / 1000).toFixed(number % 1000 ? 1 : 0)}K`;
+  return `$${number.toFixed(2)}`;
+}
+
+function predictionTone(value) {
+  const text = String(value || "").toLowerCase();
+  if (text.includes("fail") || text.includes("error") || text.includes("block") || text.includes("lock") || text.includes("禁止") || text.includes("事故") || text.includes("熔断")) return "pm-tone-danger";
+  if (text.includes("warn") || text.includes("check") || text.includes("执行") || text.includes("等待") || text.includes("待")) return "pm-tone-warning";
+  return "pm-tone-ok";
+}
+
+function predictionReasonLabel(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "仅监控";
+  const labels = {
+    neg_risk: "已订阅 · Negative Risk 暂不可参与",
+    fee_unverified_or_enabled: "已订阅 · 收费市场不可参与",
+    readiness_stale: "交易检查未完成",
+    book_stale: "盘口过期，等待更新",
+    no_threshold_candidate: "已订阅 · $20 上限内净利润不足 $1",
+    monitor_degraded: "数据连接异常，仅监控",
+    opportunity_unavailable: "机会已变化或已失效",
+  };
+  return labels[raw] || raw.replaceAll("_", " ");
+}
+
+function predictionIncidentReasonLabel(value) {
+  const raw = String(value || "").trim();
+  const labels = {
+    one_leg_fill: "YES 成交、NO 被拒",
+    no_safe_remediation: "未找到安全处置方案",
+    remediation_unverified: "自动处置未确认",
+    remediation_reconciliation_unverified: "处置后持仓未确认归零",
+    remediation_merge_not_confirmed: "处置后的合并未确认",
+    startup_open_orders: "重启时发现未完成订单",
+    startup_directional_imbalance: "重启时发现单腿持仓",
+    merge_not_confirmed: "合并未确认",
+  };
+  return labels[raw] || predictionReasonLabel(raw);
+}
+
+function predictionIncidentStatusLabel(value) {
+  const raw = String(value || "").trim();
+  const labels = {
+    directional_incident: "已消除敞口 · 待解除熔断",
+    neutralized_incident: "已处置 · 待解除熔断",
+    merge_incident: "合并未确认 · 待人工处理",
+    remediating: "自动处置中",
+  };
+  return labels[raw] || raw;
+}
+
+function predictionGeoblockLabel(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (["allowed", "allow", "ok", "ready", "pass"].includes(raw)) return "允许交易";
+  if (["blocked", "denied", "fail", "failed", "error"].includes(raw)) return "检查失败";
+  return value;
+}
+
+function predictionStatusLabel(payload) {
+  const readiness = payload?.readiness || {};
+  const status = String(payload?.status || readiness.status || "").toLowerCase();
+  if (payload?.stale || status === "degraded" || status === "unavailable" || status === "error") return ["Watcher 异常", "danger"];
+  if (status === "loading" || status === "checking") return ["正在读取状态", "warning"];
+  return ["Watcher 在线", "ok"];
+}
+
+function predictionOpportunityDisplay(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const result = {...source};
+  result.opportunity_id = source.opportunity_id ?? source.id ?? source.opportunityId;
+  result.title = source.title ?? source.question ?? source.market_title ?? source.event_title ?? "预测市场机会";
+  result.yes_price = source.yes_price ?? source.yes_max_price ?? source.yes_best_bid;
+  result.no_price = source.no_price ?? source.no_max_price ?? source.no_best_bid;
+  result.yes_cost = source.yes_cost ?? source.yes_max_cost;
+  result.no_cost = source.no_cost ?? source.no_max_cost;
+  result.max_cost = source.max_cost ?? source.total_max_cost ?? source.cost;
+  result.profit = source.profit ?? source.minimum_profit ?? source.estimated_profit ?? source.gross_upper_bound;
+  result.quantity = source.quantity ?? source.size;
+  return result;
+}
+
+function predictionEventDisplay(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const result = {...source};
+  const rawOpportunities = Array.isArray(source.opportunities) ? source.opportunities : [];
+  const rawMarkets = Array.isArray(source.markets) ? source.markets : [];
+  const nested = (rawOpportunities.length ? rawOpportunities : rawMarkets)
+    .filter((item) => item && typeof item === "object")
+    .map(predictionOpportunityDisplay);
+  result.title = source.title ?? source.question ?? source.event_title ?? source.market_title ?? nested[0]?.title ?? "预测市场事件";
+  result.volume_24h = source.volume_24h ?? source.volume24h ?? nested[0]?.volume_24h;
+  result.market_count = source.market_count ?? (Array.isArray(source.markets) ? source.markets.length : source.markets);
+  result.opportunities = nested;
+  result.actionable = source.actionable === true || nested.some((item) => item.actionable === true);
+  result.profit = source.profit ?? source.minimum_profit ?? source.gross_upper_bound ?? nested[0]?.profit;
+  if (!Array.isArray(source.details) && nested.length) {
+    result.details = nested.map((item) => [
+      item.title || item.market_title || "市场",
+      item.actionable ? "可参与" : predictionReasonLabel(item.reason || item.eligibility_reason || item.status),
+    ]);
+  }
+  return result;
+}
+
+function predictionEvents(payload) {
+  const events = Array.isArray(payload?.events) ? payload.events.filter((item) => item && typeof item === "object") : [];
+  if (events.length) return events.map(predictionEventDisplay);
+  return (Array.isArray(payload?.opportunities) ? payload.opportunities : []).map((opportunity, index) => ({
+    event_id: opportunity.event_id || opportunity.opportunity_id || `opportunity-${index}`,
+    ...predictionEventDisplay({
+      ...predictionOpportunityDisplay(opportunity),
+      opportunities: [opportunity],
+    }),
+  }));
+}
+
+function predictionOpportunities(payload) {
+  return (Array.isArray(payload?.opportunities) ? payload.opportunities : [])
+    .filter((item) => item && typeof item === "object")
+    .map(predictionOpportunityDisplay);
+}
+
+function predictionPageHeader(payload) {
+  const [health, tone] = predictionStatusLabel(payload);
+  return `<header class="pm-page-head"><div><h1>预测市场套利</h1><p>先看监控范围和实盘状态，再决定是否参与当前机会。</p></div><div class="pm-updated"><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : tone === "warning" ? "warning" : ""}"></i>${health}</span><br>最后心跳：${escapeHtml(predictionValue(payload?.heartbeat_at || payload?.heartbeat, "暂无"))} · Polymarket</div></header>`;
+}
+
+function predictionReadinessStrip(payload) {
+  const readiness = payload?.readiness || {};
+  const breaker = payload?.breaker || {};
+  const baseStatus = String(payload?.status || readiness.status || "").toLowerCase();
+  const executionStatus = String(payload?.current_execution?.status || payload?.current_execution?.state || "").toLowerCase();
+  const executionActive = ["running", "executing", "pending", "submitted", "reconciling", "validating", "final_validating", "submitting", "merging"].some((value) => executionStatus.includes(value));
+  const incidentActive = baseStatus.includes("incident") || Boolean(breaker.open && breaker.incident);
+  const status = incidentActive ? "incident" : executionActive ? "executing" : baseStatus;
+  const balance = readiness.p_usd_balance ?? readiness.balance ?? payload?.balances?.p_usd;
+  const wallet = readiness.masked_address || payload?.wallet?.masked_address || payload?.masked_wallet || readiness.wallet_address || readiness.wallet;
+  const geoblock = predictionGeoblockLabel(readiness.geoblock || readiness.region || readiness.region_status);
+  const trading = status.includes("incident") ? ["熔断中", "pm-tone-danger", "等待人工解除"]
+    : status.includes("execut") ? ["执行中", "pm-tone-warning", "其他按钮已锁定"]
+      : status.includes("degraded") || status.includes("unavailable") || status.includes("error") ? ["禁止交易", "pm-tone-danger", "数据连接未通过"]
+        : status.includes("loading") || status.includes("checking") ? ["检查中", "pm-tone-warning", "暂不可下单"]
+          : ["可以交易", "pm-tone-ok", "串行执行"];
+  const first = readiness.first_live_order === "已验证" ? ["已验证", "pm-tone-ok", "今天 14:36"]
+    : status.includes("incident") ? ["事故熔断", "pm-tone-danger", "已记录并通知"]
+      : ["待首单", "pm-tone-warning", "实盘链路尚未完成首单验证"];
+  return `<section class="pm-readiness" aria-label="实盘就绪状态">
+    <article class="pm-readiness-item"><span>交易钱包</span><strong>${escapeHtml(predictionValue(wallet, "未配置"))}</strong><small>独立低余额钱包 · Keychain</small></article>
+    <article class="pm-readiness-item"><span>可用余额</span><strong>${escapeHtml(predictionMoney(balance, "$50.00"))} pUSD</strong><small>不自动充值</small></article>
+    <article class="pm-readiness-item"><span>地区与连接</span><strong class="${predictionTone(geoblock)}">${escapeHtml(predictionValue(geoblock, "检查中"))}</strong><small>官方 geoblock · 本机访问</small></article>
+    <article class="pm-readiness-item"><span>实盘状态</span><strong class="${trading[1]}">${trading[0]}</strong><small>${trading[2]} · $20 / 应急 $2</small></article>
+    <article class="pm-readiness-item"><span>首单验证</span><strong class="${first[1]}">${first[0]}</strong><small>${first[2]}</small></article>
+  </section>`;
+}
+
+function predictionExecutionAlert(payload) {
+  const execution = payload?.current_execution;
+  const incident = payload?.breaker?.incident;
+  const status = String(execution?.status || execution?.state || payload?.status || "").toLowerCase();
+  if (incident || payload?.breaker?.open && status.includes("incident")) {
+    const incidentId = incident?.incident_id || incident?.id || "";
+    return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>交易已熔断：发生单腿成交</strong><p>${escapeHtml(predictionValue(incident?.reason || incident?.message, "YES 成交、NO 被拒；系统已卖回 YES，当前不平衡持仓为 0，实际损失 $0.60。macOS 与飞书已通知。"))}</p></div><button class="pm-button danger" type="button" data-action="open-reset" data-incident-id="${escapeHtml(incidentId)}">查看并解除熔断</button></section>`;
+  }
+  if (execution && ["running", "executing", "pending", "submitted", "reconciling", "validating", "final_validating", "submitting", "merging"].some((value) => status.includes(value))) {
+    return `<section class="pm-alert info" role="status" aria-live="polite"><div class="pm-alert-body"><strong>正在执行：${escapeHtml(predictionValue(execution.event_title || execution.market_title, "预测市场机会"))}</strong><p>本笔完成前，其他机会暂时不可参与。</p><div class="pm-progress" aria-label="订单执行进度"><div class="pm-progress-step done"><span>1 · 最终检查</span><strong>价格、余额、地区通过</strong></div><div class="pm-progress-step done"><span>2 · 双腿提交</span><strong>2 笔 FOK 已签名</strong></div><div class="pm-progress-step current"><span>3 · 成交核对</span><strong>正在读取两腿结果</strong></div><div class="pm-progress-step"><span>4 · 自动合并</span><strong>等待完整代币组</strong></div></div></div><span class="pm-pill watch">请勿关闭页面</span></section>`;
+  }
+  if (execution && ["confirmed", "completed", "merged", "success"].some((value) => status.includes(value))) {
+    const profit = execution.realized_profit ?? execution.profit ?? execution.net_profit;
+    return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交并自动合并</strong><p>买入 ${escapeHtml(predictionValue(execution.quantity, "20"))} 组实际成本 ${escapeHtml(predictionMoney(execution.actual_cost, "$18.80"))}，合并收回 ${escapeHtml(predictionMoney(execution.merge_value, "$20.00"))}，本次已实现净利润 <b>${escapeHtml(predictionSignedMoney(profit, "+$1.20"))}</b>。</p></div><span class="pm-pill action">已完成 · ${escapeHtml(predictionValue(execution.completed_at, "14:36:12"))}</span></section>`;
+  }
+  if (payload?.stale) return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>Polymarket 数据连接异常</strong><p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+  return "";
+}
+
+function predictionErrorAlert() {
+  const message = String(state.predictionMarket.error || "").trim();
+  if (!message) return "";
+  return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>本次操作未提交</strong><p>${escapeHtml(message)}</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+}
+
+function predictionMetricStrip(payload) {
+  const status = String(payload?.status || "").toLowerCase();
+  if (!payload || status === "loading") return `<section class="pm-metrics" aria-label="监控摘要加载中" aria-busy="true">${["当前可参与", "监控事件", "市场 / Token", "WebSocket", "过去 24 小时"].map((label) => `<article class="pm-metric"><span>${label}</span><strong>—</strong><small>正在读取…</small></article>`).join("")}</section>`;
+  const events = predictionEvents(payload);
+  const opportunities = predictionOpportunities(payload);
+  const executionStatus = String(payload?.current_execution?.status || payload?.current_execution?.state || "").toLowerCase();
+  const executionBlocked = payload?.current_execution && ["running", "executing", "pending", "submitted", "reconciling", "validating", "final_validating", "submitting", "merging"].some((value) => executionStatus.includes(value));
+  const actionable = payload?.breaker?.open || payload?.stale || executionBlocked
+    ? 0
+    : opportunities.filter((item) => item.actionable === true).length;
+  const marketCount = payload.market_count ?? payload.markets ?? "-";
+  const tokenCount = payload.token_count ?? payload.tokens ?? "-";
+  return `<section class="pm-metrics" aria-label="监控摘要"><article class="pm-metric primary"><span>当前可参与</span><strong>${actionable}</strong><small>后台检查全部通过后才显示</small></article><article class="pm-metric"><span>监控事件</span><strong>${predictionNumber(payload.event_count ?? events.length)}</strong><small>按 24h 成交量动态筛选</small></article><article class="pm-metric"><span>市场 / Token</span><strong>${escapeHtml(`${predictionValue(marketCount)} / ${predictionValue(tokenCount)}`)}</strong><small>不可参与市场仍持续监控</small></article><article class="pm-metric"><span>WebSocket</span><strong>${payload?.stale ? "重连中" : "正常"}</strong><small>Polymarket · 最近更新 1s</small></article><article class="pm-metric"><span>过去 24 小时</span><strong>${predictionNumber(payload.signals_24h ?? payload.history_count_24h ?? 0)}</strong><small>曾达到可参与条件</small></article></section>`;
+}
+
+function predictionEventRows(payload) {
+  const events = predictionEvents(payload);
+  if (!events.length) return `<div class="pm-empty compact"><strong>暂无监控事件</strong><p>Watcher 正常运行后，事件会按 24h 成交量显示。</p></div>`;
+  return events.map((event, index) => {
+    const nested = Array.isArray(event.opportunities) ? event.opportunities.map(predictionOpportunityDisplay) : [];
+    const opportunity = nested[0] || event;
+    const actionable = event.actionable === true || nested.some((item) => item?.actionable === true);
+    const title = event.title || event.event_title || opportunity.event_title || opportunity.title || "预测市场事件";
+    const volume = event.volume_24h ?? opportunity.volume_24h;
+    const details = Array.isArray(event.details) ? event.details : nested.length ? nested.map((item) => [item.title || item.market_title || "市场", item.actionable ? "可参与" : predictionReasonLabel(item.reason || item.eligibility_reason || item.status)]) : [[event.market_title || "市场", event.actionable ? "可参与" : predictionReasonLabel(event.reason || event.eligibility_reason || event.status)]];
+    return `<details class="pm-event"${index === 0 ? " open" : ""}><summary><div><div class="pm-event-title">${escapeHtml(title)}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count || event.markets, "市场"))} · ${escapeHtml(event.profit_label || (actionable ? "预计净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div><div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(predictionValue(event.status, actionable ? "可参与" : "仅监控"))}</div></summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
+  }).join("");
+}
+
+function predictionOpportunityPanel(payload) {
+  const status = String(payload?.status || "").toLowerCase();
+  if (status === "loading") return `<div class="pm-empty" aria-busy="true"><strong>正在读取可参与机会</strong><p>钱包、地区、费用和最新盘口完成检查后才会显示按钮。</p></div>`;
+  if (status === "unavailable") return `<div class="pm-empty"><strong>预测市场暂不可用</strong><p>当前只保留最后一次监控结果，连接恢复并通过安全检查后才开放按钮。</p></div>`;
+  const opportunities = predictionOpportunities(payload);
+  const opportunity = opportunities[0];
+  if (!opportunity) return `<div class="pm-empty"><strong>当前没有可参与机会</strong><p>Watcher 正常运行。历史信号仍可在下方查看。</p></div>`;
+  const executionStatus = String(payload?.current_execution?.status || payload?.current_execution?.state || "").toLowerCase();
+  const executionBlocked = payload?.current_execution && ["running", "executing", "pending", "submitted", "reconciling", "validating", "final_validating", "submitting", "merging"].some((value) => executionStatus.includes(value));
+  const actionable = opportunity.actionable === true && !payload?.breaker?.open && !executionBlocked && !payload?.stale;
+  const title = opportunity.title || opportunity.market_title || opportunity.event_title || "预测市场机会";
+  const buttonText = executionBlocked ? "另一笔正在执行" : payload?.stale ? "数据异常" : payload?.breaker?.open ? "熔断中" : actionable ? `参与 · 预计 ${predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit, "+$1.20")}` : "暂不可参与";
+  return `<article class="pm-opportunity ${actionable ? "" : "disabled"}"><div class="pm-opportunity-title"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(predictionValue(opportunity.venue || "Polymarket"))} · ${escapeHtml(predictionValue(opportunity.market_type || "普通二元"))} · ${escapeHtml(predictionValue(opportunity.fee_status || "免手续费"))} · ${escapeHtml(predictionValue(opportunity.updated_at || "1 秒前更新"))}</p></div><span class="pm-pill ${actionable ? "action" : "watch"}">${actionable ? "可参与" : "暂不可参与"}</span></div><dl class="pm-opportunity-metrics"><div><dt>YES 最高买价</dt><dd>${escapeHtml(predictionPrice(opportunity.yes_price ?? opportunity.yes_best_bid))}</dd></div><div><dt>NO 最高买价</dt><dd>${escapeHtml(predictionPrice(opportunity.no_price ?? opportunity.no_best_bid))}</dd></div><div><dt>自动数量</dt><dd>${escapeHtml(predictionValue(opportunity.quantity ?? opportunity.size, "-"))} 组</dd></div><div><dt>最大成本</dt><dd>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.cost))}</dd></div><div><dt>最低净利润</dt><dd class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit, "+$1.20"))}</dd></div></dl><div class="pm-opportunity-action"><p>确认时会重新检查价格；不满足利润门槛就拒绝下单。</p><button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id || opportunity.id, ""))}"${actionable ? "" : " disabled"}>${escapeHtml(buttonText)}</button></div></article>`;
+}
+
+function predictionHistoryContent(payload, kind) {
+  const rows = payload?.histories?.[kind];
+  if (!Array.isArray(rows) || !rows.length) return `<div class="pm-empty compact"><strong>${kind === "signals" ? "还没有历史信号" : kind === "executions" ? "还没有真实交易" : "没有交易事故"}</strong><p>${kind === "signals" ? "后台达到正式信号门槛后会保留出现时间、成交量和利润。" : kind === "executions" ? "第一笔真实机会完成后，这里会记录两腿订单、合并交易和已实现利润。" : "单腿成交、自动处置失败和合并失败会永久保留在这里。"}</p></div>`;
+  const displayRows = rows.map((row) => predictionHistoryDisplay(kind, row));
+  if (kind === "signals") {
+    return `<table class="pm-table"><thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>峰值净边际</th><th>可执行</th><th>峰值利润</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="出现时间">${escapeHtml(predictionValue(row.occurred_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="持续">${escapeHtml(predictionValue(row.duration))}</td><td data-label="峰值净边际">${escapeHtml(row.peak_edge === undefined || row.peak_edge === null ? "-" : `$${predictionValue(row.peak_edge)}`)}</td><td data-label="可执行">${escapeHtml(predictionValue(row.quantity))} 组</td><td data-label="峰值利润" class="pm-positive"><strong>${escapeHtml(predictionMoney(row.profit, "$1.20"))}</strong></td></tr>`).join("")}</tbody></table>`;
+  }
+  if (kind === "executions") {
+    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${escapeHtml(predictionSignedMoney(row.realized_profit, "+$1.20"))}</strong></td></tr>`; }).join("")}</tbody></table>`;
+  }
+  return `<table class="pm-table"><thead><tr><th>发生时间</th><th>市场</th><th>原因</th><th>自动处置</th><th>损失</th><th>状态</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="发生时间">${escapeHtml(predictionValue(row.happened_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="原因">${escapeHtml(predictionIncidentReasonLabel(row.reason))}</td><td data-label="自动处置">${escapeHtml(predictionValue(row.remediation))}</td><td data-label="损失" class="pm-tone-danger"><strong>${escapeHtml(predictionSignedMoney(row.loss, "-$0.60"))}</strong></td><td data-label="状态">${escapeHtml(predictionIncidentStatusLabel(row.status))}</td></tr>`).join("")}</tbody></table>`;
+}
+
+function predictionHistoryDisplay(kind, value) {
+  const row = value && typeof value === "object" ? value : {};
+  const evidence = row.evidence && typeof row.evidence === "object" ? row.evidence : {};
+  if (kind === "signals") {
+    return {
+      ...row,
+      occurred_at: row.occurred_at ?? row.started_at ?? row.created_at,
+      event_title: row.event_title ?? row.question ?? row.title,
+      duration: row.duration ?? "-",
+      peak_edge: row.peak_edge ?? row.peak_net_edge ?? row.net_edge,
+      quantity: row.quantity ?? row.peak_quantity,
+      profit: row.profit ?? row.peak_estimated_profit ?? row.estimated_profit ?? row.minimum_profit,
+    };
+  }
+  if (kind === "executions") {
+    return {
+      ...row,
+      completed_at: row.completed_at ?? row.updated_at ?? row.created_at,
+      event_title: row.event_title ?? row.question ?? row.title,
+      quantity: row.quantity ?? row.peak_quantity,
+      actual_cost: row.actual_cost ?? row.total_max_cost,
+      merge_value: row.merge_value ?? row.merge_amount ?? row.quantity,
+      realized_profit: row.realized_profit ?? row.profit ?? row.minimum_profit,
+    };
+  }
+  return {
+    ...row,
+    happened_at: row.happened_at ?? row.created_at ?? row.updated_at,
+    event_title: row.event_title ?? row.question ?? row.title,
+    reason: row.reason ?? evidence.reason,
+    remediation: row.remediation ?? evidence.remediation,
+    loss: row.loss ?? evidence.loss ?? evidence.actual_loss,
+    status: row.status ?? row.state,
+  };
+}
+
+function predictionHistoryPanel(payload) {
+  const kind = state.predictionMarket.historyKind;
+  return `<section class="pm-panel"><header class="pm-panel-heading"><div><h2>历史记录</h2><p>信号、真实交易与事故分开保存；不记录原始盘口 tick。</p></div><div class="pm-history-tabs" aria-label="历史类型"><button class="pm-history-tab" type="button" data-history="signals" aria-pressed="${kind === "signals"}">信号历史</button><button class="pm-history-tab" type="button" data-history="executions" aria-pressed="${kind === "executions"}">交易与合并</button><button class="pm-history-tab" type="button" data-history="incidents" aria-pressed="${kind === "incidents"}">事故</button></div></header>${predictionHistoryContent(payload, kind)}</section>`;
+}
+
+function renderPredictionMarket() {
+  const root = elements["prediction-market-root"];
+  if (!root) return;
+  const payload = state.predictionMarket.payload;
+  const viewPayload = payload || {status: "loading", events: [], opportunities: []};
+  root.innerHTML = `<aside class="pm-prototype-note">UI 设计原型：所有价格、钱包和交易记录都是演示数据；底部场景控制器不会进入正式产品。</aside>${predictionPageHeader(viewPayload)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload)}${predictionExecutionAlert(viewPayload)}${predictionMetricStrip(viewPayload)}<aside class="pm-policy"><strong>V1 只对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控、显示成交量和毛利润上限，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${predictionEvents(viewPayload).length} / ${escapeHtml(predictionValue(viewPayload.event_count || predictionEvents(viewPayload).length))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload)}</div></section><div class="pm-stack"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前机会</h2><p>后台检查通过后，才允许在 Open Trader 内确认下单。</p></div><span class="pm-pill venue">Polymarket</span></header>${predictionOpportunityPanel(viewPayload)}</section>${predictionHistoryPanel(viewPayload)}</div></div>`;
+}
+
+function startPredictionPolling() {
+  stopPredictionPolling();
+  if (state.workspaceView !== "prediction_market") return;
+  state.predictionMarket.pollId = window.setInterval(fetchPredictionState, 5000);
+}
+
+function stopPredictionPolling() {
+  if (state.predictionMarket.pollId !== null) {
+    window.clearInterval(state.predictionMarket.pollId);
+    state.predictionMarket.pollId = null;
+  }
+}
+
+function predictionRequestUrl(path) {
+  if (typeof window === "undefined" || !window.location) return path;
+  const scenario = new URLSearchParams(window.location.search || "").get("prediction_state");
+  return scenario ? `${path}${path.includes("?") ? "&" : "?"}scenario=${encodeURIComponent(scenario)}` : path;
+}
+
+function setPredictionScenario(value) {
+  if (typeof window === "undefined" || !window.history || !window.location) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("prediction_state", value);
+  window.history.replaceState({}, "", url);
+}
+
+async function fetchPredictionState() {
+  if (state.workspaceView !== "prediction_market") return;
+  try {
+    const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/state"), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error(`prediction state ${response.status}`);
+    const payload = await response.json();
+    const previousHistories = state.predictionMarket.payload?.histories || {};
+    state.predictionMarket.payload = {...payload, histories: {...previousHistories, ...(payload.histories || {})}};
+    state.predictionMarket.error = "";
+    state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
+    const status = String(payload?.status || "").toLowerCase();
+    if (status === "success" || status === "completed") {
+      state.predictionMarket.historyKind = "executions";
+    } else if (status === "incident") {
+      state.predictionMarket.historyKind = "incidents";
+    } else if (!state.predictionMarket.payload?.histories?.[state.predictionMarket.historyKind]) {
+      state.predictionMarket.historyKind = "signals";
+    }
+  } catch (error) {
+    state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+    if (state.predictionMarket.payload) {
+      state.predictionMarket.payload = {...state.predictionMarket.payload, stale: true};
+    } else {
+      state.predictionMarket.payload = {status: "unavailable", stale: true, readiness: {status: "unavailable"}, events: [], opportunities: [], breaker: {open: true}};
+    }
+  }
+  renderPredictionMarket();
+  const kind = state.predictionMarket.historyKind;
+  if (state.predictionMarket.payload && !Array.isArray(state.predictionMarket.payload.histories?.[kind])) {
+    loadPredictionHistory(kind);
+  }
+}
+
+async function loadPredictionHistory(kind) {
+  const payload = state.predictionMarket.payload || {};
+  try {
+    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/history?kind=${encodeURIComponent(kind)}&limit=100`), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error(`prediction history ${response.status}`);
+    const result = await response.json();
+    state.predictionMarket.payload = {...payload, histories: {...(payload.histories || {}), [kind]: Array.isArray(result.items) ? result.items : []}};
+    state.predictionMarket.error = "";
+  } catch (error) {
+    state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+  }
+  renderPredictionMarket();
+}
+
+async function predictionPost(path, body) {
+  const response = await fetch(predictionRequestUrl(path), {method: "POST", credentials: "same-origin", headers: {"Content-Type": "application/json", "X-CSRF-Token": state.predictionMarket.csrfToken}, body: JSON.stringify(body)});
+  if (!response.ok) {
+    let message = `prediction mutation ${response.status}`;
+    try { message = (await response.json()).message || message; } catch (_) { /* keep status */ }
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+function predictionIdempotencyKey() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `prediction-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function predictionModalHtml(kind, data = {}) {
+  const reset = kind === "reset";
+  const title = reset ? "确认解除交易熔断" : "确认真实下单";
+  const description = reset ? "事故记录会永久保留；解除后系统才重新开放“参与”按钮。" : "确认后由 Open Trader 使用独立钱包直接签名并执行，不跳转 Polymarket。";
+  if (reset) {
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>${description}</p></header><div class="pm-risk-note"><strong>本次事故实际损失 $0.60</strong><p>YES 成交后 NO 被拒，系统已在 $2 授权内卖回 YES。</p></div><div class="pm-check-list"><div class="pm-check"><span>不平衡持仓</span><strong class="pm-tone-ok">${escapeHtml(predictionValue(data.unbalanced_positions, "0"))}</strong></div><div class="pm-check"><span>未完成订单</span><strong class="pm-tone-ok">${escapeHtml(predictionValue(data.open_orders, "0"))}</strong></div><div class="pm-check"><span>当前余额</span><strong>${escapeHtml(predictionValue(data.balance, "$49.40 pUSD"))}</strong></div><div class="pm-check"><span>通知状态</span><strong>${escapeHtml(predictionValue(data.notification_status, "macOS 与飞书已发送"))}</strong></div></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">保持熔断</button><button class="pm-button danger" type="button" data-modal-action="reset">我已处理，恢复交易</button></footer></section>`;
+  }
+  const opportunity = predictionOpportunityDisplay(data.opportunity || data);
+  return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>${description}</p></header><div class="pm-order-market"><span>Polymarket · ${escapeHtml(predictionValue(opportunity.market_type, "普通二元"))} · ${escapeHtml(predictionValue(opportunity.fee_status, "免手续费"))}</span><strong>${escapeHtml(predictionValue(opportunity.title || opportunity.market_title || opportunity.event_title, "预测市场机会"))}</strong></div><div class="pm-order-legs"><article class="pm-order-leg"><span>第一腿 · BUY YES · FOK</span><strong>${escapeHtml(predictionValue(opportunity.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(opportunity.yes_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(opportunity.yes_cost))} · 全成或全撤</small></article><article class="pm-order-leg"><span>第二腿 · BUY NO · FOK</span><strong>${escapeHtml(predictionValue(opportunity.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(opportunity.no_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(opportunity.no_cost))} · 全成或全撤</small></article></div><div class="pm-order-summary"><div><span>正常最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost))}</strong></div><div><span>合并收回</span><strong>${escapeHtml(predictionMoney(opportunity.merge_value, "$20.00"))}</strong></div><div><span>最低净利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit, "+$1.20"))}</strong></div></div><div class="pm-risk-note" role="note"><strong>两笔订单不是原子交易</strong><p>可能只成交一腿。你同时授权系统最多承担 $2 预计损失进行补腿或平仓；随后会熔断并通知。</p></div><div class="pm-check-list"><div class="pm-check"><span>独立钱包</span><strong>${escapeHtml(predictionValue(data.masked_wallet || data.wallet, "Keychain"))} · $50.00 pUSD</strong></div><div class="pm-check"><span>确认时处理</span><strong>重新检查价格、费用、余额和地区</strong></div><div class="pm-check"><span>失败规则</span><strong>净利润低于 $1 就拒绝，不追价</strong></div></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="confirm">确认下单 · 最多 $20</button></footer></section>`;
+}
+
+function openPredictionModal(kind, trigger, data) {
+  predictionModal = {kind, previousFocus: trigger || document.activeElement, busy: false, data: data || {}};
+  const root = elements["prediction-market-modal-root"];
+  root.innerHTML = predictionModalHtml(kind, data);
+  document.body.style.overflow = "hidden";
+  requestAnimationFrame(() => root.querySelector(".pm-modal")?.focus());
+}
+
+function closePredictionModal() {
+  const previous = predictionModal.previousFocus;
+  predictionModal = {kind: "", previousFocus: null, busy: false, data: null};
+  elements["prediction-market-modal-root"].innerHTML = "";
+  document.body.style.overflow = "";
+  if (previous?.matches?.("[data-action='participate']")) previous.disabled = false;
+  previous?.focus?.();
+}
+
+function setPredictionModalBusy(busy) {
+  predictionModal.busy = busy;
+  elements["prediction-market-modal-root"].querySelectorAll("button").forEach((button) => {
+    button.disabled = busy;
+  });
+}
+
+async function handlePredictionMarketClick(event) {
+  const history = event.target.closest("[data-history]");
+  if (history) {
+    state.predictionMarket.historyKind = history.dataset.history || "signals";
+    renderPredictionMarket();
+    loadPredictionHistory(state.predictionMarket.historyKind);
+    return;
+  }
+  const reset = event.target.closest("[data-action='open-reset']");
+  if (reset) {
+    openPredictionModal("reset", reset, state.predictionMarket.payload?.breaker?.incident || {incident_id: reset.dataset.incidentId});
+    return;
+  }
+  const participate = event.target.closest("[data-action='participate']");
+  if (!participate || participate.disabled) return;
+  const opportunityId = participate.dataset.opportunityId;
+  if (!opportunityId) return;
+  participate.disabled = true;
+  try {
+    const preview = await predictionPost("/api/prediction-arbitrage/preview", {opportunity_id: opportunityId});
+    if (!preview || preview.state !== "previewed" || !String(preview.preview_id || "").trim()) {
+      const reason = String(preview?.reason || "preview_unavailable");
+      const messages = {
+        circuit_breaker_open: "交易已熔断，暂不允许下单。",
+        active_execution: "已有另一笔交易正在执行，请等待完成。",
+        execution_lock: "已有另一笔操作正在确认，请稍后重试。",
+        opportunity_unavailable: "机会已变化或已失效，请刷新后重新检查。",
+        readiness_unavailable: "交易钱包、地区或余额检查未通过。",
+      };
+      state.predictionMarket.error = messages[reason] || `后台拒绝预览：${reason}`;
+      participate.disabled = false;
+      renderPredictionMarket();
+      return;
+    }
+    openPredictionModal("order", participate, {...preview, opportunity: preview.opportunity || predictionOpportunities(state.predictionMarket.payload).find((item) => (item.opportunity_id || item.id) === opportunityId) || {opportunity_id: opportunityId}, masked_wallet: state.predictionMarket.payload?.masked_wallet});
+  } catch (error) {
+    state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+    participate.disabled = false;
+    renderPredictionMarket();
+  }
+}
+
+async function handlePredictionModalClick(event) {
+  const action = event.target.closest("[data-modal-action]")?.dataset.modalAction;
+  if (!action || predictionModal.busy) return;
+  if (action === "cancel") {
+    closePredictionModal();
+    return;
+  }
+  setPredictionModalBusy(true);
+  try {
+    if (action === "confirm") {
+      const previewId = predictionModal.data?.preview_id || predictionModal.data?.id;
+      if (!String(previewId || "").trim()) throw new Error("预览已失效，请重新获取机会。");
+      const result = await predictionPost("/api/prediction-arbitrage/executions", {preview_id: String(previewId || ""), idempotency_key: predictionIdempotencyKey()});
+      if (!result || ["locked", "busy", "rejected"].includes(String(result.state || "").toLowerCase()) || !String(result.execution_id || "").trim()) {
+        throw new Error("确认时后台未接受订单，未提交新的执行任务。");
+      }
+      state.predictionMarket.activeExecutionId = result.execution_id || "";
+      closePredictionModal();
+      setPredictionScenario("success");
+      await fetchPredictionState();
+      return;
+    }
+    if (action === "reset") {
+      const incidentId = predictionModal.data?.incident_id || predictionModal.data?.id;
+      const result = await predictionPost("/api/prediction-arbitrage/circuit-breaker/reset", {incident_id: String(incidentId || "")});
+      if (!result || ["locked", "busy", "rejected"].includes(String(result.state || "").toLowerCase())) {
+        throw new Error("事故仍未解除，系统继续保持熔断。");
+      }
+      closePredictionModal();
+      setPredictionScenario("ready");
+      await fetchPredictionState();
+    }
+  } catch (error) {
+    state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+    setPredictionModalBusy(false);
+    renderPredictionMarket();
+  }
+}
+
+function handlePredictionModalKeydown(event) {
+  if (!predictionModal.kind) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (!predictionModal.busy) closePredictionModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const modal = elements["prediction-market-modal-root"].querySelector(".pm-modal");
+  if (!modal) return;
+  const focusable = [...modal.querySelectorAll("button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex='-1'])")];
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function kellyExperimentStatusLabel(status) {

@@ -9,14 +9,26 @@
   </head>
   <body>
     <div id="dashboard-shell" class="dashboard-shell">
-      <header class="dashboard-header">
+      <header id="main-topbar" class="pm-topbar" aria-label="一级导航">
+        <div class="pm-brand">
+          <strong>Open Trader</strong>
+          <span>持仓实时看板</span>
+        </div>
+        <nav id="main-navigation" class="pm-nav" aria-label="一级导航">
+          <button type="button" data-workspace="portfolio" aria-current="page">持仓</button>
+          <button type="button" data-workspace="prediction_market">预测市场</button>
+          <button type="button" data-workspace="standard_backtest">策略回测</button>
+          <button type="button" data-workspace="kelly_lab">凯利实验室</button>
+        </nav>
+      </header>
+      <header id="dashboard-header" class="dashboard-header">
         <section class="header-brand-panel" aria-label="看板筛选">
           <div class="brand-block">
             <span class="brand">Open Trader</span>
             <span class="page-title">持仓实时看板</span>
             <div class="strategy-tools" aria-label="策略工具">
-              <button id="open-standard-backtest" class="secondary-button" type="button">策略回测</button>
-              <button id="open-kelly-lab" class="secondary-button" type="button">凯利实验室</button>
+              <button id="open-standard-backtest" class="secondary-button" type="button" aria-label="辅助回测入口">策略回测</button>
+              <button id="open-kelly-lab" class="secondary-button" type="button" aria-label="辅助 Kelly 入口">凯利实验室</button>
               <button id="return-to-portfolio" class="secondary-button hidden" type="button" hidden>返回持仓</button>
             </div>
           </div>
@@ -104,6 +116,9 @@
           <div id="symbol-detail-panel" class="symbol-detail-panel hidden" aria-live="polite"></div>
         </section>
       </main>
+      <section id="prediction-market-workspace" class="prediction-market-workspace hidden" hidden aria-label="预测市场" aria-live="polite">
+        <div id="prediction-market-root"></div>
+      </section>
       <section id="trend-report-workspace" class="trend-report-workspace hidden" hidden aria-live="polite"></section>
       <section id="standard-backtest-workspace" class="backtest-workspace hidden" hidden>
         <header class="backtest-workspace-header">
@@ -171,5 +186,6 @@
         </footer>
       </section>
     </div>
+    <div id="prediction-market-modal-root" class="pm-modal-layer" aria-live="assertive"></div>
   </body>
 </html>

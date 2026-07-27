@@ -173,10 +173,239 @@ def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Dec
     )
 
 
+def _prediction_first(row: Mapping[str, object], *keys: str) -> object | None:
+    """Return the first present, non-empty value from a projected row."""
+
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _prediction_opportunity_aliases(value: object) -> object:
+    """Project monitor/execution field names into the dashboard vocabulary."""
+
+    if not isinstance(value, Mapping):
+        return value
+    result = dict(value)
+    aliases = {
+        "title": ("title", "question", "market_title", "event_title"),
+        "event_title": ("event_title", "title", "question", "market_title"),
+        "yes_price": ("yes_price", "yes_max_price", "yes_best_bid"),
+        "no_price": ("no_price", "no_max_price", "no_best_bid"),
+        "yes_cost": ("yes_cost", "yes_max_cost"),
+        "no_cost": ("no_cost", "no_max_cost"),
+        "max_cost": ("max_cost", "total_max_cost", "cost"),
+        "profit": ("profit", "minimum_profit", "estimated_profit", "net_profit"),
+    }
+    for target, keys in aliases.items():
+        if result.get(target) in (None, ""):
+            source = _prediction_first(result, *keys)
+            if source is not None:
+                result[target] = source
+    return result
+
+
+def _prediction_event_aliases(value: object) -> object:
+    """Keep event rows useful when the monitor returns nested market mappings."""
+
+    if not isinstance(value, Mapping):
+        return value
+    result = dict(value)
+    title = _prediction_first(result, "title", "event_title", "question", "market_title")
+    if title is not None:
+        result.setdefault("title", title)
+        result.setdefault("event_title", title)
+    markets = result.get("markets")
+    if isinstance(markets, (list, tuple)):
+        projected_markets = [
+            _prediction_opportunity_aliases(item) for item in markets
+        ]
+        result["markets"] = projected_markets
+        result.setdefault("market_count", len(projected_markets))
+        result.setdefault(
+            "actionable",
+            any(
+                isinstance(item, Mapping) and item.get("actionable") is True
+                for item in projected_markets
+            ),
+        )
+    opportunities = result.get("opportunities")
+    if isinstance(opportunities, (list, tuple)):
+        result["opportunities"] = [
+            _prediction_opportunity_aliases(item) for item in opportunities
+        ]
+    return result
+
+
+def _prediction_evidence_value(row: Mapping[str, object], *keys: str) -> object | None:
+    evidence = row.get("evidence")
+    if isinstance(evidence, Mapping):
+        return _prediction_first(evidence, *keys)
+    if isinstance(evidence, (list, tuple)):
+        for item in reversed(evidence):
+            if isinstance(item, Mapping):
+                value = _prediction_first(item, *keys)
+                if value is not None:
+                    return value
+    return None
+
+
+def _prediction_remediation_aliases(row: Mapping[str, object]) -> tuple[object | None, object | None]:
+    """Derive a human-readable action and loss from persisted safety options."""
+
+    options = row.get("remediation_options")
+    if not isinstance(options, Mapping):
+        evidence = row.get("evidence")
+        if isinstance(evidence, Mapping):
+            options = evidence.get("remediation_options")
+        elif isinstance(evidence, (list, tuple)):
+            for item in reversed(evidence):
+                if isinstance(item, Mapping) and isinstance(item.get("remediation_options"), Mapping):
+                    options = item["remediation_options"]
+                    break
+    if not isinstance(options, Mapping):
+        return None, None
+    candidates: list[tuple[Decimal, str, Mapping[str, object]]] = []
+    for name, option in options.items():
+        if not isinstance(option, Mapping):
+            continue
+        loss = _prediction_decimal_sort(_prediction_first(option, "loss", "estimated_loss", "expected_loss"))
+        if not loss.is_finite():
+            continue
+        candidates.append((loss, str(name), option))
+    if not candidates:
+        return None, None
+    loss, _, chosen = min(candidates, key=lambda item: item[0])
+    side = str(chosen.get("side") or "").upper()
+    leg = str(chosen.get("leg") or "").upper()
+    quantity = _prediction_first(chosen, "quantity", "shares")
+    if side == "SELL":
+        action = "卖回"
+    elif side == "BUY":
+        action = "补买"
+    else:
+        action = "处置"
+    parts = [action]
+    if quantity is not None:
+        parts.append(str(quantity))
+    if leg:
+        parts.append(leg)
+    return " ".join(parts), format(-abs(loss), "f")
+
+
+def _prediction_duration(start: object, end: object) -> str | None:
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        started = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    seconds = max(0, int((ended - started).total_seconds()))
+    minutes, remainder = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes}m {remainder}s"
+    return f"{remainder}s"
+
+
+def _prediction_history_aliases(kind: str, value: object) -> object:
+    """Normalize durable store rows without changing their audit fields."""
+
+    if not isinstance(value, Mapping):
+        return value
+    result = dict(value)
+    if kind == "signals":
+        occurred_at = _prediction_first(
+            result, "occurred_at", "started_at", "detected_at", "created_at"
+        )
+        event_title = _prediction_first(
+            result, "event_title", "question", "title", "market_title"
+        )
+        duration = _prediction_first(result, "duration")
+        if duration is None:
+            duration = (
+                "进行中"
+                if result.get("started_at") and not result.get("ended_at")
+                else _prediction_duration(result.get("started_at"), result.get("ended_at"))
+            )
+        aliases = {
+            "occurred_at": occurred_at,
+            "event_title": event_title,
+            "duration": duration,
+            "peak_edge": _prediction_first(result, "peak_edge", "peak_net_edge", "net_edge"),
+            "quantity": _prediction_first(result, "quantity", "peak_quantity"),
+            "profit": _prediction_first(
+                result,
+                "profit",
+                "peak_profit",
+                "peak_estimated_profit",
+                "estimated_profit",
+                "minimum_profit",
+            ),
+        }
+    elif kind == "executions":
+        aliases = {
+            "status": _prediction_first(result, "status", "state"),
+            "completed_at": _prediction_first(
+                result, "completed_at", "updated_at", "created_at"
+            ),
+            "event_title": _prediction_first(
+                result, "event_title", "question", "title", "market_title"
+            ),
+            "quantity": _prediction_first(result, "quantity", "execution_quantity"),
+            "actual_cost": _prediction_first(
+                result, "actual_cost", "total_max_cost", "total_cost", "cost"
+            ),
+            "merge_value": _prediction_first(
+                result,
+                "merge_value",
+                "merged_value",
+                "payout",
+                "merge_amount",
+            ),
+            "realized_profit": _prediction_first(
+                result,
+                "realized_profit",
+                "net_profit",
+                "profit",
+                "minimum_profit",
+            ),
+        }
+        if aliases["merge_value"] is None and aliases["status"] == "complete":
+            # A complete pair always redeems one dollar per protected share.
+            aliases["merge_value"] = aliases["quantity"]
+    else:
+        derived_remediation, derived_loss = _prediction_remediation_aliases(result)
+        aliases = {
+            "status": _prediction_first(result, "status", "state"),
+            "happened_at": _prediction_first(
+                result, "happened_at", "created_at", "updated_at"
+            ),
+            "event_title": _prediction_first(
+                result, "event_title", "question", "title", "market_title"
+            ),
+            "reason": _prediction_first(result, "reason")
+            or _prediction_evidence_value(result, "reason", "error", "error_code"),
+            "remediation": _prediction_first(result, "remediation")
+            or _prediction_evidence_value(result, "remediation", "action")
+            or derived_remediation,
+            "loss": _prediction_first(result, "loss", "actual_loss")
+            or _prediction_evidence_value(result, "loss", "actual_loss", "loss_amount")
+            or derived_loss,
+        }
+    for key, item in aliases.items():
+        if item is not None and result.get(key) in (None, ""):
+            result[key] = item
+    return result
+
+
 def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_unavailable") -> dict[str, object]:
     return {
         "status": "unavailable",
         "readiness": {"status": "unavailable", "reason": reason},
+        "first_live_order": "待首单",
         "wallet": {"address": "", "masked_address": ""},
         "masked_wallet": "",
         "balances": {"p_usd": None, "allowance": None},
@@ -189,8 +418,13 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
         },
         "heartbeat": None,
         "heartbeat_at": None,
+        "stale": True,
         "events": [],
         "opportunities": [],
+        "event_count": 0,
+        "market_count": 0,
+        "token_count": 0,
+        "signals_24h": 0,
         "current_execution": None,
         "breaker": {"open": True, "status": "locked", "incident": None},
         "csrf_token": csrf_token,
@@ -260,11 +494,91 @@ def _prediction_state_payload(
     opportunities = safe_snapshot.get("opportunities")
     event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
     opportunity_rows = [row for row in opportunities if isinstance(row, Mapping)] if isinstance(opportunities, (list, tuple)) else []
-    event_rows = sorted(event_rows, key=_prediction_sort_key)
-    opportunity_rows = sorted(opportunity_rows, key=_prediction_sort_key)
+    event_rows = [_prediction_event_aliases(row) for row in event_rows]
+    opportunity_rows = [_prediction_opportunity_aliases(row) for row in opportunity_rows]
+    event_rows = sorted(
+        (row for row in event_rows if isinstance(row, Mapping)), key=_prediction_sort_key
+    )
+    opportunity_rows = sorted(
+        (row for row in opportunity_rows if isinstance(row, Mapping)), key=_prediction_sort_key
+    )
+    event_count = len(event_rows)
+    market_count = 0
+    token_ids: set[str] = set()
+    for event in event_rows:
+        markets = event.get("markets")
+        if isinstance(markets, (list, tuple)):
+            market_count += len(markets)
+            for market in markets:
+                if not isinstance(market, Mapping):
+                    continue
+                for key in ("yes_token_id", "no_token_id"):
+                    token = market.get(key)
+                    if token:
+                        token_ids.add(str(token))
+        elif isinstance(event.get("market_count"), int):
+            market_count += int(event["market_count"])
+    if not market_count:
+        market_count = int(safe_snapshot.get("market_count") or 0)
+    if not token_ids:
+        for opportunity in opportunity_rows:
+            for key in ("yes_token_id", "no_token_id"):
+                token = opportunity.get(key)
+                if token:
+                    token_ids.add(str(token))
+    token_count = len(token_ids)
+    if not token_count:
+        try:
+            token_count = int(safe_snapshot.get("token_count") or market_count * 2)
+        except (TypeError, ValueError):
+            token_count = market_count * 2
+    signals_24h = safe_snapshot.get("signals_24h", safe_snapshot.get("history_count_24h"))
+    if signals_24h is None and store is not None:
+        signal_history = getattr(store, "signal_history", None)
+        if callable(signal_history):
+            try:
+                signals_24h = len(signal_history("24h"))
+            except Exception:
+                signals_24h = 0
+    try:
+        signals_24h = int(signals_24h or 0)
+    except (TypeError, ValueError):
+        signals_24h = 0
+    first_live_order = readiness.get("first_live_order")
+    if bool(getattr(execution, "_first_live_order_verified", False)):
+        first_live_order = "已验证"
+    elif first_live_order is None and store is not None:
+        load_runtime = getattr(store, "load_runtime", None)
+        if callable(load_runtime):
+            try:
+                runtime = load_runtime()
+            except Exception:
+                runtime = None
+            if isinstance(runtime, Mapping):
+                runtime_prediction = runtime.get("prediction_arbitrage")
+                if isinstance(runtime_prediction, Mapping):
+                    first_live_order = runtime_prediction.get("first_live_order")
+                if first_live_order is None:
+                    first_live_order = runtime.get("first_live_order")
+    if first_live_order is not None:
+        if str(first_live_order).casefold() in {"validated", "verified", "complete"}:
+            first_live_order = "已验证"
+        readiness["first_live_order"] = first_live_order
+    current_execution = _prediction_safe_value(active)
+    if isinstance(current_execution, Mapping):
+        current_execution = dict(current_execution)
+        state_value = current_execution.get("state")
+        if state_value is not None:
+            current_execution.setdefault("status", state_value)
+        event_title = _prediction_first(
+            current_execution, "question", "title", "market_title"
+        )
+        if event_title is not None:
+            current_execution.setdefault("event_title", event_title)
     status = str(safe_snapshot.get("status") or "unavailable")
     if not snapshot:
         status = "unavailable"
+    stale = bool(safe_snapshot.get("stale")) or status in {"degraded", "unavailable", "error"}
     policy = _prediction_unavailable_state(csrf_token)["policy_limits"]
     balances = {
         "p_usd": readiness.get("p_usd_balance", readiness.get("balance")),
@@ -273,15 +587,21 @@ def _prediction_state_payload(
     return {
         "status": status,
         "readiness": dict(readiness),
+        "first_live_order": first_live_order,
         "wallet": {"address": "", "masked_address": masked_wallet},
         "masked_wallet": masked_wallet,
         "balances": balances,
         "policy_limits": policy,
         "heartbeat": safe_snapshot.get("heartbeat_at"),
         "heartbeat_at": safe_snapshot.get("heartbeat_at"),
+        "stale": stale,
         "events": event_rows,
         "opportunities": opportunity_rows,
-        "current_execution": _prediction_safe_value(active),
+        "event_count": event_count,
+        "market_count": market_count,
+        "token_count": token_count,
+        "signals_24h": signals_24h,
+        "current_execution": current_execution,
         "breaker": {
             "open": breaker_open,
             "status": "locked" if breaker_open else "ready",
@@ -301,7 +621,9 @@ def _prediction_history_payload(
     if kind not in PREDICTION_HISTORY_KINDS:
         raise ValueError("kind must be signals, executions, or incidents")
     rows = store.histories(kind) if store is not None else []
-    safe_rows = [_prediction_safe_value(row) for row in rows]
+    safe_rows = [
+        _prediction_history_aliases(kind, _prediction_safe_value(row)) for row in rows
+    ]
     items = safe_rows[offset : offset + limit]
     return {
         "kind": kind,

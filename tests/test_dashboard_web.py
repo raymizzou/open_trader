@@ -1933,6 +1933,126 @@ def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path:
         thread.join(timeout=5)
 
 
+def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload, _prediction_state_payload
+
+    class FakeStore:
+        def active_execution(self) -> dict[str, object]:
+            return {
+                "execution_id": "exec-1",
+                "state": "reconciling",
+                "question": "Will the event happen?",
+            }
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return [{"signal_id": "s-1"}, {"signal_id": "s-2"}]
+
+        def load_runtime(self) -> dict[str, object]:
+            return {"prediction_arbitrage": "ready", "first_live_order": "validated"}
+
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            if kind == "signals":
+                return [{
+                    "started_at": "2026-07-27T10:00:00Z",
+                    "ended_at": "2026-07-27T10:02:03Z",
+                    "question": "Will the event happen?",
+                    "peak_net_edge": "0.060",
+                    "peak_quantity": "20",
+                    "peak_estimated_profit": "1.20",
+                }]
+            if kind == "executions":
+                return [{
+                    "state": "complete",
+                    "updated_at": "2026-07-27T10:03:00Z",
+                    "question": "Will the event happen?",
+                    "quantity": "20",
+                    "total_max_cost": "18.80",
+                    "minimum_profit": "1.20",
+                }]
+            return [{
+                "state": "directional_incident",
+                "created_at": "2026-07-27T10:04:00Z",
+                "question": "Will the event happen?",
+                "filled_leg": "YES",
+                "evidence": [{
+                    "reason": "no_leg_rejected",
+                    "remediation_options": {
+                        "complete": {"side": "BUY", "leg": "NO", "quantity": "20", "loss": "1.20"},
+                        "unwind": {"side": "SELL", "leg": "YES", "quantity": "20", "loss": "0.60"},
+                    },
+                }],
+            }]
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "readiness": {"balance": "50.00", "geoblock": "allowed", "relayer": "ready"},
+                "events": [{
+                    "event_id": "event-1",
+                    "title": "Will the event happen?",
+                    "markets": [{"market_id": "market-1", "yes_token_id": "yes-1", "no_token_id": "no-1"}],
+                }],
+                "opportunities": [{
+                    "opportunity_id": "opp-1",
+                    "question": "Will the event happen?",
+                    "yes_max_price": "0.450",
+                    "no_max_price": "0.480",
+                    "yes_max_cost": "9.00",
+                    "no_max_cost": "9.60",
+                    "total_max_cost": "18.60",
+                    "minimum_profit": "1.40",
+                }],
+            }
+
+    class FakeExecution:
+        _first_live_order_verified = True
+        _breaker_open = False
+
+    state = _prediction_state_payload(
+        store=FakeStore(), monitor=FakeMonitor(), execution=FakeExecution(), csrf_token="csrf"
+    )
+    assert state["event_count"] == 1
+    assert state["market_count"] == 1
+    assert state["token_count"] == 2
+    assert state["signals_24h"] == 2
+    assert state["first_live_order"] == "已验证"
+    assert state["readiness"]["first_live_order"] == "已验证"
+    assert state["current_execution"]["status"] == "reconciling"
+    assert state["opportunities"][0]["title"] == "Will the event happen?"
+    assert state["opportunities"][0]["yes_price"] == "0.450"
+    assert state["opportunities"][0]["max_cost"] == "18.60"
+
+    store = FakeStore()
+    assert _prediction_history_payload(store, kind="signals", limit=10, offset=0)["items"][0] == {
+        "started_at": "2026-07-27T10:00:00Z",
+        "ended_at": "2026-07-27T10:02:03Z",
+        "question": "Will the event happen?",
+        "peak_net_edge": "0.060",
+        "peak_quantity": "20",
+        "peak_estimated_profit": "1.20",
+        "occurred_at": "2026-07-27T10:00:00Z",
+        "event_title": "Will the event happen?",
+        "duration": "2m 3s",
+        "peak_edge": "0.060",
+        "quantity": "20",
+        "profit": "1.20",
+    }
+    execution_item = _prediction_history_payload(store, kind="executions", limit=10, offset=0)["items"][0]
+    assert execution_item["status"] == "complete"
+    assert execution_item["actual_cost"] == "18.80"
+    assert execution_item["merge_value"] == "20"
+    assert execution_item["realized_profit"] == "1.20"
+    incident_item = _prediction_history_payload(store, kind="incidents", limit=10, offset=0)["items"][0]
+    assert incident_item["happened_at"] == "2026-07-27T10:04:00Z"
+    assert incident_item["reason"] == "no_leg_rejected"
+    assert incident_item["remediation"] == "卖回 20 YES"
+    assert incident_item["loss"] == "-0.60"
+
+
 @pytest.mark.parametrize("failure", ["host", "origin", "cookie", "csrf", "address"])
 def test_prediction_arbitrage_mutation_security_matrix_rejects_before_body(
     tmp_path: Path,
@@ -3887,6 +4007,39 @@ def test_dashboard_static_mounts_broker_tabs_and_removes_cash_view() -> None:
     assert 'brokerFilter: "futu"' in js
     assert "function renderAccountTabs(" in js
     assert "function selectBroker(" in js
+
+
+def test_prediction_market_static_contract_is_present() -> None:
+    """Lock the approved direct-execution shell before browser coverage exists."""
+
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    nav_order = ["持仓", "预测市场", "策略回测", "凯利实验室"]
+    assert html.index('data-workspace="portfolio"') < html.index('data-workspace="prediction_market"')
+    assert [html.index(label) for label in nav_order] == sorted(html.index(label) for label in nav_order)
+    assert html.count("预测市场") >= 2
+    assert 'id="prediction-market-workspace"' in html
+    assert 'id="prediction-market-root"' in html
+    assert "pm-controller" not in html
+    assert "原型场景控制器" not in html
+    assert "底部场景" not in html
+    for label in ("实盘就绪状态", "当前监控范围", "当前机会", "历史记录", "信号历史", "交易与合并", "事故"):
+        assert label in js
+    for copy in ("$50", "$20", "$2", "免手续费", "可能只成交一腿", "24h 成交量"):
+        assert copy in js
+    assert "确认真实下单" in js
+    assert "确认解除交易熔断" in js
+    assert "aria-modal=\"true\"" in js
+    assert "activeExecutionId" in js
+    assert "pollId" in js
+    assert 'historyKind: "signals"' in js
+    assert "private-key" not in html.lower() + js.lower()
+    assert "api-secret" not in html.lower() + js.lower()
+    assert ".pm-readiness" in css
+    assert ".pm-opportunity" in css
+    assert ".pm-modal-layer" in css
 
 
 def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:
