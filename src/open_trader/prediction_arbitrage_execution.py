@@ -127,7 +127,9 @@ class PredictionExecutionService:
         self._notifier = notifier
         self._lock_path = Path(lock_path)
         self._process_lock = _PROCESS_LOCK
-        self._breaker_open = False
+        # A newly constructed process has not reconciled its dedicated wallet;
+        # only a clean startup/reset path may clear this lock.
+        self._breaker_open = True
         self._first_live_order_verified = False
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
@@ -362,6 +364,43 @@ class PredictionExecutionService:
             }
             self._startup_incident(active_id, "startup_directional_imbalance", evidence)
             return {"state": "locked", "reason": "directional_imbalance", **evidence}
+        confirmed_merge = self._confirmed_merge_evidence(active)
+        if active is not None and confirmed_merge is not None:
+            try:
+                self._transition(
+                    active_id,
+                    "complete",
+                    {
+                        "phase": "startup_merge_reconciled",
+                        "merge": "already_confirmed",
+                        "merge_result": confirmed_merge,
+                        "checked_at": snapshot.get("checked_at"),
+                        "positions": snapshot.get("positions", ()),
+                    },
+                )
+            except Exception:
+                return {
+                    "state": "locked",
+                    "reason": "startup_reconcile_persistence_failed",
+                    "execution_id": active_id,
+                }
+            if not self._relayer_ready():
+                return {"state": "locked", "reason": "readiness_unavailable"}
+            if not self._notification_channels_ready():
+                return {"state": "locked", "reason": "notification_config_unavailable"}
+            self._breaker_open = False
+            self._store.write_runtime(
+                {
+                    "prediction_arbitrage": "ready",
+                    "reconciled_at": _timestamp(_utc_now()),
+                    "readiness": "reconciled",
+                }
+            )
+            return {
+                "state": "ready",
+                "readiness": "reconciled",
+                "execution_id": active_id,
+            }
         if active is not None:
             evidence = {"phase": "startup_local_pending", "execution_id": active_id}
             self._startup_incident(active_id, "stale_local_execution", evidence)
@@ -565,6 +604,7 @@ class PredictionExecutionService:
                     proof=execution_proof,
                     since=submitted_at,
                     tick_size=tick_size,
+                    account=account,
                 )
                 return
             if no_quantity > 0 and yes_quantity <= 0:
@@ -578,6 +618,7 @@ class PredictionExecutionService:
                     proof=execution_proof,
                     since=submitted_at,
                     tick_size=tick_size,
+                    account=account,
                 )
                 return
             if yes_quantity <= 0 or no_quantity <= 0 or yes_quantity != no_quantity:
@@ -913,13 +954,17 @@ class PredictionExecutionService:
             merge_evidence = [
                 item
                 for item in evidence
-                if isinstance(item, Mapping) and item.get("phase") == "merge_result"
+                if isinstance(item, Mapping)
+                and item.get("phase") in {"merge_result", "remediation_merge_result"}
             ]
             startup_attempts = [
                 item
                 for item in evidence
                 if isinstance(item, Mapping)
-                and item.get("phase") == "startup_merge_attempt"
+                and item.get("phase") in {
+                    "startup_merge_attempt",
+                    "remediation_merge_attempt",
+                }
             ]
             if merge_evidence:
                 if self._merge_confirmed(merge_evidence[-1]):
@@ -1059,10 +1104,30 @@ class PredictionExecutionService:
             return False
         return any(
             isinstance(item, Mapping)
-            and item.get("phase") == "merge_result"
+            and item.get("phase") in {"merge_result", "remediation_merge_result"}
             and item.get("confirmed") is not True
             for item in evidence
         )
+
+    @staticmethod
+    def _confirmed_merge_evidence(
+        active: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not active:
+            return None
+        evidence = active.get("evidence", ())
+        if not isinstance(evidence, (list, tuple)):
+            return None
+        for item in reversed(evidence):
+            if not isinstance(item, Mapping):
+                continue
+            phase = item.get("phase")
+            if phase in {"startup_merge_attempt", "remediation_merge_attempt"}:
+                return None
+            if phase not in {"merge_result", "remediation_merge_result"}:
+                continue
+            return dict(item) if PredictionExecutionService._merge_confirmed(item) else None
+        return None
 
     def _pending_merge_for_incident(
         self,
@@ -1234,6 +1299,7 @@ class PredictionExecutionService:
         proof: Mapping[str, object],
         since: datetime,
         tick_size: Decimal,
+        account: Mapping[str, object],
     ) -> None:
         # Open the breaker before any remediation-capable collaborator is called.
         self._breaker_open = True
@@ -1342,6 +1408,27 @@ class PredictionExecutionService:
                 notify=False,
             )
             return
+        merge_idempotency_key = f"remediation-merge:{execution_id}:{known[0]:f}"
+        try:
+            self._transition(
+                execution_id,
+                "merging",
+                {
+                    "phase": "remediation_merge_attempt",
+                    "idempotency_key": merge_idempotency_key,
+                    "condition_id": intent.condition_id,
+                    "quantity": known[0],
+                },
+            )
+        except Exception:
+            self._finish_incident(
+                execution_id,
+                "remediation_merge_attempt_persistence_failed",
+                state="merge_incident",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
         merge = getattr(self._trading, "merge_once", None)
         try:
             merge_result = _call(
@@ -1349,18 +1436,53 @@ class PredictionExecutionService:
             )
         except Exception:
             merge_result = {"status": "blocked", "confirmed": False, "error_code": "merge_error"}
-        self._transition(
-            execution_id,
-            "merging",
-            {
-                "phase": "remediation_merge_result",
-                **(self._safe_mapping(merge_result) if isinstance(merge_result, Mapping) else {"status": self._result_status(merge_result)}),
-            },
-        )
+        merge_evidence = {
+            "phase": "remediation_merge_result",
+            **(
+                self._safe_mapping(merge_result)
+                if isinstance(merge_result, Mapping)
+                else {"status": self._result_status(merge_result)}
+            ),
+        }
+        if not self._merge_confirmed(merge_result):
+            merge_evidence["confirmed"] = False
+        try:
+            self._transition(execution_id, "merging", merge_evidence)
+        except Exception:
+            self._finish_incident(
+                execution_id,
+                "remediation_merge_result_persistence_failed",
+                state="merge_incident",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
         if not self._merge_confirmed(merge_result):
             self._finish_incident(
                 execution_id,
                 "remediation_merge_not_confirmed",
+                state="merge_incident",
+                incident_id=incident_id,
+                notify=False,
+            )
+            return
+        after = self._fresh_account_snapshot()
+        after_totals = self._position_totals(after, intent) if after is not None else None
+        before_balance = _decimal(account.get("p_usd_balance"))
+        after_balance = _decimal(after.get("p_usd_balance")) if after else None
+        if (
+            after is None
+            or after_totals is None
+            or after_totals["unknown"]
+            or after_totals["yes"] != 0
+            or after_totals["no"] != 0
+            or before_balance is None
+            or after_balance is None
+            or after_balance <= before_balance
+        ):
+            self._finish_incident(
+                execution_id,
+                "remediation_merge_state_unverified",
                 state="merge_incident",
                 incident_id=incident_id,
                 notify=False,
@@ -1389,6 +1511,7 @@ class PredictionExecutionService:
 
     def _verify_unwound(self, intent: PairIntent, filled_leg: str) -> bool:
         method = getattr(self._trading, "reconcile_neutralization", None)
+        collaborator_verified = True
         if callable(method):
             try:
                 value = _call(
@@ -1398,14 +1521,16 @@ class PredictionExecutionService:
                     expected_quantity=Decimal("0"),
                 )
                 if isinstance(value, Mapping):
-                    return value.get("verified") is True or value.get("directional_imbalance") in (False, Decimal("0"), "0")
+                    collaborator_verified = value.get("verified") is True or value.get("directional_imbalance") in (False, Decimal("0"), "0")
+                else:
+                    collaborator_verified = False
             except Exception:
                 return False
         snapshot = self._fresh_account_snapshot()
         if snapshot is None:
             return False
         totals = self._position_totals(snapshot, intent)
-        return totals["yes"] == 0 and totals["no"] == 0 and not totals["unknown"]
+        return collaborator_verified and totals["yes"] == 0 and totals["no"] == 0 and not totals["unknown"]
 
     def _relayer_ready(self) -> bool:
         method = getattr(self._trading, "readiness_snapshot", None)

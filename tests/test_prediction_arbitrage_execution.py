@@ -112,7 +112,9 @@ class FakeTrading:
 
     def account_snapshot(self) -> AccountSnapshot:
         self._account_reads += 1
-        balance = Decimal("22") if self._account_reads >= 3 else Decimal("20")
+        # Fixtures perform an explicit clean startup read before preview and
+        # execution; expose the post-merge balance only on the later proof read.
+        balance = Decimal("22") if self._account_reads >= 4 else Decimal("20")
         return AccountSnapshot(
             wallet_address="0x" + "1" * 40,
             p_usd_balance=balance,
@@ -435,6 +437,24 @@ class CompositeTestNotifier:
         self._notifiers = list(notifiers)
 
 
+def test_new_service_starts_locked_until_startup_reconciliation(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = FakeTrading()
+    service = PredictionExecutionService(
+        store=store,
+        monitor=FakeMonitor(_intent()),
+        trading=trading,
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+    )
+
+    result = service.preview("opp-1")
+
+    assert result == {"state": "locked", "reason": "circuit_breaker_open"}
+    assert trading.preflight_calls == 0
+    assert trading.batch_calls == 0
+
+
 def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
     store = PredictionArbitrageStore(tmp_path / "data")
     trading = FakeTrading(result=result)
@@ -448,6 +468,7 @@ def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
         ),
         lock_path=tmp_path / "execution.lock",
     )
+    assert service.reconcile_startup()["state"] == "ready"
     return service, trading, store, monitor
 
 
@@ -464,6 +485,7 @@ def incident_fixture(tmp_path: Path, *, result: str, notifier: object | None = N
         ),
         lock_path=tmp_path / "execution.lock",
     )
+    assert service.reconcile_startup()["state"] == "ready"
     service._sleep = lambda _: None  # type: ignore[attr-defined]
     service._clock = iter(float(index) for index in range(200)).__next__  # type: ignore[attr-defined]
     return service, trading, store, monitor
@@ -940,6 +962,17 @@ def test_completion_requires_strict_verified_reconciliation_proof(tmp_path: Path
     assert trading.merge_calls == 0
 
 
+def test_completion_merge_requires_fresh_neutral_post_state(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="yes_only")
+    trading.account_mode = "equal_pair"
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "stale-remediation-merge")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "merge_incident"
+    assert trading.merge_calls == 1
+
+
 def test_one_leg_above_two_dollars_sends_no_remediation(tmp_path: Path) -> None:
     service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
     preview = service.preview("opp-1")
@@ -1021,6 +1054,54 @@ def test_startup_merge_attempt_evidence_blocks_duplicate_merge_after_restart(tmp
     assert result["reason"] == "equal_pair"
     assert result["merge"] == "pending"
     assert result["reconciled"] is False
+    assert result["merge_reason"] == "merge_attempt_in_flight"
+    assert trading.merge_calls == 0
+
+
+def test_startup_confirmed_merge_evidence_reconciles_clean_execution(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "startup-confirmed-merge")
+    store.transition_execution(
+        str(execution["execution_id"]),
+        state="merging",
+        evidence={
+            "phase": "merge_result",
+            "status": "confirmed",
+            "confirmed": True,
+            "transaction_hash": "0xconfirmed-startup",
+        },
+    )
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "ready"
+    assert result["readiness"] == "reconciled"
+    assert trading.merge_calls == 0
+    assert service.execution(str(execution["execution_id"]))["state"] == "complete"
+    assert store.unacknowledged_incident() is None
+
+
+def test_startup_remediation_merge_attempt_blocks_duplicate_merge(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="yes_only")
+    trading.account_mode = "equal_pair"
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(str(preview["id"]), "remediation-merge-attempt")
+    store.transition_execution(
+        str(execution["execution_id"]),
+        state="merging",
+        evidence={
+            "phase": "remediation_merge_attempt",
+            "idempotency_key": f"remediation-merge:{execution['execution_id']}:10",
+            "condition_id": "condition-1",
+            "quantity": "10",
+        },
+    )
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert result["merge"] == "pending"
     assert result["merge_reason"] == "merge_attempt_in_flight"
     assert trading.merge_calls == 0
 
@@ -1132,6 +1213,9 @@ def test_missing_feishu_or_macos_blocks_preview_readiness(tmp_path: Path) -> Non
         notifier=ChannelNotifier("macos"),
         lock_path=tmp_path / "execution.lock",
     )
+    # This test targets notifier gating itself; bypass the constructor lock
+    # without implying that production can skip startup reconciliation.
+    service._breaker_open = False  # type: ignore[attr-defined]
 
     result = service.preview("opp-1")
 
