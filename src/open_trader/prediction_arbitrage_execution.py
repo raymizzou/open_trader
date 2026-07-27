@@ -1621,7 +1621,7 @@ class PredictionExecutionService:
                                 "channel": channel if channel not in {"unknown", ""} else attempt.channel,
                                 "success": attempt.success,
                                 "error_type": attempt.error_type,
-                                "error": attempt.error,
+                                "error": "delivery_failed" if attempt.error else "",
                                 "suppressed": attempt.suppressed,
                             }
                         )
@@ -1633,7 +1633,7 @@ class PredictionExecutionService:
                         "channel": channel,
                         "success": False,
                         "error_type": type(exc).__name__,
-                        "error": str(exc),
+                        "error": "delivery_failed",
                     }
                 )
         selected_channels = {self._notification_channel(target) for target in selected}
