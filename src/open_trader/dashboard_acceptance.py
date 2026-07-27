@@ -358,6 +358,44 @@ def validate_quotes_payload(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_prediction_payload(payload: Mapping[str, Any]) -> list[str]:
+    """Validate the non-mutating prediction Dashboard contract."""
+
+    errors: list[str] = []
+    status = str(payload.get("status") or "")
+    if status not in {"healthy", "loading", "degraded", "unavailable", "error", "executing", "success", "incident", "completed"}:
+        errors.append(f"预测市场状态无效：{status or 'missing'}")
+    events = payload.get("events")
+    if not isinstance(events, list):
+        errors.append("预测市场 events 不是数组")
+        events = []
+    for index, event in enumerate(events):
+        if not isinstance(event, Mapping):
+            errors.append(f"预测市场事件 {index} 不是对象")
+            continue
+        if not str(event.get("title") or event.get("question") or "").strip():
+            errors.append(f"预测市场事件 {index} 缺少标题")
+        if "volume_24h" not in event:
+            errors.append(f"预测市场事件 {index} 缺少 24h 成交量")
+    event_count = payload.get("event_count")
+    if event_count is not None and (not isinstance(event_count, int) or event_count < len(events)):
+        errors.append("预测市场 event_count 小于当前事件数量")
+    opportunities = payload.get("opportunities")
+    if not isinstance(opportunities, list):
+        errors.append("预测市场 opportunities 不是数组")
+        opportunities = []
+    stale = bool(payload.get("stale")) or status in {"degraded", "unavailable", "error"}
+    breaker = payload.get("breaker")
+    breaker_open = isinstance(breaker, Mapping) and breaker.get("open") is True
+    execution = payload.get("current_execution")
+    execution_state = str(execution.get("status") or execution.get("state") or "").lower() if isinstance(execution, Mapping) else ""
+    execution_locked = any(value in execution_state for value in ("running", "executing", "validating", "submitting", "reconciling", "merging"))
+    if stale or breaker_open or execution_locked:
+        if any(isinstance(item, Mapping) and item.get("actionable") is True for item in opportunities):
+            errors.append("预测市场异常/执行锁定时仍暴露 actionable opportunity")
+    return errors
+
+
 def classify_result(
     errors: list[str],
     *,

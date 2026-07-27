@@ -14,11 +14,13 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from open_trader import dashboard_acceptance
+from open_trader.prediction_arbitrage_acceptance import SCENARIO_IDS, scenario_results, validate_registry
 from open_trader.dashboard_acceptance import (
     _is_actionable_console_error,
     classify_result,
     dashboard_signature,
     validate_dashboard_payload,
+    validate_prediction_payload,
     validate_quotes_payload,
 )
 from open_trader.strategy_drawdown import (
@@ -28,6 +30,36 @@ from open_trader.strategy_drawdown import (
 
 
 MISSING_FRESH = object()
+
+
+def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
+    assert len(SCENARIO_IDS) == 54
+    assert len(set(SCENARIO_IDS)) == 54
+    assert SCENARIO_IDS[:10] == tuple(f"MON-{index:02d}" for index in range(1, 11))
+    assert SCENARIO_IDS[-3:] == ("OPS-01", "OPS-02", "OPS-03")
+    assert validate_registry(scenario_results()) == []
+
+
+def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -> None:
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
+    registry = "python -m open_trader.prediction_arbitrage_acceptance"
+    assert registry in makefile
+    assert makefile.index(registry) < makefile.index("python -m open_trader.dashboard_acceptance")
+
+
+def test_prediction_payload_validation_fails_closed_for_stale_actionable_rows() -> None:
+    payload = {
+        "status": "degraded",
+        "stale": True,
+        "events": [{"title": "event", "volume_24h": "100"}],
+        "event_count": 1,
+        "opportunities": [{"opportunity_id": "opp", "actionable": True}],
+        "breaker": {"open": False},
+    }
+    errors = validate_prediction_payload(payload)
+    assert any("actionable" in error for error in errors)
+    payload["opportunities"] = []
+    assert validate_prediction_payload(payload) == []
 
 
 def serialized_trend_account(
