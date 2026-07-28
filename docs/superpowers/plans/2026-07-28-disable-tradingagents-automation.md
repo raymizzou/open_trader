@@ -87,10 +87,18 @@ Run:
 
 ```bash
 set -euo pipefail
-ps axww -o pid=,command= | rg -i 'TradingAgents|run-daily-premarket|run-premarket|tradingagents_worker' | rg -v 'rg -i' || true
+process_matches="$(
+  ps axww -o pid=,command= |
+    rg -i 'TradingAgents|run-daily-premarket|run-premarket|tradingagents_worker' |
+    rg -v 'rg -i' || true
+)"
+[[ -z "$process_matches" ]]
 for domain in "gui/$(id -u)" system; do
   for label in com.open-trader.premarket com.open-trader.premarket.hk com.open-trader.premarket.us; do
-    ! launchctl print "$domain/$label" >/dev/null 2>&1
+    if launchctl print "$domain/$label" >/dev/null 2>&1; then
+      echo "unexpected launchd job: $domain/$label" >&2
+      exit 1
+    fi
   done
 done
 plist_roots=(
@@ -153,7 +161,7 @@ from the already committed design document.
 
 ## Operational Result
 
-Verified at `2026-07-28T19:52:18+0800`:
+Verified at `2026-07-28T19:53:55+0800`:
 
 - `notify_daily_report=False`; shared notifiers remain
   `feishu_app,macos,xiaoai`.
