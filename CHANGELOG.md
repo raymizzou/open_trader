@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Added prior-to-current right-side count and market-cap ratios to the existing
+  trend-report industry context table and Markdown/JSON outputs. The Dashboard
+  now explains both denominators and structure gap on hover, focus, or click;
+  missing provider data remains unavailable and does not change strategy
+  ordering or risk actions. Verified focused context, report, market, and
+  Dashboard suites before the final acceptance gate.
 - Verified the unified CN/HK/US trend reports in the live Dashboard with
   Playwright: buy, sell, review, and holding rows expose the same temperature
   change and phase columns, and every market includes current industry
