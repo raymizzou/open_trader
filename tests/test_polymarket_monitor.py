@@ -296,6 +296,32 @@ def test_only_exact_active_binary_markets_are_subscribed_and_books_match_by_toke
     assert snapshot["diagnostics"]["malformed_markets"] == 1
 
 
+def test_large_token_universe_is_subscribed_in_websocket_safe_chunks(
+    tmp_path: Path,
+) -> None:
+    markets = tuple(
+        market(
+            f"market-{index:03d}",
+            yes=f"yes-{index:03d}",
+            no=f"no-{index:03d}",
+            fees_enabled=True,
+        )
+        for index in range(126)
+    )
+    setup_public([event("large-event", markets=markets)])
+
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+
+    specs = FakePublicClient.subscribe_specs[-1]
+    assert isinstance(specs, list)
+    assert [len(spec.token_ids) for spec in specs] == [250, 2]
+    assert sorted(token for spec in specs for token in spec.token_ids) == sorted(
+        [f"yes-{index:03d}" for index in range(126)]
+        + [f"no-{index:03d}" for index in range(126)]
+    )
+
+
 def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path: Path) -> None:
     setup_public([event("e", markets=(market("m"),))])
     trading = FakeTrading()

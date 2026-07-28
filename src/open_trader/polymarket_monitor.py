@@ -36,6 +36,7 @@ UNIVERSE_STALE_SECONDS = 10 * 60
 RUNTIME_WRITE_SECONDS = 1
 PUBLIC_REFRESH_TIMEOUT_SECONDS = 30.0
 PUBLIC_BOOK_CONCURRENCY = 8
+STREAM_SUBSCRIPTION_CHUNK_SIZE = 250
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -448,7 +449,11 @@ class PolymarketMonitor:
         subscribe = getattr(client, "subscribe", None)
         if not callable(subscribe):
             raise ConnectionError("public client has no market stream")
-        handle = await _call(subscribe, MarketSpec(token_ids=token_ids))
+        specs = [
+            MarketSpec(token_ids=token_ids[index : index + STREAM_SUBSCRIPTION_CHUNK_SIZE])
+            for index in range(0, len(token_ids), STREAM_SUBSCRIPTION_CHUNK_SIZE)
+        ]
+        handle = await _call(subscribe, specs[0] if len(specs) == 1 else specs)
         self._stream_handle = handle
         self._stream_connected_at = self._now()
         self._stream_disconnected_at = None
