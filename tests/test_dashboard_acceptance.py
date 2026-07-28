@@ -2384,10 +2384,10 @@ class TabbedAccountLocator:
         if self.selector == "[data-back-to-holdings]:visible":
             self.page.workspace_view = "portfolio"
             return
-        if self.selector == "#open-kelly-lab":
+        if self.selector == '#main-navigation [data-workspace="kelly_lab"]':
             self.page.workspace_view = "kelly"
             return
-        if self.selector == "#open-standard-backtest":
+        if self.selector == '#main-navigation [data-workspace="standard_backtest"]':
             self.page.workspace_view = "backtest"
             return
         if self.selector == "#research-chat-close:visible":
@@ -2440,11 +2440,11 @@ class TabbedAccountLocator:
             return 1
         if self.selector == "[data-back-to-holdings]:visible":
             return int(self.page.workspace_view == "detail")
-        if self.selector == "#open-kelly-lab":
+        if self.selector == '#main-navigation [data-workspace="kelly_lab"]':
             return 1
         if self.selector == ".kelly-lab-panel:visible":
             return int(self.page.workspace_view == "kelly")
-        if self.selector == "#open-standard-backtest":
+        if self.selector == '#main-navigation [data-workspace="standard_backtest"]':
             return 1
         if self.selector == "#standard-backtest-workspace:visible":
             return int(self.page.workspace_view == "backtest")
@@ -3766,10 +3766,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             counts = {
                 '.account-holding-actions button[data-detail-mode="t_signal"]:visible': 1,
                 "[data-back-to-holdings]:visible": int(self.page.view == "detail"),
-                "#open-kelly-lab": 1,
+                '#main-navigation [data-workspace="kelly_lab"]': 1,
                 ".kelly-lab-panel:visible": int(self.page.view == "kelly"),
                 "#return-to-portfolio:visible": int(self.page.view != "portfolio"),
-                "#open-standard-backtest": 1,
+                '#main-navigation [data-workspace="standard_backtest"]': 1,
                 "#standard-backtest-workspace:visible": int(self.page.view == "backtest"),
                 "[data-research-chat]:visible": 0,
                 ".research-chat-modal:visible": int(self.page.research_open),
@@ -3782,13 +3782,13 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
 
         def click(self) -> None:
             self.page.clicks.append(self.selector)
-            if self.selector == "#open-kelly-lab":
+            if self.selector == '#main-navigation [data-workspace="kelly_lab"]':
                 self.page.view = "kelly"
             elif self.selector == '.account-holding-actions button[data-detail-mode="t_signal"]:visible':
                 self.page.view = "detail"
             elif self.selector == "[data-back-to-holdings]:visible":
                 self.page.view = "portfolio"
-            elif self.selector == "#open-standard-backtest":
+            elif self.selector == '#main-navigation [data-workspace="standard_backtest"]':
                 self.page.view = "backtest"
             elif self.selector == "#return-to-portfolio:visible":
                 self.page.view = "portfolio"
@@ -3831,8 +3831,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     assert page.clicks == [
         '.account-holding-actions button[data-detail-mode="t_signal"]:visible',
         "[data-back-to-holdings]:visible",
-        "#open-kelly-lab", "#return-to-portfolio:visible",
-        "#open-standard-backtest", "#return-to-portfolio:visible",
+        '#main-navigation [data-workspace="kelly_lab"]', "#return-to-portfolio:visible",
+        '#main-navigation [data-workspace="standard_backtest"]', "#return-to-portfolio:visible",
         "#research-chat-close:visible",
     ]
     assert page.first_uses == [

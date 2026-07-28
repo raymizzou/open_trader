@@ -1818,7 +1818,7 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
             "做T详情返回后持仓未恢复"
         )
 
-    page.locator("#open-kelly-lab").click()
+    page.locator('#main-navigation [data-workspace="kelly_lab"]').click()
     assert page.locator(".kelly-lab-panel:visible").count() == 1, (
         "Kelly Lab 工作区未显示"
     )
@@ -1831,7 +1831,7 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
         "Kelly Lab 返回后持仓未恢复"
     )
 
-    page.locator("#open-standard-backtest").click()
+    page.locator('#main-navigation [data-workspace="standard_backtest"]').click()
     assert page.locator("#standard-backtest-workspace:visible").count() == 1, (
         "标准回测工作区未显示"
     )

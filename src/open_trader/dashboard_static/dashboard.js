@@ -239,7 +239,14 @@ function bindEvents() {
   elements["main-navigation"].addEventListener("click", (event) => {
     const button = event.target.closest("[data-workspace]");
     if (!button) return;
-    setWorkspaceView(button.dataset.workspace || "portfolio");
+    const workspace = button.dataset.workspace || "portfolio";
+    if (workspace === "standard_backtest") {
+      return openStandardBacktest();
+    }
+    if (workspace === "portfolio") {
+      return returnToPortfolio();
+    }
+    setWorkspaceView(workspace);
   });
   elements["prediction-market-root"].addEventListener("click", handlePredictionMarketClick);
   elements["prediction-market-modal-root"].addEventListener("click", handlePredictionModalClick);
