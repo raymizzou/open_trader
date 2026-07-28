@@ -17,7 +17,10 @@ from .daily_premarket import send_notification_with_results
 from .notifications import Notifier
 from .polymarket_trading import LegResult, PairSubmission, PolymarketTradingClient
 from .prediction_arbitrage import (
+    MAX_EMERGENCY_LOSS,
+    MAX_NORMAL_COST,
     MAX_WALLET_BALANCE,
+    MIN_ESTIMATED_PROFIT,
     PROTECTED_BUY_SHARE_PRECISION,
     PairIntent,
     protected_buy_quantity,
@@ -1669,6 +1672,13 @@ class PredictionExecutionService:
             "minimum_profit": format(intent.minimum_profit, "f"),
             "net_edge": format(intent.net_edge, "f"),
             "wallet_address": str(account.get("wallet_address", "")),
+            "available_balance": _safe_decimal(account.get("p_usd_balance")),
+            "policy_limits": {
+                "max_wallet_balance": format(MAX_WALLET_BALANCE, "f"),
+                "max_normal_cost": format(MAX_NORMAL_COST, "f"),
+                "max_emergency_loss": format(MAX_EMERGENCY_LOSS, "f"),
+                "min_estimated_profit": format(MIN_ESTIMATED_PROFIT, "f"),
+            },
             "expires_at": _timestamp(expires_at),
         }
 

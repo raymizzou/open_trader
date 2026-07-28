@@ -2058,7 +2058,12 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
     class FakeMonitor:
         def snapshot(self) -> dict[str, object]:
             return {
-                "status": "healthy",
+                "status": "degraded",
+                "health": {
+                    "status": "degraded",
+                    "degraded_reasons": ["heartbeat_stale", "stream_disconnected"],
+                    "heartbeat_age_seconds": "31.2",
+                },
                 "readiness": {"balance": "50.00", "geoblock": "allowed", "relayer": "ready"},
                 "events": [{
                     "event_id": "event-1",
@@ -2088,6 +2093,12 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
     assert state["market_count"] == 1
     assert state["token_count"] == 2
     assert state["signals_24h"] == 2
+    assert state["health"] == {
+        "status": "degraded",
+        "degraded_reasons": ["heartbeat_stale", "stream_disconnected"],
+        "heartbeat_age_seconds": "31.2",
+    }
+    assert state["failure_reason"] == "heartbeat_stale"
     assert state["first_live_order"] == "已验证"
     assert state["readiness"]["first_live_order"] == "已验证"
     assert state["current_execution"]["status"] == "reconciling"

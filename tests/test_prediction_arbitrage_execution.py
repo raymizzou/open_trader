@@ -561,6 +561,13 @@ def test_preview_rechecks_without_signing_and_serializes_only_safe_intent(tmp_pa
     assert trading.batch_calls == 0
     assert preview["expires_at"]
     assert preview["intent"]["quantity"] == "10"
+    assert preview["available_balance"] == "20"
+    assert preview["policy_limits"] == {
+        "max_wallet_balance": "65.00",
+        "max_normal_cost": "20.00",
+        "max_emergency_loss": "2.00",
+        "min_estimated_profit": "1.00",
+    }
     assert "PairIntent" not in repr(preview)
     assert not {"prices", "quantity", "wallet", "limits"} & set(inspect.signature(service.preview).parameters)
 

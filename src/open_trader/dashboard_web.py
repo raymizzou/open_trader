@@ -404,6 +404,8 @@ def _prediction_history_aliases(kind: str, value: object) -> object:
 def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_unavailable") -> dict[str, object]:
     return {
         "status": "unavailable",
+        "health": {"status": "unavailable", "degraded_reasons": [reason]},
+        "failure_reason": reason,
         "readiness": {"status": "unavailable", "reason": reason},
         "first_live_order": "待首单",
         "wallet": {"address": "", "masked_address": ""},
@@ -578,6 +580,17 @@ def _prediction_state_payload(
     status = str(safe_snapshot.get("status") or "unavailable")
     if not snapshot:
         status = "unavailable"
+    health = safe_snapshot.get("health")
+    if not isinstance(health, Mapping):
+        health = {"status": status, "degraded_reasons": []}
+    else:
+        health = dict(health)
+    degraded_reasons = health.get("degraded_reasons")
+    failure_reason = (
+        degraded_reasons[0]
+        if isinstance(degraded_reasons, (list, tuple)) and degraded_reasons
+        else readiness.get("reason")
+    )
     stale = bool(safe_snapshot.get("stale")) or status in {"degraded", "unavailable", "error"}
     policy = _prediction_unavailable_state(csrf_token)["policy_limits"]
     balances = {
@@ -586,6 +599,8 @@ def _prediction_state_payload(
     }
     return {
         "status": status,
+        "health": health,
+        "failure_reason": failure_reason,
         "readiness": dict(readiness),
         "first_live_order": first_live_order,
         "wallet": {"address": "", "masked_address": masked_wallet},
