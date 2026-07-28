@@ -53,7 +53,10 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
         capture_output=True,
         text=True,
     )
-    assert plistlib.loads(result.stdout.encode("utf-8"))["Label"] == "com.open-trader.dashboard"
+    payload = plistlib.loads(result.stdout.encode("utf-8"))
+    assert payload["Label"] == "com.open-trader.dashboard"
+    args = payload["ProgramArguments"]
+    assert args[args.index("--reports-dir") + 1] == str(ROOT / "reports")
     assert not list(agents.iterdir())
     assert "127.0.0.1" in result.stdout
     assert "8766" in result.stdout

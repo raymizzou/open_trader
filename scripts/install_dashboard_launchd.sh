@@ -45,11 +45,11 @@ render_plist() {
   reports="$(sed_escape "$REPORTS_DIR")"
   prediction="$(sed_escape "$PREDICTION_CONFIG")"
   sed \
-    -e "s|OPEN_TRADER_REPO|$repo|g" \
     -e "s|OPEN_TRADER_PYTHON|$python|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$data|g" \
     -e "s|OPEN_TRADER_REPORTS_DIR|$reports|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$prediction|g" \
+    -e "s|OPEN_TRADER_REPO|$repo|g" \
     "$TEMPLATE"
 }
 
