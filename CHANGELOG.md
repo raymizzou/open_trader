@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-29
+
+- Verified the unified CN/HK/US trend reports in the live Dashboard with
+  Playwright: buy, sell, review, and holding rows expose the same temperature
+  change and phase columns, and every market includes current industry
+  temperature. Generated and selected the pre-execution HK `2026-07-28-r1`
+  revision; the in-session US report remained immutable after its execution
+  batch lock and passed the same rendered-report checks.
+
 ## 2026-07-28
 
 - Unified the CN/US/HK trend-report action tables so buy, sell, review, and
