@@ -559,3 +559,49 @@ def test_runtime_refresh_applies_total_timeout(
     assert time.monotonic() - started < 0.1
     assert snapshot["health"]["actionable"] is False
     assert snapshot["diagnostics"]["last_error"] == "universe:TimeoutError"
+
+
+def test_runtime_confirms_books_with_bounded_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_trader import polymarket_monitor
+    from open_trader.polymarket_monitor import PolymarketMonitor
+
+    class SlowBookClient(FakePublicClient):
+        active = 0
+        max_active = 0
+
+        async def get_order_books(
+            self, *, token_ids: list[str]
+        ) -> tuple[object, ...]:
+            type(self).active += 1
+            type(self).max_active = max(type(self).max_active, type(self).active)
+            try:
+                await asyncio.sleep(0.02)
+                return await super().get_order_books(token_ids=token_ids)
+            finally:
+                type(self).active -= 1
+
+    rows = tuple(
+        market(
+            f"m-{i:02d}",
+            yes=f"yes-{i:02d}",
+            no=f"no-{i:02d}",
+            fees_enabled=True,
+        )
+        for i in range(20)
+    )
+    setup_public([event("e", markets=rows)])
+    monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.15)
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        trading=FakeTrading(),
+        public_client_factory=SlowBookClient,
+        clock=lambda: NOW,
+    )
+
+    snapshot = monitor.refresh_once()
+
+    assert snapshot["health"]["status"] == "healthy", snapshot["health"]
+    assert SlowBookClient.max_active == 8
+    assert len(SlowBookClient.book_calls) == 20

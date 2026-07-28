@@ -35,6 +35,7 @@ STREAM_DISCONNECT_SECONDS = 15
 UNIVERSE_STALE_SECONDS = 10 * 60
 RUNTIME_WRITE_SECONDS = 1
 PUBLIC_REFRESH_TIMEOUT_SECONDS = 30.0
+PUBLIC_BOOK_CONCURRENCY = 8
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -503,13 +504,23 @@ class PolymarketMonitor:
             self._universe_failed = False
         await self._subscribe(client)
         await self._refresh_readiness()
+        semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
+
+        async def confirm(
+            market_row: dict[str, object],
+        ) -> dict[str, object] | None:
+            async with semaphore:
+                try:
+                    return await self._confirm_market(client, market_row)
+                except Exception as exc:
+                    self._record_error(exc, "books")
+                    return None
+
+        confirmed = await asyncio.gather(
+            *(confirm(market_row) for market_row in markets.values())
+        )
         current_opportunities: dict[str, dict[str, object]] = {}
-        for market_row in markets.values():
-            try:
-                opportunity = await self._confirm_market(client, market_row)
-            except Exception as exc:
-                self._record_error(exc, "books")
-                opportunity = None
+        for opportunity in confirmed:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
         with self._lock:
