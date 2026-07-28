@@ -12,7 +12,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Made HK/US protection-monitor timestamps timezone-aware so triggered orders
   remain valid in the action ledger and Dashboard simulation/history checks;
   acceptance now reuses the shared report projection and recognizes validated
-  synthetic protection actions without inventing frozen reports.
+  synthetic protection actions without inventing frozen reports, and refreshes
+  live simulated positions before each browser viewport.
 - Changed prediction-market monitored events to start collapsed and preserve
   each operator-selected expanded/collapsed state across watcher refreshes.
   Added the behavior as the explicit `UI-14` acceptance scenario.

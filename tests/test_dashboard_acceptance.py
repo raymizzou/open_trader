@@ -3575,6 +3575,30 @@ def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
     )
 
 
+def test_acceptance_refreshes_simulated_positions_before_each_browser_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fetch(_url: str, path: str) -> object:
+        calls.append(path)
+        return {"available": True, "positions": [{"symbol": path.rsplit("/", 1)[-1]}]}
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetch)
+
+    refreshed = dashboard_acceptance._refresh_simulate_payloads(
+        "http://dashboard", {"tiger": {}, "phillips": {}}
+    )
+
+    assert calls == [
+        "/api/trend-simulate-positions/tiger",
+        "/api/trend-simulate-positions/phillips",
+    ]
+    assert [refreshed[broker]["positions"][0]["symbol"] for broker in refreshed] == [
+        "tiger", "phillips",
+    ]
+
+
 def test_acceptance_uses_browser_snapshot_when_controller_phase_advances() -> None:
     payload = valid_payload()
     controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]

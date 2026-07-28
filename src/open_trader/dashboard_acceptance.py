@@ -3823,6 +3823,20 @@ def _validate_acceptance_screenshots(started_at_ns: int) -> list[str]:
     return errors
 
 
+def _refresh_simulate_payloads(
+    url: str,
+    payloads: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    refreshed: dict[str, dict[str, Any]] = {}
+    for broker in payloads:
+        payload = _fetch_json_path(
+            url, f"/api/trend-simulate-positions/{broker}"
+        )
+        assert isinstance(payload, Mapping), f"{broker} 模拟盘 API 不是对象"
+        refreshed[broker] = dict(payload)
+    return refreshed
+
+
 def _browser_check(
     url: str,
     expected_cn: int,
@@ -3902,7 +3916,7 @@ def _browser_check(
                             _check_trend_account_views(
                                 page,
                                 payload,
-                                simulate_payloads,
+                                _refresh_simulate_payloads(url, simulate_payloads),
                                 history_expectations,
                                 screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
                             )
