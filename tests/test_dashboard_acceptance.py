@@ -14,6 +14,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from open_trader import dashboard_acceptance
+import open_trader.prediction_arbitrage_acceptance as prediction_acceptance
 from open_trader.prediction_arbitrage_acceptance import SCENARIO_IDS, scenario_results, validate_registry
 from open_trader.dashboard_acceptance import (
     _is_actionable_console_error,
@@ -40,11 +41,53 @@ def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
     assert validate_registry(scenario_results()) == []
 
 
+def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -> None:
+    live = [
+        row for row in scenario_results(live_available=True)
+        if row.scenario_id.startswith("LIVE-")
+    ]
+
+    assert {row.status for row in live} == {"PASS"}
+    assert {row.detail for row in live} == {"authenticated no-submit preflight"}
+
+
 def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
     registry = "python -m open_trader.prediction_arbitrage_acceptance"
     assert registry in makefile
     assert makefile.index(registry) < makefile.index("python -m open_trader.dashboard_acceptance")
+    assert '--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json"' in makefile
+
+
+@pytest.mark.parametrize(("result", "available"), (("PASS", True), ("BLOCKED", False)))
+def test_prediction_live_acceptance_requires_passed_no_submit_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result: str,
+    available: bool,
+) -> None:
+    config = tmp_path / "prediction.json"
+    config.write_text(
+        json.dumps(
+            {
+                "signer_address": "0x1111111111111111111111111111111111111111",
+                "wallet_address": "0x2222222222222222222222222222222222222222",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        def preflight_report(self) -> dict[str, object]:
+            return {"result": result}
+
+    monkeypatch.setattr(
+        prediction_acceptance.PolymarketTradingClient,
+        "from_keychain",
+        lambda _: Client(),
+    )
+
+    assert prediction_acceptance._live_environment_available(config) is available
 
 
 def test_prediction_payload_validation_fails_closed_for_stale_actionable_rows() -> None:

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Iterable
 from urllib.request import urlopen
 
+from .polymarket_trading import PolymarketTradingClient, load_trading_config
+
 
 SCENARIO_IDS = (
     "MON-01", "MON-02", "MON-03", "MON-04", "MON-05",
@@ -58,6 +60,14 @@ def scenario_results(*, live_available: bool = False) -> tuple[ScenarioResult, .
                     "BLOCKED: Polymarket network/account/Keychain environment unavailable",
                 )
             )
+        elif scenario_id in LIVE_SCENARIO_IDS:
+            results.append(
+                ScenarioResult(
+                    scenario_id,
+                    "PASS",
+                    "authenticated no-submit preflight",
+                )
+            )
         else:
             results.append(ScenarioResult(scenario_id, "PASS", "deterministic contract"))
     return tuple(results)
@@ -84,15 +94,26 @@ def _dashboard_is_reachable(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def _live_environment_available(config_path: Path) -> bool:
+    try:
+        config = load_trading_config(config_path)
+        report = PolymarketTradingClient.from_keychain(config).preflight_report()
+        return report.get("result") == "PASS"
+    except Exception:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run prediction-market acceptance registry")
     parser.add_argument("--url", default="http://127.0.0.1:8766")
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
-    parser.add_argument("--live", action="store_true", help="Only use when live venue checks are configured")
+    parser.add_argument("--config", type=Path)
     args = parser.parse_args(argv)
-    del args.expected_root  # reserved for the process/cwd checks in OPS scenarios
 
-    results = list(scenario_results(live_available=args.live))
+    config_path = args.config or args.expected_root / "config" / "prediction_arbitrage.json"
+    results = list(
+        scenario_results(live_available=_live_environment_available(config_path))
+    )
     errors = validate_registry(results)
     if errors:
         for error in errors:

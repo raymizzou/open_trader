@@ -14,8 +14,10 @@ acceptance:
 		"$(WORKTREE_ROOT)/.venv/bin/python" -m pytest "$(WORKTREE_ROOT)/tests" -q
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
-		PYTHONPATH=src .venv/bin/python -m open_trader.prediction_arbitrage_acceptance \
-		--url "$(DASHBOARD_URL)" --expected-root "$(WORKTREE_ROOT)" || status=$$?; \
+	PYTHONPATH=src .venv/bin/python -m open_trader.prediction_arbitrage_acceptance \
+		--url "$(DASHBOARD_URL)" \
+		--expected-root "$(WORKTREE_ROOT)" \
+		--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json" || status=$$?; \
 	if [ $$status -eq 2 ]; then echo BLOCKED; exit 2; fi; \
 	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
 	@status=0; \
