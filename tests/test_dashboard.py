@@ -2347,6 +2347,27 @@ def test_dashboard_projects_legacy_trend_money_as_cny_billions(
     assert buys[0]["amount_cny_100m"] == expected_amount
 
 
+def test_dashboard_holding_phase_projection_uses_frozen_snapshot() -> None:
+    payload = {
+        "metadata": {"market": "HK"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [
+                {"action": "HOLD", "symbol": "00939", "reason": "trend_intact"},
+            ],
+        },
+        "signal_snapshots": {
+            "holdings": {
+                "00939": {"phase": "立夏"},
+            },
+        },
+    }
+
+    _, _, holds, _ = dashboard_module._project_trend_actions(payload, {})
+
+    assert holds[0]["phase"] == "立夏"
+
+
 def test_dashboard_preserves_frozen_trend_cny_money_fields() -> None:
     payload = {
         "metadata": {"market": "US"},

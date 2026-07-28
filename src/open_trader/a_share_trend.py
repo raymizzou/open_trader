@@ -1089,6 +1089,7 @@ class HoldingDecision:
     temperature_prev: str | None = None
     temperature_curr: str | None = None
     strength: Decimal | None = None
+    phase: str | None = None
     entry_hints: tuple[str, ...] = ()
     position_started_for: str | None = None
     target_fraction: Decimal | None = None
@@ -2970,6 +2971,7 @@ def build_report(
                 temperature_prev=snapshot.temperature_prev if snapshot else None,
                 temperature_curr=snapshot.temperature_curr if snapshot else None,
                 strength=snapshot.strength if snapshot else None,
+                phase=snapshot.phase if snapshot else None,
                 entry_hints=(
                     _holding_entry_hints(snapshot) if market == "CN" else ()
                 ),

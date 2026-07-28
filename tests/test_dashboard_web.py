@@ -2901,14 +2901,14 @@ console.log(JSON.stringify([
 def test_dashboard_trend_stages_format_only_numeric_fields_losslessly() -> None:
     output = run_dashboard_js(r'''
 const cn = [
-  renderCnSellOrHoldStage("卖出", [{
+  renderTrendSellOrHoldStage("卖出", [{
     symbol:"02840",name:"SPDR 金",close:"24.545714285714",strength:"99.876",
     temperature_prev:"温",temperature_curr:"热",reason:"left_trend_right_side",
     active_line:"9007199254740993",entry_hints:["编号 00001234"],
     execution:{status:"partially_filled",filled_qty:"13.129",target_qty:"23.428",
       avg_fill_price:"207.185",order_ids:["00001234"],updated_at:"2026-07-22T09:30:00+08:00"},
   }], "sell"),
-  renderCnBuyStage({buy_window:"09:30–10:00",buy_actions:[{
+  renderTrendBuyStage({buy_window:"09:30–10:00",buy_actions:[{
     symbol:"600001",name:"测试",filter_price:"1234567.505",close:"24.545714285714",
     temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99.876",
     industry:"科技",industry_temperature:"热",market_cap:"12345.678",amount:"2.345",
@@ -2920,11 +2920,11 @@ const cn = [
     target_weight:"0.04123456",target_amount:"8888.888"}]}),
 ].join("");
 const us = [
-  renderMarketSellOrHoldStage("持有", [{
+  renderTrendSellOrHoldStage("持有", [{
     symbol:"00001234",name:"编号测试",close:"30.594999999999995",strength:"90.444",
     reason:"trend_intact",active_line:"28.305071428571",
   }], "hold"),
-  renderMarketBuyStage({buy_window:"常规时段",buy_actions:[{
+  renderTrendBuyStage({buy_window:"常规时段",buy_actions:[{
     symbol:"EA",name:"艺电",close:"207.185",strength:"99.876",industry:"通讯服务",
     target_weight:"0.04123456",target_amount:"4941.499",estimated_shares:"9007199254740993",
     estimated_initial_line:"205.46930",execution:{status:"partially_filled",
@@ -3064,8 +3064,8 @@ state.dashboard = {kelly_lab:{available:true,experiment_count:"10000",experiment
 }]}};
 const kelly = renderKellyLabPanel();
 const trend = [
-  renderMarketBuyStage({buy_window:"09:30–10:00",buy_actions:[{symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}]}),
-  renderMarketSellOrHoldStage("盘中持续 · 已有持仓", [{symbol:"02840",name:"SPDR 金",reason:"trend_intact",active_line:"1234567.50"}], "hold"),
+  renderTrendBuyStage({buy_window:"09:30–10:00",buy_actions:[{symbol:"02840",name:"SPDR 金",estimated_shares:"10000",target_amount:"29320000.00",estimated_initial_line:"1234567.50"}]}),
+  renderTrendSellOrHoldStage("盘中持续 · 已有持仓", [{symbol:"02840",name:"SPDR 金",reason:"trend_intact",active_line:"1234567.50"}], "hold"),
   renderTrendAudit({
     candidates:[{symbol:"02840",name:"SPDR 金",strength:"10000"}],
     excluded:{},industry_concentration:[["科技","10000","2932.00"]],
@@ -3088,7 +3088,7 @@ console.log(JSON.stringify({kelly,trend,grouped,omitted}));
         assert expected in rendered["kelly"]
     assert ">02840 SPDR 金<" in rendered["trend"]
     for expected in (
-        "10,000 股", "金额上限", "29,320,000", "预计保护线", "1,234,567.5",
+        "10,000 股", "目标金额", "29,320,000", "预计保护线", "1,234,567.5",
         "活动保护线", "强度 10,000", "科技｜10,000｜2,932",
         "API 成本：1,234.5",
     ):
@@ -5887,7 +5887,7 @@ const cn = renderTrendReportWorkspace({
     data_sources:["Trend Animals","Futu CN calendar/QFQ daily K-line"]},
 });
 for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买入计划",
-  "需要确认 · 人工复核","盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价（Futu 前复权）",
+  "需要确认 · 人工复核","盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价",
   "温 → 热","目标仓位 4%","全部卖出","正式买入","继续持有",
   "人工复核","600036","600519","日线数据不可用","筛选价数据不可用",
   "趋势信号不完整","行业温度数据不可用","纪律","本报告未提供该类纪律参数","审计详情"]) {
@@ -5949,16 +5949,64 @@ const usOrder=["优先处理 · 卖出触发","美股常规交易时段 · 正�
   .map((text)=>us.indexOf(`<h2>${text}</h2>`));
 if (usOrder.some((index)=>index<0) ||
     !usOrder.every((index,i)=>i===0||usOrder[i-1]<index)) throw new Error(us);
-    if (!us.includes('class="cn-trend-report"') ||
+if (!us.includes('class="cn-trend-report"') ||
     (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
     !us.includes('class="cn-trend-card"') ||
-    us.includes("今日执行检查") || us.includes("筛选价（Trend Animals）") ||
+    us.includes("今日执行检查") || !us.includes("筛选价（Trend Animals）") ||
     us.includes('class="trend-discipline"') ||
     (us.match(/class="trend-discipline-category"/g) || []).length !== 6 ||
     us.includes('class="trend-discipline-card"') ||
     !us.includes("本报告未提供该类纪律参数")) throw new Error(us);
 if (us.includes('class="cn-trend-execution"') ||
     us.includes("部分成交") || us.includes("执行详情按钮") || us.includes("执行状态卡片")) throw new Error(us);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_cross_market_trend_report_tables_are_identical() -> None:
+    output = run_dashboard_js(r'''
+const base = (market) => ({
+  available:true, market,
+  broker:market === "CN" ? "eastmoney" : market === "US" ? "tiger" : "phillips",
+  broker_label:market === "CN" ? "东方财富" : market === "US" ? "老虎" : "辉立",
+  market_label:market === "CN" ? "A股" : market === "US" ? "美股" : "港股",
+  report_date:"2026-07-28", data_date:"2026-07-27", generated_at:"now",
+  account_status:"已更新", buy_window:"09:30–10:00",
+  counts:{sell:1,buy:1,hold:1,review:1}, audit:{},
+  sell_actions:[{symbol:"SELL",name:"卖出",close:"9.13",temperature_prev:"热",temperature_curr:"热",phase:"立夏",strength:"98.5",reason:"danger_signal",active_line:"8.42",entry_hints:[]}],
+  buy_actions:[{symbol:"BUY",name:"买入",filter_price:"9.60",close:"9.13",temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99.1",industry:"银行",industry_temperature:"热",market_cap:"180",amount:"6",target_weight:"0.04",target_amount:"1000",estimated_shares:100,estimated_initial_line:"8.42"}],
+  hold_actions:[{symbol:"HOLD",name:"持仓",close:"9.13",temperature_prev:"热",temperature_curr:"热",phase:"立夏",strength:"98.5",reason:"trend_intact",active_line:"8.42",entry_hints:[]}],
+  review_actions:[{symbol:"REVIEW",name:"复核",close:null,temperature_prev:null,temperature_curr:null,phase:null,strength:null,reason:"holding_signal_unknown",active_line:null,entry_hints:[]}],
+});
+const sectionHeaders = (html, marker) => {
+  const headingIndex = html.indexOf(marker);
+  if (headingIndex < 0) throw new Error("missing stage " + marker);
+  const start = html.lastIndexOf("<section", headingIndex);
+  const end = html.indexOf("</section>", headingIndex);
+  return [...html.slice(start, end).matchAll(/<th scope="col">([^<]+)<\/th>/g)].map((match) => match[1]);
+};
+const expectedBuy = ["标的", "动作", "筛选价（Trend Animals）", "执行参考价", "温度变化", "节气", "强度", "行业", "行业温度", "行业确认", "市值（亿元）", "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线"];
+const expectedSell = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "触发原因", "活动保护线", "持仓提示"];
+const expectedHold = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "当前判断", "活动保护线", "持仓提示"];
+const expectedReview = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "复核原因", "活动保护线", "持仓提示"];
+for (const market of ["CN", "US", "HK"]) {
+  const html = renderTrendReportWorkspace(base(market));
+  for (const [marker, expected] of [
+    ["优先处理 · 卖出触发", expectedSell],
+    ["正式买入计划", expectedBuy],
+    ["需要确认 · 人工复核", expectedReview],
+    ["盘中持续 · 已有持仓", expectedHold],
+  ]) {
+    const actual = sectionHeaders(html, marker);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(market + " " + marker + "\n" + JSON.stringify(actual));
+  }
+  for (const text of ["温 → 热", "立夏", "数据未提供"]) {
+    if (!html.includes(text)) throw new Error(market + " missing " + text);
+  }
+  if (html.includes("执行参考价（Futu 前复权）")) throw new Error(market + " retained market-specific price heading");
+}
 console.log("ok");
 ''')
 
@@ -6361,7 +6409,7 @@ const html=renderTrendReportWorkspace({
 if (html.includes(attack) || !html.includes("&lt;img") ||
     !html.includes('class="cn-trend-report"') ||
     !html.includes("筛选价（Trend Animals）") ||
-    !html.includes("执行参考价（Futu 前复权）")) throw new Error(html);
+    !html.includes("执行参考价")) throw new Error(html);
 console.log("ok");
 ''')
 
@@ -6626,7 +6674,7 @@ const html=renderTrendReportWorkspace({
 });
 if ((html.match(/class="cn-trend-table"/g) || []).length !== 3 ||
     !html.includes("筛选价（Trend Animals）") ||
-    !html.includes("执行参考价（Futu 前复权）") ||
+    !html.includes("执行参考价") ||
     (html.match(/<p>无<\/p>/g) || []).length !== 3 ||
     html.includes("需要确认 · 人工复核")) throw new Error(html);
 console.log("ok");

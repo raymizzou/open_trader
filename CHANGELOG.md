@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-28
 
+- Unified the CN/US/HK trend-report action tables so buy, sell, review, and
+  holding stages use the same complete columns, including temperature and
+  phase; legacy holding reports now enrich phase read-only from frozen
+  snapshots. Verified cross-market web parity and frozen-report regressions.
 - Changed prediction-market monitored events to start collapsed and preserve
   each operator-selected expanded/collapsed state across watcher refreshes.
   Added the behavior as the explicit `UI-14` acceptance scenario.

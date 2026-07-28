@@ -1064,9 +1064,24 @@ def _project_trend_actions(
         }
         for item in judgments["formal_actions"]
     ]
-    holdings = _project_trend_money_items(
-        judgments["holding_decisions"], payload=payload, market=market
+    frozen_holding_snapshots = payload.get("signal_snapshots", {})
+    frozen_holding_snapshots = (
+        frozen_holding_snapshots.get("holdings", {})
+        if isinstance(frozen_holding_snapshots, dict)
+        else {}
     )
+    holdings = []
+    for item in judgments["holding_decisions"]:
+        if not isinstance(item, dict):
+            continue
+        projected = _project_trend_money_fields(
+            item, payload=payload, market=market
+        )
+        if projected.get("phase") in (None, ""):
+            snapshot = frozen_holding_snapshots.get(str(projected.get("symbol") or ""))
+            if isinstance(snapshot, dict) and snapshot.get("phase") not in (None, ""):
+                projected["phase"] = snapshot["phase"]
+        holdings.append(projected)
     full_exit_symbols = {
         symbol
         for item in formal

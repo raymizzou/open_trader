@@ -4643,6 +4643,22 @@ def test_frozen_json_formal_actions_include_sells_and_buys(tmp_path: Path) -> No
     assert "no_action" not in payload
 
 
+def test_frozen_json_holding_decisions_include_phase(tmp_path: Path) -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600009"),
+        candidates=(),
+        holding_snapshots={"600009": holding("600009", danger=True, phase="立夏")},
+        bars_by_symbol={"600009": None},
+    )
+
+    _, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert payload["strategy_judgments"]["holding_decisions"][0]["phase"] == "立夏"
+
+
 @pytest.mark.parametrize("market", ["US", "HK"])
 def test_us_hk_frozen_candidates_keep_attention_risk_fields(
     tmp_path: Path, market: str
