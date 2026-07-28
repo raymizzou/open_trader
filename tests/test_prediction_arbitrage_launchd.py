@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -87,6 +88,24 @@ def test_uninstaller_only_targets_the_dashboard_label() -> None:
 def test_dashboard_installer_retries_transient_launchctl_bootstrap(
     tmp_path: Path,
 ) -> None:
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "ops/launchd").mkdir(parents=True)
+    (repo / "config").mkdir()
+    shutil.copy2(INSTALLER, repo / "scripts/install_dashboard_launchd.sh")
+    shutil.copy2(
+        TEMPLATE,
+        repo / "ops/launchd/com.open-trader.dashboard.plist.template",
+    )
+    (repo / "config/prediction_arbitrage.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    log_dir = repo / "logs/dashboard"
+    log_dir.mkdir(parents=True)
+    stdout_log = log_dir / "launchd.out.log"
+    stderr_log = log_dir / "launchd.err.log"
+    stdout_log.write_text("old stdout\n", encoding="utf-8")
+    stderr_log.write_text("old stderr\n", encoding="utf-8")
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
     runtime_root = tmp_path / "runtime"
@@ -117,7 +136,7 @@ exit 0
         [
             str(INSTALLER),
             "--repo-root",
-            str(ROOT),
+            str(repo),
             "--runtime-root",
             str(runtime_root),
             "--launch-agents-dir",
@@ -141,6 +160,8 @@ exit 0
     )
 
     assert state.read_text(encoding="utf-8").strip() == "2"
+    assert stdout_log.read_text(encoding="utf-8") == ""
+    assert stderr_log.read_text(encoding="utf-8") == ""
 
 
 def test_prediction_status_command_is_registered() -> None:

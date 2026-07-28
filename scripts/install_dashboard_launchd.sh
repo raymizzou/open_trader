@@ -36,6 +36,8 @@ REPORTS_DIR="$RUNTIME_ROOT/reports"
 PORTFOLIO="$DATA_DIR/latest/portfolio.csv"
 DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
 PREDICTION_CONFIG="$REPO_ROOT/config/prediction_arbitrage.json"
+OUT_LOG="$REPO_ROOT/logs/dashboard/launchd.out.log"
+ERR_LOG="$REPO_ROOT/logs/dashboard/launchd.err.log"
 
 [[ -f "$TEMPLATE" ]] || { echo "missing launchd template: $TEMPLATE" >&2; exit 1; }
 
@@ -126,6 +128,8 @@ mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/dashboard" "$DATA_DIR" "$REPORTS_
 printf '%s\n' "$rendered" > "$PLIST_PATH"
 
 "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
+: > "$OUT_LOG"
+: > "$ERR_LOG"
 bootstrap_agent
 "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LABEL"
 wait_ready
