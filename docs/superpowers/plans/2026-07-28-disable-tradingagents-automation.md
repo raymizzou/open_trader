@@ -92,7 +92,10 @@ process_matches="$(
     rg -i 'TradingAgents|run-daily-premarket|run-premarket|tradingagents_worker' |
     rg -v 'rg -i' || true
 )"
-[[ -z "$process_matches" ]]
+if [[ -n "$process_matches" ]]; then
+  printf 'unexpected TradingAgents process:\n%s\n' "$process_matches" >&2
+  exit 1
+fi
 for domain in "gui/$(id -u)" system; do
   for label in com.open-trader.premarket com.open-trader.premarket.hk com.open-trader.premarket.us; do
     if launchctl print "$domain/$label" >/dev/null 2>&1; then
@@ -118,18 +121,41 @@ plist_matches="$(
       'com\.open-trader\.premarket|run-daily-premarket|run-premarket|TradingAgents' \
       2>/dev/null || true
 )"
-[[ -z "$named_plists" ]]
-[[ -z "$plist_matches" ]]
-crontab -l 2>&1 | rg -i 'run-daily-premarket|run-premarket|TradingAgents' && exit 1 || true
-atq 2>&1 | rg -i 'run-daily-premarket|run-premarket|TradingAgents' && exit 1 || true
-screen -ls 2>&1 | rg -i 'run-daily-premarket|run-premarket|TradingAgents' && exit 1 || true
+if [[ -n "$named_plists" || -n "$plist_matches" ]]; then
+  printf 'unexpected TradingAgents plist:\n%s\n%s\n' \
+    "$named_plists" "$plist_matches" >&2
+  exit 1
+fi
+cron_matches="$(
+  crontab -l 2>&1 |
+    rg -i 'run-daily-premarket|run-premarket|TradingAgents' || true
+)"
+at_matches="$(
+  atq 2>&1 |
+    rg -i 'run-daily-premarket|run-premarket|TradingAgents' || true
+)"
+screen_matches="$(
+  screen -ls 2>&1 |
+    rg -i 'run-daily-premarket|run-premarket|TradingAgents' || true
+)"
+if [[ -n "$cron_matches" || -n "$at_matches" || -n "$screen_matches" ]]; then
+  printf 'unexpected TradingAgents scheduled task:\n%s\n%s\n%s\n' \
+    "$cron_matches" "$at_matches" "$screen_matches" >&2
+  exit 1
+fi
 for market in CN HK US; do
   lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
   label="com.open-trader.trend-market-controller.$lower"
   pid="$(launchctl list | awk -v label="$label" '$3 == label {print $1}')"
-  [[ "$pid" =~ ^[0-9]+$ ]]
-  ps -p "$pid" -o command= |
-    rg "open_trader trend-market run --market $market"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    echo "missing live trend controller PID: $label" >&2
+    exit 1
+  fi
+  if ! ps -p "$pid" -o command= |
+    rg "open_trader trend-market run --market $market"; then
+    echo "unexpected trend controller command: $label pid=$pid" >&2
+    exit 1
+  fi
   PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python - "$market" "$pid" <<'PY'
 import json
 import sys
@@ -161,7 +187,7 @@ from the already committed design document.
 
 ## Operational Result
 
-Verified at `2026-07-28T19:53:55+0800`:
+Verified at `2026-07-28T19:56:11+0800`:
 
 - `notify_daily_report=False`; shared notifiers remain
   `feishu_app,macos,xiaoai`.
