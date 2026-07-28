@@ -32,9 +32,13 @@ class IndustryContext:
     strength: Decimal | None
     valid: bool
     invalid_reasons: tuple[str, ...]
+    aggregate_right_count_ratio: Decimal | None = None
+    aggregate_right_market_cap_ratio: Decimal | None = None
     prior_as_of_date: str | None = None
     prior_temperature: str | None = None
     prior_right_share: Decimal | None = None
+    prior_aggregate_right_count_ratio: Decimal | None = None
+    prior_aggregate_right_market_cap_ratio: Decimal | None = None
     temperature_direction: str | None = None
     right_share_change_pp: Decimal | None = None
 
@@ -96,6 +100,8 @@ def calculate_industry_context(
 
     temperature: str | None = None
     strength: Decimal | None = None
+    aggregate_right_count_ratio: Decimal | None = None
+    aggregate_right_market_cap_ratio: Decimal | None = None
     if isinstance(industry_row, Mapping) and _industry_row_matches(
         industry_row, industry_tm_id, expected_date
     ):
@@ -109,6 +115,20 @@ def calculate_industry_context(
                 industry_row,
                 "trendStrengthLocalCurr",
                 "strength",
+            )
+        )
+        aggregate_right_count_ratio = _valid_ratio(
+            _row_value(
+                industry_row,
+                "TrendRightSideCountRatio",
+                "trendRightSideCountRatio",
+            )
+        )
+        aggregate_right_market_cap_ratio = _valid_ratio(
+            _row_value(
+                industry_row,
+                "TrendRightSideMktCapRatio",
+                "trendRightSideMktCapRatio",
             )
         )
 
@@ -145,6 +165,8 @@ def calculate_industry_context(
         strength=strength,
         valid=not invalid_reasons,
         invalid_reasons=tuple(invalid_reasons),
+        aggregate_right_count_ratio=aggregate_right_count_ratio,
+        aggregate_right_market_cap_ratio=aggregate_right_market_cap_ratio,
     )
 
 
@@ -191,6 +213,20 @@ def _valid_strength(value: object) -> Decimal | None:
     )
 
 
+def _valid_ratio(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, AttributeError):
+        return None
+    return (
+        parsed
+        if parsed.is_finite() and Decimal("0") <= parsed <= Decimal("1")
+        else None
+    )
+
+
 def attach_prior_context(
     contexts: Sequence[IndustryContext],
     prior_by_industry: Mapping[int, IndustryContext],
@@ -205,10 +241,6 @@ def attach_prior_context(
             or prior is None
             or not prior.valid
             or bool(prior.invalid_reasons)
-            or prior.right_share is None
-            or context.right_share is None
-            or prior.temperature not in temperature_order
-            or context.temperature not in temperature_order
         ):
             attached.append(context)
             continue
@@ -219,25 +251,35 @@ def attach_prior_context(
         except ValueError:
             attached.append(context)
             continue
-        current_temperature = temperature_order[context.temperature]
-        prior_temperature = temperature_order[prior.temperature]
-        direction = (
-            "rising"
-            if current_temperature > prior_temperature
-            else "falling"
-            if current_temperature < prior_temperature
-            else "unchanged"
-        )
-        attached.append(
-            replace(
-                context,
-                prior_as_of_date=prior.as_of_date,
+        changes: dict[str, object] = {
+            "prior_as_of_date": prior.as_of_date,
+            "prior_aggregate_right_count_ratio": prior.aggregate_right_count_ratio,
+            "prior_aggregate_right_market_cap_ratio": prior.aggregate_right_market_cap_ratio,
+        }
+        if (
+            prior.right_share is not None
+            and context.right_share is not None
+            and prior.temperature in temperature_order
+            and context.temperature in temperature_order
+        ):
+            current_temperature = temperature_order[context.temperature]
+            prior_temperature = temperature_order[prior.temperature]
+            direction = (
+                "rising"
+                if current_temperature > prior_temperature
+                else "falling"
+                if current_temperature < prior_temperature
+                else "unchanged"
+            )
+            changes.update(
                 prior_temperature=prior.temperature,
                 prior_right_share=prior.right_share,
                 temperature_direction=direction,
                 right_share_change_pp=(context.right_share - prior.right_share)
                 * Decimal("100"),
             )
+        attached.append(
+            replace(context, **changes)
         )
     return tuple(attached)
 
@@ -439,7 +481,17 @@ def _contexts_from_history_payload(
 
 
 def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
-    if any(field.name not in row for field in fields(IndustryContext)):
+    aggregate_fields = {
+        "aggregate_right_count_ratio",
+        "aggregate_right_market_cap_ratio",
+        "prior_aggregate_right_count_ratio",
+        "prior_aggregate_right_market_cap_ratio",
+    }
+    if any(
+        field.name not in row
+        for field in fields(IndustryContext)
+        if field.name not in aggregate_fields
+    ):
         return None
     industry_tm_id = _positive_int(row.get("industry_tm_id"))
     if industry_tm_id is None or not isinstance(row.get("industry"), str):
@@ -486,6 +538,9 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         if row.get(field) is not None and parsed is None:
             return None
         optional_decimals[field] = parsed
+    aggregate_decimals = {
+        field: _valid_ratio(row.get(field)) for field in aggregate_fields
+    }
     temperature = row.get("temperature")
     prior_temperature = row.get("prior_temperature")
     temperature_direction = row.get("temperature_direction")
@@ -511,9 +566,21 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         strength=strength,
         valid=row["valid"],
         invalid_reasons=tuple(reasons),
+        aggregate_right_count_ratio=aggregate_decimals[
+            "aggregate_right_count_ratio"
+        ],
+        aggregate_right_market_cap_ratio=aggregate_decimals[
+            "aggregate_right_market_cap_ratio"
+        ],
         prior_as_of_date=prior_as_of_date,
         prior_temperature=prior_temperature,
         prior_right_share=optional_decimals["prior_right_share"],
+        prior_aggregate_right_count_ratio=aggregate_decimals[
+            "prior_aggregate_right_count_ratio"
+        ],
+        prior_aggregate_right_market_cap_ratio=aggregate_decimals[
+            "prior_aggregate_right_market_cap_ratio"
+        ],
         temperature_direction=temperature_direction,
         right_share_change_pp=optional_decimals["right_share_change_pp"],
     )

@@ -34,13 +34,20 @@ def _industry(
     as_of_date: str = "2026-07-24",
     temperature: object = "热",
     strength: object = "88.5",
+    right_count_ratio: object | None = None,
+    right_market_cap_ratio: object | None = None,
 ) -> dict[str, object]:
-    return {
+    row: dict[str, object] = {
         "tmId": 700001,
         "asOfDate": as_of_date,
         "trendTemperatureCurr": temperature,
         "trendStrengthLocalCurr": strength,
     }
+    if right_count_ratio is not None:
+        row["TrendRightSideCountRatio"] = right_count_ratio
+    if right_market_cap_ratio is not None:
+        row["TrendRightSideMktCapRatio"] = right_market_cap_ratio
+    return row
 
 
 def test_calculation_deduplicates_components_and_member_snapshots() -> None:
@@ -72,6 +79,42 @@ def test_calculation_deduplicates_components_and_member_snapshots() -> None:
     assert context.strength == Decimal("88.5")
     assert context.valid
     assert context.invalid_reasons == ()
+
+
+def test_calculation_extracts_optional_aggregate_ratios_without_affecting_validity() -> None:
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="工业",
+        expected_date="2026-07-24",
+        component_tm_ids=list(range(1, 11)),
+        member_rows=[_member(tm_id) for tm_id in range(1, 11)],
+        industry_row=_industry(
+            right_count_ratio="0.191", right_market_cap_ratio="0.650"
+        ),
+        warm_to_hot_count=0,
+    )
+
+    assert context.valid
+    assert context.aggregate_right_count_ratio == Decimal("0.191")
+    assert context.aggregate_right_market_cap_ratio == Decimal("0.650")
+
+
+def test_invalid_aggregate_ratios_become_unavailable_without_invalidating_context() -> None:
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="工业",
+        expected_date="2026-07-24",
+        component_tm_ids=list(range(1, 11)),
+        member_rows=[_member(tm_id) for tm_id in range(1, 11)],
+        industry_row=_industry(
+            right_count_ratio="NaN", right_market_cap_ratio="1.01"
+        ),
+        warm_to_hot_count=0,
+    )
+
+    assert context.valid
+    assert context.aggregate_right_count_ratio is None
+    assert context.aggregate_right_market_cap_ratio is None
 
 
 def test_calculation_uses_only_exact_date_and_boolean_tradable_rows() -> None:
@@ -226,6 +269,24 @@ def test_attach_prior_context_sets_direction_and_percentage_point_change() -> No
     assert attached.right_share_change_pp == Decimal("5.8")
 
 
+def test_attach_prior_context_freezes_provider_aggregate_baseline() -> None:
+    current = replace(
+        _valid_context(),
+        aggregate_right_count_ratio=Decimal("0.191"),
+        aggregate_right_market_cap_ratio=Decimal("0.650"),
+    )
+    prior = replace(
+        _valid_context(as_of_date="2026-07-23"),
+        aggregate_right_count_ratio=Decimal("0.150"),
+        aggregate_right_market_cap_ratio=Decimal("0.600"),
+    )
+
+    [attached] = attach_prior_context((current,), {current.industry_tm_id: prior})
+
+    assert attached.prior_aggregate_right_count_ratio == Decimal("0.150")
+    assert attached.prior_aggregate_right_market_cap_ratio == Decimal("0.600")
+
+
 @pytest.mark.parametrize(
     ("current_temperature", "prior_temperature", "expected"),
     [("热", "热", "unchanged"), ("温", "热", "falling")],
@@ -296,6 +357,35 @@ def test_history_loader_skips_invalid_file_and_duplicate_industry_rows(
     assert load_latest_prior_context(
         tmp_path, market="CN", before_date="2026-07-24"
     ) == {}
+
+
+def test_history_loader_accepts_legacy_rows_without_aggregate_fields(
+    tmp_path: Path,
+) -> None:
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(_valid_context(as_of_date="2026-07-23"),),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for row in payload["industries"]:
+        for key in (
+            "aggregate_right_count_ratio",
+            "aggregate_right_market_cap_ratio",
+            "prior_aggregate_right_count_ratio",
+            "prior_aggregate_right_market_cap_ratio",
+        ):
+            row.pop(key)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    )
+
+    assert loaded[700001].aggregate_right_count_ratio is None
+    assert loaded[700001].aggregate_right_market_cap_ratio is None
 
 
 @pytest.mark.parametrize("field", ["generated_at", "strategy_version"])
