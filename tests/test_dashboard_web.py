@@ -1764,6 +1764,7 @@ def test_prediction_arbitrage_state_is_schema_valid_when_unavailable(tmp_path: P
         assert payload["opportunities"] == []
         assert payload["current_execution"] is None
         assert payload["csrf_token"]
+        assert payload["policy_limits"]["max_wallet_balance"] == "65.00"
     finally:
         server.shutdown()
         server.server_close()
@@ -4027,8 +4028,9 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "底部场景" not in html
     for label in ("实盘就绪状态", "当前监控范围", "当前机会", "历史记录", "信号历史", "交易与合并", "事故"):
         assert label in js
-    for copy in ("$50", "$20", "$2", "免手续费", "可能只成交一腿", "24h 成交量"):
+    for copy in ("$65", "$20", "$2", "免手续费", "可能只成交一腿", "24h 成交量"):
         assert copy in js
+    assert "$50.00 pUSD" not in js
     assert "确认真实下单" in js
     assert "确认解除交易熔断" in js
     assert "aria-modal=\"true\"" in js

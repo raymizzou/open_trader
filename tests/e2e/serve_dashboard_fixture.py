@@ -81,7 +81,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "wallet": {"masked_address": "0x7A4E…91C2"},
         "masked_wallet": "0x7A4E…91C2",
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
-        "policy_limits": {"max_wallet_balance": "50", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
+        "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
         "heartbeat_at": "刚刚",
         "event_count": 20,
         "market_count": 331,

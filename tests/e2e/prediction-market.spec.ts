@@ -241,7 +241,7 @@ test.describe('approved prediction execution workspace', () => {
   test('[UI-05] cost disclosure', async ({ page }) => {
     await openPrediction(page, 'confirmation');
     await page.locator('[data-action="participate"]').click();
-    await expect(page.locator('.pm-modal')).toContainText('$50');
+    await expect(page.locator('.pm-modal')).toContainText('$65');
     await expect(page.locator('.pm-modal')).toContainText('$20');
     await expect(page.locator('.pm-modal')).toContainText('$2');
   });

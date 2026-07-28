@@ -94,7 +94,7 @@ without submitting an order.
 ### 2.5 Risk Limits
 
 - Dedicated low-balance trading wallet.
-- Initial wallet funding cap: `$50.00` pUSD.
+- Initial wallet funding cap: `$65.00` pUSD.
 - No automatic refill.
 - Maximum normal cost per confirmed click: `$20.00`, including any applicable
   fees. V1 only enables fee-free markets.
@@ -273,7 +273,7 @@ There is no bottom navigation.
 The prediction workspace begins with a persistent readiness strip showing:
 
 - masked wallet address
-- pUSD balance and the `$50` wallet-cap policy
+- pUSD balance and the `$65` wallet-cap policy
 - region-check status
 - circuit-breaker/trading status
 - first-live-order validation status
@@ -891,7 +891,7 @@ insufficient.
 | `UI-02 Mobile prototype parity` | Repeat every Section 5.1 state at `375x812` with the same deterministic data and browser configuration. | Production matches the mobile golden screenshots; single-column order, wrapping, modal placement, and all visible content are identical; no horizontal overflow; controls are at least `44x44`. | Per-state visual diff meets the same strict threshold; browser assertions record scroll width, hit targets, interactions, and screenshot paths. | Responsive behavior that differs from the approved prototype, bottom nav, off-screen confirm/reset, hidden volume, or hover-only information. |
 | `UI-03 Keyboard modal` | Open confirmation and reset modals using keyboard; Tab/Shift-Tab; press Escape where safe; close. | Initial focus is meaningful, focus is trapped, visible focus exists, cancel closes, focus returns to invoker; executing mutation cannot be accidentally dismissed as canceled. | Browser assertions cover focus order and restored element. | Focus escaping behind modal, background action activation, duplicate submit from Enter. |
 | `UI-04 Status semantics` | Exercise every approved prototype state with controlled data. | Colors, text, icons, stale/quiet distinction, `可参与`, and first-live-order status match the corresponding golden state exactly. | API enum-to-copy mapping is exhaustive; every state has a named screenshot comparison. | Color-only meaning, “risk-free” language, success before confirmation, or visual state not present in the approved prototype. |
-| `UI-05 Cost disclosure` | Open workspace and modal in actionable state. | Readiness/policy makes `$50` wallet cap, `$20` normal cap, `$2` emergency expected-loss cap, fee-free-only policy, and possible real loss understandable. | Values come from server policy and match enforced configuration. | UI-only limits differing from backend; promise of zero loss or guaranteed profit. |
+| `UI-05 Cost disclosure` | Open workspace and modal in actionable state. | Readiness/policy makes `$65` wallet cap, `$20` normal cap, `$2` emergency expected-loss cap, fee-free-only policy, and possible real loss understandable. | Values come from server policy and match enforced configuration. | UI-only limits differing from backend; promise of zero loss or guaranteed profit. |
 
 ### 16.8 Live integration and operations
 
