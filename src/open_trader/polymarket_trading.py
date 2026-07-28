@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence, cast
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from polymarket import BuilderApiKey, PRODUCTION, PublicClient, SecureClient
 
@@ -421,7 +421,8 @@ class PolymarketTradingClient:
 
         opener = self._urlopen_fn or urlopen
         try:
-            with opener(GEOBLOCK_URL, timeout=GEOBLOCK_TIMEOUT_SECONDS) as response:
+            request = Request(GEOBLOCK_URL, headers={"User-Agent": "OpenTrader/1.0"})
+            with opener(request, timeout=GEOBLOCK_TIMEOUT_SECONDS) as response:
                 raw = response.read()
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
@@ -523,12 +524,13 @@ class PolymarketTradingClient:
                 "DEPOSIT_WALLET": "WALLET",
             }.get(wallet_type)
             relayer = getattr(context, "relayer", None)
-            wallet = str(getattr(context, "wallet", ""))
-            if relay_type is None or not wallet or not callable(getattr(relayer, "get_json", None)):
+            signer = str(getattr(getattr(context, "signer", None), "address", ""))
+            if relay_type is None or not signer or not callable(getattr(relayer, "get_json", None)):
                 return False
+            path = "/relay-payload" if wallet_type == "POLY_PROXY" else "/v1/account/transactions/params"
             payload = relayer.get_json(
-                "/v1/account/transactions/params",
-                params={"address": wallet, "type": relay_type},
+                path,
+                params={"address": signer, "type": relay_type},
             )
             if not isinstance(payload, Mapping):
                 return False
@@ -536,7 +538,7 @@ class PolymarketTradingClient:
             nonce = payload.get("nonce")
             return (
                 isinstance(address, str)
-                and address.lower() == wallet.lower()
+                and _ADDRESS_RE.fullmatch(address) is not None
                 and isinstance(nonce, str)
                 and bool(nonce)
                 and nonce.isdigit()
@@ -802,9 +804,13 @@ class PolymarketTradingClient:
     def _discover_probe(self) -> tuple[PairIntent, Decimal]:
         try:
             public = self._public_client_factory()
-            markets = _collect(
-                public.list_markets(closed=False, order="volume24hr", page_size=100)
+            page = public.list_markets(
+                closed=False,
+                order="volume24hr",
+                ascending=False,
+                page_size=100,
             )
+            markets = _collect(_field(page.first_page(), "items"))
             eligible: list[tuple[Decimal, str, object]] = []
             for market in markets:
                 state = _field(market, "state")
@@ -832,70 +838,97 @@ class PolymarketTradingClient:
                 eligible.append((volume_decimal, market_id, market))
             if not eligible:
                 raise PolymarketTradingError("market_probe_unavailable")
-            _, market_id, market = max(eligible, key=lambda item: (item[0], item[1]))
-            outcomes = _field(market, "outcomes")
-            yes = _field(outcomes, "yes")
-            no = _field(outcomes, "no")
-            yes_token = self._field_alias(yes, "token_id", "tokenId")
-            no_token = self._field_alias(no, "token_id", "tokenId")
-            condition_id = self._field_alias(market, "condition_id", "conditionId", default="")
-            trading = _field(market, "trading")
-            tick_value = self._field_alias(trading, "minimum_tick_size", "minimumTickSize")
-            minimum_value = self._field_alias(trading, "minimum_order_size", "minimumOrderSize")
-            if not isinstance(yes_token, str) or not isinstance(no_token, str) or not isinstance(condition_id, str):
-                raise PolymarketTradingError("market_probe_unavailable")
-            yes_book = public.get_order_book(token_id=yes_token)
-            no_book = public.get_order_book(token_id=no_token)
-            yes_asks = _collect(_field(yes_book, "asks"))
-            no_asks = _collect(_field(no_book, "asks"))
-            if not yes_asks or not no_asks:
-                raise PolymarketTradingError("market_probe_unavailable")
-            yes_level = min(yes_asks, key=lambda level: _decimal(_field(level, "price")))
-            no_level = min(no_asks, key=lambda level: _decimal(_field(level, "price")))
-            yes_price = _decimal(_field(yes_level, "price"))
-            no_price = _decimal(_field(no_level, "price"))
-            yes_size = _decimal(_field(yes_level, "size"))
-            no_size = _decimal(_field(no_level, "size"))
-            if not isinstance(tick_value, Decimal):
-                tick_value = _field(yes_book, "tick_size")
-            if not isinstance(minimum_value, Decimal):
-                minimum_value = _field(yes_book, "min_order_size")
-            if not isinstance(tick_value, Decimal) or not isinstance(minimum_value, Decimal):
-                raise PolymarketTradingError("market_probe_unavailable")
-            yes_candidates = self._probe_candidates(
-                price=yes_price, size=yes_size, minimum=minimum_value, tick_size=tick_value
-            )
-            no_candidates = self._probe_candidates(
-                price=no_price, size=no_size, minimum=minimum_value, tick_size=tick_value
-            )
-            common = sorted(
-                quantity
-                for quantity in set(yes_candidates) & set(no_candidates)
-                if yes_candidates[quantity] + no_candidates[quantity] <= MAX_NORMAL_COST
-            )
-            if not common:
-                raise PolymarketTradingError("market_probe_unavailable")
-            quantity = common[0]
-            yes_cost = yes_candidates[quantity]
-            no_cost = no_candidates[quantity]
-            return (
-                PairIntent(
-                    event_id=market_id,
-                    market_id=market_id,
-                    condition_id=condition_id,
-                    yes_token_id=yes_token,
-                    no_token_id=no_token,
-                    quantity=quantity,
-                    yes_max_price=yes_price,
-                    no_max_price=no_price,
-                    yes_max_cost=yes_cost,
-                    no_max_cost=no_cost,
-                    total_max_cost=yes_cost + no_cost,
-                    minimum_profit=quantity - yes_cost - no_cost,
-                    net_edge=(quantity - yes_cost - no_cost) / quantity,
-                ),
-                tick_value,
-            )
+            for _, market_id, market in sorted(eligible, reverse=True):
+                outcomes = _field(market, "outcomes")
+                yes = _field(outcomes, "yes")
+                no = _field(outcomes, "no")
+                yes_token = self._field_alias(yes, "token_id", "tokenId")
+                no_token = self._field_alias(no, "token_id", "tokenId")
+                condition_id = self._field_alias(
+                    market, "condition_id", "conditionId", default=""
+                )
+                trading = _field(market, "trading")
+                tick_value = self._field_alias(
+                    trading, "minimum_tick_size", "minimumTickSize"
+                )
+                minimum_value = self._field_alias(
+                    trading, "minimum_order_size", "minimumOrderSize"
+                )
+                if not (
+                    isinstance(yes_token, str)
+                    and isinstance(no_token, str)
+                    and isinstance(condition_id, str)
+                ):
+                    continue
+                yes_book = public.get_order_book(token_id=yes_token)
+                no_book = public.get_order_book(token_id=no_token)
+                yes_asks = _collect(_field(yes_book, "asks"))
+                no_asks = _collect(_field(no_book, "asks"))
+                if not yes_asks or not no_asks:
+                    continue
+                try:
+                    yes_level = min(
+                        yes_asks, key=lambda level: _decimal(_field(level, "price"))
+                    )
+                    no_level = min(
+                        no_asks, key=lambda level: _decimal(_field(level, "price"))
+                    )
+                    yes_price = _decimal(_field(yes_level, "price"))
+                    no_price = _decimal(_field(no_level, "price"))
+                    yes_size = _decimal(_field(yes_level, "size"))
+                    no_size = _decimal(_field(no_level, "size"))
+                except ValueError:
+                    continue
+                if not isinstance(tick_value, Decimal):
+                    tick_value = _field(yes_book, "tick_size")
+                if not isinstance(minimum_value, Decimal):
+                    minimum_value = _field(yes_book, "min_order_size")
+                if not isinstance(tick_value, Decimal) or not isinstance(
+                    minimum_value, Decimal
+                ):
+                    continue
+                yes_candidates = self._probe_candidates(
+                    price=yes_price,
+                    size=yes_size,
+                    minimum=minimum_value,
+                    tick_size=tick_value,
+                )
+                no_candidates = self._probe_candidates(
+                    price=no_price,
+                    size=no_size,
+                    minimum=minimum_value,
+                    tick_size=tick_value,
+                )
+                common = sorted(
+                    quantity
+                    for quantity in set(yes_candidates) & set(no_candidates)
+                    if yes_candidates[quantity] + no_candidates[quantity]
+                    <= MAX_NORMAL_COST
+                )
+                if not common:
+                    continue
+                quantity = common[0]
+                yes_cost = yes_candidates[quantity]
+                no_cost = no_candidates[quantity]
+                return (
+                    PairIntent(
+                        event_id=market_id,
+                        market_id=market_id,
+                        condition_id=condition_id,
+                        yes_token_id=yes_token,
+                        no_token_id=no_token,
+                        quantity=quantity,
+                        yes_max_price=yes_price,
+                        no_max_price=no_price,
+                        yes_max_cost=yes_cost,
+                        no_max_cost=no_cost,
+                        total_max_cost=yes_cost + no_cost,
+                        minimum_profit=quantity - yes_cost - no_cost,
+                        net_edge=(quantity - yes_cost - no_cost) / quantity,
+                    ),
+                    tick_value,
+                )
+            raise PolymarketTradingError("market_probe_unavailable")
         except PolymarketTradingError:
             raise
         except Exception as exc:

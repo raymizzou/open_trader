@@ -384,6 +384,20 @@ def test_geoblock_timeout_and_error_fail_closed(monkeypatch: pytest.MonkeyPatch)
     assert adapter.geoblock_allowed() is False
 
 
+def test_geoblock_sends_an_explicit_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _ = make_adapter()
+
+    def reject_default_urllib(request: object, **kwargs: object) -> FakeResponse:
+        get_header = getattr(request, "get_header", None)
+        user_agent = get_header("User-agent") if callable(get_header) else None
+        if not isinstance(user_agent, str) or user_agent.startswith("Python-urllib"):
+            raise PermissionError("default urllib user agent rejected")
+        return FakeResponse({"blocked": False})
+
+    monkeypatch.setattr("open_trader.polymarket_trading.urlopen", reject_default_urllib)
+    assert adapter.geoblock_allowed() is True
+
+
 def test_no_submit_identity_missing_is_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -812,13 +826,14 @@ def test_secure_client_readiness_uses_authenticated_relayer_probe() -> None:
     class Relayer:
         def get_json(self, path: str, *, params: dict[str, object]) -> dict[str, object]:
             calls.append((path, params))
-            return {"address": WALLET, "nonce": "1"}
+            return {"address": "0x3333333333333333333333333333333333333333", "nonce": "1"}
 
     client = object.__new__(SecureClient)
     client._ended = False
     client._ctx_inner = SimpleNamespace(
         wallet_type="POLY_PROXY",
         wallet=WALLET,
+        signer=SimpleNamespace(address=SIGNER),
         relayer=Relayer(),
     )
     adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=client)
@@ -829,8 +844,8 @@ def test_secure_client_readiness_uses_authenticated_relayer_probe() -> None:
     assert result["merge_ready"] is True
     assert calls == [
         (
-            "/v1/account/transactions/params",
-            {"address": WALLET, "type": "PROXY"},
+            "/relay-payload",
+            {"address": SIGNER, "type": "PROXY"},
         )
     ]
 
@@ -927,6 +942,28 @@ class FakePublicClient:
     def __init__(self) -> None:
         self.markets = [
             SimpleNamespace(
+                id="empty-book",
+                condition_id="condition-empty",
+                state=SimpleNamespace(
+                    active=True,
+                    closed=False,
+                    archived=False,
+                    accepting_orders=True,
+                    enable_order_book=True,
+                    neg_risk=False,
+                ),
+                outcomes=SimpleNamespace(
+                    yes=SimpleNamespace(token_id="empty-yes"),
+                    no=SimpleNamespace(token_id="empty-no"),
+                ),
+                metrics=SimpleNamespace(volume_24hr=Decimal("500")),
+                trading=SimpleNamespace(
+                    minimum_order_size=Decimal("1"),
+                    minimum_tick_size=Decimal("0.01"),
+                    fees_enabled=False,
+                ),
+            ),
+            SimpleNamespace(
                 id="eligible",
                 condition_id="condition-eligible",
                 state=SimpleNamespace(
@@ -972,10 +1009,18 @@ class FakePublicClient:
             ),
         ]
 
-    def list_markets(self, **kwargs: object) -> list[object]:
-        return self.markets
+    def list_markets(self, **kwargs: object) -> object:
+        return SimpleNamespace(
+            first_page=lambda: SimpleNamespace(items=tuple(self.markets))
+        )
 
     def get_order_book(self, *, token_id: str) -> object:
+        if token_id == "empty-yes":
+            return SimpleNamespace(
+                asks=(),
+                min_order_size=Decimal("1"),
+                tick_size=Decimal("0.01"),
+            )
         return SimpleNamespace(
             asks=(SimpleNamespace(price=Decimal("0.45" if token_id == "yes-token" else "0.48"), size=Decimal("100")),),
             min_order_size=Decimal("1"),
