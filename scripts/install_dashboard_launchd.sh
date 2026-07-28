@@ -3,19 +3,21 @@ set -euo pipefail
 
 DRY_RUN=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-/bin/launchctl}"
 WAIT_SECONDS="${DASHBOARD_LAUNCHD_WAIT_SECONDS:-30}"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--repo-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
+    --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
     --launch-agents-dir) [[ $# -ge 2 ]] || { usage; exit 2; }; LAUNCH_AGENTS_DIR="$2"; shift 2 ;;
     --wait-seconds) [[ $# -ge 2 ]] || { usage; exit 2; }; WAIT_SECONDS="$2"; shift 2 ;;
@@ -24,11 +26,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
+RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd)"
 TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.dashboard.plist.template"
 LABEL="com.open-trader.dashboard"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
-DATA_DIR="$REPO_ROOT/data"
-REPORTS_DIR="$REPO_ROOT/reports"
+DATA_DIR="$RUNTIME_ROOT/data"
+REPORTS_DIR="$RUNTIME_ROOT/reports"
+PORTFOLIO="$DATA_DIR/latest/portfolio.csv"
+DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
 PREDICTION_CONFIG="$REPO_ROOT/config/prediction_arbitrage.json"
 
 [[ -f "$TEMPLATE" ]] || { echo "missing launchd template: $TEMPLATE" >&2; exit 1; }
@@ -38,16 +44,20 @@ sed_escape() {
 }
 
 render_plist() {
-  local repo python data reports prediction
+  local repo python data reports portfolio daily_config prediction
   repo="$(sed_escape "$REPO_ROOT")"
   python="$(sed_escape "$PYTHON_BIN")"
   data="$(sed_escape "$DATA_DIR")"
   reports="$(sed_escape "$REPORTS_DIR")"
+  portfolio="$(sed_escape "$PORTFOLIO")"
+  daily_config="$(sed_escape "$DAILY_CONFIG")"
   prediction="$(sed_escape "$PREDICTION_CONFIG")"
   sed \
     -e "s|OPEN_TRADER_PYTHON|$python|g" \
+    -e "s|OPEN_TRADER_PORTFOLIO|$portfolio|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$data|g" \
     -e "s|OPEN_TRADER_REPORTS_DIR|$reports|g" \
+    -e "s|OPEN_TRADER_DAILY_CONFIG|$daily_config|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$prediction|g" \
     -e "s|OPEN_TRADER_REPO|$repo|g" \
     "$TEMPLATE"

@@ -36,12 +36,16 @@ def test_dashboard_launchd_template_has_the_single_loopback_job() -> None:
 def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Path) -> None:
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
     result = subprocess.run(
         [
             str(INSTALLER),
             "--dry-run",
             "--repo-root",
             str(ROOT),
+            "--runtime-root",
+            str(runtime_root),
             "--launch-agents-dir",
             str(agents),
             "--python",
@@ -56,7 +60,18 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     payload = plistlib.loads(result.stdout.encode("utf-8"))
     assert payload["Label"] == "com.open-trader.dashboard"
     args = payload["ProgramArguments"]
-    assert args[args.index("--reports-dir") + 1] == str(ROOT / "reports")
+    assert payload["WorkingDirectory"] == str(ROOT)
+    assert args[args.index("--portfolio") + 1] == str(
+        runtime_root / "data/latest/portfolio.csv"
+    )
+    assert args[args.index("--data-dir") + 1] == str(runtime_root / "data")
+    assert args[args.index("--reports-dir") + 1] == str(runtime_root / "reports")
+    assert args[args.index("--config") + 1] == str(
+        runtime_root / "config/daily_premarket.env"
+    )
+    assert args[args.index("--prediction-config") + 1] == str(
+        ROOT / "config/prediction_arbitrage.json"
+    )
     assert not list(agents.iterdir())
     assert "127.0.0.1" in result.stdout
     assert "8766" in result.stdout
