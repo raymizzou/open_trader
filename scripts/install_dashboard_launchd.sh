@@ -102,6 +102,17 @@ wait_ready() {
   return 1
 }
 
+bootstrap_agent() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if "$LAUNCHCTL_BIN" bootstrap "gui/$UID" "$PLIST_PATH"; then
+      return 0
+    fi
+    [[ "$attempt" -lt 5 ]] || return 1
+    sleep 1
+  done
+}
+
 rendered="$(render_plist)"
 lint_plist "$rendered"
 
@@ -115,7 +126,7 @@ mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/dashboard" "$DATA_DIR" "$REPORTS_
 printf '%s\n' "$rendered" > "$PLIST_PATH"
 
 "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
-"$LAUNCHCTL_BIN" bootstrap "gui/$UID" "$PLIST_PATH"
+bootstrap_agent
 "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LABEL"
 wait_ready
 echo "installed launchd agent: $LABEL"

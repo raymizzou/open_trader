@@ -84,6 +84,65 @@ def test_uninstaller_only_targets_the_dashboard_label() -> None:
     assert "com.open-trader.premarket" not in source
 
 
+def test_dashboard_installer_retries_transient_launchctl_bootstrap(
+    tmp_path: Path,
+) -> None:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    state = tmp_path / "bootstrap-count"
+    launchctl = bin_dir / "launchctl"
+    launchctl.write_text(
+        """#!/bin/sh
+if [ "$1" = "bootstrap" ]; then
+  count="$(cat "$FAKE_BOOTSTRAP_STATE" 2>/dev/null || echo 0)"
+  count=$((count + 1))
+  echo "$count" > "$FAKE_BOOTSTRAP_STATE"
+  [ "$count" -gt 1 ] || exit 5
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    for name in ("curl", "lsof"):
+        executable = bin_dir / name
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+
+    subprocess.run(
+        [
+            str(INSTALLER),
+            "--repo-root",
+            str(ROOT),
+            "--runtime-root",
+            str(runtime_root),
+            "--launch-agents-dir",
+            str(agents),
+            "--python",
+            str(ROOT / ".venv" / "bin" / "python"),
+            "--wait-seconds",
+            "1",
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "FAKE_BOOTSTRAP_STATE": str(state),
+            "HOME": str(tmp_path),
+            "LAUNCHCTL_BIN": str(launchctl),
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert state.read_text(encoding="utf-8").strip() == "2"
+
+
 def test_prediction_status_command_is_registered() -> None:
     source = (ROOT / "src" / "open_trader" / "cli.py").read_text(encoding="utf-8")
     assert 'add_parser("status"' in source
