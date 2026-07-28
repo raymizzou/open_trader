@@ -642,6 +642,59 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
         )
 
 
+def test_acceptance_uses_dashboard_legacy_holding_phase_projection(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_us_tiger" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [{
+                "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
+            }],
+            "top10_candidates": [],
+        },
+        "signal_snapshots": {"holdings": {"EOG": {"phase": "立夏"}}},
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "available": True,
+        "broker": "tiger",
+        "market": "US",
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "sell_actions": [],
+        "buy_actions": [],
+        "hold_actions": [{
+            "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
+            "phase": "立夏",
+        }],
+        "review_actions": [],
+        "counts": {"sell": 0, "buy": 0, "hold": 1, "review": 0},
+        "audit": {
+            "artifact": "2026-07-15.json",
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "tiger", projected
+    )
+
+
 def test_acceptance_recognizes_only_strict_partial_sell_actions() -> None:
     partial = {
         "action": "SELL_PARTIAL",
@@ -5887,6 +5940,57 @@ def test_acceptance_rejects_history_that_drops_ledger_referenced_old_action(
         dashboard_acceptance._validate_history_projection(
             tmp_path / "data", reports_dir, "tiger", history, {}
         )
+
+
+def test_acceptance_does_not_require_synthetic_protection_report_history(
+    tmp_path: Path,
+) -> None:
+    from open_trader import trend_review
+
+    data_dir = tmp_path / "data"
+    execution_date = "2026-07-17"
+    action_key = trend_review.trend_action_key(
+        "US", execution_date, "US.EOG", "sell"
+    )
+    report_hash = trend_review._report_hash(
+        trend_review._protection_report("EOG", "protection-1")
+    )
+    evidence = {
+        "market": "US",
+        "date": execution_date,
+        "strategy_version": "protection-v1",
+        "report_sha256": report_hash,
+        "action_index": 0,
+        "symbol": "EOG",
+        "futu_code": "US.EOG",
+        "side": "sell",
+        "sell_goal": "position_zero",
+    }
+    trend_review._write_action_event(
+        data_dir=data_dir,
+        market="US",
+        execution_date=execution_date,
+        action_key=action_key,
+        payload={
+            **evidence,
+            "status": "reason_added",
+            "reason_id": "protection-1",
+            "reason": "protection_event",
+        },
+        recorded_at="2026-07-17T10:15:00-04:00",
+    )
+    trend_review._write_action_event(
+        data_dir=data_dir,
+        market="US",
+        execution_date=execution_date,
+        action_key=action_key,
+        payload={**evidence, "status": "submitted"},
+        recorded_at="2026-07-17T10:15:01-04:00",
+    )
+
+    assert dashboard_acceptance._validate_history_projection(
+        data_dir, tmp_path / "reports", "tiger", [], {}
+    ) == []
 
 
 def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(

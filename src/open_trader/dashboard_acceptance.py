@@ -16,6 +16,7 @@ from urllib.request import urlopen
 from .dashboard import (
     SHANGHAI,
     _is_dashboard_holding,
+    _project_trend_actions,
     _project_trend_money_fields,
     _read_csv_rows,
     _valid_partial_trend_action,
@@ -29,7 +30,7 @@ from .trend_simulate_positions import (
     _action_events,
     _reports_by_hash,
 )
-from .trend_review import _report_hash
+from .trend_review import _protection_event_identity, _report_hash
 from .strategy_drawdown import valid_strategy_parameter_audit_identity
 
 
@@ -1036,7 +1037,8 @@ def _validate_history_projection(
     events_by_action: dict[
         tuple[str, str, str], list[Mapping[str, object]]
     ] = {}
-    for _, _, _, event in _action_events(data_dir, market):
+    protection_actions: set[tuple[str, str, str]] = set()
+    for event_date, _, event_path, event in _action_events(data_dir, market):
         report_hash = str(event.get("report_sha256") or "").strip().lower()
         if len(report_hash) == 64:
             action = (
@@ -1046,10 +1048,19 @@ def _validate_history_projection(
             )
             latest_events[action] = event
             events_by_action.setdefault(action, []).append(event)
+            if _protection_event_identity(
+                event,
+                market=market,
+                execution_date=event_date,
+                action_key=Path(event_path).parent.name,
+            ) is not None:
+                protection_actions.add(action)
 
     expectations: list[dict[str, Any]] = []
     for (report_hash, symbol, side), event in latest_events.items():
         report = reports.get(report_hash)
+        if report is None and (report_hash, symbol, side) in protection_actions:
+            continue
         assert report is not None, f"{broker} 账本引用的冻结报告不存在：{report_hash}"
         artifact = report["artifact"]
         summary = history_rows.get(artifact)
@@ -2180,45 +2191,7 @@ def _check_trend_artifact_projection(
     assert isinstance(holdings, list) and all(
         isinstance(item, Mapping) for item in holdings
     ), f"{broker} 冻结报告持仓动作无效"
-    formal = [
-        _project_trend_money_fields(
-            dict(item), payload=dict(payload), market=expected_market
-        )
-        for item in formal
-    ]
-    holdings = [
-        _project_trend_money_fields(
-            dict(item), payload=dict(payload), market=expected_market
-        )
-        for item in holdings
-    ]
-    def canonical_sell_symbol(item: Mapping[str, Any]) -> str:
-        try:
-            return to_futu_symbol(expected_market, str(item.get("symbol") or ""))
-        except ValueError:
-            return ""
-
-    full_exit_symbols = {
-        symbol
-        for item in formal
-        if item.get("action") == "SELL_ALL"
-        and not _trend_action_needs_review(item)
-        if (symbol := canonical_sell_symbol(item))
-    }
-    sells = [
-        item for item in formal
-        if item.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
-        and not _trend_action_needs_review(item)
-        and not (
-            item.get("action") == "SELL_PARTIAL"
-            and canonical_sell_symbol(item) in full_exit_symbols
-        )
-    ]
-    buys = [
-        item for item in formal
-        if item.get("action") == "BUY"
-        and not _trend_action_needs_review(item)
-    ]
+    sells, buys, holds, reviews = _project_trend_actions(dict(payload), {})
     if broker == "eastmoney":
         for item in buys:
             for key, label in (
@@ -2229,14 +2202,6 @@ def _check_trend_artifact_projection(
                 assert item.get(key) is not None and str(item[key]).strip() not in {
                     "", "-",
                 }, f"A 股正式买入缺少 {label}"
-    holds = [
-        item for item in holdings
-        if item.get("action") == "HOLD" and not _trend_action_needs_review(item)
-    ]
-    reviews: list[Mapping[str, Any]] = []
-    for item in [*formal, *holdings]:
-        if _trend_action_needs_review(item) and item not in reviews:
-            reviews.append(item)
     expected_actions = {
         "sell_actions": sells,
         "buy_actions": buys,
