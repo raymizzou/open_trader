@@ -3574,6 +3574,18 @@ def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
         )
 
 
+def test_trend_context_acceptance_uses_visible_number_format() -> None:
+    assert dashboard_acceptance._trend_context_display_value(
+        "strength", "100.0"
+    ) == "100"
+    assert dashboard_acceptance._trend_context_display_value(
+        "warm_to_hot_count", 3
+    ) == "3"
+    assert dashboard_acceptance._trend_context_display_value(
+        "temperature", "热"
+    ) == "热"
+
+
 def test_check_trend_audit_uses_unknown_when_both_api_costs_are_null() -> None:
     class Locator:
         def __init__(

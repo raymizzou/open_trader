@@ -1193,6 +1193,12 @@ def _trend_context_percent(value: Any) -> str | None:
     return f"{_display_number(str(number))}%"
 
 
+def _trend_context_display_value(key: str, value: Any) -> str:
+    if key in {"strength", "warm_to_hot_count"}:
+        return _display_number(value)
+    return str(value)
+
+
 def _check_frozen_trend_disciplines(
     report_root: Any, report: Mapping[str, Any], broker: str,
     *, page: Any | None = None,
@@ -1284,7 +1290,8 @@ def _check_frozen_trend_disciplines(
         for key in ("industry", "temperature", "strength", "warm_to_hot_count"):
             value = context.get(key)
             if value is not None:
-                assert str(value) in context_text, (
+                expected = _trend_context_display_value(key, value)
+                assert expected in context_text, (
                     f"{broker} 行业上下文缺少 {key}：{value}"
                 )
         right_count = context.get("right_count")
