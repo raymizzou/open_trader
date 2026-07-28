@@ -786,6 +786,8 @@ class PolymarketMonitor:
             "market_id": market_id,
             "condition_id": market_row["condition_id"],
             "question": market_row["question"],
+            "market_type": "standard_binary",
+            "fee_status": "fee_free",
             "volume_24h": market_row["volume_24h"],
             "actionable": True,
             "eligibility": "actionable",

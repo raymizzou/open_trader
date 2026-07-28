@@ -208,11 +208,11 @@ not be enabled.
 
 The approved interactive design evidence is:
 
-- branch: `prototype/prediction-market-ui`
-- commit: `e0d5083`
+- branch: `feat/prediction-market-arbitrage-v1`
+- commit: `12d3391`
 - source:
-  `src/open_trader/dashboard_static/prediction-market-execution-prototype.html`
-- layout: Variant A, `运营控制台`
+  `src/open_trader/dashboard_static/prediction-market-truthful-ui-prototype.html`
+- layout: Variant A, `延续当前 Dashboard`
 
 The prototype is disposable design evidence and is not merged directly.
 Production HTML, CSS, and JavaScript recreate its approved behavior in the
@@ -223,7 +223,8 @@ before production implementation.
 
 ### 5.1 Prototype is the mandatory acceptance baseline
 
-Commit `e0d5083` is the UI source of truth, not an illustrative reference.
+Commit `12d3391` Variant A is the UI source of truth, not an illustrative
+reference.
 Before production UI implementation, acceptance fixtures must render that exact
 commit into fixed golden screenshots for:
 
@@ -231,12 +232,17 @@ commit into fixed golden screenshots for:
 - mobile `375x812`
 - ready/actionable
 - quiet
+- incomplete opportunity
 - executing
 - success/merge
+- success with incomplete detail
 - incident/circuit-breaker
+- incident with incomplete detail
 - degraded
+- unavailable and unknown status
 - loading
 - confirmation modal
+- incomplete preview rejection
 - reset modal
 - signal, trade/merge, and incident history tabs
 
@@ -273,17 +279,21 @@ There is no bottom navigation.
 The prediction workspace begins with a persistent readiness strip showing:
 
 - masked wallet address
-- pUSD balance and the `$65` wallet-cap policy
+- pUSD balance
 - region-check status
-- circuit-breaker/trading status
-- first-live-order validation status
+- binary trading status: `可以交易` or `不可用`
 
 The UI never displays a private key, API secret, full credential, or a field
 into which one can paste a private key.
 
-Until a real order pair and merge have succeeded, the status remains
-`实盘链路尚未完成首单验证`. Deterministic tests and unsigned/unsubmitted
-previews do not change that status.
+`可以交易` requires an explicitly healthy watcher, complete current readiness,
+complete server policy, a closed breaker, and no active execution. Missing,
+stale, degraded, unavailable, error, and unknown states all render `不可用`.
+The normal and emergency single-order limits appear in this strip only when the
+server returns both. The `$65` wallet cap appears only in the confirmation
+modal. First-live-order verification remains a backend operational check and is
+not a permanent Dashboard card; the first real success appears in normal
+execution history.
 
 ### 5.4 Monitoring workspace
 
@@ -343,6 +353,13 @@ The modal uses fresh server data. On confirmation, the server validates again.
 The browser cannot supply prices, quantities, wallet identifiers, or risk
 limits as trusted execution inputs.
 
+The modal opens only when the latest preview itself contains the market,
+market type, fee status, both prices and costs, quantity, total cost, merge
+value, minimum profit, current balance, wallet identity, and all policy limits.
+The browser never fills a missing preview field from the opportunity list or a
+UI constant. An incomplete preview produces `预览数据不完整，未下单`, leaves
+the modal closed, and sends no execution request.
+
 ### 5.7 Execution and incident views
 
 While executing, the card and modal show the current phase without implying a
@@ -356,16 +373,16 @@ fill before venue confirmation:
 - complete
 - incident/locked
 
-A circuit-breaker banner remains visible until acknowledged. Its detail view
-shows:
+A circuit-breaker banner remains visible until acknowledged. The banner and
+detail view show only incident facts actually returned by the backend. Missing
+time, market, loss, or detail renders `-` or `事故详情未返回`; the UI never
+invents open-order counts, exposure, remediation, balance, or notification
+delivery.
 
-- both intended legs
-- each venue result
-- any remediation attempt
-- current orders and position reconciliation
-- merge state
-- alert delivery state
-- the reason reset is allowed or denied
+`重新检查并解除` invokes the existing reset endpoint. That endpoint performs
+fresh checks of open orders, directional exposure, pending merge, account
+freshness, relayer readiness, and notification readiness. Any failed check
+keeps the breaker open and its backend reason visible.
 
 ## 6. Monitoring Universe and Eligibility
 
@@ -887,11 +904,19 @@ insufficient.
 
 | ID | Preconditions and action | Required visible UI | Required backend and persisted evidence | Forbidden behavior |
 |---|---|---|---|---|
-| `UI-01 Desktop prototype parity` | Render every Section 5.1 state with deterministic prototype data in the fixed browser at `1440x1100`; capture production screenshots and exercise every approved interaction. | Production matches the fixed `e0d5083` golden hierarchy, component order, dimensions, spacing, typography, colors, borders, copy, and state behavior; visible volume/sorting are exact; console has no functional errors. | Per-state visual diff is `<=0.1%` changed pixels and contains no semantic mismatch; interaction assertions and screenshot paths are included in the acceptance report. | Any unapproved addition, omission, reorder, restyle, copy drift, bottom nav, clipped control, or prototype-only scenario selector in production. |
-| `UI-02 Mobile prototype parity` | Repeat every Section 5.1 state at `375x812` with the same deterministic data and browser configuration. | Production matches the mobile golden screenshots; single-column order, wrapping, modal placement, and all visible content are identical; no horizontal overflow; controls are at least `44x44`. | Per-state visual diff meets the same strict threshold; browser assertions record scroll width, hit targets, interactions, and screenshot paths. | Responsive behavior that differs from the approved prototype, bottom nav, off-screen confirm/reset, hidden volume, or hover-only information. |
+| `UI-01 Desktop prototype parity` | Render every Section 5.1 state with deterministic prototype data in the fixed browser at `1440x1100`; capture production screenshots and exercise every approved interaction. | Production matches `12d3391` Variant A hierarchy, component order, dimensions, spacing, typography, colors, borders, copy, and state behavior; visible volume/sorting are exact; console has no functional errors. | Per-state visual diff is `<=0.1%` changed pixels and contains no semantic mismatch; interaction assertions and screenshot paths are included in the acceptance report. | Any unapproved addition, omission, reorder, restyle, copy drift, bottom nav, clipped control, or prototype-only scenario selector in production. |
+| `UI-02 Mobile prototype parity` | Repeat every Section 5.1 state at `375x812` with the same deterministic data and browser configuration. | Production matches the mobile golden screenshots; the page uses the approved stack with 2×2 readiness/metric grids, correct wrapping and modal placement; no horizontal overflow; controls are at least `44x44`. | Per-state visual diff meets the same strict threshold; browser assertions record grid columns, scroll width, hit targets, interactions, and screenshot paths. | Responsive behavior that differs from the approved prototype, bottom nav, off-screen confirm/reset, hidden volume, or hover-only information. |
 | `UI-03 Keyboard modal` | Open confirmation and reset modals using keyboard; Tab/Shift-Tab; press Escape where safe; close. | Initial focus is meaningful, focus is trapped, visible focus exists, cancel closes, focus returns to invoker; executing mutation cannot be accidentally dismissed as canceled. | Browser assertions cover focus order and restored element. | Focus escaping behind modal, background action activation, duplicate submit from Enter. |
-| `UI-04 Status semantics` | Exercise every approved prototype state with controlled data. | Colors, text, icons, stale/quiet distinction, `可参与`, and first-live-order status match the corresponding golden state exactly. | API enum-to-copy mapping is exhaustive; every state has a named screenshot comparison. | Color-only meaning, “risk-free” language, success before confirmation, or visual state not present in the approved prototype. |
-| `UI-05 Cost disclosure` | Open workspace and modal in actionable state. | Readiness/policy makes `$65` wallet cap, `$20` normal cap, `$2` emergency expected-loss cap, fee-free-only policy, and possible real loss understandable. | Values come from server policy and match enforced configuration. | UI-only limits differing from backend; promise of zero loss or guaranteed profit. |
+| `UI-04 Binary status semantics` | Exercise healthy, loading, stale, degraded, unavailable, error, missing, and unknown health. | Only explicitly healthy is `Watcher 正常`; every other value is `Watcher 不可用`, shows the first backend reason, and cannot trade. | Health, reason, and heartbeat come from the state API; every state has a named screenshot comparison. | A fallback branch treating an unknown value as healthy; `降级` as a third operator-facing status; color-only meaning. |
+| `UI-05 Cost disclosure` | Open workspace and modal in actionable state. | Readiness shows server `$20` normal and `$2` emergency limits; confirmation shows server `$65` wallet cap and `$1` minimum; fee-free-only policy and possible real loss are understandable. | Every displayed amount comes from state/preview policy and matches enforced constants. | UI-only limits, duplicated limits in unrelated cards, or promise of zero loss/guaranteed profit. |
+| `UI-06 Four-card A layout` | Render ready desktop and mobile views. | Readiness is exactly wallet, balance, region/connection, trading status; metrics are exactly actionable, monitored events, market/token, and 24-hour signals. | DOM assertions and screenshots cover 1440, 375, and the required 1920/768 responsive checks. | Permanent first-order card, duplicate WebSocket card, hidden volume, or bottom navigation. |
+| `UI-07 Incomplete opportunity` | Return an opportunity marked actionable but omit one displayed/action-critical field. | The card and its monitored event remain visible; absent values are `-`; both use `数据不完整`; participate is disabled. | No preview or execution request occurs. | Hiding the record, labeling its event `可参与`, inventing a default field, or enabling action because `actionable=true` alone. |
+| `UI-08 Latest preview completeness` | Keep a complete stale list card, then return an incomplete fresh preview. | No modal opens and `预览数据不完整，未下单` is visible. | No execution request; the list payload is never copied into preview data. | Falling back to list price, quantity, cost, wallet, or policy. |
+| `UI-09 Complete preview` | Return a complete latest preview and open confirmation. | Every leg, amount, wallet/balance, and policy value matches the preview; one selected opportunity is shown. | Confirm sends one preview ID and one idempotency key; double click does not create a second execution. | Browser-supplied economics, list fallback, batch selection, or duplicate submit. |
+| `UI-10 Incomplete success` | Return completed state or durable execution history without one or more actual execution detail fields. | `交易已完成，详情数据未返回` appears without sample amount/time; missing historical actual cost, merge value, and realized profit render `-`. | Planned maximum cost and minimum profit remain distinct stored facts and are never aliased to realized values. | `$18.80`, `$20.00`, `+$1.20`, `14:36:12`, planned cost/profit, or any other UI default presented as actual. |
+| `UI-11 Incident truthfulness` | Return complete and incomplete incidents. | Complete facts render verbatim; incomplete facts use `-`/`事故详情未返回`; banner action is `查看事故并处理`. | Breaker remains open and incident ID is preserved. | Inferred exposure, orders, remediation, balance, notification result, time, or loss. |
+| `UI-12 Reset live recheck` | Open reset, then exercise pass and each backend denial. | Modal explains the live checks; buttons are `保持熔断` and `重新检查并解除`; denial keeps modal/breaker and displays the backend reason. | Existing reset endpoint proves clean account/merge/readiness before clearing. | `我已处理` as sufficient proof, prefilled zero checks, or UI-only breaker clearing. |
+| `UI-13 No fabricated constants` | Scan production JS and render missing-field states. | Missing informational values are `-`/`数据未返回`; action surfaces are disabled. | Static test rejects sample balances, profits, losses, times, first-order text, and post-action scenario mutation. | Any sample trading value, status, timestamp, venue fact, or notification claim appearing without API data. |
 
 ### 16.8 Live integration and operations
 
@@ -899,7 +924,7 @@ insufficient.
 |---|---|---|---|---|
 | `LIVE-01 Public data` | With network available, start the actual watcher and open the actual Dashboard. | Real top-20 events, explicit 24h volumes, heartbeat, venue, and current eligibility render; data source is not labeled fixture. | Real Gamma response, WebSocket subscription, same-batch CLOB read, timestamps, and SQLite signal read/write all succeed. | Fixture/mock substituted for this scenario; stale data labeled live. |
 | `LIVE-02 Authenticated non-mutating preflight` | With dedicated wallet configured, run acceptance preflight. | Only masked wallet, balance, allowance, region, relayer, and readiness appear. | Real Keychain retrieval, derived-address match, geoblock, authenticated account reads, exact two-leg construction/signing without POST, official merge-capability presence, and relayer authentication/readiness pass; controlled execution tests cover merge construction/response handling; logs are secret-clean. | Any live order/merge/approval; calling the SDK's mutate-only merge method during acceptance; secret in output; unsigned mock substituted for the two-leg signing check. |
-| `LIVE-03 First-order status` | Run acceptance before any real user trade and exercise the success path only through the controlled executor. | Live Dashboard remains `实盘链路尚未完成首单验证`; controlled success never changes it. | Code path requires durable real venue fill and merge references before the flag can change; the first later user-confirmed live success is verified operationally when it occurs. | Acceptance/test double or manual config setting the live-verified flag; automatic canary order. |
+| `LIVE-03 First-order evidence` | Run acceptance before any real user trade and exercise the success path only through the controlled executor. | No permanent first-order status card is present; normal history remains empty until a real user-confirmed success exists. | Code path requires durable real venue fill and merge references before operational verification can change; controlled tests cannot create that evidence. | Acceptance/test double or manual config setting the live-verified flag; automatic canary order; routine UI demanding user action. |
 | `OPS-01 launchd continuity` | Install/restart accepted launch configuration and inspect service/process manager. | Dashboard health becomes fresh after restart. | `launchctl` and process inspection show expected PID, loopback bind, working directory, accepted SHA, `caffeinate -s`, and fresh timestamped logs/heartbeat. | Old pre-change process still serving; wrong worktree/SHA; only unit-test evidence. |
 | `OPS-02 Crash restart` | Terminate the watcher process without corrupting storage; observe launchd. | Brief degraded/recovering state, then the correct reconciliation outcome. | launchd starts a new PID; SQLite integrity passes; startup reconciliation and fresh heartbeat appear in logs. | Silent death, duplicate concurrent process, readiness before reconciliation. |
 | `OPS-03 Exact-SHA deployment readiness` | Before the gate, deploy the committed candidate SHA using the production launchd path and open the review URL. | Review URL returns HTTP 200 and shows the candidate UI/data state. | PID, cwd, candidate SHA, start time, fresh logs, heartbeat, and HTTP 200 are captured; the installer is ready to repeat the exact-SHA restart after PASS. | Dirty source, wrong SHA, stale process, or asking the user to run acceptance. |

@@ -2040,6 +2040,9 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
                     "quantity": "20",
                     "total_max_cost": "18.80",
                     "minimum_profit": "1.20",
+                    "actual_cost": "18.80",
+                    "merge_value": "20",
+                    "realized_profit": "1.20",
                 }]
             return [{
                 "state": "directional_incident",
@@ -2162,6 +2165,272 @@ console.log(JSON.stringify({
     assert "-$0.60" not in rendered["incidents"]
     assert "已确认无敞口 · 已解除熔断" in rendered["incidents"]
     assert "待解除熔断" not in rendered["incidents"]
+
+
+def test_prediction_history_never_presents_planned_values_as_realized_facts() -> None:
+    output = run_dashboard_js(r'''
+const payload = {histories: {
+  executions: [{
+    status: "complete",
+    completed_at: "2026-07-28T03:40:32Z",
+    question: "真实市场",
+    quantity: "20",
+    total_max_cost: "18.80",
+    minimum_profit: "1.20",
+  }],
+}};
+console.log(predictionHistoryContent(payload, "executions"));
+''')
+
+    assert "真实市场" in output
+    assert "20 组" in output
+    assert "$18.80" not in output
+    assert "+$1.20" not in output
+    assert output.count('data-label="实际成本">-') == 1
+    assert output.count('data-label="合并收回">-') == 1
+    assert output.count('data-label="已实现" class="pm-positive"><strong>-') == 1
+
+
+def test_prediction_history_api_never_aliases_planned_values_as_realized_facts() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+
+    class FakeStore:
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "executions"
+            return [{
+                "state": "complete",
+                "updated_at": "2026-07-28T03:40:32Z",
+                "question": "真实市场",
+                "quantity": "20",
+                "total_max_cost": "18.80",
+                "minimum_profit": "1.20",
+            }]
+
+    item = _prediction_history_payload(
+        FakeStore(), kind="executions", limit=10, offset=0
+    )["items"][0]
+
+    assert item.get("actual_cost") is None
+    assert item.get("merge_value") is None
+    assert item.get("realized_profit") is None
+
+
+def test_prediction_market_layout_a_uses_binary_health_and_four_truthful_metrics() -> None:
+    output = run_dashboard_js(r'''
+const healthy = {
+  status:"healthy",
+  health:{status:"healthy",degraded_reasons:[]},
+  heartbeat_at:"2026-07-28T08:18:42Z",
+  readiness:{status:"ready",balance:"50.00",geoblock:"allowed",relayer:"ready"},
+  masked_wallet:"0x1234…5678",
+  balances:{p_usd:"50.00"},
+  policy_limits:{max_wallet_balance:"65.00",max_normal_cost:"20.00",
+    max_emergency_loss:"2.00",min_estimated_profit:"1.00"},
+  event_count:19,market_count:240,token_count:480,signals_24h:3,
+  opportunities:[{opportunity_id:"opp-1",actionable:true}],
+  breaker:{open:false},
+};
+const unavailable = {
+  status:"mystery",
+  health:{status:"mystery",degraded_reasons:["heartbeat_stale"]},
+  failure_reason:"heartbeat_stale",
+  readiness:{status:"ready"},
+  breaker:{open:false},
+};
+console.log(JSON.stringify({
+  healthyHeader:predictionPageHeader(healthy),
+  unavailableHeader:predictionPageHeader(unavailable),
+  healthyReadiness:predictionReadinessStrip(healthy),
+  unavailableReadiness:predictionReadinessStrip(unavailable),
+  healthyMetrics:predictionMetricStrip(healthy),
+  unavailableMetrics:predictionMetricStrip(unavailable),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "Watcher 正常" in rendered["healthyHeader"]
+    assert "Watcher 不可用" in rendered["unavailableHeader"]
+    assert "盘口心跳已过期" in rendered["unavailableHeader"]
+    assert rendered["healthyReadiness"].count('class="pm-readiness-item"') == 4
+    assert "首单验证" not in rendered["healthyReadiness"]
+    assert "可以交易" in rendered["healthyReadiness"]
+    assert "单笔上限 $20.00 · 应急上限 $2.00" in rendered["healthyReadiness"]
+    assert "$65" not in rendered["healthyReadiness"]
+    assert "不可用" in rendered["unavailableReadiness"]
+    assert "可以交易" not in rendered["unavailableReadiness"]
+    assert rendered["healthyMetrics"].count('<article class="pm-metric') == 4
+    assert "WebSocket" not in rendered["healthyMetrics"]
+    assert "过去 24 小时信号" in rendered["healthyMetrics"]
+    assert rendered["unavailableMetrics"].count("<strong>-</strong>") == 4
+
+
+def test_prediction_market_incomplete_opportunity_stays_visible_but_cannot_trade() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status:"healthy",
+  health:{status:"healthy",degraded_reasons:[]},
+  breaker:{open:false},
+  opportunities:[{
+    opportunity_id:"opp-incomplete",
+    title:"数据不完整的真实市场",
+    market_type:"standard_binary",
+    fee_status:"fee_free",
+    yes_price:"0.45",
+    quantity:"20",
+    max_cost:"18.80",
+    actionable:true,
+  }],
+};
+console.log(predictionOpportunityPanel(payload));
+''')
+    html = output
+
+    assert "数据不完整的真实市场" in html
+    assert "数据不完整" in html
+    assert 'data-action="participate"' in html
+    assert " disabled" in html
+    assert "+$1.20" not in html
+    assert "1 秒前更新" not in html
+
+
+def test_prediction_market_incomplete_event_is_not_labeled_actionable() -> None:
+    output = run_dashboard_js(r'''
+const opportunity = {
+  opportunity_id:"opp-incomplete",
+  event_id:"event-incomplete",
+  title:"数据不完整的真实市场",
+  market_type:"standard_binary",
+  fee_status:"fee_free",
+  yes_price:"0.45",
+  quantity:"20",
+  max_cost:"18.80",
+  actionable:true,
+};
+console.log(predictionEventRows({
+  status:"healthy",
+  health:{status:"healthy",degraded_reasons:[]},
+  breaker:{open:false},
+  opportunities:[opportunity],
+  events:[{
+    event_id:"event-incomplete",
+    title:"数据不完整的真实事件",
+    actionable:true,
+    status:"可参与",
+    opportunities:[opportunity],
+    details:[["当前执行条件","20 组 · 最多 $18.80 · 可参与"]],
+  }],
+}));
+''')
+
+    assert "数据不完整的真实事件" in output
+    assert "数据不完整" in output
+    assert "当前执行条件" in output
+    assert "可参与</div>" not in output
+    assert "· 可参与</span>" not in output
+
+
+def test_prediction_market_alerts_never_invent_execution_or_incident_facts() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify({
+  success:predictionExecutionAlert({
+    status:"success",
+    current_execution:{status:"completed",execution_id:"exec-1"},
+    breaker:{open:false},
+  }),
+  incident:predictionExecutionAlert({
+    status:"incident",
+    breaker:{open:true,incident:{incident_id:"incident-1"}},
+  }),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "交易已完成，详情数据未返回" in rendered["success"]
+    for fabricated in ("20 组", "$18.80", "$20.00", "+$1.20", "14:36:12"):
+        assert fabricated not in rendered["success"]
+    assert "交易已熔断" in rendered["incident"]
+    assert "事故详情未返回" in rendered["incident"]
+    assert "查看事故并处理" in rendered["incident"]
+    for fabricated in ("YES 成交", "$0.60", "macOS", "飞书"):
+        assert fabricated not in rendered["incident"]
+
+
+def test_prediction_market_execution_progress_only_claims_reached_backend_states() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify({
+  validating:predictionExecutionAlert({
+    status:"healthy",current_execution:{state:"validating",event_title:"真实市场"},
+    breaker:{open:false},
+  }),
+  reconciling:predictionExecutionAlert({
+    status:"healthy",current_execution:{state:"reconciling",event_title:"真实市场"},
+    breaker:{open:false},
+  }),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "最终检查" in rendered["validating"]
+    assert "正在检查" in rendered["validating"]
+    assert "批次已提交" not in rendered["validating"]
+    assert "批次已提交" in rendered["reconciling"]
+    assert "正在读取两腿结果" in rendered["reconciling"]
+
+
+def test_prediction_market_preview_must_be_complete_and_never_falls_back_to_list_data() -> None:
+    output = run_dashboard_js(r'''
+const trigger={disabled:false,dataset:{opportunityId:"opp-1"}};
+const event={target:{closest(selector){
+  if(selector==="[data-action='participate']")return trigger;
+  return null;
+}}};
+state.predictionMarket.payload={
+  masked_wallet:"0xLIST…FAKE",
+  policy_limits:{max_wallet_balance:"999"},
+  opportunities:[{
+    opportunity_id:"opp-1",title:"列表旧数据",market_type:"standard_binary",
+    fee_status:"fee_free",yes_price:"0.01",no_price:"0.01",quantity:"999",
+    yes_cost:"9",no_cost:"9",max_cost:"18",profit:"99",actionable:true,
+  }],
+};
+let opened=null;
+openPredictionModal=(...args)=>{opened=args;};
+renderPredictionMarket=()=>{};
+predictionPost=async()=>({
+  state:"previewed",preview_id:"preview-incomplete",question:"最新预览",
+  market_type:"standard_binary",fee_status:"fee_free",
+  quantity:"20",yes_max_price:"0.45",no_max_price:"0.49",
+  yes_max_cost:"9",no_max_cost:"9.8",total_max_cost:"18.8",
+  minimum_profit:"1.2",
+});
+await handlePredictionMarketClick(event);
+const incomplete={opened,error:state.predictionMarket.error,disabled:trigger.disabled};
+opened=null;state.predictionMarket.error="";trigger.disabled=false;
+predictionPost=async()=>({
+  state:"previewed",preview_id:"preview-complete",question:"最新预览",
+  market_type:"standard_binary",fee_status:"fee_free",
+  quantity:"20",yes_max_price:"0.45",no_max_price:"0.49",
+  yes_max_cost:"9",no_max_cost:"9.8",total_max_cost:"18.8",
+  merge_value:"20",minimum_profit:"1.2",available_balance:"50",
+  wallet_address:"0x1234567890abcdef",
+  policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",
+    max_emergency_loss:"2",min_estimated_profit:"1"},
+});
+await handlePredictionMarketClick(event);
+console.log(JSON.stringify({incomplete,complete:opened&&opened[2]}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["incomplete"] == {
+        "opened": None,
+        "error": "预览数据不完整，未下单",
+        "disabled": False,
+    }
+    assert rendered["complete"]["question"] == "最新预览"
+    assert rendered["complete"]["quantity"] == "20"
+    assert "opportunity" not in rendered["complete"]
+    assert "0xLIST…FAKE" not in json.dumps(rendered["complete"], ensure_ascii=False)
+    assert "999" not in json.dumps(rendered["complete"], ensure_ascii=False)
 
 
 @pytest.mark.parametrize("failure", ["host", "origin", "cookie", "csrf", "address"])
@@ -4138,11 +4407,17 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "底部场景" not in html
     for label in ("实盘就绪状态", "当前监控范围", "当前机会", "历史记录", "信号历史", "交易与合并", "事故"):
         assert label in js
-    for copy in ("$65", "$20", "$2", "免手续费", "可能只成交一腿", "24h 成交量"):
+    for copy in ("免手续费", "可能只成交一腿", "24h 成交量"):
         assert copy in js
-    assert "$50.00 pUSD" not in js
+    for fabricated in (
+        "$65.00", "$50.00 pUSD", "$49.40", "$18.80", "$20.00",
+        "+$1.20", "$0.60", "14:36:12", "1 秒前更新", "首单验证",
+        "macOS 与飞书已发送",
+    ):
+        assert fabricated not in js
     assert "确认真实下单" in js
     assert "确认解除交易熔断" in js
+    assert "predictionPreviewIsComplete" in js
     assert "aria-modal=\"true\"" in js
     assert "activeExecutionId" in js
     assert "pollId" in js

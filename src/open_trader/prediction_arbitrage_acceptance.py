@@ -28,6 +28,8 @@ SCENARIO_IDS = (
     "RST-01", "RST-02",
     "HIS-01", "HIS-02", "HIS-03",
     "UI-01", "UI-02", "UI-03", "UI-04", "UI-05",
+    "UI-06", "UI-07", "UI-08", "UI-09", "UI-10",
+    "UI-11", "UI-12", "UI-13",
     "LIVE-01", "LIVE-02", "LIVE-03",
     "OPS-01", "OPS-02", "OPS-03",
 )

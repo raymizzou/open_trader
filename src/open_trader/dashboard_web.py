@@ -356,7 +356,7 @@ def _prediction_history_aliases(kind: str, value: object) -> object:
             ),
             "quantity": _prediction_first(result, "quantity", "execution_quantity"),
             "actual_cost": _prediction_first(
-                result, "actual_cost", "total_max_cost", "total_cost", "cost"
+                result, "actual_cost", "total_actual_cost"
             ),
             "merge_value": _prediction_first(
                 result,
@@ -369,13 +369,9 @@ def _prediction_history_aliases(kind: str, value: object) -> object:
                 result,
                 "realized_profit",
                 "net_profit",
-                "profit",
-                "minimum_profit",
+                "actual_profit",
             ),
         }
-        if aliases["merge_value"] is None and aliases["status"] == "complete":
-            # A complete pair always redeems one dollar per protected share.
-            aliases["merge_value"] = aliases["quantity"]
     else:
         derived_remediation, derived_loss = _prediction_remediation_aliases(result)
         aliases = {

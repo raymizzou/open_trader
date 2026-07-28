@@ -67,6 +67,8 @@ class FakeMonitor:
             "market_id": self.intent.market_id,
             "condition_id": self.intent.condition_id,
             "question": "Will it happen?",
+            "market_type": "standard_binary",
+            "fee_status": "fee_free",
             "volume_24h": Decimal("1000"),
             "actionable": self.actionable,
             "eligibility": "actionable" if self.actionable else "stale",
@@ -561,6 +563,9 @@ def test_preview_rechecks_without_signing_and_serializes_only_safe_intent(tmp_pa
     assert trading.batch_calls == 0
     assert preview["expires_at"]
     assert preview["intent"]["quantity"] == "10"
+    assert preview["market_type"] == "standard_binary"
+    assert preview["fee_status"] == "fee_free"
+    assert preview["merge_value"] == "10"
     assert preview["available_balance"] == "20"
     assert preview["policy_limits"] == {
         "max_wallet_balance": "65.00",

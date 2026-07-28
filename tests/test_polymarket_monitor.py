@@ -331,6 +331,8 @@ def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path
     opportunity = monitor.opportunity("e:m")
     assert opportunity is not None
     assert opportunity["actionable"] is True
+    assert opportunity["market_type"] == "standard_binary"
+    assert opportunity["fee_status"] == "fee_free"
     assert opportunity["confirmed_age_seconds"] <= 10
     assert trading.submit_calls == trading.remediation_calls == trading.merge_calls == 0
 

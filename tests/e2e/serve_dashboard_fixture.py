@@ -17,6 +17,8 @@ FIXTURE_PATH = Path(__file__).with_name("fixtures") / "kelly-dashboard.json"
 def _prediction_payload(scenario: str) -> dict[str, object]:
     if scenario == "preview-rejected":
         scenario = "ready"
+    elif scenario == "preview-incomplete":
+        scenario = "ready"
     elif scenario == "reset-denied":
         scenario = "incident"
     if scenario == "reset":
@@ -27,15 +29,15 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         scenario = "success"
     elif scenario == "history-incidents":
         scenario = "incident"
-    history_kind = "executions" if scenario == "success" else "incidents" if scenario == "incident" else "signals"
+    history_kind = "executions" if scenario in {"success", "success-incomplete"} else "incidents" if scenario in {"incident", "incident-incomplete"} else "signals"
     opportunity = {
         "opportunity_id": "opp-ceasefire",
         "event_id": "event-ceasefire",
         "title": "以色列与伊朗停火是否持续至 2026 年 8 月 31 日？",
         "venue": "Polymarket",
-        "market_type": "普通二元",
-        "fee_status": "免手续费",
-        "updated_at": "1 秒前更新",
+        "market_type": "standard_binary",
+        "fee_status": "fee_free",
+        "updated_at": "2026-07-28T08:18:41Z",
         "yes_price": "0.450",
         "no_price": "0.490",
         "quantity": "20",
@@ -46,13 +48,13 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "profit": "1.20",
         "minimum_profit": "1.20",
         "volume_24h": "9700000",
-        "actionable": scenario in {"ready", "confirmation", "executing", "success"},
+        "actionable": scenario in {"ready", "confirmation", "executing", "success", "success-incomplete", "incomplete"},
     }
     events = [
         {"event_id": "event-ceasefire", "title": "以色列与伊朗停火是否持续至 8 月 31 日？", "volume_24h": "9700000", "markets": "1 个普通二元市场", "profit": "1.20", "actionable": opportunity["actionable"], "details": [["停火持续至 8 月 31 日？", "普通二元 · 免手续费 · 已订阅"], ["当前执行条件", "20 组 · 最多 $18.80 · 可参与"]], "opportunities": [opportunity]},
         {"event_id": "event-btc", "title": "比特币会在 8 月突破 $150,000？", "volume_24h": "12800000", "markets": "2 个市场", "profit": "4.60", "actionable": False, "opportunities": [{"title": "主要二元市场", "volume_24h": "12800000", "actionable": False, "reason": "已订阅 · 收费市场不可参与"}]},
         {"event_id": "event-fed", "title": "2026 年 9 月美联储是否降息？", "volume_24h": "15400000", "markets": "8 个市场", "profit": "3.80", "actionable": False, "opportunities": [{"title": "多结果事件市场", "volume_24h": "15400000", "actionable": False, "reason": "已订阅 · Negative Risk 暂不可参与"}]},
-        {"event_id": "event-eth", "title": "以太坊会在 9 月前突破 $6,000？", "volume_24h": "7100000", "markets": "2 个市场", "profit": "2.10", "actionable": False, "opportunities": [{"title": "主要二元市场", "volume_24h": "7100000", "actionable": False, "reason": "已订阅 · $20 上限内净利润不足 $1"}]},
+        {"event_id": "event-eth", "title": "以太坊会在 9 月前突破 $6,000？", "volume_24h": "7100000", "markets": "2 个市场", "profit": "2.10", "actionable": False, "opportunities": [{"title": "主要二元市场", "volume_24h": "7100000", "actionable": False, "reason": "已订阅 · 净利润未达到策略门槛"}]},
         {"event_id": "event-senate", "title": "2026 年美国参议院控制权", "volume_24h": "6800000", "markets": "12 个市场", "profit": "1.40", "actionable": False, "opportunities": [{"title": "多结果事件市场", "volume_24h": "6800000", "actionable": False, "reason": "已订阅 · Negative Risk 暂不可参与"}]},
         {"event_id": "event-fed-chair", "title": "下一任美联储主席人选", "volume_24h": "5900000", "markets": "14 个市场", "profit": "1.40", "actionable": False, "opportunities": [{"title": "多结果事件市场", "volume_24h": "5900000", "markets": "14 个市场", "actionable": False, "reason": "已订阅 · Negative Risk 暂不可参与"}]},
     ]
@@ -71,13 +73,26 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
     if scenario == "quiet":
         opportunity = {**opportunity, "actionable": False}
         events[0] = {**events[0], "actionable": False, "opportunities": [opportunity]}
+    if scenario == "incomplete":
+        opportunity = {
+            key: value
+            for key, value in opportunity.items()
+            if key not in {"no_price", "profit", "minimum_profit"}
+        }
+        opportunity["actionable"] = True
+        events[0] = {**events[0], "actionable": True, "opportunities": [opportunity]}
     if scenario == "loading":
-        return {"status": "loading", "readiness": {"status": "checking", "wallet_address": "0x7A4E…91C2", "balance": "50.00", "geoblock": "允许交易", "first_live_order": "待首单"}, "wallet": {"masked_address": "0x7A4E…91C2"}, "masked_wallet": "0x7A4E…91C2", "events": events, "opportunities": [opportunity], "histories": {"signals": _prediction_history("signals")}, "event_count": 20, "market_count": 331, "token_count": 662, "breaker": {"open": True}, "heartbeat_at": "刚刚", "csrf_token": "fixture-csrf"}
+        return {"status": "loading", "health": {"status": "loading", "degraded_reasons": ["universe_unavailable"]}, "failure_reason": "universe_unavailable", "readiness": {"status": "unavailable", "reason": "readiness_unavailable"}, "events": [], "opportunities": [], "histories": {"signals": []}, "breaker": {"open": True}, "csrf_token": "fixture-csrf"}
     if scenario == "degraded":
-        return {"status": "degraded", "stale": True, "readiness": {"status": "degraded", "wallet_address": "0x7A4E…91C2", "balance": "50.00", "geoblock": "检查失败", "first_live_order": "待首单"}, "wallet": {"masked_address": "0x7A4E…91C2"}, "masked_wallet": "0x7A4E…91C2", "events": events, "opportunities": [opportunity], "histories": {"signals": _prediction_history("signals")}, "signals_24h": 3, "event_count": 20, "market_count": 331, "token_count": 662, "breaker": {"open": True}, "heartbeat_at": "刚刚", "csrf_token": "fixture-csrf"}
+        return {"status": "degraded", "health": {"status": "degraded", "degraded_reasons": ["heartbeat_stale"]}, "failure_reason": "heartbeat_stale", "stale": True, "readiness": {"status": "degraded", "wallet_address": "0x7A4E…91C2", "balance": "50.00", "geoblock": "blocked", "relayer": "ready"}, "wallet": {"masked_address": "0x7A4E…91C2"}, "masked_wallet": "0x7A4E…91C2", "events": events, "opportunities": [opportunity], "histories": {"signals": _prediction_history("signals")}, "signals_24h": 3, "event_count": 20, "market_count": 331, "token_count": 662, "breaker": {"open": True}, "heartbeat_at": "2026-07-28T08:17:40Z", "csrf_token": "fixture-csrf"}
+    if scenario in {"unavailable", "unknown"}:
+        status = "unavailable" if scenario == "unavailable" else "mystery"
+        reason = "configuration_unavailable" if scenario == "unavailable" else "status_unknown"
+        return {"status": status, "health": {"status": status, "degraded_reasons": [reason]}, "failure_reason": reason, "readiness": {"status": "unavailable", "reason": reason}, "events": [], "opportunities": [], "histories": {"signals": []}, "breaker": {"open": True}, "csrf_token": "fixture-csrf"}
     payload: dict[str, object] = {
-        "status": "healthy" if scenario not in {"executing", "success", "incident"} else scenario,
-        "readiness": {"status": "ready", "wallet_address": "0x7A4E…91C2", "balance": "$49.40" if scenario == "incident" else "$51.20" if scenario == "success" else "$50.00", "geoblock": "允许交易", "first_live_order": "已验证" if scenario == "success" else "事故熔断" if scenario == "incident" else "待首单"},
+        "status": "healthy",
+        "health": {"status": "healthy", "degraded_reasons": []},
+        "readiness": {"status": "ready", "wallet_address": "0x7A4E…91C2", "balance": "49.40" if scenario in {"incident", "incident-incomplete"} else "51.20" if scenario in {"success", "success-incomplete"} else "50.00", "geoblock": "allowed", "relayer": "ready"},
         "wallet": {"masked_address": "0x7A4E…91C2"},
         "masked_wallet": "0x7A4E…91C2",
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
@@ -94,12 +109,15 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "csrf_token": "fixture-csrf",
     }
     if scenario == "executing":
-        payload["current_execution"] = {"execution_id": "exec-fixture", "status": "executing", "event_title": "停火持续至 8 月 31 日？"}
+        payload["current_execution"] = {"execution_id": "exec-fixture", "status": "reconciling", "event_title": "停火持续至 8 月 31 日？"}
     elif scenario == "success":
-        payload["current_execution"] = {"execution_id": "exec-fixture", "status": "completed", "event_title": opportunity["title"], "realized_profit": "1.20", "actual_cost": "18.80", "merge_value": "20.00", "completed_at": "14:36:12"}
+        payload["current_execution"] = {"execution_id": "exec-fixture", "status": "completed", "event_title": opportunity["title"], "quantity": "20", "realized_profit": "1.20", "actual_cost": "18.80", "merge_value": "20.00", "completed_at": "14:36:12"}
+    elif scenario == "success-incomplete":
+        payload["current_execution"] = {"execution_id": "exec-fixture", "status": "completed"}
     elif scenario == "incident":
-        payload["breaker"] = {"open": True, "status": "locked", "incident": {"incident_id": "incident-fixture", "reason": "YES 成交、NO 被拒；系统已卖回 YES，当前不平衡持仓为 0，实际损失 $0.60。macOS 与飞书已通知。", "unbalanced_positions": "0", "open_orders": "0", "balance": "$49.40 pUSD", "notification_status": "macOS 与飞书已发送"}}
-        payload["status"] = "incident"
+        payload["breaker"] = {"open": True, "status": "locked", "incident": {"incident_id": "incident-fixture", "happened_at": "2026-07-28T06:36:09Z", "event_title": opportunity["title"], "reason": "YES 成交、NO 被拒", "loss": "-0.60"}}
+    elif scenario == "incident-incomplete":
+        payload["breaker"] = {"open": True, "status": "locked", "incident": {"incident_id": "incident-fixture"}}
     return payload
 
 
@@ -122,10 +140,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query, keep_blank_values=True)
-        requested_scenario = str(query.get("scenario", [""])[0] or "").strip()
-        if requested_scenario:
-            type(self).prediction_scenario = requested_scenario
         if path == "/":
+            requested_scenario = str(query.get("prediction_state", [""])[0] or "").strip()
+            if requested_scenario:
+                type(self).prediction_scenario = requested_scenario
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
             return
         if path == "/static/dashboard.css":
@@ -180,8 +198,42 @@ class Handler(BaseHTTPRequestHandler):
         if path.endswith("/preview"):
             if type(self).prediction_scenario == "preview-rejected":
                 self._send_json({"state": "rejected", "reason": "opportunity_unavailable"})
+            elif type(self).prediction_scenario == "preview-incomplete":
+                self._send_json({
+                    "state": "previewed",
+                    "preview_id": "preview-fixture",
+                    "question": "以色列与伊朗停火是否持续至 2026 年 8 月 31 日？",
+                    "market_type": "standard_binary",
+                    "fee_status": "fee_free",
+                    "quantity": "20",
+                    "yes_max_price": "0.450",
+                    "no_max_price": "0.490",
+                    "yes_max_cost": "9.00",
+                    "no_max_cost": "9.80",
+                    "total_max_cost": "18.80",
+                    "merge_value": "20.00",
+                    "minimum_profit": "1.20",
+                })
             else:
-                self._send_json({"state": "previewed", "preview_id": "preview-fixture", "opportunity": _prediction_payload("ready")["opportunities"][0]})
+                opportunity = dict(_prediction_payload("ready")["opportunities"][0])
+                self._send_json({
+                    "state": "previewed",
+                    "preview_id": "preview-fixture",
+                    "question": opportunity["title"],
+                    "market_type": opportunity["market_type"],
+                    "fee_status": opportunity["fee_status"],
+                    "quantity": opportunity["quantity"],
+                    "yes_max_price": opportunity["yes_price"],
+                    "no_max_price": opportunity["no_price"],
+                    "yes_max_cost": opportunity["yes_cost"],
+                    "no_max_cost": opportunity["no_cost"],
+                    "total_max_cost": opportunity["max_cost"],
+                    "merge_value": opportunity["merge_value"],
+                    "minimum_profit": opportunity["profit"],
+                    "available_balance": "50.00",
+                    "wallet_address": "0x7A4E1234567890ABCDEF91C2",
+                    "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
+                })
         elif path.endswith("/executions"):
             type(self).prediction_scenario = "success"
             self._send_json({"execution_id": "exec-fixture", "status": "executing"})

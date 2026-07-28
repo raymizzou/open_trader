@@ -1,13 +1,14 @@
 import { expect, test, type Page } from '@playwright/test';
 
 // Goldens are intentionally tied to the user-approved prototype commit.
-const APPROVED_PROTOTYPE_SHA = 'e0d5083';
-const PROTOTYPE_BASE_URL = process.env.PREDICTION_UI_BASE_URL ?? 'http://127.0.0.1:8772/prediction-market-execution-prototype.html';
+const APPROVED_PROTOTYPE_SHA = '12d3391';
+const PROTOTYPE_BASE_URL = process.env.PREDICTION_UI_BASE_URL ?? 'http://127.0.0.1:8773/prediction-market-truthful-ui-prototype.html';
 const GOLDEN_SOURCE = `${PROTOTYPE_BASE_URL} @ ${APPROVED_PROTOTYPE_SHA}; deterministic six-event fixture is kept in serve_dashboard_fixture.py`;
 const CAPTURE_PROTOTYPE = process.env.PREDICTION_UI_CAPTURE === '1';
 const states = [
-  'loading', 'ready', 'quiet', 'executing', 'success', 'incident',
-  'degraded', 'confirmation', 'reset', 'history-signals',
+  'loading', 'ready', 'quiet', 'incomplete', 'executing', 'success',
+  'success-incomplete', 'incident', 'incident-incomplete', 'degraded',
+  'unavailable', 'unknown', 'confirmation', 'reset', 'history-signals',
   'history-executions', 'history-incidents',
 ] as const;
 const viewports = [
@@ -32,6 +33,9 @@ async function openPrediction(page: Page, state: string) {
 function prototypeStateFor(state: string) {
   if (state === 'confirmation') return { state: 'ready', history: 'signals' };
   if (state === 'reset') return { state: 'incident', history: 'incidents' };
+  if (state === 'incomplete' || state === 'unavailable' || state === 'unknown') return { state: 'unavailable', history: 'signals' };
+  if (state === 'success-incomplete') return { state: 'success', history: 'trades' };
+  if (state === 'incident-incomplete') return { state: 'incident', history: 'incidents' };
   if (state === 'history-signals') return { state: 'ready', history: 'signals' };
   if (state === 'history-executions') return { state: 'success', history: 'trades' };
   if (state === 'history-incidents') return { state: 'incident', history: 'incidents' };
@@ -45,17 +49,21 @@ test.describe('approved prediction execution workspace', () => {
     await openPrediction(page, 'ready');
     await expect(page.locator('.dashboard-header')).toBeHidden();
     await expect(page.locator('.pm-nav button')).toHaveText(['持仓', '预测市场', '策略回测', '凯利实验室']);
-    for (const label of ['交易钱包', '可用余额', '地区与连接', '实盘状态', '首单验证']) {
+    for (const label of ['交易钱包', '可用余额', '地区与连接', '实盘状态']) {
       await expect(page.locator('.pm-readiness')).toContainText(label);
     }
+    await expect(page.locator('.pm-readiness-item')).toHaveCount(4);
+    await expect(page.locator('.pm-readiness')).not.toContainText('首单验证');
+    await expect(page.locator('.pm-metric')).toHaveCount(4);
+    await expect(page.locator('.pm-metrics')).not.toContainText('WebSocket');
     await expect(page.locator('.pm-panel').nth(0)).toContainText('当前监控范围');
     await expect(page.locator('.pm-panel').nth(1)).toContainText('当前机会');
     await expect(page.locator('.pm-panel').nth(2)).toContainText('历史记录');
     await expect(page.locator('body')).toContainText('24h 成交量');
     await expect(page.locator('.pm-prototype-note')).toHaveCount(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-    expect(APPROVED_PROTOTYPE_SHA).toBe('e0d5083');
-    expect(PROTOTYPE_BASE_URL).toContain('prediction-market-execution-prototype.html');
+    expect(APPROVED_PROTOTYPE_SHA).toBe('12d3391');
+    expect(PROTOTYPE_BASE_URL).toContain('prediction-market-truthful-ui-prototype.html');
   });
 
   test('participation preview and confirmation submit exactly once', async ({ page }) => {
@@ -120,7 +128,7 @@ test.describe('approved prediction execution workspace', () => {
   test('keeps the reset modal open when the backend denies reset', async ({ page }) => {
     await openPrediction(page, 'reset-denied');
     await page.locator('[data-action="open-reset"]').click();
-    await page.getByRole('button', { name: '我已处理，恢复交易' }).click();
+    await page.getByRole('button', { name: '重新检查并解除' }).click();
     await expect(page.locator('.pm-modal')).toBeVisible();
     await expect(page.getByRole('alert').filter({ hasText: '本次操作未提交' })).toBeVisible();
     await expect(page.locator('[data-action="open-reset"]')).toBeVisible();
@@ -132,7 +140,10 @@ test.describe('approved prediction execution workspace', () => {
         contentType: 'application/json',
         body: JSON.stringify({
           status: 'healthy',
-          readiness: { status: 'ready', balance: '50.00', geoblock: '允许交易', first_live_order: '待首单' },
+          health: { status: 'healthy', degraded_reasons: [] },
+          readiness: { status: 'ready', balance: '50.00', geoblock: 'allowed', relayer: 'ready' },
+          masked_wallet: '0x7A4E…91C2',
+          policy_limits: { max_wallet_balance: '65', max_normal_cost: '20', max_emergency_loss: '2', min_estimated_profit: '1' },
           event_count: 1,
           market_count: 1,
           token_count: 2,
@@ -143,6 +154,7 @@ test.describe('approved prediction execution workspace', () => {
           }],
           opportunities: [{
             opportunity_id: 'live-opp', question: '真实问题字段', actionable: true,
+            market_type: 'standard_binary', fee_status: 'fee_free',
             yes_max_price: '0.401', no_max_price: '0.499', yes_max_cost: '8.02',
             no_max_cost: '9.98', total_max_cost: '18.00', minimum_profit: '2.00', quantity: '20',
           }],
@@ -161,7 +173,7 @@ test.describe('approved prediction execution workspace', () => {
     await expect(page.locator('.pm-opportunity')).toContainText('$18.00');
     await expect(page.locator('.pm-opportunity')).toContainText('+$2.00');
     await expect(page.locator('.pm-progress')).toBeVisible();
-    await expect(page.locator('.pm-readiness')).toContainText('执行中');
+    await expect(page.locator('.pm-readiness')).toContainText('不可用');
   });
 
   test('incident reset and history tabs remain visible', async ({ page }) => {
@@ -169,7 +181,7 @@ test.describe('approved prediction execution workspace', () => {
     await expect(page.locator('[data-action="open-reset"]')).toBeVisible();
     await page.locator('[data-action="open-reset"]').click();
     await expect(page.locator('.pm-modal')).toContainText('确认解除交易熔断');
-    await page.getByRole('button', { name: '我已处理，恢复交易' }).click();
+    await page.getByRole('button', { name: '重新检查并解除' }).click();
     await expect(page.locator('[data-action="open-reset"]')).toHaveCount(0);
     for (const [kind, label] of [['signals', '信号历史'], ['executions', '交易与合并'], ['incidents', '事故']] as const) {
       await page.getByRole('button', { name: label, exact: true }).click();
@@ -179,12 +191,12 @@ test.describe('approved prediction execution workspace', () => {
 
   test('keeps the approved state-specific copy and six-column histories', async ({ page }) => {
     await openPrediction(page, 'incident');
-    await expect(page.locator('.pm-alert.danger')).toContainText('交易已熔断：发生单腿成交');
-    for (const copy of ['YES 成交、NO 被拒', '$0.60', 'macOS 与飞书已通知']) {
-      await expect(page.locator('.pm-alert.danger')).toContainText(copy);
-    }
+    await expect(page.locator('.pm-alert.danger')).toContainText('交易已熔断');
+    await expect(page.locator('.pm-alert.danger')).toContainText('YES 成交、NO 被拒');
+    await expect(page.locator('.pm-alert.danger')).not.toContainText('$0.60');
+    await expect(page.locator('.pm-alert.danger')).not.toContainText('macOS');
     await openPrediction(page, 'executing');
-    for (const copy of ['双腿提交', '2 笔 FOK 已签名', '成交核对']) {
+    for (const copy of ['双腿提交', '批次已提交', '成交核对']) {
       await expect(page.locator('.pm-progress')).toContainText(copy);
     }
     await openPrediction(page, 'success');
@@ -197,8 +209,8 @@ test.describe('approved prediction execution workspace', () => {
     await openPrediction(page, 'degraded');
     await expect(page.locator('.pm-opportunity.disabled')).toBeVisible();
     await openPrediction(page, 'loading');
-    await expect(page.locator('.pm-event')).toHaveCount(6);
-    await expect(page.locator('.pm-stack > .pm-panel').first().locator('.pm-empty')).toContainText('正在读取可参与机会');
+    await expect(page.locator('.pm-event')).toHaveCount(0);
+    await expect(page.locator('.pm-stack > .pm-panel').first().locator('.pm-empty')).toContainText('预测市场暂不可用');
     await openPrediction(page, 'history-signals');
     await page.locator('[data-history="signals"]').click();
     await expect(page.locator('.pm-table th')).toHaveCount(6);
@@ -216,8 +228,22 @@ test.describe('approved prediction execution workspace', () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await openPrediction(page, 'ready');
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await expect(page.locator('.pm-readiness')).toHaveCSS('grid-template-columns', /.+ .+/);
+    await expect(page.locator('.pm-metrics')).toHaveCSS('grid-template-columns', /.+ .+/);
     for (const height of await page.locator('#prediction-market-workspace').evaluate((root) => Array.from(root.querySelectorAll('button')).filter((element) => element.getClientRects().length).map((element) => element.getBoundingClientRect().height))) {
       expect(height).toBeGreaterThanOrEqual(44);
+    }
+  });
+
+  test('keeps the approved A hierarchy at 1920 and 768 pixels', async ({ page }) => {
+    for (const viewport of [{ width: 1920, height: 1200 }, { width: 768, height: 1024 }]) {
+      await page.setViewportSize(viewport);
+      await openPrediction(page, 'ready');
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await expect.poll(() => page.locator('.pm-readiness').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(4);
+      await expect.poll(() => page.locator('.pm-metrics').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(4);
+      await expect.poll(() => page.locator('.pm-layout').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(viewport.width === 1920 ? 2 : 1);
+      await expect(page.locator('.pm-volume').first()).toContainText('24h 成交量');
     }
   });
 
@@ -236,7 +262,7 @@ test.describe('approved prediction execution workspace', () => {
     await expect(page.locator('.pm-alert.danger')).toContainText('交易已熔断');
     await openPrediction(page, 'degraded');
     await expect(page.locator('.pm-alert.danger')).toContainText('数据连接异常');
-    await expect(page.locator('.pm-opportunity button')).toHaveText('数据异常');
+    await expect(page.locator('.pm-opportunity button')).toHaveText('不可用');
   });
 
   test('[UI-05] cost disclosure', async ({ page }) => {
@@ -245,6 +271,56 @@ test.describe('approved prediction execution workspace', () => {
     await expect(page.locator('.pm-modal')).toContainText('$65');
     await expect(page.locator('.pm-modal')).toContainText('$20');
     await expect(page.locator('.pm-modal')).toContainText('$2');
+  });
+
+  test('missing and unknown data remains visible but cannot authorize an order', async ({ page }) => {
+    await openPrediction(page, 'incomplete');
+    await expect(page.locator('.pm-opportunity')).toContainText('数据不完整');
+    await expect(page.locator('.pm-opportunity')).toContainText('-');
+    await expect(page.locator('[data-action="participate"]')).toBeDisabled();
+
+    await openPrediction(page, 'unknown');
+    await expect(page.locator('.pm-status-line')).toContainText('Watcher 不可用');
+    await expect(page.locator('.pm-metric strong')).toHaveText(['-', '-', '-', '-']);
+    await expect(page.locator('.pm-readiness')).toContainText('不可用');
+  });
+
+  test('an incomplete latest preview never opens a confirmation or submits', async ({ page }) => {
+    await openPrediction(page, 'preview-incomplete');
+    const executionRequests: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().includes('/prediction-arbitrage/executions')) executionRequests.push(request.method());
+    });
+    await page.locator('[data-action="participate"]').click();
+    await expect(page.locator('.pm-modal')).toHaveCount(0);
+    await expect(page.getByRole('alert')).toContainText('预览数据不完整，未下单');
+    expect(executionRequests).toEqual([]);
+  });
+
+  test('incomplete completed-trade and incident states never grow sample facts', async ({ page }) => {
+    await openPrediction(page, 'success-incomplete');
+    await expect(page.locator('.pm-alert.success')).toContainText('交易已完成，详情数据未返回');
+    for (const copy of ['$18.80', '$20.00', '+$1.20', '14:36:12']) {
+      await expect(page.locator('.pm-alert.success')).not.toContainText(copy);
+    }
+
+    await openPrediction(page, 'incident-incomplete');
+    await expect(page.locator('.pm-alert.danger')).toContainText('事故详情未返回');
+    await page.locator('[data-action="open-reset"]').click();
+    await expect(page.locator('.pm-modal')).toContainText('事故详情未返回');
+    await expect(page.locator('.pm-modal')).toContainText('实际损失');
+    await expect(page.locator('.pm-modal')).not.toContainText('$0.60');
+    await expect(page.locator('.pm-modal')).not.toContainText('未完成订单 0');
+  });
+
+  test('reset dialog shows only stored incident facts before live recheck', async ({ page }) => {
+    await openPrediction(page, 'incident');
+    await page.locator('[data-action="open-reset"]').click();
+    for (const copy of ['事故时间', '市场', 'YES 成交、NO 被拒', '-$0.60', '重新检查并解除']) {
+      await expect(page.locator('.pm-modal')).toContainText(copy);
+    }
+    await expect(page.locator('.pm-modal')).not.toContainText('未完成订单 0');
+    await expect(page.locator('.pm-modal')).not.toContainText('通知状态');
   });
 
   for (const viewport of viewports) {

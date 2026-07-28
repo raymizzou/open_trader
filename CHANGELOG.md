@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-28
+
+- Reworked the prediction-market workspace to the approved truth-driven
+  Variant A: exactly four readiness cards and four live metrics, visible volume
+  ranking, fail-closed incomplete data, fresh-preview-only confirmation,
+  truthful execution/incident history, and responsive desktop/mobile layouts.
+  Expanded the acceptance registry to 62 scenarios and added deterministic
+  golden coverage for unavailable, unknown, and incomplete states.
+
 ## 2026-07-27
 
 - Allowed the Dashboard to show a newer validated trend-report revision when

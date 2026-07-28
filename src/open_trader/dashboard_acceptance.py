@@ -365,6 +365,14 @@ def validate_prediction_payload(payload: Mapping[str, Any]) -> list[str]:
     status = str(payload.get("status") or "")
     if status not in {"healthy", "loading", "degraded", "unavailable", "error", "executing", "success", "incident", "completed"}:
         errors.append(f"预测市场状态无效：{status or 'missing'}")
+    health = payload.get("health")
+    if not isinstance(health, Mapping):
+        errors.append("预测市场 health 不是对象")
+        health_status = ""
+    else:
+        health_status = str(health.get("status") or "")
+        if health_status not in {"healthy", "loading", "degraded", "unavailable", "error"}:
+            errors.append(f"预测市场 health 状态无效：{health_status or 'missing'}")
     events = payload.get("events")
     if not isinstance(events, list):
         errors.append("预测市场 events 不是数组")
@@ -384,7 +392,23 @@ def validate_prediction_payload(payload: Mapping[str, Any]) -> list[str]:
     if not isinstance(opportunities, list):
         errors.append("预测市场 opportunities 不是数组")
         opportunities = []
-    stale = bool(payload.get("stale")) or status in {"degraded", "unavailable", "error"}
+    required_actionable_fields = (
+        "opportunity_id", "title", "market_type", "fee_status", "yes_price",
+        "no_price", "quantity", "max_cost", "profit",
+    )
+    for index, opportunity in enumerate(opportunities):
+        if not isinstance(opportunity, Mapping) or opportunity.get("actionable") is not True:
+            continue
+        if any(
+            opportunity.get(key) is None or str(opportunity.get(key)).strip() == ""
+            for key in required_actionable_fields
+        ):
+            errors.append(f"预测市场 actionable opportunity 字段不完整：{index}")
+    stale = (
+        bool(payload.get("stale"))
+        or status in {"degraded", "unavailable", "error"}
+        or health_status != "healthy"
+    )
     breaker = payload.get("breaker")
     breaker_open = isinstance(breaker, Mapping) and breaker.get("open") is True
     execution = payload.get("current_execution")
