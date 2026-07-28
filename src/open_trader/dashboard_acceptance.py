@@ -1386,10 +1386,10 @@ def _check_frozen_trend_disciplines(
                 for index in range(len(boxes) - 1)
             ), f"{broker} 移动端趋势报告顺序不符合行动优先布局：{boxes}"
     if page is not None:
-        metrics = context_section.locator(".trend-industry-metric")
+        metrics = context_section.locator("tbody .trend-industry-metric")
         if metrics.count():
             market_metric = context_section.locator(
-                '[data-trend-industry-help*="不是账户仓位或上涨概率"]'
+                'tbody [data-trend-industry-help*="不是账户仓位或上涨概率"]'
             )
             if market_metric.count() == 0:
                 market_metric = metrics.nth(0)
