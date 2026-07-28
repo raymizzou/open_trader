@@ -285,6 +285,15 @@ function bindEvents() {
   elements["account-tabs"].addEventListener("keydown", handleBrokerTabKeydown);
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
+    const industryMetric = event.target.closest?.("[data-trend-industry-help]");
+    if (industryMetric) {
+      if (industryMetric.dataset.trendIndustryHelpOpen === "pinned") {
+        closeTrendIndustryHelp(industryMetric);
+      } else {
+        showTrendIndustryHelp(industryMetric, true);
+      }
+      return;
+    }
     const accountView = event.target.closest("[data-account-view]");
     if (accountView) {
       setAccountView(
@@ -335,6 +344,31 @@ function bindEvents() {
       return;
     }
     handleSymbolDetailClick(event);
+  });
+  elements["account-holdings"].addEventListener("mouseover", (event) => {
+    const trigger = event.target.closest?.("[data-trend-industry-help]");
+    if (!trigger || (event.relatedTarget && trigger.contains?.(event.relatedTarget))) return;
+    showTrendIndustryHelp(trigger);
+  });
+  elements["account-holdings"].addEventListener("mouseout", (event) => {
+    const trigger = event.target.closest?.("[data-trend-industry-help]");
+    if (!trigger || (event.relatedTarget && trigger.contains?.(event.relatedTarget))) return;
+    if (trigger.dataset.trendIndustryHelpOpen !== "pinned") closeTrendIndustryHelp(trigger);
+  });
+  elements["account-holdings"].addEventListener("focusin", (event) => {
+    const trigger = event.target.closest?.("[data-trend-industry-help]");
+    if (trigger) showTrendIndustryHelp(trigger);
+  });
+  elements["account-holdings"].addEventListener("focusout", (event) => {
+    const trigger = event.target.closest?.("[data-trend-industry-help]");
+    if (!trigger || (event.relatedTarget && trigger.contains?.(event.relatedTarget))) return;
+    if (trigger.dataset.trendIndustryHelpOpen !== "pinned") closeTrendIndustryHelp(trigger);
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest?.("[data-trend-industry-help]")) closeTrendIndustryHelp();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeTrendIndustryHelp();
   });
   elements["account-holdings"].addEventListener("keydown", handleAccountViewTabKeydown);
   elements["account-holdings"].addEventListener("change", handleStatementFileSelection);
@@ -3394,6 +3428,97 @@ function trendIndustryPercent(value) {
   return `${percent.toLocaleString("zh-CN", {maximumFractionDigits: 2})}%`;
 }
 
+function trendIndustryTransition(current, prior) {
+  const currentText = trendIndustryPercent(current);
+  if (!currentText) return "未提供";
+  const priorText = trendIndustryPercent(prior);
+  return priorText ? `${priorText} → ${currentText}` : `${currentText} · 基准建立中`;
+}
+
+function trendIndustryStructureCopy(context) {
+  if (!hasValue(context.aggregate_right_count_ratio)
+      || !hasValue(context.aggregate_right_market_cap_ratio)) return "";
+  const count = Number(context.aggregate_right_count_ratio);
+  const marketCap = Number(context.aggregate_right_market_cap_ratio);
+  if (!Number.isFinite(count) || !Number.isFinite(marketCap)) return "";
+  const gap = (marketCap - count) * 100;
+  const relation = gap > 0 ? "高于" : gap < 0 ? "低于" : "等于";
+  const bias = gap > 0 ? "右侧更偏大市值成分"
+    : gap < 0 ? "右侧更偏小市值成分" : "两个占比相同";
+  let text = `当前右侧市值占比${relation}右侧个数占比 ${formatDisplayNumber(Math.abs(gap))} 个百分点，${bias}。`;
+  const priorCount = hasValue(context.prior_aggregate_right_count_ratio)
+    ? Number(context.prior_aggregate_right_count_ratio) : null;
+  const priorMarketCap = hasValue(context.prior_aggregate_right_market_cap_ratio)
+    ? Number(context.prior_aggregate_right_market_cap_ratio) : null;
+  if (Number.isFinite(priorMarketCap)) {
+    const marketCapChange = (marketCap - priorMarketCap) * 100;
+    const marketCapDirection = marketCapChange > 0 ? "上升"
+      : marketCapChange < 0 ? "下降" : "持平";
+    text = `较前一有效交易日${marketCapDirection} ${formatDisplayNumber(Math.abs(marketCapChange))} 个百分点。${text}`;
+  }
+  if (Number.isFinite(priorCount) && Number.isFinite(priorMarketCap)) {
+    const change = gap - (priorMarketCap - priorCount) * 100;
+    const direction = change > 0 ? "扩大" : change < 0 ? "收窄" : "持平";
+    text += `结构差较前值${direction} ${formatDisplayNumber(Math.abs(change))} 个百分点。`;
+  }
+  return `${text}该指标不是账户仓位或上涨概率。`;
+}
+
+function trendIndustryRatioChangeCopy(label, definition, current, prior) {
+  if (!hasValue(current) || !Number.isFinite(Number(current))) return "";
+  let text = `${label}：${definition}。`;
+  if (hasValue(prior) && Number.isFinite(Number(prior))) {
+    const change = (Number(current) - Number(prior)) * 100;
+    const direction = change > 0 ? "上升" : change < 0 ? "下降" : "持平";
+    text += `较前一有效交易日${direction} ${formatDisplayNumber(Math.abs(change))} 个百分点。`;
+  } else {
+    text += "历史基准建立中。";
+  }
+  return text;
+}
+
+function trendIndustryMetric(value, help) {
+  const visible = value || "未提供";
+  const label = help ? `${visible}：${help}` : visible;
+  return `<button type="button" class="trend-industry-metric" data-trend-industry-help="${escapeHtml(help)}" aria-expanded="false" aria-label="${escapeHtml(label)}">${escapeHtml(visible)}</button>`;
+}
+
+function showTrendIndustryHelp(trigger, pinned = false) {
+  const section = trigger.closest?.(".trend-industry-context");
+  const tooltip = section?.querySelector?.(".trend-industry-tooltip");
+  const text = trigger.dataset.trendIndustryHelp || "";
+  if (!tooltip || !text) return;
+  closeTrendIndustryHelp();
+  tooltip.textContent = text;
+  tooltip.hidden = false;
+  tooltip.setAttribute("aria-hidden", "false");
+  trigger.dataset.trendIndustryHelpOpen = pinned ? "pinned" : "hover";
+  trigger.setAttribute("aria-expanded", String(pinned));
+  const target = trigger.getBoundingClientRect();
+  const box = tooltip.getBoundingClientRect();
+  const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1024;
+  tooltip.style.left = `${Math.min(Math.max(12, target.left), viewportWidth - box.width - 12)}px`;
+  tooltip.style.top = `${target.top >= box.height + 20 ? target.top - box.height - 8 : target.bottom + 8}px`;
+}
+
+function closeTrendIndustryHelp(trigger = null) {
+  const sections = trigger?.closest?.(".trend-industry-context")
+    ? [trigger.closest(".trend-industry-context")]
+    : [...(document.querySelectorAll?.(".trend-industry-context") || [])];
+  sections.forEach((section) => {
+    const tooltip = section.querySelector?.(".trend-industry-tooltip");
+    if (tooltip) {
+      tooltip.hidden = true;
+      tooltip.setAttribute("aria-hidden", "true");
+      tooltip.textContent = "";
+    }
+    section.querySelectorAll?.("[data-trend-industry-help]").forEach((item) => {
+      delete item.dataset.trendIndustryHelpOpen;
+      item.setAttribute("aria-expanded", "false");
+    });
+  });
+}
+
 function trendIndustryContextFallback(status, contexts) {
   if (!(contexts || []).length && !hasValue(status?.ordering_mode)
       && status?.current_complete !== true) {
@@ -3424,36 +3549,45 @@ function renderTrendIndustryContext(report) {
   const status = report?.industry_context_status && typeof report.industry_context_status === "object"
     ? report.industry_context_status : {};
   const rows = contexts.map((context) => {
-    const rightShare = trendIndustryPercent(context.right_share);
-    const priorShare = trendIndustryPercent(context.prior_right_share);
-    const change = hasValue(context.right_share_change_pp)
-      ? `${Number(context.right_share_change_pp) >= 0 ? "+" : ""}${formatDisplayNumber(context.right_share_change_pp)} 个百分点`
-      : "";
-    const breadth = hasValue(context.right_count) && hasValue(context.valid_count) && rightShare
-      ? `${formatDisplayNumber(context.right_count)} / ${formatDisplayNumber(context.valid_count)} = ${rightShare}`
-      : "数据未提供";
-    const history = [
-      priorShare ? `此前右侧占比 ${priorShare}` : "",
-      change,
-    ].filter(Boolean).join(" · ");
-    const statusText = context.valid === false
-      ? (context.invalid_reasons || []).map(formatPlain).join("、") || "数据不可用"
-      : history;
+    const countValue = trendIndustryTransition(
+      context.aggregate_right_count_ratio,
+      context.prior_aggregate_right_count_ratio,
+    );
+    const marketCapValue = trendIndustryTransition(
+      context.aggregate_right_market_cap_ratio,
+      context.prior_aggregate_right_market_cap_ratio,
+    );
+    const countHelp = trendIndustryRatioChangeCopy(
+      "右侧个数占比", "右侧成分数 ÷ 行业有效成分数",
+      context.aggregate_right_count_ratio,
+      context.prior_aggregate_right_count_ratio,
+    );
+    const marketCapHelp = trendIndustryRatioChangeCopy(
+      "右侧市值占比", "右侧成分总市值 ÷ 行业有效成分总市值",
+      context.aggregate_right_market_cap_ratio,
+      context.prior_aggregate_right_market_cap_ratio,
+    );
+    const countExplanation = countHelp || "当前右侧个数占比不可用。";
+    const marketCapExplanation = marketCapHelp
+      ? `${marketCapHelp}${trendIndustryStructureCopy(context)}`
+      : "当前右侧市值占比不可用。";
     return `<tr class="trend-industry-context-row${context.valid === false ? " invalid" : ""}">
       <th scope="row" data-label="行业"><strong>${escapeHtml(formatPlain(context.industry || "行业"))}</strong></th>
       <td data-label="当前温度">${escapeHtml(hasValue(context.temperature) ? formatPlain(context.temperature) : "数据未提供")}</td>
       <td data-label="温度方向">${escapeHtml(hasValue(context.temperature_direction) ? trendIndustryDirection(context.temperature_direction) : "数据未提供")}</td>
       <td data-label="趋势强度">${escapeHtml(hasValue(context.strength) ? formatDisplayNumber(context.strength) : "数据未提供")}</td>
       <td data-label="温转热数量">${escapeHtml(hasValue(context.warm_to_hot_count) ? formatDisplayNumber(context.warm_to_hot_count) : "数据未提供")}</td>
-      <td data-label="右侧占比">${escapeHtml(breadth)}</td>
-      <td class="trend-industry-context-status${context.valid === false ? " trend-industry-context-invalid" : ""}" data-label="变化">${escapeHtml(statusText || "—")}</td>
+      <td data-label="右侧个数占比">${trendIndustryMetric(countValue, countExplanation)}</td>
+      <td data-label="右侧市值占比">${trendIndustryMetric(marketCapValue, marketCapExplanation)}</td>
     </tr>`;
   }).join("");
+  const countHeader = trendIndustryMetric("右侧个数占比", "右侧成分数 ÷ 行业有效成分数。");
+  const marketCapHeader = trendIndustryMetric("右侧市值占比", "右侧成分总市值 ÷ 行业有效成分总市值。");
   return `<section class="trend-industry-context" aria-label="行业上下文">
     <header><h2>行业上下文</h2><span>${escapeHtml(status.current_complete === false ? "当前数据不完整" : `${contexts.length} 个行业`)}</span></header>
     ${trendIndustryContextFallback(status, contexts)}
     ${rows
-      ? `<div class="trend-industry-context-table-wrap"><table class="trend-industry-context-table"><thead><tr><th scope="col">行业</th><th scope="col">当前温度</th><th scope="col">温度方向</th><th scope="col">趋势强度</th><th scope="col">温转热数量</th><th scope="col">右侧占比</th><th scope="col">变化</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      ? `<div class="trend-industry-context-table-wrap"><table class="trend-industry-context-table"><thead><tr><th scope="col">行业</th><th scope="col">当前温度</th><th scope="col">温度方向</th><th scope="col">趋势强度</th><th scope="col">温转热数量</th><th scope="col">${countHeader}</th><th scope="col">${marketCapHeader}</th></tr></thead><tbody>${rows}</tbody></table></div><div class="trend-industry-tooltip" role="tooltip" aria-hidden="true" hidden></div>`
       : "<p>行业上下文数据未提供</p>"}
   </section>`;
 }

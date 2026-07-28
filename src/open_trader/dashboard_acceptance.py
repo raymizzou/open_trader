@@ -1228,6 +1228,14 @@ def _trend_context_percent(value: Any) -> str | None:
     return f"{_display_number(str(number))}%"
 
 
+def _trend_ratio_transition(current: Any, prior: Any) -> str:
+    current_text = _trend_context_percent(current)
+    if current_text is None:
+        return "未提供"
+    prior_text = _trend_context_percent(prior)
+    return f"{prior_text} → {current_text}" if prior_text else f"{current_text} · 基准建立中"
+
+
 def _trend_context_display_value(key: str, value: Any) -> str:
     if key in {"strength", "warm_to_hot_count"}:
         return _display_number(value)
@@ -1329,25 +1337,16 @@ def _check_frozen_trend_disciplines(
                 assert expected in context_text, (
                     f"{broker} 行业上下文缺少 {key}：{value}"
                 )
-        right_count = context.get("right_count")
-        valid_count = context.get("valid_count")
-        right_share = _trend_context_percent(context.get("right_share"))
-        if right_count is not None and valid_count is not None and right_share:
-            expected = f"{_display_number(right_count)} / {_display_number(valid_count)} = {right_share}"
-            assert expected in context_text, f"{broker} 行业右侧占比未显示：{expected}"
-        prior = _trend_context_percent(context.get("prior_right_share"))
-        change = context.get("right_share_change_pp")
-        if prior:
-            assert f"此前右侧占比 {prior}" in context_text, (
-                f"{broker} 行业此前右侧占比未显示：{prior}"
-            )
-        if change is not None and str(change).strip():
-            change_text = _display_number(change)
-            if not str(change_text).startswith(("-", "+")):
-                change_text = f"+{change_text}"
-            assert f"{change_text} 个百分点" in context_text, (
-                f"{broker} 行业右侧占比变化未显示：{change_text}"
-            )
+        count_text = _trend_ratio_transition(
+            context.get("aggregate_right_count_ratio"),
+            context.get("prior_aggregate_right_count_ratio"),
+        )
+        market_cap_text = _trend_ratio_transition(
+            context.get("aggregate_right_market_cap_ratio"),
+            context.get("prior_aggregate_right_market_cap_ratio"),
+        )
+        assert count_text in context_text, f"{broker} 行业右侧个数占比未显示：{count_text}"
+        assert market_cap_text in context_text, f"{broker} 行业右侧市值占比未显示：{market_cap_text}"
     if isinstance(status, Mapping) and (
         str(status.get("ordering_mode", "")).startswith("legacy")
         or status.get("current_complete") is False
@@ -1386,6 +1385,50 @@ def _check_frozen_trend_disciplines(
                 float(boxes[index]["y"]) <= float(boxes[index + 1]["y"])
                 for index in range(len(boxes) - 1)
             ), f"{broker} 移动端趋势报告顺序不符合行动优先布局：{boxes}"
+    if page is not None:
+        metrics = context_section.locator(".trend-industry-metric")
+        if metrics.count():
+            market_metric = context_section.locator(
+                '[data-trend-industry-help*="不是账户仓位或上涨概率"]'
+            )
+            if market_metric.count() == 0:
+                market_metric = metrics.nth(0)
+            tooltip = context_section.locator(".trend-industry-tooltip")
+            market_metric.hover()
+            visible = getattr(tooltip, "is_visible", None)
+            assert visible() if callable(visible) else tooltip.get_attribute("hidden") is None, (
+                f"{broker} 行业指标 hover 未显示解释"
+            )
+            if callable(getattr(tooltip, "inner_text", None)):
+                tooltip_text = tooltip.inner_text()
+                if market_metric.get_attribute("data-trend-industry-help") and "不是账户仓位或上涨概率" in market_metric.get_attribute("data-trend-industry-help"):
+                    assert "不是账户仓位或上涨概率" in tooltip_text, (
+                        f"{broker} 右侧市值占比 tooltip 缺少口径说明"
+                    )
+            focus = getattr(market_metric, "focus", None)
+            if callable(focus):
+                focus()
+            click = getattr(market_metric, "click", None)
+            if callable(click):
+                click()
+            press = getattr(market_metric, "press", None)
+            if callable(press):
+                press("Escape")
+            if callable(visible):
+                assert not visible(), f"{broker} 行业指标 Escape 未关闭解释"
+        if getattr(page, "viewport_size", None) and page.viewport_size.get("width", 0) <= 760:
+            cells = context_section.locator(
+                'td[data-label="右侧个数占比"], td[data-label="右侧市值占比"]'
+            )
+            evaluate_all = getattr(cells, "evaluate_all", None)
+            if callable(evaluate_all):
+                boxes = evaluate_all(
+                    "nodes => nodes.map(node => ({height: node.getBoundingClientRect().height, width: node.getBoundingClientRect().width}))"
+                )
+                assert all(
+                    box.get("height", 0) >= 44 and box.get("width", 0) > 0
+                    for box in boxes
+                ), f"{broker} 移动端行业指标点击区域不足 44px：{boxes}"
     if workspace.get_attribute("open") is not None:
         workspace_summary.click()
 

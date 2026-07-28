@@ -1823,7 +1823,8 @@ def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_contex
     workspace_text = " ".join(
         [*(str(row[key]) for row in rows for key in ("group", "name", "value")),
          "实际 API 成本 1.25 单位", "科技 当前温度 热 温度方向 上升 趋势强度 97.5",
-         "温转热数量 3 右侧占比 8 / 10 = 80% 此前右侧占比 60% +20 个百分点"]
+         "温转热数量 3 右侧个数占比 60% → 80% 右侧市值占比 70% → 90%",
+         "结构差较前值持平 0 个百分点 该指标不是账户仓位或上涨概率"]
     )
 
     class Summary:
@@ -1928,9 +1929,12 @@ def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_contex
             },
             "industry_contexts": [{
                 "industry": "科技", "temperature": "热", "strength": "97.5",
-                "warm_to_hot_count": 3, "right_count": 8, "valid_count": 10,
-                "right_share": "0.8", "prior_right_share": "0.6",
-                "right_share_change_pp": "20", "valid": True,
+                "warm_to_hot_count": 3,
+                "aggregate_right_count_ratio": "0.8",
+                "aggregate_right_market_cap_ratio": "0.9",
+                "prior_aggregate_right_count_ratio": "0.6",
+                "prior_aggregate_right_market_cap_ratio": "0.7",
+                "valid": True,
             }],
         },
         "eastmoney",

@@ -6103,6 +6103,48 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_right_side_structure_in_existing_industry_table() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendIndustryContext({
+  industry_context_status:{current_complete:true},
+  industry_contexts:[{
+    industry:"银行",temperature:"热",temperature_direction:"rising",
+    strength:"100",warm_to_hot_count:6,valid:true,invalid_reasons:[],
+    aggregate_right_count_ratio:"0.191",
+    aggregate_right_market_cap_ratio:"0.650",
+    prior_aggregate_right_count_ratio:"0.150",
+    prior_aggregate_right_market_cap_ratio:"0.600",
+  },{
+    industry:"证券",temperature:"温",valid:true,
+    aggregate_right_count_ratio:"0.191",
+  },{
+    industry:"保险",temperature:"凉",valid:true,
+    aggregate_right_count_ratio:"bad",
+    aggregate_right_market_cap_ratio:null,
+  }],
+});
+for (const text of [
+  "右侧个数占比", "右侧市值占比",
+  "15% → 19.1%", "60% → 65%",
+  "45.9 个百分点", "结构差较前值扩大 0.9 个百分点",
+  "该指标不是账户仓位或上涨概率",
+  "19.1% · 基准建立中", "未提供",
+]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+if (html.includes('<th scope="col">变化</th>')
+    || html.includes("trend-industry-context-status")) {
+  throw new Error("redundant change column remains\n" + html);
+}
+if ((html.match(/data-trend-industry-help=/g) || []).length < 4
+    || !html.includes('role="tooltip"')) {
+  throw new Error("accessible metric explanations missing\n" + html);
+}
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_dashboard_renders_frozen_risk_summary_and_candidate_detail_rows() -> None:
     output = run_dashboard_js(r'''
 const html = renderTrendReportWorkspace({
@@ -10657,11 +10699,12 @@ const rows = [
   {group:"其他",name:"未知<纪律>",value:"值<script>alert(1)</script>"},
   {group:"累计回撤",name:"策略累计回撤暂停",value:"达到 5% 暂停"},
 ];
-const context = [{
-  industry_tm_id: 1, industry:"科技", temperature:"热", strength:"97.5",
-  warm_to_hot_count: 3, right_count: 8, valid_count: 10,
-  right_share:"0.8", prior_right_share:"0.6", temperature_direction:"rising",
-  right_share_change_pp:"20", valid:true, invalid_reasons:[],
+    const context = [{
+      industry_tm_id: 1, industry:"科技", temperature:"热", strength:"97.5",
+      warm_to_hot_count: 3, temperature_direction:"rising",
+      aggregate_right_count_ratio:"0.8", aggregate_right_market_cap_ratio:"0.9",
+      prior_aggregate_right_count_ratio:"0.6", prior_aggregate_right_market_cap_ratio:"0.7",
+      valid:true, invalid_reasons:[],
 }];
 const report = (market) => ({
   available:true, market, broker:market === "CN" ? "eastmoney" : market === "US" ? "tiger" : "phillips",
@@ -10681,7 +10724,7 @@ for (const market of ["CN","US","HK"]) {
         if (!html.includes(`<summary><strong>${title}</strong>`)) throw new Error(`${market}: ${title}`);
       }
       if (!html.includes("趋势动物组合：冻结组合")) throw new Error(`${market}: compact summary facts missing`);
-      for (const text of ["冻结组合","强度降序","账户净值的 4%","初始保护线","退出条件","未知冻结规则","版本 v7","实际 API 成本 1.25 单位","科技","热","8 / 10 = 80%","上升","+20 个百分点"]) {
+      for (const text of ["冻结组合","强度降序","账户净值的 4%","初始保护线","退出条件","未知冻结规则","版本 v7","实际 API 成本 1.25 单位","科技","热","60% → 80%","70% → 90%","上升"]) {
     if (!html.includes(text)) throw new Error(`${market}: ${text}\\n${html}`);
   }
       if (html.includes("趋势强度不低于 95")) throw new Error(`${market}: hard-coded rule leaked`);
