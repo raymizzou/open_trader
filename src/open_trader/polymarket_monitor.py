@@ -34,6 +34,7 @@ HEARTBEAT_FRESHNESS_SECONDS = 30
 STREAM_DISCONNECT_SECONDS = 15
 UNIVERSE_STALE_SECONDS = 10 * 60
 RUNTIME_WRITE_SECONDS = 1
+PUBLIC_REFRESH_TIMEOUT_SECONDS = 30.0
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -101,6 +102,15 @@ async def _collect(value: object) -> tuple[object, ...]:
     if page_items is not None and _value(value, "has_more", default=None) is not None:
         return _items(page_items)
     return _items(value)
+
+
+async def _collect_first_page(value: object) -> tuple[object, ...]:
+    if inspect.isawaitable(value):
+        value = await value
+    first_page = getattr(value, "first_page", None)
+    if callable(first_page):
+        return await _collect(await _call(first_page))
+    return await _collect(value)
 
 
 async def _call(value: object, *args: object, **kwargs: object) -> object:
@@ -340,7 +350,7 @@ class PolymarketMonitor:
             client = self._public_client_factory()
             self._client = client
         try:
-            await self._refresh_universe(client)
+            await self._refresh_universe_bounded(client)
             return self.snapshot()
         except Exception as exc:
             self._record_error(exc, "universe")
@@ -358,7 +368,7 @@ class PolymarketMonitor:
                 current = time.monotonic()
                 if self._universe_at is None or current >= next_refresh:
                     try:
-                        await self._refresh_universe(client)
+                        await self._refresh_universe_bounded(client)
                     except Exception as exc:
                         self._record_error(exc, "universe")
                     next_refresh = current + UNIVERSE_REFRESH_SECONDS
@@ -396,6 +406,12 @@ class PolymarketMonitor:
         finally:
             await self._close_stream()
             self._client = None
+
+    async def _refresh_universe_bounded(self, client: object) -> None:
+        await asyncio.wait_for(
+            self._refresh_universe(client),
+            timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
+        )
 
     async def _stream_next(self, handle: object) -> object:
         iterator = getattr(handle, "__anext__", None)
@@ -448,7 +464,7 @@ class PolymarketMonitor:
             ascending=False,
             page_size=TOP_EVENT_LIMIT,
         )
-        rows = await _collect(raw)
+        rows = await _collect_first_page(raw)
         normalized: list[dict[str, object]] = []
         malformed_events = 0
         for row in rows:
@@ -989,7 +1005,7 @@ async def _monitor_once_diagnostic_async(
     )
     probe = object.__new__(PolymarketMonitor)
     rows: list[dict[str, object]] = []
-    for item in await _collect(raw):
+    for item in await _collect_first_page(raw):
         normalized = probe._normalize_event(item)
         if normalized is not None:
             rows.append(normalized)
@@ -1051,7 +1067,7 @@ async def _monitor_once_diagnostic_async(
                     except Exception:
                         pass
     if (
-        result["event_count"] == TOP_EVENT_LIMIT
+        0 < result["event_count"] <= TOP_EVENT_LIMIT  # type: ignore[operator]
         and result["volumes"] == "present"
         and result["websocket_heartbeat"] == "pass"
         and result["paired_book_read"] == "pass"
@@ -1067,9 +1083,12 @@ def monitor_once_diagnostic(
 ) -> dict[str, object]:
     try:
         return asyncio.run(
-            _monitor_once_diagnostic_async(
+            asyncio.wait_for(
+                _monitor_once_diagnostic_async(
+                    timeout=timeout,
+                    public_client_factory=public_client_factory,
+                ),
                 timeout=timeout,
-                public_client_factory=public_client_factory,
             )
         )
     except Exception:

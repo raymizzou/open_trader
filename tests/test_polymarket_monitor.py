@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -144,10 +145,18 @@ class Page:
 
 
 class PagePaginator:
+    first_page_calls = 0
+    iter_calls = 0
+
     def __init__(self, items: list[object]) -> None:
-        self.pages = [Page(tuple(items[:12]), True), Page(tuple(items[12:]), False)]
+        self.pages = [Page(tuple(items[:20]), True), Page(tuple(items[20:]), False)]
+
+    async def first_page(self) -> Page:
+        type(self).first_page_calls += 1
+        return self.pages[0]
 
     def __aiter__(self) -> "PagePaginator":
+        type(self).iter_calls += 1
         self._index = 0
         return self
 
@@ -205,6 +214,8 @@ def setup_public(event_rows: list[object]) -> None:
     FakePublicClient.subscribe_specs = []
     FakePublicClient.page_mode = False
     FakePublicClient.fail_list_events = False
+    PagePaginator.first_page_calls = 0
+    PagePaginator.iter_calls = 0
 
 
 def make_monitor(tmp_path: Path, *, trading: FakeTrading | None = None):
@@ -248,7 +259,7 @@ def test_refresh_uses_official_event_query_and_limits_valid_top_twenty(tmp_path:
     assert snapshot["diagnostics"]["malformed_events"] == 4
 
 
-def test_refresh_drains_official_page_shaped_async_paginator(tmp_path: Path) -> None:
+def test_refresh_reads_only_official_first_page(tmp_path: Path) -> None:
     setup_public([event(f"event-{i:02d}", volume=str(1000 - i), markets=(market(f"m-{i:02d}"),)) for i in range(21)])
     FakePublicClient.page_mode = True
 
@@ -257,6 +268,8 @@ def test_refresh_drains_official_page_shaped_async_paginator(tmp_path: Path) -> 
 
     assert len(monitor.snapshot()["events"]) == 20
     assert monitor.snapshot()["events"][0]["event_id"] == "event-00"
+    assert PagePaginator.first_page_calls == 1
+    assert PagePaginator.iter_calls == 0
 
 
 def test_only_exact_active_binary_markets_are_subscribed_and_books_match_by_token_id(
@@ -475,6 +488,23 @@ def test_monitor_once_diagnostic_is_public_and_non_mutating() -> None:
     }
 
 
+def test_monitor_once_accepts_fewer_events_than_the_limit() -> None:
+    from open_trader.polymarket_monitor import monitor_once_diagnostic
+
+    setup_public([
+        event(f"event-{i:02d}", markets=(market(f"m-{i:02d}"),))
+        for i in range(18)
+    ])
+    FakePublicClient.streams = [FakeStream([object()])]
+
+    report = monitor_once_diagnostic(
+        timeout=0.2, public_client_factory=FakePublicClient
+    )
+
+    assert report["event_count"] == 18
+    assert report["result"] == "PASS"
+
+
 def test_monitor_once_diagnostic_converts_public_failures_to_blocked() -> None:
     from open_trader.polymarket_monitor import monitor_once_diagnostic
 
@@ -483,3 +513,49 @@ def test_monitor_once_diagnostic_converts_public_failures_to_blocked() -> None:
     report = monitor_once_diagnostic(timeout=0.1, public_client_factory=FakePublicClient)
     assert report["result"] == "BLOCKED"
     assert report["mutations"] == 0
+
+
+def test_monitor_once_diagnostic_applies_total_timeout() -> None:
+    from open_trader.polymarket_monitor import monitor_once_diagnostic
+
+    class SlowPublicClient(FakePublicClient):
+        async def list_events(self, **kwargs: object) -> list[object]:
+            del kwargs
+            await asyncio.sleep(0.2)
+            return []
+
+    started = time.monotonic()
+    report = monitor_once_diagnostic(
+        timeout=0.01, public_client_factory=SlowPublicClient
+    )
+
+    assert time.monotonic() - started < 0.1
+    assert report["result"] == "BLOCKED"
+    assert report["mutations"] == 0
+
+
+def test_runtime_refresh_applies_total_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_trader import polymarket_monitor
+    from open_trader.polymarket_monitor import PolymarketMonitor
+
+    class SlowPublicClient(FakePublicClient):
+        async def list_events(self, **kwargs: object) -> list[object]:
+            del kwargs
+            await asyncio.sleep(0.2)
+            return []
+
+    monkeypatch.setattr(polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.01)
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        trading=FakeTrading(),
+        public_client_factory=SlowPublicClient,
+        clock=lambda: NOW,
+    )
+    started = time.monotonic()
+    snapshot = monitor.refresh_once()
+
+    assert time.monotonic() - started < 0.1
+    assert snapshot["health"]["actionable"] is False
+    assert snapshot["diagnostics"]["last_error"] == "universe:TimeoutError"
