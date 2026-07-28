@@ -86,20 +86,60 @@ Expected: exit code `0` and `notify_daily_report=False`.
 Run:
 
 ```bash
+set -euo pipefail
 ps axww -o pid=,command= | rg -i 'TradingAgents|run-daily-premarket|run-premarket|tradingagents_worker' | rg -v 'rg -i' || true
-for label in com.open-trader.premarket com.open-trader.premarket.hk com.open-trader.premarket.us; do
-  ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1
+for domain in "gui/$(id -u)" system; do
+  for label in com.open-trader.premarket com.open-trader.premarket.hk com.open-trader.premarket.us; do
+    ! launchctl print "$domain/$label" >/dev/null 2>&1
+  done
 done
-plist_matches="$(
-  find "$HOME/Library/LaunchAgents" /Library/LaunchAgents /Library/LaunchDaemons \
-    -maxdepth 1 -type f -name '*.plist' -print0 2>/dev/null |
-    xargs -0 rg -l -i 'run-daily-premarket|run-premarket|TradingAgents' 2>/dev/null || true
+plist_roots=(
+  "$HOME/Library/LaunchAgents"
+  /Library/LaunchAgents
+  /Library/LaunchDaemons
+  /System/Library/LaunchAgents
+  /System/Library/LaunchDaemons
+)
+named_plists="$(
+  find "${plist_roots[@]}" -maxdepth 1 -type f \
+    -name 'com.open-trader.premarket*.plist' -print 2>/dev/null || true
 )"
+plist_matches="$(
+  find "${plist_roots[@]}" -maxdepth 1 -type f -name '*.plist' -print0 2>/dev/null |
+    xargs -0 rg -l -i \
+      'com\.open-trader\.premarket|run-daily-premarket|run-premarket|TradingAgents' \
+      2>/dev/null || true
+)"
+[[ -z "$named_plists" ]]
 [[ -z "$plist_matches" ]]
 crontab -l 2>&1 | rg -i 'run-daily-premarket|run-premarket|TradingAgents' && exit 1 || true
 atq 2>&1 | rg -i 'run-daily-premarket|run-premarket|TradingAgents' && exit 1 || true
 screen -ls 2>&1 | rg -i 'run-daily-premarket|run-premarket|TradingAgents' && exit 1 || true
-launchctl list | rg 'com\.open-trader\.trend-market-controller\.(cn|hk|us)$'
+for market in CN HK US; do
+  lower="$(printf '%s' "$market" | tr '[:upper:]' '[:lower:]')"
+  label="com.open-trader.trend-market-controller.$lower"
+  pid="$(launchctl list | awk -v label="$label" '$3 == label {print $1}')"
+  [[ "$pid" =~ ^[0-9]+$ ]]
+  ps -p "$pid" -o command= |
+    rg "open_trader trend-market run --market $market"
+  PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python - "$market" "$pid" <<'PY'
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+market, pid = sys.argv[1], int(sys.argv[2])
+status = json.loads(
+    Path(f"/Users/ray/projects/open_trader/data/trend_controller/{market}/status.json")
+    .read_text(encoding="utf-8")
+)
+heartbeat = datetime.fromisoformat(status["heartbeat_at"])
+now = datetime.now(heartbeat.tzinfo)
+assert status["pid"] == pid
+assert (now - heartbeat).total_seconds() < 120
+print(f"{market}: pid={pid} heartbeat={heartbeat.isoformat()}")
+PY
+done
 ```
 
 Expected: no matching process, plist, cron entry, or screen session; all three
@@ -113,11 +153,12 @@ from the already committed design document.
 
 ## Operational Result
 
-Verified at `2026-07-28T19:47:45+0800`:
+Verified at `2026-07-28T19:52:18+0800`:
 
 - `notify_daily_report=False`; shared notifiers remain
   `feishu_app,macos,xiaoai`.
-- TradingAgents processes, launchd jobs, scheduler plists, cron entries, `at`
-  entries, screen sessions, and run locks: `0`.
+- TradingAgents processes, user/system launchd jobs, scheduler plists, cron
+  entries, `at` entries, screen sessions, and run locks: `0`.
 - Notification-disabled success, partial, and failure tests: `3 passed`.
-- CN, HK, and US trend controllers remained loaded with fresh heartbeats.
+- CN, HK, and US trend controllers remained loaded with matching live process
+  commands and fresh heartbeats.

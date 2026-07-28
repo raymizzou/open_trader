@@ -34,12 +34,15 @@ notifications continue to work.
 
 - No process command contains `run-daily-premarket`, `run-premarket`, or a
   TradingAgents worker.
-- `launchctl` cannot find any of the three daily premarket labels.
-- No matching plist exists in the user or system launch-agent directories.
+- Neither the user GUI nor system launchd domain contains any of the three
+  daily premarket labels.
+- No matching label-named or command-matching plist exists in the user or
+  system launch-agent or launch-daemon directories.
 - No matching cron, `at`, or `screen` task exists.
 - Loading `config/daily_premarket.env` returns
   `notify_daily_report == False`.
-- CN, HK, and US `trend-market` controller labels and processes remain present.
+- CN, HK, and US `trend-market` controller labels remain present with live
+  PIDs, matching process commands, and fresh status heartbeats.
 
 Because this is an operational configuration change rather than a Dashboard
 source change, the Dashboard acceptance gate does not apply.
