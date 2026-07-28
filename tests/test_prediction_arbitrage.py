@@ -7,7 +7,6 @@ import pytest
 
 from open_trader.prediction_arbitrage import (
     MAX_EMERGENCY_LOSS,
-    MAX_WALLET_BALANCE,
     PROTECTED_BUY_SHARE_PRECISION,
     BookLevel,
     ConfirmedBooks,
@@ -180,16 +179,22 @@ def test_balance_or_allowance_below_total_cost_is_rejected() -> None:
     assert build_pair_intent(facts, books, balance=Decimal("50"), allowance=Decimal("18.59")) is None
 
 
-def test_wallet_balance_above_funding_cap_is_rejected() -> None:
+@pytest.mark.parametrize(
+    ("balance", "accepted"),
+    (("65.00", True), ("65.01", False)),
+)
+def test_wallet_funding_cap_boundary(balance: str, accepted: bool) -> None:
     facts = market_facts(minimum_order_size="5")
     books = confirmed_books(yes=[("0.45", "20")], no=[("0.48", "20")])
 
-    assert build_pair_intent(
+    intent = build_pair_intent(
         facts,
         books,
-        balance=MAX_WALLET_BALANCE + Decimal("0.01"),
-        allowance=Decimal("50"),
-    ) is None
+        balance=Decimal(balance),
+        allowance=Decimal("65.00"),
+    )
+
+    assert (intent is not None) is accepted
 
 
 def test_minimum_size_and_book_tick_grid_violations_are_rejected() -> None:
