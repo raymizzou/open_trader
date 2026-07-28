@@ -4366,6 +4366,36 @@ def test_industry_concentration_includes_slots_and_account_weight() -> None:
     assert "电力：当前持仓 1 个席位，当前仓位 20.00%" in render_markdown(built)
 
 
+def test_report_freezes_and_renders_aggregate_right_side_structure() -> None:
+    context = replace(
+        _industry_context(700001),
+        industry="银行",
+        aggregate_right_count_ratio=Decimal("0.191"),
+        aggregate_right_market_cap_ratio=Decimal("0.650"),
+        prior_aggregate_right_count_ratio=Decimal("0.150"),
+        prior_aggregate_right_market_cap_ratio=Decimal("0.600"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        industry_contexts=(context,),
+    )
+
+    payload = trend_module._report_payload(built)
+    markdown = render_markdown(built)
+
+    assert payload["industry_contexts"][0]["aggregate_right_count_ratio"] == "0.191"
+    assert payload["industry_contexts"][0]["aggregate_right_market_cap_ratio"] == "0.650"
+    assert "右侧个数占比 15% → 19.1%" in markdown
+    assert "右侧市值占比 60% → 65%" in markdown
+    assert "高于右侧个数占比 45.9 个百分点" in markdown
+    assert "不是账户仓位或上涨概率" in markdown
+
+
 def test_no_action_report_uses_exact_cash_sentence() -> None:
     assert "现金也是有效仓位，本日无需交易。" in render_markdown(report())
 
@@ -5020,16 +5050,26 @@ class ReadyApi:
 
     def get_snapshot_billing(self) -> list[dict[str, object]]:
         self.calls.append("api.billing")
+        catalog_fields = tuple(
+            dict.fromkeys((*UNIFIED_TREND_FIELDS, *trend_module.INDUSTRY_STATE_FIELDS))
+        )
         return [
             {
                 "columnName": field,
                 "priceCost": (
                     "bad"
                     if self.invalid_billing
-                    else self.catalog_unit_cost if field == "tickerName" else "0"
+                    else self.catalog_unit_cost
+                    if field == "tickerName"
+                    else "0.004"
+                    if field in {
+                        "TrendRightSideCountRatio",
+                        "TrendRightSideMktCapRatio",
+                    }
+                    else "0"
                 ),
             }
-            for field in UNIFIED_TREND_FIELDS
+            for field in catalog_fields
         ]
 
     def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
@@ -5066,6 +5106,8 @@ class ReadyApi:
                     "asOfDate": expected_date,
                     "trendTemperatureCurr": self.industry_state_temperature,
                     "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
                 }
                 for tm_id in tm_ids
             ]
@@ -5132,7 +5174,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
         "cache=client-managed"
     ) in payload["api_facts"]
-    assert payload["estimated_api_cost"] == "0.142"
+    assert payload["estimated_api_cost"] == "0.150"
     assert payload["api_cost"]["estimate_complete"] is False
     evidence_path = trend_config(tmp_path).data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -5198,6 +5240,8 @@ def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_m
                     "asOfDate": expected_date,
                     "trendTemperatureCurr": "热",
                     "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
                 }
             ]
 
@@ -5226,11 +5270,15 @@ def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_m
 
     assert [context.industry_tm_id for context in contexts] == [700001]
     assert contexts[0].component_count == 12
+    assert contexts[0].aggregate_right_count_ratio == Decimal("0.191")
+    assert contexts[0].aggregate_right_market_cap_ratio == Decimal("0.650")
     assert contexts[0].warm_to_hot_count == 12
     assert status["ordering_mode"] == "context_current_only"
     assert facts["member_ids"] == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
     assert facts["member_fields"] == trend_module.INDUSTRY_MEMBER_FIELDS
     assert facts["state_fields"] == trend_module.INDUSTRY_STATE_FIELDS
+    assert "TrendRightSideCountRatio" in trend_module.INDUSTRY_STATE_FIELDS
+    assert "TrendRightSideMktCapRatio" in trend_module.INDUSTRY_STATE_FIELDS
     assert calls == [
         ("components", 700001),
         (

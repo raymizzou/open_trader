@@ -106,6 +106,8 @@ INDUSTRY_STATE_FIELDS = (
     "asOfDate",
     "trendTemperatureCurr",
     "trendStrengthLocalCurr",
+    "TrendRightSideCountRatio",
+    "TrendRightSideMktCapRatio",
 )
 CN_MAX_FILTER_PRICE = Decimal("200")
 CN_MIN_STRENGTH = Decimal("95")
@@ -3716,6 +3718,68 @@ def render_trend_failure_text(
     )
 
 
+def _industry_ratio_percent(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return f"{_industry_number(value * Decimal('100'))}%"
+
+
+def _industry_number(value: Decimal) -> str:
+    return format(value.quantize(Decimal("0.01")).normalize(), "f")
+
+
+def _industry_ratio_transition(
+    current: Decimal | None,
+    prior: Decimal | None,
+) -> str:
+    current_text = _industry_ratio_percent(current)
+    if current_text is None:
+        return "未提供"
+    prior_text = _industry_ratio_percent(prior)
+    return (
+        f"{prior_text} → {current_text}"
+        if prior_text is not None
+        else f"{current_text} · 基准建立中"
+    )
+
+
+def _industry_structure_explanation(context: IndustryContext) -> str:
+    count = context.aggregate_right_count_ratio
+    market_cap = context.aggregate_right_market_cap_ratio
+    if count is None or market_cap is None:
+        return ""
+    prior_market_cap = context.prior_aggregate_right_market_cap_ratio
+    gap = (market_cap - count) * Decimal("100")
+    relation = "高于" if gap > 0 else "低于" if gap < 0 else "等于"
+    bias = (
+        "右侧更偏大市值成分"
+        if gap > 0
+        else "右侧更偏小市值成分"
+        if gap < 0
+        else "两个占比相同"
+    )
+    text = (
+        f"右侧市值占比{relation}右侧个数占比 {_industry_number(abs(gap))} 个百分点，"
+        f"{bias}。"
+    )
+    if prior_market_cap is not None:
+        market_cap_change = (market_cap - prior_market_cap) * Decimal("100")
+        text = (
+            "较前一有效交易日"
+            f"{'上升' if market_cap_change > 0 else '下降' if market_cap_change < 0 else '持平'}"
+            f" {_industry_number(abs(market_cap_change))} 个百分点。"
+            + text
+        )
+    prior_count = context.prior_aggregate_right_count_ratio
+    if prior_count is not None and prior_market_cap is not None:
+        gap_change = gap - (prior_market_cap - prior_count) * Decimal("100")
+        text += (
+            f"结构差较前值{'扩大' if gap_change > 0 else '收窄' if gap_change < 0 else '持平'}"
+            f" {_industry_number(abs(gap_change))} 个百分点。"
+        )
+    return text + "该指标不是账户仓位或上涨概率。"
+
+
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     strategy_version = str(report.strategy_snapshot.get("strategy_version") or "")
@@ -3944,6 +4008,23 @@ def render_markdown(report: TrendReport) -> str:
         )
     else:
         lines.append("- 当前无行业持仓集中事实。")
+
+    lines.extend(["", "### 行业上下文", ""])
+    if report.industry_contexts:
+        for context in report.industry_contexts:
+            explanation = _industry_structure_explanation(context)
+            line = (
+                f"- {context.industry or '未知行业'}｜"
+                "右侧个数占比 "
+                f"{_industry_ratio_transition(context.aggregate_right_count_ratio, context.prior_aggregate_right_count_ratio)}｜"
+                "右侧市值占比 "
+                f"{_industry_ratio_transition(context.aggregate_right_market_cap_ratio, context.prior_aggregate_right_market_cap_ratio)}"
+            )
+            if explanation:
+                line += f"｜{explanation}"
+            lines.append(line)
+    else:
+        lines.append("- 无可用行业上下文。")
 
     lines.extend(["", "### 排除项", ""])
     for symbol, reasons in report.excluded.items():

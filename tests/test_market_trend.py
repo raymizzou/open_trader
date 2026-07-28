@@ -915,12 +915,24 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
+            catalog_fields = tuple(
+                dict.fromkeys((*UNIFIED_TREND_FIELDS, *INDUSTRY_STATE_FIELDS))
+            )
             return [
                 {
                     "field": field,
-                    "priceCost": "0.071" if field == "tickerName" else "0",
+                    "priceCost": (
+                        "0.071"
+                        if field == "tickerName"
+                        else "0.004"
+                        if field in {
+                            "TrendRightSideCountRatio",
+                            "TrendRightSideMktCapRatio",
+                        }
+                        else "0"
+                    ),
                 }
-                for field in UNIFIED_TREND_FIELDS
+                for field in catalog_fields
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
@@ -940,6 +952,8 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
                     "asOfDate": kwargs["expected_date"],
                     "trendTemperatureCurr": "热",
                     "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
                 }]
             assert kwargs["tm_ids"] == [1, 2]
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
@@ -1065,7 +1079,9 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
-    assert payload["estimated_api_cost"] == "0.142"
+    assert payload["estimated_api_cost"] == "0.150"
+    assert payload["industry_contexts"][0]["aggregate_right_count_ratio"] == "0.191"
+    assert payload["industry_contexts"][0]["aggregate_right_market_cap_ratio"] == "0.650"
     assert payload["api_cost"]["label"] == "本报告 API 费用：实扣 0 Trend Animals 余额单位"
     assert payload["signal_snapshots"]["holdings"]["00700"] | {
         "gain_since_entry": "0.048",
@@ -1218,12 +1234,24 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
+            catalog_fields = tuple(
+                dict.fromkeys((*UNIFIED_TREND_FIELDS, *INDUSTRY_STATE_FIELDS))
+            )
             return [
                 {
                     "field": field,
-                    "priceCost": "0.071" if field == "tickerName" else "0",
+                    "priceCost": (
+                        "0.071"
+                        if field == "tickerName"
+                        else "0.004"
+                        if field in {
+                            "TrendRightSideCountRatio",
+                            "TrendRightSideMktCapRatio",
+                        }
+                        else "0"
+                    ),
                 }
-                for field in UNIFIED_TREND_FIELDS
+                for field in catalog_fields
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
@@ -1243,6 +1271,8 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
                     "asOfDate": kwargs["expected_date"],
                     "trendTemperatureCurr": "热",
                     "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
                 }]
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
@@ -1301,7 +1331,9 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
         "cache=client-managed"
     ) in payload["api_facts"]
-    assert payload["estimated_api_cost"] == "0.142"
+    assert payload["estimated_api_cost"] == "0.150"
+    assert payload["industry_contexts"][0]["aggregate_right_count_ratio"] == "0.191"
+    assert payload["industry_contexts"][0]["aggregate_right_market_cap_ratio"] == "0.650"
     assert payload["api_cost"]["label"] == "本报告 API 费用：实扣 0 Trend Animals 余额单位"
     assert payload["account"]["fresh"] is True
     assert payload["metadata"]["simulate_acc_id"] == 102
@@ -1412,12 +1444,24 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
+            catalog_fields = tuple(
+                dict.fromkeys((*UNIFIED_TREND_FIELDS, *INDUSTRY_STATE_FIELDS))
+            )
             return [
                 {
                     "field": field,
-                    "priceCost": "0.072" if field == "tickerName" else "0",
+                    "priceCost": (
+                        "0.072"
+                        if field == "tickerName"
+                        else "0.004"
+                        if field in {
+                            "TrendRightSideCountRatio",
+                            "TrendRightSideMktCapRatio",
+                        }
+                        else "0"
+                    ),
                 }
-                for field in UNIFIED_TREND_FIELDS
+                for field in catalog_fields
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
