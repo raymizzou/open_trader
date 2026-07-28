@@ -30,6 +30,7 @@ TOP_EVENT_LIMIT = 20
 UNIVERSE_REFRESH_SECONDS = 5 * 60
 BOOK_FRESHNESS_SECONDS = 10
 READINESS_FRESHNESS_SECONDS = 60
+READINESS_REFRESH_SECONDS = 30
 HEARTBEAT_FRESHNESS_SECONDS = 30
 STREAM_DISCONNECT_SECONDS = 15
 UNIVERSE_STALE_SECONDS = 10 * 60
@@ -365,15 +366,20 @@ class PolymarketMonitor:
         client = self._public_client_factory()
         self._client = client
         next_refresh = 0.0
+        next_readiness_refresh = 0.0
         try:
             while not self._stop_event.is_set():
                 current = time.monotonic()
                 if self._universe_at is None or current >= next_refresh:
                     try:
                         await self._refresh_universe_bounded(client)
+                        next_readiness_refresh = current + READINESS_REFRESH_SECONDS
                     except Exception as exc:
                         self._record_error(exc, "universe")
                     next_refresh = current + UNIVERSE_REFRESH_SECONDS
+                if current >= next_readiness_refresh:
+                    await self._refresh_readiness()
+                    next_readiness_refresh = current + READINESS_REFRESH_SECONDS
                 if self._stream_handle is None:
                     try:
                         await self._subscribe(client)

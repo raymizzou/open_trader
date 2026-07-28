@@ -446,6 +446,41 @@ def test_healthy_quiet_is_distinct_from_degraded_and_runtime_is_throttled(tmp_pa
     assert monitor.snapshot()["health"]["opportunity_count"] == 0
 
 
+def test_background_monitor_refreshes_readiness_before_it_becomes_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    class LiveTrading(FakeTrading):
+        def readiness_snapshot(self) -> dict[str, object]:
+            value = super().readiness_snapshot()
+            value["checked_at"] = datetime.now(UTC)
+            return value
+
+    class LiveStream(FakeStream):
+        async def __anext__(self) -> object:
+            await asyncio.sleep(0.005)
+            return object()
+
+    monkeypatch.setattr(monitor_module, "READINESS_FRESHNESS_SECONDS", 0.04)
+    monkeypatch.setattr(
+        monitor_module,
+        "READINESS_REFRESH_SECONDS",
+        0.01,
+        raising=False,
+    )
+    setup_public([event("e", markets=(market("m"),))])
+    FakePublicClient.streams = [LiveStream()]
+    monitor = make_monitor(tmp_path, trading=LiveTrading())
+    monitor._clock = lambda: datetime.now(UTC)
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=0.08))
+
+    assert monitor.snapshot()["health"]["status"] == "healthy"
+
+
 def test_no_stream_message_for_over_fifteen_seconds_is_degraded(tmp_path: Path) -> None:
     setup_public([event("e", markets=(market("m"),))])
     now = [NOW]
