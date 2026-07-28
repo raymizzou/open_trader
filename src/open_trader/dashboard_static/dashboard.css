@@ -5423,7 +5423,6 @@ table {
 .pm-button:disabled { cursor: not-allowed; opacity: 0.46; }
 .prediction-market-workspace { min-width: 0; }
 .dashboard-header.hidden { display: none !important; }
-.pm-prototype-note { background: #f4eadb; border: 1px dashed #c49b6b; border-radius: 7px; color: #68441f; margin-bottom: 10px; padding: 9px 12px; }
 .pm-page-head { align-items: end; display: flex; gap: 20px; justify-content: space-between; margin: 18px 0 12px; }
 .pm-page-head h1 { font-size: 25px; margin: 0 0 5px; }
 .pm-page-head p { color: var(--muted); margin: 0; }

@@ -52,6 +52,7 @@ test.describe('approved prediction execution workspace', () => {
     await expect(page.locator('.pm-panel').nth(1)).toContainText('当前机会');
     await expect(page.locator('.pm-panel').nth(2)).toContainText('历史记录');
     await expect(page.locator('body')).toContainText('24h 成交量');
+    await expect(page.locator('.pm-prototype-note')).toHaveCount(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     expect(APPROVED_PROTOTYPE_SHA).toBe('e0d5083');
     expect(PROTOTYPE_BASE_URL).toContain('prediction-market-execution-prototype.html');
@@ -215,7 +216,7 @@ test.describe('approved prediction execution workspace', () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await openPrediction(page, 'ready');
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-    for (const height of await page.locator('#prediction-market-workspace button:visible').evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height))) {
+    for (const height of await page.locator('#prediction-market-workspace').evaluate((root) => Array.from(root.querySelectorAll('button')).filter((element) => element.getClientRects().length).map((element) => element.getBoundingClientRect().height))) {
       expect(height).toBeGreaterThanOrEqual(44);
     }
   });
@@ -275,7 +276,7 @@ test.describe('approved prediction execution workspace', () => {
         expect(httpErrors, `HTTP errors in ${state}`).toEqual([]);
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
         if (viewport.name === 'mobile') {
-          for (const height of await page.locator('#prediction-market-workspace button:visible').evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height))) {
+          for (const height of await page.locator('#prediction-market-workspace').evaluate((root) => Array.from(root.querySelectorAll('button')).filter((element) => element.getClientRects().length).map((element) => element.getBoundingClientRect().height))) {
             expect(height).toBeGreaterThanOrEqual(44);
           }
         }

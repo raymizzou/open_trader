@@ -293,6 +293,16 @@ class IncidentTrading(FakeTrading):
                 {"condition_id": "condition-1", "token_id": "yes-token", "size": "10"},
                 {"condition_id": "condition-1", "token_id": "no-token", "size": "10"},
             )
+        elif self.account_mode == "settled":
+            positions = (
+                {
+                    "condition_id": "settled-condition",
+                    "token_id": "settled-token",
+                    "size": "10",
+                    "current_value": "0",
+                    "redeemable": "True",
+                },
+            )
         elif self.account_mode == "open_order":
             return AccountSnapshot(
                 wallet_address=base.wallet_address,
@@ -1115,6 +1125,16 @@ def test_clean_startup_becomes_ready_only_after_fresh_reconciliation(tmp_path: P
     assert result["readiness"] == "fresh"
     assert service.preview("opp-1")["state"] == "previewed"
     assert trading.batch_calls == 0
+
+
+def test_settled_zero_value_positions_do_not_lock_startup(tmp_path: Path) -> None:
+    service, trading, _, _ = incident_fixture(tmp_path, result="unsafe")
+    trading.account_mode = "settled"
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "ready"
+    assert result["readiness"] == "fresh"
 
 
 def test_reset_breaker_denies_directional_imbalance_without_orders(tmp_path: Path) -> None:

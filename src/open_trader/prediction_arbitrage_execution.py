@@ -883,6 +883,14 @@ class PredictionExecutionService:
                 continue
             token = position.get("token_id", position.get("tokenId", position.get("asset_id", "")))
             quantity = _decimal(position.get("size", position.get("quantity", position.get("shares"))))
+            current_value = _decimal(
+                position.get("current_value", position.get("currentValue"))
+            )
+            redeemable = position.get("redeemable")
+            if current_value == 0 and (
+                redeemable is True or str(redeemable).casefold() == "true"
+            ):
+                continue
             if not isinstance(token, str) or quantity is None or quantity < 0:
                 totals["unknown"].append(PredictionExecutionService._safe_mapping(position))
                 continue
