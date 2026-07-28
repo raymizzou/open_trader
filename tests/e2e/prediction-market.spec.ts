@@ -113,6 +113,25 @@ test.describe('approved prediction execution workspace', () => {
     }
   });
 
+  test('[UI-14] starts events collapsed and preserves the user choice across polling refreshes', async ({ page }) => {
+    await openPrediction(page, 'ready');
+    const firstEvent = page.locator('.pm-event').first();
+    const refresh = () => page.evaluate(() => (
+      window as Window & { fetchPredictionState: () => Promise<void> }
+    ).fetchPredictionState());
+
+    await expect(firstEvent).not.toHaveAttribute('open', '');
+    await firstEvent.locator('summary').click();
+    await expect(firstEvent).toHaveAttribute('open', '');
+    await refresh();
+    await expect(firstEvent).toHaveAttribute('open', '');
+
+    await firstEvent.locator('summary').click();
+    await expect(firstEvent).not.toHaveAttribute('open', '');
+    await refresh();
+    await expect(firstEvent).not.toHaveAttribute('open', '');
+  });
+
   test('does not open an order modal when the preview is rejected', async ({ page }) => {
     await openPrediction(page, 'preview-rejected');
     const executionRequests: string[] = [];

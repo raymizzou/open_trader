@@ -2294,7 +2294,7 @@ function predictionReplacePositiveActionLabel(value, replacement) {
   return value;
 }
 
-function predictionEventRows(payload) {
+function predictionEventRows(payload, expandedEventKeys = new Set()) {
   const events = predictionEvents(payload);
   const globalOpportunities = predictionOpportunities(payload);
   if (!events.length) return `<div class="pm-empty compact"><strong>暂无监控事件</strong><p>Watcher 正常运行后，事件会按 24h 成交量显示。</p></div>`;
@@ -2326,7 +2326,11 @@ function predictionEventRows(payload) {
     const displayStatus = !actionable
       ? predictionReplacePositiveActionLabel(rawStatus, unavailableLabel)
       : rawStatus;
-    return `<details class="pm-event"${index === 0 ? " open" : ""}><summary><div><div class="pm-event-title">${escapeHtml(title)}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "预计净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div><div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(displayStatus)}</div></summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
+    const eventKey = predictionValue(
+      event.event_id ?? event.id ?? event.slug ?? event.question ?? event.title ?? event.event_title,
+      String(index)
+    );
+    return `<details class="pm-event" data-event-key="${escapeHtml(eventKey)}"${expandedEventKeys.has(eventKey) ? " open" : ""}><summary><div><div class="pm-event-title">${escapeHtml(title)}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "预计净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div><div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(displayStatus)}</div></summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
   }).join("");
 }
 
@@ -2418,11 +2422,15 @@ function predictionHistoryPanel(payload) {
 function renderPredictionMarket() {
   const root = elements["prediction-market-root"];
   if (!root) return;
+  const expandedEventKeys = new Set(
+    Array.from(root.querySelectorAll(".pm-event[open][data-event-key]"))
+      .map((event) => event.dataset.eventKey)
+  );
   const payload = state.predictionMarket.payload;
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const displayedEvents = predictionEvents(viewPayload).length;
   const eventTotal = predictionHasValue(viewPayload.event_count) ? viewPayload.event_count : "-";
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload)}${predictionExecutionAlert(viewPayload)}${predictionMetricStrip(viewPayload)}<aside class="pm-policy"><strong>V1 只对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控、显示成交量和毛利润上限，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload)}</div></section><div class="pm-stack"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前机会</h2><p>后台检查通过后，才允许在 Open Trader 内确认下单。</p></div><span class="pm-pill venue">Polymarket</span></header>${predictionOpportunityPanel(viewPayload)}</section>${predictionHistoryPanel(viewPayload)}</div></div>`;
+  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload)}${predictionExecutionAlert(viewPayload)}${predictionMetricStrip(viewPayload)}<aside class="pm-policy"><strong>V1 只对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控、显示成交量和毛利润上限，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前机会</h2><p>后台检查通过后，才允许在 Open Trader 内确认下单。</p></div><span class="pm-pill venue">Polymarket</span></header>${predictionOpportunityPanel(viewPayload)}</section>${predictionHistoryPanel(viewPayload)}</div></div>`;
 }
 
 function startPredictionPolling() {

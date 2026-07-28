@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-28
 
+- Changed prediction-market monitored events to start collapsed and preserve
+  each operator-selected expanded/collapsed state across watcher refreshes.
+  Added the behavior as the explicit `UI-14` acceptance scenario.
 - Reworked the prediction-market workspace to the approved truth-driven
   Variant A: exactly four readiness cards and four live metrics, visible volume
   ranking, fail-closed incomplete data, fresh-preview-only confirmation,

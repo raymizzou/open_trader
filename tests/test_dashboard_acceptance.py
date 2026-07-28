@@ -34,11 +34,11 @@ MISSING_FRESH = object()
 
 
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
-    assert len(SCENARIO_IDS) == 62
-    assert len(set(SCENARIO_IDS)) == 62
+    assert len(SCENARIO_IDS) == 63
+    assert len(set(SCENARIO_IDS)) == 63
     assert SCENARIO_IDS[:10] == tuple(f"MON-{index:02d}" for index in range(1, 11))
     ui_ids = tuple(item for item in SCENARIO_IDS if item.startswith("UI-"))
-    assert ui_ids == tuple(f"UI-{index:02d}" for index in range(1, 14))
+    assert ui_ids == tuple(f"UI-{index:02d}" for index in range(1, 15))
     assert SCENARIO_IDS[-3:] == ("OPS-01", "OPS-02", "OPS-03")
     assert validate_registry(scenario_results()) == []
 
