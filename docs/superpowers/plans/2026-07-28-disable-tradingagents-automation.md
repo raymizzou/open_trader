@@ -28,7 +28,7 @@
 - Consumes: the existing launchd labels `com.open-trader.premarket`, `com.open-trader.premarket.hk`, and `com.open-trader.premarket.us`
 - Produces: shared configuration with `DailyPremarketConfig.notify_daily_report == False`
 
-- [ ] **Step 1: Capture the pre-change state**
+- [x] **Step 1: Capture the pre-change state**
 
 Run:
 
@@ -42,7 +42,7 @@ launchctl list | rg 'com\.open-trader\.trend-market-controller\.(cn|hk|us)$'
 Expected: no TradingAgents process or daily premarket label; notification flag
 is `1`; all three trend controllers are listed.
 
-- [ ] **Step 2: Remove every legacy daily premarket launchd job**
+- [x] **Step 2: Remove every legacy daily premarket launchd job**
 
 Run:
 
@@ -53,7 +53,7 @@ scripts/uninstall_daily_premarket_launchd.sh
 Expected: the script reports each daily premarket agent as removed or not
 installed. It must not remove a trend-controller label.
 
-- [ ] **Step 3: Disable all daily premarket notifications**
+- [x] **Step 3: Disable all daily premarket notifications**
 
 Apply this exact local configuration change:
 
@@ -64,7 +64,7 @@ Apply this exact local configuration change:
 
 Do not change `OPEN_TRADER_NOTIFIERS`; trend controllers share that list.
 
-- [ ] **Step 4: Verify the configuration loader sees notifications disabled**
+- [x] **Step 4: Verify the configuration loader sees notifications disabled**
 
 Run:
 
@@ -81,7 +81,7 @@ PY
 
 Expected: exit code `0` and `notify_daily_report=False`.
 
-- [ ] **Step 5: Verify no scheduler or process can emit another automatic report notification**
+- [x] **Step 5: Verify no scheduler or process can emit another automatic report notification**
 
 Run:
 
@@ -105,8 +105,19 @@ launchctl list | rg 'com\.open-trader\.trend-market-controller\.(cn|hk|us)$'
 Expected: no matching process, plist, cron entry, or screen session; all three
 trend controllers remain listed.
 
-- [ ] **Step 6: Record the operational result**
+- [x] **Step 6: Record the operational result**
 
 No production commit is required because the only runtime change is in the
 Git-ignored local configuration. Commit this implementation plan separately
 from the already committed design document.
+
+## Operational Result
+
+Verified at `2026-07-28T19:47:45+0800`:
+
+- `notify_daily_report=False`; shared notifiers remain
+  `feishu_app,macos,xiaoai`.
+- TradingAgents processes, launchd jobs, scheduler plists, cron entries, `at`
+  entries, screen sessions, and run locks: `0`.
+- Notification-disabled success, partial, and failure tests: `3 passed`.
+- CN, HK, and US trend controllers remained loaded with fresh heartbeats.
