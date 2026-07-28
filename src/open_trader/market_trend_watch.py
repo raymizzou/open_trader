@@ -94,13 +94,14 @@ def watch_market_protection(
     reconnect_seconds: float,
     once: bool = False,
     quote_client_factory: Callable[[], object] | None = None,
-    now_fn: Callable[[], datetime] = datetime.now,
+    now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], None] = time_module.sleep,
     on_session_open: Callable[[str], None] | None = None,
     on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
 ) -> AShareWatchResult:
     market = _market(market)
     timezone = MARKET_TIMEZONES[market]
+    now_fn = now_fn or (lambda: datetime.now(timezone))
     client = quote_client
     interrupted = _monitor_interrupted(events_path)
     now = now_fn()

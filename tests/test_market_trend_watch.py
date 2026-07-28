@@ -141,6 +141,36 @@ def test_once_market_watcher_returns_abnormal_when_reconnect_client_fails(
     assert result.exception_count == 1
 
 
+def test_market_watcher_default_clock_records_aware_timestamps(
+    tmp_path: Path,
+) -> None:
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            raise watcher_error("calendar offline")
+
+        def close(self) -> None:
+            pass
+
+    events_path = tmp_path / "events.jsonl"
+
+    watch_market_protection(
+        market="HK",
+        data_dir=tmp_path / "data",
+        portfolio_path=tmp_path / "unused.csv",
+        state_path=tmp_path / "state.json",
+        events_path=events_path,
+        report_lock_path=tmp_path / "report.lock",
+        quote_client=Quote(),
+        notifier=NullNotifier(),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+    )
+
+    event = json.loads(events_path.read_text(encoding="utf-8"))
+    assert datetime.fromisoformat(event["occurred_at"]).tzinfo is not None
+
+
 def test_once_market_watcher_returns_abnormal_when_calendar_fails(
     tmp_path: Path,
 ) -> None:
