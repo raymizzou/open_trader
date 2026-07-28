@@ -9,7 +9,7 @@ from subprocess import CompletedProcess
 from types import SimpleNamespace
 
 import pytest
-from polymarket import SecureClient
+from polymarket import PRODUCTION, SecureClient
 
 import open_trader.cli as cli
 from open_trader.polymarket_trading import (
@@ -808,8 +808,15 @@ def test_secure_client_readiness_does_not_trust_deprecated_gasless_flag() -> Non
     client = object.__new__(SecureClient)
     client._ended = False
     client._ctx_inner = SimpleNamespace(
+        environment=PRODUCTION,
         wallet_type="EOA",
         wallet=WALLET,
+        secure_clob=SimpleNamespace(
+            get_json=lambda *args, **kwargs: {
+                "balance": 20_000_000,
+                "allowances": {PRODUCTION.standard_exchange: 18_600_000},
+            }
+        ),
         relayer=SimpleNamespace(get_json=lambda *args, **kwargs: {"address": WALLET, "nonce": "1"}),
     )
     adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=client)
@@ -831,9 +838,16 @@ def test_secure_client_readiness_uses_authenticated_relayer_probe() -> None:
     client = object.__new__(SecureClient)
     client._ended = False
     client._ctx_inner = SimpleNamespace(
+        environment=PRODUCTION,
         wallet_type="POLY_PROXY",
         wallet=WALLET,
         signer=SimpleNamespace(address=SIGNER),
+        secure_clob=SimpleNamespace(
+            get_json=lambda *args, **kwargs: {
+                "balance": 20_000_000,
+                "allowances": {PRODUCTION.standard_exchange: 18_600_000},
+            }
+        ),
         relayer=Relayer(),
     )
     adapter = PolymarketTradingClient(TradingConfig(SIGNER, WALLET), client=client)
@@ -866,6 +880,18 @@ def test_readiness_snapshot_requires_fresh_gasless_and_merge_capabilities() -> N
     blocked = adapter.readiness_snapshot()
     assert blocked["relayer_ready"] is False
     assert blocked["merge_ready"] is False
+
+
+def test_readiness_snapshot_includes_wallet_and_fresh_collateral_only() -> None:
+    adapter, fake = make_adapter()
+
+    result = adapter.readiness_snapshot()
+
+    assert result["wallet"] == "ready"
+    assert result["wallet_address"] == WALLET
+    assert result["p_usd_balance"] == Decimal("20")
+    assert result["p_usd_allowance"] == Decimal("18.6")
+    assert fake.read_calls == ["balance"]
 
 
 def test_cancel_and_merge_use_official_methods_once() -> None:

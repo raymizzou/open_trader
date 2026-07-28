@@ -433,28 +433,12 @@ class PolymarketTradingClient:
 
     def account_snapshot(self) -> AccountSnapshot:
         try:
-            balance = self._client.get_balance_allowance(asset_type="COLLATERAL")
+            p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
             orders = _collect(self._client.list_open_orders())
             # This read is intentionally performed even though the snapshot only
             # stores open-order IDs; the authenticated preflight must prove it.
             _collect(self._client.list_account_trades())
             positions = _collect(self._client.list_positions())
-            p_usd_balance = _decimal(_field(balance, "balance"), base_units=True)
-            allowances = _field(balance, "allowances", {})
-            environment = getattr(self._client, "environment", PRODUCTION)
-            spender = getattr(environment, "standard_exchange", None)
-            if not isinstance(spender, str) or not isinstance(allowances, Mapping):
-                p_usd_allowance = Decimal("0")
-            else:
-                selected = next(
-                    (
-                        value
-                        for key, value in allowances.items()
-                        if isinstance(key, str) and key.lower() == spender.lower()
-                    ),
-                    0,
-                )
-                p_usd_allowance = _decimal(selected, base_units=True)
             open_order_ids = tuple(
                 _safe_string(order_id)
                 for order in orders
@@ -481,10 +465,29 @@ class PolymarketTradingClient:
             del exc
             raise PolymarketTradingError(code) from None
 
+    def _collateral_balance_allowance(self) -> tuple[Decimal, Decimal]:
+        balance = self._client.get_balance_allowance(asset_type="COLLATERAL")
+        p_usd_balance = _decimal(_field(balance, "balance"), base_units=True)
+        allowances = _field(balance, "allowances", {})
+        environment = getattr(self._client, "environment", PRODUCTION)
+        spender = getattr(environment, "standard_exchange", None)
+        if not isinstance(spender, str) or not isinstance(allowances, Mapping):
+            return p_usd_balance, Decimal("0")
+        selected = next(
+            (
+                value
+                for key, value in allowances.items()
+                if isinstance(key, str) and key.lower() == spender.lower()
+            ),
+            0,
+        )
+        return p_usd_balance, _decimal(selected, base_units=True)
+
     def readiness_snapshot(self) -> dict[str, object]:
         """Return a fresh, explicit gasless-relayer and merge capability fact."""
 
         checked_at = datetime.now(UTC)
+        p_usd_balance, p_usd_allowance = self._collateral_balance_allowance()
         merge_capable = callable(getattr(self._client, "merge_positions", None))
         if isinstance(self._client, SecureClient):
             gasless_ready = self._authenticated_relayer_probe()
@@ -502,6 +505,10 @@ class PolymarketTradingClient:
         merge_ready = merge_capable and gasless_ready
         return {
             "checked_at": checked_at,
+            "wallet": "ready",
+            "wallet_address": self.config.wallet_address,
+            "p_usd_balance": p_usd_balance,
+            "p_usd_allowance": p_usd_allowance,
             "merge_capability": merge_capable,
             "merge_ready": merge_ready,
             "merge": "ready" if merge_ready else "unavailable",

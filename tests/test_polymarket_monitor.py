@@ -361,6 +361,30 @@ def test_task2_account_and_merge_capability_readiness_is_actionable(tmp_path: Pa
     assert monitor.opportunity("e:m")["actionable"] is True  # type: ignore[index]
 
 
+def test_explicit_readiness_is_enriched_with_fresh_geoblock(tmp_path: Path) -> None:
+    class Trading:
+        def readiness_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet": "ready",
+                "wallet_address": "0xwallet",
+                "p_usd_balance": Decimal("50"),
+                "p_usd_allowance": Decimal("50"),
+                "relayer": "ready",
+                "checked_at": NOW,
+            }
+
+        def geoblock_allowed(self) -> bool:
+            return True
+
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path, trading=Trading())  # type: ignore[arg-type]
+
+    monitor.refresh_once()
+
+    assert monitor.snapshot()["readiness"]["geoblock"] == "allowed"  # type: ignore[index]
+    assert monitor.opportunity("e:m")["actionable"] is True  # type: ignore[index]
+
+
 def test_candidate_age_is_recomputed_after_confirmation(tmp_path: Path) -> None:
     setup_public([event("e", markets=(market("m"),))])
     now = [NOW]

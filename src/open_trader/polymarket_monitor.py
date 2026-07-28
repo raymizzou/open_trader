@@ -637,6 +637,11 @@ class PolymarketMonitor:
             if callable(method):
                 value = await _call(method)
                 readiness = dict(value) if isinstance(value, Mapping) else self._object_dict(value)
+                if "geoblock" not in readiness:
+                    geoblock_method = getattr(self._trading, "geoblock_allowed", None)
+                    if callable(geoblock_method):
+                        geoblock = await _call(geoblock_method)
+                        readiness["geoblock"] = "allowed" if geoblock is True else "blocked"
             else:
                 account = await _call(getattr(self._trading, "account_snapshot"))
                 readiness = self._object_dict(account)
