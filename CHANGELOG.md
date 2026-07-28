@@ -14,6 +14,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   truthful execution/incident history, and responsive desktop/mobile layouts.
   Expanded the acceptance registry to 62 scenarios and added deterministic
   golden coverage for unavailable, unknown, and incomplete states.
+- Disabled the legacy TradingAgents daily premarket automation and its HK/US
+  start, action, blocker, and completion notifications while preserving manual
+  runs, historical artifacts, and all three trend controllers. Verified no
+  matching process, launchd job, plist, cron, `at`, or `screen` task remained;
+  the notification-off checks and full test suite passed.
 
 ## 2026-07-27
 
