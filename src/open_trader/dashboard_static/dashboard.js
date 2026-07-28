@@ -1996,6 +1996,7 @@ function predictionIncidentReasonLabel(value) {
 function predictionIncidentStatusLabel(value) {
   const raw = String(value || "").trim();
   const labels = {
+    resolved_clean: "已确认无敞口 · 已解除熔断",
     directional_incident: "已消除敞口 · 待解除熔断",
     neutralized_incident: "已处置 · 待解除熔断",
     merge_incident: "合并未确认 · 待人工处理",
@@ -2179,15 +2180,17 @@ function predictionOpportunityPanel(payload) {
 
 function predictionHistoryContent(payload, kind) {
   const rows = payload?.histories?.[kind];
-  if (!Array.isArray(rows) || !rows.length) return `<div class="pm-empty compact"><strong>${kind === "signals" ? "还没有历史信号" : kind === "executions" ? "还没有真实交易" : "没有交易事故"}</strong><p>${kind === "signals" ? "后台达到正式信号门槛后会保留出现时间、成交量和利润。" : kind === "executions" ? "第一笔真实机会完成后，这里会记录两腿订单、合并交易和已实现利润。" : "单腿成交、自动处置失败和合并失败会永久保留在这里。"}</p></div>`;
-  const displayRows = rows.map((row) => predictionHistoryDisplay(kind, row));
+  const displayRows = (Array.isArray(rows) ? rows : [])
+    .map((row) => predictionHistoryDisplay(kind, row))
+    .filter((row) => kind !== "executions" || row.phase !== "startup_unknown_state");
+  if (!displayRows.length) return `<div class="pm-empty compact"><strong>${kind === "signals" ? "还没有历史信号" : kind === "executions" ? "还没有真实交易" : "没有交易事故"}</strong><p>${kind === "signals" ? "后台达到正式信号门槛后会保留出现时间、成交量和利润。" : kind === "executions" ? "第一笔真实机会完成后，这里会记录两腿订单、合并交易和已实现利润。" : "单腿成交、自动处置失败和合并失败会永久保留在这里。"}</p></div>`;
   if (kind === "signals") {
-    return `<table class="pm-table"><thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>峰值净边际</th><th>可执行</th><th>峰值利润</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="出现时间">${escapeHtml(predictionValue(row.occurred_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="持续">${escapeHtml(predictionValue(row.duration))}</td><td data-label="峰值净边际">${escapeHtml(row.peak_edge === undefined || row.peak_edge === null ? "-" : `$${predictionValue(row.peak_edge)}`)}</td><td data-label="可执行">${escapeHtml(predictionValue(row.quantity))} 组</td><td data-label="峰值利润" class="pm-positive"><strong>${escapeHtml(predictionMoney(row.profit, "$1.20"))}</strong></td></tr>`).join("")}</tbody></table>`;
+    return `<table class="pm-table"><thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>峰值净边际</th><th>可执行</th><th>峰值利润</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="出现时间">${escapeHtml(predictionValue(row.occurred_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="持续">${escapeHtml(predictionValue(row.duration))}</td><td data-label="峰值净边际">${escapeHtml(row.peak_edge === undefined || row.peak_edge === null ? "-" : `$${predictionValue(row.peak_edge)}`)}</td><td data-label="可执行">${escapeHtml(predictionValue(row.quantity))} 组</td><td data-label="峰值利润" class="pm-positive"><strong>${escapeHtml(predictionMoney(row.profit))}</strong></td></tr>`).join("")}</tbody></table>`;
   }
   if (kind === "executions") {
-    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${escapeHtml(predictionSignedMoney(row.realized_profit, "+$1.20"))}</strong></td></tr>`; }).join("")}</tbody></table>`;
+    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
   }
-  return `<table class="pm-table"><thead><tr><th>发生时间</th><th>市场</th><th>原因</th><th>自动处置</th><th>损失</th><th>状态</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="发生时间">${escapeHtml(predictionValue(row.happened_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="原因">${escapeHtml(predictionIncidentReasonLabel(row.reason))}</td><td data-label="自动处置">${escapeHtml(predictionValue(row.remediation))}</td><td data-label="损失" class="pm-tone-danger"><strong>${escapeHtml(predictionSignedMoney(row.loss, "-$0.60"))}</strong></td><td data-label="状态">${escapeHtml(predictionIncidentStatusLabel(row.status))}</td></tr>`).join("")}</tbody></table>`;
+  return `<table class="pm-table"><thead><tr><th>发生时间</th><th>市场</th><th>原因</th><th>自动处置</th><th>损失</th><th>状态</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="发生时间">${escapeHtml(predictionValue(row.happened_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="原因">${escapeHtml(predictionIncidentReasonLabel(row.reason))}</td><td data-label="自动处置">${escapeHtml(predictionValue(row.remediation))}</td><td data-label="损失" class="pm-tone-danger"><strong>${escapeHtml(predictionSignedMoney(row.loss))}</strong></td><td data-label="状态">${escapeHtml(predictionIncidentStatusLabel(row.status))}</td></tr>`).join("")}</tbody></table>`;
 }
 
 function predictionHistoryDisplay(kind, value) {
@@ -2222,7 +2225,9 @@ function predictionHistoryDisplay(kind, value) {
     reason: row.reason ?? evidence.reason,
     remediation: row.remediation ?? evidence.remediation,
     loss: row.loss ?? evidence.loss ?? evidence.actual_loss,
-    status: row.status ?? row.state,
+    status: row.acknowledged && row.acknowledgement?.reconciliation === "fresh_clean"
+      ? "resolved_clean"
+      : row.status ?? row.state,
   };
 }
 

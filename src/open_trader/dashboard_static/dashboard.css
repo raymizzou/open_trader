@@ -139,6 +139,21 @@ select:focus-visible {
   gap: 10px;
 }
 
+.brand-block {
+  display: none;
+}
+
+.tool-workspace-view .brand-block {
+  display: flex;
+}
+
+.header-brand-panel .brand,
+.header-brand-panel .page-title,
+#open-standard-backtest,
+#open-kelly-lab {
+  display: none;
+}
+
 .brand {
   font-size: 20px;
   font-weight: 800;

@@ -184,6 +184,18 @@ test('renders the exact approved warm-ledger contract', async ({ page }) => {
   await expect(page.locator('.research-chat-context .status-ok')).toHaveCSS('color', rgb.text);
 });
 
+test('keeps one visible dashboard header while retaining portfolio filters', async ({ page }) => {
+  await installLedgerFixture(page);
+  await page.goto('/');
+
+  await expect(page.locator('#main-topbar')).toBeVisible();
+  await expect(page.locator('.header-brand-panel .brand')).toBeHidden();
+  await expect(page.locator('.header-brand-panel .page-title')).toBeHidden();
+  await expect(page.locator('#open-standard-backtest')).toBeHidden();
+  await expect(page.locator('#open-kelly-lab')).toBeHidden();
+  await expect(page.locator('#header-market-filters')).toBeVisible();
+});
+
 test('switches every broker tab and card while preserving US-filtered ledgers', async ({ page }) => {
   await installLedgerFixture(page);
   await page.goto('/');

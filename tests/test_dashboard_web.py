@@ -2120,6 +2120,37 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
     assert incident_item["loss"] == "-0.60"
 
 
+def test_prediction_history_does_not_present_startup_recovery_as_a_trade() -> None:
+    output = run_dashboard_js(r'''
+const payload = {histories: {
+  executions: [{
+    phase: "startup_unknown_state",
+    recovery: true,
+    status: "directional_incident",
+    completed_at: "2026-07-28T03:40:32Z",
+  }],
+  incidents: [{
+    reason: "unknown_external_state",
+    status: "directional_incident",
+    happened_at: "2026-07-28T03:40:32Z",
+    acknowledged: true,
+    acknowledgement: {reconciliation: "fresh_clean"},
+  }],
+}};
+console.log(JSON.stringify({
+  executions: predictionHistoryContent(payload, "executions"),
+  incidents: predictionHistoryContent(payload, "incidents"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "还没有真实交易" in rendered["executions"]
+    assert "+$1.20" not in rendered["executions"]
+    assert "-$0.60" not in rendered["incidents"]
+    assert "已确认无敞口 · 已解除熔断" in rendered["incidents"]
+    assert "待解除熔断" not in rendered["incidents"]
+
+
 @pytest.mark.parametrize("failure", ["host", "origin", "cookie", "csrf", "address"])
 def test_prediction_arbitrage_mutation_security_matrix_rejects_before_body(
     tmp_path: Path,
