@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-28
+
+- Disabled the legacy TradingAgents daily premarket automation and its HK/US
+  start, action, blocker, and completion notifications while preserving manual
+  runs, historical artifacts, and all three trend controllers. Verified no
+  matching process, launchd job, plist, cron, `at`, or `screen` task remained;
+  the notification-off checks and full test suite passed.
+
 ## 2026-07-27
 
 - Allowed the Dashboard to show a newer validated trend-report revision when
