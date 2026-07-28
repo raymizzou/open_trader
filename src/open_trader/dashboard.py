@@ -1836,7 +1836,7 @@ def _project_broker_trend_report(
                     generated_at,
                     _,
                 ) = locked
-                selected = (
+                locked_selected = (
                     path,
                     payload,
                     execution_date,
@@ -1844,6 +1844,11 @@ def _project_broker_trend_report(
                     freshness_date,
                     generated_at,
                 )
+                if (
+                    latest_payload["strategy_judgments"]["formal_actions"]
+                    != payload["strategy_judgments"]["formal_actions"]
+                ):
+                    selected = locked_selected
                 execution_batch = batch
                 revision_anomaly = batch["report_sha256"] != latest_report_sha256
     if execution_batch_error:
@@ -1890,11 +1895,16 @@ def _project_broker_trend_report(
     account = payload["account"]
     metadata = payload["metadata"]
     report_sha256 = _report_hash(payload)
+    execution_report_sha256 = (
+        str(execution_batch["report_sha256"])
+        if execution_batch is not None
+        else report_sha256
+    )
     executions = _trend_action_executions(
         data_dir,
         market=market,
         execution_date=execution_date.isoformat(),
-        report_sha256=report_sha256,
+        report_sha256=execution_report_sha256,
     )
     sell_actions, buy_actions, hold_actions, review_actions = (
         _project_trend_actions(payload, executions)

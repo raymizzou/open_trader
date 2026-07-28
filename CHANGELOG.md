@@ -3,6 +3,22 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-27
+
+- Allowed the Dashboard to show a newer validated trend-report revision when
+  its formal actions exactly match the execution-locked report, while keeping
+  execution events bound to the original batch SHA. Verified both same-action
+  display and changed-action fallback paths plus invalid-batch/history
+  regressions.
+- Corrected the fixed CN/HK/US Futu stock-simulation account deployment,
+  archived the previous HK option-account report and ledger generation without
+  rewriting history, and restarted HK from an account-bound no-replay cycle.
+  Verified all three configured accounts with real SIMULATE submit/cancel
+  orders; order IDs `7606013`, `7606014`, and `7606015` all finished
+  `CANCELLED_ALL` with zero fills. Refreshed the account-bound trade statistics
+  and made Dashboard acceptance recognize a frozen US report whose execution
+  date is already the current Shanghai operator date.
+
 ## 2026-07-26
 
 - Added the local Polymarket prediction-market monitor and exact approved
