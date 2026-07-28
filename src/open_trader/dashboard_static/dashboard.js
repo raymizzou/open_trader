@@ -2287,6 +2287,13 @@ function predictionMetricStrip(payload) {
   return `<section class="pm-metrics" aria-label="监控摘要"><article class="pm-metric primary"><span>当前可参与</span><strong>${actionable}</strong><small>后台检查全部通过后才显示</small></article><article class="pm-metric"><span>监控事件</span><strong>${eventCount}</strong><small>按 24h 成交量动态筛选</small></article><article class="pm-metric"><span>市场 / Token</span><strong>${escapeHtml(`${marketCount} / ${tokenCount}`)}</strong><small>不可参与市场仍持续监控</small></article><article class="pm-metric"><span>过去 24 小时信号</span><strong>${signals}</strong><small>曾达到可参与条件</small></article></section>`;
 }
 
+function predictionReplacePositiveActionLabel(value, replacement) {
+  const raw = String(value || "");
+  if (raw === "可参与") return replacement;
+  if (raw.endsWith(" · 可参与")) return `${raw.slice(0, -3)}${replacement}`;
+  return value;
+}
+
 function predictionEventRows(payload) {
   const events = predictionEvents(payload);
   const globalOpportunities = predictionOpportunities(payload);
@@ -2311,13 +2318,13 @@ function predictionEventRows(payload) {
     const unavailableLabel = incomplete ? "数据不完整" : "暂不可参与";
     const details = rawDetails.map(([label, value]) => [
       label,
-      !actionable && String(value || "").includes("可参与")
-        ? String(value).replaceAll("可参与", unavailableLabel)
+      !actionable
+        ? predictionReplacePositiveActionLabel(value, unavailableLabel)
         : value,
     ]);
     const rawStatus = predictionValue(event.status, actionable ? "可参与" : "仅监控");
-    const displayStatus = !actionable && String(rawStatus).includes("可参与")
-      ? String(rawStatus).replaceAll("可参与", unavailableLabel)
+    const displayStatus = !actionable
+      ? predictionReplacePositiveActionLabel(rawStatus, unavailableLabel)
       : rawStatus;
     return `<details class="pm-event"${index === 0 ? " open" : ""}><summary><div><div class="pm-event-title">${escapeHtml(title)}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "预计净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div><div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(displayStatus)}</div></summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
   }).join("");

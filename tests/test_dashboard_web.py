@@ -2311,15 +2311,18 @@ console.log(predictionEventRows({
   health:{status:"healthy",degraded_reasons:[]},
   breaker:{open:false},
   opportunities:[opportunity],
-  events:[{
-    event_id:"event-incomplete",
-    title:"数据不完整的真实事件",
-    actionable:true,
-    status:"可参与",
-    opportunities:[opportunity],
-    details:[["当前执行条件","20 组 · 最多 $18.80 · 可参与"]],
-  }],
-}));
+    events:[{
+      event_id:"event-incomplete",
+      title:"数据不完整的真实事件",
+      actionable:true,
+      status:"可参与",
+      opportunities:[opportunity],
+      details:[
+        ["当前执行条件","20 组 · 最多 $18.80 · 可参与"],
+        ["不可参与市场","已订阅 · Negative Risk 暂不可参与"],
+      ],
+    }],
+  }));
 ''')
 
     assert "数据不完整的真实事件" in output
@@ -2327,6 +2330,8 @@ console.log(predictionEventRows({
     assert "当前执行条件" in output
     assert "可参与</div>" not in output
     assert "· 可参与</span>" not in output
+    assert "已订阅 · Negative Risk 暂不可参与" in output
+    assert "暂不暂不可参与" not in output
 
 
 def test_prediction_market_alerts_never_invent_execution_or_incident_facts() -> None:
