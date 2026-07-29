@@ -5420,6 +5420,18 @@ def rebuild_trend_report_from_evidence(
                     else str(raw["prior_temperature"])
                 ),
                 prior_right_share=decimal_or_none(raw.get("prior_right_share")),
+                aggregate_right_count_ratio=decimal_or_none(
+                    raw.get("aggregate_right_count_ratio")
+                ),
+                aggregate_right_market_cap_ratio=decimal_or_none(
+                    raw.get("aggregate_right_market_cap_ratio")
+                ),
+                prior_aggregate_right_count_ratio=decimal_or_none(
+                    raw.get("prior_aggregate_right_count_ratio")
+                ),
+                prior_aggregate_right_market_cap_ratio=decimal_or_none(
+                    raw.get("prior_aggregate_right_market_cap_ratio")
+                ),
                 temperature_direction=(
                     None
                     if raw.get("temperature_direction") is None

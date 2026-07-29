@@ -7,8 +7,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Allowed a same-date trend-report revision to enrich legacy industry history
   with the newly available right-side count and market-cap ratios, while still
-  rejecting any change to previously recorded industry facts. Verified the
-  history and A-share report suites against the shared runtime data.
+  rejecting any change to previously recorded industry facts; frozen-evidence
+  replays now preserve all four current/prior ratios. Verified the history,
+  replay, and A-share report suites against the shared runtime data.
 - Added prior-to-current right-side count and market-cap ratios to the existing
   trend-report industry context table and Markdown/JSON outputs. The Dashboard
   now explains both denominators and structure gap on hover, focus, or click;

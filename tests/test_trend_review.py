@@ -560,6 +560,10 @@ def test_rebuild_preserves_frozen_industry_context_ordering_facts(tmp_path: Path
         prior_as_of_date="2026-07-15",
         prior_temperature="温",
         prior_right_share=Decimal("0.4"),
+        aggregate_right_count_ratio=Decimal("0.51"),
+        aggregate_right_market_cap_ratio=Decimal("0.64"),
+        prior_aggregate_right_count_ratio=Decimal("0.45"),
+        prior_aggregate_right_market_cap_ratio=Decimal("0.58"),
         temperature_direction="rising",
         right_share_change_pp=Decimal("10"),
     )
