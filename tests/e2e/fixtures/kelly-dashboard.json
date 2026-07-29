@@ -11,6 +11,58 @@
     "holding_count": 2
   },
   "broker_summaries": [],
+  "trend_reports": {
+    "tiger": {
+      "available": true,
+      "broker": "tiger",
+      "broker_label": "老虎",
+      "market": "US",
+      "market_label": "美股",
+      "report_date": "2026-07-16",
+      "data_date": "2026-07-15",
+      "generated_at": "2026-07-16 08:00",
+      "account_status": "已更新",
+      "buy_window": "美股常规交易时段",
+      "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
+      "sell_actions": [],
+      "buy_actions": [{
+        "symbol": "VIXY",
+        "name": "波动率 ETF",
+        "close": "19.00",
+        "option_anomaly": {
+          "available": true,
+          "status": "ok",
+          "run_date": "2026-07-16",
+          "summary": "期权波动率偏高。",
+          "signal": "watch",
+          "confidence": "中",
+          "suggested_constraint": "仅观察",
+          "categories": []
+        }
+      }],
+      "hold_actions": [],
+      "review_actions": [],
+      "audit": {"candidates": [], "excluded": {}, "industry_concentration": [], "data_sources": ["fixture"]}
+    },
+    "phillips": {
+      "available": true,
+      "broker": "phillips",
+      "broker_label": "辉立",
+      "market": "HK",
+      "market_label": "港股",
+      "report_date": "2026-07-16",
+      "data_date": "2026-07-15",
+      "generated_at": "2026-07-16 08:00",
+      "account_status": "已更新",
+      "buy_window": "09:30–10:00",
+      "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 0},
+      "sell_actions": [],
+      "buy_actions": [],
+      "hold_actions": [],
+      "review_actions": [],
+      "audit": {"candidates": [], "excluded": {}, "industry_concentration": [], "data_sources": ["fixture"]}
+    }
+  },
   "cash_details": [],
   "kelly_lab": {
     "available": true,
