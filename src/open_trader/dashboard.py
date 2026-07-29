@@ -688,9 +688,6 @@ def _load_trend_reports(
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
     }
-    reports["futu"] = _project_futu_attention(
-        reports["tiger"], reports["phillips"]
-    )
     return reports
 
 
@@ -844,32 +841,6 @@ def load_historical_trend_report(
         current_candidate_pool_ids=config.trend_candidate_pool_ids(market),
         historical=True,
     )
-
-
-def _project_futu_attention(
-    tiger: dict[str, Any], phillips: dict[str, Any]
-) -> dict[str, Any]:
-    def project(source: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "market": source["market"],
-            "market_label": source["market_label"],
-            "data_status": source["data_status"],
-            "data_date": source.get("data_date", ""),
-            "status_text": source["status_text"],
-            "items": source.get("option_attention", [])
-            if source["available"]
-            else [],
-        }
-
-    return {
-        "available": tiger["available"] or phillips["available"],
-        "broker": "futu",
-        "broker_label": "富途",
-        "market": "US_HK",
-        "market_label": "美股 / 港股",
-        "status_text": "期权关注",
-        "attention_markets": [project(tiger), project(phillips)],
-    }
 
 
 def _shanghai_date(now: datetime | None = None) -> date:

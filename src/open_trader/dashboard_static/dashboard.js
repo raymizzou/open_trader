@@ -2854,9 +2854,9 @@ function trendReasonLabel(item, report) {
 }
 
 function renderTrendReportEntry(broker) {
-  if (!ACCOUNT_BROKERS.includes(broker)) return "";
+  if (!TREND_ACCOUNT_BROKERS.includes(broker)) return "";
   const report = state.dashboard?.trend_reports?.[broker] || {};
-  const label = broker === "futu" ? "期权关注" : "当天趋势报告";
+  const label = "当天趋势报告";
   const reviews = state.dashboard?.trend_reviews;
   const review = reviews?.[broker];
   const reviewLabel = `${formatPlain(review?.market_label || report.market_label || {futu:"美股",phillips:"港股",eastmoney:"A股"}[broker])}复盘`.replaceAll(" ", "");
@@ -2867,9 +2867,7 @@ function renderTrendReportEntry(broker) {
     ? `<button type="button" data-trend-review="${escapeHtml(broker)}">${escapeHtml(reviewLabel)}</button>`
     : `<button type="button" disabled>${escapeHtml(reviewLabel)}</button>`;
   const details = report.available
-    ? broker === "futu"
-      ? `<span>${escapeHtml(formatPlain(report.status_text || "期权关注"))}</span>`
-      : `<span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span><span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span><span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>`
+    ? `<span>${escapeHtml(formatPlain(report.status_text || "今日已更新"))}</span><span>报告日期 ${escapeHtml(formatPlain(report.report_date))}</span><span>数据截至 ${escapeHtml(formatPlain(report.data_date))}</span>`
     : `<span>${escapeHtml(formatPlain(report.status_text || "今日暂无趋势报告"))}</span>`;
   const reviewStatus = review && !review.available
     ? `<span>${escapeHtml(formatPlain(review.status_text || "暂无复盘数据"))}</span>`
@@ -3993,78 +3991,8 @@ function formatTrendControllerLastSuccess(value) {
   return parts.length ? parts.join(" · ") : "—";
 }
 
-const OPTION_ATTENTION_COLUMNS = [
-  {label: "标的", content: (item) => [item.symbol, item.name].map(optionAttentionValue).map(escapeHtml).join(" ")},
-  {label: "分类", content: (item) => escapeHtml(optionAttentionValue(item.category))},
-  {label: "右侧状态", content: (item) => renderOptionAttentionTransition(item.right_side)},
-  {label: "趋势温度", content: (item) => renderOptionAttentionTransition(item.temperature)},
-  {label: "趋势节气", content: (item) => renderOptionAttentionTransition(item.phase)},
-  {label: "本地 / 全球强度", content: (item) => [item.local_strength, item.global_strength].map(optionAttentionValue).map(escapeHtml).join(" / ")},
-  {label: "上周 / 上月", content: (item) => `${[item.strength_prev_week, item.strength_prev_month].map(optionAttentionValue).map(escapeHtml).join(" / ")}<br>${renderOptionAttentionTransition(item.strength_change)}`},
-  {label: "右侧天数 / 累计涨幅", content: (item) => [item.days, item.gain_since_entry].map(optionAttentionValue).map(escapeHtml).join(" / ")},
-  {label: "危险 / 沸腾 / 开香槟", content: (item) => [item.danger, item.boiling, item.champagne].map(renderOptionAttentionTransition).join(" / ")},
-  {label: "来源动作", content: (item) => [optionAttentionValue(item.source_broker), optionAttentionAction(item.source_action)].map(escapeHtml).join(" / ")},
-];
-
-function optionAttentionValue(value) {
-  if (value === null || value === undefined || typeof value === "string" && !value.trim()) {
-    return "未提供";
-  }
-  if (typeof value === "boolean") return value ? "是" : "否";
-  return formatPlain(value);
-}
-
-function renderOptionAttentionTransition(transition) {
-  const value = transition && typeof transition === "object" && !Array.isArray(transition)
-    ? transition
-    : {};
-  const text = `${optionAttentionValue(value.previous)} → ${optionAttentionValue(value.current)}`;
-  const changed = value.changed === true ? ' class="option-attention-changed"' : "";
-  return `<span${changed}>${escapeHtml(text)}</span>`;
-}
-
-function optionAttentionAction(action) {
-  if (action === "BUY") return "允许买入";
-  if (action === "SELL_ALL") return "卖出复核";
-  if (action === "SELL_PARTIAL") return "止盈减仓 30%";
-  if (action === "HOLD") return "继续持有";
-  return "观察";
-}
-
-function optionAttentionMarketStatus(market) {
-  if (hasValue(market.status_text)) return optionAttentionValue(market.status_text);
-  if (market.data_status === "current") return "今日已更新";
-  if (market.data_status === "stale") {
-    return `数据截至 ${optionAttentionValue(market.data_date)}；今日未更新`;
-  }
-  return "暂时不可用";
-}
-
-function renderOptionAttentionRow(item) {
-  return `<tr class="option-attention-row">${OPTION_ATTENTION_COLUMNS.map(({label, content}) => `<td data-label="${escapeHtml(label)}">${content(item)}</td>`).join("")}</tr>`;
-}
-
-function renderOptionAttentionWorkspace(report) {
-  const order = {US: 0, HK: 1};
-  const markets = (Array.isArray(report.attention_markets) ? report.attention_markets : [])
-    .filter((market) => market && typeof market === "object" && !Array.isArray(market))
-    .sort((left, right) => (order[String(left.market).toUpperCase()] ?? 2) - (order[String(right.market).toUpperCase()] ?? 2));
-  const rowgroups = markets.map((market) => {
-    const items = Array.isArray(market.items)
-      ? market.items.filter((item) => item && typeof item === "object" && !Array.isArray(item))
-      : [];
-    return `<tbody><tr class="option-attention-market"><th colspan="${OPTION_ATTENTION_COLUMNS.length}" scope="rowgroup"><div class="option-attention-market-content"><span>${escapeHtml(optionAttentionValue(market.market_label))}</span><span>${escapeHtml(optionAttentionMarketStatus(market))}</span></div></th></tr>${items.map(renderOptionAttentionRow).join("")}</tbody>`;
-  }).join("");
-  return `<main class="option-attention-workspace">
-    <header class="option-attention-header"><h1>期权关注</h1><button type="button" data-close-trend-report>返回持仓看板</button></header>
-    <table class="option-attention-table"><thead><tr>${OPTION_ATTENTION_COLUMNS.map(({label}) => `<th scope="col">${escapeHtml(label)}</th>`).join("")}</tr></thead>${rowgroups}</table>
-  </main>`;
-}
-
 function renderTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {
-  return String(report && report.broker || "").toLowerCase() === "futu"
-    ? renderOptionAttentionWorkspace(report || {})
-    : renderCnTrendReportWorkspace(report || {}, embedded, historical, trailingContent);
+  return renderCnTrendReportWorkspace(report || {}, embedded, historical, trailingContent);
 }
 
 function renderHeaderSummary() {
@@ -4426,7 +4354,6 @@ function renderAccountSection(group) {
         <span>时间 ${escapeHtml(formatPlain(sourceTime))}</span>
         ${renderAccountCashDetails(group)}
       </div>
-      ${group.broker === "futu" ? renderTrendReportEntry(group.broker) : ""}
       <div class="account-section-actions">
         <strong>${escapeHtml(formatMoney(group.summary.portfolio_value_hkd, "HKD"))}</strong>
         ${renderStatementUpload(group.broker)}
