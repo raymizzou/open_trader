@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Added the first manual-confirmation Polymarket threshold-hedge path: full
+  same-event relation scanning, deterministic proofs plus structured Codex
+  validation/cache metrics, truthful rejected/unavailable reasons, separate
+  condition BUY/FOK submission and reconciliation, `holding_to_resolution`
+  for multiple unresolved combinations, folded in-memory scan logs, and a
+  Dashboard confirmation card that never invokes merge for cross-condition
+  legs. Verified focused discovery, trading, execution, store, monitor, and
+  Dashboard suites; live order submission remains behind the existing explicit
+  preview/confirm gate.
 - Allowed an explicitly authorized same-day simulated late buy to bind a
   higher, hash-verified corrective report when the execution batch had already
   frozen a bug-suppressed report. Recovery still requires a prior missed event,

@@ -2125,6 +2125,7 @@ function predictionTradingAvailable(payload) {
 
 function predictionMarketTypeLabel(value) {
   const raw = String(value || "").trim();
+  if (raw === "threshold_hedge") return "阈值关系套利";
   return raw === "standard_binary" ? "普通二元" : raw || "-";
 }
 
@@ -2151,11 +2152,41 @@ function predictionOpportunityDisplay(value) {
   result.max_cost = source.max_cost ?? source.total_max_cost ?? source.cost;
   result.profit = source.profit ?? source.minimum_profit ?? source.estimated_profit ?? source.gross_upper_bound;
   result.quantity = source.quantity ?? source.size;
+  if (String(result.market_type || "") === "threshold_hedge") {
+    result.question_a = source.question_a ?? source.market_a_question;
+    result.question_b = source.question_b ?? source.market_b_question;
+    result.condition_id_a = source.condition_id_a ?? source.conditionA;
+    result.condition_id_b = source.condition_id_b ?? source.conditionB;
+    result.buy_legs = Array.isArray(source.buy_legs) ? source.buy_legs : [];
+    result.llm_status = source.llm_status;
+    result.llm_decision = source.llm_decision;
+    result.llm_summary = source.llm_summary;
+    result.llm_reason_codes = source.llm_reason_codes;
+    result.llm_evidence = source.llm_evidence;
+    result.llm_uncertainties = source.llm_uncertainties;
+  }
   return result;
 }
 
 function predictionOpportunityIsComplete(value) {
   const opportunity = predictionOpportunityDisplay(value);
+  if (String(opportunity.market_type || "") === "threshold_hedge") {
+    const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];
+    return [
+      opportunity.opportunity_id,
+      opportunity.question_a,
+      opportunity.question_b,
+      opportunity.relation,
+      opportunity.condition_id_a,
+      opportunity.condition_id_b,
+    ].every(predictionHasValue)
+      && predictionHasValue(opportunity.quantity)
+      && predictionHasValue(opportunity.max_cost)
+      && predictionHasValue(opportunity.profit)
+      && legs.length === 2
+      && legs.every((leg) => [leg?.label, leg?.outcome, leg?.condition_id, leg?.token_id, leg?.quantity, leg?.max_price, leg?.max_cost]
+        .every(predictionHasValue) && Number.isFinite(Number(leg.max_price)) && Number.isFinite(Number(leg.max_cost)));
+  }
   const textFields = [
     opportunity.opportunity_id,
     opportunity.title,
@@ -2289,6 +2320,9 @@ function predictionExecutionAlert(payload) {
     }
     return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交并自动合并</strong><p>买入 ${escapeHtml(predictionValue(execution.quantity))} 组实际成本 ${escapeHtml(predictionMoney(execution.actual_cost))}，合并收回 ${escapeHtml(predictionMoney(execution.merge_value))}，本次已实现净利润 <b>${escapeHtml(predictionSignedMoney(profit))}</b>。</p></div><span class="pm-pill action">已完成 · ${escapeHtml(predictionValue(execution.completed_at))}</span></section>`;
   }
+  if (execution && status === "holding_to_resolution") {
+    return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交，待结算</strong><p>这是两个独立 condition 的阈值关系组合；不会 merge，结算前允许继续持有其他已确认组合。</p></div><span class="pm-pill action">待结算</span></section>`;
+  }
   if (payload?.stale) return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>Polymarket 数据连接异常</strong><p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
   return "";
 }
@@ -2368,6 +2402,46 @@ function predictionEventRows(payload, expandedEventKeys = new Set()) {
   }).join("");
 }
 
+function predictionConditionLabel(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "-";
+  return raw.length > 18 ? `${raw.slice(0, 8)}…${raw.slice(-6)}` : raw;
+}
+
+function predictionLlmDecisionLabel(opportunity) {
+  const decision = String(opportunity?.llm_decision || "").trim().toUpperCase();
+  const status = String(opportunity?.llm_status || "").trim().toLowerCase();
+  if (decision === "APPROVE" || status === "approved") return "Codex APPROVE";
+  if (decision === "REJECT" || status === "llm_rejected") return "Codex REJECT";
+  if (status === "llm_unavailable") return "Codex 不可用";
+  return "Codex 未校验";
+}
+
+function predictionLlmReasonHtml(opportunity) {
+  const reasons = Array.isArray(opportunity?.llm_reason_codes) ? opportunity.llm_reason_codes : [];
+  const uncertainties = Array.isArray(opportunity?.llm_uncertainties) ? opportunity.llm_uncertainties : [];
+  const evidence = Array.isArray(opportunity?.llm_evidence) ? opportunity.llm_evidence : [];
+  const reasonText = [...reasons, ...uncertainties].filter(predictionHasValue).map(escapeHtml).join(" · ");
+  const evidenceText = evidence.map((item) => {
+    if (!item || typeof item !== "object") return String(item || "");
+    return Object.entries(item).map(([key, value]) => `${key}: ${value}`).join(" · ");
+  }).filter(predictionHasValue).map(escapeHtml).join("<br>");
+  return `${opportunity?.llm_summary ? `<p>${escapeHtml(opportunity.llm_summary)}</p>` : ""}${reasonText ? `<small>原因：${reasonText}</small>` : ""}${evidenceText ? `<small>证据：${evidenceText}</small>` : ""}`;
+}
+
+function predictionRelationDiscoveryPanel(payload) {
+  const discovery = payload?.relation_discovery && typeof payload.relation_discovery === "object" ? payload.relation_discovery : {};
+  const usage = discovery.codex_usage_24h && typeof discovery.codex_usage_24h === "object" ? discovery.codex_usage_24h : {};
+  const distribution = discovery.annualized_distribution && typeof discovery.annualized_distribution === "object" ? discovery.annualized_distribution : {};
+  const logs = Array.isArray(discovery.scan_logs) ? discovery.scan_logs : [];
+  const distributionRows = ["current", "7d", "30d"].map((window) => {
+    const item = distribution[window] && typeof distribution[window] === "object" ? distribution[window] : {};
+    return `<tr><td>${window === "current" ? "当前" : window}</td><td>${escapeHtml(predictionValue(item.count, "0"))}</td><td>${escapeHtml(predictionValue(item.median, "-"))}</td><td>${escapeHtml(predictionValue(item.p90, "-"))}</td></tr>`;
+  }).join("");
+  const logRows = logs.length ? logs.map((item) => `<li>${escapeHtml(typeof item === "object" ? Object.entries(item).map(([key, value]) => `${key}=${value}`).join(" · ") : String(item))}</li>`).join("") : "<li>暂无扫描日志</li>";
+  return `<section class="pm-panel pm-relation-discovery"><header class="pm-panel-heading"><div><h2>关联合约扫描</h2><p>全量扫描同一事件的阈值合约；日志仅保留在内存。</p></div><span class="pm-pill">${escapeHtml(predictionValue(discovery.status, "不可用"))}</span></header><div class="pm-relation-summary"><span>Codex 24h：${escapeHtml(predictionValue(usage.calls, "0"))} calls · ${escapeHtml(predictionValue(usage.successes, "0"))} 成功 · ${escapeHtml(predictionValue(usage.failures, "0"))} 失败 · ${escapeHtml(predictionValue(usage.cache_hits, "0"))} cache hits</span><span>tokens：${escapeHtml(predictionValue(usage.input_tokens, "0"))} input · ${escapeHtml(predictionValue(usage.output_tokens, "0"))} output</span></div><table class="pm-table pm-distribution"><thead><tr><th>窗口</th><th>样本</th><th>中位数年化</th><th>P90 年化</th></tr></thead><tbody>${distributionRows}</tbody></table><details class="pm-scan-logs"><summary>扫描日志（${logs.length} 条，内存）</summary><ul>${logRows}</ul></details></section>`;
+}
+
 function predictionOpportunityPanel(payload) {
   const opportunities = predictionOpportunities(payload);
   const opportunity = opportunities[0];
@@ -2379,6 +2453,17 @@ function predictionOpportunityPanel(payload) {
   const complete = predictionOpportunityIsComplete(opportunity);
   const executionBlocked = predictionExecutionIsActive(payload);
   const actionable = complete && opportunity.actionable === true && predictionTradingAvailable(payload);
+  if (String(opportunity.market_type || "") === "threshold_hedge") {
+    const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];
+    const legRows = legs.map((leg) => `<article class="pm-order-leg"><span>${escapeHtml(predictionValue(leg.label))} · BUY ${escapeHtml(predictionValue(leg.outcome))} · FOK · ${escapeHtml(predictionConditionLabel(leg.condition_id))}</span><strong>${escapeHtml(predictionValue(leg.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · token ${escapeHtml(predictionConditionLabel(leg.token_id))}</small></article>`).join("");
+    const llm = predictionLlmDecisionLabel(opportunity);
+    const annualized = Number(opportunity.annualized_yield);
+    const annualizedLabel = Number.isFinite(annualized) ? `${annualized.toFixed(2)}%` : "-";
+    const reason = opportunity.llm_status === "llm_unavailable" ? "Codex 未返回，保留机会但禁止下单。" : (!opportunity.llm_summary && !opportunity.llm_reason_codes?.length ? "结构化关系证明未返回。" : "");
+    const status = !complete ? "数据不完整" : actionable ? "可参与" : "暂不可参与";
+    const buttonText = !complete ? "数据不完整" : actionable ? `参与 · 预计 ${predictionSignedMoney(opportunity.profit)}` : "暂不可参与";
+    return `<article class="pm-opportunity pm-threshold-opportunity ${actionable ? "" : "disabled"}"><div class="pm-opportunity-title"><div><h3>阈值关系套利 · ${escapeHtml(predictionValue(opportunity.relation, "关系未返回"))}</h3><p>同一事件的两个独立 Polymarket condition · 24h 成交量 ${escapeHtml(predictionVolume(opportunity.volume_24h, "-"))}</p></div><span class="pm-pill ${actionable ? "action" : "watch"}">${status}</span></div><div class="pm-threshold-questions"><div><span>市场 A</span><strong>${escapeHtml(predictionValue(opportunity.question_a, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))}</small></div><div><span>市场 B</span><strong>${escapeHtml(predictionValue(opportunity.question_b, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div></div><div class="pm-threshold-llm"><span class="pm-pill ${llm.includes("APPROVE") ? "action" : "watch"}">${escapeHtml(llm)}</span>${predictionLlmReasonHtml(opportunity)}${reason ? `<small>${escapeHtml(reason)}</small>` : ""}</div><div class="pm-order-legs">${legRows || `<div class="pm-empty compact">两条 BUY 腿数据未返回</div>`}</div><dl class="pm-opportunity-metrics"><div><dt>最大成本（含费）</dt><dd>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))}</dd></div><div><dt>最低收回</dt><dd>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</dd></div><div><dt>最低净利润</dt><dd class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</dd></div><div><dt>简单年化</dt><dd>${escapeHtml(annualizedLabel)}</dd></div></dl><div class="pm-opportunity-action"><p>两笔订单非原子、不同 condition，不会 merge；确认时重新读取规则、盘口、费用和账户。单腿补救最多按 ${escapeHtml(predictionMoney(payload?.policy_limits?.max_emergency_loss ?? "2"))} 估算。</p><button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id || opportunity.id, ""))}"${actionable ? "" : " disabled"}>${escapeHtml(buttonText)}</button></div></article>`;
+  }
   const title = opportunity.title || opportunity.market_title || opportunity.event_title || "数据未返回";
   const status = !complete ? "数据不完整" : actionable ? "可参与" : "暂不可参与";
   const buttonText = !complete ? "数据不完整"
@@ -2405,7 +2490,7 @@ function predictionHistoryContent(payload, kind) {
     return `<table class="pm-table"><thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>峰值净边际</th><th>可执行</th><th>峰值利润</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="出现时间">${escapeHtml(predictionValue(row.occurred_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="持续">${escapeHtml(predictionValue(row.duration))}</td><td data-label="峰值净边际">${escapeHtml(row.peak_edge === undefined || row.peak_edge === null ? "-" : `$${predictionValue(row.peak_edge)}`)}</td><td data-label="可执行">${escapeHtml(predictionValue(row.quantity))} 组</td><td data-label="峰值利润" class="pm-positive"><strong>${escapeHtml(predictionMoney(row.profit))}</strong></td></tr>`).join("")}</tbody></table>`;
   }
   if (kind === "executions") {
-    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
+    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; const holding = row.state === "holding_to_resolution"; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${holding ? "待结算（不 merge）" : escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${holding ? "待结算" : escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
   }
   return `<table class="pm-table"><thead><tr><th>发生时间</th><th>市场</th><th>原因</th><th>自动处置</th><th>损失</th><th>状态</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="发生时间">${escapeHtml(predictionValue(row.happened_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="原因">${escapeHtml(predictionIncidentReasonLabel(row.reason))}</td><td data-label="自动处置">${escapeHtml(predictionValue(row.remediation))}</td><td data-label="损失" class="pm-tone-danger"><strong>${escapeHtml(predictionSignedMoney(row.loss))}</strong></td><td data-label="状态">${escapeHtml(predictionIncidentStatusLabel(row.status))}</td></tr>`).join("")}</tbody></table>`;
 }
@@ -2464,7 +2549,7 @@ function renderPredictionMarket() {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const displayedEvents = predictionEvents(viewPayload).length;
   const eventTotal = predictionHasValue(viewPayload.event_count) ? viewPayload.event_count : "-";
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload)}${predictionExecutionAlert(viewPayload)}${predictionMetricStrip(viewPayload)}<aside class="pm-policy"><strong>V1 只对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控、显示成交量和毛利润上限，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前机会</h2><p>后台检查通过后，才允许在 Open Trader 内确认下单。</p></div><span class="pm-pill venue">Polymarket</span></header>${predictionOpportunityPanel(viewPayload)}</section>${predictionHistoryPanel(viewPayload)}</div></div>`;
+  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload)}${predictionExecutionAlert(viewPayload)}${predictionMetricStrip(viewPayload)}<aside class="pm-policy"><strong>V1 仅对规则完整、免手续费的机会开放实盘</strong><p>普通二元市场可做同市场配对；结构化阈值关系会展示两个独立 condition、Codex 结论和有限补救。收费市场、Negative Risk 或规则未通过校验的市场仍监控，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前机会</h2><p>后台检查通过后，才允许在 Open Trader 内确认下单。</p></div><span class="pm-pill venue">Polymarket</span></header>${predictionOpportunityPanel(viewPayload)}</section>${predictionHistoryPanel(viewPayload)}${predictionRelationDiscoveryPanel(viewPayload)}</div></div>`;
 }
 
 function startPredictionPolling() {
@@ -2556,7 +2641,7 @@ function predictionMaskedWallet(value) {
 
 function predictionPreviewDisplay(value) {
   const source = value && typeof value === "object" ? value : {};
-  return {
+  const result = {
     ...predictionOpportunityDisplay(source),
     preview_id: source.preview_id ?? source.id,
     title: source.title ?? source.question ?? source.market_title ?? source.event_title,
@@ -2567,10 +2652,36 @@ function predictionPreviewDisplay(value) {
     wallet: source.masked_wallet ?? source.wallet_address,
     policy_limits: source.policy_limits,
   };
+  if (String(result.market_type || "") === "threshold_hedge") {
+    result.question_a = source.question_a;
+    result.question_b = source.question_b;
+    result.relation = source.relation;
+    result.condition_id_a = source.condition_id_a;
+    result.condition_id_b = source.condition_id_b;
+    result.buy_legs = Array.isArray(source.buy_legs) ? source.buy_legs : [];
+    result.maximum_fee = source.maximum_fee;
+    result.minimum_payout = source.minimum_payout;
+    result.rules_hash_a = source.rules_hash_a;
+    result.rules_hash_b = source.rules_hash_b;
+    result.cache_key = source.cache_key;
+  }
+  return result;
 }
 
 function predictionPreviewIsComplete(value) {
   const preview = predictionPreviewDisplay(value);
+  if (String(preview.market_type || "") === "threshold_hedge") {
+    const legs = Array.isArray(preview.buy_legs) ? preview.buy_legs : [];
+    return [preview.preview_id, preview.question_a, preview.question_b, preview.relation, preview.condition_id_a, preview.condition_id_b, preview.wallet]
+      .every(predictionHasValue)
+      && predictionHasValue(preview.quantity)
+      && predictionHasValue(preview.max_cost)
+      && predictionHasValue(preview.profit)
+      && predictionHasValue(preview.available_balance)
+      && predictionPolicyIsComplete(preview.policy_limits)
+      && legs.length === 2
+      && legs.every((leg) => [leg?.label, leg?.outcome, leg?.condition_id, leg?.quantity, leg?.max_price, leg?.max_cost].every(predictionHasValue));
+  }
   const policy = preview.policy_limits;
   const textFields = [
     preview.preview_id,
@@ -2613,6 +2724,10 @@ function predictionModalHtml(kind, data = {}) {
   const normalCap = predictionMoney(policy.max_normal_cost);
   const emergencyCap = predictionMoney(policy.max_emergency_loss);
   const minimumProfit = predictionMoney(policy.min_estimated_profit);
+  if (String(opportunity.market_type || "") === "threshold_hedge") {
+    const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>${description}</p></header><div class="pm-order-market"><span>Polymarket · 阈值关系套利 · ${escapeHtml(predictionValue(opportunity.relation, "关系未返回"))}</span><strong>${escapeHtml(predictionValue(opportunity.question_a, "数据未返回"))}<br>${escapeHtml(predictionValue(opportunity.question_b, "数据未返回"))}</strong></div><div class="pm-order-legs">${legs.map((leg) => `<article class="pm-order-leg"><span>${escapeHtml(predictionValue(leg.label))} · BUY ${escapeHtml(predictionValue(leg.outcome))} · FOK · ${escapeHtml(predictionConditionLabel(leg.condition_id))}</span><strong>${escapeHtml(predictionValue(leg.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · 全成或全撤</small></article>`).join("")}</div><div class="pm-order-summary"><div><span>含费最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost))}</strong></div><div><span>最低收回</span><strong>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>最低净利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit))}</strong></div></div><div class="pm-risk-note" role="note"><strong>两笔订单不是原子交易，也不会 merge</strong><p>两个 condition 必须分别成交和核对；若只成交一腿，系统最多按 ${escapeHtml(emergencyCap)} 预计补腿或平仓，超过上限就熔断并通知。</p></div><div class="pm-check-list"><div class="pm-check"><span>规则校验</span><strong>${escapeHtml(predictionLlmDecisionLabel(opportunity))} · ${escapeHtml(predictionValue(opportunity.llm_summary, "结构化理由未返回"))}</strong></div><div class="pm-check"><span>独立钱包</span><strong>${escapeHtml(predictionMaskedWallet(opportunity.wallet))} · 可用 ${escapeHtml(predictionMoney(opportunity.available_balance))} pUSD</strong></div><div class="pm-check"><span>确认时处理</span><strong>重新检查两条规则、两个盘口、费用、余额和地区</strong></div></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="confirm">确认下单 · 最多 ${escapeHtml(normalCap)}</button></footer></section>`;
+  }
   return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>${description}</p></header><div class="pm-order-market"><span>Polymarket · ${escapeHtml(predictionMarketTypeLabel(opportunity.market_type))} · ${escapeHtml(predictionFeeStatusLabel(opportunity.fee_status))}</span><strong>${escapeHtml(predictionValue(opportunity.title, "-"))}</strong></div><div class="pm-order-legs"><article class="pm-order-leg"><span>第一腿 · BUY YES · FOK</span><strong>${escapeHtml(predictionValue(opportunity.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(opportunity.yes_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(opportunity.yes_cost))} · 全成或全撤</small></article><article class="pm-order-leg"><span>第二腿 · BUY NO · FOK</span><strong>${escapeHtml(predictionValue(opportunity.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(opportunity.no_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(opportunity.no_cost))} · 全成或全撤</small></article></div><div class="pm-order-summary"><div><span>正常最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost))}</strong></div><div><span>合并收回</span><strong>${escapeHtml(predictionMoney(opportunity.merge_value))}</strong></div><div><span>最低净利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit))}</strong></div></div><div class="pm-risk-note" role="note"><strong>两笔订单不是原子交易</strong><p>可能只成交一腿。你授权系统最多承担 ${escapeHtml(emergencyCap)} 预计损失进行补腿或平仓；随后会熔断并通知。</p></div><div class="pm-check-list"><div class="pm-check"><span>独立钱包</span><strong>${escapeHtml(predictionMaskedWallet(opportunity.wallet))} · 可用 ${escapeHtml(predictionMoney(opportunity.available_balance))} pUSD</strong></div><div class="pm-check"><span>钱包余额上限</span><strong>${escapeHtml(walletCap)} pUSD</strong></div><div class="pm-check"><span>确认时处理</span><strong>重新检查价格、费用、余额和地区</strong></div><div class="pm-check"><span>失败规则</span><strong>净利润低于 ${escapeHtml(minimumProfit)} 就拒绝，不追价</strong></div></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="confirm">确认下单 · 最多 ${escapeHtml(normalCap)}</button></footer></section>`;
 }
 
