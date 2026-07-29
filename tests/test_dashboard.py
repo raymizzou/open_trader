@@ -419,6 +419,105 @@ def test_exact_historical_report_includes_its_immutable_execution(
     assert report["strategy_version"] == "v1"
 
 
+def test_trend_report_projects_only_same_day_futu_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+08:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    payload["strategy_judgments"]["holding_decisions"] = [
+        {"action": "HOLD", "reason": "trend_intact", "symbol": "SPY"},
+    ]
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-15",
+    )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["buy_actions"][0]["option_anomaly"]["available"] is True
+    assert report["buy_actions"][0]["option_anomaly"]["summary"] == "期权波动率偏高。"
+    assert report["hold_actions"][0]["option_anomaly"]["available"] is False
+    assert report["hold_actions"][0]["option_anomaly"]["reason"] == "富途未返回该标的期权异动"
+
+
+def test_trend_report_disables_mismatched_futu_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+08:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-14",
+    )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    option_anomaly = report["buy_actions"][0]["option_anomaly"]
+    assert option_anomaly["available"] is False
+    assert option_anomaly["status"] == "stale_run_date"
+    assert option_anomaly["reason"] == "富途期权异动日期与趋势报告不一致"
+
+
+def test_historical_trend_report_uses_archived_futu_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+08:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-14",
+    )
+    write_futu_skill_facts(
+        config.data_dir / "runs/2026-07-15/US/futu_skill_facts.json",
+        run_date="2026-07-15",
+    )
+
+    report = dashboard_module.load_historical_trend_report(
+        config,
+        broker="tiger",
+        artifact="2026-07-15.json",
+    )
+
+    option_anomaly = report["buy_actions"][0]["option_anomaly"]
+    assert option_anomaly["available"] is True
+    assert option_anomaly["run_date"] == "2026-07-15"
+
+
 @pytest.mark.parametrize("artifact", ["../secret.json", "/tmp/secret.json"])
 def test_historical_report_rejects_unsafe_artifact_paths(
     tmp_path: Path, artifact: str,
@@ -3230,7 +3329,10 @@ def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
 
     assert report["account_fresh"] is False
     assert report["account_status"] == "账户数据非实时，执行前核对现金与持仓"
-    assert report["buy_actions"] == [stale_buy]
+    assert report["buy_actions"][0]["action"] == stale_buy["action"]
+    assert report["buy_actions"][0]["symbol"] == stale_buy["symbol"]
+    assert report["buy_actions"][0]["name"] == stale_buy["name"]
+    assert report["buy_actions"][0]["option_anomaly"]["available"] is False
     assert report["review_actions"] == []
     assert report["counts"]["buy"] == 1
     assert report["counts"]["review"] == 0
