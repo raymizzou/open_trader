@@ -3,6 +3,13 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-30
+
+- Prevented CN/HK/US trend controllers from repeatedly revalidating already
+  completed historical action audits on every polling cycle. Each process still
+  validates them once after startup, then keeps heartbeats fresh during live
+  monitoring; verified against the large US audit ledger and controller tests.
+
 ## 2026-07-29
 
 - Dashboard 美股/港股趋势报告在正式买入和继续持有标的下增加富途“期权异动”按钮；同日数据可查看只读详情，缺失或过期时置灰。移除旧跨市场“期权关注”入口，并从飞书趋势报告删除该段落。
