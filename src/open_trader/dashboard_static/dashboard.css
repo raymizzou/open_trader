@@ -5182,6 +5182,11 @@ table {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .trend-option-dialog button {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
   .trend-option-dialog footer,
   .trend-option-dialog footer button {
     width: 100%;

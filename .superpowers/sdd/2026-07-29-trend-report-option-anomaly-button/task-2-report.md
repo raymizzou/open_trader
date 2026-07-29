@@ -63,3 +63,25 @@ $ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q tests/test_dashb
   this task only covers render/CSS behavior and focused Python-driven JS tests.
 - Dialog data is intentionally limited to `item.option_anomaly`; the server
   projection and date/freshness policy are supplied by Task 1.
+
+## Fix round 1
+
+Addressed the reviewer findings:
+
+- Mobile `.trend-option-dialog button` controls now have both `min-height` and
+  `min-width` of 44px, including the header and footer close controls.
+- Each dialog has an escaped `aria-label` tied to its visible symbol heading.
+- The render test now exercises delegated `showModal()` and `close()` targets.
+
+```text
+$ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q \
+    tests/test_dashboard_web.py::test_dashboard_renders_option_anomaly_button_and_native_dialog \
+    tests/test_dashboard_web.py::test_dashboard_trend_option_button_mobile_layout_css
+..                                                                       [100%]
+2 passed in 0.62s
+
+$ /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q tests/test_dashboard_web.py
+276 passed in 38.13s
+```
+
+`git diff --check` passed with no output.

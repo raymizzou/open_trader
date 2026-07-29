@@ -6788,11 +6788,24 @@ const cn = renderTrendReportWorkspace(report("CN"));
 if ((usBuyHold.match(/期权异动/g) || []).length < 1) throw new Error(usBuyHold);
 if ((usBuyHold.match(/data-option-anomaly-open/g) || []).length !== 2) throw new Error(usBuyHold);
 if ((usBuyHold.match(/<dialog class="trend-option-dialog"/g) || []).length !== 2) throw new Error(usBuyHold);
+if (!usBuyHold.includes('aria-label="富途期权异动详情：VIXY 波动率ETF"')) throw new Error(usBuyHold);
 if (!usBuyHold.includes("&lt;b&gt;不得执行&lt;/b&gt;") || !usBuyHold.includes("&lt;img src=x onerror=alert(1)&gt;")) throw new Error(usBuyHold);
 if (!usBuyHold.includes('disabled title="富途未返回该标的期权异动"')) throw new Error(usBuyHold);
 if (usSell.includes("期权异动") || usReview.includes("期权异动")) throw new Error(usSell + usReview);
 if (cn.includes("期权异动")) throw new Error(cn);
 if ((usBuy.match(/<th scope="col">/g) || []).length !== 16) throw new Error(usBuy);
+let opened = 0;
+let closed = 0;
+const dialog = {showModal(){opened += 1;}, close(){closed += 1;}};
+const openTarget = {
+  parentElement:{querySelector(selector){if (selector !== "dialog.trend-option-dialog") throw new Error(selector); return dialog;}},
+  closest(selector){return selector === "[data-option-anomaly-open]" ? this : null;},
+};
+const closeTarget = {
+  closest(selector){return selector === "[data-option-anomaly-close]" ? this : selector === "dialog" ? dialog : null;},
+};
+if (!handleTrendOptionDialog({target:openTarget}) || opened !== 1) throw new Error("dialog did not open");
+if (!handleTrendOptionDialog({target:closeTarget}) || closed !== 1) throw new Error("dialog did not close");
 console.log("ok");
 ''')
 
@@ -6810,6 +6823,9 @@ def test_dashboard_trend_option_button_mobile_layout_css() -> None:
     button_css = mobile.split(".trend-option-button", 1)[1].split("}", 1)[0]
     assert "min-height: 44px;" in button_css
     assert "grid-template-columns: minmax(0, 1fr);" in mobile
+    dialog_buttons = mobile.split(".trend-option-dialog button", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px;" in dialog_buttons
+    assert "min-width: 44px;" in dialog_buttons
 
 
 def test_dashboard_renders_fixed_order_futu_option_attention_list() -> None:

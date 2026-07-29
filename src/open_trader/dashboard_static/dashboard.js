@@ -3069,7 +3069,7 @@ function renderTrendOptionDialog(item, anomaly) {
   const windowDays = hasValue(anomaly.window_days)
     ? `${formatPlain(anomaly.window_days)} 天`
     : "数据未提供";
-  return `<dialog class="trend-option-dialog">
+  return `<dialog class="trend-option-dialog" aria-label="富途期权异动详情：${escapeHtml(identity)}">
     <header class="trend-option-dialog-header">
       <div><p>富途期权异动</p><h3>${escapeHtml(identity)}</h3></div>
       <button type="button" data-option-anomaly-close aria-label="关闭期权异动详情">×</button>
