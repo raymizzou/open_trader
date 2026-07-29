@@ -443,12 +443,12 @@ def setup_threshold_books(
     )
 
 
-def test_threshold_discovery_scans_all_pages_and_only_calls_codex_for_positive_relation(
+def test_threshold_discovery_scans_relation_first_page_and_only_calls_codex_for_positive_relation(
     tmp_path: Path,
 ) -> None:
     rows = [
         event(f"top-{index:02d}", volume=str(1000 - index), markets=(market(f"m-{index:02d}"),))
-        for index in range(20)
+        for index in range(19)
     ]
     rows.append(threshold_event())
     setup_public(rows)
@@ -475,8 +475,8 @@ def test_threshold_discovery_scans_all_pages_and_only_calls_codex_for_positive_r
         "ended": False,
         "page_size": 100,
     }
-    assert PagePaginator.first_page_calls == 1
-    assert PagePaginator.iter_calls == 1
+    assert PagePaginator.first_page_calls == 2
+    assert PagePaginator.iter_calls == 0
     assert len(monitor.snapshot()["events"]) == 20
     threshold_rows = [
         row

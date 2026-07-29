@@ -633,7 +633,13 @@ class PolymarketMonitor:
             ended=False,
             page_size=THRESHOLD_BOOK_BATCH_SIZE,
         )
-        events = await _collect(raw)
+        # The SDK async iterator may issue a slow per-item follow-up request on
+        # the live Gamma endpoint.  A full iterator therefore regularly
+        # outlives the monitor's bounded refresh window before discovery can
+        # even start.  The first Gamma page still expands coverage fivefold
+        # over the ordinary Top-20 monitor and keeps the relation layer
+        # time-bounded; the next scheduled scan refreshes the active window.
+        events = await _collect_first_page(raw)
         resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
         if not callable(resolver):
             raise RuntimeError("relation discovery is not callable")
