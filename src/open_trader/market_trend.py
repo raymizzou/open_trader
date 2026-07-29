@@ -61,7 +61,7 @@ from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .parsers.base import detect_asset_class
-from .trend_animals import TrendAnimalsClient, TrendAnimalsError, TrendAnimalsLookupError
+from .trend_animals import TrendAnimalsClient, TrendAnimalsError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
 from .strategy_drawdown import observe_strategy_equity
@@ -994,9 +994,11 @@ def _attempt_market_report(
             if row is None:
                 continue
             try:
-                symbol = _normalized_symbol(market, str(row.get("tickerSymbol", "")))
+                futu_symbol = from_trend_animals_symbol(
+                    market, str(row.get("tickerSymbol", ""))
+                )
                 bars = quote.get_daily_kline(
-                    to_futu_symbol(market, symbol), start=start, end=as_of_date
+                    futu_symbol, start=start, end=as_of_date
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):

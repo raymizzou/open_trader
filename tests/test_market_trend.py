@@ -694,7 +694,7 @@ def test_hk_etf_root_rejects_malformed_child_rows(
 def test_hk_etf_root_loads_unique_warm_to_hot_child() -> None:
     security = {
         "tmId": 708001,
-        "tickerSymbol": "02800.HK",
+        "tickerSymbol": "2800.HK",
         "asOfDate": "2026-07-24",
     }
 
@@ -904,11 +904,11 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
             if tm_id == 700001:
                 return [
-                    {"tmId": member_id, "tickerSymbol": f"028{member_id:03d}.HK", "asOfDate": expected_date}
+                    {"tmId": member_id, "tickerSymbol": f"28{member_id:02d}.HK", "asOfDate": expected_date}
                     for member_id in range(1, 11)
                 ]
             assert tm_id == 622494
-            return [{"tmId": 1, "tickerSymbol": "02800.HK", "asOfDate": expected_date}]
+            return [{"tmId": 1, "tickerSymbol": "2800.HK", "asOfDate": expected_date}]
 
         def search_exact_symbol(self, symbol: str, *, market: str) -> int:
             assert (symbol, market) == ("00700", "HK")
@@ -958,7 +958,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             assert kwargs["tm_ids"] == [1, 2]
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
-                snapshot(1, "02800.HK", "盈富基金"),
+                snapshot(1, "2800.HK", "盈富基金"),
                 snapshot(2, "0700.HK", "腾讯"),
             ]
 

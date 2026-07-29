@@ -54,7 +54,6 @@ from .trend_industry_context import (
 from .trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
-    TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
 from .trend_review import (
@@ -1497,21 +1496,8 @@ def _paid_expansion_fields(
 def _symbol_parts(value: object, *, market: str = "CN") -> tuple[str, str]:
     if not isinstance(value, str):
         raise ValueError("tickerSymbol must be a string")
-    normalized_market = market.strip().upper()
-    if normalized_market in {"US", "HK"}:
-        text = value.strip().upper()
-        suffix = f".{normalized_market}"
-        raw_symbol = text[: -len(suffix)] if text.endswith(suffix) else text
-        futu_symbol = to_futu_symbol(normalized_market, raw_symbol)
-        exchange, symbol = futu_symbol.split(".", 1)
-        return symbol, exchange
-    parts = value.strip().upper().rsplit(".", 1)
-    if len(parts) == 1:
-        exchange, symbol = to_futu_symbol("CN", parts[0]).split(".", 1)
-        return symbol, exchange
-    if len(parts) != 2 or len(parts[0]) != 6 or not parts[0].isdigit() or not parts[1]:
-        raise ValueError(f"invalid tickerSymbol: {value!r}")
-    return parts[0], parts[1]
+    exchange, symbol = from_trend_animals_symbol(market, value).split(".", 1)
+    return symbol, exchange
 
 
 def evaluate_candidate(
@@ -5220,7 +5206,7 @@ def _attempt_report(
                 holding_ids[position.symbol] = api.search_exact_symbol(
                     position.symbol, market="CN"
                 )
-            except TrendAnimalsLookupError:
+            except TrendAnimalsError:
                 continue
 
         requested_ids = sorted(component_ids | set(holding_ids.values()))

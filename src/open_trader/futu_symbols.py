@@ -61,9 +61,9 @@ def to_trend_animals_symbol(market: str, symbol: str) -> str:
     if exchange in CN_EXCHANGES:
         return f"{code}.{exchange}"
     if exchange == "HK":
-        if len(code) != 5 or not code.isdigit():
+        if len(code) != 5 or not code.isdigit() or not code.startswith("0"):
             raise ValueError(f"invalid HK symbol: {symbol}")
-        return f"{code[1:] if code.startswith('0') else code}.HK"
+        return f"{code[1:]}.HK"
     return code
 
 
@@ -71,13 +71,15 @@ def from_trend_animals_symbol(market: str, symbol: str) -> str:
     normalized_market = market.strip().upper()
     normalized_symbol = symbol.strip().upper()
     if normalized_market == "CN":
-        try:
-            code, exchange = normalized_symbol.rsplit(".", 1)
-        except ValueError:
-            raise ValueError(f"invalid CN Trend Animals symbol: {symbol}") from None
+        parts = normalized_symbol.rsplit(".", 1)
+        if len(parts) == 1:
+            return to_futu_symbol("CN", normalized_symbol)
+        code, exchange = parts
         if exchange not in CN_EXCHANGES:
             raise ValueError(f"invalid CN Trend Animals symbol: {symbol}")
-        return to_futu_symbol("CN", f"{exchange}.{code}")
+        if len(code) != 6 or not code.isdigit():
+            raise ValueError(f"invalid CN Trend Animals symbol: {symbol}")
+        return f"{exchange}.{code}"
     if normalized_market == "HK":
         try:
             code, exchange = normalized_symbol.rsplit(".", 1)

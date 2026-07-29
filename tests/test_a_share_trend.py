@@ -1610,7 +1610,7 @@ def test_candidate_accepts_days_amount_and_strength_boundaries() -> None:
     ("market", "ticker_symbol", "asset", "symbol", "exchange"),
     [
         ("US", "VIXY.US", "美股", "VIXY", "US"),
-        ("HK", "700.HK", "港股", "00700", "HK"),
+        ("HK", "0700.HK", "港股", "00700", "HK"),
     ],
 )
 def test_candidate_supports_hk_us_symbols_and_market_assets(
@@ -6799,7 +6799,9 @@ def test_report_runner_uses_first_later_cn_session_across_closed_days(tmp_path: 
     assert payload["execution_date"] == "2026-07-20"
 
 
-def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_path: Path) -> None:
+def test_report_runner_mapping_failure_is_manual_with_independent_price(
+    tmp_path: Path,
+) -> None:
     config = trend_config(tmp_path)
     write_portfolio(config.portfolio, [portfolio_row(symbol="600009")])
     timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
@@ -6823,18 +6825,45 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
     assert "价格缺失" not in str(payload["risk_summary"]["pause_reason"])
     assert "futu.kline.SH.600009" in calls
 
-    blocked = trend_config(tmp_path / "blocked")
-    write_portfolio(blocked.portfolio, [portfolio_row(symbol="600009")])
-    os.utime(blocked.portfolio, (timestamp, timestamp))
-    blocked_result = run_a_share_trend_report(
-        config=blocked, run_date="2026-07-14",
+    transport = trend_config(tmp_path / "transport")
+    write_portfolio(transport.portfolio, [portfolio_row(symbol="600009")])
+    os.utime(transport.portfolio, (timestamp, timestamp))
+    transport_calls: list[str] = []
+    transport_result = run_a_share_trend_report(
+        config=transport, run_date="2026-07-14",
         now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], holding_error=TrendAnimalsError("transport")),
-        quote_factory=lambda **kwargs: ReadyQuote([]),
+        quote_factory=lambda **kwargs: ReadyQuote(transport_calls),
         account_factory=simulation_account_with_positions("SH.600009"),
         notifier=RecordingMacOS(),
     )
-    assert blocked_result.status == "failed"
+    transport_payload = json.loads(
+        transport_result.json_path.read_text(encoding="utf-8")
+    )
+    transport_decision = transport_payload[
+        "strategy_judgments"
+    ]["holding_decisions"][0]
+    assert transport_result.status == "generated"
+    assert (
+        transport_decision["action"],
+        transport_decision["reason"],
+        transport_decision["close"],
+    ) == ("MANUAL_REVIEW", "holding_signal_unknown", "10")
+    assert "价格缺失" not in str(
+        transport_payload["risk_summary"]["pause_reason"]
+    )
+    assert "futu.kline.SH.600009" in transport_calls
+
+
+def test_candidate_rejects_cross_market_trend_symbol() -> None:
+    row = {
+        "tmId": 600036,
+        "tickerSymbol": "600036.HK",
+        "asOfDate": "2026-07-14",
+    }
+
+    with pytest.raises(ValueError, match="invalid CN Trend Animals symbol"):
+        evaluate_candidate(row, bars(), market="CN")
 
 
 def test_report_runner_rejects_cached_holding_symbol_mismatch(

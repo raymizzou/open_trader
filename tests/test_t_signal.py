@@ -229,6 +229,11 @@ def test_trend_animals_symbol_accepts_explicit_us_suffix() -> None:
     assert from_trend_animals_symbol("US", "ARWR.US") == "US.ARWR"
 
 
+def test_trend_animals_symbol_rejects_hk_code_without_futu_padding_zero() -> None:
+    with pytest.raises(ValueError):
+        to_trend_animals_symbol("HK", "HK.80000")
+
+
 @pytest.mark.parametrize(
     ("market", "symbol"),
     [
