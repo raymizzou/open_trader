@@ -5,6 +5,7 @@ import re
 
 KNOWN_PREFIXES = {"HK", "US", "CN", "SH", "SZ", "BJ"}
 US_SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)*")
+CN_EXCHANGES = {"SH", "SZ", "BJ"}
 
 
 def to_futu_symbol(market: str, symbol: str) -> str:
@@ -52,6 +53,47 @@ def to_futu_symbol(market: str, symbol: str) -> str:
     if normalized_market == "CN":
         return f"{_cn_exchange(normalized_symbol)}.{normalized_symbol}"
     raise ValueError(f"invalid symbol for market {normalized_market}: {symbol}")
+
+
+def to_trend_animals_symbol(market: str, symbol: str) -> str:
+    futu_symbol = to_futu_symbol(market, symbol)
+    exchange, code = futu_symbol.split(".", 1)
+    if exchange in CN_EXCHANGES:
+        return f"{code}.{exchange}"
+    if exchange == "HK":
+        if len(code) != 5 or not code.isdigit():
+            raise ValueError(f"invalid HK symbol: {symbol}")
+        return f"{code[1:] if code.startswith('0') else code}.HK"
+    return code
+
+
+def from_trend_animals_symbol(market: str, symbol: str) -> str:
+    normalized_market = market.strip().upper()
+    normalized_symbol = symbol.strip().upper()
+    if normalized_market == "CN":
+        try:
+            code, exchange = normalized_symbol.rsplit(".", 1)
+        except ValueError:
+            raise ValueError(f"invalid CN Trend Animals symbol: {symbol}") from None
+        if exchange not in CN_EXCHANGES:
+            raise ValueError(f"invalid CN Trend Animals symbol: {symbol}")
+        return to_futu_symbol("CN", f"{exchange}.{code}")
+    if normalized_market == "HK":
+        try:
+            code, exchange = normalized_symbol.rsplit(".", 1)
+        except ValueError:
+            raise ValueError(f"invalid HK Trend Animals symbol: {symbol}") from None
+        if exchange != "HK" or len(code) != 4 or not code.isdigit():
+            raise ValueError(f"invalid HK Trend Animals symbol: {symbol}")
+        return to_futu_symbol("HK", code)
+    if normalized_market == "US":
+        suffix = normalized_symbol.rsplit(".", 1)[-1]
+        if suffix == "US":
+            normalized_symbol = normalized_symbol[:-3]
+        elif suffix in KNOWN_PREFIXES:
+            raise ValueError(f"invalid US Trend Animals symbol: {symbol}")
+        return to_futu_symbol("US", normalized_symbol)
+    raise ValueError(f"unsupported Futu market: {market}")
 
 
 def _cn_exchange(symbol: str) -> str:

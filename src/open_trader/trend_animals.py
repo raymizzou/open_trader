@@ -10,6 +10,12 @@ from typing import Callable, Mapping, Sequence
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from .futu_symbols import (
+    from_trend_animals_symbol,
+    to_futu_symbol,
+    to_trend_animals_symbol,
+)
+
 
 BASE_URL = "https://www.trendtrader.cn/apiData/data"
 MAX_REQUEST_URL_LENGTH = 3_500
@@ -91,12 +97,12 @@ class TrendAnimalsClient:
             raise TrendAnimalsError("getAccountBalance returned no unique summary")
         return rows[0]
 
-    def search_exact_symbol(self, symbol: str) -> int:
+    def search_exact_symbol(self, symbol: str, *, market: str) -> int:
         if not isinstance(symbol, str):
             raise TypeError("symbol must be a string")
-        normalized = symbol.strip().upper().split(".", 1)[0]
-        if not normalized or not normalized.isalnum():
-            raise ValueError("symbol must contain only letters and digits")
+        target = to_futu_symbol(market, symbol)
+        normalized = target.split(".", 1)[1]
+        query = to_trend_animals_symbol(market, target)
         if self._api_key in normalized:
             raise ValueError("symbol conflicts with credentials")
         cache_path = self.cache_dir / "symbols" / f"{normalized}.json"
@@ -110,20 +116,24 @@ class TrendAnimalsClient:
                 raise TrendAnimalsError("symbol cache has an invalid shape")
             return cached["tmId"]
 
-        rows = self._get("searchTicker", {"keyword": normalized})
-        matches: list[dict[str, object]] = []
+        rows = self._get("searchTicker", {"keyword": query})
+        matches: set[int] = set()
         for row in rows:
             ticker_symbol = row.get("tickerSymbol")
             tm_id = row.get("tmId")
             if not isinstance(ticker_symbol, str) or not self._valid_tm_id(tm_id):
                 raise TrendAnimalsError("searchTicker returned an invalid row")
-            if ticker_symbol.split(".", 1)[0].upper() == normalized:
-                matches.append(row)
+            try:
+                candidate = from_trend_animals_symbol(market, ticker_symbol)
+            except ValueError:
+                continue
+            if candidate == target:
+                matches.add(tm_id)
         if len(matches) != 1:
             raise TrendAnimalsLookupError(
                 f"searchTicker found no unique exact match for {normalized}"
             )
-        tm_id = matches[0]["tmId"]
+        tm_id = next(iter(matches))
         self._write_cache(cache_path, {"symbol": normalized, "tmId": tm_id})
         return tm_id
 

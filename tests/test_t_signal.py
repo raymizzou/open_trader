@@ -7,6 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from open_trader.futu_symbols import (
+    from_trend_animals_symbol,
+    to_trend_animals_symbol,
+)
 from open_trader.t_signal import (
     TMarketFacts,
     TPortfolioBaseline,
@@ -200,6 +204,45 @@ def test_to_futu_symbol_normalizes_supported_market_symbols() -> None:
     assert to_futu_symbol("CN", "000001") == "SZ.000001"
     assert to_futu_symbol("CN", "000300") == "SH.000300"
     assert to_futu_symbol("CN", "SH.600025") == "SH.600025"
+
+
+@pytest.mark.parametrize(
+    ("market", "futu_symbol", "trend_symbol"),
+    [
+        ("CN", "SH.600036", "600036.SH"),
+        ("CN", "SZ.000001", "000001.SZ"),
+        ("HK", "HK.00027", "0027.HK"),
+        ("HK", "HK.00622", "0622.HK"),
+        ("HK", "HK.00939", "0939.HK"),
+        ("HK", "HK.02800", "2800.HK"),
+        ("US", "US.ARWR", "ARWR"),
+    ],
+)
+def test_trend_animals_symbol_round_trip(
+    market: str, futu_symbol: str, trend_symbol: str
+) -> None:
+    assert to_trend_animals_symbol(market, futu_symbol) == trend_symbol
+    assert from_trend_animals_symbol(market, trend_symbol) == futu_symbol
+
+
+def test_trend_animals_symbol_accepts_explicit_us_suffix() -> None:
+    assert from_trend_animals_symbol("US", "ARWR.US") == "US.ARWR"
+
+
+@pytest.mark.parametrize(
+    ("market", "symbol"),
+    [
+        ("HK", "600036.SH"),
+        ("CN", "0027.HK"),
+        ("US", "0027.HK"),
+        ("HK", "000027.HK"),
+    ],
+)
+def test_trend_animals_symbol_rejects_cross_market_or_malformed_code(
+    market: str, symbol: str
+) -> None:
+    with pytest.raises(ValueError):
+        from_trend_animals_symbol(market, symbol)
 
 
 @pytest.mark.parametrize(

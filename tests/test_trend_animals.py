@@ -302,14 +302,61 @@ def test_search_exact_symbol_caches_tm_id_without_guessing(tmp_path: Path) -> No
         api_key="secret-value", cache_dir=tmp_path, transport=transport
     )
 
-    assert client.search_exact_symbol("600025") == 7
-    assert client.search_exact_symbol("600025.SH") == 7
+    assert client.search_exact_symbol("SH.600025", market="CN") == 7
+    assert client.search_exact_symbol("600025", market="CN") == 7
     assert len(transport.calls) == 1
     assert transport.calls[0][1] == {
         "apiKey": ["secret-value"],
-        "keyword": ["600025"],
+        "keyword": ["600025.SH"],
     }
     assert (tmp_path / "symbols" / "600025.json").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("market", "symbol", "ticker_symbol", "keyword"),
+    [
+        ("HK", "HK.00027", "0027.HK", "0027.HK"),
+        ("CN", "SH.600036", "600036.SH", "600036.SH"),
+        ("US", "US.ARWR", "ARWR.US", "ARWR"),
+    ],
+)
+def test_search_exact_symbol_uses_market_qualified_conversion(
+    market: str,
+    symbol: str,
+    ticker_symbol: str,
+    keyword: str,
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        {
+            "searchTicker": success(
+                [{"tmId": 7, "tickerSymbol": ticker_symbol}]
+            )
+        }
+    )
+    client = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=transport
+    )
+
+    assert client.search_exact_symbol(symbol, market=market) == 7
+    assert transport.calls[0][1]["keyword"] == [keyword]
+
+
+def test_search_exact_symbol_rejects_cross_market_result(tmp_path: Path) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "searchTicker": success(
+                    [{"tmId": 7, "tickerSymbol": "000027.SZ"}]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsLookupError, match="no unique exact match"):
+        client.search_exact_symbol("HK.00027", market="HK")
 
 
 def test_snapshot_rejects_wrong_data_date_without_caching(tmp_path: Path) -> None:
@@ -415,7 +462,7 @@ def test_exact_symbol_miss_has_distinct_error(tmp_path: Path) -> None:
     )
 
     with pytest.raises(TrendAnimalsLookupError, match="no unique exact match"):
-        client.search_exact_symbol("600025")
+        client.search_exact_symbol("600025", market="CN")
 
 
 @pytest.mark.parametrize(
@@ -436,7 +483,7 @@ def test_exact_symbol_rejects_invalid_match_values(
     )
 
     with pytest.raises(TrendAnimalsError, match="searchTicker"):
-        client.search_exact_symbol("600025")
+        client.search_exact_symbol("600025", market="CN")
 
 
 def test_corrupt_response_cache_fails_without_repurchase(tmp_path: Path) -> None:
@@ -471,7 +518,7 @@ def test_corrupt_symbol_cache_fails_without_search(tmp_path: Path) -> None:
     )
 
     with pytest.raises(TrendAnimalsError, match="cache"):
-        client.search_exact_symbol("600025")
+        client.search_exact_symbol("600025", market="CN")
 
     assert transport.calls == []
 
@@ -616,7 +663,7 @@ def test_secret_shaped_inputs_never_reach_paths_or_errors(tmp_path: Path) -> Non
     )
 
     with pytest.raises(ValueError) as exc_info:
-        client.search_exact_symbol("600025")
+        client.search_exact_symbol("600025", market="CN")
 
     assert "600025" not in str(exc_info.value)
     assert list(tmp_path.rglob("*")) == []
