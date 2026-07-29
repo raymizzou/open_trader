@@ -401,7 +401,7 @@ git commit -m "feat: monitor cross-market threshold hedges"
 - Consumes: `ThresholdHedgeIntent` and the existing authenticated signer/account/geoblock/preflight collaborators.
 - Produces: `no_submit_threshold_preflight`, `submit_threshold_hedge_once`, `reconcile_threshold_hedge`, threshold preview, final confirmation, remediation, and `holding_to_resolution`.
 
-- [ ] **Step 1: Write failing signer/preflight tests**
+- [x] **Step 1: Write failing signer/preflight tests**
 
 Assert the trading client:
 
@@ -414,7 +414,7 @@ Assert the trading client:
 - posts the two signed orders exactly once;
 - treats ambiguous POST results as ambiguous and never retries.
 
-- [ ] **Step 2: Run trading tests and verify RED**
+- [x] **Step 2: Run trading tests and verify RED**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -423,11 +423,11 @@ Assert the trading client:
 
 Expected: missing threshold preflight/submission methods.
 
-- [ ] **Step 3: Add explicit threshold methods without changing same-market methods**
+- [x] **Step 3: Add explicit threshold methods without changing same-market methods**
 
 Reuse `_sign_leg`, `_signed_quantity`, `account_snapshot`, and `post_orders`. Do not coerce threshold legs into `PairIntent`, fabricate a shared condition ID, or call `merge_once`.
 
-- [ ] **Step 4: Write failing execution tests**
+- [x] **Step 4: Write failing execution tests**
 
 Cover:
 
@@ -443,7 +443,7 @@ Cover:
 - one filled leg uses only a verified `<= $2` remediation option, opens breaker, and notifies;
 - unknown state never retries and opens breaker.
 
-- [ ] **Step 5: Run execution tests and verify RED**
+- [x] **Step 5: Run execution tests and verify RED**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -452,7 +452,7 @@ Cover:
 
 Expected: threshold opportunities cannot be parsed and same-market merge behavior fails the expected holding assertion.
 
-- [ ] **Step 6: Add a narrow threshold branch**
+- [x] **Step 6: Add a narrow threshold branch**
 
 Parse intent by `intent_type`. Share preview TTL, locks, idempotency, volatile checks, evidence persistence, remediation selection, incidents, and notifications. Branch only at trading preflight/submission/reconciliation and successful terminal handling:
 
@@ -463,7 +463,7 @@ threshold_hedge  → holding_to_resolution, merge never invoked
 
 Add `holding_to_resolution` to terminal/non-in-flight store states while retaining it in execution history.
 
-- [ ] **Step 7: Run execution/trading/store regressions and commit**
+- [x] **Step 7: Run execution/trading/store regressions and commit**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -494,11 +494,11 @@ git commit -m "feat: execute cross-condition threshold hedges"
 - Consumes: monitor/store threshold snapshot and the unchanged preview/confirm HTTP routes.
 - Produces: threshold opportunity cards, structured LLM decisions/reasons, annualized distribution, usage summary, folded logs, and a cross-condition confirmation modal.
 
-- [ ] **Step 1: Write failing API projection tests**
+- [x] **Step 1: Write failing API projection tests**
 
 Assert threshold fields survive `_prediction_state_payload` redaction/aliasing, full wallet/token secrets remain masked, Codex raw prompt/stdout never appears, and unavailable state disables ordering while preserving reasons and metrics.
 
-- [ ] **Step 2: Run API tests and verify RED**
+- [x] **Step 2: Run API tests and verify RED**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -507,7 +507,7 @@ Assert threshold fields survive `_prediction_state_payload` redaction/aliasing, 
 
 Expected: missing threshold aliases/fields.
 
-- [ ] **Step 3: Add threshold card and modal rendering**
+- [x] **Step 3: Add threshold card and modal rendering**
 
 Show:
 
@@ -522,7 +522,7 @@ Show:
 
 The preview modal says the two orders are non-atomic, belong to separate conditions, will not merge, and authorize at most `$2` estimated remediation.
 
-- [ ] **Step 4: Add distribution, usage, and folded scan logs**
+- [x] **Step 4: Add distribution, usage, and folded scan logs**
 
 Use native `<details>` for the nonpersistent logs. Render current/7d/30d distributions and:
 
@@ -533,11 +533,11 @@ input tokens · cached input tokens · output tokens
 
 Do not add a charting dependency.
 
-- [ ] **Step 5: Add Playwright acceptance states**
+- [x] **Step 5: Add Playwright acceptance states**
 
 Cover APPROVE/actionable, REJECT/reason, unavailable, stale, tiny positive profit, multiple holdings, modal/cancel/confirm, and `<details>` collapsed by default at 1920, 1440, 768, and 375 widths.
 
-- [ ] **Step 6: Run Dashboard tests and commit**
+- [x] **Step 6: Run Dashboard tests and commit**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -566,11 +566,11 @@ git commit -m "feat: show threshold hedge validation"
 - Consumes: existing Dashboard/launchd monitor construction.
 - Produces: production discovery/validator wiring using the local Codex CLI.
 
-- [ ] **Step 1: Write failing production wiring tests**
+- [x] **Step 1: Write failing production wiring tests**
 
 Assert configured prediction-arbitrage startup creates discovery and Codex validator once, does not require `DEEPSEEK_API_KEY`, and reports `unavailable` rather than crashing when `codex` is absent or not logged in.
 
-- [ ] **Step 2: Run wiring tests and verify RED**
+- [x] **Step 2: Run wiring tests and verify RED**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -578,11 +578,11 @@ Assert configured prediction-arbitrage startup creates discovery and Codex valid
   tests/test_prediction_arbitrage_launchd.py -k 'prediction and codex' -q
 ```
 
-- [ ] **Step 3: Wire production collaborators and update changelog**
+- [x] **Step 3: Wire production collaborators and update changelog**
 
 Construct both collaborators beside the existing monitor/store/trading services. Add the dated operator-facing entry to `CHANGELOG.md` before any merge.
 
-- [ ] **Step 4: Run all focused automated tests**
+- [x] **Step 4: Run all focused automated tests**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -596,15 +596,15 @@ Construct both collaborators beside the existing monitor/store/trading services.
   tests/test_prediction_arbitrage_launchd.py -q
 ```
 
-- [ ] **Step 5: Run live read-only workflows**
+- [x] **Step 5: Run live read-only workflows**
 
 Run one real full Gamma scan, one real CLOB batch read, and one real Codex cache-miss validation. Confirm the second validation is a cache hit and the 24h usage counter increments once. Run `prediction-arb preflight --no-submit`; do not post orders.
 
-- [ ] **Step 6: Inspect long-running process state before final gate**
+- [x] **Step 6: Inspect long-running process state before final gate**
 
 Record current monitor/dashboard PIDs, working directories, Git SHAs, screen sessions, launchd jobs, and fresh logs. Stop any review process that still has pre-change code loaded.
 
-- [ ] **Step 7: Commit final wiring and changelog**
+- [x] **Step 7: Commit final wiring and changelog**
 
 ```bash
 git add src/open_trader/dashboard_web.py src/open_trader/cli.py \
