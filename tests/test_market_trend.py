@@ -29,7 +29,7 @@ from open_trader.market_trend import (
     run_market_trend_report,
     updates_ready,
 )
-from open_trader.trend_animals import TrendAnimalsError
+from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
 from open_trader.notifications import (
     FeishuWebhookNotifier,
     NotificationError,
@@ -910,8 +910,8 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             assert tm_id == 622494
             return [{"tmId": 1, "tickerSymbol": "02800.HK", "asOfDate": expected_date}]
 
-        def search_exact_symbol(self, symbol: str) -> int:
-            assert symbol == "00700"
+        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
+            assert (symbol, market) == ("00700", "HK")
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
@@ -959,7 +959,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             assert kwargs["fields"] == UNIFIED_TREND_FIELDS
             return [
                 snapshot(1, "02800.HK", "盈富基金"),
-                snapshot(2, "00700.HK", "腾讯"),
+                snapshot(2, "0700.HK", "腾讯"),
             ]
 
     class Quote:
@@ -1103,6 +1103,126 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
 
 
+@pytest.mark.parametrize(
+    ("lookup_fails", "returned_symbol"),
+    [
+        (True, None),
+        (False, "AAPL.US"),
+    ],
+    ids=("holding_lookup_miss", "cached_holding_symbol_mismatch"),
+)
+def test_market_report_keeps_futu_holding_price_when_trend_mapping_is_unavailable(
+    tmp_path: Path,
+    lookup_fails: bool,
+    returned_symbol: str | None,
+) -> None:
+    cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, "US")
+    quote_requests: list[str] = []
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": "美股", "asOfDate": "2026-07-14"},
+                {"asset": "美国ETF", "asOfDate": "2026-07-14"},
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
+            assert (symbol, market) == ("VIXY", "US")
+            if lookup_fails:
+                raise TrendAnimalsLookupError("missing")
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs["tm_ids"] == [2]
+            return [{
+                "tmId": 2,
+                "tickerName": "Wrong cached symbol",
+                "tickerSymbol": returned_symbol,
+                "asset": "美股",
+                "asOfDate": "2026-07-14",
+                "tradableFlag": True,
+                "industryName": "ETF",
+                "amount1d": "2",
+                "isTrendRightSide": True,
+                "daysSinceTrendEntry": 3,
+                "trendStrengthLocalCurr": "96",
+                "stopwinFlagByDangerSignal": False,
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+            }]
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-07-14", "2026-07-15"]
+
+        def get_daily_kline(
+            self, symbol: str, **kwargs: object
+        ) -> list[DailyKlineBar]:
+            quote_requests.append(symbol)
+            end = datetime(2026, 7, 14)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def close(self) -> None:
+            pass
+
+    result = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=simulation_account_with_positions("US.VIXY"),
+    )
+
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    decision = payload["strategy_judgments"]["holding_decisions"][0]
+    assert (decision["action"], decision["reason"]) == (
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+    )
+    assert decision["close"] == "10"
+    assert "价格缺失" not in str(payload["risk_summary"]["pause_reason"])
+    assert "US.VIXY" in quote_requests
+
+
 def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
     tmp_path: Path,
 ) -> None:
@@ -1229,8 +1349,8 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             assert (tm_id, expected_date) == (622460, "2026-07-14")
             return [{"tmId": 1, "tickerSymbol": "QQQ.US", "asOfDate": expected_date}]
 
-        def search_exact_symbol(self, symbol: str) -> int:
-            assert symbol == "VIXY"
+        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
+            assert (symbol, market) == ("VIXY", "US")
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
@@ -1440,7 +1560,7 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
         ) -> list[dict[str, object]]:
             return [{"tmId": 1, "tickerSymbol": "VIXY.US", "asOfDate": expected_date}]
 
-        def search_exact_symbol(self, symbol: str) -> int:
+        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:

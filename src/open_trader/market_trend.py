@@ -59,7 +59,7 @@ from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .trend_kelly import load_trend_kelly_rounds
 from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
-from .futu_symbols import to_futu_symbol
+from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .parsers.base import detect_asset_class
 from .trend_animals import TrendAnimalsClient, TrendAnimalsError, TrendAnimalsLookupError
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
@@ -955,7 +955,9 @@ def _attempt_market_report(
         holding_ids: dict[str, int] = {}
         for position in account.positions:
             try:
-                holding_ids[position.symbol] = api.search_exact_symbol(position.symbol)
+                holding_ids[position.symbol] = api.search_exact_symbol(
+                    position.symbol, market=market
+                )
             except TrendAnimalsError:
                 continue
         requested_ids = sorted(component_ids | set(holding_ids.values()))
@@ -1008,20 +1010,28 @@ def _attempt_market_report(
                 )
             )
         holding_snapshots = {position.symbol: None for position in account.positions}
-        for symbol, tm_id in holding_ids.items():
-            row = rows_by_id.get(tm_id)
-            bars = None
+        for position in account.positions:
             try:
-                bars = quote.get_daily_kline(
-                    to_futu_symbol(market, symbol), start=start, end=as_of_date
+                bars_by_symbol[position.symbol] = quote.get_daily_kline(
+                    to_futu_symbol(market, position.symbol),
+                    start=start,
+                    end=as_of_date,
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
-                bars = None
-            bars_by_symbol[symbol] = bars
+                bars_by_symbol[position.symbol] = None
+            except ValueError:
+                bars_by_symbol[position.symbol] = None
+        for symbol, tm_id in holding_ids.items():
+            row = rows_by_id.get(tm_id)
+            bars = bars_by_symbol[symbol]
             if row is not None:
                 try:
+                    if from_trend_animals_symbol(
+                        market, str(row.get("tickerSymbol") or "")
+                    ) != to_futu_symbol(market, symbol):
+                        continue
                     holding_snapshots[symbol] = _holding_snapshot(
                         row, market=market, bars=tuple(bars or ())
                     )
