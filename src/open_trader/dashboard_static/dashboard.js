@@ -3063,15 +3063,19 @@ function cnTrendHints(item) {
     : "数据不可用";
 }
 
-function trendIndustryBuyContext(report, item) {
+function trendIndustryContext(report, item) {
   const direct = item && item.industry_context && typeof item.industry_context === "object"
     ? item.industry_context : null;
   const contexts = Array.isArray(report?.industry_contexts)
     ? report.industry_contexts : [];
   const itemIndustryId = item?.industry_tm_id ?? item?.industry_id;
-  const context = direct || contexts.find((candidate) => candidate && typeof candidate === "object"
+  return direct || contexts.find((candidate) => candidate && typeof candidate === "object"
     && ((hasValue(itemIndustryId) && String(candidate.industry_tm_id) === String(itemIndustryId))
       || (hasValue(item?.industry) && String(candidate.industry) === String(item.industry))));
+}
+
+function trendIndustryBuyContext(report, item) {
+  const context = trendIndustryContext(report, item);
   if (!context) {
     return report?.industry_context_status?.current_complete === false
       ? "行业上下文无效 · 当前数据不完整" : "行业上下文未提供";
@@ -3090,6 +3094,11 @@ function trendIndustryBuyContext(report, item) {
       ? context.invalid_reasons.map(formatPlain).join("、") : "数据不可用"}`);
   }
   return parts.join(" · ") || "行业上下文未提供";
+}
+
+function trendIndustryBuyTemperature(report, item) {
+  if (hasValue(item?.industry_temperature)) return item.industry_temperature;
+  return trendIndustryContext(report, item)?.temperature;
 }
 
 function trendRiskPercent(value) {
@@ -3281,7 +3290,7 @@ function renderTrendBuyStage(report) {
       ${renderTrendCell("节气", item.phase)}
       ${renderTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : null)}
       ${renderTrendCell("行业", item.industry)}
-      ${renderTrendCell("行业温度", item.industry_temperature)}
+      ${renderTrendCell("行业温度", trendIndustryBuyTemperature(report, item))}
       ${renderTrendCell("行业确认", trendIndustryBuyContext(report, item))}
       ${renderTrendCell("市值（亿元）", hasValue(trendMoney(item, "market_cap_cny_100m", "market_cap")) ? formatDisplayNumber(trendMoney(item, "market_cap_cny_100m", "market_cap")) : null)}
       ${renderTrendCell("日成交额（亿元）", hasValue(trendMoney(item, "amount_cny_100m", "amount")) ? formatDisplayNumber(trendMoney(item, "amount_cny_100m", "amount")) : null)}

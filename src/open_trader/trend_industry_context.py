@@ -133,14 +133,10 @@ def calculate_industry_context(
         )
 
     invalid_reasons: list[str] = []
-    if component_count < 10:
-        invalid_reasons.append("component_count_below_10")
     if snapshot_coverage < Decimal("0.9"):
         invalid_reasons.append("snapshot_coverage_below_90pct")
     if right_state_coverage < Decimal("0.9"):
         invalid_reasons.append("right_state_coverage_below_90pct")
-    if valid_count < 10:
-        invalid_reasons.append("valid_count_below_10")
     if normalized_warm_to_hot_count is None:
         invalid_reasons.append("warm_to_hot_count_invalid")
     if temperature is None:

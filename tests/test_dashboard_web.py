@@ -6013,6 +6013,50 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_buy_rows_use_frozen_industry_temperature_for_every_market() -> None:
+    output = run_dashboard_js(r'''
+for (const market of ["CN", "US", "HK"]) {
+  const html = renderTrendBuyStage({
+    market,
+    buy_window:"常规交易时段",
+    buy_actions:[{symbol:"BUY",industry:"金融",industry_tm_id:7}],
+    risk_skips:[],
+    industry_contexts:[{
+      industry_tm_id:7,industry:"金融",temperature:"热",valid:true,
+      right_count:10,valid_count:20,right_share:"0.5",
+    }],
+  });
+  if (!html.includes('data-label="行业温度">热</td>')) {
+    throw new Error(market + "\n" + html);
+  }
+}
+const direct = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[{
+    symbol:"BUY",industry:"金融",industry_tm_id:7,industry_temperature:"沸",
+  }],
+  risk_skips:[],
+  industry_contexts:[{
+    industry_tm_id:7,industry:"金融",temperature:"热",valid:true,
+  }],
+});
+if (!direct.includes('data-label="行业温度">沸</td>')) throw new Error(direct);
+const legacy = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[{symbol:"BUY",industry:"美国医疗ETF",industry_tm_id:8}],
+  risk_skips:[],
+  industry_contexts:[{
+    industry_tm_id:8,industry:"美国医疗ETF",temperature:"热",valid:false,
+    invalid_reasons:["component_count_below_10","valid_count_below_10"],
+  }],
+});
+if (!legacy.includes('data-label="行业温度">热</td>')) throw new Error(legacy);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_compact_report_layout_contract_for_all_markets() -> None:
     output = run_dashboard_js(r'''
 const base = (market) => ({

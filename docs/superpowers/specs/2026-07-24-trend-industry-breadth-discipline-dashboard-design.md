@@ -4,6 +4,10 @@
 **Status:** Approved in conversation
 **Markets:** CN, US, HK
 
+**2026-07-29 amendment:** Complete small industry groups no longer fail a
+minimum component or valid-row count. See
+`2026-07-29-trend-industry-minimum-buy-display-design.md`.
+
 ## Goal
 
 Improve warm-to-hot candidate ordering with auditable industry context, show the
@@ -152,10 +156,8 @@ The report displays exact counts with the share, for example:
 An industry's current context is valid only when:
 
 - all rows use the report's exact `asOfDate`;
-- `component_count >= 10`;
 - `snapshot_count / component_count >= 90%`;
 - at least 90% of currently tradable rows have a boolean right-side state;
-- `valid_count >= 10`;
 - the industry temperature is a known Trend Animals temperature; and
 - industry strength is finite and between 0 and 100 inclusive.
 

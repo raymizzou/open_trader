@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Removed the local 10-component and 10-valid-row minimums from trend industry
+  context validation, so complete small ETF groups no longer disable industry
+  ordering for an entire market. CN/HK/US buy plans now reuse each report's
+  frozen industry context when the action row lacks industry temperature.
 - Allowed an explicitly authorized same-day simulated late buy to bind a
   higher, hash-verified corrective report when the execution batch had already
   frozen a bug-suppressed report. Recovery still requires a prior missed event,

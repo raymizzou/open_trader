@@ -992,6 +992,31 @@ def test_candidate_context_missing_prior_uses_current_only_for_every_candidate()
     assert decisions.ordering_mode == "context_current_only"
 
 
+def test_complete_small_context_keeps_industry_ordering_enabled() -> None:
+    small = replace(
+        _industry_context(1, temperature="平", strength="30"),
+        component_count=2,
+        snapshot_count=2,
+        tradable_count=2,
+        valid_count=2,
+        right_count=2,
+    )
+    decisions = build_candidate_list(
+        [
+            candidate("600001", strength="99", industry_tm_id=1),
+            candidate("600002", strength="96", industry_tm_id=2),
+        ],
+        held_symbols=set(),
+        industry_contexts={
+            1: small,
+            2: _industry_context(2, temperature="热", strength="100"),
+        },
+    )
+
+    assert decisions.ordering_mode == "context_with_history"
+    assert [item.symbol for item in decisions.eligible] == ["600002", "600001"]
+
+
 def test_invalid_current_industry_context_restores_legacy_order() -> None:
     rows = [
         candidate("600001", strength="99", days=5, amount="2", industry_tm_id=1),
