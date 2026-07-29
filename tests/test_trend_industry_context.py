@@ -388,6 +388,48 @@ def test_history_loader_accepts_legacy_rows_without_aggregate_fields(
     assert loaded[700001].aggregate_right_market_cap_ratio is None
 
 
+def test_history_writer_enriches_legacy_rows_with_optional_aggregate_fields(
+    tmp_path: Path,
+) -> None:
+    context = _valid_context(as_of_date="2026-07-23")
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(context,),
+    )
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    for row in legacy["industries"]:
+        for key in (
+            "aggregate_right_count_ratio",
+            "aggregate_right_market_cap_ratio",
+            "prior_aggregate_right_count_ratio",
+            "prior_aggregate_right_market_cap_ratio",
+        ):
+            row.pop(key)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    enriched = replace(
+        context,
+        aggregate_right_count_ratio=Decimal("0.191"),
+        aggregate_right_market_cap_ratio=Decimal("0.650"),
+    )
+    assert write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T19:00:00+08:00",
+        strategy_version="v10",
+        contexts=(enriched,),
+    ) == path
+
+    loaded = load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    )
+    assert loaded[700001].aggregate_right_count_ratio == Decimal("0.191")
+    assert loaded[700001].aggregate_right_market_cap_ratio == Decimal("0.650")
+
+
 @pytest.mark.parametrize("field", ["generated_at", "strategy_version"])
 def test_history_loader_requires_top_level_metadata(
     tmp_path: Path, field: str

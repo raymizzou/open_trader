@@ -378,7 +378,40 @@ def write_industry_context_history(
             and existing.get("industries") == payload["industries"]
         ):
             return path
-        raise ValueError("conflicting same-date industry context history")
+        aggregate_fields = {
+            "aggregate_right_count_ratio",
+            "aggregate_right_market_cap_ratio",
+            "prior_aggregate_right_count_ratio",
+            "prior_aggregate_right_market_cap_ratio",
+        }
+        existing_industries = (
+            existing.get("industries") if isinstance(existing, Mapping) else None
+        )
+        legacy_rows = (
+            [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in aggregate_fields
+                }
+                for row in payload["industries"]
+            ]
+            if isinstance(existing_industries, list)
+            and all(
+                isinstance(row, Mapping)
+                and aggregate_fields.isdisjoint(row)
+                for row in existing_industries
+            )
+            else None
+        )
+        if not (
+            isinstance(existing, Mapping)
+            and existing.get("schema_version") == _HISTORY_SCHEMA_VERSION
+            and existing.get("market") == market_name
+            and existing.get("as_of_date") == as_of_date
+            and existing_industries == legacy_rows
+        ):
+            raise ValueError("conflicting same-date industry context history")
     temp_path: Path | None = None
     try:
         with NamedTemporaryFile(
