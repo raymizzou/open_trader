@@ -274,4 +274,4 @@ At the relevant market's open session, bind authorization to the corrected repor
 
 - [ ] **Step 8: Verify broker and Kelly evidence**
 
-For every submitted action, verify the Futu simulated account id, order id, filled quantity/price, resulting position, exactly one matching order, immutable intent/result/observation/action files, and frozen report attribution. Sync statistics and verify the eventual round remains `attribution_status=attributed` and `kelly_eligible=true` when closed.
+For every submitted action, verify the Futu simulated account id, order id, filled quantity/price, resulting position, exactly one matching order, immutable intent/result/observation/action files, and frozen report attribution. Sync statistics and verify the opening fill is `attribution_status=attributed` with the frozen cost model; the existing closed-round test must prove that such an opening becomes `kelly_eligible=true` after its future exit.
