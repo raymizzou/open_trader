@@ -667,6 +667,34 @@ def test_current_live_snapshots_publish_exit_discipline_without_partial_profit(
         assert "沸状态仓位" not in rows
 
 
+@pytest.mark.parametrize("market", ["CN", "US", "HK"])
+def test_current_live_snapshots_summarize_industry_first_candidate_order(
+    market: str,
+) -> None:
+    pools = (
+        (622466, 697199)
+        if market == "CN"
+        else (622460,)
+        if market == "US"
+        else (622494,)
+    )
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        pools,
+    )
+    rows = {
+        row["name"]: row["value"]
+        for row in snapshot["parameter_rows"]
+    }
+
+    assert rows["排序顺序"] == (
+        "行业优先（变化、温度、强度、温转热数量、右侧占比），"
+        "再按个股趋势强度、右侧天数、成交额、代码；"
+        "缺历史省略变化键，行业上下文无效时回退个股排序"
+    )
+
+
 def test_cn_v8_snapshot_and_sizing_keep_legacy_boiling_two_percent() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199), strategy_version="v8"
@@ -990,6 +1018,31 @@ def test_candidate_context_missing_prior_uses_current_only_for_every_candidate()
     )
 
     assert decisions.ordering_mode == "context_current_only"
+
+
+def test_complete_small_context_keeps_industry_ordering_enabled() -> None:
+    small = replace(
+        _industry_context(1, temperature="平", strength="30"),
+        component_count=2,
+        snapshot_count=2,
+        tradable_count=2,
+        valid_count=2,
+        right_count=2,
+    )
+    decisions = build_candidate_list(
+        [
+            candidate("600001", strength="99", industry_tm_id=1),
+            candidate("600002", strength="96", industry_tm_id=2),
+        ],
+        held_symbols=set(),
+        industry_contexts={
+            1: small,
+            2: _industry_context(2, temperature="热", strength="100"),
+        },
+    )
+
+    assert decisions.ordering_mode == "context_with_history"
+    assert [item.symbol for item in decisions.eligible] == ["600002", "600001"]
 
 
 def test_invalid_current_industry_context_restores_legacy_order() -> None:

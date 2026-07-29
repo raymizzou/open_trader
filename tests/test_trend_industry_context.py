@@ -176,13 +176,29 @@ def test_calculation_records_stable_reasons_for_invalid_context_inputs() -> None
     assert context.strength is None
     assert not context.valid
     assert context.invalid_reasons == (
-        "component_count_below_10",
         "snapshot_coverage_below_90pct",
         "right_state_coverage_below_90pct",
-        "valid_count_below_10",
         "industry_temperature_invalid",
         "industry_strength_invalid",
     )
+
+
+def test_complete_small_industry_context_is_valid() -> None:
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="美国医疗ETF",
+        expected_date="2026-07-24",
+        component_tm_ids=[1, 2],
+        member_rows=[_member(1), _member(2)],
+        industry_row=_industry(),
+        warm_to_hot_count=2,
+    )
+
+    assert context.component_count == 2
+    assert context.valid_count == 2
+    assert context.right_share == Decimal("1")
+    assert context.valid
+    assert context.invalid_reasons == ()
 
 
 @pytest.mark.parametrize("warm_to_hot_count", [True, -1, "3"])

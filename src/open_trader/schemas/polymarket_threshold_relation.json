@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision",
+    "relation",
+    "market_a",
+    "market_b",
+    "proof",
+    "reason_codes",
+    "summary",
+    "evidence",
+    "uncertainties"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "decision": {
+      "enum": [
+        "APPROVE",
+        "REJECT"
+      ]
+    },
+    "relation": {
+      "enum": [
+        "A_IMPLIES_B",
+        "B_IMPLIES_A",
+        "NONE"
+      ]
+    },
+    "market_a": {
+      "$ref": "#/$defs/market"
+    },
+    "market_b": {
+      "$ref": "#/$defs/market"
+    },
+    "proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "excluded_state",
+        "why_excluded"
+      ],
+      "properties": {
+        "excluded_state": {
+          "enum": [
+            "A=YES,B=NO",
+            "A=NO,B=YES",
+            null
+          ]
+        },
+        "why_excluded": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "MISSING_RULES",
+          "SUBJECT_MISMATCH",
+          "METRIC_MISMATCH",
+          "SOURCE_MISMATCH",
+          "TIME_WINDOW_MISMATCH",
+          "TIMEZONE_MISMATCH",
+          "UNIT_MISMATCH",
+          "SPECIAL_SETTLEMENT_MISMATCH",
+          "NON_MONOTONIC_RULES",
+          "AMBIGUOUS_RULES",
+          "NOT_LOGICALLY_GUARANTEED",
+          "INVALID_INPUT"
+        ]
+      }
+    },
+    "summary": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "market",
+          "field",
+          "quote"
+        ],
+        "properties": {
+          "market": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "field": {
+            "type": "string"
+          },
+          "quote": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "uncertainties": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "condition_id",
+        "subject",
+        "metric",
+        "operator",
+        "threshold",
+        "unit",
+        "currency",
+        "observation_start",
+        "observation_end",
+        "timezone",
+        "resolution_source",
+        "special_settlement"
+      ],
+      "properties": {
+        "condition_id": {
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metric": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator": {
+          "enum": [
+            ">",
+            ">=",
+            "<",
+            "<=",
+            null
+          ]
+        },
+        "threshold": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observation_start": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observation_end": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timezone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolution_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "special_settlement": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

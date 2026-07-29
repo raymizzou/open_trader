@@ -11,10 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from open_trader.prediction_arbitrage import PairIntent
+from open_trader.prediction_arbitrage import PairIntent, ThresholdHedgeIntent, ThresholdHedgeLeg
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
-from open_trader.polymarket_trading import AccountSnapshot, LegResult, PairSubmission
+from open_trader.polymarket_trading import (
+    AccountSnapshot,
+    LegResult,
+    PairSubmission,
+    ThresholdHedgeSubmission,
+    ThresholdLegResult,
+)
 
 
 def _intent() -> PairIntent:
@@ -32,6 +38,27 @@ def _intent() -> PairIntent:
         total_max_cost=Decimal("8.00"),
         minimum_profit=Decimal("2.00"),
         net_edge=Decimal("0.20"),
+    )
+
+
+def _threshold_intent() -> ThresholdHedgeIntent:
+    return ThresholdHedgeIntent(
+        relation_id="relation-1",
+        event_id="event-threshold",
+        relation="B_IMPLIES_A",
+        leg_a=ThresholdHedgeLeg(
+            label="A", condition_id="condition-a", market_id="market-a",
+            outcome="YES", token_id="a-token", quantity=Decimal("10"),
+            max_price=Decimal("0.10"), max_cost=Decimal("1.00"), tick_size=Decimal("0.01"),
+        ),
+        leg_b=ThresholdHedgeLeg(
+            label="B", condition_id="condition-b", market_id="market-b",
+            outcome="NO", token_id="b-token", quantity=Decimal("10"),
+            max_price=Decimal("0.11"), max_cost=Decimal("1.10"), tick_size=Decimal("0.01"),
+        ),
+        quantity=Decimal("10"), maximum_fee=Decimal("0.02"),
+        total_max_cost=Decimal("2.12"), minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("7.88"), net_edge=Decimal("0.788"),
     )
 
 
@@ -94,6 +121,42 @@ class FakeMonitor:
         if self.include_tick:
             result["tick_size"] = self.tick_size
         return result
+
+
+class ThresholdMonitor(FakeMonitor):
+    def __init__(self, intent: ThresholdHedgeIntent) -> None:
+        super().__init__(_intent())
+        self.threshold_intent = intent
+        self.rules_hash_a = "hash-a"
+        self.rules_hash_b = "hash-b"
+        self.cache_key = "cache-key"
+
+    def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        if opportunity_id != "threshold-opp-1":
+            return None
+        intent = self.threshold_intent
+        return {
+            "opportunity_id": opportunity_id,
+            "intent_type": "threshold_hedge",
+            "event_id": intent.event_id,
+            "market_id": intent.relation_id,
+            "market_type": "threshold_hedge",
+            "relation_id": intent.relation_id,
+            "relation": intent.relation,
+            "condition_id_a": intent.leg_a.condition_id,
+            "condition_id_b": intent.leg_b.condition_id,
+            "question_a": "Will BTC be above 90k?",
+            "question_b": "Will BTC be above 100k?",
+            "rules_hash_a": self.rules_hash_a,
+            "rules_hash_b": self.rules_hash_b,
+            "cache_key": self.cache_key,
+            "actionable": True,
+            "eligibility_reason": "actionable",
+            "confirmed_at": datetime.now(UTC),
+            "confirmed_age_seconds": Decimal("1"),
+            "intent": intent,
+            "tick_size": Decimal("0.01"),
+        }
 
 
 class FakeTrading:
@@ -270,6 +333,77 @@ class FakeTrading:
             "quantity": quantity,
             "transaction_hash": "0xmerge-hash",
             "transaction_id": "merge-transaction",
+        }
+
+
+class ThresholdTrading(FakeTrading):
+    def __init__(self, *, result: str = "both_filled") -> None:
+        super().__init__(result=result)
+        self.holding_positions: tuple[dict[str, str], ...] = ()
+        self.threshold_preflight_calls = 0
+        self.threshold_submit_calls = 0
+        self.threshold_reconcile_calls = 0
+        self.threshold_reconcile_kwargs: list[dict[str, object]] = []
+
+    def no_submit_threshold_preflight(
+        self, intent: ThresholdHedgeIntent
+    ) -> dict[str, object]:
+        self.threshold_preflight_calls += 1
+        return {"result": "PASS", "intent": intent}
+
+    def account_snapshot(self) -> AccountSnapshot:
+        base = super().account_snapshot()
+        return AccountSnapshot(
+            wallet_address=base.wallet_address,
+            p_usd_balance=base.p_usd_balance,
+            p_usd_allowance=base.p_usd_allowance,
+            open_order_ids=base.open_order_ids,
+            positions=self.holding_positions,
+            checked_at=base.checked_at,
+        )
+
+    def submit_threshold_hedge_once(
+        self, intent: ThresholdHedgeIntent
+    ) -> ThresholdHedgeSubmission:
+        self.threshold_submit_calls += 1
+        return ThresholdHedgeSubmission(
+            leg_a=ThresholdLegResult(
+                "A", intent.leg_a.outcome, intent.leg_a.condition_id,
+                intent.leg_a.token_id, True, "filled", "a-order", intent.quantity,
+                ("a-trade",), "none",
+            ),
+            leg_b=ThresholdLegResult(
+                "B", intent.leg_b.outcome, intent.leg_b.condition_id,
+                intent.leg_b.token_id, True, "filled", "b-order", intent.quantity,
+                ("b-trade",), "none",
+            ),
+        )
+
+    def reconcile_threshold_hedge(
+        self, *, intent: ThresholdHedgeIntent, since: datetime,
+        leg_a: ThresholdLegResult, leg_b: ThresholdLegResult,
+    ) -> dict[str, object]:
+        self.threshold_reconcile_calls += 1
+        self.threshold_reconcile_kwargs.append({
+            "intent": intent, "since": since, "leg_a": leg_a, "leg_b": leg_b,
+        })
+        return {
+            "status": "ok",
+            "leg_a_quantity": intent.quantity,
+            "leg_b_quantity": intent.quantity,
+            "execution_proof": {
+                "verified": True,
+                "venue": "polymarket",
+                "positions_verified": True,
+                "matched_refs": {
+                    "A": {"token_id": intent.leg_a.token_id, "order_ids": ["a-order"], "trade_ids": ["a-trade"]},
+                    "B": {"token_id": intent.leg_b.token_id, "order_ids": ["b-order"], "trade_ids": ["b-trade"]},
+                },
+                "position_refs": {
+                    "A": {"token_id": intent.leg_a.token_id, "quantity": "10"},
+                    "B": {"token_id": intent.leg_b.token_id, "quantity": "10"},
+                },
+            },
         }
 
 
@@ -484,6 +618,21 @@ def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
     return service, trading, store, monitor
 
 
+def threshold_execution_fixture(tmp_path: Path):
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = ThresholdTrading()
+    monitor = ThresholdMonitor(_threshold_intent())
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        lock_path=tmp_path / "execution.lock",
+    )
+    assert service.reconcile_startup()["state"] == "ready"
+    return service, trading, store, monitor
+
+
 def incident_fixture(tmp_path: Path, *, result: str, notifier: object | None = None):
     store = PredictionArbitrageStore(tmp_path / "data")
     trading = IncidentTrading(result=result)
@@ -510,6 +659,7 @@ def wait_until_terminal(service: object, execution_id: str, timeout: float = 3.0
         if value.get("state") in {
             "both_rejected",
             "complete",
+            "holding_to_resolution",
             "neutralized_incident",
             "directional_incident",
             "merge_incident",
@@ -517,6 +667,83 @@ def wait_until_terminal(service: object, execution_id: str, timeout: float = 3.0
             return value
         time.sleep(0.01)
     return service.execution(execution_id)  # type: ignore[attr-defined]
+
+
+def test_threshold_equal_fill_holds_without_merge(tmp_path: Path) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+
+    preview = service.preview("threshold-opp-1")
+    execution = service.confirm(str(preview["id"]), "threshold-request-1")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    assert trading.threshold_preflight_calls == 1
+    assert trading.threshold_submit_calls == 1
+    assert trading.threshold_reconcile_calls == 1
+    assert trading.merge_calls == 0
+    evidence = final["evidence"]
+    held = next(item for item in evidence if item.get("phase") == "holding_to_resolution")
+    assert held["execution_proof"]["matched_refs"]["A"]["trade_ids"] == ["a-trade"]
+    assert held["execution_proof"]["matched_refs"]["B"]["trade_ids"] == ["b-trade"]
+    assert store.active_execution() is None
+
+
+def test_two_threshold_holdings_do_not_block_a_new_preview(tmp_path: Path) -> None:
+    service, _, store, _ = threshold_execution_fixture(tmp_path)
+    payload = {
+        "opportunity_id": "historical-threshold",
+        "intent_type": "threshold_hedge",
+        "market_type": "threshold_hedge",
+        "intent": service._intent_payload(_threshold_intent()),
+    }
+    for index in range(2):
+        preview_id = store.create_preview(payload, expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat())
+        execution = store.consume_preview_and_create_execution(preview_id, f"historical-{index}")
+        store.transition_execution(
+            str(execution["execution_id"]),
+            state="holding_to_resolution",
+            evidence={"phase": "holding_to_resolution"},
+        )
+
+    result = service.preview("threshold-opp-1")
+    assert result["state"] == "previewed"
+
+
+def test_threshold_confirm_rejects_changed_rule_hash_before_post(tmp_path: Path) -> None:
+    service, trading, _, monitor = threshold_execution_fixture(tmp_path)
+    preview = service.preview("threshold-opp-1")
+    monitor.rules_hash_b = "changed-hash"
+
+    execution = service.confirm(str(preview["id"]), "threshold-rule-change")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    assert trading.threshold_preflight_calls == 0
+    assert trading.threshold_submit_calls == 0
+    evidence = final["evidence"]
+    assert any(item.get("reason") == "rule_hash_changed" for item in evidence)
+
+
+def test_startup_recognizes_known_threshold_holdings_without_merge(tmp_path: Path) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    payload = {
+        "opportunity_id": "historical-threshold",
+        "intent_type": "threshold_hedge",
+        "market_type": "threshold_hedge",
+        "intent": service._intent_payload(_threshold_intent()),
+    }
+    preview_id = store.create_preview(payload, expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat())
+    execution = store.consume_preview_and_create_execution(preview_id, "known-holding")
+    store.transition_execution(str(execution["execution_id"]), state="holding_to_resolution", evidence={"phase": "holding_to_resolution"})
+    trading.holding_positions = (
+        {"condition_id": "condition-a", "token_id": "a-token", "size": "10"},
+        {"condition_id": "condition-b", "token_id": "b-token", "size": "10"},
+    )
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "ready"
+    assert trading.merge_calls == 0
 
 
 def test_one_confirm_posts_exactly_one_equal_fok_batch_and_merges(tmp_path: Path) -> None:

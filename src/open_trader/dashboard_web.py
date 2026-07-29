@@ -30,6 +30,7 @@ from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
+from .polymarket_relation_discovery import CodexRelationValidator, discover_threshold_relations
 from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .daily_premarket import build_notifier
 from .notifications import NullNotifier
@@ -115,6 +116,8 @@ def _prediction_safe_value(value: object, *, key: str = "") -> object:
         return value.astimezone().isoformat()
     if isinstance(value, Decimal):
         return format(value, "f")
+    if lowered in {"wallet_address", "wallet"} and isinstance(value, str) and value.startswith("0x"):
+        return _prediction_mask_wallet(value)
     if isinstance(value, Mapping):
         result: dict[str, object] = {}
         for name, item in value.items():
@@ -419,6 +422,12 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
         "stale": True,
         "events": [],
         "opportunities": [],
+        "relation_discovery": {
+            "status": "unavailable",
+            "scan_logs": [],
+            "codex_usage_24h": {},
+            "annualized_distribution": {},
+        },
         "event_count": 0,
         "market_count": 0,
         "token_count": 0,
@@ -608,6 +617,9 @@ def _prediction_state_payload(
         "stale": stale,
         "events": event_rows,
         "opportunities": opportunity_rows,
+        "relation_discovery": _prediction_safe_value(
+            safe_snapshot.get("relation_discovery", {})
+        ),
         "event_count": event_count,
         "market_count": market_count,
         "token_count": token_count,
@@ -1366,9 +1378,16 @@ def serve_dashboard(
             prediction_trading = PolymarketTradingClient.from_keychain(
                 load_trading_config(prediction_path)
             )
+            codex_model = os.environ.get("OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol").strip()
+            relation_validator = CodexRelationValidator(
+                prediction_store,
+                model=codex_model,
+            )
             prediction_monitor = PolymarketMonitor(
                 store=prediction_store,
                 trading=prediction_trading,
+                relation_discovery=discover_threshold_relations,
+                relation_validator=relation_validator,
             )
             prediction_execution = PredictionExecutionService(
                 store=prediction_store,

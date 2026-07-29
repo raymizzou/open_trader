@@ -5560,6 +5560,9 @@ table {
 .pm-page-head { align-items: end; display: flex; gap: 20px; justify-content: space-between; margin: 18px 0 12px; }
 .pm-page-head h1 { font-size: 25px; margin: 0 0 5px; }
 .pm-page-head p { color: var(--muted); margin: 0; }
+.pm-strategy-tabs { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: inline-grid; gap: 4px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 10px; padding: 4px; }
+.pm-strategy-tabs button { background: transparent; border: 1px solid transparent; border-radius: 6px; color: var(--muted); min-height: 44px; padding: 9px 16px; }
+.pm-strategy-tabs button[aria-pressed="true"] { background: #eef6f8; border-color: #214f5c; color: #214f5c; font-weight: 800; }
 .pm-updated { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
 .pm-failure-reason { color: var(--danger); font-size: 12px; margin-top: 5px; }
 .pm-status-line { align-items: center; display: inline-flex; gap: 7px; }
@@ -5633,6 +5636,42 @@ table {
 .pm-positive { color: var(--success); }
 .pm-opportunity-action { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
 .pm-opportunity-action p { color: var(--muted); margin: 0; }
+.pm-relation-discovery { display: grid; gap: 10px; margin-bottom: 14px; }
+.pm-relation-summary { color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 12px; }
+.pm-scan-logs { background: #f2eee7; border-radius: 6px; padding: 8px 10px; }
+.pm-scan-logs summary { cursor: pointer; font-weight: 750; }
+.pm-scan-logs ul { color: var(--muted); margin: 8px 0 0 18px; padding: 0; }
+.pm-llm-layout { align-items: start; display: grid; gap: 10px; grid-template-columns: minmax(250px, 0.32fr) minmax(0, 1fr); }
+.pm-llm-layout .pm-relation-discovery { margin-bottom: 0; }
+.pm-threshold-candidates { display: grid; gap: 8px; }
+.pm-threshold-candidate { display: block; padding: 0; }
+.pm-threshold-candidate > summary { align-items: center; display: grid; gap: 10px; grid-template-columns: minmax(220px, 1.5fr) auto repeat(4, minmax(100px, 0.65fr)); list-style: none; min-height: 74px; padding: 10px 12px; }
+.pm-threshold-candidate > summary::-webkit-details-marker { display: none; }
+.pm-threshold-candidate > summary > div:not(.pm-threshold-summary-title) span,
+.pm-threshold-candidate > summary > div:not(.pm-threshold-summary-title) small { color: var(--muted); display: block; font-size: 10px; margin-bottom: 4px; }
+.pm-threshold-candidate > summary > div:not(.pm-threshold-summary-title) strong { display: block; font-size: 14px; }
+.pm-threshold-summary-title { display: grid; gap: 4px; min-width: 0; }
+.pm-threshold-summary-title strong { line-height: 1.35; overflow-wrap: anywhere; }
+.pm-threshold-summary-title small { color: var(--muted); }
+.pm-threshold-yield { background: #f2eee7; border-radius: 6px; padding: 8px; }
+.pm-threshold-detail { border-top: 1px solid var(--line); display: grid; gap: 14px; padding: 14px; }
+.pm-threshold-detail h3 { margin: 0 0 8px; }
+.pm-threshold-formula { display: grid; gap: 8px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pm-threshold-formula > div,
+.pm-threshold-history > div { background: #f2eee7; border-radius: 6px; padding: 10px; }
+.pm-threshold-formula span,
+.pm-threshold-history span,
+.pm-threshold-history small { color: var(--muted); display: block; font-size: 11px; margin-bottom: 5px; }
+.pm-threshold-formula strong,
+.pm-threshold-history strong { display: block; overflow-wrap: anywhere; }
+.pm-threshold-caveat { color: var(--muted); margin: 8px 0; }
+.pm-threshold-history { display: grid; gap: 8px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pm-threshold-questions { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+.pm-threshold-questions > div { background: #f2eee7; border-radius: 6px; display: grid; gap: 3px; padding: 10px; }
+.pm-threshold-questions span, .pm-threshold-questions small { color: var(--muted); font-size: 11px; }
+.pm-threshold-questions strong { line-height: 1.35; }
+.pm-threshold-llm { border: 1px solid var(--line); border-radius: 6px; display: grid; gap: 5px; padding: 10px; }
+.pm-threshold-llm p, .pm-threshold-llm small { color: var(--muted); margin: 0; }
 .pm-participate { min-width: 190px; }
 .pm-empty { align-items: center; display: grid; justify-items: center; min-height: 210px; padding: 30px; text-align: center; }
 .pm-empty.compact { min-height: 150px; }
@@ -5673,13 +5712,18 @@ table {
 .pm-modal-actions { align-items: center; display: flex; gap: 10px; justify-content: flex-end; }
 .pm-modal-actions .pm-button { min-width: 150px; }
 @media (max-width: 1100px) {
-  .pm-layout { grid-template-columns: 1fr; }
+  .pm-layout, .pm-llm-layout { grid-template-columns: 1fr; }
+}
+@media (max-width: 850px) {
+  .pm-threshold-candidate > summary { align-items: stretch; grid-template-columns: minmax(0, 1fr) auto; }
+  .pm-threshold-candidate > summary > div:not(.pm-threshold-summary-title) { display: grid; grid-column: 1 / -1; grid-template-columns: 110px minmax(0, 1fr); }
 }
 @media (max-width: 720px) {
   body.prediction-market-active { font-size: 16px; }
   .dashboard-shell.prediction-market-active { padding: 10px; }
   .pm-topbar, .pm-page-head { align-items: stretch; display: grid; }
   .pm-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pm-strategy-tabs { display: grid; width: 100%; }
   .pm-updated { text-align: left; }
   .pm-readiness { grid-template-columns: 1fr 1fr; }
   .pm-readiness-item, .pm-readiness-item:nth-child(3) { border-right: 1px solid var(--line); }
@@ -5690,6 +5734,8 @@ table {
   .pm-progress { grid-template-columns: 1fr 1fr; }
   .pm-panel-heading, .pm-opportunity-title, .pm-opportunity-action, .pm-alert { align-items: stretch; display: grid; }
   .pm-opportunity-metrics { grid-template-columns: 1fr 1fr; }
+  .pm-threshold-formula, .pm-threshold-history { grid-template-columns: 1fr; }
+  .pm-threshold-questions { grid-template-columns: 1fr; }
   .pm-participate { width: 100%; }
   .pm-event summary { grid-template-columns: minmax(0, 1fr) auto; }
   .pm-event-state { grid-column: 1 / -1; }

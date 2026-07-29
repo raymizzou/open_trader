@@ -6,6 +6,34 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-07-29
 
 - Dashboard 美股/港股趋势报告在正式买入和继续持有标的下增加富途“期权异动”按钮；同日数据可查看只读详情，缺失或过期时置灰。移除旧跨市场“期权关注”入口，并从飞书趋势报告删除该段落。
+- Removed the local 10-component and 10-valid-row minimums from trend industry
+  context validation, so complete small ETF groups no longer disable industry
+  ordering for an entire market. CN/HK/US buy plans now reuse each report's
+  frozen industry context when the action row lacks industry temperature, and
+  their current discipline summaries now state the real industry-first
+  candidate order instead of the legacy four-key stock-only order.
+  Verified with 1,219 focused tests and offline rebuilds of the latest frozen
+  CN/HK/US evidence; the US two-member healthcare ETF context remains valid and
+  restores industry-first ordering.
+- Fixed the live Dashboard acceptance hover check to select one real industry
+  metric when a report contains multiple industry rows, preventing Playwright
+  strict-mode failures while preserving the tooltip content assertion.
+- Added the first manual-confirmation Polymarket threshold-hedge path: a
+  time-bounded scan of the first 100 active Gamma events for same-event
+  relations, deterministic proofs plus structured Codex
+  validation/cache metrics, truthful rejected/unavailable reasons, separate
+  condition BUY/FOK submission and reconciliation, `holding_to_resolution`
+  for multiple unresolved combinations, folded in-memory scan logs, and a
+  Dashboard switch between `YES/NO套利` and `LLM对冲套利`. LLM candidates start
+  folded and disclose their current annualized calculation, historical
+  distribution, structured Codex evidence, independent legs, and
+  confirmation action in place; cross-condition legs never invoke merge.
+  Confirmation now also fails closed against contradictory LLM status,
+  relation/outcome directions, condition/token identities, quantities,
+  economics, or settlement timing, and every blocked candidate keeps its
+  reason visible. Verified 311 focused monitor/Dashboard tests and all 55
+  prediction-market browser scenarios across desktop, tablet, and mobile; live
+  order submission remains behind the existing explicit preview/confirm gate.
 - Allowed an explicitly authorized same-day simulated late buy to bind a
   higher, hash-verified corrective report when the execution batch had already
   frozen a bug-suppressed report. Recovery still requires a prior missed event,

@@ -45,6 +45,65 @@ function prototypeStateFor(state: string) {
 }
 
 test.describe('approved prediction execution workspace', () => {
+  test('LLM hedge strategy switches in place and survives polling', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await openPrediction(page, 'threshold');
+    const url = page.url();
+    const strategyButtons = page.locator('[data-prediction-strategy]');
+    await expect(strategyButtons).toHaveText(['YES/NO套利', 'LLM对冲套利']);
+    await expect(page.locator('[data-prediction-strategy="yes_no"]')).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('.pm-threshold-candidate')).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'LLM对冲套利', exact: true }).click();
+    expect(page.url()).toBe(url);
+    await expect(page.locator('[data-prediction-strategy="llm_hedge"]')).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('.pm-threshold-candidate')).toHaveCount(2);
+
+    const first = page.locator('[data-relation-key="threshold-approved"]');
+    await expect(first).not.toHaveAttribute('open', '');
+    await first.locator('summary').click();
+    await expect(first).toHaveAttribute('open', '');
+    await page.evaluate(() => (
+      window as Window & { fetchPredictionState: () => Promise<void> }
+    ).fetchPredictionState());
+    await expect(page.locator('[data-prediction-strategy="llm_hedge"]')).toHaveAttribute('aria-pressed', 'true');
+    await expect(first).toHaveAttribute('open', '');
+  });
+
+  test('LLM hedge strategy discloses current annualized math and rejection evidence responsively', async ({ page }) => {
+    for (const viewport of [
+      { width: 1440, height: 1100 },
+      { width: 768, height: 1024 },
+      { width: 375, height: 812 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await openPrediction(page, 'threshold');
+      await page.getByRole('button', { name: 'LLM对冲套利', exact: true }).click();
+
+      const approved = page.locator('[data-relation-key="threshold-approved"]');
+      await expect(approved.locator('summary')).toContainText('21.5%');
+      await expect(approved.locator('summary')).toContainText('$19.46 / $20.00');
+      await approved.locator('summary').click();
+      await expect(approved).toContainText('$0.54 / $19.46');
+      await expect(approved).toContainText('21.55%');
+      await expect(approved).toContainText('47 天');
+      await expect(approved).toContainText('7 天');
+      await expect(approved).toContainText('30 天');
+      await expect(approved).toContainText('A · BUY NO');
+      await expect(approved).toContainText('B · BUY YES');
+      await expect(approved.locator('[data-action="participate"]')).toBeEnabled();
+
+      const rejected = page.locator('[data-relation-key="threshold-rejected"]');
+      await expect(rejected.locator('summary')).toContainText('REJECT');
+      await rejected.locator('summary').click();
+      await expect(rejected).toContainText('SPECIAL_SETTLEMENT_MISMATCH');
+      await expect(rejected).toContainText('特殊结算可能破坏覆盖关系');
+      await expect(rejected.locator('[data-action="participate"]')).toHaveCount(0);
+      await expect(page.locator('.pm-scan-logs')).not.toHaveAttribute('open', '');
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    }
+  });
+
   test('keeps the top navigation and workspace order exact', async ({ page }) => {
     await openPrediction(page, 'ready');
     await expect(page.locator('.dashboard-header')).toBeHidden();

@@ -2136,6 +2136,86 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
     assert incident_item["loss"] == "-0.60"
 
 
+def test_prediction_arbitrage_projects_threshold_relation_validation_without_secrets() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return []
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {"status": "ready", "geoblock": "allowed", "relayer": "ready"},
+                "opportunities": [{
+                    "opportunity_id": "relation-1",
+                    "market_type": "threshold_hedge",
+                    "question_a": "BTC above 90k?",
+                    "question_b": "BTC above 100k?",
+                    "condition_id_a": "condition-a",
+                    "condition_id_b": "condition-b",
+                    "relation": "B_IMPLIES_A",
+                    "rules_hash_a": "hash-a",
+                    "rules_hash_b": "hash-b",
+                    "buy_legs": [
+                        {"label": "A", "outcome": "YES", "condition_id": "condition-a", "token_id": "a-token", "quantity": "10", "max_price": "0.10", "max_cost": "1.00"},
+                        {"label": "B", "outcome": "NO", "condition_id": "condition-b", "token_id": "b-token", "quantity": "10", "max_price": "0.11", "max_cost": "1.10"},
+                    ],
+                    "volume_24h": "1000",
+                    "total_max_cost": "2.12",
+                    "minimum_payout": "10",
+                    "minimum_profit": "7.88",
+                    "annualized_yield": "0.1234",
+                    "resolution_at": "2026-12-31T17:00:00Z",
+                    "remaining_days": "155.5",
+                    "confirmed_at": "2026-07-29T00:00:00Z",
+                    "llm_status": "llm_rejected",
+                    "llm_decision": "REJECT",
+                    "llm_summary": "规则存在例外结算。",
+                    "llm_reason_codes": ["SPECIAL_SETTLEMENT_MISMATCH"],
+                    "llm_evidence": [{"market": "A", "quote": "ambiguous"}],
+                    "llm_uncertainties": ["special settlement"],
+                    "actionable": False,
+                }],
+                "relation_discovery": {
+                    "status": "healthy",
+                    "scan_logs": [{"phase": "books", "status": "healthy"}],
+                    "codex_usage_24h": {"calls": 1, "successes": 1, "failures": 0, "cache_hits": 2},
+                    "annualized_distribution": {"current": {"count": 1, "median": "0.1234"}, "7d": {"count": 2}, "30d": {"count": 3}},
+                },
+            }
+
+    class FakeExecution:
+        _first_live_order_verified = False
+        _breaker_open = False
+
+    state = _prediction_state_payload(
+        store=FakeStore(), monitor=FakeMonitor(), execution=FakeExecution(), csrf_token="csrf"
+    )
+
+    row = state["opportunities"][0]
+    assert row["market_type"] == "threshold_hedge"
+    assert row["question_a"] == "BTC above 90k?"
+    assert row["buy_legs"][1]["outcome"] == "NO"
+    assert row["resolution_at"] == "2026-12-31T17:00:00Z"
+    assert row["remaining_days"] == "155.5"
+    assert row["llm_reason_codes"] == ["SPECIAL_SETTLEMENT_MISMATCH"]
+    assert state["relation_discovery"]["codex_usage_24h"]["cache_hits"] == 2
+    assert "prompt" not in repr(state)
+    assert "secret" not in repr(state).casefold()
+
+
 def test_prediction_history_does_not_present_startup_recovery_as_a_trade() -> None:
     output = run_dashboard_js(r'''
 const payload = {histories: {
@@ -2293,6 +2373,145 @@ console.log(predictionOpportunityPanel(payload));
     assert "1 秒前更新" not in html
 
 
+def test_prediction_market_threshold_card_shows_both_conditions_llm_reason_and_folded_logs() -> None:
+    output = run_dashboard_js(r'''
+const opportunity = {
+  opportunity_id:"relation-1",
+  market_type:"threshold_hedge",
+  question_a:"BTC above 90k?",
+  question_b:"BTC above 100k?",
+  relation:"B_IMPLIES_A",
+  condition_id_a:"condition-a",
+  condition_id_b:"condition-b",
+  buy_legs:[
+    {label:"A",outcome:"YES",condition_id:"condition-a",token_id:"a-token",quantity:"10",max_price:"0.10",max_cost:"1.00"},
+    {label:"B",outcome:"NO",condition_id:"condition-b",token_id:"b-token",quantity:"10",max_price:"0.11",max_cost:"1.10"},
+  ],
+  quantity:"10", total_max_cost:"2.12", minimum_payout:"10", minimum_profit:"7.88",
+  annualized_yield:"0.2155", remaining_days:"47", resolution_at:"2026-09-14T00:00:00Z",
+  volume_24h:"1000", confirmed_at:"2026-07-29T00:00:00Z",
+  llm_status:"llm_rejected", llm_decision:"REJECT", llm_summary:"规则存在例外结算。",
+  llm_reason_codes:["SPECIAL_SETTLEMENT_MISMATCH"], llm_evidence:[{market:"A",quote:"ambiguous"}],
+  llm_uncertainties:["special settlement"], actionable:false,
+};
+const payload = {status:"healthy",health:{status:"healthy"},breaker:{open:false},opportunities:[opportunity],relation_discovery:{
+  status:"healthy",scan_logs:[{phase:"books",status:"healthy"}],codex_usage_24h:{calls:1,successes:1,failures:0,cache_hits:2},
+  annualized_distribution:{current:{count:1,median:"0.2155",p90:"0.2155"},"7d":{count:2,median:"0.21",p90:"0.34"},"30d":{count:3,median:"0.19",p90:"0.31"}},
+}};
+const preview = {...opportunity, preview_id:"preview-1", wallet_address:"0x1111111111111111111111111111111111111111", available_balance:"20", policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"}};
+console.log(JSON.stringify({
+  tabs:predictionStrategyTabs("yes_no"),
+  candidate:predictionThresholdCandidateHtml(opportunity, payload, new Set()),
+  logs:predictionRelationDiscoveryPanel(payload),
+  modal:predictionModalHtml("order", preview),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "YES/NO套利" in rendered["tabs"]
+    assert "LLM对冲套利" in rendered["tabs"]
+    assert 'data-prediction-strategy="yes_no"' in rendered["tabs"]
+    assert 'aria-pressed="true"' in rendered["tabs"]
+    assert rendered["candidate"].startswith("<details")
+    assert " open" not in rendered["candidate"].split(">", 1)[0]
+    assert "BTC above 90k?" in rendered["candidate"]
+    assert "BTC above 100k?" in rendered["candidate"]
+    assert "condition-a" in rendered["candidate"]
+    assert "REJECT" in rendered["candidate"]
+    assert "规则存在例外结算" in rendered["candidate"]
+    assert "SPECIAL_SETTLEMENT_MISMATCH" in rendered["candidate"]
+    assert "21.5%" in rendered["candidate"]
+    assert "$7.88 / $2.12" in rendered["candidate"]
+    assert "47 天" in rendered["candidate"]
+    assert "7 天" in rendered["candidate"]
+    assert "30 天" in rendered["candidate"]
+    assert 'data-action="participate"' not in rendered["candidate"]
+    assert "<details" in rendered["logs"]
+    assert " open" not in rendered["logs"]
+    assert "Codex 24h" in rendered["logs"]
+    assert "cache hits" in rendered["logs"]
+    assert "两个 condition 必须分别成交和核对" in rendered["modal"]
+    assert "不会 merge" in rendered["modal"]
+    assert "最多按 $2.00" in rendered["modal"]
+
+
+def test_prediction_market_threshold_action_fails_closed_on_contradictory_payloads() -> None:
+    output = run_dashboard_js(r'''
+const opportunity = {
+  opportunity_id:"relation-approved",
+  market_type:"threshold_hedge",
+  question_a:"BTC above 90k?",
+  question_b:"BTC above 100k?",
+  relation:"B_IMPLIES_A",
+  condition_id_a:"condition-a",
+  condition_id_b:"condition-b",
+  buy_legs:[
+    {label:"A",outcome:"YES",condition_id:"condition-a",token_id:"a-token",quantity:"10",max_price:"0.10",max_cost:"1.00"},
+    {label:"B",outcome:"NO",condition_id:"condition-b",token_id:"b-token",quantity:"10",max_price:"0.11",max_cost:"1.10"},
+  ],
+  quantity:"10", total_max_cost:"2.12", minimum_payout:"10", minimum_profit:"7.88",
+  annualized_yield:"0.2155", remaining_days:"47", resolution_at:"2026-09-14T00:00:00Z",
+  llm_status:"approved", llm_decision:"APPROVE", actionable:true,
+};
+const payload = {
+  status:"healthy", health:{status:"healthy"}, breaker:{open:false},
+  readiness:{status:"ready",geoblock:"allowed",relayer:"ready",balance:"50"},
+  wallet:{masked_address:"0x1234…5678"},
+  policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"},
+};
+const renderCandidate = (candidate) => predictionThresholdCandidateHtml(
+  candidate, {...payload, opportunities:[candidate]}, new Set()
+);
+const hasAction = (candidate) => renderCandidate(candidate).includes('data-action="participate"');
+console.log(JSON.stringify({
+  approved:hasAction(opportunity),
+  rejected:hasAction({...opportunity,llm_status:"llm_rejected",llm_decision:"REJECT"}),
+  missingPayout:hasAction({...opportunity,minimum_payout:null}),
+  missingTiming:hasAction({...opportunity,remaining_days:null,resolution_at:null}),
+  sameCondition:hasAction({...opportunity,condition_id_b:"condition-a"}),
+  mismatchedLeg:hasAction({...opportunity,buy_legs:[
+    opportunity.buy_legs[0],
+    {...opportunity.buy_legs[1],condition_id:"condition-c"},
+  ]}),
+  duplicateToken:hasAction({...opportunity,buy_legs:[
+    opportunity.buy_legs[0],
+    {...opportunity.buy_legs[1],token_id:"a-token"},
+  ]}),
+  unequalQuantity:hasAction({...opportunity,buy_legs:[
+    opportunity.buy_legs[0],
+    {...opportunity.buy_legs[1],quantity:"9"},
+  ]}),
+  wrongOutcomes:hasAction({...opportunity,buy_legs:[
+    {...opportunity.buy_legs[0],outcome:"NO"},
+    {...opportunity.buy_legs[1],outcome:"YES"},
+  ]}),
+  bookStaleReason:renderCandidate({
+    ...opportunity,actionable:false,eligibility_reason:"book_stale",
+  }).includes("盘口过期，等待更新"),
+  unavailableReason:renderCandidate({
+    ...opportunity,actionable:false,llm_status:"llm_unavailable",llm_decision:null,
+    llm_summary:"",llm_reason_codes:[],llm_evidence:[],llm_uncertainties:[],
+    eligibility_reason:"llm_unavailable",
+  }).includes("LLM 校验不可用"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "approved": True,
+        "rejected": False,
+        "missingPayout": False,
+        "missingTiming": False,
+        "sameCondition": False,
+        "mismatchedLeg": False,
+        "duplicateToken": False,
+        "unequalQuantity": False,
+        "wrongOutcomes": False,
+        "bookStaleReason": True,
+        "unavailableReason": True,
+    }
+
+
 def test_prediction_market_incomplete_event_is_not_labeled_actionable() -> None:
     output = run_dashboard_js(r'''
 const opportunity = {
@@ -2380,6 +2599,19 @@ console.log(JSON.stringify({
     assert "批次已提交" not in rendered["validating"]
     assert "批次已提交" in rendered["reconciling"]
     assert "正在读取两腿结果" in rendered["reconciling"]
+
+
+def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:
+    output = run_dashboard_js(r'''
+console.log(predictionExecutionAlert({
+  status:"healthy",
+  current_execution:{state:"holding_to_resolution",execution_id:"hold-1"},
+  breaker:{open:false},
+}));
+''')
+    assert "两腿已成交，待结算" in output
+    assert "不会 merge" in output
+    assert "自动合并" not in output
 
 
 def test_prediction_market_preview_must_be_complete_and_never_falls_back_to_list_data() -> None:
@@ -2580,8 +2812,10 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
             order.append("trading.close")
 
     class FakeMonitor:
+        kwargs: dict[str, object] = {}
+
         def __init__(self, **_: object) -> None:
-            pass
+            self.__class__.kwargs = dict(_)
 
         def start(self) -> None:
             order.append("monitor.start")
@@ -2625,6 +2859,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert order.index("monitor.stop") < order.index("server.close")
     assert "execution.close" in order
     assert "trading.close" in order
+    assert FakeMonitor.kwargs["relation_discovery"] is dashboard_web.discover_threshold_relations
+    assert FakeMonitor.kwargs["relation_validator"].__class__.__name__ == "CodexRelationValidator"
+    assert "DEEPSEEK_API_KEY" not in repr(FakeMonitor.kwargs)
 
 
 def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
@@ -5984,6 +6221,62 @@ for (const market of ["CN", "US", "HK"]) {
     if (!html.includes(text)) throw new Error(market + " missing " + text);
   }
   if (html.includes("执行参考价（Futu 前复权）")) throw new Error(market + " retained market-specific price heading");
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_buy_rows_use_frozen_industry_temperature_for_every_market() -> None:
+    output = run_dashboard_js(r'''
+for (const market of ["CN", "US", "HK"]) {
+  const html = renderTrendBuyStage({
+    market,
+    buy_window:"常规交易时段",
+    buy_actions:[{symbol:"BUY",industry:"金融",industry_tm_id:7}],
+    risk_skips:[],
+    industry_contexts:[{
+      industry_tm_id:7,industry:"金融",temperature:"热",valid:true,
+      right_count:10,valid_count:20,right_share:"0.5",
+    }],
+  });
+  if (!html.includes('data-label="行业温度">热</td>')) {
+    throw new Error(market + "\n" + html);
+  }
+}
+const direct = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[{
+    symbol:"BUY",industry:"金融",industry_tm_id:7,industry_temperature:"沸",
+  }],
+  risk_skips:[],
+  industry_contexts:[{
+    industry_tm_id:7,industry:"金融",temperature:"热",valid:true,
+  }],
+});
+if (!direct.includes('data-label="行业温度">沸</td>')) throw new Error(direct);
+const legacy = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[{symbol:"BUY",industry:"美国医疗ETF",industry_tm_id:8}],
+  risk_skips:[],
+  industry_contexts:[{
+    industry_tm_id:8,industry:"美国医疗ETF",temperature:"热",valid:false,
+    invalid_reasons:["component_count_below_10","valid_count_below_10"],
+  }],
+});
+if (!legacy.includes('data-label="行业温度">热</td>')) throw new Error(legacy);
+const invalid = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[{symbol:"BUY",industry:"金融",industry_tm_id:9}],
+  risk_skips:[],
+  industry_contexts:[{
+    industry_tm_id:9,industry:"金融",temperature:"热",valid:false,
+    invalid_reasons:["snapshot_coverage_below_90pct"],
+  }],
+});
+if (!invalid.includes('data-label="行业温度">数据未提供</td>')) {
+  throw new Error(invalid);
 }
 console.log("ok");
 ''')

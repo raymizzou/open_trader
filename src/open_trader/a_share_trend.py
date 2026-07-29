@@ -702,6 +702,13 @@ def live_trend_strategy_snapshot(
     if version in {"v5", "v8", "v9", "v10"} or (
         version in {"v6", "v7"} and market in {"US", "HK"}
     ):
+        for row in rows:
+            if row["name"] == "排序顺序":
+                row["value"] = (
+                    "行业优先（变化、温度、强度、温转热数量、右侧占比），"
+                    "再按个股趋势强度、右侧天数、成交额、代码；"
+                    "缺历史省略变化键，行业上下文无效时回退个股排序"
+                )
         rows.extend(
             {
                 "group": group,

@@ -82,6 +82,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "executions",
         "execution_legs",
         "incidents",
+        "llm_cache",
+        "llm_usage",
     }
 
 
@@ -250,6 +252,123 @@ def test_signal_history_windows_have_exact_boundaries_and_newest_first(tmp_path:
     ]
     with pytest.raises(ValueError, match="window"):
         db.signal_history("month")  # type: ignore[arg-type]
+
+
+def test_signal_history_supports_thirty_day_annualized_distribution_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "open_trader.prediction_arbitrage_store._utc_now", lambda: iso(now)
+    )
+    db = store(tmp_path)
+    db.upsert_signal(
+        signal_payload("boundary30d", iso(now - timedelta(days=30)))
+    )
+    db.upsert_signal(
+        signal_payload(
+            "older30d", iso(now - timedelta(days=30, microseconds=1))
+        )
+    )
+
+    assert [row["market_id"] for row in db.signal_history("30d")] == [
+        "boundary30d"
+    ]
+
+
+def test_llm_cache_survives_restart_and_replaces_the_same_fingerprint(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    db.save_llm_cache(
+        "cache-key",
+        {
+            "decision": "APPROVE",
+            "relation": "B_IMPLIES_A",
+            "summary": "初次校验",
+        },
+    )
+    db.save_llm_cache(
+        "cache-key",
+        {
+            "decision": "REJECT",
+            "relation": "NONE",
+            "summary": "规则已由调用方生成新指纹前不得覆盖",
+        },
+    )
+
+    assert PredictionArbitrageStore(db.data_dir).load_llm_cache("cache-key") == {
+        "decision": "REJECT",
+        "relation": "NONE",
+        "summary": "规则已由调用方生成新指纹前不得覆盖",
+    }
+    assert db.load_llm_cache("missing") is None
+
+
+def test_llm_usage_24h_counts_calls_failures_hits_and_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "open_trader.prediction_arbitrage_store._utc_now", lambda: iso(now)
+    )
+    db = store(tmp_path)
+    db.record_llm_call(
+        status="success",
+        usage={
+            "input_tokens": 100,
+            "cached_input_tokens": 60,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
+        },
+    )
+    db.record_llm_call(status="failed", usage={})
+    db.record_llm_cache_hit()
+
+    assert db.llm_usage_24h() == {
+        "calls": 2,
+        "successes": 1,
+        "failures": 1,
+        "cache_hits": 1,
+        "input_tokens": 100,
+        "cached_input_tokens": 60,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 5,
+    }
+
+
+def test_llm_usage_window_includes_exact_boundary_and_excludes_older(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "open_trader.prediction_arbitrage_store._utc_now", lambda: iso(current)
+    )
+    db = store(tmp_path)
+    current -= timedelta(microseconds=1)
+    db.record_llm_call(status="failed", usage={"output_tokens": 99})
+    current += timedelta(microseconds=1)
+    db.record_llm_call(status="success", usage={"input_tokens": 10})
+    current += timedelta(hours=24)
+
+    assert db.llm_usage_24h() == {
+        "calls": 1,
+        "successes": 1,
+        "failures": 0,
+        "cache_hits": 0,
+        "input_tokens": 10,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+
+
+@pytest.mark.parametrize("status", ["", "unknown", "SUCCESS"])
+def test_llm_usage_rejects_unknown_status(
+    tmp_path: Path, status: str
+) -> None:
+    with pytest.raises(ValueError, match="status"):
+        store(tmp_path).record_llm_call(status=status, usage={})
 
 
 def test_histories_are_newest_first_for_all_kinds(tmp_path: Path) -> None:

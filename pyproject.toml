@@ -29,7 +29,12 @@ open-trader = "open_trader.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-open_trader = ["dashboard_static/*.html", "dashboard_static/*.css", "dashboard_static/*.js"]
+open_trader = [
+    "dashboard_static/*.html",
+    "dashboard_static/*.css",
+    "dashboard_static/*.js",
+    "schemas/*.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
