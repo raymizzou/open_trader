@@ -64,7 +64,7 @@ def to_trend_animals_symbol(market: str, symbol: str) -> str:
         if len(code) != 5 or not code.isdigit() or not code.startswith("0"):
             raise ValueError(f"invalid HK symbol: {symbol}")
         return f"{code[1:]}.HK"
-    return code
+    return code.replace(".", "_")
 
 
 def from_trend_animals_symbol(market: str, symbol: str) -> str:
@@ -94,7 +94,7 @@ def from_trend_animals_symbol(market: str, symbol: str) -> str:
             normalized_symbol = normalized_symbol[:-3]
         elif suffix in KNOWN_PREFIXES:
             raise ValueError(f"invalid US Trend Animals symbol: {symbol}")
-        return to_futu_symbol("US", normalized_symbol)
+        return to_futu_symbol("US", normalized_symbol.replace("_", "."))
     raise ValueError(f"unsupported Futu market: {market}")
 
 

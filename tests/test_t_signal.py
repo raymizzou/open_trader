@@ -216,6 +216,7 @@ def test_to_futu_symbol_normalizes_supported_market_symbols() -> None:
         ("HK", "HK.00939", "0939.HK"),
         ("HK", "HK.02800", "2800.HK"),
         ("US", "US.ARWR", "ARWR"),
+        ("US", "US.BRK.B", "BRK_B"),
     ],
 )
 def test_trend_animals_symbol_round_trip(

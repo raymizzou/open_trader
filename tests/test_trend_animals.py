@@ -318,6 +318,7 @@ def test_search_exact_symbol_caches_tm_id_without_guessing(tmp_path: Path) -> No
         ("HK", "HK.00027", "0027.HK", "0027.HK"),
         ("CN", "SH.600036", "600036.SH", "600036.SH"),
         ("US", "US.ARWR", "ARWR.US", "ARWR"),
+        ("US", "US.BRK.B", "BRK_B", "BRK_B"),
     ],
 )
 def test_search_exact_symbol_uses_market_qualified_conversion(
