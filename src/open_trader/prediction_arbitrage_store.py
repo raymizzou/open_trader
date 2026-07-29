@@ -20,6 +20,7 @@ _PREVIEW_TTL = timedelta(seconds=10)
 _TERMINAL_EXECUTION_STATES = (
     "both_rejected",
     "complete",
+    "holding_to_resolution",
     "neutralized_incident",
     "directional_incident",
     "merge_incident",
@@ -294,10 +295,12 @@ class PredictionArbitrageStore:
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_signal_per_market
             ON signals(market_id) WHERE ended_at IS NULL;
 
+            DROP INDEX IF EXISTS one_nonterminal_execution;
+
             CREATE UNIQUE INDEX IF NOT EXISTS one_nonterminal_execution
             ON executions(singleton)
             WHERE state NOT IN (
-                'both_rejected', 'complete', 'neutralized_incident',
+                'both_rejected', 'complete', 'holding_to_resolution', 'neutralized_incident',
                 'directional_incident', 'merge_incident'
             );
 

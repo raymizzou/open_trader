@@ -15,12 +15,18 @@ import open_trader.cli as cli
 from open_trader.polymarket_trading import (
     KEYCHAIN_SERVICE,
     PolymarketTradingClient,
+    ThresholdHedgeSubmission,
+    ThresholdLegResult,
     TradingConfig,
     load_keychain_secret,
     load_trading_config,
     store_keychain_secret,
 )
-from open_trader.prediction_arbitrage import PairIntent
+from open_trader.prediction_arbitrage import (
+    PairIntent,
+    ThresholdHedgeIntent,
+    ThresholdHedgeLeg,
+)
 
 
 SIGNER = "0x1111111111111111111111111111111111111111"
@@ -42,6 +48,42 @@ def intent() -> PairIntent:
         total_max_cost=Decimal("18.60"),
         minimum_profit=Decimal("1.40"),
         net_edge=Decimal("0.07"),
+    )
+
+
+def threshold_intent() -> ThresholdHedgeIntent:
+    return ThresholdHedgeIntent(
+        relation_id="relation-1",
+        event_id="event-threshold",
+        relation="B_IMPLIES_A",
+        leg_a=ThresholdHedgeLeg(
+            label="A",
+            condition_id="condition-a",
+            market_id="market-a",
+            outcome="YES",
+            token_id="a-token",
+            quantity=Decimal("10"),
+            max_price=Decimal("0.10"),
+            max_cost=Decimal("1.00"),
+            tick_size=Decimal("0.01"),
+        ),
+        leg_b=ThresholdHedgeLeg(
+            label="B",
+            condition_id="condition-b",
+            market_id="market-b",
+            outcome="NO",
+            token_id="b-token",
+            quantity=Decimal("10"),
+            max_price=Decimal("0.11"),
+            max_cost=Decimal("1.10"),
+            tick_size=Decimal("0.01"),
+        ),
+        quantity=Decimal("10"),
+        maximum_fee=Decimal("0.02"),
+        total_max_cost=Decimal("2.12"),
+        minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("7.88"),
+        net_edge=Decimal("0.788"),
     )
 
 
@@ -583,6 +625,119 @@ def test_submit_pair_post_exception_is_ambiguous_without_retry(
     assert result.no.status == "ambiguous"
     assert result.yes.error_code == "ambiguous"
     assert "signature-sentinel" not in repr(result)
+
+
+def test_threshold_preflight_signs_independent_conditions_without_merge_or_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter()
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    summary = adapter.no_submit_threshold_preflight(threshold_intent())
+
+    assert summary["result"] == "PASS"
+    assert summary["posted"] is False
+    assert summary["equal_requested_shares"] == "pass"
+    assert len(fake.create_calls) == 2
+    assert fake.post_calls == []
+    assert fake.merge_calls == []
+    assert fake.create_calls == [
+        {
+            "token_id": "a-token",
+            "side": "BUY",
+            "amount": Decimal("1.00"),
+            "max_spend": Decimal("1.00"),
+            "max_price": Decimal("0.10"),
+            "order_type": "FOK",
+        },
+        {
+            "token_id": "b-token",
+            "side": "BUY",
+            "amount": Decimal("1.10"),
+            "max_spend": Decimal("1.10"),
+            "max_price": Decimal("0.11"),
+            "order_type": "FOK",
+        },
+    ]
+
+
+def test_threshold_submit_requires_preflight_and_posts_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter()
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+    blocked = adapter.submit_threshold_hedge_once(threshold_intent())
+    assert blocked.leg_a.error_code == "preflight_required"
+    assert fake.post_calls == []
+
+    assert adapter.no_submit_threshold_preflight(threshold_intent())["result"] == "PASS"
+    result = adapter.submit_threshold_hedge_once(threshold_intent())
+    assert len(fake.post_calls) == 1
+    assert len(fake.post_calls[0]) == 2
+    assert result.leg_a.accepted is True
+    assert result.leg_b.accepted is False
+    assert result.leg_a.condition_id == "condition-a"
+    assert result.leg_b.condition_id == "condition-b"
+    assert fake.merge_calls == []
+
+
+def test_threshold_post_exception_is_ambiguous_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeClient()
+    fake.post_error = RuntimeError("signature-sentinel")
+    adapter, _ = make_adapter(fake)
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    assert adapter.no_submit_threshold_preflight(threshold_intent())["result"] == "PASS"
+    result = adapter.submit_threshold_hedge_once(threshold_intent())
+
+    assert len(fake.post_calls) == 1
+    assert result.leg_a.status == "ambiguous"
+    assert result.leg_b.status == "ambiguous"
+    assert "signature-sentinel" not in repr(result)
+
+
+def test_threshold_reconcile_keeps_condition_and_token_refs_separate() -> None:
+    adapter, fake = make_adapter()
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    matched_at = datetime.now(UTC)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="a-trade", condition_id="condition-a", token_id="a-token",
+            taker_order_id="a-order", size=Decimal("10"), status="CONFIRMED",
+            side="BUY", matched_at=matched_at,
+        ),
+        SimpleNamespace(
+            id="b-trade", condition_id="condition-b", token_id="b-token",
+            taker_order_id="b-order", size=Decimal("10"), status="CONFIRMED",
+            side="BUY", matched_at=matched_at,
+        ),
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-a", "token_id": "a-token", "size": "10"},
+        {"condition_id": "condition-b", "token_id": "b-token", "size": "10"},
+    ]
+    value = adapter.reconcile_threshold_hedge(
+        intent=threshold_intent(),
+        since=since,
+        leg_a=ThresholdLegResult("A", "YES", "condition-a", "a-token", True, "filled", "a-order", Decimal("10"), ("a-trade",), "none"),
+        leg_b=ThresholdLegResult("B", "NO", "condition-b", "b-token", True, "filled", "b-order", Decimal("10"), ("b-trade",), "none"),
+    )
+
+    assert value["status"] == "ok"
+    assert value["execution_proof"]["verified"] is True
+    assert value["execution_proof"]["condition_ids"] == {"A": "condition-a", "B": "condition-b"}
+    assert value["execution_proof"]["matched_refs"]["B"]["token_id"] == "b-token"
 
 
 def test_account_reads_cover_balance_orders_trades_and_positions() -> None:

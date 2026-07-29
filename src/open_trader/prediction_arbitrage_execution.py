@@ -15,7 +15,13 @@ from typing import Any, Mapping
 
 from .daily_premarket import send_notification_with_results
 from .notifications import Notifier
-from .polymarket_trading import LegResult, PairSubmission, PolymarketTradingClient
+from .polymarket_trading import (
+    LegResult,
+    PairSubmission,
+    PolymarketTradingClient,
+    ThresholdHedgeSubmission,
+    ThresholdLegResult,
+)
 from .prediction_arbitrage import (
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
@@ -23,6 +29,8 @@ from .prediction_arbitrage import (
     MIN_ESTIMATED_PROFIT,
     PROTECTED_BUY_SHARE_PRECISION,
     PairIntent,
+    ThresholdHedgeIntent,
+    ThresholdHedgeLeg,
     protected_buy_quantity,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
@@ -34,11 +42,13 @@ MAX_RECONCILIATION_SECONDS = 30
 TERMINAL_STATES = {
     "both_rejected",
     "complete",
+    "holding_to_resolution",
     "neutralized_incident",
     "directional_incident",
     "merge_incident",
 }
 _PROCESS_LOCK = threading.Lock()
+ExecutionIntent = PairIntent | ThresholdHedgeIntent
 
 
 def _utc_now() -> datetime:
@@ -329,11 +339,39 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "open_orders", **evidence}
 
         active_intent = self._intent_from_payload(active.get("intent")) if active else None
-        totals = self._position_totals(snapshot, active_intent)
+        totals = self._position_totals(
+            snapshot,
+            active_intent,
+            known_tokens=self._known_holding_tokens(),
+        )
         if totals["unknown"]:
             evidence = {"phase": "startup_unknown_state", "positions": totals["unknown"]}
             self._startup_incident(active_id, "unknown_external_state", evidence)
             return {"state": "locked", "reason": "unknown_external_state", **evidence}
+        if isinstance(active_intent, ThresholdHedgeIntent):
+            if totals["yes"] > 0 and totals["no"] > 0 and totals["yes"] == totals["no"]:
+                try:
+                    self._transition(
+                        active_id,
+                        "holding_to_resolution",
+                        {
+                            "phase": "startup_threshold_holding",
+                            "merge": "not_applicable",
+                            "quantity": totals["yes"],
+                        },
+                    )
+                except Exception:
+                    return {"state": "locked", "reason": "startup_reconcile_persistence_failed"}
+                active = None
+                active_id = ""
+            elif totals["yes"] > 0 or totals["no"] > 0:
+                evidence = {
+                    "phase": "startup_threshold_directional_imbalance",
+                    "leg_a_quantity": _safe_decimal(totals["yes"]),
+                    "leg_b_quantity": _safe_decimal(totals["no"]),
+                }
+                self._startup_incident(active_id, "startup_directional_imbalance", evidence)
+                return {"state": "locked", "reason": "directional_imbalance", **evidence}
         if totals["yes"] > 0 and totals["no"] > 0 and totals["yes"] == totals["no"]:
             merge = self._startup_merge(
                 active,
@@ -553,6 +591,15 @@ class PredictionExecutionService:
             # The intent is rebuilt from current server data; browser and stale
             # preview economics never reach the authenticated client.
             intent = current_intent
+            if isinstance(intent, ThresholdHedgeIntent):
+                self._run_threshold_execution(
+                    execution_id,
+                    intent=intent,
+                    opportunity=opportunity,
+                    account=account,
+                    preview_payload=row,
+                )
+                return
             tick_size = self._tick_size(opportunity)
             if tick_size is None:
                 self._finish_rejected(execution_id, "tick_size_unavailable")
@@ -717,6 +764,402 @@ class PredictionExecutionService:
             self._threads.pop(execution_id, None)
             self._release_global_lock(lock)
 
+    def _run_threshold_execution(
+        self,
+        execution_id: str,
+        *,
+        intent: ThresholdHedgeIntent,
+        opportunity: Mapping[str, object],
+        account: Mapping[str, object],
+        preview_payload: Mapping[str, object],
+    ) -> None:
+        """Execute the non-merge branch for two independent conditions."""
+
+        preview_hash_a = preview_payload.get("rules_hash_a")
+        preview_hash_b = preview_payload.get("rules_hash_b")
+        current_hash_a = opportunity.get("rules_hash_a")
+        current_hash_b = opportunity.get("rules_hash_b")
+        if (
+            preview_hash_a is not None
+            and preview_hash_b is not None
+            and (preview_hash_a != current_hash_a or preview_hash_b != current_hash_b)
+        ):
+            self._finish_rejected(execution_id, "rule_hash_changed")
+            return
+        preview_cache_key = preview_payload.get("cache_key")
+        current_cache_key = opportunity.get("cache_key")
+        if (
+            preview_cache_key
+            and current_cache_key
+            and preview_cache_key != current_cache_key
+        ):
+            self._finish_rejected(execution_id, "cache_fingerprint_changed")
+            return
+        self._transition(execution_id, "submitting", {"phase": "submitting"})
+        submitted_at = _utc_now()
+        preflight = getattr(self._trading, "no_submit_threshold_preflight", None)
+        if not callable(preflight):
+            self._finish_rejected(execution_id, "threshold_preflight_unavailable")
+            return
+        try:
+            result = _call(preflight, intent)
+        except Exception:
+            result = None
+        if not self._preflight_passed(result):
+            self._finish_rejected(execution_id, "preflight_failed")
+            return
+        submit = getattr(self._trading, "submit_threshold_hedge_once", None)
+        if not callable(submit):
+            self._finish_rejected(execution_id, "threshold_submission_unavailable")
+            return
+        try:
+            submission = _call(submit, intent)
+        except Exception:
+            submission = self._ambiguous_threshold_submission(intent)
+        leg_a, leg_b = self._threshold_submission_legs(submission, intent)
+        self._store.record_leg(execution_id, self._threshold_leg_payload(leg_a))
+        self._store.record_leg(execution_id, self._threshold_leg_payload(leg_b))
+        self._transition(
+            execution_id,
+            "reconciling",
+            {"phase": "reconciling", "post_attempted": True},
+        )
+        if self._threshold_both_rejected(leg_a, leg_b):
+            self._transition(
+                execution_id,
+                "both_rejected",
+                {"phase": "both_rejected", "merge": "not_applicable"},
+            )
+            return
+        known = self._threshold_reconcile_until(
+            intent, since=submitted_at, leg_a=leg_a, leg_b=leg_b
+        )
+        if known is None:
+            self._finish_incident(execution_id, "reconciliation_timeout")
+            return
+        quantity_a, quantity_b, proof = known
+        if quantity_a > 0 and quantity_b <= 0:
+            self._handle_threshold_one_leg(
+                execution_id, intent, "A", quantity_a, leg_a, leg_b, proof, submitted_at, account
+            )
+            return
+        if quantity_b > 0 and quantity_a <= 0:
+            self._handle_threshold_one_leg(
+                execution_id, intent, "B", quantity_b, leg_a, leg_b, proof, submitted_at, account
+            )
+            return
+        if quantity_a <= 0 or quantity_b <= 0 or quantity_a != quantity_b:
+            self._finish_incident(execution_id, "directional_imbalance")
+            return
+        if proof.get("verified") is not True:
+            self._finish_incident(execution_id, "equal_fill_proof_unverified")
+            return
+        self._transition(
+            execution_id,
+            "reconciling",
+            {
+                "phase": "reconciled",
+                "leg_a_quantity": quantity_a,
+                "leg_b_quantity": quantity_b,
+                "execution_proof": proof,
+            },
+        )
+        self._transition(
+            execution_id,
+            "holding_to_resolution",
+            {
+                "phase": "holding_to_resolution",
+                "merge": "not_applicable",
+                "relation_id": intent.relation_id,
+                "leg_a_condition_id": intent.leg_a.condition_id,
+                "leg_b_condition_id": intent.leg_b.condition_id,
+                "quantity": quantity_a,
+                "execution_proof": proof,
+            },
+        )
+
+    def _threshold_reconcile_until(
+        self,
+        intent: ThresholdHedgeIntent,
+        *,
+        since: datetime,
+        leg_a: ThresholdLegResult,
+        leg_b: ThresholdLegResult,
+    ) -> tuple[Decimal, Decimal, dict[str, object]] | None:
+        started = self._clock()
+        for attempt in range(MAX_RECONCILIATION_SECONDS + 1):
+            reconcile = getattr(self._trading, "reconcile_threshold_hedge", None)
+            if not callable(reconcile):
+                return None
+            try:
+                value = _call(
+                    reconcile,
+                    intent=intent,
+                    since=since,
+                    leg_a=leg_a,
+                    leg_b=leg_b,
+                )
+            except Exception:
+                value = None
+            if isinstance(value, Mapping):
+                status = str(value.get("status", "")).lower()
+                proof = value.get("execution_proof")
+                quantity_a = _decimal(value.get("leg_a_quantity")) or Decimal("0")
+                quantity_b = _decimal(value.get("leg_b_quantity")) or Decimal("0")
+                if status in {"ok", "partial", "confirmed", "filled", "complete"} and isinstance(proof, Mapping):
+                    if quantity_a > 0 or quantity_b > 0:
+                        return quantity_a, quantity_b, dict(proof)
+            if attempt >= MAX_RECONCILIATION_SECONDS or self._clock() - started >= MAX_RECONCILIATION_SECONDS:
+                break
+            self._sleep(1)
+        return None
+
+    @staticmethod
+    def _ambiguous_threshold_submission(
+        intent: ThresholdHedgeIntent,
+    ) -> ThresholdHedgeSubmission:
+        return ThresholdHedgeSubmission(
+            leg_a=ThresholdLegResult(
+                "A", intent.leg_a.outcome, intent.leg_a.condition_id,
+                intent.leg_a.token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            ),
+            leg_b=ThresholdLegResult(
+                "B", intent.leg_b.outcome, intent.leg_b.condition_id,
+                intent.leg_b.token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            ),
+        )
+
+    @staticmethod
+    def _threshold_submission_legs(
+        value: object, intent: ThresholdHedgeIntent
+    ) -> tuple[ThresholdLegResult, ThresholdLegResult]:
+        if isinstance(value, ThresholdHedgeSubmission):
+            return value.leg_a, value.leg_b
+        if isinstance(value, Mapping):
+            return (
+                PredictionExecutionService._coerce_threshold_leg(value.get("leg_a", value.get("a")), intent.leg_a),
+                PredictionExecutionService._coerce_threshold_leg(value.get("leg_b", value.get("b")), intent.leg_b),
+            )
+        return (
+            PredictionExecutionService._ambiguous_threshold_submission(intent).leg_a,
+            PredictionExecutionService._ambiguous_threshold_submission(intent).leg_b,
+        )
+
+    @staticmethod
+    def _coerce_threshold_leg(value: object, leg: ThresholdHedgeLeg) -> ThresholdLegResult:
+        if isinstance(value, ThresholdLegResult):
+            return value
+        if isinstance(value, Mapping):
+            filled = _decimal(value.get("filled_quantity", value.get("quantity", 0))) or Decimal("0")
+            return ThresholdLegResult(
+                leg.label,
+                leg.outcome,
+                leg.condition_id,
+                leg.token_id,
+                value.get("accepted") is True,
+                str(value.get("status", "rejected")),
+                str(value.get("order_id", "")),
+                filled,
+                tuple(item for item in value.get("trade_ids", ()) if isinstance(item, str)),
+                str(value.get("error_code", "none")),
+            )
+        return ThresholdLegResult(
+            leg.label, leg.outcome, leg.condition_id, leg.token_id,
+            False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+        )
+
+    @staticmethod
+    def _threshold_leg_payload(leg: ThresholdLegResult) -> dict[str, object]:
+        return {
+            "label": leg.label,
+            "outcome": leg.outcome,
+            "condition_id": leg.condition_id,
+            "token_id": leg.token_id,
+            "accepted": leg.accepted,
+            "status": leg.status,
+            "order_id": leg.order_id,
+            "filled_quantity": format(leg.filled_quantity, "f"),
+            "trade_ids": list(leg.trade_ids),
+            "error_code": leg.error_code,
+        }
+
+    @staticmethod
+    def _threshold_both_rejected(
+        leg_a: ThresholdLegResult, leg_b: ThresholdLegResult
+    ) -> bool:
+        return (
+            not leg_a.accepted
+            and not leg_b.accepted
+            and leg_a.filled_quantity <= 0
+            and leg_b.filled_quantity <= 0
+            and not PredictionExecutionService._threshold_ambiguous(leg_a)
+            and not PredictionExecutionService._threshold_ambiguous(leg_b)
+        )
+
+    @staticmethod
+    def _threshold_ambiguous(leg: ThresholdLegResult) -> bool:
+        return leg.error_code == "ambiguous" or leg.status.lower() in {
+            "ambiguous", "pending", "delayed", "processing"
+        }
+
+    @staticmethod
+    def _threshold_option(options: Mapping[str, object], name: str) -> dict[str, object] | None:
+        value = options.get(name)
+        return dict(value) if isinstance(value, Mapping) else None
+
+    def _choose_threshold_remediation(
+        self,
+        options: Mapping[str, object],
+        *,
+        intent: ThresholdHedgeIntent,
+        filled_label: str,
+        filled_quantity: Decimal,
+    ) -> dict[str, object] | None:
+        filled = intent.leg_a if filled_label == "A" else intent.leg_b
+        missing = intent.leg_b if filled_label == "A" else intent.leg_a
+        candidates: list[tuple[Decimal, int, dict[str, object]]] = []
+        complete = self._threshold_option(options, "complete")
+        if complete is not None:
+            loss = _decimal(complete.get("loss", complete.get("estimated_loss")))
+            amount = complete.get("amount", complete.get("max_spend"))
+            max_price = complete.get("max_price")
+            if (
+                loss is not None and 0 <= loss <= Decimal("2")
+                and complete.get("leg") == missing.label
+                and complete.get("side") == "BUY"
+                and complete.get("token_id") == missing.token_id
+                and isinstance(amount, Decimal) and isinstance(max_price, Decimal)
+                and amount > 0 and amount <= Decimal("2") and 0 < max_price <= 1
+                and protected_buy_quantity(spend=amount, price=max_price, tick_size=missing.tick_size) == filled_quantity
+            ):
+                candidate = dict(complete)
+                candidate["quantity"] = filled_quantity
+                candidate["condition_id"] = missing.condition_id
+                candidates.append((loss, 0, candidate))
+        unwind = self._threshold_option(options, "unwind")
+        if unwind is not None:
+            loss = _decimal(unwind.get("loss", unwind.get("estimated_loss")))
+            shares = unwind.get("shares", unwind.get("quantity"))
+            min_price = unwind.get("min_price")
+            if (
+                loss is not None and 0 <= loss <= Decimal("2")
+                and unwind.get("leg") == filled.label
+                and unwind.get("side") == "SELL"
+                and unwind.get("token_id") == filled.token_id
+                and shares == filled_quantity
+                and isinstance(min_price, Decimal) and 0 < min_price <= 1
+            ):
+                candidate = dict(unwind)
+                candidate["quantity"] = filled_quantity
+                candidate["condition_id"] = filled.condition_id
+                candidates.append((loss, 1, candidate))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+    def _handle_threshold_one_leg(
+        self,
+        execution_id: str,
+        intent: ThresholdHedgeIntent,
+        filled_label: str,
+        filled_quantity: Decimal,
+        leg_a: ThresholdLegResult,
+        leg_b: ThresholdLegResult,
+        proof: Mapping[str, object],
+        since: datetime,
+        account: Mapping[str, object],
+    ) -> None:
+        self._breaker_open = True
+        filled = intent.leg_a if filled_label == "A" else intent.leg_b
+        remediation = getattr(self._trading, "threshold_remediation_options", None)
+        if not callable(remediation):
+            remediation = getattr(self._trading, "remediation_options", None)
+        options: Mapping[str, object] = {}
+        if callable(remediation):
+            try:
+                value = _call(
+                    remediation,
+                    condition_id=filled.condition_id,
+                    yes_token_id=filled.token_id if filled.outcome == "YES" else "",
+                    no_token_id=filled.token_id if filled.outcome == "NO" else "",
+                    filled_leg=filled_label,
+                    filled_quantity=filled_quantity,
+                    since=since,
+                    intent=intent,
+                )
+                if isinstance(value, Mapping):
+                    options = value
+            except Exception:
+                options = {}
+        chosen = self._choose_threshold_remediation(
+            options,
+            intent=intent,
+            filled_label=filled_label,
+            filled_quantity=filled_quantity,
+        )
+        incident_id = self._record_incident(
+            execution_id,
+            "one_leg_fill",
+            state="remediating" if chosen is not None else "directional_incident",
+            evidence={
+                "phase": "one_leg",
+                "filled_leg": filled_label,
+                "filled_quantity": _safe_decimal(filled_quantity),
+                "execution_proof": proof,
+                "remediation_options": options,
+            },
+        )
+        if chosen is None:
+            self._finish_incident(
+                execution_id, "no_safe_remediation", incident_id=incident_id, notify=False
+            )
+            return
+        self._transition(execution_id, "remediating", {"phase": "remediation_selected", "order": chosen})
+        submit = getattr(self._trading, "submit_threshold_remediation_once", None)
+        if not callable(submit):
+            submit = getattr(self._trading, "submit_remediation_once", None)
+        try:
+            result = _call(submit, chosen) if callable(submit) else None
+        except Exception:
+            result = None
+        if isinstance(result, ThresholdLegResult):
+            repaired = result
+        elif isinstance(result, LegResult):
+            repaired = ThresholdLegResult(
+                str(chosen.get("leg", filled_label)),
+                filled.outcome if str(chosen.get("leg", filled_label)) == filled.label else (intent.leg_a.outcome if filled_label == "B" else intent.leg_b.outcome),
+                str(chosen.get("condition_id", filled.condition_id)),
+                str(chosen.get("token_id", filled.token_id)),
+                result.accepted, result.status, result.order_id, result.filled_quantity,
+                result.trade_ids, result.error_code,
+            )
+        else:
+            repaired = ThresholdLegResult(
+                str(chosen.get("leg", filled_label)), filled.outcome, filled.condition_id,
+                filled.token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            )
+        self._store.record_leg(execution_id, {**self._threshold_leg_payload(repaired), "label": "remediation"})
+        self._transition(execution_id, "remediating", {"phase": "remediation_result", **self._threshold_leg_payload(repaired)})
+        if not repaired.accepted or repaired.filled_quantity != filled_quantity or self._threshold_ambiguous(repaired):
+            self._finish_incident(execution_id, "remediation_unverified", incident_id=incident_id, notify=False)
+            return
+        if chosen.get("side") == "SELL":
+            self._finish_incident(
+                execution_id, "one_leg_unwound", state="neutralized_incident", incident_id=incident_id, notify=False
+            )
+            return
+        repaired_a = leg_a if filled_label == "A" else repaired
+        repaired_b = leg_b if filled_label == "B" else repaired
+        known = self._threshold_reconcile_until(intent, since=since, leg_a=repaired_a, leg_b=repaired_b)
+        if known is None or known[0] <= 0 or known[1] <= 0 or known[0] != known[1] or known[2].get("verified") is not True:
+            self._finish_incident(execution_id, "remediation_reconciliation_unverified", incident_id=incident_id, notify=False)
+            return
+        self._transition(
+            execution_id,
+            "holding_to_resolution",
+            {"phase": "holding_to_resolution", "merge": "not_applicable", "quantity": known[0], "execution_proof": known[2]},
+        )
+
     def _fresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
         refreshed: object = None
         for name in ("refresh_once", "refresh_opportunity", "recheck_opportunity", "refresh"):
@@ -769,7 +1212,7 @@ class PredictionExecutionService:
         return self._execution_for_idempotency(key)
 
     def _volatile_checks(
-        self, intent: PairIntent
+        self, intent: ExecutionIntent
     ) -> tuple[dict[str, object] | None, str | None]:
         if not self._notification_channels_ready():
             return None, "notification_config_unavailable"
@@ -803,7 +1246,7 @@ class PredictionExecutionService:
             checked_age = _age_seconds(account.get("checked_at"))
             if checked_age is None or checked_age > 60:
                 return None, "account_stale"
-        if not self._relayer_ready():
+        if not self._relayer_ready(require_merge=not isinstance(intent, ThresholdHedgeIntent)):
             return None, "relayer_unavailable"
         return account, None
 
@@ -872,14 +1315,22 @@ class PredictionExecutionService:
 
     @staticmethod
     def _position_totals(
-        snapshot: Mapping[str, object], intent: PairIntent | None
+        snapshot: Mapping[str, object],
+        intent: ExecutionIntent | None,
+        *,
+        known_tokens: set[str] | None = None,
     ) -> dict[str, object]:
         positions = snapshot.get("positions", ())
         totals: dict[str, object] = {"yes": Decimal("0"), "no": Decimal("0"), "unknown": []}
         if not isinstance(positions, (list, tuple)):
             return totals
-        yes_token = intent.yes_token_id if intent else None
-        no_token = intent.no_token_id if intent else None
+        if isinstance(intent, ThresholdHedgeIntent):
+            yes_token = intent.leg_a.token_id
+            no_token = intent.leg_b.token_id
+        else:
+            yes_token = intent.yes_token_id if intent else None
+            no_token = intent.no_token_id if intent else None
+        known = known_tokens or set()
         for position in positions:
             if not isinstance(position, Mapping):
                 totals["unknown"].append(str(position))
@@ -901,9 +1352,23 @@ class PredictionExecutionService:
                 totals["yes"] = totals["yes"] + quantity
             elif no_token and token == no_token:
                 totals["no"] = totals["no"] + quantity
+            elif token in known and quantity > 0:
+                continue
             elif quantity > 0:
                 totals["unknown"].append(PredictionExecutionService._safe_mapping(position))
         return totals
+
+    def _known_holding_tokens(self) -> set[str]:
+        tokens: set[str] = set()
+        for row in self._store.histories("executions"):
+            if row.get("state") != "holding_to_resolution":
+                continue
+            intent = self._intent_from_payload(row.get("intent"))
+            if isinstance(intent, ThresholdHedgeIntent):
+                tokens.update((intent.leg_a.token_id, intent.leg_b.token_id))
+            elif isinstance(intent, PairIntent):
+                tokens.update((intent.yes_token_id, intent.no_token_id))
+        return tokens
 
     def _startup_incident(
         self,
@@ -1547,7 +2012,7 @@ class PredictionExecutionService:
         totals = self._position_totals(snapshot, intent)
         return collaborator_verified and totals["yes"] == 0 and totals["no"] == 0 and not totals["unknown"]
 
-    def _relayer_ready(self) -> bool:
+    def _relayer_ready(self, *, require_merge: bool = True) -> bool:
         method = getattr(self._trading, "readiness_snapshot", None)
         if callable(method):
             try:
@@ -1578,7 +2043,7 @@ class PredictionExecutionService:
                     None,
                 )
                 accepted = (True, "ready", "allowed", "pass", "confirmed")
-                return relayer in accepted and merge in accepted
+                return relayer in accepted and (not require_merge or merge in accepted)
         for name in ("relayer_ready", "relayer_readiness"):
             value = getattr(self._trading, name, None)
             if callable(value):
@@ -1593,12 +2058,12 @@ class PredictionExecutionService:
                 relayer = value.get("ready", value.get("relayer_ready", value.get("relayer")))
                 merge = value.get("merge_ready", value.get("merge"))
                 accepted = (True, "ready", "allowed", "pass", "confirmed")
-                return relayer in accepted and merge in accepted
+                return relayer in accepted and (not require_merge or merge in accepted)
             return False
         return False
 
     def _validate_opportunity(
-        self, opportunity: Mapping[str, object], intent: PairIntent
+        self, opportunity: Mapping[str, object], intent: ExecutionIntent
     ) -> str | None:
         if opportunity.get("actionable") is not True:
             return str(opportunity.get("eligibility_reason", "opportunity_not_actionable"))
@@ -1610,6 +2075,22 @@ class PredictionExecutionService:
             return "book_freshness_invalid"
         if age > BOOK_FRESHNESS_SECONDS or timestamp_age > float(BOOK_FRESHNESS_SECONDS):
             return "books_stale"
+        if isinstance(intent, ThresholdHedgeIntent):
+            if opportunity.get("intent_type", "threshold_hedge") != "threshold_hedge":
+                return "intent_type_mismatch"
+            if opportunity.get("rules_hash_a") in (None, "") or opportunity.get("rules_hash_b") in (None, ""):
+                return "rule_hash_unavailable"
+            if opportunity.get("cache_key") in (None, ""):
+                return "cache_fingerprint_unavailable"
+            if intent.leg_a.condition_id == intent.leg_b.condition_id:
+                return "condition_identity"
+            if intent.leg_a.token_id == intent.leg_b.token_id:
+                return "token_identity"
+            if intent.leg_a.quantity != intent.quantity or intent.leg_b.quantity != intent.quantity:
+                return "order_amount_mismatch"
+            if intent.total_max_cost > MAX_NORMAL_COST or intent.minimum_profit <= 0 or intent.net_edge <= 0:
+                return "threshold_economics"
+            return None
         tick_size = self._tick_size(opportunity)
         if tick_size is None:
             return "tick_size_unavailable"
@@ -1647,31 +2128,26 @@ class PredictionExecutionService:
     def _preview_payload(
         self,
         opportunity: Mapping[str, object],
-        intent: PairIntent,
+        intent: ExecutionIntent,
         *,
         account: Mapping[str, object],
         expires_at: datetime,
     ) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "opportunity_id": str(
                 opportunity.get("opportunity_id", opportunity.get("id", ""))
             ),
             "event_id": intent.event_id,
-            "market_id": intent.market_id,
-            "condition_id": intent.condition_id,
+            "market_id": getattr(intent, "market_id", getattr(intent, "relation_id", "")),
+            "condition_id": getattr(intent, "condition_id", ""),
             "question": str(opportunity.get("question", "")),
             "market_type": str(opportunity.get("market_type", "")),
+            "intent_type": "threshold_hedge" if isinstance(intent, ThresholdHedgeIntent) else "pair",
             "fee_status": str(opportunity.get("fee_status", "")),
             "volume_24h": _safe_decimal(opportunity.get("volume_24h")) or "0",
             "intent": self._intent_payload(intent),
-            "tick_size": _safe_decimal(self._tick_size(opportunity)) or "",
             "quantity": format(intent.quantity, "f"),
-            "yes_max_price": format(intent.yes_max_price, "f"),
-            "no_max_price": format(intent.no_max_price, "f"),
-            "yes_max_cost": format(intent.yes_max_cost, "f"),
-            "no_max_cost": format(intent.no_max_cost, "f"),
             "total_max_cost": format(intent.total_max_cost, "f"),
-            "merge_value": format(intent.quantity, "f"),
             "minimum_profit": format(intent.minimum_profit, "f"),
             "net_edge": format(intent.net_edge, "f"),
             "wallet_address": str(account.get("wallet_address", "")),
@@ -1684,16 +2160,77 @@ class PredictionExecutionService:
             },
             "expires_at": _timestamp(expires_at),
         }
+        if isinstance(intent, PairIntent):
+            payload.update(
+                {
+                    "condition_id": intent.condition_id,
+                    "tick_size": _safe_decimal(self._tick_size(opportunity)) or "",
+                    "yes_max_price": format(intent.yes_max_price, "f"),
+                    "no_max_price": format(intent.no_max_price, "f"),
+                    "yes_max_cost": format(intent.yes_max_cost, "f"),
+                    "no_max_cost": format(intent.no_max_cost, "f"),
+                    "merge_value": format(intent.quantity, "f"),
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "relation_id": intent.relation_id,
+                    "relation": intent.relation,
+                    "rules_hash_a": opportunity.get("rules_hash_a", ""),
+                    "rules_hash_b": opportunity.get("rules_hash_b", ""),
+                    "cache_key": opportunity.get("cache_key", ""),
+                    "condition_id_a": intent.leg_a.condition_id,
+                    "condition_id_b": intent.leg_b.condition_id,
+                    "buy_legs": [
+                        self._threshold_intent_leg_payload(intent.leg_a),
+                        self._threshold_intent_leg_payload(intent.leg_b),
+                    ],
+                    "maximum_fee": format(intent.maximum_fee, "f"),
+                    "minimum_payout": format(intent.minimum_payout, "f"),
+                    "merge_value": "not_applicable",
+                }
+            )
+        return payload
 
     @staticmethod
-    def _intent_payload(intent: PairIntent) -> dict[str, object]:
+    def _threshold_intent_leg_payload(leg: ThresholdHedgeLeg) -> dict[str, object]:
+        return {
+            "label": leg.label,
+            "condition_id": leg.condition_id,
+            "market_id": leg.market_id,
+            "outcome": leg.outcome,
+            "token_id": leg.token_id,
+            "quantity": format(leg.quantity, "f"),
+            "max_price": format(leg.max_price, "f"),
+            "max_cost": format(leg.max_cost, "f"),
+            "tick_size": format(leg.tick_size, "f"),
+        }
+
+    @staticmethod
+    def _intent_payload(intent: ExecutionIntent) -> dict[str, object]:
+        if isinstance(intent, ThresholdHedgeIntent):
+            return {
+                "intent_type": "threshold_hedge",
+                "relation_id": intent.relation_id,
+                "event_id": intent.event_id,
+                "relation": intent.relation,
+                "leg_a": PredictionExecutionService._threshold_intent_leg_payload(intent.leg_a),
+                "leg_b": PredictionExecutionService._threshold_intent_leg_payload(intent.leg_b),
+                "quantity": format(intent.quantity, "f"),
+                "maximum_fee": format(intent.maximum_fee, "f"),
+                "total_max_cost": format(intent.total_max_cost, "f"),
+                "minimum_payout": format(intent.minimum_payout, "f"),
+                "minimum_profit": format(intent.minimum_profit, "f"),
+                "net_edge": format(intent.net_edge, "f"),
+            }
         result: dict[str, object] = {}
         for field in fields(PairIntent):
             value = getattr(intent, field.name)
             result[field.name] = format(value, "f") if isinstance(value, Decimal) else value
         return result
 
-    def _intent_from_opportunity(self, opportunity: Mapping[str, object] | None) -> PairIntent | None:
+    def _intent_from_opportunity(self, opportunity: Mapping[str, object] | None) -> ExecutionIntent | None:
         if opportunity is None:
             return None
         value = opportunity.get("intent")
@@ -1703,11 +2240,33 @@ class PredictionExecutionService:
         return self._intent_from_payload(opportunity)
 
     @staticmethod
-    def _intent_from_payload(value: object) -> PairIntent | None:
+    def _intent_from_payload(value: object) -> ExecutionIntent | None:
+        if isinstance(value, ThresholdHedgeIntent):
+            return value
         if isinstance(value, PairIntent):
             return value
         if not isinstance(value, Mapping):
             return None
+        if value.get("intent_type") == "threshold_hedge" or {
+            "relation_id", "leg_a", "leg_b", "maximum_fee", "minimum_payout"
+        } <= set(value):
+            leg_a = PredictionExecutionService._threshold_leg_from_payload(value.get("leg_a"), "A")
+            leg_b = PredictionExecutionService._threshold_leg_from_payload(value.get("leg_b"), "B")
+            if leg_a is None or leg_b is None:
+                return None
+            decimal_names = {"quantity", "maximum_fee", "total_max_cost", "minimum_payout", "minimum_profit", "net_edge"}
+            raw = {name: _decimal(value.get(name)) for name in decimal_names}
+            if any(item is None for item in raw.values()):
+                return None
+            if not isinstance(value.get("relation_id"), str) or not isinstance(value.get("event_id"), str):
+                return None
+            try:
+                return ThresholdHedgeIntent(
+                    relation_id=value["relation_id"], event_id=value["event_id"], relation=value.get("relation"),
+                    leg_a=leg_a, leg_b=leg_b, **raw  # type: ignore[arg-type]
+                )
+            except (TypeError, ValueError):
+                return None
         names = {field.name for field in fields(PairIntent)}
         if not names <= set(value):
             return None
@@ -1723,6 +2282,26 @@ class PredictionExecutionService:
             return None
         try:
             return PairIntent(**raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _threshold_leg_from_payload(value: object, label: str) -> ThresholdHedgeLeg | None:
+        if isinstance(value, ThresholdHedgeLeg):
+            return value
+        if not isinstance(value, Mapping):
+            return None
+        if value.get("label", label) != label:
+            return None
+        names = ("condition_id", "market_id", "outcome", "token_id")
+        if not all(isinstance(value.get(name), str) and value.get(name).strip() for name in names):
+            return None
+        decimal_names = ("quantity", "max_price", "max_cost", "tick_size")
+        parsed = {name: _decimal(value.get(name)) for name in decimal_names}
+        if any(item is None for item in parsed.values()):
+            return None
+        try:
+            return ThresholdHedgeLeg(label=label, **{name: value[name] for name in names}, **parsed)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return None
 
