@@ -5043,6 +5043,12 @@ table {
     min-height: 44px;
   }
 
+  .trend-industry-metric {
+    min-height: 44px;
+    text-align: left;
+    width: 100%;
+  }
+
   .trend-option-dialog {
     margin: auto;
     max-height: calc(100dvh - 20px);

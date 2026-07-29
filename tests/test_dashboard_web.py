@@ -7091,6 +7091,8 @@ def test_dashboard_trend_option_button_mobile_layout_css() -> None:
     assert ".trend-option-button" in mobile
     button_css = mobile.split(".trend-option-button", 1)[1].split("}", 1)[0]
     assert "min-height: 44px;" in button_css
+    industry_metric_css = mobile.split(".trend-industry-metric", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px;" in industry_metric_css
     assert "grid-template-columns: minmax(0, 1fr);" in mobile
     dialog_buttons = mobile.split(".trend-option-dialog button", 1)[1].split("}", 1)[0]
     assert "min-height: 44px;" in dialog_buttons
