@@ -2714,8 +2714,10 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
             order.append("trading.close")
 
     class FakeMonitor:
+        kwargs: dict[str, object] = {}
+
         def __init__(self, **_: object) -> None:
-            pass
+            self.__class__.kwargs = dict(_)
 
         def start(self) -> None:
             order.append("monitor.start")
@@ -2759,6 +2761,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert order.index("monitor.stop") < order.index("server.close")
     assert "execution.close" in order
     assert "trading.close" in order
+    assert FakeMonitor.kwargs["relation_discovery"] is dashboard_web.discover_threshold_relations
+    assert FakeMonitor.kwargs["relation_validator"].__class__.__name__ == "CodexRelationValidator"
+    assert "DEEPSEEK_API_KEY" not in repr(FakeMonitor.kwargs)
 
 
 def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
