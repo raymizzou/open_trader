@@ -2336,6 +2336,13 @@ class TabbedAccountLocator:
         return self
 
     def locator(self, selector: str) -> "TabbedAccountLocator":
+        if re.fullmatch(r"#account-\w+-view-panel:visible", selector):
+            return self.page.locator(selector)
+        if ".cn-trend-report:visible" in self.selector:
+            return self.page.locator(
+                "#trend-report-workspace:visible"
+                + (f" {selector}" if selector else "")
+            )
         return self.page.locator(f"{self.selector} {selector}")
 
     def _require_known_broker(self, broker: str) -> str:
@@ -2357,7 +2364,17 @@ class TabbedAccountLocator:
         if match:
             broker = self._require_known_broker(match.group(1))
             assert broker == self.page.selected
-            self.page.account_views[broker] = match.group(2)
+            view = match.group(2)
+            self.page.account_views[broker] = view
+            if view == "report":
+                self.page.trend_broker = broker
+                self.page.opened_reports.append(broker)
+                self.page.active = self.selector
+                self.page._record_visible_sections()
+            elif view == "real" and self.page.trend_broker == broker:
+                self.page.trend_broker = None
+                self.page.active = self.selector
+                self.page._record_visible_sections()
             return
         if self.selector == '[data-market="CN"]':
             self.page.market = "CN"
@@ -2389,6 +2406,14 @@ class TabbedAccountLocator:
             "#trend-report-workspace:visible dialog.trend-option-dialog:visible button[data-option-anomaly-close]:visible",
         }:
             self.page.option_dialog_open = False
+            return
+        match = re.fullmatch(
+            r'#account-(\w+)-view-panel:visible details\.trend-review-disclosure :scope > summary',
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            self.page.opened_reviews.append(broker)
             return
         match = re.fullmatch(
             r'#account-(\w+):visible \[data-trend-review="\w+"\]',
@@ -2466,6 +2491,13 @@ class TabbedAccountLocator:
         }
         if self.selector in target_selectors:
             return 1
+        if re.fullmatch(
+            r"#account-(\w+)-view-panel:visible \.cn-trend-report "
+            r"(?:button|summary):visible, #account-\1-view-panel:visible "
+            r"\.cn-trend-report summary:visible",
+            self.selector,
+        ):
+            return 1
         if self.selector in VISUAL_CONTRACT_STYLES:
             return 1
         if self.selector == (
@@ -2504,7 +2536,34 @@ class TabbedAccountLocator:
         if match:
             broker = self._require_known_broker(match.group(1))
             return int(
-                self.page.trend_broker is None and self.page.selected == broker
+                self.page.selected == broker
+                and (
+                    self.page.trend_broker is None
+                    or (
+                        self.page.trend_broker == broker
+                        and self.page.account_views.get(broker) == "report"
+                    )
+                )
+            )
+        match = re.fullmatch(r"#account-(\w+)-view-panel:visible", self.selector)
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            return int(
+                self.page.selected == broker
+                and self.page.trend_broker == broker
+                and self.page.account_views.get(broker) == "report"
+            )
+        match = re.fullmatch(
+            r"#account-(\w+)-view-panel:visible \.cn-trend-report:visible",
+            self.selector,
+        )
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            return int(
+                self.page.selected == broker
+                and self.page.trend_broker == broker
+                and self.page.account_views.get(broker) == "report"
+                and self.page.reports[broker].get("available") is True
             )
         match = re.fullmatch(
             r'#account-(\w+):visible \[data-account-view="(\w+)"\]',
@@ -2541,6 +2600,8 @@ class TabbedAccountLocator:
                 return 0
             if broker == "futu":
                 return 0
+            if broker in {"tiger", "phillips", "eastmoney"}:
+                return 0
             if self.selector == f"{entry} [data-trend-report]":
                 return int(bool(self.page.reports[broker]["available"]))
             return 1
@@ -2558,6 +2619,15 @@ class TabbedAccountLocator:
             )
         if self.selector == "#trend-report-workspace:visible":
             return int(self.page.trend_broker is not None)
+        if self.selector.endswith(" details.trend-review-disclosure"):
+            match = re.search(r"#account-(\w+)-view-panel:visible", self.selector)
+            if not match:
+                return 0
+            broker = self._require_known_broker(match.group(1))
+            return int(
+                self.page.trend_broker == broker
+                and self.page.account_views.get(broker) == "report"
+            )
         if self.selector == "#trend-report-workspace:visible .cn-trend-table thead th":
             return 16
         if self.selector in {
@@ -2804,7 +2874,17 @@ class TabbedAccountLocator:
         )
         if match and match.group(1) in self.page.tab_order:
             return self.page.entry_texts[match.group(1)]
-        if self.selector == "#trend-report-workspace:visible":
+        match = re.fullmatch(r"#account-(\w+)-view-panel:visible", self.selector)
+        if match:
+            broker = self._require_known_broker(match.group(1))
+            report = self.page.reports[broker]
+            if report.get("available") is not True:
+                return str(report.get("status_text") or "今日暂无趋势报告")
+            return self.page.workspace_texts[broker]
+        if self.selector == "#trend-report-workspace:visible" or re.fullmatch(
+            r"#account-(\w+)-view-panel:visible \.cn-trend-report:visible",
+            self.selector,
+        ):
             if self.page.trend_kind == "review":
                 broker = str(self.page.trend_broker)
                 return trend_review_workspace_text(broker)
@@ -3157,7 +3237,11 @@ class TabbedAccountPage:
         return len(self.option_actions())
 
     def _record_visible_sections(self) -> int:
-        visible = self.visible_account_sections if self.trend_broker is None else 0
+        embedded = (
+            self.trend_broker is not None
+            and self.account_views.get(self.trend_broker) == "report"
+        )
+        visible = self.visible_account_sections if self.trend_broker is None or embedded else 0
         self.max_visible_account_sections = max(
             self.max_visible_account_sections, visible
         )
@@ -4541,15 +4625,20 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             assert (viewport, f"#account-{broker}:visible") in selectors
         assert (
             viewport,
-            '#account-futu:visible .trend-report-entry [data-trend-report]',
+            '#account-futu:visible [data-account-view="report"]',
         ) not in clicks
         for broker in ("tiger", "phillips"):
             assert (
                 viewport,
-                f'#account-{broker}:visible .trend-report-entry [data-trend-report]',
+                f'#account-{broker}:visible [data-account-view="report"]',
             ) in clicks
         assert (viewport, '#return-to-portfolio:visible') in clicks
-        assert (viewport, '#trend-report-workspace:visible') in selectors
+        for broker in ("tiger", "phillips"):
+            assert (viewport, f"#account-{broker}-view-panel:visible") in selectors
+            assert (
+                viewport,
+                f"#account-{broker}-view-panel:visible .cn-trend-report:visible",
+            ) in selectors
         assert (viewport, '.account-section:visible') in selectors
         assert (viewport, '#account-tiger:visible') in selectors
         assert (viewport, '#tiger-long-term-panel') in selectors
@@ -4574,8 +4663,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ] == list(VISUAL_CONTRACT_STYLES)
         assert (viewport, "#refresh-quotes") in visual_focus_calls
         assert (viewport, "#refresh-quotes") in visual_focus_evaluations
-    assert geometry_evaluations == ["wide_desktop", "wide_desktop"]
-    assert sorted(buy_overflow_evaluations) == ["desktop", "wide_desktop"]
+    assert geometry_evaluations == []
+    assert buy_overflow_evaluations == []
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
     assert screenshots == [
         ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
@@ -4674,8 +4763,7 @@ def test_check_account_holdings_visits_every_broker_tab(
     assert page.opened_reviews == ["tiger", "phillips"]
     assert page.disabled_reports == set()
     assert projections == ["tiger", "phillips", "eastmoney"]
-    assert "#return-to-portfolio:visible" in page.focus_checks
-    assert "#trend-report-workspace:visible .cn-trend-buy" in page.focus_checks
+    assert page.account_views["tiger"] == page.account_views["phillips"] == "real"
 
 
 @pytest.mark.parametrize(

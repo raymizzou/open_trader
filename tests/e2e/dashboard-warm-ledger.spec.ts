@@ -362,6 +362,10 @@ test('opens every warm-ledger destination, using real UI paths where available',
   await page.getByRole('tab', { name: /老虎/ }).click();
   await page.getByRole('tab', { name: '趋势报告', exact: true }).click();
   await expect(page.locator('#account-tiger-view-panel .cn-trend-report')).toBeVisible();
+  await expect(page.locator('.trend-option-button:disabled')).toHaveCount(1);
+  await expect(page.locator('.trend-option-button:disabled').first()).toHaveAttribute(
+    'aria-label', /期权异动不可用：富途未返回该标的期权异动/,
+  );
   await page.getByRole('button', { name: '期权异动', exact: true }).first().click();
   await expect(page.locator('.trend-option-dialog')).toBeVisible();
   await expect(page.locator('.trend-option-dialog')).toContainText('富途期权异动');

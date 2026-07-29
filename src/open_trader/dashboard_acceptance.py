@@ -2671,6 +2671,7 @@ def _check_trend_option_buttons(
             first_enabled = (button, action)
 
     headings = workspace.locator(".cn-trend-table thead th").count()
+    assert headings >= 3, f"{broker} 趋势表格表头缺失"
     if first_enabled is None:
         return
     button, action = first_enabled
@@ -2764,26 +2765,40 @@ def _check_account_holdings(
         if entry.count() == 0:
             report_tab = section.locator('[data-account-view="report"]')
             assert report_tab.count() == 1, f"{broker} 账户缺少趋势报告视图"
-            assert report.get("available") is True, f"{broker} 当前趋势报告不可用"
             report_tab.click()
             panel = section.locator(f"#account-{broker}-view-panel:visible")
-            workspace = panel.locator(".cn-trend-report:visible")
-            assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
-            workspace_text = workspace.inner_text()
-            for label, key in (("报告", "report_date"), ("数据", "data_date")):
-                assert _plain(report.get(key)) in workspace_text, (
-                    f"{broker} 趋势报告缺少 {label}日期"
+            assert panel.count() == 1, f"{broker} 趋势报告视图面板未显示"
+            if report.get("available") is True:
+                workspace = panel.locator(".cn-trend-report:visible")
+                assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
+                workspace_text = workspace.inner_text()
+                for label, key in (("报告", "report_date"), ("数据", "data_date")):
+                    assert _plain(report.get(key)) in workspace_text, (
+                        f"{broker} 趋势报告缺少 {label}日期"
+                    )
+                _check_trend_option_buttons(page, workspace, report, broker)
+                if reports_dir is not None and broker in TREND_REPORT_BROKERS:
+                    _check_trend_artifact_projection(reports_dir, broker, report)
+                if (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760:
+                    _check_mobile_targets(
+                        page,
+                        f"#account-{broker}-view-panel:visible .cn-trend-report button:visible, "
+                        f"#account-{broker}-view-panel:visible .cn-trend-report summary:visible",
+                    )
+                    assert page.evaluate(
+                        "document.documentElement.scrollWidth <= window.innerWidth"
+                    ), f"{broker} 趋势报告工作区出现横向滚动"
+            else:
+                status_text = _plain(report.get("status_text") or "今日暂无趋势报告")
+                assert status_text in panel.inner_text(), (
+                    f"{broker} 不可用趋势报告缺少状态文案"
                 )
-            _check_trend_option_buttons(page, workspace, report, broker)
-            if (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760:
-                _check_mobile_targets(
-                    page,
-                    f"#account-{broker}-view-panel:visible .cn-trend-report button:visible, "
-                    f"#account-{broker}-view-panel:visible .cn-trend-report summary:visible",
-                )
-                assert page.evaluate(
-                    "document.documentElement.scrollWidth <= window.innerWidth"
-                ), f"{broker} 趋势报告工作区出现横向滚动"
+            review = reviews.get(broker) if isinstance(reviews, Mapping) else None
+            assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
+            review_disclosure = panel.locator("details.trend-review-disclosure")
+            assert review_disclosure.count() == 1, f"{broker} 趋势复盘折叠栏目数量不是 1"
+            review_disclosure.locator(":scope > summary").click()
+            assert review.get("available") is True, f"{broker} 趋势复盘不可用"
             section.locator('[data-account-view="real"]').click()
             continue
         assert entry_label in text, f"{broker} 账户区块缺少 {entry_label}"
