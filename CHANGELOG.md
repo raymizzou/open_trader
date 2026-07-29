@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Fixed the live Dashboard acceptance hover check to select one real industry
+  metric when a report contains multiple industry rows, preventing Playwright
+  strict-mode failures while preserving the tooltip content assertion.
 - Added the first manual-confirmation Polymarket threshold-hedge path: a
   time-bounded scan of the first 100 active Gamma events for same-event
   relations, deterministic proofs plus structured Codex
