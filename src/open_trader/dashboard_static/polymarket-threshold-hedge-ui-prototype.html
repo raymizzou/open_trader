@@ -111,6 +111,30 @@
       }
       .page-heading h1 { font-size: 25px; letter-spacing: -.025em; margin: 0 0 5px; }
       .page-heading p { color: var(--muted); margin: 0; }
+      .strategy-switch {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: inline-grid;
+        gap: 4px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-bottom: 12px;
+        padding: 4px;
+      }
+      .strategy-switch button {
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        color: var(--muted);
+        min-height: 44px;
+        padding: 9px 16px;
+      }
+      .strategy-switch button[aria-current="page"] {
+        background: var(--proto-blue-soft);
+        border-color: var(--proto-blue);
+        color: var(--proto-blue);
+        font-weight: 800;
+      }
       .live-status { color: var(--muted); text-align: right; }
       .status-line { align-items: center; display: inline-flex; gap: 7px; }
       .status-dot {
@@ -747,6 +771,7 @@
         .opportunity-title,
         .action-row { align-items: stretch; display: grid; }
         .top-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .strategy-switch { display: grid; width: 100%; }
         .live-status { text-align: left; }
         .state-switcher { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
         .state-switcher button { min-height: 44px; }
@@ -849,16 +874,31 @@
 
       <section class="pm-page-head page-heading">
         <div>
-          <h1>Polymarket 阈值关系套利</h1>
-          <p>扫描同一事件的关联合约，由确定性规则与 Codex 双重校验，再由你确认下单。</p>
+          <h1>预测市场套利</h1>
+          <p id="strategy-description">扫描同一事件的关联合约，由确定性规则与 Codex 双重校验，再由你确认下单。</p>
         </div>
         <div class="pm-updated live-status">
-          <span class="pm-status-line status-line"><i class="pm-status-dot status-dot pulse" aria-hidden="true"></i><strong>扫描运行中</strong></span>
+          <span class="pm-status-line status-line"><i class="pm-status-dot status-dot pulse" aria-hidden="true"></i><strong>监控运行中</strong></span>
           <div>最近轮次 14:32:05 · 下轮约 04:37</div>
         </div>
       </section>
 
-      <section class="state-bar" aria-label="原型状态">
+      <nav class="strategy-switch" aria-label="套利策略">
+        <button type="button" data-strategy="yes_no">YES/NO套利</button>
+        <button type="button" data-strategy="llm_hedge">LLM对冲套利</button>
+      </nav>
+
+      <section id="yes-no-strategy" class="panel existing-strategy-handoff" hidden>
+        <header class="panel-heading">
+          <div>
+            <h2>YES/NO套利</h2>
+            <p>这里接回现在已有的套利监控、机会确认和历史记录，页面内容保持不变。</p>
+          </div>
+          <span class="pill neutral">现有页面</span>
+        </header>
+      </section>
+
+      <section class="state-bar llm-strategy-content" aria-label="原型状态">
         <div class="state-bar-label">
           <strong>查看关键状态</strong>
           <small>切换后可检查扫描、放行、拒绝、确认和持仓界面。</small>
@@ -872,7 +912,7 @@
         </div>
       </section>
 
-      <section class="health-strip" aria-label="系统状态">
+      <section class="health-strip llm-strategy-content" aria-label="系统状态">
         <div class="health-item">
           <span>Polymarket 数据</span>
           <strong class="ok">正常 · 1.4s</strong>
@@ -900,7 +940,7 @@
         </div>
       </section>
 
-      <section class="metric-strip" aria-label="扫描指标">
+      <section class="metric-strip llm-strategy-content" aria-label="扫描指标">
         <div class="metric primary">
           <span>本轮关系候选</span>
           <strong>14</strong>
@@ -928,9 +968,9 @@
         </div>
       </section>
 
-      <div id="variant-root" aria-live="polite"></div>
+      <div id="variant-root" class="llm-strategy-content" aria-live="polite"></div>
 
-      <details class="log-panel">
+      <details class="log-panel llm-strategy-content">
         <summary>
           <strong>扫描日志</strong>
           <span>内存中 24 条 · 页面刷新后清空</span>
@@ -945,7 +985,7 @@
       </details>
     </main>
 
-    <div class="prototype-controller" aria-label="原型方案切换">
+    <div class="prototype-controller llm-strategy-content" aria-label="原型方案切换">
       <button type="button" data-variant-direction="-1" aria-label="上一种方案">←</button>
       <div class="prototype-controller-label">
         <small>UI 方案 · 键盘 ← → 可切换</small>
@@ -963,6 +1003,7 @@
         C: { name: "决策队列" },
       };
       const states = ["scanning", "approved", "rejected", "confirm", "holding"];
+      const strategies = ["yes_no", "llm_hedge"];
       const stateCopy = {
         scanning: "扫描中",
         approved: "LLM 放行",
@@ -1350,7 +1391,8 @@
         const params = new URLSearchParams(window.location.search);
         const variant = variants[params.get("variant")] ? params.get("variant") : "A";
         const state = states.includes(params.get("state")) ? params.get("state") : "approved";
-        return { variant, state };
+        const strategy = strategies.includes(params.get("strategy")) ? params.get("strategy") : "llm_hedge";
+        return { variant, state, strategy };
       }
 
       function setParams(next) {
@@ -1358,6 +1400,7 @@
         const params = new URLSearchParams(window.location.search);
         params.set("variant", next.variant || current.variant);
         params.set("state", next.state || current.state);
+        params.set("strategy", next.strategy || current.strategy);
         history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
         render();
       }
@@ -1389,23 +1432,42 @@
       }
 
       function render() {
-        const { variant, state } = currentParams();
+        const { variant, state, strategy } = currentParams();
+        const llmActive = strategy === "llm_hedge";
         const renderVariant = variant === "B" ? variantB : variant === "C" ? variantC : variantA;
-        document.getElementById("variant-root").innerHTML = renderVariant(state);
+        document.getElementById("variant-root").innerHTML = llmActive ? renderVariant(state) : "";
         document.getElementById("variant-label").textContent = `${variant} — ${variants[variant].name}`;
+        document.querySelectorAll("[data-strategy]").forEach((button) => {
+          const active = button.dataset.strategy === strategy;
+          button.setAttribute("aria-current", active ? "page" : "false");
+        });
+        document.querySelectorAll(".llm-strategy-content").forEach((element) => {
+          element.hidden = !llmActive;
+        });
+        document.getElementById("yes-no-strategy").hidden = llmActive;
+        document.getElementById("strategy-description").textContent = llmActive
+          ? "扫描同一事件的关联合约，由确定性规则与 Codex 双重校验，再由你确认下单。"
+          : "监控同一市场的 YES 与 NO 价格，在成本低于结算赔付时提供确认下单。";
         document.querySelectorAll("[data-state]").forEach((button) => {
           const active = button.dataset.state === state;
           button.classList.toggle("active", active);
           button.setAttribute("aria-pressed", String(active));
         });
-        document.title = `Open Trader · ${variants[variant].name} · ${stateCopy[state]}`;
-        document.getElementById("modal-root").innerHTML = state === "confirm" ? confirmModal() : "";
-        if (state === "confirm") {
+        document.title = llmActive
+          ? `Open Trader · LLM对冲套利 · ${stateCopy[state]}`
+          : "Open Trader · YES/NO套利";
+        document.getElementById("modal-root").innerHTML = llmActive && state === "confirm" ? confirmModal() : "";
+        if (llmActive && state === "confirm") {
           requestAnimationFrame(() => document.querySelector(".modal")?.focus());
         }
       }
 
       document.addEventListener("click", (event) => {
+        const strategyButton = event.target.closest("[data-strategy]");
+        if (strategyButton) {
+          setParams({ strategy: strategyButton.dataset.strategy });
+          return;
+        }
         const stateButton = event.target.closest("[data-state]");
         if (stateButton) {
           setParams({ state: stateButton.dataset.state });
@@ -1438,7 +1500,8 @@
       document.addEventListener("keydown", (event) => {
         if (event.target.matches("input, textarea, [contenteditable=true]")) return;
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-        const { variant } = currentParams();
+        const { variant, strategy } = currentParams();
+        if (strategy !== "llm_hedge") return;
         const keys = Object.keys(variants);
         const direction = event.key === "ArrowLeft" ? -1 : 1;
         const nextIndex = (keys.indexOf(variant) + direction + keys.length) % keys.length;
