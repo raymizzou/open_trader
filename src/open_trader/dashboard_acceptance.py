@@ -1393,6 +1393,8 @@ def _check_frozen_trend_disciplines(
             )
             if market_metric.count() == 0:
                 market_metric = metrics.nth(0)
+            else:
+                market_metric = market_metric.first
             tooltip = context_section.locator(".trend-industry-tooltip")
             market_metric.hover()
             visible = getattr(tooltip, "is_visible", None)
