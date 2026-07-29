@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Prevented standalone protection-line full exits from entering the legacy 30%
+  overheat-trim lifecycle rebuild. A valid protection sell can no longer block
+  a later US trend report merely because the day's frozen report had no formal
+  sell action. Verified the protection audit and market-report suites.
 - Corrected the shared CN/HK/US Trend Animals-to-Futu symbol mapping, including
   four-digit Hong Kong provider codes, and made every simulated holding's Futu
   daily price refresh independent from provider lookup success. Mapping failures

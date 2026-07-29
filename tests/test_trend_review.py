@@ -5793,6 +5793,56 @@ def test_protection_upgrade_succeeds_after_partial_abandon(tmp_path: Path) -> No
     assert len(client.requests) == 2
 
 
+def test_overheat_projection_ignores_standalone_position_zero_protection(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([])
+    report_path = tmp_path / "reports/2026-07-17.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=report_path,
+        report=report,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
+    trend_review.execute_trend_review_stop(
+        data_dir=tmp_path,
+        market="CN",
+        symbol="600001",
+        trading_date="2026-07-17",
+        event_id="protection-1",
+        client=FakeTrendSimClient(
+            positions=[{"code": "SH.600001", "qty": "300"}]
+        ),
+        now="2026-07-17T10:15:00+08:00",
+    )
+    state_path = tmp_path / "trend_a_share/protection_state.json"
+    write_protection_state(
+        state_path,
+        {
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-16",
+                }
+            },
+        },
+    )
+
+    projection = trend_review.rebuild_overheat_trim_projection(
+        tmp_path, market="CN", state_path=state_path
+    )
+
+    assert projection["positions"]["600001"] == {
+        "position_started_for": "2026-07-01",
+        "updated_for": "2026-07-16",
+    }
+
+
 def test_protection_upgrade_waits_for_uncertain_partial_then_sells_live_remainder(
     tmp_path: Path,
 ) -> None:

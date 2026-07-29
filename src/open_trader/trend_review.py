@@ -2260,6 +2260,14 @@ def overheat_trim_progress(
             continue
         has_batch = (ledger / "batches" / f"{execution_date}.json").is_file()
         if has_batch:
+            recorded_events = (
+                _action_events(action_root) if action_root.is_dir() else []
+            )
+            if not any(
+                payload.get("sell_goal") == "partial_30"
+                for payload in [*(item[1] for item in facts), *recorded_events]
+            ):
+                continue
             events, resolutions = load_trend_action_audit(
                 data_dir,
                 market=market,
