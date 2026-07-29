@@ -6,6 +6,18 @@ Start new isolated feature or fix work from the local `main` branch unless the
 user explicitly selects another baseline. Create a separate branch and worktree
 from `main`; do not derive the branch from an unrelated or dirty checkout.
 
+## UI Design Approval Gate
+
+For every new feature that adds or changes a user-facing interface, create an
+isolated UI design or prototype before implementing the production interface.
+Show the main states and both desktop and mobile layouts, and obtain the user's
+explicit approval.
+
+Do not implement the production UI, run final acceptance, or deploy the feature
+before that approval. If the approved layout or interaction changes materially,
+obtain approval again before continuing production UI work. Backend-only
+features with no user interface are outside this gate.
+
 ## Merge Log Gate
 
 Before merging any branch into `main`, update and commit its dated
