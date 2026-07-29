@@ -1,0 +1,1222 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Open Trader · 阈值套利 UI 原型</title>
+    <link rel="stylesheet" href="dashboard.css">
+    <style>
+      /*
+       * PROTOTYPE ONLY — UI design review, demo data, no live API and no real orders.
+       * Three threshold-hedge layouts, switchable with ?variant=A|B|C.
+       */
+      :root {
+        --proto-blue: #214f5c;
+        --proto-blue-soft: #eef6f8;
+        --proto-green: #21623f;
+        --proto-green-soft: #e8f4ed;
+        --proto-amber: #704915;
+        --proto-amber-soft: #fff4df;
+        --proto-red: #8b221a;
+        --proto-red-soft: #fff2f0;
+        --proto-ink: #171512;
+      }
+
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-size: 14px;
+        margin: 0;
+        padding-bottom: 92px;
+      }
+      button, summary { cursor: pointer; }
+      button, input { font: inherit; }
+      button:focus-visible,
+      summary:focus-visible,
+      [tabindex]:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 2px;
+      }
+      button:disabled { cursor: not-allowed; opacity: .46; }
+      .sr-only {
+        clip: rect(0, 0, 0, 0);
+        clip-path: inset(50%);
+        height: 1px;
+        overflow: hidden;
+        position: absolute;
+        white-space: nowrap;
+        width: 1px;
+      }
+      .prototype-shell {
+        margin: 0 auto;
+        max-width: 1600px;
+        min-height: 100vh;
+        padding: 16px;
+      }
+      .prototype-banner {
+        align-items: center;
+        background: #f4eadb;
+        border: 1px dashed #b88955;
+        border-radius: 7px;
+        color: #68441f;
+        display: flex;
+        font-size: 12px;
+        gap: 10px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        padding: 8px 12px;
+      }
+      .prototype-banner strong { letter-spacing: .03em; }
+      .topbar {
+        align-items: center;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        display: flex;
+        gap: 18px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        min-height: 70px;
+        padding: 14px;
+      }
+      .brand-row { align-items: baseline; display: flex; flex-wrap: wrap; gap: 9px; }
+      .brand-row strong { font-size: 20px; letter-spacing: -.03em; }
+      .brand-row span { color: var(--muted); font-weight: 700; }
+      .top-nav { display: flex; flex-wrap: wrap; gap: 7px; }
+      .top-nav button,
+      .state-switcher button,
+      .button {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        color: var(--text);
+        min-height: 44px;
+        padding: 9px 13px;
+      }
+      .top-nav button[aria-current="page"] {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: var(--on-primary);
+        font-weight: 800;
+      }
+      .page-heading {
+        align-items: end;
+        display: flex;
+        gap: 18px;
+        justify-content: space-between;
+        margin: 18px 0 12px;
+      }
+      .page-heading h1 { font-size: 25px; letter-spacing: -.025em; margin: 0 0 5px; }
+      .page-heading p { color: var(--muted); margin: 0; }
+      .live-status { color: var(--muted); text-align: right; }
+      .status-line { align-items: center; display: inline-flex; gap: 7px; }
+      .status-dot {
+        background: var(--success);
+        border-radius: 50%;
+        box-shadow: 0 0 0 4px rgba(47, 133, 90, .10);
+        height: 8px;
+        width: 8px;
+      }
+      .status-dot.pulse { animation: pulse 1.6s ease-out infinite; }
+      @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(47, 133, 90, .3); }
+        70% { box-shadow: 0 0 0 7px rgba(47, 133, 90, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(47, 133, 90, 0); }
+      }
+      .state-bar {
+        align-items: center;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        padding: 10px 12px;
+      }
+      .state-bar-label strong { display: block; }
+      .state-bar-label small { color: var(--muted); }
+      .state-switcher { display: flex; flex-wrap: wrap; gap: 6px; }
+      .state-switcher button {
+        min-height: 36px;
+        padding: 7px 10px;
+      }
+      .state-switcher button.active {
+        background: var(--surface-soft);
+        border-color: var(--accent);
+        color: var(--text);
+        font-weight: 800;
+      }
+      .health-strip {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        display: grid;
+        margin-bottom: 10px;
+      }
+      .health-strip { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .metric-strip {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        margin-bottom: 10px;
+      }
+      .health-item {
+        border-right: 1px solid var(--line);
+        min-width: 0;
+        padding: 12px 13px;
+      }
+      .health-item:last-child { border-right: 0; }
+      .metric {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-width: 0;
+        padding: 13px;
+      }
+      .health-item span,
+      .metric span {
+        color: var(--muted);
+        display: block;
+        font-size: 11px;
+        margin-bottom: 6px;
+      }
+      .health-item strong,
+      .metric strong { display: block; line-height: 1.3; overflow-wrap: anywhere; }
+      .metric strong { font-size: 19px; }
+      .health-item small,
+      .metric small { color: var(--muted); display: block; margin-top: 4px; }
+      .metric.primary {
+        background: var(--primary);
+        color: var(--on-primary);
+      }
+      .metric.primary span,
+      .metric.primary small { color: #d9d5ce; }
+      .ok { color: var(--proto-green); }
+      .warn { color: var(--proto-amber); }
+      .bad { color: var(--proto-red); }
+      .info { color: var(--proto-blue); }
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        min-width: 0;
+        padding: 14px;
+      }
+      .panel-heading {
+        align-items: start;
+        display: flex;
+        gap: 14px;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+      .panel-heading h2,
+      .panel-heading h3 { margin: 0; }
+      .panel-heading h2 { font-size: 17px; }
+      .panel-heading h3 { font-size: 15px; }
+      .panel-heading p { color: var(--muted); margin: 4px 0 0; }
+      .pill {
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 850;
+        gap: 5px;
+        line-height: 1;
+        padding: 7px 9px;
+        white-space: nowrap;
+      }
+      .pill.approved { background: var(--proto-green-soft); border-color: #b9dac6; color: var(--proto-green); }
+      .pill.pending { background: var(--proto-amber-soft); border-color: #e5c98f; color: var(--proto-amber); }
+      .pill.rejected { background: var(--proto-red-soft); border-color: #e7aaa4; color: var(--proto-red); }
+      .pill.neutral { background: var(--proto-blue-soft); border-color: #b8d0d8; color: var(--proto-blue); }
+      .panel-stack { display: grid; gap: 10px; }
+      .button { font-weight: 700; }
+      .button:hover:not(:disabled) { border-color: var(--accent); }
+      .button.primary {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: var(--on-primary);
+        font-weight: 850;
+      }
+      .button.secondary { background: var(--surface-soft); }
+      .button.danger { background: var(--danger); border-color: var(--danger); color: white; }
+      .opportunity-title {
+        align-items: start;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+      }
+      .opportunity-title h2 { font-size: 18px; line-height: 1.35; margin: 0; }
+      .opportunity-title p { color: var(--muted); margin: 5px 0 0; }
+      .market-pair {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .market-leg {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        min-width: 0;
+        padding: 11px;
+      }
+      .market-leg header {
+        align-items: center;
+        display: flex;
+        gap: 8px;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      .market-leg header span { color: var(--muted); font-size: 11px; font-weight: 800; }
+      .market-leg h3 { font-size: 14px; line-height: 1.4; margin: 0 0 9px; }
+      .leg-order {
+        align-items: end;
+        background: var(--surface-soft);
+        border-radius: 6px;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        padding: 9px;
+      }
+      .leg-order span { color: var(--muted); display: block; font-size: 11px; }
+      .leg-order strong { display: block; font-size: 16px; margin-top: 3px; }
+      .leg-order div:last-child { text-align: right; }
+      .llm-card {
+        background: var(--proto-blue-soft);
+        border: 1px solid #b8d0d8;
+        border-radius: 8px;
+        padding: 12px;
+      }
+      .llm-card.approved { background: var(--proto-green-soft); border-color: #b9dac6; }
+      .llm-card.rejected { background: var(--proto-red-soft); border-color: #e7aaa4; }
+      .llm-card header {
+        align-items: center;
+        display: flex;
+        gap: 10px;
+        justify-content: space-between;
+        margin-bottom: 10px;
+      }
+      .llm-card header strong { font-size: 15px; }
+      .llm-summary { font-weight: 750; line-height: 1.45; margin: 0 0 9px; }
+      .reason-codes { display: flex; flex-wrap: wrap; gap: 6px; }
+      .reason-code {
+        background: rgba(255, 255, 255, .68);
+        border: 1px solid currentColor;
+        border-radius: 5px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 10px;
+        padding: 4px 6px;
+      }
+      .evidence-grid,
+      .economics-grid {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+      .evidence-grid div,
+      .economics-grid div {
+        background: var(--surface-soft);
+        border-radius: 6px;
+        min-width: 0;
+        padding: 9px;
+      }
+      .evidence-grid span,
+      .economics-grid span { color: var(--muted); display: block; font-size: 10px; margin-bottom: 5px; }
+      .evidence-grid strong,
+      .economics-grid strong { display: block; overflow-wrap: anywhere; }
+      .truth-table,
+      .data-table { border-collapse: collapse; width: 100%; }
+      .truth-table th,
+      .truth-table td,
+      .data-table th,
+      .data-table td {
+        border-bottom: 1px solid var(--line);
+        padding: 8px 7px;
+        text-align: left;
+        vertical-align: top;
+      }
+      .truth-table th,
+      .data-table th {
+        color: var(--muted);
+        font-size: 10px;
+        letter-spacing: .02em;
+        text-transform: uppercase;
+      }
+      .truth-table tr:last-child td,
+      .data-table tr:last-child td { border-bottom: 0; }
+      .truth-table .guaranteed { color: var(--proto-green); font-weight: 850; }
+      .action-row {
+        align-items: center;
+        border-top: 1px solid var(--line);
+        display: flex;
+        gap: 14px;
+        justify-content: space-between;
+        margin-top: 12px;
+        padding-top: 12px;
+      }
+      .action-row p { color: var(--muted); margin: 0; max-width: 760px; }
+      .action-row .button { flex: 0 0 auto; min-width: 190px; }
+      .risk-note {
+        background: #fff5f3;
+        border: 1px solid #efb6af;
+        border-radius: 7px;
+        color: #7a211a;
+        padding: 11px 12px;
+      }
+      .risk-note strong { display: block; margin-bottom: 3px; }
+      .risk-note p { margin: 0; }
+      .scan-list,
+      .queue-list,
+      .holding-list { display: grid; gap: 7px; }
+      .scan-row,
+      .queue-row,
+      .holding-row {
+        background: var(--surface-soft);
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 10px;
+      }
+      .scan-row.active { background: var(--proto-blue-soft); border-color: #b8d0d8; }
+      .scan-row header,
+      .queue-row header,
+      .holding-row header {
+        align-items: start;
+        display: flex;
+        gap: 10px;
+        justify-content: space-between;
+      }
+      .scan-row strong,
+      .queue-row strong,
+      .holding-row strong { line-height: 1.35; }
+      .scan-row p,
+      .queue-row p,
+      .holding-row p { color: var(--muted); font-size: 12px; margin: 5px 0 0; }
+      details.log-panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+      }
+      details.log-panel summary {
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        min-height: 46px;
+        padding: 10px 13px;
+      }
+      details.log-panel summary span { color: var(--muted); font-size: 12px; }
+      .logs {
+        border-top: 1px solid var(--line);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+        list-style: none;
+        margin: 0;
+        max-height: 210px;
+        overflow: auto;
+        padding: 10px 13px 12px;
+      }
+      .logs li { line-height: 1.55; }
+      .logs time { color: var(--muted); margin-right: 8px; }
+      .distribution {
+        display: grid;
+        gap: 8px;
+      }
+      .dist-row {
+        align-items: center;
+        display: grid;
+        gap: 9px;
+        grid-template-columns: 52px minmax(90px, 1fr) 54px 54px 54px;
+      }
+      .dist-row > span { color: var(--muted); font-size: 11px; }
+      .dist-track {
+        background: var(--surface-soft);
+        border-radius: 999px;
+        height: 8px;
+        overflow: hidden;
+      }
+      .dist-track i {
+        background: var(--proto-blue);
+        border-radius: inherit;
+        display: block;
+        height: 100%;
+      }
+      .dist-row strong { font-size: 11px; text-align: right; }
+      .empty-state {
+        align-content: center;
+        display: grid;
+        justify-items: center;
+        min-height: 240px;
+        padding: 28px;
+        text-align: center;
+      }
+      .empty-state .spinner {
+        animation: spin 1s linear infinite;
+        border: 3px solid var(--line);
+        border-radius: 50%;
+        border-top-color: var(--proto-blue);
+        height: 30px;
+        margin-bottom: 14px;
+        width: 30px;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .empty-state strong { font-size: 17px; margin-bottom: 7px; }
+      .empty-state p { color: var(--muted); margin: 0; max-width: 480px; }
+
+      /* A — Operator console: scan queue, evidence, controls. */
+      .layout-a {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(250px, .62fr) minmax(520px, 1.38fr) minmax(250px, .65fr);
+      }
+      .layout-a .middle-stack { display: grid; gap: 10px; }
+
+      /* B — Evidence ledger: one compact table with a right evidence inspector. */
+      .ledger-shell {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(720px, 1.45fr) minmax(330px, .55fr);
+      }
+      .ledger-table { table-layout: fixed; }
+      .ledger-table tbody tr { cursor: pointer; }
+      .ledger-table tbody tr.selected { background: var(--proto-blue-soft); box-shadow: inset 3px 0 var(--proto-blue); }
+      .ledger-table td:first-child { width: 30%; }
+      .ledger-question { font-weight: 800; line-height: 1.35; }
+      .ledger-question small { color: var(--muted); display: block; font-weight: 500; margin-top: 3px; }
+      .evidence-rail { align-content: start; display: grid; gap: 10px; }
+      .evidence-chain { display: grid; gap: 6px; }
+      .evidence-step {
+        border-left: 3px solid var(--line);
+        padding: 6px 0 6px 10px;
+      }
+      .evidence-step.done { border-left-color: var(--proto-green); }
+      .evidence-step.fail { border-left-color: var(--proto-red); }
+      .evidence-step span { color: var(--muted); display: block; font-size: 10px; margin-bottom: 3px; }
+      .evidence-step strong { line-height: 1.35; }
+
+      /* C — Decision queue: review cards and a chronological operating stream. */
+      .decision-shell {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: 270px minmax(540px, 1fr) 330px;
+      }
+      .decision-nav { align-content: start; display: grid; gap: 7px; }
+      .decision-nav button {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        color: var(--text);
+        min-height: 52px;
+        padding: 10px;
+        text-align: left;
+      }
+      .decision-nav button.active { background: var(--proto-blue-soft); border-color: var(--proto-blue); }
+      .decision-nav strong,
+      .decision-nav span { display: block; }
+      .decision-nav span { color: var(--muted); font-size: 11px; margin-top: 3px; }
+      .decision-card {
+        border-top: 4px solid var(--proto-green);
+        display: grid;
+        gap: 13px;
+      }
+      .decision-card.rejected { border-top-color: var(--proto-red); }
+      .decision-card.pending { border-top-color: var(--proto-amber); }
+      .timeline { display: grid; gap: 0; }
+      .timeline-item {
+        border-left: 2px solid var(--line);
+        margin-left: 5px;
+        padding: 0 0 15px 14px;
+        position: relative;
+      }
+      .timeline-item:last-child { padding-bottom: 0; }
+      .timeline-item::before {
+        background: var(--surface);
+        border: 2px solid var(--line);
+        border-radius: 50%;
+        content: "";
+        height: 8px;
+        left: -6px;
+        position: absolute;
+        top: 2px;
+        width: 8px;
+      }
+      .timeline-item.done::before { background: var(--proto-green); border-color: var(--proto-green); }
+      .timeline-item.fail::before { background: var(--proto-red); border-color: var(--proto-red); }
+      .timeline-item time { color: var(--muted); display: block; font-size: 10px; margin-bottom: 3px; }
+      .timeline-item strong { line-height: 1.35; }
+      .timeline-item p { color: var(--muted); font-size: 11px; margin: 3px 0 0; }
+
+      .prototype-controller {
+        align-items: center;
+        background: var(--proto-ink);
+        border: 1px solid #403c36;
+        border-radius: 13px;
+        bottom: 14px;
+        box-shadow: 0 14px 48px rgba(0, 0, 0, .28);
+        color: white;
+        display: flex;
+        gap: 9px;
+        left: 50%;
+        max-width: calc(100vw - 20px);
+        padding: 8px;
+        position: fixed;
+        transform: translateX(-50%);
+        z-index: 1000;
+      }
+      .prototype-controller button {
+        align-items: center;
+        background: #2e2b27;
+        border: 1px solid #4e4a44;
+        border-radius: 8px;
+        color: white;
+        display: inline-flex;
+        height: 44px;
+        justify-content: center;
+        width: 44px;
+      }
+      .prototype-controller-label { min-width: 210px; padding: 0 7px; }
+      .prototype-controller-label small { color: #bdb7ae; display: block; margin-bottom: 2px; }
+      .prototype-controller-label strong { display: block; }
+      .modal-layer {
+        align-items: center;
+        background: rgba(20, 18, 15, .62);
+        display: flex;
+        inset: 0;
+        justify-content: center;
+        padding: 16px;
+        position: fixed;
+        z-index: 900;
+      }
+      .modal {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, .28);
+        max-height: calc(100dvh - 32px);
+        max-width: 760px;
+        overflow: auto;
+        padding: 20px;
+        width: 100%;
+      }
+      .modal h2 { font-size: 22px; margin: 0 0 5px; }
+      .modal > p { color: var(--muted); margin: 0 0 15px; }
+      .modal-checks { display: grid; gap: 6px; margin: 12px 0; }
+      .modal-check {
+        align-items: start;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        padding: 8px 0;
+      }
+      .modal-check span { color: var(--muted); }
+      .modal-check strong { max-width: 70%; text-align: right; }
+      .modal-actions { display: flex; gap: 9px; justify-content: flex-end; margin-top: 14px; }
+      .modal-actions .button { min-width: 150px; }
+
+      @media (max-width: 1180px) {
+        .layout-a,
+        .decision-shell { grid-template-columns: 240px minmax(500px, 1fr); }
+        .layout-a > :last-child,
+        .decision-shell > :last-child { grid-column: 1 / -1; }
+        .ledger-shell { grid-template-columns: 1fr; }
+        .evidence-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .metric-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      }
+      @media (max-width: 800px) {
+        body { font-size: 16px; }
+        .prototype-shell { padding: 10px; }
+        .prototype-banner,
+        .topbar,
+        .page-heading,
+        .state-bar,
+        .panel-heading,
+        .opportunity-title,
+        .action-row { align-items: stretch; display: grid; }
+        .top-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .live-status { text-align: left; }
+        .state-switcher { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .state-switcher button { min-height: 44px; }
+        .health-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .health-item { border-bottom: 1px solid var(--line); }
+        .health-item:nth-child(even) { border-right: 0; }
+        .health-item:last-child { border-bottom: 0; grid-column: 1 / -1; }
+        .metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .layout-a,
+        .ledger-shell,
+        .decision-shell { grid-template-columns: minmax(0, 1fr); }
+        .layout-a > :last-child,
+        .decision-shell > :last-child { grid-column: auto; }
+        .market-pair,
+        .evidence-grid,
+        .economics-grid,
+        .evidence-rail { grid-template-columns: minmax(0, 1fr); }
+        .action-row .button { width: 100%; }
+        .ledger-table thead { display: none; }
+        .ledger-table,
+        .ledger-table tbody,
+        .ledger-table tr,
+        .ledger-table td { display: block; width: 100%; }
+        .ledger-table tr { border-bottom: 1px solid var(--line); padding: 9px 0; }
+        .ledger-table td { border: 0; display: grid; gap: 8px; grid-template-columns: 116px minmax(0, 1fr); padding: 5px 7px; }
+        .ledger-table td::before { color: var(--muted); content: attr(data-label); font-size: 11px; font-weight: 800; }
+        .modal { padding: 16px; }
+        .modal-actions { display: grid; }
+        .modal-actions .button { width: 100%; }
+      }
+      @media (max-width: 480px) {
+        .state-switcher { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .health-strip,
+        .metric-strip { grid-template-columns: minmax(0, 1fr); }
+        .health-item,
+        .health-item:nth-child(even) { border-bottom: 1px solid var(--line); border-right: 0; }
+        .health-item:last-child { border-bottom: 0; grid-column: auto; }
+        .leg-order { align-items: start; display: grid; }
+        .leg-order div:last-child { text-align: left; }
+        .dist-row { grid-template-columns: 42px minmax(70px, 1fr) 48px 48px; }
+        .dist-row > *:last-child { display: none; }
+        .prototype-controller-label { min-width: 0; width: min(190px, 52vw); }
+        .modal-check { display: grid; }
+        .modal-check strong { max-width: none; text-align: left; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          animation-duration: .01ms !important;
+          scroll-behavior: auto !important;
+          transition-duration: .01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="prototype-shell">
+      <aside class="prototype-banner" role="note">
+        <strong>PROTOTYPE · 仅用于 UI 设计确认</strong>
+        <span>以下全部为演示数据；不连接实时 API，不会发出订单。</span>
+      </aside>
+      <header class="pm-topbar topbar">
+        <div class="pm-brand brand-row">
+          <strong>Open Trader</strong>
+          <span>预测市场</span>
+        </div>
+        <nav class="pm-nav top-nav" aria-label="一级导航">
+          <button type="button">账户总览</button>
+          <button type="button" aria-current="page">预测市场</button>
+        </nav>
+      </header>
+
+      <section class="pm-page-head page-heading">
+        <div>
+          <h1>Polymarket 阈值关系套利</h1>
+          <p>扫描同一事件的关联合约，由确定性规则与 Codex 双重校验，再由你确认下单。</p>
+        </div>
+        <div class="pm-updated live-status">
+          <span class="pm-status-line status-line"><i class="pm-status-dot status-dot pulse" aria-hidden="true"></i><strong>扫描运行中</strong></span>
+          <div>最近轮次 14:32:05 · 下轮约 04:37</div>
+        </div>
+      </section>
+
+      <section class="state-bar" aria-label="原型状态">
+        <div class="state-bar-label">
+          <strong>查看关键状态</strong>
+          <small>切换后可检查扫描、放行、拒绝、确认和持仓界面。</small>
+        </div>
+        <div class="state-switcher" role="group" aria-label="状态切换">
+          <button type="button" data-state="scanning">扫描中</button>
+          <button type="button" data-state="approved">LLM 放行</button>
+          <button type="button" data-state="rejected">LLM 拒绝</button>
+          <button type="button" data-state="confirm">确认下单</button>
+          <button type="button" data-state="holding">待结算持仓</button>
+        </div>
+      </section>
+
+      <section class="health-strip" aria-label="系统状态">
+        <div class="health-item">
+          <span>Polymarket 数据</span>
+          <strong class="ok">正常 · 1.4s</strong>
+          <small>盘口和规则已刷新</small>
+        </div>
+        <div class="health-item">
+          <span>关联合约扫描</span>
+          <strong class="ok">运行中 · 428 个市场</strong>
+          <small>63 个事件组</small>
+        </div>
+        <div class="health-item">
+          <span>Codex 校验</span>
+          <strong class="ok">可用 · gpt-5</strong>
+          <small>仅校验新规则版本</small>
+        </div>
+        <div class="health-item">
+          <span>交易准备</span>
+          <strong class="ok">通过</strong>
+          <small>钱包、地区、余额正常</small>
+        </div>
+        <div class="health-item">
+          <span>执行政策</span>
+          <strong>人工确认 · FOK</strong>
+          <small>单腿补救损失上限 $2.00</small>
+        </div>
+      </section>
+
+      <section class="metric-strip" aria-label="扫描指标">
+        <div class="metric primary">
+          <span>本轮关系候选</span>
+          <strong>14</strong>
+          <small>尚未等于套利机会</small>
+        </div>
+        <div class="metric">
+          <span>确定性规则通过</span>
+          <strong>3</strong>
+          <small>11 个关系不成立</small>
+        </div>
+        <div class="metric">
+          <span>Codex 放行 / 拒绝</span>
+          <strong>1 / 2</strong>
+          <small>理由全部保留</small>
+        </div>
+        <div class="metric">
+          <span>当前理论净利润</span>
+          <strong class="ok">+$0.54</strong>
+          <small>成交前尚未锁定</small>
+        </div>
+        <div class="metric">
+          <span>简单年化</span>
+          <strong>22.8%</strong>
+          <small>预计 47 天结算</small>
+        </div>
+        <div class="metric">
+          <span>Codex 24h 调用</span>
+          <strong>18</strong>
+          <small>11 cache hits · 0 失败</small>
+        </div>
+      </section>
+
+      <div id="variant-root" aria-live="polite"></div>
+
+      <details class="log-panel">
+        <summary>
+          <strong>扫描日志</strong>
+          <span>内存中 24 条 · 页面刷新后清空</span>
+        </summary>
+        <ol class="logs">
+          <li><time>14:32:05.882</time> round_complete events=63 markets=428 candidates=14 duration=6.8s</li>
+          <li><time>14:32:04.315</time> codex_cache_hit rules_hash=79d4…c21 decision=APPROVE</li>
+          <li><time>14:32:03.910</time> economics_pass pair=btc-2026-09-30 cost=19.46 payout=20.00</li>
+          <li><time>14:32:02.744</time> relation_pass relation=A_threshold_le_B_threshold</li>
+          <li><time>14:31:59.013</time> scan_start source=polymarket cursor=all_active_events</li>
+        </ol>
+      </details>
+    </main>
+
+    <div class="prototype-controller" aria-label="原型方案切换">
+      <button type="button" data-variant-direction="-1" aria-label="上一种方案">←</button>
+      <div class="prototype-controller-label">
+        <small>UI 方案 · 键盘 ← → 可切换</small>
+        <strong id="variant-label">A — 操作台</strong>
+      </div>
+      <button type="button" data-variant-direction="1" aria-label="下一种方案">→</button>
+    </div>
+
+    <div id="modal-root"></div>
+
+    <script>
+      const variants = {
+        A: { name: "操作台" },
+        B: { name: "证据账本" },
+        C: { name: "决策队列" },
+      };
+      const states = ["scanning", "approved", "rejected", "confirm", "holding"];
+      const stateCopy = {
+        scanning: "扫描中",
+        approved: "LLM 放行",
+        rejected: "LLM 拒绝",
+        confirm: "确认下单",
+        holding: "待结算持仓",
+      };
+
+      const pairHtml = () => `
+        <div class="market-pair">
+          <article class="market-leg">
+            <header><span>市场 A · condition 0x7b…91a</span><span class="pill neutral">24h $184k</span></header>
+            <h3>Will Bitcoin be below $100,000 on September 30, 2026?</h3>
+            <div class="leg-order">
+              <div><span>第一腿 · BUY YES · FOK</span><strong>20 份 @ 最高 $0.42</strong></div>
+              <div><span>最大成本</span><strong>$8.40</strong></div>
+            </div>
+          </article>
+          <article class="market-leg">
+            <header><span>市场 B · condition 0xc4…e02</span><span class="pill neutral">24h $231k</span></header>
+            <h3>Will Bitcoin be above $90,000 on September 30, 2026?</h3>
+            <div class="leg-order">
+              <div><span>第二腿 · BUY YES · FOK</span><strong>20 份 @ 最高 $0.55</strong></div>
+              <div><span>最大成本</span><strong>$11.00</strong></div>
+            </div>
+          </article>
+        </div>`;
+
+      const llmHtml = (state) => {
+        if (state === "scanning") {
+          return `<section class="llm-card"><header><strong>Codex 结构化校验</strong><span class="pill pending">PENDING · 等待候选</span></header><p class="llm-summary">只有确定性关系和经济性先通过，才会调用 Codex。缓存命中不会重复调用。</p><div class="reason-codes"><span class="reason-code">schema: hedge_relation_v1</span><span class="reason-code">fail_closed: true</span></div></section>`;
+        }
+        if (state === "rejected") {
+          return `<section class="llm-card rejected" role="alert"><header><strong>Codex 结构化校验</strong><span class="pill rejected">REJECT · 禁止下单</span></header><p class="llm-summary">两个市场的截止时刻表面相同，但市场 B 的规则允许使用 Coinbase 指数，而市场 A 指定 Binance 现货。无法证明所有结算情形下至少一腿赔付。</p><div class="reason-codes"><span class="reason-code">ORACLE_MISMATCH</span><span class="reason-code">PAYOFF_NOT_EXHAUSTIVE</span><span class="reason-code">RULES_NOT_EQUIVALENT</span></div></section>`;
+        }
+        return `<section class="llm-card approved"><header><strong>Codex 结构化校验</strong><span class="pill approved">APPROVE · 可进入确认</span></header><p class="llm-summary">两个市场使用相同标的、同一结算时间、同一价格源和兼容边界；对于任意最终价格，A=YES 或 B=YES 至少有一腿赔付 $1。</p><div class="reason-codes"><span class="reason-code">SAME_UNDERLYING</span><span class="reason-code">SAME_EXPIRY</span><span class="reason-code">ORACLE_MATCH</span><span class="reason-code">PAYOFF_COVERAGE_PROVED</span></div></section>`;
+      };
+
+      const correctedTruthTableHtml = () => `
+        <table class="truth-table">
+          <thead><tr><th>BTC 最终价</th><th>A：below $100k</th><th>持有 A=YES</th><th>B：above $90k</th><th>持有 B=YES</th><th>组合赔付</th></tr></thead>
+          <tbody>
+            <tr><td>≤ $90k</td><td>YES</td><td>$1</td><td>NO</td><td>$0</td><td class="guaranteed">$1 · A 赔付</td></tr>
+            <tr><td>$90k–$100k</td><td>YES</td><td>$1</td><td>YES</td><td>$1</td><td class="guaranteed">$2 · 两腿赔付</td></tr>
+            <tr><td>≥ $100k</td><td>NO</td><td>$0</td><td>YES</td><td>$1</td><td class="guaranteed">$1 · B 赔付</td></tr>
+          </tbody>
+        </table>`;
+
+      const evidenceHtml = (state) => {
+        const rejected = state === "rejected";
+        return `
+          <div class="evidence-grid">
+            <div><span>关系类型</span><strong>${rejected ? "标题候选：互补区间" : "A=below $100k ∪ B=above $90k"}</strong></div>
+            <div><span>规则版本</span><strong>hash 79d4…c21</strong></div>
+            <div><span>解析置信度</span><strong>${rejected ? "0.61 · 不足" : "0.98 · 高"}</strong></div>
+            <div><span>缓存键</span><strong>event + rules_hash_a/b</strong></div>
+          </div>
+          <div>
+            <h3 style="font-size:14px;margin:0 0 8px">${rejected ? "标题级候选表 · 不可作为完整证明" : "确定性赔付证明"}</h3>
+            ${correctedTruthTableHtml()}
+            ${rejected ? `<p class="bad" style="margin:8px 0 0"><strong>未放行：</strong>表格只反映标题字面关系；规则指定的价格源不同，无法把两条腿放在同一个最终状态中证明。</p>` : ""}
+          </div>`;
+      };
+
+      const economicsHtml = (state) => `
+        <div class="economics-grid">
+          <div><span>含费最大成本</span><strong>$19.46</strong></div>
+          <div><span>最低赔付</span><strong>$20.00</strong></div>
+          <div><span>${state === "holding" ? "账面最低利润" : "理论最低净利润"}</span><strong class="ok">+$0.54</strong></div>
+          <div><span>简单年化</span><strong>22.8%</strong></div>
+        </div>`;
+
+      const distributionHtml = () => `
+        <div class="distribution" aria-label="年化收益分布">
+          <div class="dist-row"><span>当前</span><div class="dist-track"><i style="width:54%"></i></div><strong>P50 18%</strong><strong>P90 27%</strong><strong>n=14</strong></div>
+          <div class="dist-row"><span>7 天</span><div class="dist-track"><i style="width:67%"></i></div><strong>P50 21%</strong><strong>P90 34%</strong><strong>n=86</strong></div>
+          <div class="dist-row"><span>30 天</span><div class="dist-track"><i style="width:61%"></i></div><strong>P50 19%</strong><strong>P90 31%</strong><strong>n=302</strong></div>
+        </div>`;
+
+      const actionHtml = (state) => {
+        if (state === "rejected") {
+          return `<div class="action-row"><p class="bad"><strong>Codex 已拒绝：</strong>理由保留在页面中。系统负责做出不放行判断，不把规则责任推给你。</p><button class="button primary" type="button" disabled>LLM 拒绝 · 禁止下单</button></div>`;
+        }
+        if (state === "scanning") {
+          return `<div class="action-row"><p>还没有通过完整校验的机会。扫描继续运行；发现后会显示证据和预计收益。</p><button class="button primary" type="button" disabled>等待通过校验的机会</button></div>`;
+        }
+        if (state === "holding") {
+          return `<div class="action-row"><p><strong>两腿已成交，正在等待事件结算。</strong>这是多 condition 持仓，不会 merge；极端争议风险仍需单独记录。</p><button class="button secondary" type="button">查看成交回执</button></div>`;
+        }
+        return `<div class="action-row"><p><strong>成交前尚未锁定利润。</strong>点击后先重读规则、盘口、费用、余额和地区，再展示最终确认单；两笔 FOK 订单不是原子交易。</p><button class="button primary" type="button" data-open-confirm>查看并确认两腿订单</button></div>`;
+      };
+
+      const opportunityHtml = (state, className = "") => `
+        <article class="panel ${className}">
+          <header class="opportunity-title">
+            <div>
+              <h2>${state === "rejected" ? "候选 #HD-2049 · 规则存在冲突" : "机会 #HD-2051 · BTC 同事件阈值覆盖"}</h2>
+              <p>Polymarket · 两个独立 condition · 预计 47 天结算 · 演示数据</p>
+            </div>
+            <span class="pill ${state === "rejected" ? "rejected" : state === "scanning" ? "pending" : state === "holding" ? "neutral" : "approved"}">
+              ${state === "rejected" ? "REJECT · 不可下单" : state === "scanning" ? "校验队列中" : state === "holding" ? "HOLDING · 待结算" : "APPROVE · 可确认"}
+            </span>
+          </header>
+          ${pairHtml()}
+          ${llmHtml(state)}
+          ${evidenceHtml(state)}
+          ${economicsHtml(state)}
+          <aside class="risk-note">
+            <strong>组合内执行风险</strong>
+            <p>两笔订单非原子。若只成交一腿，系统自动补腿或平仓，但预计损失达到 $2.00 即熔断并通知。最终成交结果出来前，不称为“锁定利润”。</p>
+          </aside>
+          ${actionHtml(state)}
+        </article>`;
+
+      const queueHtml = (state) => `
+        <div class="queue-list">
+          <article class="queue-row"><header><strong>#HD-2051 · BTC Sep 30</strong><span class="pill ${state === "rejected" ? "rejected" : "approved"}">${state === "rejected" ? "REJECT" : "APPROVE"}</span></header><p>理论 +$0.54 · 年化 22.8% · 24h $415k</p></article>
+          <article class="queue-row"><header><strong>#HD-2050 · ETH Dec 31</strong><span class="pill rejected">REJECT</span></header><p>截止时间不一致 · 无操作</p></article>
+          <article class="queue-row"><header><strong>#HD-2048 · Fed Sep</strong><span class="pill pending">PARSING</span></header><p>规则解析中 · 2.1s</p></article>
+        </div>`;
+
+      const scannerHtml = () => `
+        <div class="scan-list">
+          <article class="scan-row active"><header><strong>Crypto · 12 个事件</strong><span class="pill neutral">扫描中</span></header><p>已读取 96 个 active markets</p></article>
+          <article class="scan-row"><header><strong>Politics · 18 个事件</strong><span class="pill approved">完成</span></header><p>2 个关系候选 · 0 个通过</p></article>
+          <article class="scan-row"><header><strong>Economy · 21 个事件</strong><span class="pill approved">完成</span></header><p>9 个关系候选 · 1 个通过</p></article>
+          <article class="scan-row"><header><strong>Sports · 12 个事件</strong><span class="pill approved">完成</span></header><p>3 个关系候选 · 0 个通过</p></article>
+        </div>`;
+
+      const holdingsHtml = () => `
+        <div class="holding-list">
+          <article class="holding-row"><header><strong>BTC Sep 30 · #HD-2036</strong><span class="pill neutral">待结算</span></header><p>$19.46 成本 · 最低赔付 $20.00 · 两腿已成交</p></article>
+          <article class="holding-row"><header><strong>Fed Sep · #HD-2029</strong><span class="pill neutral">待结算</span></header><p>$28.71 成本 · 最低赔付 $30.00 · 两腿已成交</p></article>
+          <article class="holding-row"><header><strong>ETH Dec 31 · #HD-2012</strong><span class="pill neutral">待结算</span></header><p>$9.67 成本 · 最低赔付 $10.00 · 两腿已成交</p></article>
+        </div>`;
+
+      const scanningEmptyHtml = () => `
+        <div class="empty-state">
+          <i class="spinner" aria-hidden="true"></i>
+          <strong>正在扫描关联合约</strong>
+          <p>没有通过完整校验的机会时，页面保持这个状态；不是“系统没在工作”。你可以展开底部扫描日志查看当前进度。</p>
+        </div>`;
+
+      function variantA(state) {
+        return `
+          <div class="layout-a">
+            <div class="panel-stack">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>扫描范围</h2><p>不是只看 Top 20</p></div><span class="pill neutral">428 markets</span></header>
+                ${scannerHtml()}
+              </section>
+              <section class="panel">
+                <header class="panel-heading"><div><h2>年化收益分布</h2><p>所有发现都展示</p></div></header>
+                ${distributionHtml()}
+              </section>
+            </div>
+            <div class="middle-stack">
+              ${state === "scanning" ? `<section class="panel">${scanningEmptyHtml()}</section>` : opportunityHtml(state)}
+            </div>
+            <div class="panel-stack">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>决策队列</h2><p>系统决定是否放行</p></div></header>
+                ${queueHtml(state)}
+              </section>
+              <section class="panel">
+                <header class="panel-heading"><div><h2>Codex 24h</h2><p>重复规则使用缓存</p></div><span class="pill approved">正常</span></header>
+                <div class="evidence-chain">
+                  <div class="evidence-step done"><span>调用</span><strong>18 次 · 17 成功 · 0 失败</strong></div>
+                  <div class="evidence-step done"><span>缓存</span><strong>11 hits · 节省 61%</strong></div>
+                  <div class="evidence-step done"><span>Tokens</span><strong>41.2k input · 8.6k output</strong></div>
+                </div>
+              </section>
+              ${state === "holding" ? `<section class="panel"><header class="panel-heading"><div><h2>未结算组合</h2><p>允许多个并存</p></div><span class="pill neutral">3</span></header>${holdingsHtml()}</section>` : ""}
+            </div>
+          </div>`;
+      }
+
+      function ledgerRows(state) {
+        const selectedStatus = state === "rejected" ? `<span class="pill rejected">REJECT</span>` : `<span class="pill approved">APPROVE</span>`;
+        return `
+          <tr class="selected" tabindex="0">
+            <td data-label="事件"><div class="ledger-question">BTC Sep 30 阈值覆盖<small>0x7b…91a + 0xc4…e02</small></div></td>
+            <td data-label="规则">${selectedStatus}</td>
+            <td data-label="24h 成交量">$415k</td>
+            <td data-label="成本 / 赔付">$19.46 / $20.00</td>
+            <td data-label="理论利润" class="ok">+$0.54</td>
+            <td data-label="年化">22.8%</td>
+            <td data-label="时效">1.4s</td>
+          </tr>
+          <tr tabindex="0">
+            <td data-label="事件"><div class="ledger-question">ETH Dec 31 阈值覆盖<small>0xe2…100 + 0x83…3d8</small></div></td>
+            <td data-label="规则"><span class="pill rejected">REJECT</span></td>
+            <td data-label="24h 成交量">$92k</td>
+            <td data-label="成本 / 赔付">$9.61 / $10.00</td>
+            <td data-label="理论利润" class="ok">+$0.39</td>
+            <td data-label="年化">15.4%</td>
+            <td data-label="时效">3.2s</td>
+          </tr>
+          <tr tabindex="0">
+            <td data-label="事件"><div class="ledger-question">Fed Sep 区间覆盖<small>0x10…92e + 0xa1…6b2</small></div></td>
+            <td data-label="规则"><span class="pill pending">PARSING</span></td>
+            <td data-label="24h 成交量">$67k</td>
+            <td data-label="成本 / 赔付">$28.40 / $30.00</td>
+            <td data-label="理论利润" class="ok">+$1.60</td>
+            <td data-label="年化">31.7%</td>
+            <td data-label="时效">5.8s</td>
+          </tr>`;
+      }
+
+      function variantB(state) {
+        return `
+          <div class="ledger-shell">
+            <div class="panel-stack">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>关联合约证据账本</h2><p>先看全量发现和指标，再检查选中候选的证明。</p></div><span class="pill neutral">14 candidates</span></header>
+                <table class="data-table ledger-table">
+                  <thead><tr><th>事件</th><th>规则</th><th>24h 成交量</th><th>成本 / 赔付</th><th>理论利润</th><th>年化</th><th>数据时效</th></tr></thead>
+                  <tbody>${ledgerRows(state)}</tbody>
+                </table>
+              </section>
+              <section class="panel">
+                <header class="panel-heading"><div><h2>选中候选 · 赔付证明</h2><p>所有数值可见，不依赖悬浮或颜色。</p></div></header>
+                ${state === "scanning" ? scanningEmptyHtml() : `${evidenceHtml(state)}${economicsHtml(state)}${actionHtml(state)}`}
+              </section>
+            </div>
+            <aside class="evidence-rail">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>校验链</h2><p>逐层 fail-closed</p></div></header>
+                <div class="evidence-chain">
+                  <div class="evidence-step done"><span>01 · 候选生成</span><strong>同一事件 · 同类阈值</strong></div>
+                  <div class="evidence-step done"><span>02 · 确定性关系</span><strong>覆盖所有价格区间</strong></div>
+                  <div class="evidence-step ${state === "rejected" ? "fail" : "done"}"><span>03 · Codex 规则语义</span><strong>${state === "rejected" ? "REJECT · oracle 不一致" : state === "scanning" ? "等待候选" : "APPROVE · 结构化返回"}</strong></div>
+                  <div class="evidence-step ${state === "rejected" || state === "scanning" ? "" : "done"}"><span>04 · 确认时复检</span><strong>${state === "rejected" ? "不会进入" : state === "scanning" ? "未开始" : "盘口 / 费用 / 余额"}</strong></div>
+                </div>
+              </section>
+              <section class="panel">
+                <header class="panel-heading"><div><h2>LLM 解析</h2><p>理由不能隐藏</p></div></header>
+                ${llmHtml(state)}
+              </section>
+              <section class="panel">
+                <header class="panel-heading"><div><h2>年化收益分布</h2><p>当前 / 7d / 30d</p></div></header>
+                ${distributionHtml()}
+              </section>
+              ${state === "holding" ? `<section class="panel"><header class="panel-heading"><div><h2>未结算组合</h2></div><span class="pill neutral">3</span></header>${holdingsHtml()}</section>` : ""}
+            </aside>
+          </div>`;
+      }
+
+      function timelineHtml(state) {
+        return `
+          <div class="timeline">
+            <div class="timeline-item done"><time>14:32:02.744</time><strong>确定性关系通过</strong><p>覆盖 3 个价格区间</p></div>
+            <div class="timeline-item ${state === "rejected" ? "fail" : state === "scanning" ? "" : "done"}"><time>14:32:04.315</time><strong>${state === "rejected" ? "Codex 拒绝" : state === "scanning" ? "等待 Codex 校验" : "Codex 放行"}</strong><p>${state === "rejected" ? "ORACLE_MISMATCH" : state === "scanning" ? "尚未产生调用" : "缓存命中 · 0 tokens"}</p></div>
+            <div class="timeline-item ${state === "rejected" || state === "scanning" ? "" : "done"}"><time>14:32:05.128</time><strong>经济性通过</strong><p>含费理论利润 +$0.54</p></div>
+            <div class="timeline-item ${state === "holding" ? "done" : ""}"><time>${state === "holding" ? "14:34:11.502" : "—"}</time><strong>${state === "holding" ? "两腿已成交" : "等待人工确认"}</strong><p>${state === "holding" ? "holding_to_resolution" : "不会自动下单"}</p></div>
+          </div>`;
+      }
+
+      function variantC(state) {
+        return `
+          <div class="decision-shell">
+            <nav class="decision-nav" aria-label="决策队列">
+              <button type="button" class="active"><strong>#HD-2051 · BTC Sep</strong><span>${state === "rejected" ? "REJECT · oracle 不一致" : state === "scanning" ? "PENDING · 扫描中" : "APPROVE · 理论 +$0.54"}</span></button>
+              <button type="button"><strong>#HD-2050 · ETH Dec</strong><span>REJECT · 截止时间不一致</span></button>
+              <button type="button"><strong>#HD-2048 · Fed Sep</strong><span>PARSING · 规则解析中</span></button>
+              <button type="button"><strong>#HD-2041 · Election</strong><span>REJECT · 结算源不一致</span></button>
+            </nav>
+            <div class="panel-stack">
+              ${state === "scanning" ? `<section class="panel">${scanningEmptyHtml()}</section>` : opportunityHtml(state, `decision-card ${state === "rejected" ? "rejected" : ""}`)}
+            </div>
+            <aside class="panel-stack">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>这次为什么放行</h2><p>从候选到操作的事件流</p></div></header>
+                ${timelineHtml(state)}
+              </section>
+              <section class="panel">
+                <header class="panel-heading"><div><h2>年化收益分布</h2></div></header>
+                ${distributionHtml()}
+              </section>
+              ${state === "holding" ? `<section class="panel"><header class="panel-heading"><div><h2>未结算组合</h2><p>整体风险暂不拦截</p></div><span class="pill neutral">3</span></header>${holdingsHtml()}</section>` : ""}
+            </aside>
+          </div>`;
+      }
+
+      function currentParams() {
+        const params = new URLSearchParams(window.location.search);
+        const variant = variants[params.get("variant")] ? params.get("variant") : "A";
+        const state = states.includes(params.get("state")) ? params.get("state") : "approved";
+        return { variant, state };
+      }
+
+      function setParams(next) {
+        const current = currentParams();
+        const params = new URLSearchParams(window.location.search);
+        params.set("variant", next.variant || current.variant);
+        params.set("state", next.state || current.state);
+        history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+        render();
+      }
+
+      function confirmModal() {
+        return `
+          <div class="modal-layer" data-close-modal>
+            <section class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" tabindex="-1">
+              <h2 id="confirm-title">确认两腿 FOK 订单</h2>
+              <p>这是最后确认，不是利润保证。提交前会重新读取所有关键数据；任一项变化都会取消。</p>
+              ${pairHtml()}
+              ${economicsHtml("confirm")}
+              <div class="modal-checks">
+                <div class="modal-check"><span>Codex 结构化判断</span><strong class="ok">APPROVE · PAYOFF_COVERAGE_PROVED</strong></div>
+                <div class="modal-check"><span>规则哈希</span><strong>79d4…c21 · 与发现时一致</strong></div>
+                <div class="modal-check"><span>独立钱包</span><strong>0x9A…73F · 可用 $64.80</strong></div>
+                <div class="modal-check"><span>确认时复检</span><strong>规则、盘口、费用、地区、余额全部通过</strong></div>
+              </div>
+              <aside class="risk-note">
+                <strong>两笔订单不是原子交易，也不会 merge</strong>
+                <p>若第一腿成交、第二腿失败，系统最多承担 $2.00 预计损失进行补腿或平仓；达到上限即熔断并通知。</p>
+              </aside>
+              <footer class="modal-actions">
+                <button class="button" type="button" data-cancel-confirm>取消</button>
+                <button class="button primary" type="button" data-simulate-submit>确认提交 · 最多 $19.46</button>
+              </footer>
+            </section>
+          </div>`;
+      }
+
+      function render() {
+        const { variant, state } = currentParams();
+        const renderVariant = variant === "B" ? variantB : variant === "C" ? variantC : variantA;
+        document.getElementById("variant-root").innerHTML = renderVariant(state);
+        document.getElementById("variant-label").textContent = `${variant} — ${variants[variant].name}`;
+        document.querySelectorAll("[data-state]").forEach((button) => {
+          const active = button.dataset.state === state;
+          button.classList.toggle("active", active);
+          button.setAttribute("aria-pressed", String(active));
+        });
+        document.title = `Open Trader · ${variants[variant].name} · ${stateCopy[state]}`;
+        document.getElementById("modal-root").innerHTML = state === "confirm" ? confirmModal() : "";
+        if (state === "confirm") {
+          requestAnimationFrame(() => document.querySelector(".modal")?.focus());
+        }
+      }
+
+      document.addEventListener("click", (event) => {
+        const stateButton = event.target.closest("[data-state]");
+        if (stateButton) {
+          setParams({ state: stateButton.dataset.state });
+          return;
+        }
+        const variantButton = event.target.closest("[data-variant-direction]");
+        if (variantButton) {
+          const { variant } = currentParams();
+          const keys = Object.keys(variants);
+          const nextIndex = (keys.indexOf(variant) + Number(variantButton.dataset.variantDirection) + keys.length) % keys.length;
+          setParams({ variant: keys[nextIndex] });
+          return;
+        }
+        if (event.target.closest("[data-open-confirm]")) {
+          setParams({ state: "confirm" });
+          return;
+        }
+        if (event.target.closest("[data-cancel-confirm]") || (event.target.matches("[data-close-modal]"))) {
+          setParams({ state: "approved" });
+          return;
+        }
+        const submit = event.target.closest("[data-simulate-submit]");
+        if (submit) {
+          submit.disabled = true;
+          submit.textContent = "正在提交两腿订单…";
+          window.setTimeout(() => setParams({ state: "holding" }), 650);
+        }
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.target.matches("input, textarea, [contenteditable=true]")) return;
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        const { variant } = currentParams();
+        const keys = Object.keys(variants);
+        const direction = event.key === "ArrowLeft" ? -1 : 1;
+        const nextIndex = (keys.indexOf(variant) + direction + keys.length) % keys.length;
+        setParams({ variant: keys[nextIndex] });
+      });
+
+      window.addEventListener("popstate", render);
+      render();
+    </script>
+  </body>
+</html>
