@@ -2,7 +2,7 @@
 
 > 日期：2026-07-29
 >
-> 状态：已完成对话设计，等待用户审阅书面规格
+> 状态：对话设计已确认，进入实现
 >
 > 研究依据：[LLM Hedge Discovery 如何应用到 Open Trader](../../research/2026-07-29-llm-hedge-discovery-open-trader.md)
 
@@ -54,16 +54,17 @@ Polymarket 平台
 
 ```text
 单次最大成本：        $20
-最低锁定净利润：      $1
-最低净边际：          1%
+最低锁定净利润：      > $0
 单腿补救损失上限：    $2
-专用钱包余额上限：    $65
 并发执行机会：        1
+未结算组合：          允许多个
 订单类型：            FOK
 最终下单：            必须由操作者点击确认
 ```
 
 两笔 FOK 不是原子交易。第一版保留现有的有限自动补救授权：若只成交一腿，系统可以在预计损失不超过 `$2` 的前提下补腿或平仓，随后必须熔断并通知操作者。
+
+`$2` 是系统可自动选择的补救路径上限，不是极端情况下的保证最大损失。下单前必须证明当前盘口至少存在一条预计损失不超过 `$2` 的补腿或平仓路径；成交后的极端跳空、撤单或结算争议仍可能使单组合损失达到已成交腿成本。第一版只控制单组合风险，不设置总未结算组合数、总敞口或钱包余额门槛。
 
 ## 4. 盈利定义
 
@@ -107,16 +108,25 @@ net_floor =
   - taker_fees
 ```
 
-`executable_acquisition_cost` 使用两条 FOK 的最高允许成交价计算，`taker_fees` 使用两边当前 fee schedule 的最坏可验证值。任一成本无法确定时直接拒绝，不引入未定义的额外 buffer；`$1` 最低净利润本身就是第一版的资金安全余量。
+`executable_acquisition_cost` 使用两条 FOK 的最高允许成交价计算，`taker_fees` 使用两边当前 fee schedule 的最坏可验证值。任一成本无法确定时直接拒绝，不引入未定义的额外 buffer。
 
 只有同时满足以下条件才是可参与机会：
 
 ```text
 total_max_cost <= $20
-net_floor >= $1
-net_floor / gross_floor >= 1%
-wallet_balance <= $65
+net_floor > $0
+当前存在 <= $2 的单腿补救路径
 ```
+
+`$1` 最低利润、`1%` 净边际和 `20%` 年化只作为 Dashboard 标签，不是拒绝条件。所有 `net_floor > 0` 的机会都展示。年化使用实际占用资金：
+
+```text
+simple_annualized_yield =
+  (net_floor / total_max_cost)
+  * (365 days / remaining_days_to_resolution)
+```
+
+同时展示当前、过去 7 天和过去 30 天已发现机会的年化收益分布。到期时间缺失或不在未来时显示不可计算，不伪造年化值。
 
 “发现关系”“已通过校验”“已提交订单”都不能显示为“已锁定利润”。只有两腿成交已确认、实际总成本已知且关系证明仍有效时，状态才能变为：
 
@@ -132,17 +142,23 @@ PolymarketMonitor
     ▼
 PolymarketRelationDiscovery
     │
-    ├── REJECT → 原因和证据返回 Dashboard
-    └── APPROVE → token IDs 返回 Monitor
-                         │
-                         ▼
-                  实时订阅订单簿
-                         │
-                         ▼
-                生成 ThresholdHedgeIntent
-                         │
-                         ▼
-             ThresholdHedgeExecutionService
+    └── 模板证书通过 → token IDs 返回 Monitor
+                               │
+                               ▼
+                        实时订阅订单簿
+                               │ 正收益且缓存未命中
+                               ▼
+                       Codex 结构化语义审计
+                               │
+                 ┌─────────────┴─────────────┐
+                 ▼                           ▼
+       REJECT / UNAVAILABLE          APPROVE + 程序复核
+                 │                           │
+                 ▼                           ▼
+          展示原因、禁止下单          ThresholdHedgeIntent
+                                             │
+                                             ▼
+                                ThresholdHedgeExecutionService
 ```
 
 ### 5.1 Relation Discovery seam
@@ -168,10 +184,11 @@ await discovery.scan(event_id=None) -> RelationSnapshot
 - 同事件合约分组；
 - 阈值候选预筛；
 - 规则规范化和哈希；
-- LLM Prompt 调用；
+- Codex Prompt 调用；
 - LLM JSON 解析与证据核验；
 - 确定性真值表复核；
-- LLM 结果内存缓存；
+- LLM 结果持久化缓存；
+- 24 小时 Codex 调用和 token 统计；
 - 最近 20 条内存扫描日志。
 
 Relation Discovery 不读取钱包、不计算账户余额、不提交订单。执行模块不调用 LLM、不解释自然语言规则。
@@ -181,12 +198,24 @@ Relation Discovery 不读取钱包、不计算账户余额、不提交订单。�
 Relation Discovery 接受现有 Polymarket public client 和一个具有以下 interface 的 LLM adapter：
 
 ```python
-classify(prompt: str, payload: dict[str, object]) -> str
+classify(prompt: str, payload: dict[str, object]) -> CodexResult
 ```
 
-生产环境复用项目已有 OpenAI-compatible 调用模式、`DEEPSEEK_API_KEY`、`DEFAULT_CLASSIFIER_MODEL` 和 `response_format={"type": "json_object"}`。测试使用内存 fake adapter。不得新增 LLM SDK。
+生产环境只使用本机已登录的 Codex CLI，不使用 DeepSeek，也不新增 LLM SDK：
 
-模型名、Prompt 版本、两个规则哈希必须随实际执行证据持久化。
+```text
+codex exec
+  --ephemeral
+  --sandbox read-only
+  --skip-git-repo-check
+  --ignore-user-config
+  --ignore-rules
+  --output-schema <schema>
+```
+
+命令从空临时目录运行，Prompt 明确禁止工具调用。adapter 设置超时，只接受最后一个结构化 assistant message，并读取 `turn.completed.usage`。测试使用内存 fake adapter。
+
+模型名、Prompt 版本、缓存指纹、结构化结果和 usage 必须持久化。Codex 未登录、限额、超时或输出无效时标记 `llm_unavailable`，绝不降级为自动批准。
 
 ### 5.3 执行路径
 
@@ -214,8 +243,8 @@ Top 20 事件只保留给现有同市场订单簿监控。跨合约关系发现�
 
 ```text
 closed=false
-live=true
 page_size=500
+排除 active=false、closed=true 或 ended=true
 遍历到 next_cursor 为空
 ```
 
@@ -238,33 +267,32 @@ LLM 调用前只做便宜、无交易授权含义的预筛：
 - 两边都是 YES/NO 二元合约；
 - `conditionId` 和 token IDs 完整且互不相同；
 - 完整 rules、resolution source 和 end date 可用；
-- 标题、`groupItemThreshold` 或规则文本呈现可解析的阈值形态。
+- 问题和完整规则可确定性解析出 `> >= < <=` 比较符和 Decimal 阈值；
+- 规范化后的完整规则、结算来源、结束时间和时区除阈值外完全一致。
 
 同一事件内使用简单两两组合。第一版不建立全局索引；只有实际 profiling 证明大型事件扫描过慢时才升级。
 
+`groupItemThreshold` 在 Gamma 实际数据中是梯度排序号，不是经济阈值。它只能作为同系列辅助证据，禁止要求它等于问题中的实际阈值，也禁止用它决定蕴含方向。
+
 ### 6.3 LLM 缓存
 
-内存缓存键：
+持久化缓存只使用一个字符串键：
 
 ```text
-condition_id_a
-condition_id_b
-rules_hash_a
-rules_hash_b
-prompt_version
-model_name
+cache_key = sha256(
+  model_name + prompt_version + canonical_json(llm_payload)
+)
 ```
 
-键未变化时不重复调用 LLM。进程重启后允许重新校验，不新增持久化缓存。
+扫描器以固定的低阈值/高阈值顺序构造 `llm_payload`。payload 已包含 condition IDs、完整规则、结算来源和日期；任一语义输入变化都会自然产生新键。Prompt schema 变化必须升级 `prompt_version`。
+
+`APPROVE` 和 `REJECT` 都写入现有 prediction-arbitrage SQLite；超时、限额、无效 JSON 和其他 `llm_unavailable` 不缓存。缓存无 TTL，重启后继续使用。
+
+Codex 不按五分钟定时调用。只有“模板证书通过、当前盘口净利润为正、缓存未命中”的组合才串行调用一次。价格离开后重新进入正收益、进程重启或普通五分钟扫描均复用缓存。
 
 ### 6.4 实时盘口
 
-只有同时满足以下条件的合约对才订阅订单簿：
-
-- LLM `APPROVE`；
-- LLM 输出结构有效；
-- 原文证据可回查；
-- 确定性关系复核通过。
+模板证书通过的合约对即可订阅订单簿。盘口出现正收益后才触发缓存查询和必要的 Codex 调用；LLM `APPROVE`、结构校验、证据回查和确定性复核全部通过后，机会才可下单。
 
 Market WebSocket 使用 `custom_feature_enabled=true`，处理：
 
@@ -275,7 +303,7 @@ Market WebSocket 使用 `custom_feature_enabled=true`，处理：
 - `new_market`；
 - `market_resolved`。
 
-盘口每次变化立即重算利润。WebSocket 中断或订单簿超过现有 10 秒 freshness 限制时，跨合约机会全部不可下单。
+盘口每次变化立即重算利润。freshness 使用成功收到 REST 快照或 WebSocket book/heartbeat 的本地接收时间，不把“盘口最后一次价格变化时间”误当成快照陈旧时间。WebSocket 中断或超过现有 10 秒 freshness 限制时，跨合约机会全部不可下单。
 
 ## 7. LLM Prompt 契约
 
@@ -448,7 +476,7 @@ LLM `APPROVE` 只是必要条件。程序必须：
 7. 独立生成买入腿，不信任模型建议；
 8. 枚举真值表，确认危险反例被排除。
 
-只要 LLM 或程序任一层拒绝，就不能进入盘口测算。
+盘口测算先于 LLM，用来避免为没有正收益的组合消耗 Codex。只要 LLM 或程序任一层拒绝，就不能生成可执行 intent。
 
 ## 8. 判定与 Dashboard
 
@@ -473,7 +501,7 @@ Dashboard 的跨合约区域分为：
 
 ```text
 可参与
-关系成立但未达利润
+正收益、等待或无法校验
 校验拒绝
 ```
 
@@ -489,10 +517,11 @@ Dashboard 的跨合约区域分为：
 - 实时可成交数量；
 - 最大总成本；
 - 最低净利润；
+- 简单年化收益及收益标签；
 - 24 小时成交量；
 - 数据与规则 freshness。
 
-只有完整可参与候选显示“参与”按钮。
+所有净利润为正的候选都展示；只有完整可参与候选显示“参与”按钮。页面同时展示当前、7 天和 30 天机会 episode 的年化收益分布。
 
 ### 8.3 扫描日志
 
@@ -508,10 +537,20 @@ deque(maxlen=20)
 
 ```text
 14:32:08 全量扫描：1234 个事件 / 4567 个合约
-14:32:08 阈值预筛：82 对；LLM 新校验：6 对
+14:32:08 阈值预筛：82 对；正收益：6 对；Codex 新校验：2 对
 14:32:10 LLM 通过：2 对；实时盘口监控：2 对；可参与：1 对
 14:31:55 LLM 校验失败：timeout
 ```
+
+Dashboard 另显示滚动 24 小时用量：
+
+```text
+Codex：5 次调用
+成功 5 · 失败 0 · 缓存命中 126
+输入 85k tokens（其中缓存 60k）· 输出 3k
+```
+
+每次真正启动 `codex exec` 都计为调用，包括失败；缓存命中不算调用。usage 直接取 Codex 的 `turn.completed.usage`。第一版只统计，不设置没有数据依据的调用硬上限。
 
 不得显示：
 
@@ -528,7 +567,7 @@ Relation Discovery 单独报告：
 - `healthy`：全量扫描和 LLM 校验正常；
 - `degraded`：部分分页、规则或 LLM 调用失败；
 - `stale`：全量扫描超过 10 分钟未成功；
-- `unavailable`：缺少 LLM 密钥或模块未启动。
+- `unavailable`：Codex 未安装、未登录或模块未启动。
 
 `degraded/stale/unavailable` 时，所有跨合约按钮关闭；现有同市场 YES+NO 监控不受影响。
 
@@ -618,8 +657,14 @@ holding_to_resolution
 不持久化：
 
 - 最近 20 条扫描日志；
-- 未执行候选的 LLM 内存缓存；
 - 全量扫描的临时中间结果。
+
+使用现有 prediction-arbitrage SQLite 持久化：
+
+- `cache_key → structured_result` 的 Codex APPROVE/REJECT 缓存；
+- 每次实际 Codex 调用的状态、时间和 usage；
+- 正收益机会 episode，用于当前、7 天和 30 天年化分布；
+- 下列执行证据。
 
 必须随执行记录持久化：
 
@@ -634,7 +679,7 @@ holding_to_resolution
 - 两腿订单、成交和补救证据；
 - incident 和 breaker 状态。
 
-现有 store 使用 JSON payload 保存这些字段；第一版不新增关系数据库 schema。
+第一版只在现有 SQLite 文件中增加最小缓存和调用记录表，不引入新数据库、ORM 或后台清理任务。
 
 ## 11. 失败处理
 
@@ -644,6 +689,7 @@ holding_to_resolution
 |---|---|
 | Gamma 分页不完整 | discovery degraded，禁用跨合约下单 |
 | 完整规则缺失 | LLM 不调用，候选拒绝 |
+| Codex 未安装/未登录/限额 | `llm_unavailable` |
 | LLM 超时/空响应 | `llm_unavailable` |
 | LLM JSON 不合法 | `llm_unavailable` |
 | evidence 无法回查 | `deterministic_rejected` |
@@ -665,9 +711,15 @@ holding_to_resolution
 - 两页以上的全量 event paginator；
 - `new_market` 只刷新对应 event；
 - 同事件阈值候选预筛；
+- `groupItemThreshold` 只作排序辅助且不与实际阈值比较；
 - 不同事件不配对；
 - 相同缓存键不重复调用 LLM；
+- 重启后缓存仍命中；
+- 价格退出再进入正收益后缓存仍命中；
+- 非正收益组合不调用 Codex；
 - 规则哈希或 Prompt 版本变化会重新校验；
+- APPROVE 和 REJECT 被缓存，unavailable 不缓存；
+- 24 小时调用、失败、缓存命中和 token usage 统计；
 - LLM APPROVE 正确解析；
 - LLM REJECT 原因和证据保留；
 - LLM timeout、空响应和错误 JSON；
@@ -684,6 +736,8 @@ holding_to_resolution
 - rejected candidate 仍可见但不可下单；
 - `llm_unavailable` 与 `llm_rejected` 文案不同；
 - 实时 book 变化触发利润重算；
+- 所有正收益候选都展示，不以 `$1`、`1%` 或 `20%` 年化拒绝；
+- 当前、7 天和 30 天年化分布；
 - book stale 时按钮禁用；
 - 折叠日志的桌面和移动端显示；
 - health degraded/stale/unavailable；
@@ -698,6 +752,7 @@ holding_to_resolution
 - 两腿数量相等；
 - 确认时规则哈希变化则拒绝；
 - 两腿成交后进入 `holding_to_resolution`；
+- `holding_to_resolution` 不阻止后续新组合执行；
 - 跨合约成功路径从不调用 merge；
 - 两腿失败后 closed；
 - 单腿成交执行 `$2` 内补救并熔断；
@@ -711,7 +766,7 @@ holding_to_resolution
 
 1. 运行聚焦测试；
 2. 运行真实全量 Gamma 扫描；
-3. 验证真实 LLM APPROVE、REJECT 和 ERROR 展示；
+3. 验证真实 Codex APPROVE、REJECT 和 ERROR 展示；
 4. 运行真实 no-submit 预览与确认时重读；
 5. 检查 monitor、screen/launchd、PID、工作目录和 Git SHA；
 6. 检查新进程日志和 runtime；
@@ -727,6 +782,8 @@ holding_to_resolution
 - 全量活跃事件能稳定分页完成；
 - 新市场可由 WebSocket 触发定向关系扫描；
 - LLM Prompt、schema 和版本固定；
+- Codex 只在正收益缓存 miss 时调用且重启后复用；
+- Dashboard 展示 24 小时调用与 token 用量；
 - LLM 拒绝原因可见；
 - LLM 通过后仍由程序独立复核；
 - 已批准关系实时订阅两边订单簿；
