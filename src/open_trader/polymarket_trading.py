@@ -27,6 +27,8 @@ from .prediction_arbitrage import (
     MIN_ESTIMATED_PROFIT,
     MIN_NET_EDGE,
     PairIntent,
+    ThresholdHedgeIntent,
+    ThresholdHedgeLeg,
     protected_buy_quantity,
 )
 
@@ -122,6 +124,26 @@ class LegResult:
 class PairSubmission:
     yes: LegResult
     no: LegResult
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdLegResult:
+    label: Literal["A", "B"]
+    outcome: Literal["YES", "NO"]
+    condition_id: str
+    token_id: str
+    accepted: bool
+    status: str
+    order_id: str
+    filled_quantity: Decimal
+    trade_ids: tuple[str, ...]
+    error_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdHedgeSubmission:
+    leg_a: ThresholdLegResult
+    leg_b: ThresholdLegResult
 
 
 def _run_security(
@@ -379,6 +401,7 @@ class PolymarketTradingClient:
         self._urlopen_fn = urlopen_fn
         self._public_client_factory = public_client_factory or PublicClient
         self._readiness_key: tuple[PairIntent, Decimal] | None = None
+        self._threshold_readiness_key: ThresholdHedgeIntent | None = None
 
     @classmethod
     def from_keychain(
@@ -1084,6 +1107,310 @@ class PolymarketTradingClient:
             no=self._leg_result("NO", responses[1]),
         )
 
+    @staticmethod
+    def _ambiguous_threshold(intent: ThresholdHedgeIntent) -> ThresholdHedgeSubmission:
+        return ThresholdHedgeSubmission(
+            leg_a=ThresholdLegResult(
+                "A",
+                intent.leg_a.outcome,
+                intent.leg_a.condition_id,
+                intent.leg_a.token_id,
+                False,
+                "ambiguous",
+                "",
+                Decimal("0"),
+                (),
+                "ambiguous",
+            ),
+            leg_b=ThresholdLegResult(
+                "B",
+                intent.leg_b.outcome,
+                intent.leg_b.condition_id,
+                intent.leg_b.token_id,
+                False,
+                "ambiguous",
+                "",
+                Decimal("0"),
+                (),
+                "ambiguous",
+            ),
+        )
+
+    @staticmethod
+    def _blocked_threshold(
+        intent: ThresholdHedgeIntent, error_code: str
+    ) -> ThresholdHedgeSubmission:
+        return ThresholdHedgeSubmission(
+            leg_a=ThresholdLegResult(
+                "A",
+                intent.leg_a.outcome,
+                intent.leg_a.condition_id,
+                intent.leg_a.token_id,
+                False,
+                "blocked",
+                "",
+                Decimal("0"),
+                (),
+                error_code,
+            ),
+            leg_b=ThresholdLegResult(
+                "B",
+                intent.leg_b.outcome,
+                intent.leg_b.condition_id,
+                intent.leg_b.token_id,
+                False,
+                "blocked",
+                "",
+                Decimal("0"),
+                (),
+                error_code,
+            ),
+        )
+
+    @staticmethod
+    def _threshold_leg_valid(leg: ThresholdHedgeLeg) -> bool:
+        if not isinstance(leg, ThresholdHedgeLeg):
+            return False
+        if leg.label not in {"A", "B"} or leg.outcome not in {"YES", "NO"}:
+            return False
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (leg.condition_id, leg.market_id, leg.token_id)
+        ):
+            return False
+        if not all(
+            isinstance(value, Decimal) and value.is_finite() and value > 0
+            for value in (leg.quantity, leg.max_price, leg.max_cost, leg.tick_size)
+        ):
+            return False
+        if leg.max_price > 1 or leg.max_cost % CENT:
+            return False
+        return (
+            protected_buy_quantity(
+                spend=leg.max_cost,
+                price=leg.max_price,
+                tick_size=leg.tick_size,
+            )
+            == leg.quantity
+        )
+
+    def _validate_threshold_intent(
+        self,
+        intent: ThresholdHedgeIntent,
+        *,
+        account: AccountSnapshot,
+        require_economics: bool = True,
+    ) -> str | None:
+        if not isinstance(intent, ThresholdHedgeIntent):
+            return "invalid"
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (intent.relation_id, intent.event_id, intent.relation)
+        ):
+            return "invalid"
+        if intent.relation not in {"A_IMPLIES_B", "B_IMPLIES_A"}:
+            return "invalid"
+        if not self._threshold_leg_valid(intent.leg_a) or not self._threshold_leg_valid(
+            intent.leg_b
+        ):
+            return "invalid"
+        if intent.leg_a.label != "A" or intent.leg_b.label != "B":
+            return "invalid"
+        if intent.leg_a.condition_id == intent.leg_b.condition_id:
+            return "invalid"
+        if intent.leg_a.token_id == intent.leg_b.token_id:
+            return "invalid"
+        if not isinstance(intent.quantity, Decimal) or intent.quantity <= 0:
+            return "invalid"
+        if intent.leg_a.quantity != intent.quantity or intent.leg_b.quantity != intent.quantity:
+            return "order_amount_mismatch"
+        for value in (
+            intent.maximum_fee,
+            intent.total_max_cost,
+            intent.minimum_payout,
+            intent.minimum_profit,
+            intent.net_edge,
+        ):
+            if not isinstance(value, Decimal) or not value.is_finite():
+                return "invalid"
+        if intent.maximum_fee < 0 or intent.total_max_cost <= 0:
+            return "invalid"
+        if intent.total_max_cost != (
+            intent.leg_a.max_cost + intent.leg_b.max_cost + intent.maximum_fee
+        ):
+            return "invalid"
+        if intent.minimum_payout != intent.quantity:
+            return "invalid"
+        if intent.minimum_profit != intent.minimum_payout - intent.total_max_cost:
+            return "invalid"
+        if intent.total_max_cost > MAX_NORMAL_COST:
+            return "invalid"
+        if require_economics and (intent.minimum_profit <= 0 or intent.net_edge <= 0):
+            return "invalid"
+        if account.p_usd_balance < 0 or account.p_usd_allowance < 0:
+            return "account_insufficient"
+        if account.p_usd_balance > MAX_WALLET_BALANCE:
+            return "account_insufficient"
+        if intent.total_max_cost > account.p_usd_balance or intent.total_max_cost > account.p_usd_allowance:
+            return "account_insufficient"
+        return None
+
+    def _signed_threshold_pair(
+        self, intent: ThresholdHedgeIntent
+    ) -> tuple[object, object, str | None]:
+        try:
+            signed_a = self._sign_leg(
+                token_id=intent.leg_a.token_id,
+                amount=intent.leg_a.max_cost,
+                max_price=intent.leg_a.max_price,
+            )
+            signed_b = self._sign_leg(
+                token_id=intent.leg_b.token_id,
+                amount=intent.leg_b.max_cost,
+                max_price=intent.leg_b.max_price,
+            )
+        except Exception as exc:
+            return object(), object(), _safe_error_code(exc)
+        for signed, leg in ((signed_a, intent.leg_a), (signed_b, intent.leg_b)):
+            if _field(signed, "order_type") != "FOK" or _field(signed, "side") != "BUY":
+                return signed_a, signed_b, "order_shape_mismatch"
+            if _field(signed, "token_id") not in (None, leg.token_id):
+                return signed_a, signed_b, "order_shape_mismatch"
+            if self._signed_quantity(signed, leg.quantity) != leg.quantity:
+                return signed_a, signed_b, "order_amount_mismatch"
+        return signed_a, signed_b, None
+
+    @staticmethod
+    def _threshold_leg_result(
+        leg: ThresholdHedgeLeg, response: object
+    ) -> ThresholdLegResult:
+        accepted_value = _field(response, "ok", _field(response, "success", False))
+        accepted = accepted_value is True
+        if accepted:
+            status = _safe_string(_field(response, "status", "accepted"))
+            error_code = "none"
+            order_id = _safe_string(_field(response, "order_id", ""))
+            filled = _field(response, "taking_amount", Decimal("0"))
+            trades = _field(response, "trade_ids", ())
+        else:
+            raw_code = _field(response, "code", "rejected")
+            error_code = (
+                raw_code
+                if isinstance(raw_code, str) and re.fullmatch(r"[a-z_]+", raw_code)
+                else "rejected"
+            )
+            status = "rejected"
+            order_id = ""
+            filled = Decimal("0")
+            trades = ()
+        try:
+            filled_quantity = _decimal(filled)
+        except ValueError:
+            filled_quantity = Decimal("0")
+        trade_ids = (
+            tuple(item for item in trades if isinstance(item, str))
+            if isinstance(trades, (tuple, list))
+            else ()
+        )
+        return ThresholdLegResult(
+            leg.label,
+            leg.outcome,
+            leg.condition_id,
+            leg.token_id,
+            accepted,
+            status,
+            order_id,
+            filled_quantity,
+            trade_ids,
+            error_code,
+        )
+
+    def no_submit_threshold_preflight(
+        self,
+        intent: ThresholdHedgeIntent,
+        *,
+        account: AccountSnapshot | None = None,
+        require_economics: bool = True,
+    ) -> dict[str, object]:
+        self._readiness_key = None
+        self._threshold_readiness_key = None
+        signer_match, wallet_match = self._identity_summary()
+        summary: dict[str, object] = {
+            "signer_match": signer_match,
+            "wallet_match": wallet_match,
+            "posted": False,
+            "account_reads": "fail",
+            "fok_pair_signed_not_submitted": "fail",
+            "equal_requested_shares": "fail",
+            "conditions": [intent.leg_a.condition_id, intent.leg_b.condition_id]
+            if isinstance(intent, ThresholdHedgeIntent)
+            else [],
+            "merge": "not_required",
+            "error_code": "none",
+            "result": "BLOCKED",
+        }
+        if signer_match != "yes" or wallet_match != "yes":
+            summary["error_code"] = "auth"
+            return summary
+        if account is None:
+            try:
+                account = self.account_snapshot()
+            except PolymarketTradingError as exc:
+                summary["error_code"] = exc.error_code
+                return summary
+        summary["account_reads"] = "pass"
+        if not self.geoblock_allowed():
+            summary["geoblock"] = "blocked"
+            summary["error_code"] = "geoblock_blocked"
+            return summary
+        summary["geoblock"] = "allowed"
+        error_code = self._validate_threshold_intent(
+            intent, account=account, require_economics=require_economics
+        )
+        if error_code is None:
+            _, _, error_code = self._signed_threshold_pair(intent)
+        if error_code is not None:
+            summary["error_code"] = error_code
+            return summary
+        summary["fok_pair_signed_not_submitted"] = "pass"
+        summary["equal_requested_shares"] = "pass"
+        summary["result"] = "PASS"
+        self._threshold_readiness_key = intent
+        return summary
+
+    def submit_threshold_hedge_once(
+        self, intent: ThresholdHedgeIntent
+    ) -> ThresholdHedgeSubmission:
+        if self._threshold_readiness_key != intent:
+            return self._blocked_threshold(intent, "preflight_required")
+        signer_match, wallet_match = self._identity_summary()
+        if signer_match != "yes" or wallet_match != "yes":
+            return self._blocked_threshold(intent, "auth")
+        if not self.geoblock_allowed():
+            return self._blocked_threshold(intent, "geoblock_blocked")
+        try:
+            account = self.account_snapshot()
+        except PolymarketTradingError as exc:
+            return self._blocked_threshold(intent, exc.error_code)
+        error_code = self._validate_threshold_intent(
+            intent, account=account, require_economics=True
+        )
+        if error_code is not None:
+            return self._blocked_threshold(intent, error_code)
+        signed_a, signed_b, error_code = self._signed_threshold_pair(intent)
+        if error_code is not None:
+            return self._blocked_threshold(intent, error_code)
+        try:
+            responses = tuple(self._client.post_orders((signed_a, signed_b)))
+        except Exception:
+            return self._ambiguous_threshold(intent)
+        if len(responses) != 2:
+            return self._ambiguous_threshold(intent)
+        return ThresholdHedgeSubmission(
+            leg_a=self._threshold_leg_result(intent.leg_a, responses[0]),
+            leg_b=self._threshold_leg_result(intent.leg_b, responses[1]),
+        )
+
     def reconcile(
         self,
         *,
@@ -1288,6 +1615,191 @@ class PolymarketTradingClient:
                 "error_code": code,
                 "execution_proof": proof,
             }
+
+    def _reconcile_threshold_leg(
+        self, leg: ThresholdLegResult, *, since: datetime
+    ) -> tuple[Decimal, dict[str, object]]:
+        empty: dict[str, object] = {
+            "token_id": leg.token_id,
+            "order_ids": [],
+            "trade_ids": [],
+        }
+        refs = _string_refs(leg.order_id) | _string_refs(leg.trade_ids)
+        matched: dict[str, object] = {
+            "token_id": leg.token_id,
+            "order_ids": [],
+            "trade_ids": [],
+        }
+        if not refs or not isinstance(since, datetime):
+            return Decimal("0"), {
+                "matched_refs": matched,
+                "position_ref": None,
+                "positions_verified": False,
+            }
+        since_utc = since.astimezone(UTC) if since.tzinfo else since.replace(tzinfo=UTC)
+        quantity = Decimal("0")
+        seen: set[tuple[str, str]] = set()
+        try:
+            trades = _collect(
+                self._client.list_account_trades(
+                    market=leg.condition_id, after=since_utc.isoformat()
+                )
+            )
+            for trade in trades:
+                matched_at = _trade_timestamp(trade)
+                if matched_at is None or matched_at < since_utc:
+                    continue
+                condition = _field(trade, "condition_id", _field(trade, "market", ""))
+                if condition not in (None, "", leg.condition_id):
+                    continue
+                status = _safe_string(_field(trade, "status", "")).upper()
+                if status not in {"CONFIRMED", "MATCHED", "FILLED"}:
+                    continue
+                if _safe_string(_field(trade, "side", "")).upper() != "BUY":
+                    continue
+                token = _field(
+                    trade,
+                    "token_id",
+                    _field(trade, "tokenId", _field(trade, "asset_id", "")),
+                )
+                if token not in (None, "", leg.token_id):
+                    continue
+                trade_id = _field(trade, "id", _field(trade, "trade_id", ""))
+                order_id = _field(
+                    trade,
+                    "taker_order_id",
+                    _field(trade, "order_id", _field(trade, "orderId", "")),
+                )
+                trade_ref = trade_id.strip() if isinstance(trade_id, str) else ""
+                order_ref = order_id.strip() if isinstance(order_id, str) else ""
+                if not ((trade_ref and trade_ref in refs) or (order_ref and order_ref in refs)):
+                    continue
+                identity = (trade_ref, order_ref)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                raw_quantity: Decimal | None = None
+                for name in ("size", "quantity", "shares", "taking_amount"):
+                    try:
+                        raw_quantity = _decimal(_field(trade, name))
+                    except ValueError:
+                        raw_quantity = None
+                    if raw_quantity is not None:
+                        break
+                if raw_quantity is None or raw_quantity <= 0:
+                    continue
+                quantity += raw_quantity
+                if order_ref and order_ref not in matched["order_ids"]:
+                    matched["order_ids"].append(order_ref)  # type: ignore[union-attr]
+                if trade_ref and trade_ref not in matched["trade_ids"]:
+                    matched["trade_ids"].append(trade_ref)  # type: ignore[union-attr]
+
+            position_quantity = Decimal("0")
+            position_ref: dict[str, str] | None = None
+            positions = _collect(self._client.list_positions(market=[leg.condition_id]))
+            for position in positions:
+                condition = _field(
+                    position, "condition_id", _field(position, "market", "")
+                )
+                if condition not in (None, "", leg.condition_id):
+                    continue
+                token = _field(
+                    position,
+                    "token_id",
+                    _field(position, "tokenId", _field(position, "asset_id", "")),
+                )
+                if token != leg.token_id:
+                    continue
+                position_at = _trade_timestamp(position)
+                if position_at is not None and position_at < since_utc:
+                    continue
+                size: Decimal | None = None
+                for name in ("size", "quantity", "shares"):
+                    try:
+                        size = _decimal(_field(position, name))
+                    except ValueError:
+                        size = None
+                    if size is not None:
+                        break
+                if size is None or size <= 0:
+                    continue
+                position_quantity += size
+                position_ref = {
+                    "token_id": leg.token_id,
+                    "quantity": format(position_quantity, "f"),
+                }
+            return quantity, {
+                "matched_refs": matched,
+                "position_ref": position_ref,
+                "positions_verified": quantity > 0
+                and position_quantity >= quantity,
+            }
+        except Exception:
+            return Decimal("0"), {
+                "matched_refs": matched,
+                "position_ref": None,
+                "positions_verified": False,
+            }
+
+    def reconcile_threshold_hedge(
+        self,
+        *,
+        intent: ThresholdHedgeIntent,
+        since: datetime,
+        leg_a: ThresholdLegResult,
+        leg_b: ThresholdLegResult,
+    ) -> dict[str, object]:
+        """Reconcile each threshold leg against its own condition and token."""
+
+        if not isinstance(intent, ThresholdHedgeIntent):
+            return {"status": "blocked", "error_code": "invalid"}
+        quantity_a, proof_a = self._reconcile_threshold_leg(leg_a, since=since)
+        quantity_b, proof_b = self._reconcile_threshold_leg(leg_b, since=since)
+        proof: dict[str, object] = {
+            "venue": "polymarket",
+            "adapter_verified": True,
+            "positions_verified": proof_a["positions_verified"] is True
+            and proof_b["positions_verified"] is True,
+            "matched_refs": {
+                "A": proof_a["matched_refs"],
+                "B": proof_b["matched_refs"],
+            },
+            "position_refs": {
+                "A": proof_a["position_ref"],
+                "B": proof_b["position_ref"],
+            },
+            "condition_ids": {
+                "A": intent.leg_a.condition_id,
+                "B": intent.leg_b.condition_id,
+            },
+            "token_ids": {
+                "A": intent.leg_a.token_id,
+                "B": intent.leg_b.token_id,
+            },
+        }
+        if quantity_a > 0 and quantity_b > 0:
+            proof["verified"] = proof["positions_verified"] is True
+            return {
+                "status": "ok" if proof["verified"] else "blocked",
+                "leg_a_quantity": quantity_a,
+                "leg_b_quantity": quantity_b,
+                "execution_proof": proof,
+            }
+        if quantity_a > 0 or quantity_b > 0:
+            proof["partial_verified"] = proof["positions_verified"] is True
+            return {
+                "status": "partial" if proof["partial_verified"] else "blocked",
+                "leg_a_quantity": quantity_a,
+                "leg_b_quantity": quantity_b,
+                "execution_proof": proof,
+            }
+        return {
+            "status": "blocked",
+            "error_code": "reconciliation_unverified",
+            "leg_a_quantity": Decimal("0"),
+            "leg_b_quantity": Decimal("0"),
+            "execution_proof": proof,
+        }
 
     def cancel_orders(self, order_ids: tuple[str, ...]) -> tuple[str, ...]:
         try:
@@ -1504,6 +2016,157 @@ class PolymarketTradingClient:
             return LegResult(leg, False, "ambiguous", "", Decimal("0"), (), "ambiguous")
         return self._leg_result(leg, responses[0])
 
+    def threshold_remediation_options(
+        self,
+        *,
+        intent: ThresholdHedgeIntent,
+        filled_leg: str,
+        filled_quantity: Decimal,
+        since: datetime,
+        **_: object,
+    ) -> dict[str, object]:
+        """Return a fresh, two-dollar-bounded repair for one threshold leg."""
+
+        if (
+            not isinstance(intent, ThresholdHedgeIntent)
+            or filled_leg not in {"A", "B"}
+            or not isinstance(filled_quantity, Decimal)
+            or not filled_quantity.is_finite()
+            or filled_quantity <= 0
+        ):
+            return {"fresh": False}
+        filled = intent.leg_a if filled_leg == "A" else intent.leg_b
+        missing = intent.leg_b if filled_leg == "A" else intent.leg_a
+        try:
+            account = self.account_snapshot()
+            checked_at = _venue_timestamp(account.checked_at)
+            if checked_at is None or account.open_order_ids:
+                return {"fresh": False}
+            now = datetime.now(UTC)
+            if (now - checked_at).total_seconds() < 0 or (now - checked_at).total_seconds() > REMEDIATION_BOOK_FRESHNESS_SECONDS:
+                return {"fresh": False}
+            filled_position = Decimal("0")
+            for position in account.positions:
+                token = position.get("token_id", position.get("tokenId", position.get("asset_id", "")))
+                if token != filled.token_id:
+                    continue
+                size = _decimal(position.get("size", position.get("quantity", position.get("shares"))))
+                if size is not None and size > 0:
+                    filled_position += size
+            if filled_position < filled_quantity:
+                return {"fresh": False}
+            public = self._public_client_factory()
+            filled_book = public.get_order_book(token_id=filled.token_id)
+            missing_book = public.get_order_book(token_id=missing.token_id)
+
+            def best(book: object, side: str) -> tuple[Decimal, Decimal] | None:
+                rows = _collect(_field(book, side, ()))
+                levels: list[tuple[Decimal, Decimal]] = []
+                for row in rows:
+                    price = _decimal(_field(row, "price"))
+                    size = _decimal(_field(row, "size"))
+                    if price is None or size is None or price <= 0 or price > 1 or size < filled_quantity:
+                        continue
+                    levels.append((price, size))
+                return (max(levels, key=lambda item: item[0]) if side == "bids" else min(levels, key=lambda item: item[0])) if levels else None
+
+            ask = best(missing_book, "asks")
+            bid = best(filled_book, "bids")
+            if ask is None or bid is None:
+                return {"fresh": False}
+            for book in (filled_book, missing_book):
+                stamp = _venue_timestamp(_field(book, "timestamp"))
+                if stamp is None or (now - stamp).total_seconds() < 0 or (now - stamp).total_seconds() > REMEDIATION_BOOK_FRESHNESS_SECONDS:
+                    return {"fresh": False}
+            amount: Decimal | None = None
+            for cents in range(1, 201):
+                candidate = CENT * cents
+                if protected_buy_quantity(
+                    spend=candidate,
+                    price=ask[0],
+                    tick_size=missing.tick_size,
+                ) == filled_quantity:
+                    amount = candidate
+                    break
+            if amount is None:
+                return {"fresh": False}
+            return {
+                "fresh": True,
+                "checked_at": min(
+                    _venue_timestamp(_field(filled_book, "timestamp")),
+                    _venue_timestamp(_field(missing_book, "timestamp")),
+                ),
+                "complete": {
+                    "leg": missing.label,
+                    "side": "BUY",
+                    "condition_id": missing.condition_id,
+                    "token_id": missing.token_id,
+                    "outcome": missing.outcome,
+                    "quantity": filled_quantity,
+                    "amount": amount,
+                    "max_spend": amount,
+                    "max_price": ask[0],
+                    "tick_size": missing.tick_size,
+                    "loss": amount,
+                },
+                "unwind": {
+                    "leg": filled.label,
+                    "side": "SELL",
+                    "condition_id": filled.condition_id,
+                    "token_id": filled.token_id,
+                    "outcome": filled.outcome,
+                    "shares": filled_quantity,
+                    "quantity": filled_quantity,
+                    "min_price": bid[0],
+                    "loss": max(Decimal("0"), filled_quantity * (Decimal("1") - bid[0])),
+                },
+            }
+        except Exception:
+            return {"fresh": False}
+
+    def submit_threshold_remediation_once(self, order: dict[str, object]) -> ThresholdLegResult:
+        raw_label = order.get("leg")
+        if raw_label not in {"A", "B"}:
+            return ThresholdLegResult("A", "YES", "", "", False, "blocked", "", Decimal("0"), (), "invalid")
+        label: Literal["A", "B"] = cast(Literal["A", "B"], raw_label)
+        outcome = order.get("outcome")
+        if outcome not in {"YES", "NO"}:
+            outcome = "YES"
+        condition_id = order.get("condition_id")
+        token_id = order.get("token_id")
+        side = order.get("side")
+        if not isinstance(condition_id, str) or not condition_id or not isinstance(token_id, str) or not token_id or side not in {"BUY", "SELL"}:
+            return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), str(condition_id or ""), str(token_id or ""), False, "blocked", "", Decimal("0"), (), "invalid")
+        quantity = order.get("quantity", order.get("shares"))
+        if not isinstance(quantity, Decimal) or quantity <= 0:
+            return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), condition_id, token_id, False, "blocked", "", Decimal("0"), (), "invalid")
+        try:
+            if side == "BUY":
+                amount = order.get("amount", order.get("max_spend"))
+                max_price = order.get("max_price")
+                tick_size = order.get("tick_size")
+                if not isinstance(amount, Decimal) or not isinstance(max_price, Decimal) or not isinstance(tick_size, Decimal) or protected_buy_quantity(spend=amount, price=max_price, tick_size=tick_size) != quantity:
+                    return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), condition_id, token_id, False, "blocked", "", Decimal("0"), (), "invalid")
+                signed = self._sign_leg(token_id=token_id, amount=amount, max_price=max_price)
+                expected = self._signed_quantity(signed, quantity)
+            else:
+                min_price = order.get("min_price")
+                if not isinstance(min_price, Decimal):
+                    return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), condition_id, token_id, False, "blocked", "", Decimal("0"), (), "invalid")
+                signed = self._client.create_market_order(token_id=token_id, side="SELL", shares=quantity, min_price=min_price, order_type="FOK")
+                expected = self._signed_quantity_base_units(_field(signed, "maker_amount"), quantity)
+            if _field(signed, "order_type") != "FOK" or _field(signed, "side") != side or expected != quantity:
+                return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), condition_id, token_id, False, "blocked", "", Decimal("0"), (), "order_shape_mismatch")
+            responses = tuple(self._client.post_orders((signed,)))
+        except Exception:
+            return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), condition_id, token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous")
+        if len(responses) != 1:
+            return ThresholdLegResult(label, cast(Literal["YES", "NO"], outcome), condition_id, token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous")
+        return self._threshold_leg_result(
+            ThresholdHedgeLeg(label, condition_id, str(order.get("market_id", condition_id)), cast(Literal["YES", "NO"], outcome), token_id, quantity, order.get("max_price", order.get("min_price")), order.get("amount", Decimal("0")), order.get("tick_size", DEFAULT_TICK_SIZE)),
+            responses[0],
+        )
+
     def merge_once(self, *, condition_id: str, quantity: Decimal) -> dict[str, object]:
         if not condition_id or not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
             return {"status": "blocked", "error_code": "invalid"}
@@ -1572,6 +2235,8 @@ __all__ = [
     "PairSubmission",
     "PolymarketTradingClient",
     "PolymarketTradingError",
+    "ThresholdHedgeSubmission",
+    "ThresholdLegResult",
     "TradingConfig",
     "load_keychain_secret",
     "load_trading_config",

@@ -11,9 +11,17 @@ from open_trader.prediction_arbitrage import (
     BookLevel,
     ConfirmedBooks,
     MarketFacts,
+    ThresholdOrderBook,
     build_pair_intent,
     estimated_unwind_loss,
     monitored_event_sort_key,
+)
+from open_trader.polymarket_relation_discovery import (
+    ThresholdBuyLeg,
+    ThresholdMarket,
+    ThresholdRelation,
+    build_threshold_hedge_intent,
+    simple_annualized_yield,
 )
 
 
@@ -292,3 +300,228 @@ def test_negative_finite_profit_sorts_before_missing_profit() -> None:
         "z",
         "a",
     ]
+
+
+def threshold_relation(
+    *,
+    price_tick_a: str = "0.01",
+    price_tick_b: str = "0.01",
+    fee_rate_a: str = "0",
+    fee_rate_b: str = "0",
+    minimum_order_size: str = "5",
+) -> ThresholdRelation:
+    def row(
+        label: str,
+        threshold: str,
+        tick: str,
+        fee_rate: str,
+    ) -> ThresholdMarket:
+        return ThresholdMarket(
+            event_id="event-threshold",
+            market_id=f"market-{label}",
+            condition_id=f"condition-{label}",
+            question=f"BTC above ${threshold}?",
+            rules=RULES_FOR_THRESHOLD,
+            resolution_source="Binance",
+            end_date="2027-01-01T00:00:00Z",
+            operator=">",
+            threshold=Decimal(threshold),
+            yes_token_id=f"yes-{label}",
+            no_token_id=f"no-{label}",
+            group_item_threshold="0" if label == "a" else "1",
+            fees_enabled=Decimal(fee_rate) > 0,
+            fee_rate=Decimal(fee_rate),
+            minimum_order_size=Decimal(minimum_order_size),
+            tick_size=Decimal(tick),
+        )
+
+    a = row("a", "90000", price_tick_a, fee_rate_a)
+    b = row("b", "100000", price_tick_b, fee_rate_b)
+    return ThresholdRelation(
+        relation_id="threshold:one",
+        event_id="event-threshold",
+        market_a=a,
+        market_b=b,
+        relation="B_IMPLIES_A",
+        buy_leg_a=ThresholdBuyLeg(
+            "A", a.market_id, a.condition_id, "YES", a.yes_token_id
+        ),
+        buy_leg_b=ThresholdBuyLeg(
+            "B", b.market_id, b.condition_id, "NO", b.no_token_id
+        ),
+        rules_hash_a="rules-a",
+        rules_hash_b="rules-b",
+    )
+
+
+RULES_FOR_THRESHOLD = (
+    "The Binance BTC/USDT close at 12:00 ET must be above the title threshold."
+)
+
+
+def threshold_book(
+    token_id: str,
+    *,
+    asks: list[tuple[str, str]],
+    bids: list[tuple[str, str]],
+) -> ThresholdOrderBook:
+    return ThresholdOrderBook(
+        token_id=token_id,
+        asks=tuple(BookLevel(Decimal(price), Decimal(size)) for price, size in asks),
+        bids=tuple(BookLevel(Decimal(price), Decimal(size)) for price, size in bids),
+        confirmed_at=datetime.now(UTC),
+    )
+
+
+def test_threshold_hedge_builds_equal_cross_condition_legs_and_includes_fees() -> None:
+    relation = threshold_relation(fee_rate_a="0.07", fee_rate_b="0.04")
+    books = {
+        "yes-a": threshold_book(
+            "yes-a", asks=[("0.40", "20")], bids=[("0.35", "20")]
+        ),
+        "no-b": threshold_book(
+            "no-b", asks=[("0.50", "20")], bids=[("0.42", "20")]
+        ),
+    }
+
+    intent = build_threshold_hedge_intent(relation, books)
+
+    assert intent is not None
+    assert intent.quantity == Decimal("20")
+    assert intent.leg_a.condition_id == "condition-a"
+    assert intent.leg_b.condition_id == "condition-b"
+    assert intent.leg_a.outcome == "YES"
+    assert intent.leg_b.outcome == "NO"
+    assert intent.leg_a.max_cost == Decimal("8.00")
+    assert intent.leg_b.max_cost == Decimal("10.00")
+    assert intent.maximum_fee == Decimal("0.5360")
+    assert intent.total_max_cost == Decimal("18.5360")
+    assert intent.minimum_payout == Decimal("20")
+    assert intent.minimum_profit == Decimal("1.4640")
+
+
+def test_threshold_hedge_keeps_tiny_positive_profit_instead_of_one_dollar_gate() -> None:
+    relation = threshold_relation(price_tick_a="0.001", price_tick_b="0.001")
+    books = {
+        "yes-a": threshold_book(
+            "yes-a", asks=[("0.490", "10")], bids=[("0.489", "10")]
+        ),
+        "no-b": threshold_book(
+            "no-b", asks=[("0.509", "10")], bids=[("0.508", "10")]
+        ),
+    }
+
+    intent = build_threshold_hedge_intent(relation, books)
+
+    assert intent is not None
+    assert intent.quantity == Decimal("10")
+    assert intent.minimum_profit == Decimal("0.010")
+    assert intent.net_edge == Decimal("0.001")
+
+
+@pytest.mark.parametrize(
+    ("ask_a", "ask_b"),
+    [("0.50", "0.50"), ("0.51", "0.50")],
+)
+def test_zero_or_negative_threshold_profit_is_not_executable(
+    ask_a: str, ask_b: str
+) -> None:
+    relation = threshold_relation()
+    books = {
+        "yes-a": threshold_book(
+            "yes-a", asks=[(ask_a, "20")], bids=[("0.45", "20")]
+        ),
+        "no-b": threshold_book(
+            "no-b", asks=[(ask_b, "20")], bids=[("0.45", "20")]
+        ),
+    }
+
+    assert build_threshold_hedge_intent(relation, books) is None
+
+
+def test_threshold_hedge_rejects_a_current_unwind_path_above_two_dollars() -> None:
+    relation = threshold_relation()
+    books = {
+        "yes-a": threshold_book(
+            "yes-a", asks=[("0.90", "20")], bids=[("0.01", "20")]
+        ),
+        "no-b": threshold_book(
+            "no-b", asks=[("0.05", "20")], bids=[("0.04", "20")]
+        ),
+    }
+
+    assert build_threshold_hedge_intent(relation, books) is None
+    visible_candidate = build_threshold_hedge_intent(
+        relation,
+        books,
+        require_safe_unwind=False,
+    )
+    assert visible_candidate is not None
+    assert visible_candidate.minimum_profit > 0
+
+
+@pytest.mark.parametrize(
+    "books",
+    [
+        {
+            "yes-a": threshold_book(
+                "yes-a", asks=[], bids=[("0.35", "20")]
+            ),
+            "no-b": threshold_book(
+                "no-b", asks=[("0.50", "20")], bids=[("0.42", "20")]
+            ),
+        },
+        {
+            "yes-a": threshold_book(
+                "yes-a", asks=[("0.40", "20")], bids=[]
+            ),
+            "no-b": threshold_book(
+                "no-b", asks=[("0.50", "20")], bids=[("0.42", "20")]
+            ),
+        },
+    ],
+)
+def test_threshold_hedge_requires_both_asks_and_bids(
+    books: dict[str, ThresholdOrderBook],
+) -> None:
+    assert build_threshold_hedge_intent(threshold_relation(), books) is None
+
+
+def test_threshold_hedge_supports_different_tick_sizes_per_leg() -> None:
+    relation = threshold_relation(price_tick_a="0.01", price_tick_b="0.001")
+    books = {
+        "yes-a": threshold_book(
+            "yes-a", asks=[("0.40", "20")], bids=[("0.35", "20")]
+        ),
+        "no-b": threshold_book(
+            "no-b", asks=[("0.499", "20")], bids=[("0.42", "20")]
+        ),
+    }
+
+    intent = build_threshold_hedge_intent(relation, books)
+
+    assert intent is not None
+    assert intent.leg_a.tick_size == Decimal("0.01")
+    assert intent.leg_b.tick_size == Decimal("0.001")
+
+
+def test_threshold_annualized_yield_uses_capital_and_remaining_days() -> None:
+    relation = threshold_relation(price_tick_a="0.001", price_tick_b="0.001")
+    books = {
+        "yes-a": threshold_book(
+            "yes-a", asks=[("0.490", "10")], bids=[("0.489", "10")]
+        ),
+        "no-b": threshold_book(
+            "no-b", asks=[("0.509", "10")], bids=[("0.508", "10")]
+        ),
+    }
+    intent = build_threshold_hedge_intent(relation, books)
+    assert intent is not None
+
+    annualized = simple_annualized_yield(
+        intent,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        resolution_at=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+
+    assert annualized == intent.minimum_profit / intent.total_max_cost

@@ -13,13 +13,14 @@ from typing import Any, Iterator, Literal, Mapping
 
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
-SignalHistoryWindow = Literal["24h", "7d", "all"]
+SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 
 _BUSY_TIMEOUT_MS = 5_000
 _PREVIEW_TTL = timedelta(seconds=10)
 _TERMINAL_EXECUTION_STATES = (
     "both_rejected",
     "complete",
+    "holding_to_resolution",
     "neutralized_incident",
     "directional_incident",
     "merge_incident",
@@ -277,18 +278,37 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                cache_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                usage_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_signal_per_market
             ON signals(market_id) WHERE ended_at IS NULL;
+
+            DROP INDEX IF EXISTS one_nonterminal_execution;
 
             CREATE UNIQUE INDEX IF NOT EXISTS one_nonterminal_execution
             ON executions(singleton)
             WHERE state NOT IN (
-                'both_rejected', 'complete', 'neutralized_incident',
+                'both_rejected', 'complete', 'holding_to_resolution', 'neutralized_incident',
                 'directional_incident', 'merge_incident'
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS one_execution_per_idempotency_key
             ON executions(idempotency_key);
+
+            CREATE INDEX IF NOT EXISTS llm_usage_created_at
+            ON llm_usage(created_at);
             """
         )
         if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
@@ -428,15 +448,20 @@ class PredictionArbitrageStore:
             )
 
     def signal_history(self, window: SignalHistoryWindow) -> list[dict[str, object]]:
-        if window not in {"24h", "7d", "all"}:
-            raise ValueError("window must be 24h, 7d, or all")
+        if window not in {"24h", "7d", "30d", "all"}:
+            raise ValueError("window must be 24h, 7d, 30d, or all")
         with self._read_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM signals ORDER BY started_at DESC, signal_id DESC"
             ).fetchall()
         cutoff: datetime | None = None
         if window != "all":
-            delta = timedelta(hours=24) if window == "24h" else timedelta(days=7)
+            deltas = {
+                "24h": timedelta(hours=24),
+                "7d": timedelta(days=7),
+                "30d": timedelta(days=30),
+            }
+            delta = deltas[window]
             cutoff = _parse_timestamp(_utc_now()) - delta
         result = []
         for row in rows:
@@ -455,6 +480,122 @@ class PredictionArbitrageStore:
                     },
                 )
             )
+        return result
+
+    def save_llm_cache(
+        self, cache_key: str, payload: Mapping[str, object]
+    ) -> None:
+        key = str(cache_key).strip()
+        if not key:
+            raise ValueError("llm cache_key is required")
+        encoded = _dump_payload(payload)
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO llm_cache(cache_key, payload, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload=excluded.payload,
+                    created_at=excluded.created_at
+                """,
+                (key, encoded, _utc_now()),
+            )
+
+    def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
+        key = str(cache_key).strip()
+        if not key:
+            raise ValueError("llm cache_key is required")
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM llm_cache WHERE cache_key=?",
+                (key,),
+            ).fetchone()
+        return None if row is None else _load_payload(str(row["payload"]))
+
+    @staticmethod
+    def _llm_usage_payload(
+        usage: Mapping[str, object],
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        for field in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ):
+            value = usage.get(field, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+            payload[field] = value
+        return payload
+
+    def record_llm_call(
+        self, *, status: str, usage: Mapping[str, object]
+    ) -> None:
+        if status not in {"success", "failed"}:
+            raise ValueError("unsupported llm call status")
+        payload = self._llm_usage_payload(usage)
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO llm_usage(
+                    usage_id, kind, status, payload, created_at
+                ) VALUES (?, 'call', ?, ?, ?)
+                """,
+                (_new_id(), status, _dump_payload(payload), _utc_now()),
+            )
+
+    def record_llm_cache_hit(self) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO llm_usage(
+                    usage_id, kind, status, payload, created_at
+                ) VALUES (?, 'cache_hit', 'success', '{}', ?)
+                """,
+                (_new_id(), _utc_now()),
+            )
+
+    def llm_usage_24h(self) -> dict[str, int]:
+        cutoff = _canonical_timestamp(
+            _parse_timestamp(_utc_now()) - timedelta(hours=24)
+        )
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT kind, status, payload
+                FROM llm_usage
+                WHERE created_at >= ?
+                """,
+                (cutoff,),
+            ).fetchall()
+        result = {
+            "calls": 0,
+            "successes": 0,
+            "failures": 0,
+            "cache_hits": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        }
+        for row in rows:
+            if row["kind"] == "cache_hit":
+                result["cache_hits"] += 1
+                continue
+            result["calls"] += 1
+            if row["status"] == "success":
+                result["successes"] += 1
+            else:
+                result["failures"] += 1
+            usage = _load_payload(str(row["payload"]))
+            for field in (
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+            ):
+                result[field] += int(usage.get(field, 0))
         return result
 
     def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str:

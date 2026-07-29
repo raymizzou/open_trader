@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_CEILING
-from typing import Mapping
+from typing import Literal, Mapping
 
 
 MIN_NET_EDGE = Decimal("0.01")
@@ -66,6 +66,42 @@ class PairIntent:
     yes_max_cost: Decimal
     no_max_cost: Decimal
     total_max_cost: Decimal
+    minimum_profit: Decimal
+    net_edge: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdOrderBook:
+    token_id: str
+    asks: tuple[BookLevel, ...]
+    bids: tuple[BookLevel, ...]
+    confirmed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdHedgeLeg:
+    label: Literal["A", "B"]
+    condition_id: str
+    market_id: str
+    outcome: Literal["YES", "NO"]
+    token_id: str
+    quantity: Decimal
+    max_price: Decimal
+    max_cost: Decimal
+    tick_size: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdHedgeIntent:
+    relation_id: str
+    event_id: str
+    relation: Literal["A_IMPLIES_B", "B_IMPLIES_A"]
+    leg_a: ThresholdHedgeLeg
+    leg_b: ThresholdHedgeLeg
+    quantity: Decimal
+    maximum_fee: Decimal
+    total_max_cost: Decimal
+    minimum_payout: Decimal
     minimum_profit: Decimal
     net_edge: Decimal
 
@@ -293,8 +329,11 @@ def protected_buy_quantity(
         for value in (spend, price, tick_size)
     ):
         return None
-    precision = PROTECTED_BUY_SHARE_PRECISION.get(tick_size)
-    if precision is None or price > Decimal("1") or price % tick_size != 0:
+    precision = PROTECTED_BUY_SHARE_PRECISION.get(
+        tick_size,
+        max(5, -tick_size.as_tuple().exponent + 1),
+    )
+    if price > Decimal("1") or price % tick_size != 0:
         return None
     quantum = Decimal(1).scaleb(-precision)
     return (spend / price).quantize(quantum, rounding=ROUND_CEILING)
