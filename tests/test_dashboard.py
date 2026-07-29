@@ -1661,6 +1661,57 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
     assert projected["audit"]["actual_api_cost"] == payload["actual_api_cost"]
 
 
+def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15-r1.json"
+    path.parent.mkdir(parents=True)
+    payload = _dashboard_frozen_report_payload()
+    payload["industry_contexts"] = [
+        {
+            "industry_tm_id": 339103,
+            "industry": "银行",
+            "as_of_date": "2026-07-15",
+            "component_count": 42,
+            "snapshot_count": 42,
+            "tradable_count": 42,
+            "valid_count": 42,
+            "right_count": 8,
+            "snapshot_coverage": "1",
+            "right_state_coverage": "1",
+            "right_share": "0.190476",
+            "warm_to_hot_count": 6,
+            "temperature": "热",
+            "strength": "100",
+            "valid": True,
+            "invalid_reasons": [],
+            "aggregate_right_count_ratio": "0.191",
+            "aggregate_right_market_cap_ratio": "0.650",
+            "prior_as_of_date": "2026-07-14",
+            "prior_temperature": "温",
+            "prior_right_share": "0.150",
+            "prior_aggregate_right_count_ratio": "0.150",
+            "prior_aggregate_right_market_cap_ratio": "0.600",
+            "temperature_direction": "rising",
+            "right_share_change_pp": "4.0476",
+        }
+    ]
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert projected["available"] is True
+    assert projected["artifact"] == "2026-07-15-r1.json"
+    assert projected["industry_contexts"][0][
+        "aggregate_right_market_cap_ratio"
+    ] == "0.650"
+
+
 @pytest.mark.parametrize(
     ("market", "broker", "directory", "frozen_ids", "current_ids"),
     [

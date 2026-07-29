@@ -1336,6 +1336,12 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
         "temperature_direction",
         "right_share_change_pp",
     }
+    aggregate_ratio_keys = {
+        "aggregate_right_count_ratio",
+        "aggregate_right_market_cap_ratio",
+        "prior_aggregate_right_count_ratio",
+        "prior_aggregate_right_market_cap_ratio",
+    }
 
     def valid_decimal(value: object, *, minimum: Decimal, maximum: Decimal) -> bool:
         if isinstance(value, bool):
@@ -1348,7 +1354,11 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
 
     seen_ids: set[int] = set()
     for context in contexts:
-        if not isinstance(context, dict) or set(context) != context_keys:
+        if (
+            not isinstance(context, dict)
+            or not context_keys <= set(context)
+            or set(context) - context_keys - aggregate_ratio_keys
+        ):
             return False
         industry_id = context["industry_tm_id"]
         if (
@@ -1390,6 +1400,11 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
             return False
         for key in ("right_share", "prior_right_share"):
             if context[key] is not None and not valid_decimal(
+                context[key], minimum=Decimal("0"), maximum=Decimal("1")
+            ):
+                return False
+        for key in aggregate_ratio_keys:
+            if context.get(key) is not None and not valid_decimal(
                 context[key], minimum=Decimal("0"), maximum=Decimal("1")
             ):
                 return False
