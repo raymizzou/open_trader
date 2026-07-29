@@ -316,7 +316,7 @@ git commit -m "feat: validate threshold relations with codex"
 - Consumes: existing `AsyncPublicClient.list_events().iter_items()`, relation discovery, batch `get_order_books`, existing stream subscription, store, and validator.
 - Produces: threshold rows in `snapshot()["opportunities"]`, relation health, scan logs, usage metrics, and annualized distributions.
 
-- [ ] **Step 1: Write failing universe and gating tests**
+- [x] **Step 1: Write failing universe and gating tests**
 
 Cover:
 
@@ -334,7 +334,7 @@ Cover:
 - book receipt time, not last price-change timestamp, determines freshness;
 - logs cap at 20 and disappear on a new monitor instance.
 
-- [ ] **Step 2: Run monitor tests and verify RED**
+- [x] **Step 2: Run monitor tests and verify RED**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -343,7 +343,7 @@ Cover:
 
 Expected: missing constructor collaborators and missing threshold snapshot rows.
 
-- [ ] **Step 3: Add optional discovery/validator collaborators**
+- [x] **Step 3: Add optional discovery/validator collaborators**
 
 Keep existing constructor callers working:
 
@@ -353,11 +353,11 @@ parameters to the existing constructor.
 
 Production wiring supplies both; tests and unavailable configurations may omit them. Use the existing monitor thread and stream—no second daemon.
 
-- [ ] **Step 4: Project threshold state into existing snapshot**
+- [x] **Step 4: Project threshold state into existing snapshot**
 
 Add `market_type='threshold_hedge'`, both questions/conditions/tokens, relation proof, LLM status/summary/reasons, two BUY legs, fee/cost/profit, simple annualized yield, volume, received timestamp, remediation proof, and `actionable`. Persist positive episodes through `upsert_signal(relation_id)` and close them when profit is nonpositive, books go stale, or markets close.
 
-- [ ] **Step 5: Add health/log/usage/distribution fields**
+- [x] **Step 5: Add health/log/usage/distribution fields**
 
 ```python
 snapshot["relation_discovery"] = {
@@ -374,7 +374,7 @@ snapshot["relation_discovery"] = {
 
 The distribution contains count, min, median, p75, p90, and max using stdlib sorting only.
 
-- [ ] **Step 6: Run monitor regression tests and commit**
+- [x] **Step 6: Run monitor regression tests and commit**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \

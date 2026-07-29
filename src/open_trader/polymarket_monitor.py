@@ -8,6 +8,7 @@ import inspect
 import math
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -24,6 +25,15 @@ from .prediction_arbitrage import (
     monitored_event_sort_key,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
+from .polymarket_relation_discovery import (
+    RelationValidation,
+    ThresholdHedgeIntent,
+    ThresholdOrderBook,
+    ThresholdRelation,
+    build_threshold_hedge_intent,
+    discover_threshold_relations,
+    simple_annualized_yield,
+)
 
 
 TOP_EVENT_LIMIT = 20
@@ -38,6 +48,8 @@ RUNTIME_WRITE_SECONDS = 1
 PUBLIC_REFRESH_TIMEOUT_SECONDS = 30.0
 PUBLIC_BOOK_CONCURRENCY = 8
 STREAM_SUBSCRIPTION_CHUNK_SIZE = 250
+THRESHOLD_BOOK_BATCH_SIZE = 100
+RELATION_SCAN_LOG_LIMIT = 20
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -222,6 +234,11 @@ def _asks(value: object) -> tuple[BookLevel, ...] | None:
     return tuple(levels) if levels else None
 
 
+def _event_id(value: object) -> str | None:
+    raw = _value(value, "id", "event_id", "eventId", default=None)
+    return str(raw).strip() if isinstance(raw, (str, int)) and str(raw).strip() else None
+
+
 class PolymarketMonitor:
     """One async public monitor with a serialized in-memory snapshot."""
 
@@ -232,11 +249,15 @@ class PolymarketMonitor:
         trading: object,
         public_client_factory: Callable[[], object] = AsyncPublicClient,
         clock: Callable[[], datetime] | None = None,
+        relation_discovery: Callable[[Sequence[object]], object] | object | None = None,
+        relation_validator: object | None = None,
     ) -> None:
         self._store = store
         self._trading = trading
         self._public_client_factory = public_client_factory
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._relation_discovery = relation_discovery
+        self._relation_validator = relation_validator
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -245,22 +266,31 @@ class PolymarketMonitor:
         self._events: dict[str, dict[str, object]] = {}
         self._markets: dict[str, dict[str, object]] = {}
         self._market_by_token: dict[str, str] = {}
+        self._relations: dict[str, ThresholdRelation] = {}
+        self._relation_by_token: dict[str, set[str]] = {}
+        self._relation_books: dict[str, ThresholdOrderBook] = {}
+        self._relation_volumes: dict[str, Decimal] = {}
         self._opportunities: dict[str, dict[str, object]] = {}
         self._books: dict[str, ConfirmedBooks] = {}
         self._readiness: dict[str, object] | None = None
         self._universe_at: datetime | None = None
+        self._relations_at: datetime | None = None
         self._heartbeat_at: datetime | None = None
         self._stream_connected_at: datetime | None = None
         self._stream_disconnected_at: datetime | None = None
         self._last_runtime_write: datetime | None = None
         self._store_failed = False
         self._universe_failed = False
+        self._relations_failed = False
         self._stream_message_at: datetime | None = None
         self._diagnostics: dict[str, object] = {
             "malformed_events": 0,
             "malformed_markets": 0,
             "last_error": None,
         }
+        self._relation_scan_logs: deque[dict[str, object]] = deque(
+            maxlen=RELATION_SCAN_LOG_LIMIT
+        )
 
     def start(self) -> None:
         with self._lock:
@@ -302,6 +332,7 @@ class PolymarketMonitor:
                     key=monitored_event_sort_key,
                 )
             ]
+            relation_health = self._relation_health(now)
             for opportunity in opportunities:
                 confirmed_at = opportunity.get("confirmed_at")
                 age = _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None)
@@ -312,6 +343,14 @@ class PolymarketMonitor:
                 if health["status"] == "degraded":
                     opportunity["actionable"] = False
                     opportunity["eligibility_reason"] = "monitor_degraded"
+                if (
+                    opportunity.get("market_type") == "threshold_hedge"
+                    and relation_health["status"] != "healthy"
+                ):
+                    opportunity["actionable"] = False
+                    opportunity["eligibility_reason"] = (
+                        "relation_discovery_" + str(relation_health["status"])
+                    )
             return {
                 "status": health["status"],
                 "health": health,
@@ -321,6 +360,12 @@ class PolymarketMonitor:
                 "heartbeat_at": self._heartbeat_at,
                 "universe_refreshed_at": self._universe_at,
                 "readiness": copy.deepcopy(self._readiness),
+                "relation_discovery": {
+                    **relation_health,
+                    "scan_logs": copy.deepcopy(list(self._relation_scan_logs)),
+                    "codex_usage_24h": self._llm_usage(),
+                    "annualized_distribution": self._annualized_distributions(),
+                },
             }
 
     def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
@@ -339,6 +384,15 @@ class PolymarketMonitor:
             if self._health(now)["status"] == "degraded":
                 result["actionable"] = False
                 result["eligibility_reason"] = "monitor_degraded"
+            relation_health = self._relation_health(now)
+            if (
+                result.get("market_type") == "threshold_hedge"
+                and relation_health["status"] != "healthy"
+            ):
+                result["actionable"] = False
+                result["eligibility_reason"] = (
+                    "relation_discovery_" + str(relation_health["status"])
+                )
             return result
 
     def refresh_once(self) -> dict[str, object]:
@@ -448,7 +502,9 @@ class PolymarketMonitor:
 
     async def _subscribe(self, client: object) -> None:
         with self._lock:
-            token_ids = sorted(self._market_by_token)
+            token_ids = sorted(
+                set(self._market_by_token) | set(self._relation_by_token)
+            )
         if not token_ids:
             return
         await self._close_stream()
@@ -456,7 +512,10 @@ class PolymarketMonitor:
         if not callable(subscribe):
             raise ConnectionError("public client has no market stream")
         specs = [
-            MarketSpec(token_ids=token_ids[index : index + STREAM_SUBSCRIPTION_CHUNK_SIZE])
+            MarketSpec(
+                token_ids=token_ids[index : index + STREAM_SUBSCRIPTION_CHUNK_SIZE],
+                custom_feature_enabled=True,
+            )
             for index in range(0, len(token_ids), STREAM_SUBSCRIPTION_CHUNK_SIZE)
         ]
         handle = await _call(subscribe, specs[0] if len(specs) == 1 else specs)
@@ -505,8 +564,20 @@ class PolymarketMonitor:
             event_row["markets"] = valid_markets
             event_row["market_count"] = len(valid_markets)
             event_row.pop("_raw_markets", None)
+        if self._relation_discovery is not None:
+            try:
+                await self._refresh_relation_universe(client)
+            except Exception as exc:
+                self._relations_failed = True
+                self._record_error(exc, "relations")
+                self._log_relation_scan(
+                    phase="failed",
+                    status="degraded",
+                    reason=type(exc).__name__,
+                )
         with self._lock:
-            previous_opportunities = set(self._opportunities)
+            previous_opportunity_rows = copy.deepcopy(self._opportunities)
+            previous_opportunities = set(previous_opportunity_rows)
             self._events = {str(item["event_id"]): item for item in normalized}
             self._markets = markets
             self._market_by_token = token_map
@@ -534,14 +605,368 @@ class PolymarketMonitor:
         for opportunity in confirmed:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
+        if self._relation_discovery is not None and not self._relations_failed:
+            for opportunity in await self._refresh_relation_opportunities(client):
+                current_opportunities[str(opportunity["opportunity_id"])] = opportunity
         with self._lock:
             self._opportunities = current_opportunities
             missing = previous_opportunities - set(current_opportunities)
         for opportunity_id in missing:
-            market_id = opportunity_id.split(":", 1)[-1]
+            previous = previous_opportunity_rows.get(opportunity_id, {})
+            market_id = str(previous.get("market_id", opportunity_id.split(":", 1)[-1]))
             self._close_signal(market_id, "opportunity_closed")
         self._sync_event_rows()
         self._write_runtime(force=True)
+
+    def _log_relation_scan(self, **fields: object) -> None:
+        entry = {"at": self._now(), **fields}
+        self._relation_scan_logs.append(entry)
+
+    async def _refresh_relation_universe(self, client: object) -> None:
+        list_events = getattr(client, "list_events", None)
+        if not callable(list_events):
+            raise RuntimeError("public client has no list_events")
+        self._log_relation_scan(phase="started", status="scanning")
+        raw = await _call(
+            list_events,
+            closed=False,
+            ended=False,
+            page_size=THRESHOLD_BOOK_BATCH_SIZE,
+        )
+        events = await _collect(raw)
+        resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
+        if not callable(resolver):
+            raise RuntimeError("relation discovery is not callable")
+        discovered = await _call(resolver, events)
+        relations = tuple(
+            item for item in _items(discovered) if isinstance(item, ThresholdRelation)
+        )
+        self._set_relation_state(relations, events)
+        self._log_relation_scan(
+            phase="completed",
+            status="healthy",
+            event_count=len(events),
+            relation_count=len(relations),
+        )
+
+    def _set_relation_state(
+        self,
+        relations: Sequence[ThresholdRelation],
+        events: Sequence[object],
+    ) -> None:
+        relation_map = {relation.relation_id: relation for relation in relations}
+        token_map: dict[str, set[str]] = {}
+        volumes: dict[str, Decimal] = {}
+        for raw_event in events:
+            event_id = _event_id(raw_event)
+            if event_id is None:
+                continue
+            metrics = _value(raw_event, "metrics", default=None)
+            volume = _decimal(
+                _value(
+                    metrics,
+                    "volume_24hr",
+                    "volume24hr",
+                    default=_value(raw_event, "volume_24h", "volume24hr", default=0),
+                )
+            ) or Decimal("0")
+            for relation in relations:
+                if relation.event_id == event_id:
+                    volumes[relation.relation_id] = volume
+        for relation in relations:
+            for token in (
+                relation.market_a.yes_token_id,
+                relation.market_a.no_token_id,
+                relation.market_b.yes_token_id,
+                relation.market_b.no_token_id,
+            ):
+                token_map.setdefault(token, set()).add(relation.relation_id)
+        with self._lock:
+            self._relations = relation_map
+            self._relation_by_token = token_map
+            self._relation_volumes = volumes
+            self._relations_at = self._now()
+            self._relations_failed = False
+
+    async def _refresh_relation_event(self, client: object, event_id: str) -> None:
+        get_event = getattr(client, "get_event", None)
+        if not callable(get_event):
+            raise RuntimeError("public client has no get_event")
+        raw_event = await _call(get_event, id=event_id)
+        resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
+        if not callable(resolver):
+            raise RuntimeError("relation discovery is not callable")
+        discovered = await _call(resolver, (raw_event,))
+        refreshed = tuple(
+            item for item in _items(discovered) if isinstance(item, ThresholdRelation)
+        )
+        remaining = tuple(
+            relation
+            for relation in self._relations.values()
+            if relation.event_id != event_id
+        )
+        old_volumes = dict(self._relation_volumes)
+        self._set_relation_state(remaining + refreshed, (raw_event,))
+        for relation_id, volume in old_volumes.items():
+            if relation_id in self._relations and relation_id not in {
+                relation.relation_id for relation in refreshed
+            }:
+                self._relation_volumes[relation_id] = volume
+        self._relations_failed = False
+        self._log_relation_scan(
+            phase="event",
+            status="healthy",
+            event_id=event_id,
+            relation_count=len(refreshed),
+        )
+        await self._subscribe(client)
+
+    async def _refresh_relation_books(self, client: object) -> None:
+        get_books = getattr(client, "get_order_books", None)
+        if not callable(get_books):
+            raise RuntimeError("public client has no paired order-book read")
+        tokens = sorted(self._relation_by_token)
+        if not tokens:
+            self._relation_books = {}
+            return
+        chunks = [
+            tokens[index : index + THRESHOLD_BOOK_BATCH_SIZE]
+            for index in range(0, len(tokens), THRESHOLD_BOOK_BATCH_SIZE)
+        ]
+        semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
+
+        async def fetch(chunk: list[str]) -> dict[str, ThresholdOrderBook]:
+            async with semaphore:
+                raw_books = await _call(get_books, token_ids=chunk)
+                result: dict[str, ThresholdOrderBook] = {}
+                received_at = self._now()
+                for raw_book in _items(raw_books):
+                    token = _value(
+                        raw_book,
+                        "token_id",
+                        "asset_id",
+                        "assetId",
+                        default=None,
+                    )
+                    if not isinstance(token, str) or token not in chunk:
+                        continue
+                    asks = _asks(_value(raw_book, "asks", default=()))
+                    bid_levels = _asks(_value(raw_book, "bids", default=()))
+                    bids = bid_levels or ()
+                    if asks is None:
+                        continue
+                    result[token] = ThresholdOrderBook(
+                        token_id=token,
+                        asks=asks,
+                        bids=bids,
+                        confirmed_at=received_at,
+                    )
+                return result
+
+        fetched = await asyncio.gather(*(fetch(chunk) for chunk in chunks))
+        books: dict[str, ThresholdOrderBook] = {}
+        for batch in fetched:
+            books.update(batch)
+        self._relation_books = books
+
+    async def _refresh_relation_opportunities(
+        self, client: object
+    ) -> tuple[dict[str, object], ...]:
+        await self._refresh_relation_books(client)
+        readiness = self._readiness or {}
+        now = self._now()
+        balance = _decimal(readiness.get("balance", readiness.get("p_usd_balance"))) or Decimal("0")
+        allowance = _decimal(readiness.get("allowance", readiness.get("p_usd_allowance"))) or Decimal("0")
+        rows: list[dict[str, object]] = []
+        for relation in self._relations.values():
+            candidate = build_threshold_hedge_intent(
+                relation,
+                self._relation_books,
+                require_safe_unwind=False,
+            )
+            if candidate is None or candidate.minimum_profit <= 0:
+                self._close_signal(relation.relation_id, "nonpositive_profit")
+                continue
+            validation = await self._validate_relation(relation)
+            safe_intent = build_threshold_hedge_intent(
+                relation,
+                self._relation_books,
+            )
+            confirmed_at = min(
+                self._relation_books[token].confirmed_at
+                for token in (
+                    relation.buy_leg_a.token_id,
+                    relation.buy_leg_b.token_id,
+                )
+                if token in self._relation_books
+            )
+            confirmed_age = _age(now, confirmed_at)
+            end_date = _timestamp_or_none(relation.market_b.end_date)
+            annualized = (
+                simple_annualized_yield(
+                    candidate,
+                    now=now,
+                    resolution_at=end_date,
+                )
+                if end_date is not None
+                else None
+            )
+            status = getattr(validation, "status", "llm_unavailable")
+            reason_codes = tuple(getattr(validation, "reason_codes", ()))
+            summary = str(getattr(validation, "summary", ""))
+            if self._relation_validator is None:
+                status = "llm_unavailable"
+                reason_codes = ("RELATION_VALIDATOR_UNAVAILABLE",)
+                summary = "关系校验器未配置，当前不可下单。"
+            if status == "approved":
+                eligibility_reason = "actionable"
+            elif status == "llm_rejected":
+                eligibility_reason = "llm_rejected"
+            elif status == "deterministic_rejected":
+                eligibility_reason = "deterministic_rejected"
+            else:
+                eligibility_reason = "llm_unavailable"
+            if status == "approved" and safe_intent is None:
+                eligibility_reason = "remediation_unsafe"
+            elif status == "approved" and confirmed_age > BOOK_FRESHNESS_SECONDS:
+                eligibility_reason = "book_stale"
+            elif status == "approved" and not self._readiness_ready(readiness):
+                eligibility_reason = "readiness_unavailable"
+            elif status == "approved" and (
+                _age(now, readiness.get("checked_at")) > READINESS_FRESHNESS_SECONDS
+            ):
+                eligibility_reason = "readiness_stale"
+            elif status == "approved" and safe_intent is not None and (
+                safe_intent.total_max_cost > balance
+                or safe_intent.total_max_cost > allowance
+            ):
+                eligibility_reason = "insufficient_funds"
+            actionable = status == "approved" and eligibility_reason == "actionable"
+            intent = safe_intent
+            row = self._relation_row(
+                relation,
+                candidate,
+                intent,
+                validation,
+                volume=self._relation_volumes.get(relation.relation_id, Decimal("0")),
+                confirmed_at=confirmed_at,
+                confirmed_age=confirmed_age,
+                annualized=annualized,
+                actionable=actionable,
+                eligibility_reason=eligibility_reason,
+                reason_codes=reason_codes,
+                summary=summary,
+            )
+            rows.append(row)
+            self._upsert_signal(row)
+        self._log_relation_scan(
+            phase="books",
+            status="healthy",
+            relation_count=len(self._relations),
+            positive_count=len(rows),
+        )
+        return tuple(rows)
+
+    async def _validate_relation(self, relation: ThresholdRelation) -> object:
+        validator = self._relation_validator
+        if validator is None:
+            return RelationValidation(
+                status="llm_unavailable",
+                decision=None,
+                relation=None,
+                summary="关系校验器未配置，当前不可下单。",
+                reason_codes=("RELATION_VALIDATOR_UNAVAILABLE",),
+                evidence=(),
+                uncertainties=(),
+                model="",
+                prompt_version="",
+                cache_key="",
+                cached=False,
+                structured_result=None,
+            )
+        method = getattr(validator, "validate", validator)
+        if not callable(method):
+            raise RuntimeError("relation validator is not callable")
+        return await asyncio.to_thread(method, relation)
+
+    @staticmethod
+    def _relation_row(
+        relation: ThresholdRelation,
+        candidate: ThresholdHedgeIntent,
+        intent: ThresholdHedgeIntent | None,
+        validation: object,
+        *,
+        volume: Decimal,
+        confirmed_at: datetime,
+        confirmed_age: float,
+        annualized: Decimal | None,
+        actionable: bool,
+        eligibility_reason: str,
+        reason_codes: tuple[object, ...],
+        summary: str,
+    ) -> dict[str, object]:
+        selected = intent or candidate
+        legs = (selected.leg_a, selected.leg_b)
+        structured = getattr(validation, "structured_result", None)
+        proof = structured.get("proof") if isinstance(structured, Mapping) else None
+        return {
+            "opportunity_id": relation.relation_id,
+            "relation_id": relation.relation_id,
+            "event_id": relation.event_id,
+            "market_id": relation.relation_id,
+            "market_type": "threshold_hedge",
+            "question": f"{relation.market_a.question} / {relation.market_b.question}",
+            "question_a": relation.market_a.question,
+            "question_b": relation.market_b.question,
+            "condition_id_a": relation.market_a.condition_id,
+            "condition_id_b": relation.market_b.condition_id,
+            "token_id_a": relation.market_a.yes_token_id,
+            "token_id_b": relation.market_b.yes_token_id,
+            "relation": relation.relation,
+            "rules_hash_a": relation.rules_hash_a,
+            "rules_hash_b": relation.rules_hash_b,
+            "buy_legs": [
+                {
+                    "label": leg.label,
+                    "market_id": leg.market_id,
+                    "condition_id": leg.condition_id,
+                    "outcome": leg.outcome,
+                    "token_id": leg.token_id,
+                    "quantity": leg.quantity,
+                    "max_price": leg.max_price,
+                    "max_cost": leg.max_cost,
+                }
+                for leg in legs
+            ],
+            "volume_24h": volume,
+            "confirmed_at": confirmed_at,
+            "confirmed_age_seconds": confirmed_age,
+            "profit": candidate.minimum_profit,
+            "estimated_profit": candidate.minimum_profit,
+            "net_edge": candidate.net_edge,
+            "quantity": candidate.quantity,
+            "maximum_fee": candidate.maximum_fee,
+            "total_max_cost": candidate.total_max_cost,
+            "minimum_payout": candidate.minimum_payout,
+            "annualized_yield": annualized,
+            "remediation_safe": intent is not None,
+            "actionable": actionable,
+            "eligibility": "actionable" if actionable else "visible_positive",
+            "eligibility_reason": eligibility_reason,
+            "llm_status": getattr(validation, "status", "llm_unavailable"),
+            "llm_decision": getattr(validation, "decision", None),
+            "llm_relation": getattr(validation, "relation", None),
+            "llm_summary": summary,
+            "llm_reason_codes": list(reason_codes),
+            "llm_evidence": copy.deepcopy(getattr(validation, "evidence", ())),
+            "llm_uncertainties": list(getattr(validation, "uncertainties", ())),
+            "llm_proof": copy.deepcopy(proof),
+            "codex_cached": bool(getattr(validation, "cached", False)),
+            "codex_model": getattr(validation, "model", ""),
+            "prompt_version": getattr(validation, "prompt_version", ""),
+            "cache_key": getattr(validation, "cache_key", ""),
+            "intent": intent,
+        }
 
     def _normalize_event(self, value: object) -> dict[str, object] | None:
         event_id = _value(value, "id", "event_id", "eventId", default=None)
@@ -830,26 +1255,66 @@ class PolymarketMonitor:
     async def _process_stream_event(self, client: object, message: object) -> None:
         self._stream_message_at = self._now()
         self._heartbeat_at = self._stream_message_at
+        message_type = _value(message, "type", "event_type", default="")
         payload = _value(message, "payload", default=message)
+        if message_type in {"new_market", "market_resolved"}:
+            event_message = _value(payload, "event_message", "eventMessage", default=None)
+            event_id = _event_id(event_message)
+            if event_id is None:
+                event_id = _event_id(payload)
+            if event_id is not None and self._relation_discovery is not None:
+                await self._refresh_relation_event(client, event_id)
+                relation_rows = await self._refresh_relation_opportunities(client)
+                with self._lock:
+                    self._opportunities = {
+                        key: value
+                        for key, value in self._opportunities.items()
+                        if value.get("market_type") != "threshold_hedge"
+                    }
+                    self._opportunities.update(
+                        {str(row["opportunity_id"]): row for row in relation_rows}
+                    )
+            return
+        tokens: list[str] = []
         token = _value(payload, "token_id", "asset_id", "assetId", default=None)
-        if not isinstance(token, str):
-            return
-        market_id = self._market_by_token.get(token)
-        if market_id is None:
-            return
-        market_row = self._markets.get(market_id)
-        if market_row is None:
-            return
-        self._update_stream_book(market_id, token, payload)
-        opportunity = await self._confirm_market(client, market_row)
-        with self._lock:
-            if opportunity is None:
-                previous = self._opportunities.pop(f"{market_row['event_id']}:{market_id}", None)
-            else:
-                self._opportunities[str(opportunity["opportunity_id"])] = opportunity
-                previous = None
-        if opportunity is None and previous is not None:
-            self._close_signal(market_id, "threshold_or_freshness")
+        if isinstance(token, str):
+            tokens.append(token)
+        for change in _items(_value(payload, "price_changes", "priceChanges", default=())):
+            changed_token = _value(change, "token_id", "asset_id", "assetId", default=None)
+            if isinstance(changed_token, str):
+                tokens.append(changed_token)
+        standard_market_ids: set[str] = set()
+        relation_ids: set[str] = set()
+        for token_id in set(tokens):
+            market_id = self._market_by_token.get(token_id)
+            if market_id is not None:
+                standard_market_ids.add(market_id)
+            relation_ids.update(self._relation_by_token.get(token_id, set()))
+        for market_id in standard_market_ids:
+            market_row = self._markets.get(market_id)
+            if market_row is None:
+                continue
+            if isinstance(token, str):
+                self._update_stream_book(market_id, token, payload)
+            opportunity = await self._confirm_market(client, market_row)
+            with self._lock:
+                opportunity_id = f"{market_row['event_id']}:{market_id}"
+                previous = self._opportunities.pop(opportunity_id, None)
+                if opportunity is not None:
+                    self._opportunities[opportunity_id] = opportunity
+            if opportunity is None and previous is not None:
+                self._close_signal(market_id, "threshold_or_freshness")
+        if relation_ids:
+            relation_rows = await self._refresh_relation_opportunities(client)
+            with self._lock:
+                self._opportunities = {
+                    key: value
+                    for key, value in self._opportunities.items()
+                    if value.get("market_type") != "threshold_hedge"
+                }
+                self._opportunities.update(
+                    {str(row["opportunity_id"]): row for row in relation_rows}
+                )
         self._sync_event_rows()
 
     def _update_stream_book(self, market_id: str, token: str, payload: object) -> None:
@@ -921,6 +1386,10 @@ class PolymarketMonitor:
                     "peak_quantity": peak_quantity,
                     "peak_estimated_profit": peak_profit,
                     "volume_24h": opportunity.get("volume_24h"),
+                    "market_type": opportunity.get("market_type", "standard_binary"),
+                    "annualized_yield": opportunity.get("annualized_yield"),
+                    "llm_status": opportunity.get("llm_status"),
+                    "llm_reason_codes": opportunity.get("llm_reason_codes"),
                 }
             )
         except Exception as exc:
@@ -946,6 +1415,93 @@ class PolymarketMonitor:
         self._diagnostics["last_error"] = f"{component}:{type(exc).__name__}"
         if component == "universe":
             self._universe_failed = True
+        if component == "relations":
+            self._relations_failed = True
+
+    def _relation_health(self, now: datetime) -> dict[str, object]:
+        if self._relation_discovery is None or self._relation_validator is None:
+            status = "unavailable"
+        elif self._relations_failed:
+            status = "degraded"
+        elif self._relations_at is None:
+            status = "stale"
+        elif _age(now, self._relations_at) > UNIVERSE_STALE_SECONDS:
+            status = "stale"
+        else:
+            status = "healthy"
+        return {
+            "status": status,
+            "scanned_at": self._relations_at,
+            "relation_count": len(self._relations),
+            "positive_count": sum(
+                1
+                for row in self._opportunities.values()
+                if row.get("market_type") == "threshold_hedge"
+            ),
+        }
+
+    def _llm_usage(self) -> dict[str, int]:
+        try:
+            return self._store.llm_usage_24h()
+        except Exception:
+            return {
+                "calls": 0,
+                "successes": 0,
+                "failures": 0,
+                "cache_hits": 0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+            }
+
+    @staticmethod
+    def _distribution(values: Sequence[object]) -> dict[str, object]:
+        parsed = sorted(
+            value
+            for value in (_decimal(item) for item in values)
+            if value is not None
+        )
+        if not parsed:
+            return {
+                "count": 0,
+                "min": None,
+                "median": None,
+                "p75": None,
+                "p90": None,
+                "max": None,
+            }
+
+        def percentile(percent: int) -> Decimal:
+            index = max(0, math.ceil(len(parsed) * percent / 100) - 1)
+            return parsed[index]
+
+        return {
+            "count": len(parsed),
+            "min": parsed[0],
+            "median": percentile(50),
+            "p75": percentile(75),
+            "p90": percentile(90),
+            "max": parsed[-1],
+        }
+
+    def _annualized_distributions(self) -> dict[str, dict[str, object]]:
+        current = [
+            row.get("annualized_yield")
+            for row in self._opportunities.values()
+            if row.get("market_type") == "threshold_hedge"
+        ]
+        history_7d = self._store.signal_history("7d")
+        history_30d = self._store.signal_history("30d")
+        return {
+            "current": self._distribution(current),
+            "7d": self._distribution(
+                [row.get("annualized_yield") for row in history_7d]
+            ),
+            "30d": self._distribution(
+                [row.get("annualized_yield") for row in history_30d]
+            ),
+        }
 
     def _write_runtime(self, *, force: bool = False) -> None:
         now = self._now()

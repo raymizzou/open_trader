@@ -329,8 +329,11 @@ def protected_buy_quantity(
         for value in (spend, price, tick_size)
     ):
         return None
-    precision = PROTECTED_BUY_SHARE_PRECISION.get(tick_size)
-    if precision is None or price > Decimal("1") or price % tick_size != 0:
+    precision = PROTECTED_BUY_SHARE_PRECISION.get(
+        tick_size,
+        max(5, -tick_size.as_tuple().exponent + 1),
+    )
+    if price > Decimal("1") or price % tick_size != 0:
         return None
     quantum = Decimal(1).scaleb(-precision)
     return (spend / price).quantize(quantum, rounding=ROUND_CEILING)

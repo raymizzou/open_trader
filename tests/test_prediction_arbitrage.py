@@ -451,6 +451,13 @@ def test_threshold_hedge_rejects_a_current_unwind_path_above_two_dollars() -> No
     }
 
     assert build_threshold_hedge_intent(relation, books) is None
+    visible_candidate = build_threshold_hedge_intent(
+        relation,
+        books,
+        require_safe_unwind=False,
+    )
+    assert visible_candidate is not None
+    assert visible_candidate.minimum_profit > 0
 
 
 @pytest.mark.parametrize(

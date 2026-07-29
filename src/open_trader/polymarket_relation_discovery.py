@@ -366,13 +366,34 @@ def _outcome_tokens(market: object) -> dict[str, str] | None:
             if label in {"yes", "no"} and token:
                 tokens[label] = token
     else:
-        labels = [_text(item).casefold() for item in _items(outcomes)]
-        token_ids = [
-            _text(item)
-            for item in _items(
-                _value(market, "clobTokenIds", "clob_token_ids", default=None)
+        rows = _items(outcomes)
+        structured = [
+            (
+                _text(_value(row, "label", "name", default="")).casefold(),
+                _text(
+                    _value(
+                        row,
+                        "token_id",
+                        "tokenId",
+                        "asset_id",
+                        "assetId",
+                        default="",
+                    )
+                ),
             )
+            for row in rows
         ]
+        if all(label and token for label, token in structured):
+            labels = [label for label, _ in structured]
+            token_ids = [token for _, token in structured]
+        else:
+            labels = [_text(item).casefold() for item in rows]
+            token_ids = [
+                _text(item)
+                for item in _items(
+                    _value(market, "clobTokenIds", "clob_token_ids", default=None)
+                )
+            ]
         if len(labels) != 2 or len(token_ids) != 2:
             return None
         tokens = dict(zip(labels, token_ids, strict=True))
@@ -1089,7 +1110,10 @@ def _fee_rate(market: ThresholdMarket) -> Decimal | None:
 
 
 def _book(
-    books: Mapping[str, ThresholdOrderBook], token_id: str
+    books: Mapping[str, ThresholdOrderBook],
+    token_id: str,
+    *,
+    require_bids: bool,
 ) -> ThresholdOrderBook | None:
     value = books.get(token_id)
     if (
@@ -1097,7 +1121,7 @@ def _book(
         or value.token_id != token_id
         or not isinstance(value.confirmed_at, datetime)
         or not value.asks
-        or not value.bids
+        or (require_bids and not value.bids)
     ):
         return None
     return value
@@ -1141,13 +1165,23 @@ def _sell_proceeds(
 def build_threshold_hedge_intent(
     relation: ThresholdRelation,
     books: Mapping[str, ThresholdOrderBook],
+    *,
+    require_safe_unwind: bool = True,
 ) -> ThresholdHedgeIntent | None:
     """Return the largest equal-share positive hedge with safe current unwinds."""
 
     if not isinstance(relation, ThresholdRelation):
         return None
-    book_a = _book(books, relation.buy_leg_a.token_id)
-    book_b = _book(books, relation.buy_leg_b.token_id)
+    book_a = _book(
+        books,
+        relation.buy_leg_a.token_id,
+        require_bids=require_safe_unwind,
+    )
+    book_b = _book(
+        books,
+        relation.buy_leg_b.token_id,
+        require_bids=require_safe_unwind,
+    )
     if book_a is None or book_b is None:
         return None
     rate_a = _fee_rate(relation.market_a)
@@ -1184,26 +1218,28 @@ def build_threshold_hedge_intent(
         profit = quantity - total_cost
         if total_cost > MAX_NORMAL_COST or profit <= 0:
             continue
-        unwind_a = _sell_proceeds(
-            book_a.bids,
-            quantity=quantity,
-            tick_size=relation.market_a.tick_size,
-            fee_rate=rate_a,
-        )
-        unwind_b = _sell_proceeds(
-            book_b.bids,
-            quantity=quantity,
-            tick_size=relation.market_b.tick_size,
-            fee_rate=rate_b,
-        )
-        if unwind_a is None or unwind_b is None:
-            continue
-        if (
-            max(Decimal("0"), cost_a + fee_a - unwind_a) > MAX_EMERGENCY_LOSS
-            or max(Decimal("0"), cost_b + fee_b - unwind_b)
-            > MAX_EMERGENCY_LOSS
-        ):
-            continue
+        if require_safe_unwind:
+            unwind_a = _sell_proceeds(
+                book_a.bids,
+                quantity=quantity,
+                tick_size=relation.market_a.tick_size,
+                fee_rate=rate_a,
+            )
+            unwind_b = _sell_proceeds(
+                book_b.bids,
+                quantity=quantity,
+                tick_size=relation.market_b.tick_size,
+                fee_rate=rate_b,
+            )
+            if unwind_a is None or unwind_b is None:
+                continue
+            if (
+                max(Decimal("0"), cost_a + fee_a - unwind_a)
+                > MAX_EMERGENCY_LOSS
+                or max(Decimal("0"), cost_b + fee_b - unwind_b)
+                > MAX_EMERGENCY_LOSS
+            ):
+                continue
         leg_a = ThresholdHedgeLeg(
             label="A",
             condition_id=relation.buy_leg_a.condition_id,
