@@ -162,7 +162,7 @@
       .metric-strip {
         display: grid;
         gap: 10px;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         margin-bottom: 10px;
       }
       .health-item {
@@ -473,9 +473,113 @@
       .layout-a {
         display: grid;
         gap: 10px;
-        grid-template-columns: minmax(250px, .62fr) minmax(520px, 1.38fr) minmax(250px, .65fr);
+        grid-template-columns: minmax(250px, .34fr) minmax(720px, 1.66fr);
       }
       .layout-a .middle-stack { display: grid; gap: 10px; }
+      .candidate-list { display: grid; gap: 8px; }
+      .candidate-disclosure {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: clip;
+        padding: 0;
+      }
+      .candidate-disclosure > summary {
+        align-items: center;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(230px, 1.55fr) auto minmax(72px, .55fr) minmax(112px, .8fr) minmax(74px, .55fr) minmax(132px, .8fr);
+        list-style: none;
+        min-height: 66px;
+        padding: 10px 12px;
+      }
+      .candidate-disclosure > summary::-webkit-details-marker { display: none; }
+      .candidate-disclosure[open] > summary {
+        background: var(--proto-blue-soft);
+        box-shadow: inset 3px 0 var(--proto-blue);
+      }
+      .candidate-title strong,
+      .candidate-title small,
+      .candidate-stat span,
+      .candidate-stat strong,
+      .candidate-yield small,
+      .candidate-yield strong,
+      .candidate-yield i { display: block; }
+      .candidate-title strong { font-size: 15px; line-height: 1.35; }
+      .candidate-title small { color: var(--muted); margin-top: 4px; }
+      .candidate-stat span,
+      .candidate-yield small { color: var(--muted); font-size: 10px; margin-bottom: 4px; }
+      .candidate-stat strong { line-height: 1.3; }
+      .candidate-yield {
+        align-items: center;
+        background: var(--surface-soft);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        display: grid;
+        min-height: 44px;
+        padding: 6px 9px;
+        position: relative;
+      }
+      .candidate-yield strong { font-size: 17px; line-height: 1.1; }
+      .candidate-yield i {
+        color: var(--proto-blue);
+        font-size: 10px;
+        font-style: normal;
+        margin-top: 3px;
+      }
+      .candidate-disclosure[open] .candidate-yield i::before { content: "收起详情"; }
+      .candidate-disclosure:not([open]) .candidate-yield i::before { content: "查看详情"; }
+      .candidate-detail {
+        border-top: 1px solid var(--line);
+        display: grid;
+        gap: 12px;
+        padding: 14px;
+      }
+      .candidate-detail h3 { margin: 0; }
+      .detail-heading {
+        align-items: start;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        margin-bottom: 9px;
+      }
+      .detail-heading h3 { font-size: 15px; }
+      .detail-heading p { color: var(--muted); margin: 3px 0 0; }
+      .annualized-formula {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      }
+      .annualized-formula div {
+        background: var(--surface-soft);
+        border-radius: 6px;
+        min-width: 0;
+        padding: 9px;
+      }
+      .annualized-formula span {
+        color: var(--muted);
+        display: block;
+        font-size: 10px;
+        margin-bottom: 5px;
+      }
+      .annualized-formula strong { display: block; overflow-wrap: anywhere; }
+      .formula-result { color: var(--proto-green); }
+      .formula-note {
+        color: var(--muted);
+        margin: 8px 0 0;
+      }
+      .candidate-evidence-layout {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(250px, .7fr) minmax(360px, 1.3fr);
+      }
+      .candidate-subpanel {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-width: 0;
+        padding: 12px;
+      }
+      .candidate-subpanel > h3 { font-size: 15px; margin-bottom: 9px; }
 
       /* B — Evidence ledger: one compact table with a right evidence inspector. */
       .ledger-shell {
@@ -623,11 +727,14 @@
       @media (max-width: 1180px) {
         .layout-a,
         .decision-shell { grid-template-columns: 240px minmax(500px, 1fr); }
-        .layout-a > :last-child,
         .decision-shell > :last-child { grid-column: 1 / -1; }
         .ledger-shell { grid-template-columns: 1fr; }
         .evidence-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .metric-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .candidate-disclosure > summary {
+          grid-template-columns: minmax(220px, 1.4fr) auto minmax(70px, .5fr) minmax(108px, .75fr) minmax(70px, .5fr) minmax(120px, .75fr);
+        }
+        .annualized-formula { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       }
       @media (max-width: 800px) {
         body { font-size: 16px; }
@@ -651,12 +758,35 @@
         .layout-a,
         .ledger-shell,
         .decision-shell { grid-template-columns: minmax(0, 1fr); }
-        .layout-a > :last-child,
         .decision-shell > :last-child { grid-column: auto; }
         .market-pair,
         .evidence-grid,
         .economics-grid,
-        .evidence-rail { grid-template-columns: minmax(0, 1fr); }
+        .evidence-rail,
+        .candidate-evidence-layout { grid-template-columns: minmax(0, 1fr); }
+        .candidate-disclosure > summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .candidate-title { grid-column: 1 / -1; }
+        .candidate-disclosure > summary > .pill { justify-self: start; }
+        .annualized-formula { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .truth-table thead { display: none; }
+        .truth-table,
+        .truth-table tbody,
+        .truth-table tr,
+        .truth-table td { display: block; width: 100%; }
+        .truth-table tr { border-bottom: 1px solid var(--line); padding: 7px 0; }
+        .truth-table td {
+          border: 0;
+          display: grid;
+          gap: 8px;
+          grid-template-columns: 120px minmax(0, 1fr);
+          padding: 4px 0;
+        }
+        .truth-table td::before {
+          color: var(--muted);
+          content: attr(data-label);
+          font-size: 11px;
+          font-weight: 800;
+        }
         .action-row .button { width: 100%; }
         .ledger-table thead { display: none; }
         .ledger-table,
@@ -679,6 +809,12 @@
         .health-item:last-child { border-bottom: 0; grid-column: auto; }
         .leg-order { align-items: start; display: grid; }
         .leg-order div:last-child { text-align: left; }
+        .candidate-disclosure > summary { grid-template-columns: minmax(0, 1fr); }
+        .candidate-title,
+        .candidate-stat,
+        .candidate-yield { grid-column: 1 / -1; }
+        .candidate-yield { width: 100%; }
+        .annualized-formula { grid-template-columns: minmax(0, 1fr); }
         .dist-row { grid-template-columns: 42px minmax(70px, 1fr) 48px 48px; }
         .dist-row > *:last-child { display: none; }
         .prototype-controller-label { min-width: 0; width: min(190px, 52vw); }
@@ -749,8 +885,8 @@
         </div>
         <div class="health-item">
           <span>Codex 校验</span>
-          <strong class="ok">可用 · gpt-5</strong>
-          <small>仅校验新规则版本</small>
+          <strong class="ok">sol · xhigh · fast</strong>
+          <small>默认模型 · reasoning · speed</small>
         </div>
         <div class="health-item">
           <span>交易准备</span>
@@ -784,11 +920,6 @@
           <span>当前理论净利润</span>
           <strong class="ok">+$0.54</strong>
           <small>成交前尚未锁定</small>
-        </div>
-        <div class="metric">
-          <span>简单年化</span>
-          <strong>22.8%</strong>
-          <small>预计 47 天结算</small>
         </div>
         <div class="metric">
           <span>Codex 24h 调用</span>
@@ -862,7 +993,7 @@
 
       const llmHtml = (state) => {
         if (state === "scanning") {
-          return `<section class="llm-card"><header><strong>Codex 结构化校验</strong><span class="pill pending">PENDING · 等待候选</span></header><p class="llm-summary">只有确定性关系和经济性先通过，才会调用 Codex。缓存命中不会重复调用。</p><div class="reason-codes"><span class="reason-code">schema: hedge_relation_v1</span><span class="reason-code">fail_closed: true</span></div></section>`;
+          return `<section class="llm-card"><header><strong>Codex 结构化校验</strong><span class="pill pending">PENDING · 等待结构化结果</span></header><p class="llm-summary">规则解析仍在进行；未返回结构化结论前禁止下单。缓存命中不会重复调用。</p><div class="reason-codes"><span class="reason-code">schema: hedge_relation_v1</span><span class="reason-code">fail_closed: true</span></div></section>`;
         }
         if (state === "rejected") {
           return `<section class="llm-card rejected" role="alert"><header><strong>Codex 结构化校验</strong><span class="pill rejected">REJECT · 禁止下单</span></header><p class="llm-summary">两个市场的截止时刻表面相同，但市场 B 的规则允许使用 Coinbase 指数，而市场 A 指定 Binance 现货。无法证明所有结算情形下至少一腿赔付。</p><div class="reason-codes"><span class="reason-code">ORACLE_MISMATCH</span><span class="reason-code">PAYOFF_NOT_EXHAUSTIVE</span><span class="reason-code">RULES_NOT_EQUIVALENT</span></div></section>`;
@@ -874,9 +1005,9 @@
         <table class="truth-table">
           <thead><tr><th>BTC 最终价</th><th>A：below $100k</th><th>持有 A=YES</th><th>B：above $90k</th><th>持有 B=YES</th><th>组合赔付</th></tr></thead>
           <tbody>
-            <tr><td>≤ $90k</td><td>YES</td><td>$1</td><td>NO</td><td>$0</td><td class="guaranteed">$1 · A 赔付</td></tr>
-            <tr><td>$90k–$100k</td><td>YES</td><td>$1</td><td>YES</td><td>$1</td><td class="guaranteed">$2 · 两腿赔付</td></tr>
-            <tr><td>≥ $100k</td><td>NO</td><td>$0</td><td>YES</td><td>$1</td><td class="guaranteed">$1 · B 赔付</td></tr>
+            <tr><td data-label="BTC 最终价">≤ $90k</td><td data-label="A：below $100k">YES</td><td data-label="持有 A=YES">$1</td><td data-label="B：above $90k">NO</td><td data-label="持有 B=YES">$0</td><td data-label="组合赔付" class="guaranteed">$1 · A 赔付</td></tr>
+            <tr><td data-label="BTC 最终价">$90k–$100k</td><td data-label="A：below $100k">YES</td><td data-label="持有 A=YES">$1</td><td data-label="B：above $90k">YES</td><td data-label="持有 B=YES">$1</td><td data-label="组合赔付" class="guaranteed">$2 · 两腿赔付</td></tr>
+            <tr><td data-label="BTC 最终价">≥ $100k</td><td data-label="A：below $100k">NO</td><td data-label="持有 A=YES">$0</td><td data-label="B：above $90k">YES</td><td data-label="持有 B=YES">$1</td><td data-label="组合赔付" class="guaranteed">$1 · B 赔付</td></tr>
           </tbody>
         </table>`;
 
@@ -901,14 +1032,38 @@
           <div><span>含费最大成本</span><strong>$19.46</strong></div>
           <div><span>最低赔付</span><strong>$20.00</strong></div>
           <div><span>${state === "holding" ? "账面最低利润" : "理论最低净利润"}</span><strong class="ok">+$0.54</strong></div>
-          <div><span>简单年化</span><strong>22.8%</strong></div>
+          <div><span>简单年化</span><strong>21.5%</strong></div>
         </div>`;
 
-      const distributionHtml = () => `
-        <div class="distribution" aria-label="年化收益分布">
-          <div class="dist-row"><span>当前</span><div class="dist-track"><i style="width:54%"></i></div><strong>P50 18%</strong><strong>P90 27%</strong><strong>n=14</strong></div>
+      const distributionHtml = (current = "21.5%", percentile = "58%") => `
+        <div class="distribution" aria-label="历史同类机会年化参考">
+          <div class="dist-row"><span>当前</span><div class="dist-track"><i style="width:${percentile}"></i></div><strong>${current}</strong><strong>分位 ${percentile}</strong><strong>本候选</strong></div>
           <div class="dist-row"><span>7 天</span><div class="dist-track"><i style="width:67%"></i></div><strong>P50 21%</strong><strong>P90 34%</strong><strong>n=86</strong></div>
           <div class="dist-row"><span>30 天</span><div class="dist-track"><i style="width:61%"></i></div><strong>P50 19%</strong><strong>P90 31%</strong><strong>n=302</strong></div>
+        </div>`;
+
+      const annualizedDetailHtml = ({cost, profit, days, simpleReturn, annualized}) => `
+        <section>
+          <div class="detail-heading">
+            <div><h3>简单年化怎么算</h3><p>使用理论最低利润、含费最大成本和预计资金占用天数。</p></div>
+            <span class="pill neutral">不复利</span>
+          </div>
+          <div class="annualized-formula">
+            <div><span>理论最低利润</span><strong class="ok">${profit}</strong></div>
+            <div><span>含费最大成本</span><strong>${cost}</strong></div>
+            <div><span>预计资金占用</span><strong>${days} 天</strong></div>
+            <div><span>简单收益率</span><strong>${profit} / ${cost} = ${simpleReturn}</strong></div>
+            <div><span>简单年化</span><strong class="formula-result">${simpleReturn} × 365 / ${days} = ${annualized}</strong></div>
+          </div>
+          <p class="formula-note">预计资金占用以结算时间估算；若结算延迟，实际年化会下降。两腿全部成交前，利润尚未锁定。</p>
+        </section>`;
+
+      const validationChainHtml = (state) => `
+        <div class="evidence-chain">
+          <div class="evidence-step done"><span>01 · 候选生成</span><strong>同一事件 · 同类阈值</strong></div>
+          <div class="evidence-step done"><span>02 · 确定性关系</span><strong>标题关系覆盖所有价格区间</strong></div>
+          <div class="evidence-step ${state === "rejected" ? "fail" : state === "scanning" ? "" : "done"}"><span>03 · Codex 规则语义</span><strong>${state === "rejected" ? "REJECT · oracle 不一致" : state === "scanning" ? "PARSING · 解析中" : "APPROVE · 结构化返回"}</strong></div>
+          <div class="evidence-step ${state === "rejected" || state === "scanning" ? "" : "done"}"><span>04 · 确认时复检</span><strong>${state === "rejected" ? "不会进入" : state === "scanning" ? "等待规则解析" : "盘口 / 费用 / 余额"}</strong></div>
         </div>`;
 
       const actionHtml = (state) => {
@@ -922,6 +1077,88 @@
           return `<div class="action-row"><p><strong>两腿已成交，正在等待事件结算。</strong>这是多 condition 持仓，不会 merge；极端争议风险仍需单独记录。</p><button class="button secondary" type="button">查看成交回执</button></div>`;
         }
         return `<div class="action-row"><p><strong>成交前尚未锁定利润。</strong>点击后先重读规则、盘口、费用、余额和地区，再展示最终确认单；两笔 FOK 订单不是原子交易。</p><button class="button primary" type="button" data-open-confirm>查看并确认两腿订单</button></div>`;
+      };
+
+      const candidateDisclosureHtml = (state) => {
+        const statusClass = state === "rejected" ? "rejected" : state === "holding" ? "neutral" : "approved";
+        const statusText = state === "rejected" ? "REJECT" : state === "holding" ? "HOLDING" : "APPROVE";
+        return `
+          <div class="candidate-list">
+            <details class="candidate-disclosure" data-candidate-id="HD-2051">
+              <summary>
+                <span class="candidate-title"><strong>BTC Sep 30 · 阈值覆盖</strong><small>0x7b…91a + 0xc4…e02 · 数据时效 1.4s</small></span>
+                <span class="pill ${statusClass}">${statusText}</span>
+                <span class="candidate-stat"><span>24h 成交量</span><strong>$415k</strong></span>
+                <span class="candidate-stat"><span>成本 / 最低赔付</span><strong>$19.46 / $20.00</strong></span>
+                <span class="candidate-stat"><span>理论利润</span><strong class="ok">+$0.54</strong></span>
+                <span class="candidate-yield" data-testid="candidate-btc-yield"><small>简单年化</small><strong>21.5%</strong><i aria-hidden="true"></i></span>
+              </summary>
+              <div class="candidate-detail">
+                ${annualizedDetailHtml({cost: "$19.46", profit: "$0.54", days: "47", simpleReturn: "2.77%", annualized: "21.55%"})}
+                <section class="candidate-subpanel">
+                  <div class="detail-heading"><div><h3>历史同类参考</h3><p>用于判断当前收益处于什么位置，不重复计算当前年化。</p></div></div>
+                  ${distributionHtml()}
+                </section>
+                ${pairHtml()}
+                <section class="candidate-evidence-layout">
+                  <div class="candidate-subpanel"><h3>校验链</h3>${validationChainHtml(state)}</div>
+                  <div class="candidate-subpanel"><h3>LLM 解析</h3>${llmHtml(state)}</div>
+                </section>
+                ${evidenceHtml(state)}
+                <aside class="risk-note">
+                  <strong>组合内执行风险</strong>
+                  <p>两笔订单非原子。若只成交一腿，系统自动补腿或平仓，但预计损失达到 $2.00 即熔断并通知。最终成交结果出来前，不称为“锁定利润”。</p>
+                </aside>
+                ${actionHtml(state)}
+              </div>
+            </details>
+
+            <details class="candidate-disclosure" data-candidate-id="HD-2050">
+              <summary>
+                <span class="candidate-title"><strong>ETH Dec 31 · 阈值覆盖</strong><small>0xe2…100 + 0x83…3d8 · 数据时效 3.2s</small></span>
+                <span class="pill rejected">REJECT</span>
+                <span class="candidate-stat"><span>24h 成交量</span><strong>$92k</strong></span>
+                <span class="candidate-stat"><span>成本 / 最低赔付</span><strong>$9.61 / $10.00</strong></span>
+                <span class="candidate-stat"><span>理论利润</span><strong class="ok">+$0.39</strong></span>
+                <span class="candidate-yield"><small>简单年化</small><strong>15.4%</strong><i aria-hidden="true"></i></span>
+              </summary>
+              <div class="candidate-detail">
+                ${annualizedDetailHtml({cost: "$9.61", profit: "$0.39", days: "96", simpleReturn: "4.06%", annualized: "15.43%"})}
+                <section class="candidate-subpanel">
+                  <div class="detail-heading"><div><h3>历史同类参考</h3><p>经济性成立不代表规则语义通过。</p></div></div>
+                  ${distributionHtml("15.4%", "31%")}
+                </section>
+                <section class="candidate-evidence-layout">
+                  <div class="candidate-subpanel"><h3>校验链</h3>${validationChainHtml("rejected")}</div>
+                  <div class="candidate-subpanel"><h3>LLM 解析</h3>${llmHtml("rejected")}</div>
+                </section>
+                ${actionHtml("rejected")}
+              </div>
+            </details>
+
+            <details class="candidate-disclosure" data-candidate-id="HD-2048">
+              <summary>
+                <span class="candidate-title"><strong>Fed Sep · 区间覆盖</strong><small>0x10…92e + 0xa1…6b2 · 数据时效 5.8s</small></span>
+                <span class="pill pending">PARSING</span>
+                <span class="candidate-stat"><span>24h 成交量</span><strong>$67k</strong></span>
+                <span class="candidate-stat"><span>成本 / 最低赔付</span><strong>$28.40 / $30.00</strong></span>
+                <span class="candidate-stat"><span>理论利润</span><strong class="ok">+$1.60</strong></span>
+                <span class="candidate-yield"><small>简单年化</small><strong>31.6%</strong><i aria-hidden="true"></i></span>
+              </summary>
+              <div class="candidate-detail">
+                ${annualizedDetailHtml({cost: "$28.40", profit: "$1.60", days: "65", simpleReturn: "5.63%", annualized: "31.62%"})}
+                <section class="candidate-subpanel">
+                  <div class="detail-heading"><div><h3>历史同类参考</h3><p>当前只完成经济性计算，尚未形成可执行机会。</p></div></div>
+                  ${distributionHtml("31.6%", "86%")}
+                </section>
+                <section class="candidate-evidence-layout">
+                  <div class="candidate-subpanel"><h3>校验链</h3>${validationChainHtml("scanning")}</div>
+                  <div class="candidate-subpanel"><h3>LLM 解析</h3>${llmHtml("scanning")}</div>
+                </section>
+                ${actionHtml("scanning")}
+              </div>
+            </details>
+          </div>`;
       };
 
       const opportunityHtml = (state, className = "") => `
@@ -948,7 +1185,7 @@
 
       const queueHtml = (state) => `
         <div class="queue-list">
-          <article class="queue-row"><header><strong>#HD-2051 · BTC Sep 30</strong><span class="pill ${state === "rejected" ? "rejected" : "approved"}">${state === "rejected" ? "REJECT" : "APPROVE"}</span></header><p>理论 +$0.54 · 年化 22.8% · 24h $415k</p></article>
+          <article class="queue-row"><header><strong>#HD-2051 · BTC Sep 30</strong><span class="pill ${state === "rejected" ? "rejected" : "approved"}">${state === "rejected" ? "REJECT" : "APPROVE"}</span></header><p>理论 +$0.54 · 年化 21.5% · 24h $415k</p></article>
           <article class="queue-row"><header><strong>#HD-2050 · ETH Dec 31</strong><span class="pill rejected">REJECT</span></header><p>截止时间不一致 · 无操作</p></article>
           <article class="queue-row"><header><strong>#HD-2048 · Fed Sep</strong><span class="pill pending">PARSING</span></header><p>规则解析中 · 2.1s</p></article>
         </div>`;
@@ -984,20 +1221,7 @@
                 ${scannerHtml()}
               </section>
               <section class="panel">
-                <header class="panel-heading"><div><h2>年化收益分布</h2><p>所有发现都展示</p></div></header>
-                ${distributionHtml()}
-              </section>
-            </div>
-            <div class="middle-stack">
-              ${state === "scanning" ? `<section class="panel">${scanningEmptyHtml()}</section>` : opportunityHtml(state)}
-            </div>
-            <div class="panel-stack">
-              <section class="panel">
-                <header class="panel-heading"><div><h2>决策队列</h2><p>系统决定是否放行</p></div></header>
-                ${queueHtml(state)}
-              </section>
-              <section class="panel">
-                <header class="panel-heading"><div><h2>Codex 24h</h2><p>重复规则使用缓存</p></div><span class="pill approved">正常</span></header>
+                <header class="panel-heading"><div><h2>Codex 24h</h2><p>sol · xhigh · fast</p></div><span class="pill approved">正常</span></header>
                 <div class="evidence-chain">
                   <div class="evidence-step done"><span>调用</span><strong>18 次 · 17 成功 · 0 失败</strong></div>
                   <div class="evidence-step done"><span>缓存</span><strong>11 hits · 节省 61%</strong></div>
@@ -1005,6 +1229,12 @@
                 </div>
               </section>
               ${state === "holding" ? `<section class="panel"><header class="panel-heading"><div><h2>未结算组合</h2><p>允许多个并存</p></div><span class="pill neutral">3</span></header>${holdingsHtml()}</section>` : ""}
+            </div>
+            <div class="middle-stack">
+              <section class="panel">
+                <header class="panel-heading"><div><h2>候选标的</h2><p>点击年化查看计算、校验链和 LLM 理由；默认全部隐藏。</p></div><span class="pill neutral">显示 3 / 14</span></header>
+                ${state === "scanning" ? scanningEmptyHtml() : candidateDisclosureHtml(state)}
+              </section>
             </div>
           </div>`;
       }
@@ -1018,7 +1248,7 @@
             <td data-label="24h 成交量">$415k</td>
             <td data-label="成本 / 赔付">$19.46 / $20.00</td>
             <td data-label="理论利润" class="ok">+$0.54</td>
-            <td data-label="年化">22.8%</td>
+            <td data-label="年化">21.5%</td>
             <td data-label="时效">1.4s</td>
           </tr>
           <tr tabindex="0">
@@ -1072,7 +1302,7 @@
                 ${llmHtml(state)}
               </section>
               <section class="panel">
-                <header class="panel-heading"><div><h2>年化收益分布</h2><p>当前 / 7d / 30d</p></div></header>
+                <header class="panel-heading"><div><h2>历史同类参考</h2><p>当前分位 / 7d / 30d</p></div></header>
                 ${distributionHtml()}
               </section>
               ${state === "holding" ? `<section class="panel"><header class="panel-heading"><div><h2>未结算组合</h2></div><span class="pill neutral">3</span></header>${holdingsHtml()}</section>` : ""}
@@ -1108,7 +1338,7 @@
                 ${timelineHtml(state)}
               </section>
               <section class="panel">
-                <header class="panel-heading"><div><h2>年化收益分布</h2></div></header>
+                <header class="panel-heading"><div><h2>历史同类参考</h2></div></header>
                 ${distributionHtml()}
               </section>
               ${state === "holding" ? `<section class="panel"><header class="panel-heading"><div><h2>未结算组合</h2><p>整体风险暂不拦截</p></div><span class="pill neutral">3</span></header>${holdingsHtml()}</section>` : ""}

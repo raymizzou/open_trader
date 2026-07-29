@@ -114,7 +114,7 @@ This remains display-only in the prototype.
 Reload Variant A and rerun:
 
 ```js
-const closed = document.querySelectorAll(".candidate-disclosure:not([open])").length === 1;
+const closed = document.querySelectorAll(".candidate-disclosure:not([open])").length === 3;
 const yieldText = document.querySelector(".candidate-yield")?.textContent.includes("21.5%");
 const oldYieldGone = !document.body.innerText.includes("22.8%");
 const profileVisible = document.body.innerText.includes("sol · xhigh · fast");
