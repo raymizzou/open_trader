@@ -2247,7 +2247,7 @@ def _check_trend_artifact_projection(
             {
                 field: field_value
                 for field, field_value in item.items()
-                if field != "execution"
+                if field not in {"execution", "option_anomaly"}
             }
             for item in projected
         ] == value

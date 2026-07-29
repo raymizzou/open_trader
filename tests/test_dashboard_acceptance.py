@@ -678,6 +678,11 @@ def test_acceptance_uses_dashboard_legacy_holding_phase_projection(
         "hold_actions": [{
             "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
             "phase": "立夏",
+            "option_anomaly": {
+                "available": False,
+                "status": "missing",
+                "reason": "富途未返回该标的期权异动",
+            },
         }],
         "review_actions": [],
         "counts": {"sell": 0, "buy": 0, "hold": 1, "review": 0},
