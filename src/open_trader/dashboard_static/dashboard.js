@@ -3098,7 +3098,16 @@ function trendIndustryBuyContext(report, item) {
 
 function trendIndustryBuyTemperature(report, item) {
   if (hasValue(item?.industry_temperature)) return item.industry_temperature;
-  return trendIndustryContext(report, item)?.temperature;
+  const context = trendIndustryContext(report, item);
+  if (context?.valid !== false) return context?.temperature;
+  const obsoleteReasons = new Set([
+    "component_count_below_10",
+    "valid_count_below_10",
+  ]);
+  const reasons = Array.isArray(context.invalid_reasons)
+    ? context.invalid_reasons : [];
+  return reasons.length > 0 && reasons.every((reason) => obsoleteReasons.has(reason))
+    ? context.temperature : null;
 }
 
 function trendRiskPercent(value) {

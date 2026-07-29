@@ -6051,6 +6051,18 @@ const legacy = renderTrendBuyStage({
   }],
 });
 if (!legacy.includes('data-label="行业温度">热</td>')) throw new Error(legacy);
+const invalid = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[{symbol:"BUY",industry:"金融",industry_tm_id:9}],
+  risk_skips:[],
+  industry_contexts:[{
+    industry_tm_id:9,industry:"金融",temperature:"热",valid:false,
+    invalid_reasons:["snapshot_coverage_below_90pct"],
+  }],
+});
+if (!invalid.includes('data-label="行业温度">数据未提供</td>')) {
+  throw new Error(invalid);
+}
 console.log("ok");
 ''')
 

@@ -9,6 +9,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   context validation, so complete small ETF groups no longer disable industry
   ordering for an entire market. CN/HK/US buy plans now reuse each report's
   frozen industry context when the action row lacks industry temperature.
+  Verified with 1,219 focused tests and offline rebuilds of the latest frozen
+  CN/HK/US evidence; the US two-member healthcare ETF context remains valid and
+  restores industry-first ordering.
 - Allowed an explicitly authorized same-day simulated late buy to bind a
   higher, hash-verified corrective report when the execution batch had already
   frozen a bug-suppressed report. Recovery still requires a prior missed event,
