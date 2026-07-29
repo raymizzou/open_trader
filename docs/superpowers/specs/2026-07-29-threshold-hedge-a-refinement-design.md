@@ -6,6 +6,19 @@ Variant A is the selected direction. Keep the existing Open Trader prediction
 market visual language and replace the always-visible evidence area with
 candidate-level progressive disclosure.
 
+## Strategy navigation
+
+Keep `预测市场` as the primary Open Trader navigation item. Inside that
+workspace, add a two-option strategy switch below the page title:
+
+- `同一市场套利` opens the existing YES/NO arbitrage page;
+- `关联市场套利` opens the threshold-hedge discovery page.
+
+Switching replaces the strategy body without reloading the page. Polymarket
+health, wallet, and trading-readiness status are shared; scanner metrics,
+candidates, and logs belong to the selected strategy. The existing strategy is
+the default, and the selection lasts only for the current page session.
+
 ## Candidate row
 
 Each candidate remains compact and shows:
