@@ -615,16 +615,115 @@ git add src/open_trader/dashboard_web.py src/open_trader/cli.py \
 git commit -m "feat: wire polymarket threshold hedge discovery"
 ```
 
-- [ ] **Step 8: Run the final Dashboard acceptance gate once**
+---
 
-Run:
+### Task 8: Approved Strategy Navigation and Candidate Disclosure
+
+**Files:**
+- Modify: `src/open_trader/polymarket_monitor.py`
+- Modify: `src/open_trader/dashboard_static/dashboard.js`
+- Modify: `src/open_trader/dashboard_static/dashboard.css`
+- Modify: `tests/test_polymarket_monitor.py`
+- Modify: `tests/test_dashboard_web.py`
+- Modify: `tests/e2e/serve_dashboard_fixture.py`
+- Modify: `tests/e2e/prediction-market.spec.ts`
+- Modify: `CHANGELOG.md`
+
+**Interfaces:**
+- Consumes: existing mixed `opportunities`, `relation_discovery`, readiness,
+  execution and history payloads.
+- Produces: a session-only `state.predictionMarket.strategy`, the exact
+  `YES/NO套利` / `LLM对冲套利` switch, and closed threshold-candidate
+  `<details>` whose annualized disclosure uses a decimal ratio correctly.
+
+- [ ] **Step 1: Write failing projection, renderer and browser tests**
+
+Add assertions that:
+
+- threshold rows expose real `resolution_at` and `remaining_days`;
+- domain annualized `0.2155` renders as `21.5%`;
+- production defaults to `YES/NO套利`;
+- clicking `LLM对冲套利` swaps the body without navigation;
+- every positive threshold candidate is present as a closed `<details>`;
+- opening a candidate shows the current calculation, 7d/30d reference, LLM
+  reason/evidence, two conditions and manual-confirmation action;
+- polling preserves the selected strategy and each open candidate key;
+- 1440px, 768px and 375px have no horizontal overflow;
+- rejected/unavailable candidates have no enabled order action;
+- scan logs remain closed by default.
+
+- [ ] **Step 2: Run the new tests and verify RED**
 
 ```bash
-make acceptance
+/Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_polymarket_monitor.py \
+  tests/test_dashboard_web.py -k 'threshold and (annualized or strategy or disclosure)' -q
+npx playwright test tests/e2e/prediction-market.spec.ts \
+  --grep 'LLM hedge strategy'
 ```
 
-Required result: `PASS`. On `FAIL`, fix and rerun. On `BLOCKED`, report the blocker and do not present the task for review.
+Expected: failures because the strategy switch, candidate disclosure,
+remaining-day fields and correct percent conversion do not exist.
 
-- [ ] **Step 9: Redeploy the exact accepted SHA and verify**
+- [ ] **Step 3: Project settlement timing without inventing data**
 
-Restart the Dashboard/monitor from the accepted worktree SHA without source or data changes. Verify new PID, working directory, Git SHA, fresh logs, and HTTP 200 from the review URL. Only then ask the user to review.
+Add `resolution_at` from the certified market end date and compute
+`remaining_days` from the same `now` used by `simple_annualized_yield`.
+Return `None` when the date is missing or not in the future.
+
+- [ ] **Step 4: Add the minimum strategy state and render split**
+
+Default `state.predictionMarket.strategy` to `yes_no`. Reuse the current
+YES/NO renderer with threshold opportunities filtered out. Add one LLM
+workspace that renders all positive threshold rows and the existing
+relation-discovery health/usage/log data. Preserve strategy and open relation
+IDs across every polling render.
+
+- [ ] **Step 5: Render candidate-level annualized disclosure**
+
+Use native `<details>` / `<summary>`. Convert the decimal annualized ratio to
+percent once in `predictionAnnualizedPercent`. Put the calculation,
+distribution, validation evidence, independent order legs and action inside
+the expanded body. Add only the CSS required for the approved desktop/mobile
+hierarchy and 44px controls.
+
+- [ ] **Step 6: Run focused regression and real browser checks**
+
+```bash
+/Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_polymarket_monitor.py \
+  tests/test_dashboard_web.py -q
+npx playwright test tests/e2e/prediction-market.spec.ts
+```
+
+Then open the live fixture at 1440px, 768px and 375px; exercise both strategy
+tabs, APPROVE/REJECT, candidate expansion, confirmation and holding states,
+and verify no browser console errors.
+
+- [ ] **Step 7: Update the operator log and commit**
+
+```bash
+git add src/open_trader/polymarket_monitor.py \
+  src/open_trader/dashboard_static/dashboard.js \
+  src/open_trader/dashboard_static/dashboard.css \
+  tests/test_polymarket_monitor.py tests/test_dashboard_web.py \
+  tests/e2e/serve_dashboard_fixture.py tests/e2e/prediction-market.spec.ts \
+  CHANGELOG.md docs/superpowers/specs/2026-07-29-polymarket-threshold-hedge-design.md \
+  docs/superpowers/plans/2026-07-29-polymarket-threshold-hedge.md
+git commit -m "feat: add LLM hedge strategy workspace"
+```
+
+---
+
+### Task 9: Final Acceptance and Review Deployment
+
+- [ ] **Step 1: Run the final Dashboard acceptance gate**
+
+Run `make acceptance`. Required result: `PASS`. On `FAIL`, fix and rerun. On
+`BLOCKED`, report the blocker and do not present the task for review.
+
+- [ ] **Step 2: Redeploy the exact accepted SHA and verify**
+
+Restart the Dashboard/monitor from the accepted worktree SHA without source or
+data changes. Verify new PID, working directory, Git SHA, fresh logs, and HTTP
+200 from the review URL. Only then ask the user to review.
