@@ -108,6 +108,85 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "breaker": {"open": scenario == "incident", "status": "locked" if scenario == "incident" else "ready"},
         "csrf_token": "fixture-csrf",
     }
+    if scenario == "threshold":
+        approved_threshold = {
+            "opportunity_id": "threshold-approved",
+            "relation_id": "threshold-approved",
+            "event_id": "threshold-event",
+            "market_type": "threshold_hedge",
+            "question_a": "Will Bitcoin be above $100,000 on September 30, 2026?",
+            "question_b": "Will Bitcoin be above $90,000 on September 30, 2026?",
+            "relation": "A_IMPLIES_B",
+            "condition_id_a": "0x7b000000000000000000000000000000000000091a",
+            "condition_id_b": "0xc400000000000000000000000000000000000e02",
+            "buy_legs": [
+                {"label": "A", "outcome": "NO", "condition_id": "0x7b000000000000000000000000000000000000091a", "token_id": "token-a", "quantity": "20", "max_price": "0.42", "max_cost": "8.40"},
+                {"label": "B", "outcome": "YES", "condition_id": "0xc400000000000000000000000000000000000e02", "token_id": "token-b", "quantity": "20", "max_price": "0.55", "max_cost": "11.00"},
+            ],
+            "quantity": "20",
+            "total_max_cost": "19.46",
+            "minimum_payout": "20.00",
+            "minimum_profit": "0.54",
+            "annualized_yield": "0.2155",
+            "remaining_days": "47",
+            "resolution_at": "2026-09-14T00:00:00Z",
+            "volume_24h": "415000",
+            "confirmed_at": "2026-07-29T06:32:05Z",
+            "llm_status": "approved",
+            "llm_decision": "APPROVE",
+            "llm_summary": "高阈值事件蕴含低阈值事件，危险反例被排除。",
+            "llm_reason_codes": [],
+            "llm_evidence": [
+                {"market": "A", "field": "threshold", "quote": "above $100,000"},
+                {"market": "B", "field": "threshold", "quote": "above $90,000"},
+            ],
+            "llm_uncertainties": [],
+            "actionable": True,
+        }
+        rejected_threshold = {
+            **approved_threshold,
+            "opportunity_id": "threshold-rejected",
+            "relation_id": "threshold-rejected",
+            "event_id": "threshold-event-rejected",
+            "question_a": "Will ETH be above $6,000 on December 31, 2026?",
+            "question_b": "Will ETH be above $5,000 on December 31, 2026?",
+            "condition_id_a": "condition-eth-a",
+            "condition_id_b": "condition-eth-b",
+            "buy_legs": [
+                {"label": "A", "outcome": "NO", "condition_id": "condition-eth-a", "token_id": "token-eth-a", "quantity": "20", "max_price": "0.42", "max_cost": "8.40"},
+                {"label": "B", "outcome": "YES", "condition_id": "condition-eth-b", "token_id": "token-eth-b", "quantity": "20", "max_price": "0.55", "max_cost": "11.00"},
+            ],
+            "annualized_yield": "0.154",
+            "volume_24h": "92000",
+            "llm_status": "llm_rejected",
+            "llm_decision": "REJECT",
+            "llm_summary": "两份规则的特殊结算条款不一致。",
+            "llm_reason_codes": ["SPECIAL_SETTLEMENT_MISMATCH"],
+            "llm_evidence": [{"market": "A", "field": "special_settlement", "quote": "50-50"}],
+            "llm_uncertainties": ["特殊结算可能破坏覆盖关系"],
+            "actionable": False,
+        }
+        payload["opportunities"] = [opportunity, approved_threshold, rejected_threshold]
+        payload["relation_discovery"] = {
+            "status": "healthy",
+            "scan_logs": [
+                {"phase": "full_scan", "events": 428, "candidates": 14},
+                {"phase": "books", "positive": 2, "actionable": 1},
+            ],
+            "codex_usage_24h": {
+                "calls": 18,
+                "successes": 17,
+                "failures": 0,
+                "cache_hits": 11,
+                "input_tokens": 41200,
+                "output_tokens": 8600,
+            },
+            "annualized_distribution": {
+                "current": {"count": 2, "median": "0.185", "p90": "0.2155"},
+                "7d": {"count": 86, "median": "0.21", "p90": "0.34"},
+                "30d": {"count": 302, "median": "0.19", "p90": "0.31"},
+            },
+        }
     if scenario == "executing":
         payload["current_execution"] = {"execution_id": "exec-fixture", "status": "reconciling", "event_title": "停火持续至 8 月 31 日？"}
     elif scenario == "success":

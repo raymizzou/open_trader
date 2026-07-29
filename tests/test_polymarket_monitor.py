@@ -488,6 +488,10 @@ def test_threshold_discovery_scans_relation_first_page_and_only_calls_codex_for_
     assert row["actionable"] is True
     assert row["llm_status"] == "approved"
     assert row["annualized_yield"] is not None
+    assert row["resolution_at"] == "2026-12-31T17:00:00Z"
+    assert row["remaining_days"] == Decimal(
+        "157.2083333333333333333333333"
+    )
     assert validator.calls == 1
     subscribed = FakePublicClient.subscribe_specs[-1]
     assert {"yes-low", "no-high"} <= set(subscribed.token_ids)

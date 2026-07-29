@@ -808,6 +808,12 @@ class PolymarketMonitor:
             )
             confirmed_age = _age(now, confirmed_at)
             end_date = _timestamp_or_none(relation.market_b.end_date)
+            remaining_days = (
+                Decimal(str((end_date - now).total_seconds()))
+                / Decimal("86400")
+                if end_date is not None and end_date > now
+                else None
+            )
             annualized = (
                 simple_annualized_yield(
                     candidate,
@@ -857,6 +863,8 @@ class PolymarketMonitor:
                 volume=self._relation_volumes.get(relation.relation_id, Decimal("0")),
                 confirmed_at=confirmed_at,
                 confirmed_age=confirmed_age,
+                resolution_at=relation.market_b.end_date,
+                remaining_days=remaining_days,
                 annualized=annualized,
                 actionable=actionable,
                 eligibility_reason=eligibility_reason,
@@ -905,6 +913,8 @@ class PolymarketMonitor:
         volume: Decimal,
         confirmed_at: datetime,
         confirmed_age: float,
+        resolution_at: str,
+        remaining_days: Decimal | None,
         annualized: Decimal | None,
         actionable: bool,
         eligibility_reason: str,
@@ -947,6 +957,8 @@ class PolymarketMonitor:
             "volume_24h": volume,
             "confirmed_at": confirmed_at,
             "confirmed_age_seconds": confirmed_age,
+            "resolution_at": resolution_at,
+            "remaining_days": remaining_days,
             "profit": candidate.minimum_profit,
             "estimated_profit": candidate.minimum_profit,
             "net_edge": candidate.net_edge,

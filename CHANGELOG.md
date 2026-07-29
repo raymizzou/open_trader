@@ -11,10 +11,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
   validation/cache metrics, truthful rejected/unavailable reasons, separate
   condition BUY/FOK submission and reconciliation, `holding_to_resolution`
   for multiple unresolved combinations, folded in-memory scan logs, and a
-  Dashboard confirmation card that never invokes merge for cross-condition
-  legs. Verified focused discovery, trading, execution, store, monitor, and
-  Dashboard suites; live order submission remains behind the existing explicit
-  preview/confirm gate.
+  Dashboard switch between `YES/NO套利` and `LLM对冲套利`. LLM candidates start
+  folded and disclose their current annualized calculation, historical
+  distribution, structured Codex evidence, independent legs, and
+  confirmation action in place; cross-condition legs never invoke merge.
+  Confirmation now also fails closed against contradictory LLM status,
+  relation/outcome directions, condition/token identities, quantities,
+  economics, or settlement timing, and every blocked candidate keeps its
+  reason visible. Verified 311 focused monitor/Dashboard tests and all 55
+  prediction-market browser scenarios across desktop, tablet, and mobile; live
+  order submission remains behind the existing explicit preview/confirm gate.
 - Allowed an explicitly authorized same-day simulated late buy to bind a
   higher, hash-verified corrective report when the execution batch had already
   frozen a bug-suppressed report. Recovery still requires a prior missed event,

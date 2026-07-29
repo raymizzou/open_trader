@@ -636,7 +636,7 @@ git commit -m "feat: wire polymarket threshold hedge discovery"
   `YES/NO套利` / `LLM对冲套利` switch, and closed threshold-candidate
   `<details>` whose annualized disclosure uses a decimal ratio correctly.
 
-- [ ] **Step 1: Write failing projection, renderer and browser tests**
+- [x] **Step 1: Write failing projection, renderer and browser tests**
 
 Add assertions that:
 
@@ -652,7 +652,7 @@ Add assertions that:
 - rejected/unavailable candidates have no enabled order action;
 - scan logs remain closed by default.
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -665,13 +665,13 @@ npx playwright test tests/e2e/prediction-market.spec.ts \
 Expected: failures because the strategy switch, candidate disclosure,
 remaining-day fields and correct percent conversion do not exist.
 
-- [ ] **Step 3: Project settlement timing without inventing data**
+- [x] **Step 3: Project settlement timing without inventing data**
 
 Add `resolution_at` from the certified market end date and compute
 `remaining_days` from the same `now` used by `simple_annualized_yield`.
 Return `None` when the date is missing or not in the future.
 
-- [ ] **Step 4: Add the minimum strategy state and render split**
+- [x] **Step 4: Add the minimum strategy state and render split**
 
 Default `state.predictionMarket.strategy` to `yes_no`. Reuse the current
 YES/NO renderer with threshold opportunities filtered out. Add one LLM
@@ -679,7 +679,7 @@ workspace that renders all positive threshold rows and the existing
 relation-discovery health/usage/log data. Preserve strategy and open relation
 IDs across every polling render.
 
-- [ ] **Step 5: Render candidate-level annualized disclosure**
+- [x] **Step 5: Render candidate-level annualized disclosure**
 
 Use native `<details>` / `<summary>`. Convert the decimal annualized ratio to
 percent once in `predictionAnnualizedPercent`. Put the calculation,
@@ -687,7 +687,7 @@ distribution, validation evidence, independent order legs and action inside
 the expanded body. Add only the CSS required for the approved desktop/mobile
 hierarchy and 44px controls.
 
-- [ ] **Step 6: Run focused regression and real browser checks**
+- [x] **Step 6: Run focused regression and real browser checks**
 
 ```bash
 /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
@@ -700,7 +700,7 @@ Then open the live fixture at 1440px, 768px and 375px; exercise both strategy
 tabs, APPROVE/REJECT, candidate expansion, confirmation and holding states,
 and verify no browser console errors.
 
-- [ ] **Step 7: Update the operator log and commit**
+- [x] **Step 7: Update the operator log and commit**
 
 ```bash
 git add src/open_trader/polymarket_monitor.py \
