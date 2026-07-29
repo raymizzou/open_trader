@@ -5042,7 +5042,8 @@ class ReadyApi:
         component_id = 1 if tm_id == 622466 else 2
         return [{"tmId": component_id, "tickerSymbol": f"60000{component_id}.SH", "asOfDate": expected_date}]
 
-    def search_exact_symbol(self, symbol: str) -> int:
+    def search_exact_symbol(self, symbol: str, *, market: str) -> int:
+        assert market == "CN"
         self.calls.append(f"api.search.{symbol}")
         if self.holding_error:
             raise self.holding_error
@@ -6813,7 +6814,14 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
     )
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     decision = payload["strategy_judgments"]["holding_decisions"][0]
-    assert (decision["symbol"], decision["action"]) == ("600009", "MANUAL_REVIEW")
+    assert (decision["symbol"], decision["action"], decision["reason"]) == (
+        "600009",
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+    )
+    assert decision["close"] == "10"
+    assert "价格缺失" not in str(payload["risk_summary"]["pause_reason"])
+    assert "futu.kline.SH.600009" in calls
 
     blocked = trend_config(tmp_path / "blocked")
     write_portfolio(blocked.portfolio, [portfolio_row(symbol="600009")])
@@ -6827,6 +6835,43 @@ def test_report_runner_lookup_miss_is_manual_but_transport_failure_blocks(tmp_pa
         notifier=RecordingMacOS(),
     )
     assert blocked_result.status == "failed"
+
+
+def test_report_runner_rejects_cached_holding_symbol_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    write_portfolio(config.portfolio, [portfolio_row(symbol="600009")])
+    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
+    os.utime(config.portfolio, (timestamp, timestamp))
+    calls: list[str] = []
+
+    class MismatchedApi(ReadyApi):
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            rows = super().get_snapshots(**kwargs)
+            for row in rows:
+                if row.get("tmId") == 600009:
+                    row["tickerSymbol"] = "000001.SZ"
+            return rows
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: MismatchedApi(calls),
+        quote_factory=lambda **kwargs: ReadyQuote(calls),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    decision = payload["strategy_judgments"]["holding_decisions"][0]
+    assert (decision["action"], decision["reason"], decision["close"]) == (
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+        "10",
+    )
+    assert "futu.kline.SH.600009" in calls
+    assert "futu.kline.SZ.600009" not in calls
 
 
 def test_report_runner_redacts_api_key_from_all_outputs(tmp_path: Path) -> None:

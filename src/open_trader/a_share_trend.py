@@ -22,7 +22,7 @@ from .daily_premarket import (
     send_notification_with_results,
 )
 from .futu_quote import FutuQuoteClient, FutuQuoteError
-from .futu_symbols import to_futu_symbol
+from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
@@ -5217,7 +5217,9 @@ def _attempt_report(
         holding_ids: dict[str, int] = {}
         for position in account.positions:
             try:
-                holding_ids[position.symbol] = api.search_exact_symbol(position.symbol)
+                holding_ids[position.symbol] = api.search_exact_symbol(
+                    position.symbol, market="CN"
+                )
             except TrendAnimalsLookupError:
                 continue
 
@@ -5315,26 +5317,28 @@ def _attempt_report(
                     ),
                 )
             )
-        for symbol, tm_id in holding_ids.items():
-            row = rows_by_tm_id.get(tm_id)
-            daily_bars = None
+        for position in account.positions:
             try:
-                futu_symbol = to_futu_symbol("CN", symbol)
-                if row is not None:
-                    _, exchange = _symbol_parts(row.get("tickerSymbol"))
-                    futu_symbol = f"{exchange}.{symbol}"
-                daily_bars = quote.get_daily_kline(
-                    futu_symbol, start=kline_start, end=run_date
+                bars_by_symbol[position.symbol] = quote.get_daily_kline(
+                    to_futu_symbol("CN", position.symbol),
+                    start=kline_start,
+                    end=run_date,
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
-                daily_bars = None
+                bars_by_symbol[position.symbol] = None
             except ValueError:
-                daily_bars = None
-            bars_by_symbol[symbol] = daily_bars
+                bars_by_symbol[position.symbol] = None
+        for symbol, tm_id in holding_ids.items():
+            row = rows_by_tm_id.get(tm_id)
+            daily_bars = bars_by_symbol[symbol]
             if row is not None:
                 try:
+                    if from_trend_animals_symbol(
+                        "CN", str(row.get("tickerSymbol") or "")
+                    ) != to_futu_symbol("CN", symbol):
+                        continue
                     holding_snapshots[symbol] = _holding_snapshot(
                         row,
                         industry_temperature=industry_temperatures.get(
