@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Corrected the shared CN/HK/US Trend Animals-to-Futu symbol mapping, including
+  four-digit Hong Kong provider codes, and made every simulated holding's Futu
+  daily price refresh independent from provider lookup success. Mapping failures
+  now remain explicit manual-review signals and no longer masquerade as missing
+  prices or pause otherwise eligible simulated entries. Verified 566 focused
+  symbol, provider-client, three-market report, and risk regression tests.
 - Allowed a same-date trend-report revision to enrich legacy industry history
   with the newly available right-side count and market-cap ratios, while still
   rejecting any change to previously recorded industry facts; frozen-evidence
