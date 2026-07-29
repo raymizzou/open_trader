@@ -3792,6 +3792,189 @@ def test_action_audit_rejects_event_before_bound_late_authorization(
         )
 
 
+def _corrected_report_late_buy_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, object], FakeTrendSimClient]:
+    original = report_with_actions([])
+    original_path = tmp_path / "reports/2026-07-16.json"
+    original_path.parent.mkdir(parents=True)
+    original_path.write_text(json.dumps(original), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=original_path,
+        report=original,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
+
+    corrected = cn_buy_report()
+    corrected.update(
+        {
+            "as_of_date": "2026-07-16",
+            "execution_date": "2026-07-17",
+            "process_version": "a" * 40,
+        }
+    )
+    corrected_path = tmp_path / "reports/2026-07-16-r1.json"
+    corrected_path.write_text(json.dumps(corrected), encoding="utf-8")
+    client = FakeTrendSimClient()
+    missed = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=corrected,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:01:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+    assert missed["submitted_count"] == 0
+    assert list(
+        tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-17/*/*.json"
+        )
+    )
+    authorization = (
+        tmp_path
+        / "trend_controller/CN/late_buy_authorizations/2026-07-17.json"
+    )
+    trend_review._write_immutable(
+        authorization,
+        trend_review._canonical_json_bytes(
+            {
+                "schema_version":
+                    "open_trader.trend_controller.late_buy_authorization.v1",
+                "market": "CN",
+                "as_of_date": "2026-07-16",
+                "execution_date": "2026-07-17",
+                "report_path": str(corrected_path),
+                "report_sha256": trend_review._report_hash(corrected),
+                "actor": "ray",
+                "reason": "recover buy suppressed by corrected report bug",
+                "authorized_at": "2026-07-17T10:02:00+08:00",
+            }
+        ),
+    )
+    return corrected, client
+
+
+def test_corrected_report_late_buy_waits_for_open_market(
+    tmp_path: Path,
+) -> None:
+    corrected, client = _corrected_report_late_buy_fixture(tmp_path)
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=corrected,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T12:30:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["status"] == "missed_window"
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+
+
+def test_corrected_report_late_buy_submits_and_audits_at_open_market(
+    tmp_path: Path,
+) -> None:
+    corrected, client = _corrected_report_late_buy_fixture(tmp_path)
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=corrected,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T13:01:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+    events, _ = trend_review.load_trend_action_audit(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        symbol="600001",
+        side="buy",
+    )
+    intent_path = next(
+        tmp_path.glob("trend_review/ledgers/CN/open/2026-07-17/*-intent.json")
+    )
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+
+    assert result["status"] == "submitted"
+    assert result["submitted_count"] == 1
+    assert len(client.requests) == 1
+    assert intent["report_sha256"] == trend_review._report_hash(corrected)
+    assert [event["status"] for event in events] == ["missed", "submitted"]
+
+
+def test_corrected_report_authorization_rejects_buy_already_in_locked_report(
+    tmp_path: Path,
+) -> None:
+    original = cn_buy_report()
+    original_path = tmp_path / "reports/2026-07-16.json"
+    original_path.parent.mkdir(parents=True)
+    original_path.write_text(json.dumps(original), encoding="utf-8")
+    trend_review.lock_trend_execution_batch(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-17",
+        report_path=original_path,
+        report=original,
+        locked_at="2026-07-17T09:30:00+08:00",
+    )
+    trend_review.record_trend_review_missed_buys(
+        data_dir=tmp_path,
+        report=original,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:01:00+08:00",
+    )
+    corrected = {
+        **cn_buy_report(),
+        "as_of_date": "2026-07-16",
+        "execution_date": "2026-07-17",
+        "process_version": "a" * 40,
+    }
+    corrected_path = tmp_path / "reports/2026-07-16-r1.json"
+    corrected_path.write_text(json.dumps(corrected), encoding="utf-8")
+    authorization = (
+        tmp_path
+        / "trend_controller/CN/late_buy_authorizations/2026-07-17.json"
+    )
+    trend_review._write_immutable(
+        authorization,
+        trend_review._canonical_json_bytes(
+            {
+                "schema_version":
+                    "open_trader.trend_controller.late_buy_authorization.v1",
+                "market": "CN",
+                "as_of_date": "2026-07-16",
+                "execution_date": "2026-07-17",
+                "report_path": str(corrected_path),
+                "report_sha256": trend_review._report_hash(corrected),
+                "actor": "ray",
+                "reason": "invalid attempt to replace an ordinary missed buy",
+                "authorized_at": "2026-07-17T10:02:00+08:00",
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid late buy authorization"):
+        trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=corrected,
+            client=FakeTrendSimClient(),
+            market="CN",
+            execution_date="2026-07-17",
+            now="2026-07-17T13:01:00+08:00",
+            quote_prices=TEST_QUOTE_PRICES,
+        )
+
+
 def test_report_revision_does_not_duplicate_existing_symbol_intent(
     tmp_path: Path,
 ) -> None:

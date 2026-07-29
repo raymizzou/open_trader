@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-29
 
+- Allowed an explicitly authorized same-day simulated late buy to bind a
+  higher, hash-verified corrective report when the execution batch had already
+  frozen a bug-suppressed report. Recovery still requires a prior missed event,
+  an open market, a new action absent from the locked report, immutable order
+  evidence, and normal Kelly attribution. Verified the full trend-review suite.
 - Prevented standalone protection-line full exits from entering the legacy 30%
   overheat-trim lifecycle rebuild. A valid protection sell can no longer block
   a later US trend report merely because the day's frozen report had no formal

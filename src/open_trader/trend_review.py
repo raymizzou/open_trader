@@ -1442,6 +1442,121 @@ def _action_resolutions(
     return resolutions
 
 
+def _report_revision(path: Path, as_of_date: str) -> int:
+    if path.stem == as_of_date:
+        return 0
+    prefix = f"{as_of_date}-r"
+    suffix = path.stem.removeprefix(prefix)
+    if (
+        not path.stem.startswith(prefix)
+        or not suffix.isdigit()
+        or int(suffix) <= 0
+    ):
+        raise ValueError("invalid corrected trend report revision")
+    return int(suffix)
+
+
+def _late_buy_authorization_context(
+    data_dir: Path,
+    *,
+    market: str,
+    execution_date: str,
+    report_sha: str,
+) -> tuple[dict[str, object], dict[str, object], Mapping[str, object]] | None:
+    path = (
+        data_dir
+        / "trend_controller"
+        / market
+        / "late_buy_authorizations"
+        / f"{execution_date}.json"
+    )
+    if not path.exists():
+        return None
+    batch_path = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "batches"
+        / f"{execution_date}.json"
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        batch = _validate_execution_batch(
+            json.loads(batch_path.read_text(encoding="utf-8")),
+            market=market,
+            execution_date=execution_date,
+        )
+        as_of_date = date.fromisoformat(str(payload["as_of_date"])).isoformat()
+        execution_day = date.fromisoformat(execution_date)
+        authorized_at = datetime.fromisoformat(str(payload["authorized_at"]))
+        report_path = Path(str(payload["report_path"]))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        batch_report_path = Path(str(batch["report_path"]))
+        batch_report = json.loads(batch_report_path.read_text(encoding="utf-8"))
+        if not isinstance(report, Mapping) or not isinstance(
+            batch_report, Mapping
+        ):
+            raise ValueError("trend report must be a JSON object")
+        corrected = (
+            payload.get("report_path") != batch["report_path"]
+            or payload.get("report_sha256") != batch["report_sha256"]
+        )
+        process_version = str(report.get("process_version") or "")
+        valid_correction = (
+            report_path.resolve().parent == batch_report_path.resolve().parent
+            and _report_revision(report_path, as_of_date)
+            > _report_revision(batch_report_path, as_of_date)
+            and report.get("as_of_date") == as_of_date
+            and report.get("execution_date") == execution_date
+            and len(process_version) == 40
+            and all(
+                character in "0123456789abcdef"
+                for character in process_version
+            )
+        )
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(f"invalid late buy authorization: {path}") from exc
+    actor = payload.get("actor")
+    reason = payload.get("reason")
+    window_end = time(16) if market == "US" else time(10)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != "open_trader.trend_controller.late_buy_authorization.v1"
+        or payload.get("market") != market
+        or payload.get("execution_date") != execution_date
+        or _report_hash(report) != payload.get("report_sha256")
+        or _report_hash(batch_report) != batch["report_sha256"]
+        or (corrected and not valid_correction)
+        or not isinstance(actor, str)
+        or not actor
+        or actor != actor.strip()
+        or not isinstance(reason, str)
+        or not reason
+        or reason != reason.strip()
+        or date.fromisoformat(as_of_date) >= execution_day
+        or authorized_at.tzinfo is None
+        or authorized_at.utcoffset() is None
+        or payload.get("authorized_at")
+        != authorized_at.isoformat(timespec="seconds")
+        or authorized_at.astimezone(MARKET_TIMEZONES[market]).date()
+        != execution_day
+        or authorized_at.astimezone(MARKET_TIMEZONES[market]).time() <= window_end
+    ):
+        raise ValueError(f"invalid late buy authorization: {path}")
+    if payload["report_sha256"] != report_sha:
+        return None
+    return payload, batch, report
+
+
 def _locked_action_context(
     data_dir: Path,
     *,
@@ -1449,6 +1564,7 @@ def _locked_action_context(
     execution_date: str,
     symbol: str,
     side: str,
+    report_sha_hint: str | None = None,
 ) -> tuple[str, int, Mapping[str, object], str]:
     batch_path = (
         data_dir
@@ -1472,6 +1588,26 @@ def _locked_action_context(
         or _report_hash(report) != batch["report_sha256"]
     ):
         raise ValueError(f"invalid trend execution batch: {batch_path}")
+    if report_sha_hint is not None and report_sha_hint != batch["report_sha256"]:
+        if side != "buy":
+            raise ValueError("invalid trend action identity")
+        authorization = _late_buy_authorization_context(
+            data_dir,
+            market=market,
+            execution_date=execution_date,
+            report_sha=report_sha_hint,
+        )
+        if authorization is None:
+            raise ValueError("invalid trend action identity")
+        _, _, authorized_report = authorization
+        original_actions, _ = _preflight_open_actions(report, market)
+        if any(
+            action.get("action") == "BUY"
+            and str(action.get("symbol") or "").strip() == symbol
+            for action in original_actions
+        ):
+            raise ValueError("invalid trend action identity")
+        report = authorized_report
     actions, strategy_version = _preflight_open_actions(report, market)
     expected_actions = {"BUY"} if side == "buy" else {"SELL_ALL", "SELL_PARTIAL"}
     matches = [
@@ -1483,7 +1619,7 @@ def _locked_action_context(
     if len(matches) != 1:
         raise ValueError("invalid trend action identity")
     index, action = matches[0]
-    return str(batch["report_sha256"]), index, action, strategy_version
+    return _report_hash(report), index, action, strategy_version
 
 
 def _valid_late_buy_authorization(
@@ -1492,11 +1628,12 @@ def _valid_late_buy_authorization(
     market: str,
     execution_date: str,
     report_sha: str,
+    symbol: str,
     events: Sequence[Mapping[str, object]],
     facts: Sequence[tuple[Path, dict[str, object], dict[str, object], int]],
 ) -> bool:
     missed = [event for event in events if event.get("status") == "missed"]
-    if not missed or not facts:
+    if not missed:
         return False
     path = (
         data_dir
@@ -1507,25 +1644,38 @@ def _valid_late_buy_authorization(
     )
     if not path.exists():
         return False
-    # Authorization is report-scoped; the frozen report hash binds it to every buy.
-    batch_path = (
-        data_dir
-        / "trend_review"
-        / "ledgers"
-        / market
-        / "batches"
-        / f"{execution_date}.json"
-    )
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        batch = _validate_execution_batch(
-            json.loads(batch_path.read_text(encoding="utf-8")),
+        authorization = _late_buy_authorization_context(
+            data_dir,
             market=market,
             execution_date=execution_date,
+            report_sha=report_sha,
         )
-        as_of_date = date.fromisoformat(str(payload["as_of_date"]))
-        execution_day = date.fromisoformat(execution_date)
+        if authorization is None:
+            return False
+        payload, batch, report = authorization
         authorized_at = datetime.fromisoformat(str(payload["authorized_at"]))
+        batch_report = json.loads(
+            Path(str(batch["report_path"])).read_text(encoding="utf-8")
+        )
+        if report_sha != batch["report_sha256"]:
+            original_actions, _ = _preflight_open_actions(batch_report, market)
+            if any(
+                action.get("action") == "BUY"
+                and str(action.get("symbol") or "").strip() == symbol
+                for action in original_actions
+            ):
+                raise ValueError(f"invalid late buy authorization: {path}")
+        authorized_actions, _ = _preflight_open_actions(report, market)
+        if (
+            sum(
+                action.get("action") == "BUY"
+                and str(action.get("symbol") or "").strip() == symbol
+                for action in authorized_actions
+            )
+            != 1
+        ):
+            raise ValueError(f"invalid late buy authorization: {path}")
         missed_at = [
             datetime.fromisoformat(str(event["recorded_at"])) for event in missed
         ]
@@ -1589,33 +1739,8 @@ def _valid_late_buy_authorization(
         ValueError,
     ) as exc:
         raise ValueError(f"invalid late buy authorization: {path}") from exc
-    actor = payload.get("actor")
-    reason = payload.get("reason")
-    window_end = time(16) if market == "US" else time(10)
     if (
-        not isinstance(payload, Mapping)
-        or payload.get("schema_version")
-        != "open_trader.trend_controller.late_buy_authorization.v1"
-        or payload.get("market") != market
-        or payload.get("execution_date") != execution_date
-        or payload.get("report_path") != batch["report_path"]
-        or payload.get("report_sha256") != report_sha
-        or payload.get("report_sha256") != batch["report_sha256"]
-        or not isinstance(actor, str)
-        or not actor
-        or actor != actor.strip()
-        or not isinstance(reason, str)
-        or not reason
-        or reason != reason.strip()
-        or as_of_date >= execution_day
-        or authorized_at.tzinfo is None
-        or authorized_at.utcoffset() is None
-        or payload.get("authorized_at")
-        != authorized_at.isoformat(timespec="seconds")
-        or authorized_at.astimezone(MARKET_TIMEZONES[market]).date()
-        != execution_day
-        or authorized_at.astimezone(MARKET_TIMEZONES[market]).time() <= window_end
-        or any(item.tzinfo is None or item.utcoffset() is None for item in missed_at)
+        any(item.tzinfo is None or item.utcoffset() is None for item in missed_at)
         or any(item > authorized_at for item in missed_at)
         or any(item.tzinfo is None or item.utcoffset() is None for item in fact_times)
         or any(item < authorized_at for item in fact_times)
@@ -2010,12 +2135,30 @@ def load_trend_action_audit(
                 )
             ):
                 raise ValueError("invalid trend action event evidence")
+    report_sha_hints = {
+        str(value)
+        for value in (
+            *(
+                fact.get("report_sha256")
+                for _, fact, _, _ in facts
+            ),
+            *(event.get("report_sha256") for event in events),
+        )
+        if value not in {None, ""}
+    }
+    if side == "buy" and len(report_sha_hints) > 1:
+        raise ValueError("invalid trend action event identity")
     report_sha, action_index, action, strategy_version = _locked_action_context(
         data_dir,
         market=market,
         execution_date=execution_date,
         symbol=symbol,
         side=side,
+        report_sha_hint=(
+            next(iter(report_sha_hints))
+            if side == "buy" and report_sha_hints
+            else None
+        ),
     )
     below_lot_events = [
         event for event in events if event.get("status") == "below_lot"
@@ -2111,6 +2254,7 @@ def load_trend_action_audit(
         market=market,
         execution_date=execution_date,
         report_sha=report_sha,
+        symbol=symbol,
         events=events,
         facts=facts,
     )
@@ -3065,6 +3209,19 @@ def execute_trend_review_open(
             / action_key
         )
         action_facts = _action_facts(root, futu_code=futu_code, side=side)
+        late_buy_authorized = (
+            action_name == "BUY"
+            and _valid_late_buy_authorization(
+                data_dir,
+                market=market,
+                execution_date=execution_date,
+                report_sha=report_sha,
+                symbol=symbol,
+                events=_action_events(action_events_root),
+                facts=action_facts,
+            )
+        )
+        late_buy_ready = late_buy_authorized and same_day and market_open
         sell_metadata: dict[str, object] = (
             {"sell_goal": "position_zero"}
             if action_name == "SELL_ALL"
@@ -3308,7 +3465,12 @@ def execute_trend_review_open(
             continue
         if action_name == "BUY" and futu_code in sell_symbols:
             continue
-        if action_name == "BUY" and not action_facts and buy_window_event:
+        if (
+            action_name == "BUY"
+            and not action_facts
+            and buy_window_event
+            and not late_buy_ready
+        ):
             event_status, event_reason = buy_window_event
             _write_action_status_once(
                 data_dir=data_dir,
@@ -3747,7 +3909,11 @@ def execute_trend_review_open(
                     and latest_attempt not in authorized_attempts
                 ):
                     continue
-                if action_name == "BUY" and buy_window_event:
+                if (
+                    action_name == "BUY"
+                    and buy_window_event
+                    and not late_buy_ready
+                ):
                     event_status, event_reason = buy_window_event
                     _write_action_status_once(
                         data_dir=data_dir,
