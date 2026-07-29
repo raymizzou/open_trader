@@ -3514,6 +3514,7 @@ function renderTrendSellOrHoldStage(title, items, kind, report) {
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const headings = [
     "标的", "动作", "执行参考价", "温度变化", "节气", "强度",
+    ...(kind === "hold" ? ["行业"] : []),
     reasonHeading, "活动保护线", "持仓提示",
   ];
   const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
@@ -3523,6 +3524,7 @@ function renderTrendSellOrHoldStage(title, items, kind, report) {
     ${renderTrendCell("温度变化", trendTemperature(item))}
     ${renderTrendCell("节气", item.phase)}
     ${renderTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : null)}
+    ${kind === "hold" ? renderTrendCell("行业", item.industry) : ""}
     ${renderTrendCell(reasonHeading, trendReasonLabel(item, report))}
     ${renderTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : null)}
     ${renderTrendCell("持仓提示", trendHints(item))}

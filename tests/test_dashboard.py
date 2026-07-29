@@ -2419,6 +2419,111 @@ def test_dashboard_holding_phase_projection_uses_frozen_snapshot() -> None:
     assert holds[0]["phase"] == "立夏"
 
 
+@pytest.mark.parametrize("market", ["CN", "HK", "US"])
+def test_dashboard_projects_holdings_with_frozen_industry_order(
+    market: str,
+) -> None:
+    payload = {
+        "metadata": {"market": market},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [
+                {"action": "HOLD", "symbol": "MED", "strength": "95", "reason": "trend_intact"},
+                {"action": "HOLD", "symbol": "FIN", "strength": "80", "reason": "trend_intact"},
+            ],
+        },
+        "signal_snapshots": {
+            "holdings": {
+                "MED": {"industry": "医疗保健", "industry_tm_id": 1, "days": 7},
+                "FIN": {"industry": "金融", "industry_tm_id": 2, "days": 8},
+            },
+        },
+        "industry_contexts": [
+            {
+                "industry_tm_id": 1,
+                "industry": "医疗保健",
+                "temperature": "温",
+                "strength": "90",
+                "warm_to_hot_count": 8,
+                "right_share": "0.19",
+                "valid": True,
+                "prior_as_of_date": "2026-07-21",
+                "prior_temperature": "温",
+                "prior_right_share": "0.18",
+                "temperature_direction": "unchanged",
+                "right_share_change_pp": "1",
+            },
+            {
+                "industry_tm_id": 2,
+                "industry": "金融",
+                "temperature": "热",
+                "strength": "100",
+                "warm_to_hot_count": 11,
+                "right_share": "0.25",
+                "valid": True,
+                "prior_as_of_date": "2026-07-21",
+                "prior_temperature": "温",
+                "prior_right_share": "0.22",
+                "temperature_direction": "rising",
+                "right_share_change_pp": "3",
+            },
+        ],
+    }
+    original_payload = copy.deepcopy(payload)
+
+    _, _, holds, _ = dashboard_module._project_trend_actions(payload, {})
+
+    assert [item["symbol"] for item in holds] == ["FIN", "MED"]
+    assert holds[0]["industry"] == "金融"
+    assert holds[0]["industry_tm_id"] == 2
+    assert holds[0]["days"] == 8
+    assert payload == original_payload
+
+
+def test_dashboard_falls_back_to_individual_holding_order_for_invalid_context() -> None:
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [
+                {"action": "HOLD", "symbol": "FIN", "strength": "80", "reason": "trend_intact"},
+                {"action": "HOLD", "symbol": "MED", "strength": "95", "reason": "trend_intact"},
+            ],
+        },
+        "signal_snapshots": {
+            "holdings": {
+                "FIN": {"industry": "金融", "industry_tm_id": 2, "days": 8},
+                "MED": {"industry": "医疗保健", "industry_tm_id": 1, "days": 7},
+            },
+        },
+        "industry_contexts": [
+            {
+                "industry_tm_id": 2,
+                "industry": "金融",
+                "temperature": "热",
+                "strength": "100",
+                "warm_to_hot_count": 11,
+                "right_share": "0.25",
+                "valid": False,
+                "invalid_reasons": ["context_invalid"],
+            },
+            {
+                "industry_tm_id": 1,
+                "industry": "医疗保健",
+                "temperature": "平",
+                "strength": "10",
+                "warm_to_hot_count": 0,
+                "right_share": "0.05",
+                "valid": True,
+            },
+        ],
+    }
+
+    _, _, holds, _ = dashboard_module._project_trend_actions(payload, {})
+
+    assert [item["symbol"] for item in holds] == ["MED", "FIN"]
+
+
 def test_dashboard_preserves_frozen_trend_cny_money_fields() -> None:
     payload = {
         "metadata": {"market": "US"},

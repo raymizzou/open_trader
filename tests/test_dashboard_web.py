@@ -6214,7 +6214,7 @@ const base = (market) => ({
   counts:{sell:1,buy:1,hold:1,review:1}, audit:{},
   sell_actions:[{symbol:"SELL",name:"卖出",close:"9.13",temperature_prev:"热",temperature_curr:"热",phase:"立夏",strength:"98.5",reason:"danger_signal",active_line:"8.42",entry_hints:[]}],
   buy_actions:[{symbol:"BUY",name:"买入",filter_price:"9.60",close:"9.13",temperature_prev:"温",temperature_curr:"热",phase:"立夏",strength:"99.1",industry:"银行",industry_temperature:"热",market_cap:"180",amount:"6",target_weight:"0.04",target_amount:"1000",estimated_shares:100,estimated_initial_line:"8.42"}],
-  hold_actions:[{symbol:"HOLD",name:"持仓",close:"9.13",temperature_prev:"热",temperature_curr:"热",phase:"立夏",strength:"98.5",reason:"trend_intact",active_line:"8.42",entry_hints:[]}],
+  hold_actions:[{symbol:"HOLD",name:"持仓",close:"9.13",temperature_prev:"热",temperature_curr:"热",phase:"立夏",strength:"98.5",industry:"金融",reason:"trend_intact",active_line:"8.42",entry_hints:[]}],
   review_actions:[{symbol:"REVIEW",name:"复核",close:null,temperature_prev:null,temperature_curr:null,phase:null,strength:null,reason:"holding_signal_unknown",active_line:null,entry_hints:[]}],
 });
 const sectionHeaders = (html, marker) => {
@@ -6226,7 +6226,7 @@ const sectionHeaders = (html, marker) => {
 };
 const expectedBuy = ["标的", "动作", "筛选价（Trend Animals）", "执行参考价", "温度变化", "节气", "强度", "行业", "行业温度", "行业确认", "市值（亿元）", "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线"];
 const expectedSell = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "触发原因", "活动保护线", "持仓提示"];
-const expectedHold = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "当前判断", "活动保护线", "持仓提示"];
+const expectedHold = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业", "当前判断", "活动保护线", "持仓提示"];
 const expectedReview = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "复核原因", "活动保护线", "持仓提示"];
 for (const market of ["CN", "US", "HK"]) {
   const html = renderTrendReportWorkspace(base(market));
@@ -6242,6 +6242,7 @@ for (const market of ["CN", "US", "HK"]) {
   for (const text of ["温 → 热", "立夏", "数据未提供"]) {
     if (!html.includes(text)) throw new Error(market + " missing " + text);
   }
+  if (!html.includes('data-label="行业">金融</td>')) throw new Error(market + " missing holding industry");
   if (html.includes("执行参考价（Futu 前复权）")) throw new Error(market + " retained market-specific price heading");
 }
 console.log("ok");

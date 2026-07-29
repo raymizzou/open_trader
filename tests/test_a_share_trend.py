@@ -366,6 +366,7 @@ def holding(
     temperature_prev: str | None = "温",
     temperature_curr: str | None = "热",
     phase: str | None = "立夏",
+    days: int | None = None,
 ) -> HoldingSnapshot:
     return HoldingSnapshot(
         tm_id=int(symbol),
@@ -386,6 +387,7 @@ def holding(
         temperature_prev=temperature_prev,
         temperature_curr=temperature_curr,
         phase=phase,
+        days=days,
     )
 
 
@@ -4781,7 +4783,7 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         generated_at="2026-07-14T17:00:01+08:00",
         account=account("600009"),
         candidates=(candidate("600001", danger=True),),
-        holding_snapshots={"600009": replace(holding("600009"), boiling=None)},
+        holding_snapshots={"600009": replace(holding("600009"), boiling=None, days=3)},
         bars_by_symbol={"600009": bars()},
         metadata={
             "paid_response_cache": {
@@ -4817,6 +4819,7 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "temperature_prev": "温",
         "temperature_curr": "热",
         "phase": "立夏",
+        "days": 3,
         "gain_since_entry": None,
         "phase_prev": None,
         "phase_curr": None,

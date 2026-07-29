@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-07-30
+
+- Corrected the CN/HK/US Dashboard `盘中持续 · 已有持仓` projection: holding
+  rows now recover industry and available right-side days from frozen snapshots,
+  show the shared `行业` column, and use the frozen industry-first discipline
+  order. Invalid or missing industry context falls back to individual ordering;
+  the source report payload remains unchanged. Verified the affected suites
+  with 946 passed tests.
+
 ## 2026-07-29
 
 - Removed the local 10-component and 10-valid-row minimums from trend industry

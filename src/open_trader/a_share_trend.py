@@ -3248,6 +3248,7 @@ def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
         "industry_temperature": item.industry_temperature,
         "filter_price": item.filter_price,
         "market_cap": item.market_cap,
+        "days": item.days,
         "strength": item.strength,
         "temperature_prev": item.temperature_prev,
         "temperature_curr": item.temperature_curr,
@@ -3255,7 +3256,7 @@ def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
         **_paid_expansion_signal(item),
     }
     if market.upper() in {"US", "HK"}:
-        signal.update(name=item.name, days=item.days)
+        signal.update(name=item.name)
     return signal
 
 
