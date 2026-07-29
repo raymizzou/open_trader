@@ -285,6 +285,7 @@ function bindEvents() {
   elements["account-tabs"].addEventListener("keydown", handleBrokerTabKeydown);
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
+    if (handleTrendOptionDialog(event)) return;
     const industryMetric = event.target.closest?.("[data-trend-industry-help]");
     if (industryMetric) {
       if (industryMetric.dataset.trendIndustryHelpOpen === "pinned") {
@@ -394,6 +395,7 @@ function bindEvents() {
   elements["open-kelly-lab"].addEventListener("click", () => setWorkspaceView("kelly_lab"));
   elements["return-to-portfolio"].addEventListener("click", returnToPortfolio);
   elements["trend-report-workspace"].addEventListener("click", (event) => {
+    if (handleTrendOptionDialog(event)) return;
     if (event.target.closest("[data-close-trend-report]")) returnToPortfolio();
   });
   elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
@@ -3047,6 +3049,77 @@ function trendIdentity(item) {
   return identity || null;
 }
 
+function renderTrendOptionDialog(item, anomaly) {
+  const identity = trendIdentity(item) || "数据未提供";
+  const categories = Array.isArray(anomaly.categories)
+    ? anomaly.categories.filter((category) => category && typeof category === "object" && !Array.isArray(category))
+    : [];
+  const categoryRows = categories.length
+    ? categories.map((category) => `
+      <article class="trend-option-dialog-category">
+        <header><strong>${escapeHtml(formatPlain(category.name || "缺失"))}</strong><span>${escapeHtml(translateFutuSignalValue(category.direction || category.state))}</span></header>
+        <dl>
+          <div><dt>状态</dt><dd>${escapeHtml(translateFutuSignalValue(category.state))}</dd></div>
+          <div><dt>方向</dt><dd>${escapeHtml(translateFutuSignalValue(category.direction))}</dd></div>
+          <div><dt>详情</dt><dd>${escapeHtml(formatPlain(category.detail || "缺失"))}</dd></div>
+          <div><dt>证据日期</dt><dd>${escapeHtml(formatPlain(category.evidence_date || "数据未提供"))}</dd></div>
+        </dl>
+      </article>`).join("")
+    : `<p class="trend-option-dialog-empty">未找到可展示的结构化类别。</p>`;
+  const windowDays = hasValue(anomaly.window_days)
+    ? `${formatPlain(anomaly.window_days)} 天`
+    : "数据未提供";
+  return `<dialog class="trend-option-dialog">
+    <header class="trend-option-dialog-header">
+      <div><p>富途期权异动</p><h3>${escapeHtml(identity)}</h3></div>
+      <button type="button" data-option-anomaly-close aria-label="关闭期权异动详情">×</button>
+    </header>
+    <dl class="trend-option-dialog-meta">
+      <div><dt>数据源</dt><dd>富途</dd></div>
+      <div><dt>标的</dt><dd>${escapeHtml(identity)}</dd></div>
+      <div><dt>运行日期</dt><dd>${escapeHtml(formatPlain(anomaly.run_date || "数据未提供"))}</dd></div>
+      <div><dt>观察窗口</dt><dd>${escapeHtml(windowDays)}</dd></div>
+    </dl>
+    <section class="trend-option-dialog-summary"><h4>摘要</h4><p>${escapeHtml(formatPlain(anomaly.summary || "数据未提供"))}</p></section>
+    <dl class="trend-option-dialog-signal">
+      <div><dt>信号</dt><dd>${escapeHtml(translateFutuSignalValue(anomaly.signal))}</dd></div>
+      <div><dt>置信度</dt><dd>${escapeHtml(translateFutuSignalValue(anomaly.confidence))}</dd></div>
+      <div><dt>建议约束</dt><dd>${escapeHtml(translateFutuSignalValue(anomaly.suggested_constraint))}</dd></div>
+    </dl>
+    <section class="trend-option-dialog-categories"><h4>异动类别</h4><div>${categoryRows}</div></section>
+    <footer><button type="button" data-option-anomaly-close>关闭</button></footer>
+  </dialog>`;
+}
+
+function renderTrendOptionIdentityCell(item) {
+  const anomaly = item?.option_anomaly && typeof item.option_anomaly === "object"
+    ? item.option_anomaly : {};
+  const identity = escapeHtml(trendIdentity(item) || "数据未提供");
+  const reason = hasValue(anomaly.reason)
+    ? formatPlain(anomaly.reason)
+    : "富途未返回该标的期权异动";
+  const available = anomaly.available === true;
+  const button = available
+    ? `<button class="trend-option-button" type="button" data-option-anomaly-open aria-haspopup="dialog">期权异动</button>`
+    : `<button class="trend-option-button" type="button" disabled title="${escapeHtml(reason)}" aria-label="期权异动不可用：${escapeHtml(reason)}">期权异动</button>`;
+  return `<td data-label="标的"><strong>${identity}</strong>${button}${available ? renderTrendOptionDialog(item, anomaly) : ""}</td>`;
+}
+
+function handleTrendOptionDialog(event) {
+  const target = event?.target;
+  const close = target?.closest?.("[data-option-anomaly-close]");
+  if (close) {
+    const dialog = close.closest("dialog");
+    if (typeof dialog?.close === "function") dialog.close();
+    return true;
+  }
+  const open = target?.closest?.("[data-option-anomaly-open]");
+  if (!open) return false;
+  const dialog = open.parentElement?.querySelector("dialog.trend-option-dialog");
+  if (typeof dialog?.showModal === "function") dialog.showModal();
+  return true;
+}
+
 function trendHints(item) {
   return Array.isArray(item?.entry_hints) && item.entry_hints.length
     ? item.entry_hints.map(formatPlain).join("；")
@@ -3244,12 +3317,13 @@ function syncCnTrendBuyAccessibility() {
 function renderTrendSellOrHoldStage(title, items, kind, report) {
   const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
+  const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
   const headings = [
     "标的", "动作", "执行参考价", "温度变化", "节气", "强度",
     reasonHeading, "活动保护线", "持仓提示",
   ];
   const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
-    ${renderTrendCell("标的", trendIdentity(item))}
+    ${kind === "hold" && optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
     ${renderTrendCell("动作", action(item))}
     ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
     ${renderTrendCell("温度变化", trendTemperature(item))}
@@ -3268,12 +3342,13 @@ function renderTrendBuyStage(report) {
     "温度变化", "节气", "强度", "行业", "行业温度", "行业确认", "市值（亿元）",
     "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
   ];
+  const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
   const row = (item, action, skipped = false) => {
     const targetWeight = decimalAsPercent(item.target_weight, null);
     const shares = skipped ? "0 股" : hasValue(item.estimated_shares)
       ? `${formatDisplayNumber(item.estimated_shares)} 股` : null;
     return `<tr class="cn-trend-card">
-      ${renderTrendCell("标的", trendIdentity(item))}
+      ${!skipped && optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
       ${renderTrendCell("动作", action)}
       ${renderTrendCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : null)}
       ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}

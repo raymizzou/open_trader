@@ -6755,6 +6755,63 @@ def test_dashboard_trend_report_mobile_layout_css() -> None:
     assert ".trend-audit-reason" in mobile
 
 
+def test_dashboard_renders_option_anomaly_button_and_native_dialog() -> None:
+    output = run_dashboard_js(r'''
+const available = {
+  symbol: "VIXY", name: "波动率ETF",
+  option_anomaly: {
+    available: true, status: "partial", run_date: "2026-07-15",
+    window_days: 7, signal: "risk_up", confidence: "low",
+    suggested_constraint: "no_add", summary: "<b>不得执行</b>",
+    categories: [{
+      name: "期权波动率", state: "anomaly", direction: "risk_up",
+      detail: "<img src=x onerror=alert(1)>", evidence_date: "2026-07-15",
+    }],
+  },
+};
+const missing = {
+  symbol: "SPY", name: "标普ETF",
+  option_anomaly: {
+    available: false, status: "missing",
+    reason: "富途未返回该标的期权异动", categories: [],
+  },
+};
+const report = (market) => ({market, buy_window:"常规时段", counts:{},
+  buy_actions:[available], risk_skips:[missing],
+  hold_actions:[available, missing], sell_actions:[missing], review_actions:[available], audit:{}});
+const usBuy = renderTrendBuyStage(report("US"));
+const usHold = renderTrendSellOrHoldStage("持有", report("US").hold_actions, "hold", report("US"));
+const usBuyHold = usBuy + usHold;
+const usSell = renderTrendSellOrHoldStage("卖出", report("US").sell_actions, "sell", report("US"));
+const usReview = renderTrendSellOrHoldStage("复核", report("US").review_actions, "review", report("US"));
+const cn = renderTrendReportWorkspace(report("CN"));
+if ((usBuyHold.match(/期权异动/g) || []).length < 1) throw new Error(usBuyHold);
+if ((usBuyHold.match(/data-option-anomaly-open/g) || []).length !== 2) throw new Error(usBuyHold);
+if ((usBuyHold.match(/<dialog class="trend-option-dialog"/g) || []).length !== 2) throw new Error(usBuyHold);
+if (!usBuyHold.includes("&lt;b&gt;不得执行&lt;/b&gt;") || !usBuyHold.includes("&lt;img src=x onerror=alert(1)&gt;")) throw new Error(usBuyHold);
+if (!usBuyHold.includes('disabled title="富途未返回该标的期权异动"')) throw new Error(usBuyHold);
+if (usSell.includes("期权异动") || usReview.includes("期权异动")) throw new Error(usSell + usReview);
+if (cn.includes("期权异动")) throw new Error(cn);
+if ((usBuy.match(/<th scope="col">/g) || []).length !== 16) throw new Error(usBuy);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_trend_option_button_mobile_layout_css() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    assert ".trend-option-button" in css
+    assert ".trend-option-dialog" in css
+    assert ".trend-option-dialog::backdrop" in css
+    assert ".trend-option-button" in mobile
+    button_css = mobile.split(".trend-option-button", 1)[1].split("}", 1)[0]
+    assert "min-height: 44px;" in button_css
+    assert "grid-template-columns: minmax(0, 1fr);" in mobile
+
+
 def test_dashboard_renders_fixed_order_futu_option_attention_list() -> None:
     output = run_dashboard_js(r'''
 const report = {

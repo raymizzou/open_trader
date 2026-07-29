@@ -2480,6 +2480,179 @@ table {
   font-size: 13px;
 }
 
+.trend-option-button {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 6px;
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.trend-option-button:disabled {
+  background: var(--surface-soft);
+  border-color: var(--line);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.trend-option-dialog {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+  color: var(--text);
+  max-height: calc(100dvh - 32px);
+  max-width: 720px;
+  overflow: auto;
+  padding: 20px;
+  width: min(720px, calc(100% - 32px));
+}
+
+.trend-option-dialog::backdrop {
+  background: rgba(20, 18, 15, 0.58);
+}
+
+.trend-option-dialog-header,
+.trend-option-dialog-category header {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.trend-option-dialog-header p,
+.trend-option-dialog-header h3,
+.trend-option-dialog h4,
+.trend-option-dialog-category p,
+.trend-option-dialog-category dl,
+.trend-option-dialog-meta,
+.trend-option-dialog-signal {
+  margin: 0;
+}
+
+.trend-option-dialog-header p,
+.trend-option-dialog-meta dt,
+.trend-option-dialog-signal dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-option-dialog-header h3 {
+  font-size: 22px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.trend-option-dialog-header > button {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 20px;
+  min-height: 32px;
+  min-width: 32px;
+}
+
+.trend-option-dialog-meta,
+.trend-option-dialog-signal {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 16px;
+}
+
+.trend-option-dialog-meta div,
+.trend-option-dialog-signal div,
+.trend-option-dialog-category {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  min-width: 0;
+  padding: 9px;
+}
+
+.trend-option-dialog-meta dd,
+.trend-option-dialog-signal dd,
+.trend-option-dialog-category dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.trend-option-dialog-summary,
+.trend-option-dialog-categories {
+  border-top: 1px solid var(--line);
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.trend-option-dialog-summary h4,
+.trend-option-dialog-categories h4 {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.trend-option-dialog-summary p,
+.trend-option-dialog-empty {
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.trend-option-dialog-categories > div {
+  display: grid;
+  gap: 8px;
+}
+
+.trend-option-dialog-category header {
+  align-items: center;
+}
+
+.trend-option-dialog-category header span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-option-dialog-category dl {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 8px;
+}
+
+.trend-option-dialog-category p {
+  border-top: 1px solid var(--line);
+  line-height: 1.5;
+  margin-top: 8px;
+  padding-top: 8px;
+  white-space: pre-wrap;
+}
+
+.trend-option-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.trend-option-dialog footer button {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--surface);
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 36px;
+  padding: 0 14px;
+}
+
 .cn-trend-table {
   border-collapse: collapse;
   margin-top: 8px;
@@ -4728,6 +4901,10 @@ tbody tr.active-row,
 .trend-execution-batch-error,
 .trend-risk-summary dl div,
 .cn-trend-card td:nth-child(-n + 2),
+.trend-option-button:disabled,
+.trend-option-dialog-meta div,
+.trend-option-dialog-signal div,
+.trend-option-dialog-category,
 .trend-audit-summary span,
 .trend-audit-reason-counts span,
 .option-attention-market th,
@@ -4986,6 +5163,28 @@ table {
 
   .cn-trend-stage {
     padding: 12px;
+  }
+
+  .trend-option-button {
+    min-height: 44px;
+  }
+
+  .trend-option-dialog {
+    margin: auto;
+    max-height: calc(100dvh - 20px);
+    padding: 14px;
+    width: calc(100% - 20px);
+  }
+
+  .trend-option-dialog-meta,
+  .trend-option-dialog-signal,
+  .trend-option-dialog-category dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-option-dialog footer,
+  .trend-option-dialog footer button {
+    width: 100%;
   }
 
   .cn-trend-report {
