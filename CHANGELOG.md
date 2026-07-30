@@ -41,7 +41,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   below `温` cannot appear in any buy view. The new rules are published as v8,
   inheriting v7 Kelly and drawdown history while historical HK/US v4-v7
   identities remain unchanged. Verified 3 focused below-warm report scenarios
-  and 518 focused report, strategy-identity, and drawdown-preflight tests.
+  and 798 focused report, strategy-identity, drawdown-preflight, and Dashboard
+  acceptance tests.
 - Sorted CN/HK/US real and simulated trend-report holding rows by report
   strength. Rows now reuse the existing light green, light pink, and soft gray
   backgrounds to distinguish current buy/hold membership, non-trend holdings,

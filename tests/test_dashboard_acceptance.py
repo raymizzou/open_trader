@@ -33,6 +33,11 @@ from open_trader.strategy_drawdown import (
 MISSING_FRESH = object()
 
 
+def test_dashboard_acceptance_allows_current_market_v8() -> None:
+    assert "v8" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
+    assert "v8" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
+
+
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
     assert len(SCENARIO_IDS) == 63
     assert len(set(SCENARIO_IDS)) == 63
@@ -1291,7 +1296,7 @@ def integrated_v4_payload(
     }
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            ("v10" if market == "CN" else "v7")
+            ("v10" if market == "CN" else "v8")
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )

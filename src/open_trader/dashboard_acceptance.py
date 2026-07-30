@@ -49,8 +49,8 @@ TREND_SIMULATE_MARKETS = {
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
     "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10"}),
-    "US": frozenset({"v4", "v5", "v6", "v7"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8"}),
 }
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
