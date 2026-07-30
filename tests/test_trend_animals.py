@@ -8,6 +8,7 @@ from open_trader.trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
     TrendAnimalsLookupError,
+    TrendAnimalsNoCurrentRowsError,
 )
 
 
@@ -176,6 +177,32 @@ def test_components_reject_unusable_date_sets(
 
     with pytest.raises(TrendAnimalsError, match=message):
         client.get_components(tm_id=622460, expected_date="2026-07-15")
+
+
+def test_components_distinguish_all_stale_rows_from_invalid_dates(
+    tmp_path: Path,
+) -> None:
+    client = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport(
+            {
+                "getComponentTicker": success(
+                    [
+                        {
+                            "tmId": 2,
+                            "tickerSymbol": "NUVL",
+                            "asOfDate": "2026-07-14",
+                        }
+                    ]
+                )
+            }
+        ),
+    )
+
+    with pytest.raises(TrendAnimalsNoCurrentRowsError) as error:
+        client.get_components(tm_id=622460, expected_date="2026-07-15")
+    assert "tmId=622460" in str(error.value)
 
 
 def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:

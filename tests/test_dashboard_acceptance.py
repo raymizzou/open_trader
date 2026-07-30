@@ -160,7 +160,10 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert 'PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src"' in makefile
     assert '"$(WORKTREE_ROOT)/tests" -q' in makefile
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
-    assert 'DASHBOARD_LOG ?= /tmp/open_trader_dashboard_8766.log' in makefile
+    assert (
+        'DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/dashboard/launchd.out.log'
+        in makefile
+    )
     assert "test:\n\t.venv/bin/python -m pytest -q" in makefile
     assert "acceptance: test" not in makefile
     assert "EXPECTED_CN" not in makefile

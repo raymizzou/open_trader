@@ -16,6 +16,7 @@ PORTFOLIO_FIELDNAMES = [
     "symbol",
     "name",
     "total_quantity",
+    "brokers",
 ]
 
 
@@ -289,4 +290,59 @@ def test_load_futu_quote_universe_maps_cn_exchange_prefixes(tmp_path: Path) -> N
             symbol="800001",
             reason="invalid_symbol",
         )
+    ]
+
+
+def test_load_futu_quote_universe_excludes_statement_only_holdings(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio.csv"
+    write_portfolio(
+        path,
+        [
+            {
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "600900",
+                "name": "长江电力",
+                "total_quantity": "2000",
+                "brokers": "eastmoney",
+            },
+            {
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "02824",
+                "name": "易方达黄金",
+                "total_quantity": "800",
+                "brokers": "phillips",
+            },
+            {
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "02000",
+                "name": "Mixed source",
+                "total_quantity": "100",
+                "brokers": "futu;phillips",
+            },
+        ],
+    )
+
+    universe = load_futu_quote_universe(path)
+
+    assert [item.futu_symbol for item in universe.items] == ["HK.02000"]
+    assert universe.skipped == [
+        SkippedFutuUniverseRow(
+            row_number=2,
+            market="CN",
+            asset_class="stock",
+            symbol="600900",
+            reason="statement_only_source",
+        ),
+        SkippedFutuUniverseRow(
+            row_number=3,
+            market="HK",
+            asset_class="stock",
+            symbol="02824",
+            reason="statement_only_source",
+        ),
     ]

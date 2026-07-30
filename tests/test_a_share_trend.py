@@ -48,7 +48,11 @@ from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
-from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
+from open_trader.trend_animals import (
+    TrendAnimalsError,
+    TrendAnimalsLookupError,
+    TrendAnimalsNoCurrentRowsError,
+)
 from open_trader.trend_kelly import TrendKellyRound
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_industry_context import IndustryContext
@@ -5690,6 +5694,54 @@ def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_m
             ),
         ),
     ]
+
+
+def test_collect_industry_contexts_marks_stale_only_components_invalid(
+    tmp_path: Path,
+) -> None:
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert (tm_id, expected_date) == (700001, "2026-07-14")
+            raise TrendAnimalsNoCurrentRowsError(
+                "getComponentTicker returned no current-date rows"
+            )
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            assert tm_ids == [700001]
+            assert fields == trend_module.INDUSTRY_STATE_FIELDS
+            return [{
+                "tmId": 700001,
+                "asOfDate": expected_date,
+                "trendTemperatureCurr": "热",
+                "trendStrengthLocalCurr": "92",
+            }]
+
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(candidate("600001"),),
+        candidate_rows=[{
+            "tmId": 600001,
+            "industryTmId": 700001,
+            "industryName": "电力",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+        }],
+        held_symbols=set(),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert len(contexts) == 1
+    assert contexts[0].component_count == 0
+    assert contexts[0].valid is False
+    assert "snapshot_coverage_below_90pct" in contexts[0].invalid_reasons
+    assert status["ordering_mode"] == "legacy_invalid_current"
+    assert facts["component_rows"] == 0
 
 
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(

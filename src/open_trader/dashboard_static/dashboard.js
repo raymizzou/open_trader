@@ -4961,7 +4961,7 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
     <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${attribution}</td>
     <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.total_quantity))}</td>
     <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.avg_cost_price))}</td>
-    <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderQuotePrice(display, quote)}</td>
+    <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderAccountHoldingPrice(row, quote)}</td>
     <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
     <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
     <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
@@ -8770,6 +8770,20 @@ function renderQuotePrice(holding, quote) {
     ? quoteTimeEt(quote.price_time)
     : "上一有效价";
   return `<span class="session-quote"><span class="session-quote-label" data-session="${escapeHtml(sessionKey)}">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(formatDisplayNumber(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
+}
+
+function renderAccountHoldingPrice(row, quote) {
+  if (quote && hasValue(quote.last_price)) {
+    return renderQuotePrice(row.display, quote);
+  }
+  const sourceKind = brokerSummaries().find(
+    (summary) => brokerKey(summary) === row.broker,
+  )?.source_kind;
+  if (String(sourceKind || "").toLowerCase() === "statement"
+      && hasValue(row.display?.last_price)) {
+    return `<span class="session-quote statement-quote"><span class="session-quote-label">结单</span><strong class="session-quote-price">${escapeHtml(formatDisplayNumber(row.display.last_price))}</strong></span>`;
+  }
+  return renderQuotePrice(row.display, quote);
 }
 
 function sessionQuoteLabel(value) {

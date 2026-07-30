@@ -11,6 +11,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
   The Dashboard reports `统计待重建` while retaining the accepted statement and
   previous statistics; 辉立 Payment and Deposit rows no longer create false
   incomplete-execution warnings.
+- Kept statement-only Phillips and Eastmoney holdings out of the Futu live-quote
+  universe while preserving their accepted positions and labeling their
+  statement prices explicitly in the Dashboard. A stale-only Hong Kong ETF
+  dynamic root or resolved child now means zero ETF candidates, while
+  stale-only secondary industry breadth becomes a visible invalid context and
+  falls back to individual ordering. Current-date validation remains strict
+  for every real candidate pool. The final gate now reads the launchd-owned
+  Dashboard log instead of an obsolete temporary path; verified 3,868 full
+  tests plus 11 focused launchd and gate tests.
 - Added the sole account/quote sync controller: broker reads now validate a
   candidate before atomic publication, while the Dashboard only projects
   accepted files. Removed the Dashboard refresh action and the old rollback
