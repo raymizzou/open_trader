@@ -17,12 +17,21 @@ from open_trader.account_sync_state import (
     accepted_portfolio_rows,
     effective_source_status,
     load_account_sync_state,
+    load_latest_statement_candidate,
     project_account_sync_health,
     record_source_failure,
     write_json_atomic,
     write_portfolio_atomic,
 )
+from open_trader.csv_io import write_rows
 from open_trader.models import AssetClass, CashBalance, Market, Position
+from open_trader.pipeline import (
+    CASH_FIELDNAMES,
+    MANIFEST_FIELDNAMES,
+    POSITION_FIELDNAMES,
+    _cash_to_row,
+    _position_to_row,
+)
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES, PortfolioBuildError
 
 
@@ -412,6 +421,96 @@ def test_write_portfolio_atomic_uses_the_existing_portfolio_columns(tmp_path) ->
         assert list(csv.DictReader(handle)) == [{field: "value" for field in PORTFOLIO_FIELDNAMES}]
 
 
+def test_load_latest_statement_candidate_uses_statement_period_not_run_mtime(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_statement_run(
+        data_dir / "runs" / "newer-directory",
+        broker="phillips",
+        statement_id="2026-07-10-phillips",
+        symbol="OLD",
+    )
+    _write_statement_run(
+        data_dir / "runs" / "older-directory",
+        broker="phillips",
+        statement_id="2026-07-15-phillips",
+        symbol="LATEST",
+    )
+    _write_statement_run(
+        data_dir / "runs" / "eastmoney-older-directory",
+        broker="eastmoney",
+        statement_id="2026-08-01-eastmoney",
+        symbol="600001",
+    )
+    _write_statement_run(
+        data_dir / "runs" / "eastmoney-newer-directory",
+        broker="eastmoney",
+        statement_id="2026-07-31-eastmoney",
+        symbol="600002",
+    )
+    _write_statement_run(
+        data_dir / "runs" / "failed",
+        broker="phillips",
+        statement_id="2026-08-01-phillips",
+        symbol="IGNORED",
+        manifest_status="failed",
+    )
+    _write_statement_run(
+        data_dir / "runs" / "malformed",
+        broker="eastmoney",
+        statement_id="2026-09-01-eastmoney",
+        symbol="IGNORED",
+        quantity="not-a-number",
+    )
+    _write_truncated_statement_run(
+        data_dir / "runs" / "truncated",
+        broker="phillips",
+        statement_id="2026-08-01-phillips",
+    )
+    _write_statement_run(
+        data_dir / "runs" / "live-only",
+        broker="futu",
+        statement_id="2026-10-01-futu",
+        symbol="IGNORED",
+    )
+
+    phillips = load_latest_statement_candidate(data_dir, "phillips")
+    eastmoney = load_latest_statement_candidate(data_dir, "eastmoney")
+
+    assert phillips is not None
+    assert phillips.source_kind == "statement"
+    assert phillips.period == "2026-07-15"
+    assert phillips.data_as_of == "2026-07-15"
+    assert [position.symbol for position in phillips.positions] == ["LATEST"]
+    assert phillips.summary == {
+        "position_count": 1,
+        "cash_count": 1,
+        "is_real_time": False,
+    }
+    assert eastmoney is not None
+    assert eastmoney.source_kind == "statement"
+    assert eastmoney.period == "2026-08"
+    assert eastmoney.data_as_of == "2026-08-01"
+    assert [position.symbol for position in eastmoney.positions] == ["600001"]
+    assert eastmoney.summary["is_real_time"] is False
+
+
+def test_load_latest_statement_candidate_never_selects_live_broker_artifacts(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_statement_run(
+        data_dir / "runs" / "live",
+        broker="tiger",
+        statement_id="2026-07-30-tiger",
+        symbol="AAPL",
+    )
+
+    assert load_latest_statement_candidate(data_dir, "phillips") is None
+    assert load_latest_statement_candidate(data_dir, "eastmoney") is None
+
+
 def _candidate() -> BrokerAccountCandidate:
     return BrokerAccountCandidate(
         broker="futu",
@@ -491,3 +590,94 @@ def _controller_status(heartbeat_at: datetime) -> dict[str, object]:
         "quote_loop": {},
         "blocker": None,
     }
+
+
+def _write_statement_run(
+    run_dir: Path,
+    *,
+    broker: str,
+    statement_id: str,
+    symbol: str,
+    manifest_status: str = "parsed",
+    quantity: str = "1",
+) -> None:
+    period = statement_id[:10] if broker == "phillips" else statement_id[:7]
+    position = Position(
+        statement_id=statement_id,
+        broker=broker,
+        account_alias=f"{broker}_main",
+        market=Market.HK if broker == "phillips" else Market.CN,
+        asset_class=AssetClass.STOCK,
+        symbol=symbol,
+        name=symbol,
+        currency="HKD" if broker == "phillips" else "CNY",
+        quantity=Decimal(quantity) if quantity != "not-a-number" else Decimal("1"),
+        cost_price=Decimal("10"),
+        last_price=Decimal("11"),
+        market_value=Decimal("11"),
+        cost_value=Decimal("10"),
+        unrealized_pnl=Decimal("1"),
+        confidence="high",
+        notes="statement",
+    )
+    cash = CashBalance(
+        statement_id=statement_id,
+        broker=broker,
+        account_alias=f"{broker}_main",
+        currency=position.currency,
+        cash_balance=Decimal("100"),
+        available_balance=Decimal("100"),
+        confidence="high",
+        notes="statement",
+    )
+    position_row = _position_to_row(position)
+    position_row["quantity"] = quantity
+    write_rows(
+        run_dir / "manifest.csv",
+        MANIFEST_FIELDNAMES,
+        [{
+            "month": period[:7],
+            "broker": broker,
+            "source_file": "statement.pdf",
+            "source_sha256": "hash",
+            "parsed_at": "2026-07-30T12:00:00+00:00",
+            "page_count": "1",
+            "parser_version": "test",
+            "status": manifest_status,
+        }],
+    )
+    write_rows(
+        run_dir / "extracted_positions.csv",
+        POSITION_FIELDNAMES,
+        [position_row],
+    )
+    write_rows(
+        run_dir / "extracted_cash.csv",
+        CASH_FIELDNAMES,
+        [_cash_to_row(cash)],
+    )
+
+
+def _write_truncated_statement_run(
+    run_dir: Path, *, broker: str, statement_id: str
+) -> None:
+    write_rows(
+        run_dir / "manifest.csv",
+        MANIFEST_FIELDNAMES,
+        [{
+            "month": statement_id[:7],
+            "broker": broker,
+            "source_file": "statement.pdf",
+            "source_sha256": "hash",
+            "parsed_at": "2026-07-30T12:00:00+00:00",
+            "page_count": "1",
+            "parser_version": "test",
+            "status": "parsed",
+        }],
+    )
+    write_rows(
+        run_dir / "extracted_positions.csv",
+        ["statement_id", "broker"],
+        [{"statement_id": statement_id, "broker": broker}],
+    )
+    write_rows(run_dir / "extracted_cash.csv", CASH_FIELDNAMES, [])

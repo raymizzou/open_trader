@@ -3,17 +3,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import csv
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
+from . import pipeline
 from .portfolio import (
     PORTFOLIO_FIELDNAMES,
     PortfolioBuildError,
@@ -77,6 +79,80 @@ def load_account_sync_state(path: Path) -> dict[str, object]:
     except (OSError, json.JSONDecodeError):
         return empty_account_sync_state()
     return payload if _is_valid_state(payload) else empty_account_sync_state()
+
+
+def load_latest_statement_candidate(
+    data_dir: Path,
+    broker: Literal["phillips", "eastmoney"],
+) -> BrokerAccountCandidate | None:
+    if broker not in {"phillips", "eastmoney"}:
+        raise ValueError(f"unsupported statement broker: {broker}")
+    runs_dir = data_dir / "runs"
+    if not runs_dir.is_dir():
+        return None
+    candidates = [
+        candidate
+        for run_dir in runs_dir.iterdir()
+        if run_dir.is_dir()
+        if (candidate := _statement_candidate_from_run(run_dir, broker)) is not None
+    ]
+    return max(candidates, key=lambda item: (item.period, item.data_as_of)) if candidates else None
+
+
+def _statement_candidate_from_run(
+    run_dir: Path, broker: Literal["phillips", "eastmoney"]
+) -> BrokerAccountCandidate | None:
+    try:
+        manifest = _read_detail_rows(run_dir / "manifest.csv")
+        positions = _read_detail_rows(run_dir / "extracted_positions.csv")
+        cash = _read_detail_rows(run_dir / "extracted_cash.csv")
+        position_rows = [row for row in positions if row.get("broker", "").strip().lower() == broker]
+        cash_rows = [row for row in cash if row.get("broker", "").strip().lower() == broker]
+        detail_rows = [*position_rows, *cash_rows]
+        statement_ids = {row.get("statement_id", "") for row in detail_rows}
+        if not detail_rows or len(statement_ids) != 1:
+            return None
+        data_as_of, period = _statement_period(next(iter(statement_ids)), broker)
+        if not any(
+            row.get("broker", "").strip().lower() == broker
+            and row.get("status", "") == "parsed"
+            and row.get("month", "") == period[:7]
+            for row in manifest
+        ):
+            return None
+        candidate = BrokerAccountCandidate(
+            broker=broker,
+            source_kind="statement",
+            data_as_of=data_as_of,
+            period=period,
+            positions=tuple(pipeline._position_from_row(row) for row in position_rows),
+            cash=tuple(pipeline._cash_from_row(row) for row in cash_rows),
+            fx_rates=(),
+            summary={
+                "position_count": len(position_rows),
+                "cash_count": len(cash_rows),
+                "is_real_time": False,
+            },
+        )
+        accept_candidate(empty_account_sync_state(), candidate, attempted_at=data_as_of)
+        return candidate
+    except (OSError, KeyError, TypeError, ValueError, InvalidOperation, csv.Error):
+        return None
+
+
+def _read_detail_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _statement_period(
+    statement_id: str, broker: Literal["phillips", "eastmoney"]
+) -> tuple[str, str]:
+    match = re.fullmatch(rf"(\d{{4}}-\d{{2}}-\d{{2}})-{broker}", statement_id)
+    if match is None:
+        raise ValueError("invalid statement ID")
+    data_as_of = date.fromisoformat(match.group(1)).isoformat()
+    return data_as_of, data_as_of if broker == "phillips" else data_as_of[:7]
 
 
 def accept_candidate(
