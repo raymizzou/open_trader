@@ -59,30 +59,12 @@ class StatementImportService:
             statement_period = (
                 statement_date if broker == "phillips" else statement_date[:7]
             )
-            statistics_cutoff_at = _statement_cutoff(statement_date, broker)
-            generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-            stats = build_statement_actual_stats_payload(
-                data_dir=self.data_dir,
-                reports_dir=self.reports_dir,
-                broker=broker,
-                statement_period=statement_period,
-                fills=[_trade_fill(trade, statement_period) for trade in parsed.trades],
-                generated_at=generated_at,
-                statistics_cutoff_at=statistics_cutoff_at,
-            )
             archive = self._archive_path(broker, statement_date)
-            snapshots = [
-                _snapshot_path(
-                    self.data_dir / "runs" / statement_date[:7],
-                    Path(name) / "rollback",
-                    "run",
-                ),
-                _snapshot_path(
-                    self.data_dir / "latest" / "trend_api_stats.json",
-                    Path(name) / "rollback",
-                    "stats",
-                ),
-            ]
+            run_snapshot = _snapshot_path(
+                self.data_dir / "runs" / statement_date[:7],
+                Path(name) / "rollback",
+                "run",
+            )
             backup = _promote_archive(uploaded, archive)
             try:
                 imported = run_uploaded_statement(
@@ -96,16 +78,40 @@ class StatementImportService:
                         fx_date=statement_date,
                     ),
                 )
-                write_trend_api_stats(self.data_dir, stats)
             except Exception:
                 try:
                     _restore_archive(archive, backup)
                 finally:
-                    for snapshot in snapshots:
-                        _restore_snapshot(snapshot)
+                    _restore_snapshot(run_snapshot)
                 raise
             if backup is not None:
                 backup.unlink(missing_ok=True)
+            statistics_cutoff_at = _statement_cutoff(statement_date, broker)
+            stats_snapshot = _snapshot_path(
+                self.data_dir / "latest" / "trend_api_stats.json",
+                Path(name) / "rollback",
+                "stats",
+            )
+            try:
+                generated_at = datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                )
+                stats = build_statement_actual_stats_payload(
+                    data_dir=self.data_dir,
+                    reports_dir=self.reports_dir,
+                    broker=broker,
+                    statement_period=statement_period,
+                    fills=[
+                        _trade_fill(trade, statement_period)
+                        for trade in parsed.trades
+                    ],
+                    generated_at=generated_at,
+                    statistics_cutoff_at=statistics_cutoff_at,
+                )
+                write_trend_api_stats(self.data_dir, stats)
+            except Exception:
+                _restore_snapshot(stats_snapshot)
+                stats = None
         result = {
             "status": "ok",
             "broker": broker,
@@ -114,12 +120,19 @@ class StatementImportService:
             "cash": len(parsed.cash_balances),
             "warnings": len(parsed.warnings),
             "trades": len(parsed.trades),
-            "actual_rounds": sum(
-                round_["broker"] == broker
-                and round_["attribution_status"] == "attributed"
-                for round_ in stats["rounds"]
+            "statistics_status": "updated" if stats is not None else "failed",
+            "actual_rounds": (
+                sum(
+                    round_["broker"] == broker
+                    and round_["attribution_status"] == "attributed"
+                    for round_ in stats["rounds"]
+                )
+                if stats is not None
+                else None
             ),
-            "statistics_cutoff_at": statistics_cutoff_at,
+            "statistics_cutoff_at": (
+                statistics_cutoff_at if stats is not None else None
+            ),
             "run_path": str(imported.run_dir),
         }
         if parsed.fills:

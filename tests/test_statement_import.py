@@ -221,14 +221,6 @@ def write_hk_strategy_reports(reports_dir: Path) -> None:
         )
 
 
-def tree_bytes(path: Path) -> dict[str, bytes]:
-    return {
-        str(file.relative_to(path)): file.read_bytes()
-        for file in sorted(path.rglob("*"))
-        if file.is_file()
-    }
-
-
 def write_existing_portfolio(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {field: "" for field in PORTFOLIO_FIELDNAMES}
@@ -279,6 +271,7 @@ def test_import_pdf_archives_candidate_without_replacing_latest_portfolio(
         "cash": 1,
         "warnings": 0,
         "trades": 0,
+        "statistics_status": "updated",
         "actual_rounds": 0,
         "statistics_cutoff_at": "2026-07-10T23:59:59+08:00",
         "run_path": str(tmp_path / "data/runs/2026-07"),
@@ -639,7 +632,7 @@ def test_new_statement_without_trades_keeps_samples_and_advances_source_cutoff(
     assert source["statistics_cutoff_at"] == "2026-07-13T23:59:59+08:00"
 
 
-def test_stats_write_failure_rolls_back_archive_portfolio_run_and_stats(
+def test_stats_write_failure_keeps_accepted_source_and_previous_stats(
     tmp_path: Path, monkeypatch
 ) -> None:
     statement_import = importlib.import_module("open_trader.statement_import")
@@ -656,8 +649,9 @@ def test_stats_write_failure_rolls_back_archive_portfolio_run_and_stats(
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)
-    before_portfolio = portfolio_path.read_bytes()
-    before_data = tree_bytes(data_dir)
+    archive = data_dir / "statements/phillips/2026-07-12/statement.pdf"
+    stats_path = data_dir / "latest/trend_api_stats.json"
+    before_stats = stats_path.read_bytes()
     parser.sell_price = Decimal("9")
     monkeypatch.setattr(
         statement_import,
@@ -665,11 +659,52 @@ def test_stats_write_failure_rolls_back_archive_portfolio_run_and_stats(
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stats failed")),
     )
 
-    with pytest.raises(RuntimeError, match="stats failed"):
-        service.import_pdf("phillips", b"%PDF-1.7\ncorrected")
+    result = service.import_pdf("phillips", b"%PDF-1.7\ncorrected")
 
-    assert portfolio_path.read_bytes() == before_portfolio
-    assert tree_bytes(data_dir) == before_data
+    assert result["status"] == "ok"
+    assert result["statistics_status"] == "failed"
+    assert result["actual_rounds"] is None
+    assert result["statistics_cutoff_at"] is None
+    assert archive.read_bytes() == b"%PDF-1.7\ncorrected"
+    assert Path(result["run_path"]).is_dir()
+    assert stats_path.read_bytes() == before_stats
+
+
+def test_eastmoney_statistics_clock_failure_keeps_same_period_statement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    statement_import = importlib.import_module("open_trader.statement_import")
+    monkeypatch.setattr(
+        statement_import, "EastmoneyStatementParser", FakeEastmoneyParser
+    )
+    data_dir = tmp_path / "data"
+    service = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    )
+    service.import_pdf("eastmoney", PDF_BYTES)
+    archive = data_dir / "statements/eastmoney/2026-07/statement.pdf"
+    stats_path = data_dir / "latest/trend_api_stats.json"
+    before_stats = stats_path.read_bytes()
+    replacement = b"%PDF-1.7\nsame period replacement"
+    monkeypatch.setattr(
+        statement_import,
+        "build_statement_actual_stats_payload",
+        lambda **kwargs: (_ for _ in ()).throw(
+            ValueError("generated_at must not precede statistics_cutoff_at")
+        ),
+    )
+
+    result = service.import_pdf("eastmoney", replacement)
+
+    assert result["status"] == "ok"
+    assert result["broker"] == "eastmoney"
+    assert result["statistics_status"] == "failed"
+    assert result["actual_rounds"] is None
+    assert result["statistics_cutoff_at"] is None
+    assert Path(result["run_path"]).is_dir()
+    assert archive.read_bytes() == replacement
+    assert stats_path.read_bytes() == before_stats
 
 
 def test_same_day_statement_buy_and_sell_are_excluded_when_time_is_unavailable(
