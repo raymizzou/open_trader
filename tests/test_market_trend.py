@@ -56,10 +56,12 @@ from open_trader.trend_api_stats import (
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-def unlock_live_drawdown(data_dir: Path, market: str) -> None:
-    # These fixtures generate reports for 2026-07-16, before the market v5
-    # effective dates, so the runner must use the historical v4 drawdown key.
-    version = "v4"
+def unlock_live_drawdown(
+    data_dir: Path,
+    market: str,
+    *,
+    version: str = "v4",
+) -> None:
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market=market,
@@ -1123,12 +1125,12 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     candidate_snapshot = payload["signal_snapshots"]["candidates"][0]
     assert candidate_snapshot["boiling"] is False
     assert candidate_snapshot["champagne"] is False
-    assert candidate_snapshot["industry_temperature"] == "温"
+    assert candidate_snapshot["industry_temperature"] is None
     assert len([
         call
         for call in snapshot_calls
         if call["fields"] == A_SHARE_INDUSTRY_FIELDS
-    ]) == 2
+    ]) == 0
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert (
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
@@ -1165,16 +1167,182 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
-    assert evidence["query"]["industry_fields"] == list(A_SHARE_INDUSTRY_FIELDS)
-    assert evidence["responses"]["industries"] == [{
-        "tmId": 700001,
-        "asOfDate": "2026-07-15",
-        "trendTemperatureCurr": "温",
-    }]
+    assert "industry_fields" not in evidence["query"]
+    assert "industries" not in evidence["responses"]
     assert evidence["market"] == "HK"
     assert evidence["query"]["component_pool_ids"] == [622494]
     assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
     assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
+
+
+@pytest.mark.parametrize(
+    (
+        "market",
+        "run_date",
+        "as_of_date",
+        "symbol",
+        "wire_symbol",
+        "asset",
+        "industry_error",
+        "expected_reason",
+    ),
+    [
+        (
+            "US", "2026-07-30", "2026-07-29", "GRMN", "GRMN.US", "美股",
+            False, "industry_temperature_not_hot",
+        ),
+        (
+            "HK", "2026-07-30", "2026-07-30", "00322", "0322.HK", "港股",
+            False, "industry_temperature_not_hot",
+        ),
+        (
+            "US", "2026-07-30", "2026-07-29", "GRMN", "GRMN.US", "美股",
+            True, "industry_temperature_missing",
+        ),
+    ],
+)
+def test_current_market_report_fail_closes_industry_data_from_buy_views(
+    tmp_path: Path,
+    market: str,
+    run_date: str,
+    as_of_date: str,
+    symbol: str,
+    wire_symbol: str,
+    asset: str,
+    industry_error: bool,
+    expected_reason: str,
+) -> None:
+    cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, market, version="v7")
+    industry_calls: list[dict[str, object]] = []
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": update_asset, "asOfDate": as_of_date}
+                for update_asset in market_trend.MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert expected_date == as_of_date
+            return [{
+                "tmId": 1,
+                "tickerSymbol": wire_symbol,
+                "asOfDate": expected_date,
+            }]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(
+                dict.fromkeys(
+                    (
+                        *UNIFIED_TREND_FIELDS,
+                        *A_SHARE_INDUSTRY_FIELDS,
+                        *INDUSTRY_MEMBER_FIELDS,
+                        *INDUSTRY_STATE_FIELDS,
+                    )
+                )
+            )
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            if kwargs["fields"] == A_SHARE_INDUSTRY_FIELDS:
+                industry_calls.append(dict(kwargs))
+                if industry_error:
+                    raise TrendAnimalsError("industry endpoint unavailable")
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": as_of_date,
+                    "trendTemperatureCurr": "凉",
+                }]
+            assert kwargs["fields"] == UNIFIED_TREND_FIELDS
+            return [{
+                "tmId": 1,
+                "tickerName": symbol,
+                "tickerSymbol": wire_symbol,
+                "asset": asset,
+                "asOfDate": as_of_date,
+                "tradableFlag": True,
+                "industryTmId": 700001,
+                "industryName": "可选消费",
+                "priceIndex": "10",
+                "marketCap": "200",
+                "amount1d": "3",
+                "isTrendRightSide": True,
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "daysSinceTrendEntry": 3,
+                "trendPhaseCurr": "立夏",
+                "trendStrengthLocalCurr": "98",
+                "stopwinFlagByDangerSignal": False,
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+            }]
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return sorted({as_of_date, "2026-07-30", "2026-07-31"})
+
+        def get_daily_kline(
+            self, *args: object, **kwargs: object
+        ) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {item: 100 for item in symbols}
+
+        def close(self) -> None:
+            pass
+
+    result = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+    )
+
+    assert result.status == "generated"
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+    assert payload["strategy_snapshot"]["strategy_version"] == "v7"
+    assert payload["excluded"][symbol] == [expected_reason]
+    assert judgments["formal_actions"] == []
+    assert judgments["risk_skips"] == []
+    assert judgments["top10_candidates"] == []
+    assert len(industry_calls) == 1
+    assert bool(payload["metadata"]["industry_data_reason"]) is industry_error
 
 
 @pytest.mark.parametrize(

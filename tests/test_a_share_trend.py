@@ -842,6 +842,27 @@ def test_current_market_entry_rejects_cn_discipline_failure(
     assert reason in decision.excluded[item.symbol]
 
 
+def test_industry_temperature_loader_preserves_all_known_cold_states() -> None:
+    class Api:
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": kwargs["expected_date"],
+                    "trendTemperatureCurr": temperature,
+                }
+                for tm_id, temperature in ((700001, "冻"), (700002, "寒"))
+            ]
+
+    _, temperatures = trend_module.load_industry_temperatures(
+        Api(),
+        tm_ids=(700001, 700002),
+        expected_date="2026-07-14",
+    )
+
+    assert temperatures == {700001: "冻", 700002: "寒"}
+
+
 @pytest.mark.parametrize(
     ("market", "asset", "pool_id"),
     [("US", "美股", 622460), ("HK", "港股", 622494)],
@@ -912,7 +933,55 @@ def test_current_market_report_keeps_cool_industry_out_of_every_buy_view(
     assert payload["signal_snapshots"]["candidates"][0] | {
         "eligible": False,
         "excluded_reasons": ["industry_temperature_not_hot"],
+        "market_cap_cny_threshold_met": True,
+        "amount_cny_threshold_met": True,
     } == payload["signal_snapshots"]["candidates"][0]
+
+
+def test_current_market_industry_failure_keeps_holding_exit_decisions() -> None:
+    strategy_snapshot = trend_module.live_trend_strategy_snapshot(
+        "US",
+        "abc123",
+        (622460,),
+        strategy_version="v7",
+    )
+    item = candidate(
+        "620001",
+        exchange="US",
+        asset="美股",
+        industry_temperature=None,
+        market_cap="200",
+        amount="3",
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600009"),
+        candidates=(item,),
+        holding_snapshots={
+            "600009": replace(
+                holding("600009"),
+                exchange="US",
+                danger=True,
+            )
+        },
+        bars_by_symbol={"600009": bars()},
+        market="US",
+        process_version="abc123",
+        candidate_pool_ids=(622460,),
+        strategy_snapshot=strategy_snapshot,
+        metadata={"market": "US"},
+        kelly_data_reason=(
+            "行业温度数据不可用，暂停新开仓：industry endpoint unavailable"
+        ),
+    )
+
+    assert [(decision.symbol, decision.action) for decision in built.holdings] == [
+        ("600009", "SELL_ALL")
+    ]
+    assert built.buy_actions == ()
+    assert built.excluded[item.symbol] == ["industry_temperature_missing"]
 
 
 @pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8", "v9", "v10"])
@@ -5360,6 +5429,8 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "cny_per_local_currency",
         "market_cap_cny_100m",
         "amount_cny_100m",
+        "market_cap_cny_threshold_met",
+        "amount_cny_threshold_met",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",
@@ -5433,6 +5504,8 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "cny_per_local_currency",
         "market_cap_cny_100m",
         "amount_cny_100m",
+        "market_cap_cny_threshold_met",
+        "amount_cny_threshold_met",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",

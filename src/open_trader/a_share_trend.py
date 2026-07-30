@@ -125,6 +125,10 @@ LEGACY_CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.04")}
 CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v10", "US": "v7", "HK": "v7"}
 CURRENT_TREND_EFFECTIVE_FROM = "2026-07-27"
+CURRENT_ENTRY_DISCIPLINES = frozenset({
+    ("US", "v7"),
+    ("HK", "v7"),
+})
 CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v9"),
     ("CN", "v10"),
@@ -212,6 +216,17 @@ V2_RISK_NUMERIC_FIELDS = (
     "total_risk_budget_target_pct",
     "normal_cost_rate",
 )
+
+
+def _uses_shared_entry_discipline(
+    market: str,
+    strategy_version: str | None,
+) -> bool:
+    normalized_market = market.upper()
+    return normalized_market == "CN" or (
+        normalized_market,
+        strategy_version,
+    ) in CURRENT_ENTRY_DISCIPLINES
 
 
 def _nonnegative_risk_decimal(value: object) -> Decimal | None:
@@ -669,7 +684,7 @@ def live_trend_strategy_snapshot(
     )
     parameters = dict(snapshot["parameters"])
     rows = [dict(row) for row in snapshot["parameter_rows"]]
-    if market in {"US", "HK"} and version in {"v5", "v6", "v7"}:
+    if market in {"US", "HK"} and _uses_shared_entry_discipline(market, version):
         rate = CNY_PER_LOCAL_CURRENCY[market]
         parameters.pop("min_strength_exclusive", None)
         parameters.pop("max_right_side_days_exclusive", None)
@@ -1974,9 +1989,7 @@ def _candidate_reasons(
     cny_per_local_currency: Decimal | None = None,
 ) -> list[str]:
     reasons: list[str] = []
-    shared_discipline = market == "CN" or (
-        market in {"US", "HK"} and strategy_version in {"v5", "v6", "v7"}
-    )
+    shared_discipline = _uses_shared_entry_discipline(market, strategy_version)
     cny_rate = (
         cny_per_local_currency
         if cny_per_local_currency is not None
@@ -3844,10 +3857,7 @@ def _candidate_signal(
         "phase": item.phase,
         **_paid_expansion_signal(item),
     }
-    shared_discipline = market.upper() == "CN" or (
-        market.upper() in {"US", "HK"}
-        and strategy_version in {"v5", "v6", "v7"}
-    )
+    shared_discipline = _uses_shared_entry_discipline(market, strategy_version)
     if shared_discipline:
         rate = (
             cny_per_local_currency
@@ -3863,6 +3873,16 @@ def _candidate_signal(
                 ),
                 "amount_cny_100m": (
                     item.amount * rate if item.amount is not None else None
+                ),
+                "market_cap_cny_threshold_met": (
+                    item.market_cap * rate >= CN_MIN_MARKET_CAP_100M
+                    if item.market_cap is not None
+                    else None
+                ),
+                "amount_cny_threshold_met": (
+                    item.amount * rate >= CN_MIN_AMOUNT_100M
+                    if item.amount is not None
+                    else None
                 ),
             }
         )
@@ -5779,7 +5799,7 @@ def load_industry_temperatures(
     return rows, {
         _row_tm_id(row): (
             str(row["trendTemperatureCurr"])
-            if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
+            if row.get("trendTemperatureCurr") in INDUSTRY_KNOWN_TEMPERATURES
             else None
         )
         for row in rows
@@ -5903,31 +5923,11 @@ def _attempt_report(
                 and value > 0
             }
         )
-        industry_rows = (
-            api.get_snapshots(
-                tm_ids=industry_ids,
-                fields=A_SHARE_INDUSTRY_FIELDS,
-                expected_date=run_date,
-            )
-            if industry_ids
-            else []
+        industry_rows, industry_temperatures = load_industry_temperatures(
+            api,
+            tm_ids=industry_ids,
+            expected_date=run_date,
         )
-        returned_industry_ids = [_row_tm_id(row) for row in industry_rows]
-        if (
-            len(returned_industry_ids) != len(set(returned_industry_ids))
-            or any(tm_id not in industry_ids for tm_id in returned_industry_ids)
-        ):
-            raise TrendAnimalsError("industry snapshot returned mismatched tmIds")
-        if any(row.get("asOfDate") != run_date for row in industry_rows):
-            raise TrendAnimalsError("industry snapshot returned a stale data date")
-        industry_temperatures = {
-            _row_tm_id(row): (
-                str(row["trendTemperatureCurr"])
-                if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
-                else None
-            )
-            for row in industry_rows
-        }
         candidates: list[CandidateInput] = []
         holding_snapshots: dict[str, HoldingSnapshot | None] = {
             position.symbol: None for position in account.positions
