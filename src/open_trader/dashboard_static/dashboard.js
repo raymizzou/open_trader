@@ -4900,10 +4900,12 @@ async function handleStatementFileSelection(event) {
   renderAccountHoldings();
   try {
     const payload = await uploadStatement(broker, file);
+    const statisticsMessage =
+      payload.statistics_status === "failed" ? " · 统计待重建" : "";
     state.statementUpload = {
       broker,
       busy: false,
-      message: `已导入 ${payload.statement_date} · 持仓 ${payload.positions}`,
+      message: `已导入 ${payload.statement_date} · 持仓 ${payload.positions}${statisticsMessage}`,
       error: false,
     };
     setTimeout(() => {

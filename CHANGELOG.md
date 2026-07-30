@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Made uploaded 东方财富 and 辉立 statements authoritative after broker-period
+  freshness validation: same-period replacements no longer fail or roll back
+  when derived trade statistics cannot yet satisfy their cutoff-time invariant.
+  The Dashboard reports `统计待重建` while retaining the accepted statement and
+  previous statistics; 辉立 Payment and Deposit rows no longer create false
+  incomplete-execution warnings.
 - Added the sole account/quote sync controller: broker reads now validate a
   candidate before atomic publication, while the Dashboard only projects
   accepted files. Removed the Dashboard refresh action and the old rollback

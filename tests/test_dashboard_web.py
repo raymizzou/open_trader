@@ -866,6 +866,41 @@ console.log(JSON.stringify({calls,reloads,payload}));
     assert result["payload"]["positions"] == 3
 
 
+def test_dashboard_statement_upload_reports_deferred_statistics_without_failing() -> None:
+    output = run_dashboard_js(r'''
+state.statementUpload={broker:"",busy:false,message:"",error:false};
+globalThis.fetch=async()=>({
+  ok:true,
+  status:200,
+  json:async()=>({
+    status:"ok",
+    statement_date:"2026-07-30",
+    positions:12,
+    statistics_status:"failed",
+  }),
+});
+loadDashboard=async()=>{};
+renderAccountHoldings=()=>{};
+setTimeout=()=>0;
+const input={
+  files:[{name:"statement.pdf",size:100}],
+  dataset:{statementFile:"eastmoney"},
+  value:"selected",
+};
+await handleStatementFileSelection({
+  target:{closest:(selector)=>selector==="[data-statement-file]"?input:null},
+});
+console.log(JSON.stringify(state.statementUpload));
+''')
+
+    assert json.loads(output) == {
+        "broker": "eastmoney",
+        "busy": False,
+        "message": "已导入 2026-07-30 · 持仓 12 · 统计待重建",
+        "error": False,
+    }
+
+
 def test_dashboard_statement_upload_rejects_extension_and_size_before_fetch() -> None:
     output = run_dashboard_js(r'''
 let fetches=0; globalThis.fetch=async()=>{fetches+=1;};
