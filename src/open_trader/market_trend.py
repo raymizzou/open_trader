@@ -547,13 +547,14 @@ def _candidate_pool_components(
     if len(matches) != 1:
         raise TrendAnimalsError("HK ETF warm-to-hot pool is not unique")
     resolved_id = _row_tm_id(matches[0])
-    return (
-        list(api.get_components(  # type: ignore[attr-defined]
+    try:
+        resolved_rows = api.get_components(  # type: ignore[attr-defined]
             tm_id=resolved_id,
             expected_date=expected_date,
-        )),
-        resolved_id,
-    )
+        )
+    except TrendAnimalsNoCurrentRowsError:
+        resolved_rows = []
+    return list(resolved_rows), resolved_id
 
 
 def _write_log(path: Path, event: Mapping[str, object]) -> None:

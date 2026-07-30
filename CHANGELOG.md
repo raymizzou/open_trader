@@ -8,11 +8,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Kept statement-only Phillips and Eastmoney holdings out of the Futu live-quote
   universe while preserving their accepted positions and labeling their
   statement prices explicitly in the Dashboard. A stale-only Hong Kong ETF
-  dynamic root now means zero ETF candidates, while stale-only secondary
-  industry breadth becomes a visible invalid context and falls back to
-  individual ordering. Current-date validation remains strict for every real
-  candidate pool; verified 803 relevant account-sync, quote, Dashboard, and
-  market-report tests, including the repository-data compatibility check.
+  dynamic root or resolved child now means zero ETF candidates, while
+  stale-only secondary industry breadth becomes a visible invalid context and
+  falls back to individual ordering. Current-date validation remains strict
+  for every real candidate pool; verified 803 relevant account-sync, quote,
+  Dashboard, and market-report tests, including the repository-data
+  compatibility check.
 - Added the sole account/quote sync controller: broker reads now validate a
   candidate before atomic publication, while the Dashboard only projects
   accepted files. Removed the Dashboard refresh action and the old rollback

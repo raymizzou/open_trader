@@ -741,6 +741,30 @@ def test_hk_etf_root_loads_unique_warm_to_hot_child() -> None:
     ) == ([security], 707900)
 
 
+def test_hk_etf_root_keeps_resolved_child_when_current_members_are_empty() -> None:
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            if tm_id == 707617:
+                return [{
+                    "tmId": 707824,
+                    "tickerName": "温转热(香港ETF)",
+                    "asOfDate": expected_date,
+                }]
+            assert tm_id == 707824
+            raise TrendAnimalsNoCurrentRowsError(
+                "getComponentTicker tmId=707824 returned no current-date rows"
+            )
+
+    assert _candidate_pool_components(
+        Api(),
+        market="HK",
+        pool_id=707617,
+        expected_date="2026-07-30",
+    ) == ([], 707824)
+
+
 def test_hk_etf_root_rejects_duplicate_warm_to_hot_children() -> None:
     class Api:
         def get_components(
