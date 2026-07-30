@@ -3611,9 +3611,17 @@ function trendRealHoldingSource(report) {
   return source && typeof source === "object" ? source : {};
 }
 
+function trendHoldingRowClass(item) {
+  return {
+    included: "trend-holding-included",
+    excluded: "trend-holding-excluded",
+    blacklisted: "trend-holding-blacklisted",
+  }[item?.trend_report_state] || "trend-holding-excluded";
+}
+
 function renderTrendHoldingRows(items, report) {
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
-  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
+  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card ${trendHoldingRowClass(item)}">
     ${optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
     ${renderTrendCell("动作", trendHoldingActionLabel(item))}
     ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}

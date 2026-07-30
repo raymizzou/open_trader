@@ -2676,6 +2676,18 @@ table {
   font-size: 12px;
 }
 
+.cn-trend-table .cn-trend-card.trend-holding-included td {
+  background: #e7f4ec;
+}
+
+.cn-trend-table .cn-trend-card.trend-holding-excluded td {
+  background: #fae8e6;
+}
+
+.cn-trend-table .cn-trend-card.trend-holding-blacklisted td {
+  background: var(--surface-soft);
+}
+
 .trend-discipline {
   background: var(--surface-soft);
   border: 1px solid var(--line);
