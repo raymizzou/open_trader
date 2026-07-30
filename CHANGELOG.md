@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Sorted CN/HK/US real and simulated trend-report holding rows by report
+  strength. Rows now reuse the existing light green, light pink, and soft gray
+  backgrounds to distinguish current buy/hold membership, non-trend holdings,
+  and trend-lookup blacklist exclusions without changing the ten-column table,
+  strategy, execution, or Feishu output.
 - Made real-holding Trend Animals lookup market-aware so same-code crypto rows
   no longer hide valid US stocks or ETFs. Successful mappings remain persistent;
   exact misses are cached per market and report data date, then retried on the
