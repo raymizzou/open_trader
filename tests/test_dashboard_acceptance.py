@@ -4244,7 +4244,6 @@ VISUAL_CONTRACT_STYLES = {
         "backgroundColor": "rgb(247, 245, 241)",
         "color": "rgb(32, 29, 24)",
     },
-    "#account-sync-status": {"color": "rgb(32, 29, 24)"},
     ".current-view-card": {
         "backgroundColor": "rgb(36, 33, 29)",
         "borderTopColor": "rgb(36, 33, 29)",
@@ -4286,6 +4285,8 @@ def visual_contract_page(*, accent: str = "#8B5E34") -> object:
         def count(self) -> int:
             if self.selector == "text=刷新账户与行情":
                 return 0
+            if self.selector == "#account-sync-status":
+                return 1
             return int(self.selector in VISUAL_CONTRACT_STYLES)
 
         def inner_text(self) -> str:
@@ -4834,6 +4835,33 @@ def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accept
     assert "phillips 账户同步状态不是正常" in errors
     assert "eastmoney 账户同步状态不是正常" in errors
     assert any("tiger 已接受持仓数量不匹配" in error for error in errors)
+
+
+def test_validate_dashboard_payload_counts_only_actual_accepted_holdings() -> None:
+    payload = valid_payload()
+    payload["broker_summaries"] = [{"broker": "tiger", "holding_count": 1}]
+    payload["broker_positions"] = [
+        {"broker": "tiger", "market": "US", "symbol": "MSFT", "quantity": "1"},
+        {"broker": "tiger", "market": "CASH", "symbol": "USD", "asset_class": "cash", "quantity": "1"},
+        {"broker": "tiger", "market": "US", "symbol": "MONEY", "asset_class": "money_market_fund", "quantity": "1"},
+    ]
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert not any("tiger 已接受持仓数量不匹配" in error for error in errors)
+
+
+def test_check_account_holdings_counts_only_actual_accepted_holdings() -> None:
+    payload = valid_payload()
+    payload["broker_positions"] = [
+        {"broker": "futu", "market": "US", "symbol": "QQQ", "quantity": "1"},
+        {"broker": "tiger", "market": "US", "symbol": "MSFT", "quantity": "1"},
+        {"broker": "tiger", "market": "CASH", "symbol": "USD", "asset_class": "cash", "quantity": "1"},
+        {"broker": "phillips", "market": "HK", "symbol": "0700", "quantity": "1"},
+    ]
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
 
 
 def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
@@ -5398,8 +5426,9 @@ def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:
         "portfolio_value_hkd": "628554.05",
     }]
     payload["source_statuses"] = [{
-        "broker": "phillips", "display_text": "2026-07 月结单导入"
+        "broker": "phillips", "display_text": "同步正常"
     }]
+    payload["account_sync"]["brokers"]["phillips"]["data_as_of"] = "2026-07-10"  # type: ignore[index]
 
     errors = validate_dashboard_payload(
         payload, expected_cn=5,

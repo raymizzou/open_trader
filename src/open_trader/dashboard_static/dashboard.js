@@ -8320,7 +8320,7 @@ function accountHoldingGroups() {
     const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
     const rows = (Array.isArray(state.dashboard?.broker_positions)
       ? state.dashboard.broker_positions : [])
-      .filter((position) => brokerKey(position) === broker)
+      .filter((position) => brokerKey(position) === broker && isAccountHoldingPosition(position))
       .map((position, index) => {
         const accepted = acceptedPositionForDisplay(position);
         const matching = getHoldings().find((holding) => (
@@ -8730,6 +8730,11 @@ function quoteNotApplicable(holding) {
   const market = String(holding.market || "").toUpperCase();
   const assetClass = String(holding.asset_class || "").toLowerCase();
   return market === "CASH" || assetClass === "cash" || assetClass === "money_market_fund";
+}
+
+function isAccountHoldingPosition(position) {
+  const quantity = numericValue(firstPresent(position.total_quantity, position.quantity));
+  return !quoteNotApplicable(position) && quantity !== 0;
 }
 
 function detailLivePrice(holding, quote) {

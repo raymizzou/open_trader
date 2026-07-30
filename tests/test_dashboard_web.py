@@ -3757,6 +3757,8 @@ state.dashboard = {
   broker_positions: [
     {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
     {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
+    {broker: "tiger", account_alias: "tiger_1", market: "CASH", symbol: "USD", asset_class: "cash", quantity: "1", market_value_hkd: "400"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "MONEY", asset_class: "money_market_fund", quantity: "1", market_value_hkd: "100"},
   ],
   holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
     {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},

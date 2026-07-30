@@ -262,14 +262,14 @@ def validate_dashboard_payload(
                 f"{expected_phillips_total} HKD"
             )
     if expected_phillips_period is not None:
-        phillips_status = next(
-            (
-                row for row in payload.get("source_statuses") or []
-                if row.get("broker") == "phillips"
-            ),
-            {},
+        account_sync = payload.get("account_sync")
+        brokers = account_sync.get("brokers") if isinstance(account_sync, Mapping) else {}
+        phillips_source = brokers.get("phillips") if isinstance(brokers, Mapping) else {}
+        data_as_of = str(
+            phillips_source.get("data_as_of", "")
+            if isinstance(phillips_source, Mapping) else ""
         )
-        if expected_phillips_period not in str(phillips_status.get("display_text", "")):
+        if not data_as_of.startswith(expected_phillips_period):
             errors.append(f"辉立未使用最新结单：{expected_phillips_period}")
     cn_rows = [row for row in holdings if row.get("market") == "CN"]
     if len(cn_rows) != expected_cn:
@@ -349,11 +349,27 @@ def _account_sync_errors(payload: Mapping[str, Any]) -> list[str]:
                 continue
             actual = sum(
                 1 for row in positions
-                if isinstance(row, Mapping) and str(row.get("broker") or "") == broker
+                if (
+                    isinstance(row, Mapping)
+                    and str(row.get("broker") or "") == broker
+                    and _is_accepted_dashboard_holding(row)
+                )
             )
             if actual != expected:
                 errors.append(f"{broker} 已接受持仓数量不匹配：{actual} != {expected}")
     return errors
+
+
+def _is_accepted_dashboard_holding(row: Mapping[str, Any]) -> bool:
+    normalized = {
+        str(key): "" if value is None else str(value)
+        for key, value in row.items()
+    }
+    quantity = row.get("total_quantity")
+    if quantity is None or not str(quantity).strip():
+        quantity = row.get("quantity", "")
+    normalized["total_quantity"] = "" if quantity is None else str(quantity)
+    return _is_dashboard_holding(normalized)
 
 
 def _account_sync_controller_errors(
@@ -2925,7 +2941,11 @@ def _check_account_holdings(
         if check_accepted_counts:
             expected_rows = sum(
                 1 for row in positions
-                if isinstance(row, Mapping) and row.get("broker") == broker
+                if (
+                    isinstance(row, Mapping)
+                    and row.get("broker") == broker
+                    and _is_accepted_dashboard_holding(row)
+                )
             )
             assert rows.count() == expected_rows, (
                 f"{broker} 已接受持仓行数不匹配：{rows.count()} != {expected_rows}"
@@ -3814,7 +3834,6 @@ def _check_visual_contract(page: Any) -> None:
             "backgroundColor": "rgb(247, 245, 241)",
             "color": "rgb(32, 29, 24)",
         },
-        "#account-sync-status": {"color": "rgb(32, 29, 24)"},
         ".current-view-card": {
             "backgroundColor": "rgb(36, 33, 29)",
             "borderTopColor": "rgb(36, 33, 29)",
