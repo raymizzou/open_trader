@@ -11,9 +11,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   dynamic root or resolved child now means zero ETF candidates, while
   stale-only secondary industry breadth becomes a visible invalid context and
   falls back to individual ordering. Current-date validation remains strict
-  for every real candidate pool; verified 803 relevant account-sync, quote,
-  Dashboard, and market-report tests, including the repository-data
-  compatibility check.
+  for every real candidate pool. The final gate now reads the launchd-owned
+  Dashboard log instead of an obsolete temporary path; verified 3,868 full
+  tests plus 11 focused launchd and gate tests.
 - Added the sole account/quote sync controller: broker reads now validate a
   candidate before atomic publication, while the Dashboard only projects
   accepted files. Removed the Dashboard refresh action and the old rollback
