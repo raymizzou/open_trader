@@ -11606,6 +11606,40 @@ def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
     assert importer.calls == [("phillips", b"%PDF-1.7\nstatement")]
 
 
+def test_dashboard_server_builds_candidate_only_statement_import_service(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader import dashboard_web
+
+    captured: dict[str, object] = {}
+
+    class CandidateOnlyStatementImportService:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def import_pdf(self, broker: str, body: bytes) -> dict[str, object]:
+            return {"broker": broker}
+
+    monkeypatch.setattr(
+        dashboard_web, "StatementImportService", CandidateOnlyStatementImportService
+    )
+    config = dashboard_config(tmp_path)
+    server = dashboard_web.create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        quote_service=FakeQuoteService(quote_result()),
+    )
+    try:
+        assert captured == {
+            "data_dir": config.data_dir,
+            "reports_dir": config.reports_dir,
+            "eastmoney_password": "",
+        }
+    finally:
+        server.server_close()
+
+
 def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 

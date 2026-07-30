@@ -4,11 +4,10 @@ from dataclasses import dataclass
 import csv
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from os import close
 from pathlib import Path
 import re
-from shutil import copyfile, rmtree
-from tempfile import mkdtemp, mkstemp
+from shutil import rmtree
+from tempfile import mkdtemp
 from typing import Iterable, Mapping
 from uuid import uuid4
 
@@ -27,8 +26,6 @@ from .parsers.base import ParseResult, StatementParser, sha256_file
 from .portfolio import (
     PORTFOLIO_FIELDNAMES,
     build_portfolio_rows,
-    merge_eastmoney_portfolio_rows,
-    replace_broker_portfolio_rows,
 )
 from .trend_review import ACTUAL_FILL_MARKETS_BY_BROKER, freeze_actual_fill_batch
 
@@ -106,7 +103,6 @@ MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 class ImportResult:
     run_dir: Path
     portfolio_path: Path
-    latest_path: Path
     positions_count: int
     cash_count: int
     warnings_count: int
@@ -118,20 +114,18 @@ def run_import(
     parsers: Iterable[StatementParser],
     data_dir: Path,
     fx_provider: StaticMonthEndFxProvider,
-    update_latest: bool = True,
 ) -> ImportResult:
     validate_month(month)
+    parser_list = list(parsers)
     return _run_import(
         month=month,
         statement_period=month,
         run_name=month,
         statement_paths=statement_paths,
-        parsers=parsers,
+        parsers=parser_list,
         data_dir=data_dir,
-        latest_path=data_dir / "latest" / "portfolio.csv",
         fx_provider=fx_provider,
-        update_latest=update_latest,
-        replace_latest_broker=None,
+        replace_run_brokers={parser.broker for parser in parser_list},
         actual_fill_complete_through=None,
     )
 
@@ -142,7 +136,6 @@ def run_uploaded_statement(
     statement_path: Path,
     parser: StatementParser,
     data_dir: Path,
-    portfolio_path: Path,
     fx_provider: StaticMonthEndFxProvider,
 ) -> ImportResult:
     try:
@@ -158,10 +151,8 @@ def run_uploaded_statement(
         statement_paths={parser.broker: statement_path},
         parsers=[parser],
         data_dir=data_dir,
-        latest_path=portfolio_path,
         fx_provider=fx_provider,
-        update_latest=True,
-        replace_latest_broker=parser.broker,
+        replace_run_brokers={parser.broker},
         actual_fill_complete_through=statement_date,
     )
 
@@ -174,26 +165,23 @@ def _run_import(
     statement_paths: Mapping[str, Path],
     parsers: Iterable[StatementParser],
     data_dir: Path,
-    latest_path: Path,
     fx_provider: StaticMonthEndFxProvider,
-    update_latest: bool,
-    replace_latest_broker: str | None,
+    replace_run_brokers: set[str],
     actual_fill_complete_through: str | None,
 ) -> ImportResult:
     parser_list = list(parsers)
     _validate_statement_paths(statement_paths, parser_list)
 
     run_dir = data_dir / "runs" / run_name
-    latest_dir = latest_path.parent
 
     positions: list[Position] = []
     cash_balances: list[CashBalance] = []
     fills: list[TradeFill] = []
     warnings: list[WarningRecord] = []
     manifest: list[ManifestRecord] = []
-    if replace_latest_broker is not None:
+    if replace_run_brokers:
         positions, cash_balances, fills, warnings, manifest = _preserved_run_records(
-            run_dir, replace_latest_broker
+            run_dir, replace_run_brokers
         )
     uploaded_positions: list[Position] = []
     uploaded_cash: list[CashBalance] = []
@@ -246,47 +234,11 @@ def _run_import(
         )
 
     portfolio_rows = build_portfolio_rows(month, positions, cash_balances, fx_provider)
-    uploaded_portfolio_rows = build_portfolio_rows(
-        month, uploaded_positions, uploaded_cash, fx_provider
-    )
-    latest_portfolio_rows = portfolio_rows
-
-    eastmoney_mode = {parser.broker for parser in parser_list} == {"eastmoney"}
-    if replace_latest_broker is not None and latest_path.exists():
-        detail_dir = _latest_daily_detail_dir(data_dir)
-        if detail_dir is not None:
-            latest_positions, latest_cash, _, _, _ = _preserved_run_records(
-                detail_dir, replace_latest_broker
-            )
-            latest_portfolio_rows = build_portfolio_rows(
-                month,
-                [*latest_positions, *uploaded_positions],
-                [*latest_cash, *uploaded_cash],
-                fx_provider,
-            )
-        else:
-            with latest_path.open(newline="", encoding="utf-8") as handle:
-                latest_portfolio_rows = replace_broker_portfolio_rows(
-                    list(csv.DictReader(handle)),
-                    uploaded_portfolio_rows,
-                    replace_latest_broker,
-                )
-    elif eastmoney_mode and latest_path.exists():
-        with latest_path.open(newline="", encoding="utf-8") as handle:
-            portfolio_rows = merge_eastmoney_portfolio_rows(
-                list(csv.DictReader(handle)), portfolio_rows
-            )
     temp_run_dir = _make_temp_run_dir(run_dir)
-    temp_latest_path: Path | None = None
-    backup_latest_path: Path | None = None
     backup_run_dir: Path | None = None
     temp_run_promoted = False
-    latest_replaced = False
     fills = list({(fill.broker, fill.source_id): fill for fill in fills}.values())
     try:
-        if update_latest:
-            latest_dir.mkdir(parents=True, exist_ok=True)
-            temp_latest_path = _make_temp_latest_path(latest_path)
         write_rows(
             temp_run_dir / "manifest.csv",
             MANIFEST_FIELDNAMES,
@@ -313,22 +265,6 @@ def _run_import(
             (warning.to_row() for warning in warnings),
         )
         write_rows(temp_run_dir / "portfolio.csv", PORTFOLIO_FIELDNAMES, portfolio_rows)
-
-        if update_latest:
-            assert temp_latest_path is not None
-            if latest_portfolio_rows is portfolio_rows:
-                copyfile(temp_run_dir / "portfolio.csv", temp_latest_path)
-            else:
-                write_rows(
-                    temp_latest_path,
-                    PORTFOLIO_FIELDNAMES,
-                    latest_portfolio_rows,
-                )
-            if latest_path.exists():
-                backup_latest_path = _make_backup_latest_path(latest_path)
-                latest_path.rename(backup_latest_path)
-            temp_latest_path.replace(latest_path)
-            latest_replaced = True
 
         if run_dir.exists():
             backup_run_dir = _make_backup_run_dir(run_dir)
@@ -358,63 +294,33 @@ def _run_import(
         if actual_fill_complete_through is None:
             if backup_run_dir is not None and backup_run_dir.exists():
                 rmtree(backup_run_dir)
-            if backup_latest_path is not None and backup_latest_path.exists():
-                _best_effort_unlink(backup_latest_path)
     except Exception:
         _rollback_failed_promotion(
             run_dir=run_dir,
             temp_run_dir=temp_run_dir,
-            temp_latest_path=temp_latest_path,
-            latest_path=latest_path,
-            backup_latest_path=backup_latest_path,
             backup_run_dir=backup_run_dir,
             temp_run_promoted=temp_run_promoted,
-            latest_replaced=latest_replaced,
         )
         raise
 
     if actual_fill_complete_through is not None:
         if backup_run_dir is not None and backup_run_dir.exists():
             _best_effort_rmtree(backup_run_dir)
-        if backup_latest_path is not None and backup_latest_path.exists():
-            _best_effort_unlink(backup_latest_path)
 
     portfolio_path = run_dir / "portfolio.csv"
 
     return ImportResult(
         run_dir=run_dir,
         portfolio_path=portfolio_path,
-        latest_path=latest_path,
-        positions_count=(
-            sum(row["asset_class"] != "cash" for row in portfolio_rows)
-            if eastmoney_mode and replace_latest_broker is None
-            else len(uploaded_positions)
-        ),
+        positions_count=len(uploaded_positions),
         cash_count=len(uploaded_cash),
         warnings_count=len(warnings),
     )
 
 
-def _latest_daily_detail_dir(data_dir: Path) -> Path | None:
-    runs_dir = data_dir / "runs"
-    if not runs_dir.exists():
-        return None
-    candidates = [
-        path
-        for path in runs_dir.iterdir()
-        if path.is_dir()
-        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.name)
-        and (
-            (path / "extracted_positions.csv").is_file()
-            or (path / "extracted_cash.csv").is_file()
-        )
-    ]
-    return max(candidates, key=lambda path: path.name) if candidates else None
-
-
 def _preserved_run_records(
     run_dir: Path,
-    target_broker: str,
+    target_brokers: set[str],
 ) -> tuple[
     list[Position],
     list[CashBalance],
@@ -422,21 +328,21 @@ def _preserved_run_records(
     list[WarningRecord],
     list[ManifestRecord],
 ]:
-    target = target_broker.strip().lower()
+    targets = {broker.strip().lower() for broker in target_brokers}
     positions = [
         _position_from_row(row)
         for row in _read_rows(run_dir / "extracted_positions.csv")
-        if _detail_broker(row) != target
+        if _detail_broker(row) not in targets
     ]
     cash = [
         _cash_from_row(row)
         for row in _read_rows(run_dir / "extracted_cash.csv")
-        if _detail_broker(row) != target
+        if _detail_broker(row) not in targets
     ]
     fills = [
         _fill_from_row(row)
         for row in _read_rows(run_dir / "extracted_fills.csv")
-        if _detail_broker(row) != target
+        if _detail_broker(row) not in targets
     ]
     warnings = [
         WarningRecord(
@@ -448,7 +354,7 @@ def _preserved_run_records(
             message=row.get("message", ""),
         )
         for row in _read_rows(run_dir / "parse_warnings.csv")
-        if row.get("broker", "").strip().lower() != target
+        if row.get("broker", "").strip().lower() not in targets
     ]
     manifest = [
         ManifestRecord(
@@ -462,7 +368,7 @@ def _preserved_run_records(
             status=row.get("status", ""),
         )
         for row in _read_rows(run_dir / "manifest.csv")
-        if row.get("broker", "").strip().lower() != target
+        if row.get("broker", "").strip().lower() not in targets
     ]
     return positions, cash, fills, warnings, manifest
 
@@ -565,26 +471,12 @@ def _make_backup_run_dir(run_dir: Path) -> Path:
     return _unique_sibling_path(run_dir, "backup")
 
 
-def _make_backup_latest_path(latest_path: Path) -> Path:
-    return _unique_sibling_path(latest_path, "backup")
-
-
 def _make_failed_run_dir(run_dir: Path) -> Path:
     return _unique_sibling_path(run_dir, "failed")
 
 
 def _unique_sibling_path(path: Path, suffix: str) -> Path:
     return path.parent / f".{path.name}.{uuid4().hex}.{suffix}"
-
-
-def _make_temp_latest_path(latest_path: Path) -> Path:
-    file_descriptor, name = mkstemp(
-        prefix=".portfolio.",
-        suffix=".tmp",
-        dir=latest_path.parent,
-    )
-    close(file_descriptor)
-    return Path(name)
 
 
 def _make_temp_run_dir(run_dir: Path) -> Path:
@@ -602,19 +494,9 @@ def _rollback_failed_promotion(
     *,
     run_dir: Path,
     temp_run_dir: Path,
-    temp_latest_path: Path | None,
-    latest_path: Path,
-    backup_latest_path: Path | None,
     backup_run_dir: Path | None,
     temp_run_promoted: bool,
-    latest_replaced: bool,
 ) -> None:
-    _restore_latest_after_failure(
-        latest_path=latest_path,
-        backup_latest_path=backup_latest_path,
-        latest_replaced=latest_replaced,
-    )
-
     failed_run_dir: Path | None = None
     if temp_run_promoted and run_dir.exists():
         failed_run_dir = _make_failed_run_dir(run_dir)
@@ -638,29 +520,6 @@ def _rollback_failed_promotion(
         _best_effort_rmtree(failed_run_dir)
     if temp_run_dir.exists():
         _best_effort_rmtree(temp_run_dir)
-    if temp_latest_path is not None and temp_latest_path.exists():
-        _best_effort_unlink(temp_latest_path)
-    if backup_latest_path is not None and backup_latest_path.exists():
-        _best_effort_unlink(backup_latest_path)
-
-
-def _restore_latest_after_failure(
-    *,
-    latest_path: Path,
-    backup_latest_path: Path | None,
-    latest_replaced: bool,
-) -> None:
-    if backup_latest_path is not None and backup_latest_path.exists():
-        if latest_path.exists():
-            _best_effort_unlink(latest_path)
-        try:
-            backup_latest_path.rename(latest_path)
-        except Exception:
-            pass
-    elif latest_replaced and latest_path.exists():
-        _best_effort_unlink(latest_path)
-
-
 def _best_effort_rmtree(path: Path) -> None:
     try:
         rmtree(path)

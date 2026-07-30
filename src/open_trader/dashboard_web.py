@@ -891,7 +891,6 @@ def create_dashboard_server(
     import_service = statement_import_service or StatementImportService(
         data_dir=config.data_dir,
         reports_dir=config.reports_dir,
-        portfolio_path=config.portfolio_path,
         eastmoney_password=eastmoney_password,
     )
     portfolio_update_lock = threading.Lock()

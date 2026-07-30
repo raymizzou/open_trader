@@ -42,7 +42,6 @@ from .daily_premarket import (
     load_env_config,
     require_trend_executor,
     require_trend_review_config,
-    refresh_live_portfolio,
     send_notification_with_results,
 )
 from .dashboard import DashboardConfig
@@ -386,7 +385,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_parser.add_argument("--cny-hkd", type=positive_decimal)
     import_parser.add_argument("--fx-date", type=canonical_date)
-    import_parser.add_argument("--update-latest", action="store_true")
 
     premarket_parser = subparsers.add_parser(
         "run-premarket",
@@ -1779,10 +1777,8 @@ def main(argv: list[str] | None = None) -> int:
             fx_provider=StaticMonthEndFxProvider(
                 args.month, rates, fx_date=args.fx_date
             ),
-            update_latest=args.update_latest,
         )
         print(f"portfolio: {result.portfolio_path}")
-        print(f"latest: {result.latest_path}")
         print(f"positions: {result.positions_count}")
         print(f"cash: {result.cash_count}")
         print(f"warnings: {result.warnings_count}")
@@ -1883,9 +1879,6 @@ def main(argv: list[str] | None = None) -> int:
             result = DailyPremarketRunner(
                 config=config,
                 notifier=build_notifier(config),
-                portfolio_refresher=(
-                    None if args.dry_run else refresh_live_portfolio
-                ),
             ).run(
                 run_date=run_date,
                 market=args.market,
