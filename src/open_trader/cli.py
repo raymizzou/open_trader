@@ -2088,6 +2088,8 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 result = run_t_signal_watch_once(
                     portfolio_path=args.portfolio,
+                    account_state_path=args.data_dir / "latest" / "account_sync_state.json",
+                    controller_status_path=args.data_dir / "account_sync" / "controller_status.json",
                     data_dir=args.data_dir,
                     run_date=args.date,
                     market=args.market,
@@ -2102,6 +2104,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"run_date: {result.run_date}")
                 print(f"market: {result.market}")
                 print(f"signals: {result.signal_count}")
+                print(f"blocked: {result.blocked_count}")
                 print(f"notified: {result.notified_count}")
                 print(f"signals_json: {result.run_path}")
                 print(f"latest: {result.latest_path}")

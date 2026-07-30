@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
+from open_trader.account_sync_state import empty_account_sync_state
 from open_trader.t_signal import TMarketFacts, apply_ai_interpretation
-from open_trader.t_signal_runner import run_t_signal_watch_once
+from open_trader.t_signal_runner import run_t_signal_watch_once as _run_t_signal_watch_once
 from open_trader.t_signal_store import load_t_signals_cache
 from open_trader.notifications import (
     CompositeNotifier,
@@ -169,6 +171,300 @@ class RecordingMacOS(MacOSNotifier):
 
 def fixed_now() -> datetime:
     return datetime.fromisoformat("2026-07-02T22:32:00+08:00")
+
+
+def write_account_sync_inputs(
+    data_dir: Path,
+    *,
+    now: datetime,
+    futu_status: str = "ok",
+    futu_last_success: str | None = None,
+    controller_heartbeat: datetime | None = None,
+) -> None:
+    state = empty_account_sync_state()
+    brokers = state["brokers"]
+    assert isinstance(brokers, dict)
+    for broker, source in brokers.items():
+        assert isinstance(source, dict)
+        source["status"] = futu_status if broker == "futu" else "ok"
+        source["last_success_at"] = futu_last_success if broker == "futu" and futu_last_success else now.isoformat()
+        source["data_as_of"] = source["last_success_at"]
+    state["generation"] = now.isoformat()
+    state_path = data_dir / "latest/account_sync_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    status_path = data_dir / "account_sync/controller_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.account_sync.controller.v1",
+                "pid": 123,
+                "started_at": now.isoformat(),
+                "working_directory": "/tmp",
+                "git_sha": "test",
+                "heartbeat_at": (controller_heartbeat or now).isoformat(),
+                "phase": "idle",
+                "account_loop": {},
+                "quote_loop": {"status": "failed"},
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def run_t_signal_watch_once(**kwargs):
+    data_dir = kwargs["data_dir"]
+    assert isinstance(data_dir, Path)
+    now = kwargs.get("now_fn", fixed_now)()
+    account_state_path = kwargs.setdefault(
+        "account_state_path", data_dir / "latest/account_sync_state.json"
+    )
+    controller_status_path = kwargs.setdefault(
+        "controller_status_path", data_dir / "account_sync/controller_status.json"
+    )
+    assert isinstance(account_state_path, Path)
+    assert isinstance(controller_status_path, Path)
+    if not account_state_path.exists() or not controller_status_path.exists():
+        write_account_sync_inputs(data_dir, now=now)
+    return _run_t_signal_watch_once(**kwargs)
+
+
+def write_portfolio_row(path: Path, *, symbol: str, brokers: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
+        if handle.tell() == 0:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "sort_group": "4",
+                "market": "US",
+                "asset_class": "etf",
+                "symbol": symbol,
+                "name": symbol,
+                "currency": "USD",
+                "total_quantity": "100",
+                "avg_cost_price": "45.00",
+                "last_price": "48.50",
+                "market_value": "4850.00",
+                "cost_value": "4500.00",
+                "unrealized_pnl": "350.00",
+                "unrealized_pnl_pct": "7.78%",
+                "fx_source": "fixture",
+                "fx_date": "2026-05-31",
+                "fx_to_hkd": "7.8",
+                "market_value_hkd": "37830.00",
+                "cost_value_hkd": "35100.00",
+                "portfolio_weight_hkd": "97.80%",
+                "brokers": brokers,
+                "accounts": "main",
+                "ai_eligible": "true",
+                "analysis_symbol": symbol,
+                "risk_flag": "normal",
+                "confidence": "high",
+                "notes": "",
+            }
+        )
+
+
+class RecordingInterpreter:
+    def __init__(self) -> None:
+        self.symbols: list[str] = []
+
+    def interpret(self, signal):
+        self.symbols.append(signal.symbol)
+        return signal
+
+
+def test_t_signal_runner_blocks_stale_broker_before_facts_interpretation_and_notification(
+    tmp_path: Path,
+) -> None:
+    now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="tiger")
+    write_portfolio_row(portfolio_path, symbol="TLT", brokers="futu")
+    write_account_sync_inputs(
+        data_dir,
+        now=now,
+        futu_status="ok",
+        futu_last_success="2026-07-30T11:56:54+08:00",
+    )
+    client = FakeMarketDataClient()
+    interpreter = RecordingInterpreter()
+    notifier = CapturingNotifier()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        account_state_path=data_dir / "latest/account_sync_state.json",
+        controller_status_path=data_dir / "account_sync/controller_status.json",
+        data_dir=data_dir,
+        run_date="2026-07-30",
+        market="US",
+        session_phase="regular",
+        market_data_client=client,
+        interpreter=interpreter,
+        notifier=notifier,
+        now_fn=lambda: now,
+    )
+
+    assert result.signal_count == 2
+    assert result.blocked_count == 1
+    assert [call["symbol"] for call in client.calls] == ["VIXY"]
+    assert interpreter.symbols == ["VIXY"]
+    assert len(notifier.messages) == 1
+    records = load_t_signals_cache(data_dir / "latest/US/t_signals.json")["records"]
+    stale = next(record for record in records if record["symbol"] == "TLT")
+    assert stale["action"] == "REVIEW"
+    assert stale["status"] == "error"
+    assert stale["suggested_ratio"] == ""
+    assert stale["notification"]["should_notify"] is False
+    assert stale["error"] == "账户数据已过期，数据截至 2026-07-30T11:56:54+08:00，仅供人工复核。"
+
+
+def test_t_signal_runner_blocks_failed_unknown_missing_and_stale_controller_sources(
+    tmp_path: Path,
+) -> None:
+    now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
+    cases = (
+        ("failed", "failed", None),
+        ("unknown", "unknown", None),
+        ("missing", None, None),
+        ("controller_stale", "ok", now - timedelta(seconds=16)),
+    )
+    for name, futu_status, heartbeat in cases:
+        data_dir = tmp_path / name / "data"
+        portfolio_path = data_dir / "latest/portfolio.csv"
+        write_portfolio_row(portfolio_path, symbol="VIXY", brokers="futu")
+        if futu_status is not None:
+            write_account_sync_inputs(
+                data_dir,
+                now=now,
+                futu_status=futu_status,
+                controller_heartbeat=heartbeat,
+            )
+        else:
+            write_account_sync_inputs(data_dir, now=now)
+            (data_dir / "latest/account_sync_state.json").unlink()
+        client = FakeMarketDataClient()
+        interpreter = RecordingInterpreter()
+        notifier = CapturingNotifier()
+
+        runner = _run_t_signal_watch_once if futu_status is None else run_t_signal_watch_once
+        result = runner(
+            portfolio_path=portfolio_path,
+            account_state_path=data_dir / "latest/account_sync_state.json",
+            controller_status_path=data_dir / "account_sync/controller_status.json",
+            data_dir=data_dir,
+            run_date="2026-07-30",
+            market="US",
+            session_phase="regular",
+            market_data_client=client,
+            interpreter=interpreter,
+            notifier=notifier,
+            now_fn=lambda: now,
+        )
+
+        assert result.blocked_count == 1
+        assert client.calls == []
+        assert interpreter.symbols == []
+        assert notifier.messages == []
+        record = load_t_signals_cache(data_dir / "latest/US/t_signals.json")["records"][0]
+        assert record["action"] == "REVIEW"
+        assert record["status"] == "error"
+        assert record["notification"]["should_notify"] is False
+
+
+def test_t_signal_runner_blocks_mixed_broker_row_when_one_named_broker_is_unsafe(
+    tmp_path: Path,
+) -> None:
+    now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="tiger; futu")
+    write_account_sync_inputs(data_dir, now=now, futu_status="failed")
+    client = FakeMarketDataClient()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        account_state_path=data_dir / "latest/account_sync_state.json",
+        controller_status_path=data_dir / "account_sync/controller_status.json",
+        data_dir=data_dir,
+        run_date="2026-07-30",
+        market="US",
+        session_phase="regular",
+        market_data_client=client,
+        interpreter=RecordingInterpreter(),
+        notifier=CapturingNotifier(),
+        now_fn=lambda: now,
+    )
+
+    assert result.blocked_count == 1
+    assert client.calls == []
+
+
+def test_t_signal_runner_keeps_previous_facts_visible_when_a_broker_becomes_unsafe(
+    tmp_path: Path,
+) -> None:
+    now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="futu")
+    write_account_sync_inputs(data_dir, now=now)
+    common = {
+        "portfolio_path": portfolio_path,
+        "account_state_path": data_dir / "latest/account_sync_state.json",
+        "controller_status_path": data_dir / "account_sync/controller_status.json",
+        "data_dir": data_dir,
+        "run_date": "2026-07-30",
+        "market": "US",
+        "session_phase": "regular",
+        "interpreter": RecordingInterpreter(),
+        "notifier": CapturingNotifier(),
+        "now_fn": lambda: now,
+    }
+    run_t_signal_watch_once(market_data_client=FakeMarketDataClient(), **common)
+    write_account_sync_inputs(data_dir, now=now, futu_status="failed")
+
+    run_t_signal_watch_once(market_data_client=FakeMarketDataClient(), **common)
+
+    record = load_t_signals_cache(data_dir / "latest/US/t_signals.json")["records"][0]
+    assert record["action"] == "REVIEW"
+    assert record["status"] == "error"
+    assert "账户数据同步失败" in record["error"]
+    assert record["price"]["last_price"] == "48.50"
+    assert len(record["timeline"]) == 3
+    assert record["timeline"][-1]["event_type"] == "review_required"
+
+
+def test_t_signal_runner_normalizes_naive_clock_before_checking_accepted_state(
+    tmp_path: Path,
+) -> None:
+    aware_now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="futu")
+    write_account_sync_inputs(data_dir, now=aware_now)
+    client = FakeMarketDataClient()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        account_state_path=data_dir / "latest/account_sync_state.json",
+        controller_status_path=data_dir / "account_sync/controller_status.json",
+        data_dir=data_dir,
+        run_date="2026-07-30",
+        market="US",
+        session_phase="regular",
+        market_data_client=client,
+        interpreter=RecordingInterpreter(),
+        notifier=NullNotifier(),
+        now_fn=lambda: aware_now.replace(tzinfo=None),
+    )
+
+    assert result.blocked_count == 0
+    assert [call["symbol"] for call in client.calls] == ["VIXY"]
 
 
 def test_t_signal_runner_writes_artifact_and_sends_once(tmp_path: Path) -> None:

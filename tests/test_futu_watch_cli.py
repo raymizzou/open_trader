@@ -249,6 +249,8 @@ def test_watch_t_main_wires_runner(
     assert result == 0
     assert captured["portfolio_path"] == Path("portfolio.csv")
     assert captured["data_dir"] == tmp_path / "data"
+    assert captured["account_state_path"] == tmp_path / "data/latest/account_sync_state.json"
+    assert captured["controller_status_path"] == tmp_path / "data/account_sync/controller_status.json"
     assert captured["run_date"] == "2026-07-02"
     assert captured["market"] == "US"
     assert captured["session_phase"] == "regular"
