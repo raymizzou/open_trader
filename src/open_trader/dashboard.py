@@ -1240,12 +1240,95 @@ def _project_trend_actions(
     return sell_actions, buy_actions, hold_actions, review_actions
 
 
+def _project_trend_real_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project the frozen read-only real-account decisions for the dashboard."""
+    judgments = payload.get("strategy_judgments")
+    if not isinstance(judgments, dict):
+        return []
+    raw_items = judgments.get("real_holding_decisions")
+    if not isinstance(raw_items, list):
+        return []
+    metadata = payload.get("metadata")
+    market = (
+        str(metadata.get("market") or "CN").upper()
+        if isinstance(metadata, dict)
+        else "CN"
+    )
+    snapshots = payload.get("signal_snapshots")
+    frozen = (
+        snapshots.get("real_holdings", {})
+        if isinstance(snapshots, dict)
+        else {}
+    )
+    projected_items: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        projected = _project_trend_money_fields(
+            item, payload=payload, market=market
+        )
+        snapshot = frozen.get(str(projected.get("symbol") or "")) if isinstance(frozen, dict) else None
+        if isinstance(snapshot, dict):
+            for key in ("industry", "industry_tm_id", "days", "phase"):
+                if projected.get(key) in (None, "") and snapshot.get(key) not in (None, ""):
+                    projected[key] = snapshot[key]
+        projected_items.append(projected)
+    urgency = {
+        "SELL_ALL": 0,
+        "SELL_PARTIAL": 1,
+        "MANUAL_REVIEW": 2,
+        "HOLD": 3,
+    }
+    return sorted(
+        projected_items,
+        key=lambda item: (
+            urgency.get(str(item.get("action") or ""), 4),
+            *_project_trend_holding_individual_key(item),
+        ),
+    )
+
+
 def _valid_trend_collections(
     payload: dict[str, Any], judgments: dict[str, Any]
 ) -> bool:
     if any(
         not all(isinstance(item, dict) for item in judgments[key])
         for key in ("formal_actions", "holding_decisions", "top10_candidates")
+    ):
+        return False
+    real_status = judgments.get("real_holding_decisions_status")
+    if real_status is not None:
+        if real_status == "available":
+            if not isinstance(judgments.get("real_holding_decisions"), list):
+                return False
+            if not all(
+                isinstance(item, dict)
+                for item in judgments["real_holding_decisions"]
+            ):
+                return False
+            if "real_holding_decisions_reason" in judgments:
+                return False
+        elif real_status == "unavailable":
+            reason = judgments.get("real_holding_decisions_reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return False
+            if "real_holding_decisions" in judgments:
+                return False
+        else:
+            return False
+        source = judgments.get("real_holding_decisions_source", {})
+        if not isinstance(source, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in source.items()
+        ):
+            return False
+    elif any(
+        key in judgments
+        for key in (
+            "real_holding_decisions",
+            "real_holding_decisions_reason",
+            "real_holding_decisions_source",
+        )
     ):
         return False
     risk_skips = judgments.get("risk_skips", [])
@@ -2036,6 +2119,10 @@ def _project_broker_trend_report(
             "buy_actions": [],
             "hold_actions": [],
             "review_actions": [],
+            "real_position_actions": [],
+            "real_position_status": "unavailable",
+            "real_position_reason": execution_batch_error,
+            "real_position_source": {},
             "risk_skips": [],
             "risk_summary": {},
             "drawdown_summary": {},
@@ -2062,6 +2149,7 @@ def _project_broker_trend_report(
     sell_actions, buy_actions, hold_actions, review_actions = (
         _project_trend_actions(payload, executions)
     )
+    real_position_actions = _project_trend_real_actions(payload)
     if market in {"US", "HK"}:
         option_anomalies = _trend_option_anomalies(
             data_dir,
@@ -2085,7 +2173,7 @@ def _project_broker_trend_report(
                 }
             item["option_anomaly"] = option_anomaly
 
-        for action in [*buy_actions, *hold_actions]:
+        for action in [*buy_actions, *hold_actions, *real_position_actions]:
             attach_option_anomaly(action)
     risk_skips = _project_trend_money_items(
         payload["strategy_judgments"].get("risk_skips", []),
@@ -2164,6 +2252,16 @@ def _project_broker_trend_report(
         broker_positions=broker_positions or [],
         cash_details=cash_details or [],
     )
+    real_status = payload["strategy_judgments"].get(
+        "real_holding_decisions_status"
+    )
+    if real_status not in {"available", "unavailable"}:
+        real_status = "legacy"
+    real_reason = payload["strategy_judgments"].get(
+        "real_holding_decisions_reason", ""
+    )
+    if real_status == "legacy":
+        real_reason = "当前报告未包含真实持仓判断"
     return {
         "available": True,
         "artifact": path.name,
@@ -2196,6 +2294,12 @@ def _project_broker_trend_report(
             else f"数据截至 {data_date}；今日未更新"
         ),
         "option_attention": payload.get("option_attention", []),
+        "real_position_actions": real_position_actions,
+        "real_position_status": real_status,
+        "real_position_reason": real_reason,
+        "real_position_source": payload["strategy_judgments"].get(
+            "real_holding_decisions_source", {}
+        ),
         "account_source_date": str(account.get("source_date") or ""),
         "account_fresh": account_fresh,
         "account_status": "已更新" if account_fresh else NON_REALTIME_ACCOUNT_WARNING,

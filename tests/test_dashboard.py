@@ -425,6 +425,8 @@ def test_exact_historical_report_includes_its_immutable_execution(
     assert report["audit"]["artifact"] == "2026-07-16.json"
     assert report["report_sha256"] == _report_hash(payload)
     assert report["strategy_version"] == "v1"
+    assert report["real_position_status"] == "legacy"
+    assert report["real_position_reason"] == "当前报告未包含真实持仓判断"
 
 
 def test_trend_report_projects_only_same_day_futu_derivatives(
@@ -459,6 +461,56 @@ def test_trend_report_projects_only_same_day_futu_derivatives(
     assert report["buy_actions"][0]["option_anomaly"]["summary"] == "期权波动率偏高。"
     assert report["hold_actions"][0]["option_anomaly"]["available"] is False
     assert report["hold_actions"][0]["option_anomaly"]["reason"] == "富途未返回该标的期权异动"
+
+
+def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+00:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments.update({
+        "real_holding_decisions_status": "available",
+        "real_holding_decisions_source": {
+            "broker": "tiger", "broker_label": "老虎",
+            "snapshot_period": "2026-07-15", "source_kind": "statement",
+            "freshness_text": "非实时", "read_only_text": "只读，不自动下单",
+        },
+        "real_holding_decisions": [
+            {"action": "HOLD", "symbol": "SPY", "name": "标普ETF", "reason": "trend_intact"},
+            {"action": "SELL_ALL", "symbol": "VIXY", "name": "波动率ETF", "reason": "danger_signal"},
+            {"action": "MANUAL_REVIEW", "symbol": "QQQ", "name": "纳指ETF", "reason": "holding_signal_unknown"},
+        ],
+    })
+    payload["signal_snapshots"] = {
+        "real_holdings": {"SPY": {"industry": "ETF", "phase": "立夏"}}
+    }
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-15",
+    )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15)
+    )["tiger"]
+
+    assert report["real_position_status"] == "available"
+    assert report["real_position_reason"] == ""
+    assert report["real_position_source"]["source_kind"] == "statement"
+    assert [item["action"] for item in report["real_position_actions"]] == [
+        "SELL_ALL", "MANUAL_REVIEW", "HOLD"
+    ]
+    assert report["counts"] == {"sell": 0, "buy": 1, "hold": 0, "review": 0}
 
 
 def test_trend_report_disables_mismatched_futu_derivatives(
