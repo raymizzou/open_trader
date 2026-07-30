@@ -4413,6 +4413,12 @@ def test_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
 
     state = load_dashboard_state(config).to_dict()
 
+    assert {row["symbol"] for row in state["holdings"]} == {
+        f"ACCEPTED{index}" for index in range(14)
+    }
+    assert len(state["cash_rows"]) == 1
+    assert state["summary"]["holding_count"] == 14
+    assert state["summary"]["portfolio_value_hkd"] == "1981.20"
     assert len(state["broker_positions"]) == 14
     tiger = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
     assert tiger["holding_count"] == 14

@@ -31,7 +31,11 @@ from .a_share_trend import (
     valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
-from .account_sync_state import load_account_sync_state, project_account_sync_health
+from .account_sync_state import (
+    accepted_portfolio_rows,
+    load_account_sync_state,
+    project_account_sync_health,
+)
 from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
@@ -245,9 +249,13 @@ class DashboardState:
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
-    portfolio_rows = _read_csv_rows(config.portfolio_path)
     account_state = load_account_sync_state(
         config.data_dir / "latest" / "account_sync_state.json"
+    )
+    portfolio_rows = (
+        accepted_portfolio_rows(account_state)
+        if account_state["generation"]
+        else _read_csv_rows(config.portfolio_path)
     )
     broker_positions, raw_cash_details = _accepted_broker_details(account_state)
     detail_month = _accepted_statement_period(account_state)
