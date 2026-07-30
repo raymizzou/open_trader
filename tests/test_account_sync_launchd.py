@@ -57,6 +57,7 @@ def test_dry_run_renders_runtime_paths_without_tiger_secrets(tmp_path: Path) -> 
     payload = plistlib.loads(result.stdout.encode("utf-8"))
     args = payload["ProgramArguments"]
     assert payload["WorkingDirectory"] == str(ROOT)
+    assert payload["EnvironmentVariables"]["PYTHONPATH"] == str(ROOT / "src")
     assert str(runtime_root / "data") in args
     assert str(runtime_root / "reports") in args
     assert str(runtime_root / "config/daily_premarket.env") in args
