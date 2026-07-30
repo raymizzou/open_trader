@@ -85,7 +85,9 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
         tiger_candidate=_candidate("tiger", 1, "TIGER"),
     )
     controller = AccountSyncController(
-        _config(data_dir, portfolio_path), clock=lambda: clock[0]
+        _config(data_dir, portfolio_path),
+        clock=lambda: clock[0],
+        now_text=lambda: "2026-07-30T12:00:00+08:00",
     )
 
     controller.sync_accounts_once()
@@ -108,9 +110,13 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
     assert health["status"] == "abnormal"
     assert health["reason"] == "broker_futu_failed"
 
-    reloaded = AccountSyncController(_config(data_dir, portfolio_path), clock=lambda: clock[0])
+    reloaded = AccountSyncController(
+        _config(data_dir, portfolio_path),
+        clock=lambda: clock[0],
+        now_text=lambda: "2026-07-30T12:00:00+08:00",
+    )
+    assert reloaded.sync_accounts_once()["status"] == "partial"
     assert load_account_sync_state(data_dir / "latest/account_sync_state.json") == failed
-    assert reloaded is not None
     assert controller.sync_accounts_once()["status"] == "skipped"
     assert load_account_sync_state(data_dir / "latest/account_sync_state.json") == failed
 
@@ -126,6 +132,49 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
     assert recovered["brokers"]["tiger"]["status"] == "ok"
     assert recovered["brokers"]["phillips"]["status"] == "ok"
     assert recovered["brokers"]["eastmoney"]["status"] == "ok"
+
+
+def test_state_publication_failure_stops_without_false_source_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_controller as controller_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest" / "portfolio.csv"
+    old_candidate = _candidate("futu", 1, "OLD")
+    new_candidate = _candidate("futu", 1, "NEW")
+    _seed_state(data_dir, {"futu": old_candidate})
+    state_path = data_dir / "latest" / "account_sync_state.json"
+    before = state_path.read_bytes()
+    _configure_sources(monkeypatch, controller_module, futu_candidate=new_candidate)
+    real_write = controller_module.write_json_atomic
+    state_writes = 0
+
+    def fail_state_write(path: Path, payload: object) -> None:
+        nonlocal state_writes
+        if path == state_path:
+            state_writes += 1
+            raise OSError("state storage unavailable")
+        real_write(path, payload)
+
+    monkeypatch.setattr(controller_module, "write_json_atomic", fail_state_write)
+    monkeypatch.setattr(
+        controller_module,
+        "record_source_failure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("false source failure")),
+    )
+
+    result = AccountSyncController(_config(data_dir, portfolio_path)).sync_accounts_once()
+
+    assert result == {
+        "status": "publication_failed",
+        "blocker": "account_state_publish_failed: futu",
+        "brokers": {"futu": {"status": "publication_failed"}},
+    }
+    assert state_writes == 2
+    assert state_path.read_bytes() == before
+    assert _portfolio_symbols(portfolio_path) == {"NEW0"}
+    assert not hasattr(controller_module, "_verify_or_restore_portfolio")
 
 
 def test_validation_failure_writes_diagnostic_without_replacing_accepted_data(

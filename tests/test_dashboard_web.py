@@ -1573,21 +1573,6 @@ class FakeTrendSimulatePositionService:
         return {"broker": broker, "positions": []}
 
 
-class FakeAccountSyncService:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-        self.refresh_count = 0
-
-    def refresh_if_due(self) -> object:
-        self.refresh_count += 1
-
-        class Result:
-            def to_dict(inner_self) -> dict[str, Any]:
-                return dict(self.payload)
-
-        return Result()
-
-
 class FakeStatementImportService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bytes]] = []
@@ -10866,20 +10851,17 @@ def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     assert payload["holdings"][0]["symbol"] == "VIXY"
 
 
-def test_build_quotes_payload_returns_service_refresh() -> None:
+def test_build_quotes_payload_returns_service_refresh_without_account_sync_writer() -> None:
     from open_trader.dashboard_web import build_quotes_payload
 
     service = FakeQuoteService(quote_result())
-    account_sync = FakeAccountSyncService({"status": "ok", "interval_seconds": 60})
 
-    payload = build_quotes_payload(service, account_sync_service=account_sync)
+    payload = build_quotes_payload(service)
 
     json.dumps(payload)
     assert service.refresh_count == 1
-    assert account_sync.refresh_count == 1
     assert payload["status"] == "ok"
-    assert payload["account_sync"]["status"] == "ok"
-    assert payload["account_sync"]["interval_seconds"] == 60
+    assert "account_sync" not in payload
     assert list(payload["quotes"]) == ["US.MSFT"]
     assert payload["quotes"]["US.MSFT"]["last_price"] == "500"
 
@@ -11318,13 +11300,11 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
     quote_service = FakeQuoteService(quote_result())
-    account_sync = FakeAccountSyncService({"status": "skipped", "interval_seconds": 60})
     server = create_dashboard_server(
         config=config,
         host="127.0.0.1",
         port=0,
         quote_service=quote_service,
-        account_sync_service=account_sync,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11342,9 +11322,8 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
     assert dashboard_payload["summary"]["holding_count"] == 1
     assert dashboard_payload["holdings"][0]["symbol"] == "VIXY"
     assert quotes_payload["quotes"]["US.MSFT"]["last_price"] == "500"
-    assert quotes_payload["account_sync"]["status"] == "skipped"
+    assert "account_sync" not in quotes_payload
     assert quote_service.refresh_count == 1
-    assert account_sync.refresh_count == 1
 
 
 def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None:
@@ -11567,11 +11546,6 @@ def test_serve_dashboard_configures_simulate_accounts_once(
         raising=False,
     )
     monkeypatch.setattr(
-        dashboard_web,
-        "DashboardAccountSyncService",
-        lambda **_: type("FakeAccountSync", (), {"interval_seconds": 60})(),
-    )
-    monkeypatch.setattr(
         dashboard_web, "create_dashboard_server", fake_create_dashboard_server
     )
     config = dashboard_config(
@@ -11599,6 +11573,7 @@ def test_serve_dashboard_configures_simulate_accounts_once(
     assert server_kwargs["trend_simulate_position_service"].__class__ is (
         FakeTrendSimulatePositionServiceFactory
     )
+    assert "account_sync_service" not in server_kwargs
 
 
 def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:

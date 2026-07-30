@@ -26,7 +26,6 @@ from .dashboard import (
     load_dashboard_state,
     load_trend_report_history,
 )
-from .dashboard_account_sync import DashboardAccountSyncService
 from .dashboard_quotes import DashboardQuoteService
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
@@ -788,17 +787,8 @@ def build_dashboard_payload(
 
 def build_quotes_payload(
     quote_service: DashboardQuoteService,
-    account_sync_service: DashboardAccountSyncService | None = None,
 ) -> dict[str, Any]:
-    account_sync_payload = (
-        account_sync_service.refresh_if_due().to_dict()
-        if account_sync_service is not None
-        else {}
-    )
-    payload = quote_service.refresh().to_dict()
-    if account_sync_payload:
-        payload["account_sync"] = account_sync_payload
-    return payload
+    return quote_service.refresh().to_dict()
 
 
 def build_backtest_run_payload(
@@ -885,7 +875,6 @@ def create_dashboard_server(
     host: str,
     port: int,
     quote_service: DashboardQuoteService | None = None,
-    account_sync_service: DashboardAccountSyncService | None = None,
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
     statement_import_service: StatementImportService | None = None,
@@ -963,10 +952,7 @@ def create_dashboard_server(
                 try:
                     with portfolio_update_lock:
                         self._send_json(
-                            build_quotes_payload(
-                                service,
-                                account_sync_service=account_sync_service,
-                            )
+                            build_quotes_payload(service)
                         )
                 except Exception as exc:
                     self._send_error_json(exc)
@@ -1354,7 +1340,6 @@ def serve_dashboard(
     eastmoney_password: str = "",
     prediction_notifier: object | None = None,
 ) -> None:
-    account_sync_service = DashboardAccountSyncService(config=config)
     trend_simulate_position_service = TrendSimulatePositionService(
         host=config.futu_host,
         port=config.futu_port,
@@ -1429,7 +1414,6 @@ def serve_dashboard(
         config=config,
         host=host,
         port=port,
-        account_sync_service=account_sync_service,
         trend_simulate_position_service=trend_simulate_position_service,
         eastmoney_password=eastmoney_password,
         prediction_store=prediction_store,
@@ -1446,7 +1430,6 @@ def serve_dashboard(
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")
-        print(f"account_sync_seconds: {account_sync_service.interval_seconds}")
         server.serve_forever()
     finally:
         if prediction_monitor is not None:

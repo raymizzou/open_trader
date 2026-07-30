@@ -76,12 +76,7 @@ class AccountSyncController:
                 next_state = accept_candidate(
                     state, candidate, attempted_at=attempted_at
                 )
-                write_portfolio_atomic(
-                    self.config.portfolio_path, accepted_portfolio_rows(next_state)
-                )
-                write_json_atomic(state_path, next_state)
-                state = next_state
-                results[broker] = {"status": "ok"}
+                portfolio_rows = accepted_portfolio_rows(next_state)
             except Exception as exc:
                 state = record_source_failure(
                     state,
@@ -96,6 +91,37 @@ class AccountSyncController:
                 )
                 write_json_atomic(state_path, state)
                 results[broker] = {"status": "failed", "message": state["brokers"][broker]["message"]}
+                continue
+            try:
+                write_portfolio_atomic(self.config.portfolio_path, portfolio_rows)
+            except Exception:
+                results[broker] = {"status": "publication_failed"}
+                return {
+                    "status": "publication_failed",
+                    "blocker": f"portfolio_publish_failed: {broker}",
+                    "brokers": results,
+                }
+            try:
+                write_json_atomic(state_path, next_state)
+            except OSError:
+                try:
+                    write_json_atomic(state_path, next_state)
+                except Exception:
+                    results[broker] = {"status": "publication_failed"}
+                    return {
+                        "status": "publication_failed",
+                        "blocker": f"account_state_publish_failed: {broker}",
+                        "brokers": results,
+                    }
+            except Exception:
+                results[broker] = {"status": "publication_failed"}
+                return {
+                    "status": "publication_failed",
+                    "blocker": f"account_state_publish_failed: {broker}",
+                    "brokers": results,
+                }
+            state = next_state
+            results[broker] = {"status": "ok"}
         ok_count = sum(
             1 for result in results.values() if result["status"] == "ok"
         )
