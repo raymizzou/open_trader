@@ -57,6 +57,7 @@ from .trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
     TrendAnimalsLookupError,
+    TrendAnimalsNoCurrentRowsError,
 )
 from .trend_delivery import deliver_daily_trend_text
 from .trend_review import (
@@ -2252,7 +2253,13 @@ def collect_industry_contexts(
     component_rows_by_industry: dict[int, list[Mapping[str, object]]] = {}
     component_rows_count = 0
     for industry_id in eligible_industry_ids:
-        rows = api.get_components(tm_id=industry_id, expected_date=expected_date)  # type: ignore[attr-defined]
+        try:
+            rows = api.get_components(  # type: ignore[attr-defined]
+                tm_id=industry_id,
+                expected_date=expected_date,
+            )
+        except TrendAnimalsNoCurrentRowsError:
+            rows = []
         component_rows_count += len(rows)
         component_rows_by_industry[industry_id] = list(rows)
         component_ids_by_industry[industry_id] = {
