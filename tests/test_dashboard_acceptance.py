@@ -2401,10 +2401,20 @@ class TabbedAccountLocator:
         )
         if match:
             index = int(match.group(1))
-            action = self.page.option_actions()[index]
+            action = self.page.option_available_actions()[index]
             assert action.get("option_anomaly", {}).get("available") is True
             self.page.option_dialog_open = True
             self.page.option_dialog_index = index
+            return
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r"\[data-trend-holding-view\]:nth\((\d+)\)",
+            self.selector,
+        )
+        if match:
+            index = int(match.group(1))
+            assert index in (0, 1)
+            self.page.holding_view = "real" if index == 0 else "simulate"
             return
         if self.selector in {
             "#trend-report-workspace:visible dialog.trend-option-dialog:visible button[data-option-anomaly-close]",
@@ -2635,12 +2645,60 @@ class TabbedAccountLocator:
             )
         if self.selector == "#trend-report-workspace:visible .cn-trend-table thead th":
             return 16
+        if self.selector == "#trend-report-workspace:visible [data-trend-holding-section]":
+            return 1
+        if self.selector == (
+            "#trend-report-workspace:visible [data-trend-holding-section] "
+            "[data-trend-holding-view]"
+        ):
+            return 2
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r"\[data-trend-holding-view\]:nth\((\d+)\)",
+            self.selector,
+        )
+        if match:
+            return int(int(match.group(1)) in (0, 1))
+        if self.selector in {
+            "#trend-report-workspace:visible [data-trend-holding-section] "
+            '[data-trend-holding-panel="real"]',
+            "#trend-report-workspace:visible [data-trend-holding-section] "
+            '[data-trend-holding-panel="simulate"]',
+        }:
+            return 1
+        visible_panel = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r'\[data-trend-holding-panel="(real|simulate)"\]:visible',
+            self.selector,
+        )
+        if visible_panel:
+            view = visible_panel.group(1)
+            return int(view == self.page.holding_view)
+        holding_panel_match = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r'\[data-trend-holding-panel="(real|simulate)"\] (.*)',
+            self.selector,
+        )
+        if holding_panel_match:
+            view, suffix = holding_panel_match.groups()
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            items_key = "real_position_actions" if view == "real" else "hold_actions"
+            items = report.get(items_key)
+            items = items if isinstance(items, list) else []
+            if suffix == ".cn-trend-table":
+                return int(view == "simulate" or report.get("real_position_status") == "available")
+            if suffix == ".cn-trend-table thead th":
+                return 10 if (view == "simulate" or report.get("real_position_status") == "available") else 0
+            if suffix == ".cn-trend-card":
+                return len(items)
         if self.selector in {
             "#trend-report-workspace:visible .trend-option-button",
             "#trend-report-workspace:visible .cn-trend-buy .trend-option-button",
             "#trend-report-workspace:visible .cn-trend-hold .trend-option-button",
         }:
             return self.page.option_button_count()
+        if self.selector == "#trend-report-workspace:visible .trend-option-button:disabled":
+            return 0
         match = re.fullmatch(
             r"#trend-report-workspace:visible \.trend-option-button:nth\((\d+)\)",
             self.selector,
@@ -2802,7 +2860,7 @@ class TabbedAccountLocator:
             return str(self.page.controllers[str(self.page.trend_broker)]["health"])
         if self.selector == "#trend-report-workspace:visible dialog.trend-option-dialog:visible":
             assert name == "aria-label"
-            action = self.page.option_actions()[self.page.option_dialog_index]
+            action = self.page.option_available_actions()[self.page.option_dialog_index]
             identity = " ".join(
                 str(action.get(key)).strip()
                 for key in ("symbol", "name")
@@ -2828,6 +2886,15 @@ class TabbedAccountLocator:
             broker = self._require_known_broker(match.group(1))
             assert name == "aria-selected"
             return str(self.page.account_views[broker] == match.group(2)).lower()
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r"\[data-trend-holding-view\]:nth\((\d+)\)",
+            self.selector,
+        )
+        if match:
+            assert name == "aria-selected"
+            index = int(match.group(1))
+            return str(self.page.holding_view == ("real" if index == 0 else "simulate")).lower()
         if self.selector == "#trend-report-workspace:visible .cn-trend-buy":
             mobile = self.page.viewport_size["width"] <= 760
             return {
@@ -2856,8 +2923,7 @@ class TabbedAccountLocator:
             index = int(match.group(1))
             if index in self.page.option_disabled_override:
                 return self.page.option_disabled_override[index]
-            action = self.page.option_actions()[index]
-            return action.get("option_anomaly", {}).get("available") is not True
+            return False
         match = re.fullmatch(
             r'#account-(\w+):visible \.trend-report-entry button'
             r'(?:\:has-text\("当天趋势报告"\))?',
@@ -2932,8 +2998,36 @@ class TabbedAccountLocator:
                 "当前阻塞", controller["blocker"],
                 "下次检查", controller["next_check_at"],
             ))
+        match = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r"\[data-trend-holding-view\]:nth\((\d+)\)",
+            self.selector,
+        )
+        if match:
+            return ["真实持仓", "模拟盘持仓"][int(match.group(1))]
+        panel_match = re.fullmatch(
+            r"#trend-report-workspace:visible \[data-trend-holding-section\] "
+            r'\[data-trend-holding-panel="(real|simulate)"\]',
+            self.selector,
+        )
+        if panel_match:
+            view = panel_match.group(1)
+            report = self.page.reports.get(str(self.page.trend_broker), {})
+            if view == "real" and report.get("real_position_status") == "unavailable":
+                return str(report.get("real_position_reason") or "数据未提供")
+            if view == "real" and report.get("real_position_status") == "legacy":
+                return "当前报告未包含真实持仓判断"
+            key = "real_position_actions" if view == "real" else "hold_actions"
+            items = report.get(key)
+            items = items if isinstance(items, list) else []
+            values = ["只读"] if view == "real" and report.get("real_position_status") == "available" else []
+            values.extend(
+                str(value) for item in items if isinstance(item, dict)
+                for value in (item.get("symbol"), item.get("name")) if value
+            )
+            return " ".join(values) or "无"
         if self.selector == "#trend-report-workspace:visible dialog.trend-option-dialog:visible":
-            action = self.page.option_actions()[self.page.option_dialog_index]
+            action = self.page.option_available_actions()[self.page.option_dialog_index]
             return f"富途期权异动 {action.get('symbol', '')} {action.get('name', '')}"
         if self.selector == "#trend-report-workspace:visible .trend-audit":
             return trend_audit_text(str(self.page.trend_broker))
@@ -3056,6 +3150,16 @@ class TabbedAccountLocator:
             return trend_stage_texts(broker)
         if self.selector == "#trend-report-workspace:visible .trend-stage":
             return trend_stage_texts(broker)
+        if self.selector in {
+            "#trend-report-workspace:visible [data-trend-holding-section] "
+            '[data-trend-holding-panel="real"] .cn-trend-table thead th',
+            "#trend-report-workspace:visible [data-trend-holding-section] "
+            '[data-trend-holding-panel="simulate"] .cn-trend-table thead th',
+        }:
+            return [
+                "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+                "当前判断", "活动保护线", "持仓提示",
+            ]
         if self.selector == "#trend-report-workspace:visible .trend-report-header dd":
             report = self.page.reports[broker]
             return [str(report[key]) for key in (
@@ -3192,6 +3296,7 @@ class TabbedAccountPage:
         self.max_visible_account_sections = 1
         self.trend_broker: str | None = None
         self.trend_kind = ""
+        self.holding_view = "real"
         self.active: str | None = None
         self.opened_reports: list[str] = []
         self.opened_reviews: list[str] = []
@@ -3231,15 +3336,22 @@ class TabbedAccountPage:
         report = self.reports.get(str(self.trend_broker), {})
         return [
             item
-            for key in ("buy_actions", "hold_actions")
+            for key in ("buy_actions", "real_position_actions", "hold_actions")
             for item in (report.get(key) if isinstance(report.get(key), list) else [])
             if isinstance(item, dict)
+        ]
+
+    def option_available_actions(self) -> list[dict[str, object]]:
+        return [
+            item for item in self.option_actions()
+            if isinstance(item.get("option_anomaly"), dict)
+            and item["option_anomaly"].get("available") is True
         ]
 
     def option_button_count(self) -> int:
         if self.option_button_count_override is not None:
             return self.option_button_count_override
-        return len(self.option_actions())
+        return len(self.option_available_actions())
 
     def _record_visible_sections(self) -> int:
         embedded = (
@@ -4819,7 +4931,7 @@ def test_option_anomaly_acceptance_checks_enabled_dialog_and_disabled_rows() -> 
 def test_option_anomaly_acceptance_rejects_missing_row_button() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
-    page.option_button_count_override = 1
+    page.option_button_count_override = 0
 
     with pytest.raises(AssertionError, match="期权按钮数量"):
         dashboard_acceptance._check_account_holdings(page, payload)
@@ -4830,7 +4942,7 @@ def test_option_anomaly_acceptance_rejects_wrong_disabled_state() -> None:
     page = tabbed_account_page(payload)
     page.option_disabled_override = {0: True}
 
-    with pytest.raises(AssertionError, match="可用状态"):
+    with pytest.raises(AssertionError, match="错误置灰"):
         dashboard_acceptance._check_account_holdings(page, payload)
 
 
