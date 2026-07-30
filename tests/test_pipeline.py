@@ -226,10 +226,14 @@ class InvalidExecutionBrokerFillParser(BrokerFillParser):
         )
 
 
-def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
+def test_run_import_writes_candidate_without_replacing_latest_portfolio(tmp_path: Path) -> None:
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
     data_dir = tmp_path / "data"
+    latest_path = data_dir / "latest" / "portfolio.csv"
+    sentinel = b"accepted portfolio must stay untouched\n"
+    latest_path.parent.mkdir(parents=True)
+    latest_path.write_bytes(sentinel)
     fx_provider = StaticMonthEndFxProvider(
         "2026-05", {"USD": Decimal("7.8")}, fx_date="2026-04-30"
     )
@@ -245,13 +249,12 @@ def test_run_import_writes_portfolio_and_latest(tmp_path: Path) -> None:
     run_dir = data_dir / "runs" / "2026-05"
     assert result.run_dir == run_dir
     assert result.portfolio_path == run_dir / "portfolio.csv"
-    assert result.latest_path == data_dir / "latest" / "portfolio.csv"
     assert result.positions_count == 1
     assert result.cash_count == 1
     assert result.warnings_count == 1
 
     portfolio_content = result.portfolio_path.read_text(encoding="utf-8")
-    assert result.latest_path.read_text(encoding="utf-8") == portfolio_content
+    assert latest_path.read_bytes() == sentinel
     assert "NVDA" in portfolio_content
     assert {
         row["fx_date"] for row in csv.DictReader(result.portfolio_path.open(encoding="utf-8"))
@@ -301,7 +304,6 @@ def test_uploaded_statement_without_fill_completeness_keeps_audit_artifacts(
             fills_complete=False,
         ),
         data_dir=tmp_path / "data",
-        portfolio_path=tmp_path / "current/portfolio.csv",
         fx_provider=StaticMonthEndFxProvider("2026-05", {"CNY": Decimal("1.08")}),
     )
 
@@ -318,7 +320,6 @@ def test_uploaded_statement_persists_each_fill_once(tmp_path: Path) -> None:
         "statement_path": source,
         "parser": FillParser(),
         "data_dir": tmp_path / "data",
-        "portfolio_path": tmp_path / "current" / "portfolio.csv",
         "fx_provider": StaticMonthEndFxProvider(
             "2026-05", {"USD": Decimal("7.8")}
         ),
@@ -361,7 +362,6 @@ def test_uploaded_statement_freezes_broker_fills_in_its_market_idempotently(
             fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
-        "portfolio_path": tmp_path / "current/portfolio.csv",
         "fx_provider": StaticMonthEndFxProvider(
             "2026-05", {"CNY": Decimal("1.08"), "HKD": Decimal("1")}
         ),
@@ -412,7 +412,6 @@ def test_uploaded_statement_uses_declared_fill_coverage_start(tmp_path: Path) ->
             fills_coverage_end="2026-07-15",
         ),
         data_dir=data_dir,
-        portfolio_path=tmp_path / "current/portfolio.csv",
         fx_provider=StaticMonthEndFxProvider(
             "2026-07", {"CNY": Decimal("1.08")}
         ),
@@ -438,7 +437,6 @@ def test_uploaded_statement_without_declared_coverage_does_not_advance_facts(
         statement_path=source,
         parser=BrokerFillParser("eastmoney", Market.CN),
         data_dir=data_dir,
-        portfolio_path=tmp_path / "current/portfolio.csv",
         fx_provider=StaticMonthEndFxProvider(
             "2026-07", {"CNY": Decimal("1.08")}
         ),
@@ -467,7 +465,6 @@ def test_uploaded_statement_with_invalid_execution_row_does_not_advance_fill_fac
         statement_path=source,
         parser=InvalidExecutionBrokerFillParser(broker, market),
         data_dir=data_dir,
-        portfolio_path=tmp_path / "current/portfolio.csv",
         fx_provider=StaticMonthEndFxProvider(
             "2026-05", {"CNY": Decimal("1.08"), "HKD": Decimal("1")}
         ),
@@ -503,7 +500,6 @@ def test_uploaded_empty_statement_freezes_completeness_only_after_success(
             fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
-        "portfolio_path": tmp_path / "current/portfolio.csv",
         "fx_provider": StaticMonthEndFxProvider(
             "2026-05", {"CNY": Decimal("1.08")}
         ),
@@ -522,7 +518,6 @@ def test_uploaded_empty_statement_freezes_completeness_only_after_success(
             **{
                 **arguments,
                 "data_dir": failed_dir,
-                "portfolio_path": tmp_path / "failed/portfolio.csv",
                 "parser": FakeParser(
                     broker="eastmoney",
                     position_currency="SGD",
@@ -558,7 +553,6 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
     source = tmp_path / "eastmoney.pdf"
     source.write_bytes(b"first statement")
     data_dir = tmp_path / "data"
-    portfolio_path = tmp_path / "current/portfolio.csv"
     arguments = {
         "statement_date": "2026-05-10",
         "statement_path": source,
@@ -572,7 +566,6 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
             fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
-        "portfolio_path": portfolio_path,
         "fx_provider": StaticMonthEndFxProvider(
             "2026-05", {"CNY": Decimal("1.08")}
         ),
@@ -587,7 +580,6 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
         }
 
     original_run = tree_bytes(first.run_dir)
-    original_portfolio = portfolio_path.read_bytes()
     original_facts = tree_bytes(data_dir / "trend_review/facts")
     source.write_bytes(b"second statement")
     arguments["parser"] = FakeParser(
@@ -611,10 +603,8 @@ def test_uploaded_statement_fact_failure_rolls_back_promoted_outputs(
         pipeline.run_uploaded_statement(**arguments)
 
     assert tree_bytes(first.run_dir) == original_run
-    assert portfolio_path.read_bytes() == original_portfolio
     assert tree_bytes(data_dir / "trend_review/facts") == original_facts
     assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
-    assert list(portfolio_path.parent.glob(".portfolio.csv.*.backup")) == []
 
 
 def test_uploaded_statement_commits_before_backup_cleanup(
@@ -624,7 +614,6 @@ def test_uploaded_statement_commits_before_backup_cleanup(
     source = tmp_path / "eastmoney.pdf"
     source.write_bytes(b"first statement")
     data_dir = tmp_path / "data"
-    portfolio_path = tmp_path / "current/portfolio.csv"
     arguments = {
         "statement_date": "2026-05-10",
         "statement_path": source,
@@ -638,7 +627,6 @@ def test_uploaded_statement_commits_before_backup_cleanup(
             fills_coverage_end="2026-05-10",
         ),
         "data_dir": data_dir,
-        "portfolio_path": portfolio_path,
         "fx_provider": StaticMonthEndFxProvider(
             "2026-05", {"CNY": Decimal("1.08")}
         ),
@@ -671,7 +659,6 @@ def test_uploaded_statement_commits_before_backup_cleanup(
     )
     assert manifest[0]["source_sha256"] == expected_sha
     assert "600002" in result.portfolio_path.read_text(encoding="utf-8")
-    assert "600002" in portfolio_path.read_text(encoding="utf-8")
     completeness = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in (
@@ -691,7 +678,6 @@ def test_uploaded_statements_for_two_brokers_share_monthly_run(
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
     data_dir = tmp_path / "data"
-    portfolio_path = tmp_path / "current/portfolio.csv"
     fx_provider = StaticMonthEndFxProvider(
         "2026-05", {"USD": Decimal("7.8"), "CNY": Decimal("1.08")}
     )
@@ -710,11 +696,10 @@ def test_uploaded_statements_for_two_brokers_share_monthly_run(
                 cash_currency=currency,
             ),
             data_dir=data_dir,
-            portfolio_path=portfolio_path,
             fx_provider=fx_provider,
         )
 
-    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
+    rows = list(csv.DictReader((data_dir / "runs/2026-05/portfolio.csv").open(encoding="utf-8")))
     assert {row["brokers"] for row in rows} == {"eastmoney", "phillips"}
 
 
@@ -724,7 +709,6 @@ def test_uploaded_statement_accepts_old_run_without_fills_file(
     source = tmp_path / "statement.pdf"
     source.write_bytes(b"fake pdf contents")
     data_dir = tmp_path / "data"
-    portfolio_path = tmp_path / "current/portfolio.csv"
     fx_provider = StaticMonthEndFxProvider(
         "2026-05", {"USD": Decimal("7.8"), "CNY": Decimal("1.08")}
     )
@@ -738,7 +722,6 @@ def test_uploaded_statement_accepts_old_run_without_fills_file(
             symbol="600900",
         ),
         data_dir=data_dir,
-        portfolio_path=portfolio_path,
         fx_provider=fx_provider,
     )
     (first.run_dir / "extracted_fills.csv").unlink()
@@ -748,7 +731,6 @@ def test_uploaded_statement_accepts_old_run_without_fills_file(
         statement_path=source,
         parser=FillParser(),
         data_dir=data_dir,
-        portfolio_path=portfolio_path,
         fx_provider=fx_provider,
     )
 
@@ -773,205 +755,10 @@ def test_run_import_can_leave_latest_untouched(tmp_path: Path) -> None:
         parsers=[FakeParser()],
         data_dir=tmp_path / "data",
         fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
-        update_latest=False,
     )
 
     assert result.portfolio_path.exists()
     assert latest.read_text(encoding="utf-8") == "sentinel\n"
-
-
-def test_run_uploaded_statement_rebuilds_mixed_rows_from_broker_details(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    data_dir = tmp_path / "data"
-    monthly_run = data_dir / "runs" / "2026-07"
-    daily_run = data_dir / "runs" / "2026-07-16"
-    monthly_run.mkdir(parents=True)
-    daily_run.mkdir(parents=True)
-
-    def detail_position(
-        broker: str, symbol: str, currency: str, market: str,
-    ) -> dict[str, str]:
-        return {
-            "statement_id": f"2026-07-{broker}",
-            "broker": broker,
-            "account_alias": f"{broker}_main",
-            "market": market,
-            "asset_class": "stock",
-            "symbol": symbol,
-            "name": symbol,
-            "currency": currency,
-            "quantity": "1",
-            "cost_price": "80",
-            "last_price": "100",
-            "market_value": "100",
-            "cost_value": "80",
-            "unrealized_pnl": "20",
-            "confidence": "high",
-            "notes": "",
-        }
-
-    def detail_cash(broker: str, currency: str, value: str) -> dict[str, str]:
-        return {
-            "statement_id": f"2026-07-{broker}",
-            "broker": broker,
-            "account_alias": f"{broker}_main",
-            "currency": currency,
-            "cash_balance": value,
-            "available_balance": value,
-            "confidence": "high",
-            "notes": "",
-        }
-
-    def write_detail_rows(
-        run_dir: Path,
-        positions: list[dict[str, str]],
-        cash: list[dict[str, str]],
-    ) -> None:
-        for filename, fieldnames, rows in (
-            ("extracted_positions.csv", pipeline.POSITION_FIELDNAMES, positions),
-            ("extracted_cash.csv", pipeline.CASH_FIELDNAMES, cash),
-        ):
-            with (run_dir / filename).open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
-
-    write_detail_rows(
-        monthly_run,
-        [
-            detail_position("phillips", "OLD", "USD", "US"),
-            detail_position("eastmoney", "600519", "CNY", "CN"),
-        ],
-        [detail_cash("phillips", "USD", "30"), detail_cash("eastmoney", "CNY", "40")],
-    )
-    write_detail_rows(
-        daily_run,
-        [
-            detail_position("futu", "AAPL", "USD", "US"),
-            detail_position("tiger", "TSLA", "USD", "US"),
-            detail_position("phillips", "OLD", "USD", "US"),
-            detail_position("eastmoney", "600519", "CNY", "CN"),
-        ],
-        [
-            detail_cash("futu", "USD", "10"),
-            detail_cash("tiger", "USD", "20"),
-            detail_cash("phillips", "USD", "30"),
-            detail_cash("eastmoney", "CNY", "40"),
-        ],
-    )
-    (daily_run / "futu_account_snapshot.json").write_text(
-        "sentinel", encoding="utf-8"
-    )
-
-    portfolio_path = tmp_path / "custom" / "portfolio.csv"
-    portfolio_path.parent.mkdir(parents=True)
-    existing_rows: list[dict[str, str]] = []
-    for symbol, broker, currency, market in (
-        ("AAPL", "futu", "USD", "US"),
-        ("TSLA", "tiger", "USD", "US"),
-        ("OLD", "phillips", "USD", "US"),
-        ("600519", "eastmoney", "CNY", "CN"),
-    ):
-        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-        row.update(
-            {
-                "sort_group": "2",
-                "market": market,
-                "asset_class": "stock",
-                "symbol": symbol,
-                "currency": currency,
-                "market_value": "100",
-                "cost_value": "80",
-                "fx_to_hkd": "1.08" if currency == "CNY" else "7.8",
-                "brokers": broker,
-                "risk_flag": "normal",
-            }
-        )
-        existing_rows.append(row)
-    mixed_cash = {field: "" for field in PORTFOLIO_FIELDNAMES}
-    mixed_cash.update({
-        "sort_group": "7", "market": "CASH", "asset_class": "cash",
-        "symbol": "USD_CASH", "currency": "USD", "market_value": "60",
-        "fx_to_hkd": "7.8", "brokers": "futu;phillips;tiger",
-        "accounts": "futu_main;phillips_main;tiger_main", "risk_flag": "normal",
-    })
-    existing_rows.append(mixed_cash)
-    with portfolio_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(existing_rows)
-
-    result = pipeline.run_uploaded_statement(
-        statement_date="2026-07-10",
-        statement_path=source,
-        parser=FakeParser(broker="phillips"),
-        data_dir=data_dir,
-        portfolio_path=portfolio_path,
-        fx_provider=StaticMonthEndFxProvider(
-            "2026-07",
-            {"USD": Decimal("7.8"), "CNY": Decimal("1.08")},
-            fx_date="2026-07-10",
-        ),
-    )
-
-    assert result.run_dir == monthly_run
-    assert result.latest_path == portfolio_path
-    assert result.positions_count == 1
-    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
-    assert {(row["brokers"], row["symbol"]) for row in rows} >= {
-        ("futu", "AAPL"), ("tiger", "TSLA"),
-        ("eastmoney", "600519"), ("phillips", "NVDA"),
-        ("futu;phillips;tiger", "USD_CASH"),
-    }
-    usd_cash = next(row for row in rows if row["symbol"] == "USD_CASH")
-    assert usd_cash["market_value"] == "80"
-    detail_rows = list(
-        csv.DictReader(
-            (result.run_dir / "extracted_positions.csv").open(encoding="utf-8")
-        )
-    )
-    assert {(row["broker"], row["symbol"]) for row in detail_rows} == {
-        ("eastmoney", "600519"), ("phillips", "NVDA"),
-    }
-    assert next(row for row in detail_rows if row["broker"] == "phillips")[
-        "statement_id"
-    ] == "2026-07-10-phillips"
-    assert (daily_run / "futu_account_snapshot.json").read_text(
-        encoding="utf-8"
-    ) == "sentinel"
-
-
-def test_eastmoney_import_counts_all_combined_non_cash_holdings(tmp_path: Path) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    latest = tmp_path / "data" / "latest" / "portfolio.csv"
-    latest.parent.mkdir(parents=True)
-    existing = {field: "" for field in PORTFOLIO_FIELDNAMES}
-    existing.update({
-        "sort_group": "2", "market": "US", "asset_class": "stock", "symbol": "AAPL",
-        "currency": "USD", "market_value": "100", "cost_value": "80", "fx_to_hkd": "7.8",
-        "brokers": "futu", "risk_flag": "normal",
-    })
-    with latest.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
-        writer.writeheader()
-        writer.writerow(existing)
-
-    result = run_import(
-        month="2026-05",
-        statement_paths={"eastmoney": source},
-        parsers=[FakeParser(broker="eastmoney", position_currency="CNY")],
-        data_dir=tmp_path / "data",
-        fx_provider=StaticMonthEndFxProvider(
-            "2026-05", {"CNY": Decimal("1.08"), "USD": Decimal("7.8")}
-        ),
-        update_latest=False,
-    )
-
-    assert result.positions_count == 2
 
 
 def test_run_import_does_not_write_run_dir_when_portfolio_build_fails(
@@ -1031,9 +818,7 @@ def test_run_import_failed_rerun_keeps_previous_outputs(tmp_path: Path) -> None:
         fx_provider=fx_provider,
     )
     assert first.run_dir.exists()
-    assert first.latest_path.exists()
     original_portfolio = first.portfolio_path.read_text(encoding="utf-8")
-    original_latest = first.latest_path.read_text(encoding="utf-8")
 
     with pytest.raises(KeyError, match="SGD"):
         run_import(
@@ -1046,47 +831,6 @@ def test_run_import_failed_rerun_keeps_previous_outputs(tmp_path: Path) -> None:
 
     assert first.run_dir.exists()
     assert first.portfolio_path.read_text(encoding="utf-8") == original_portfolio
-    assert first.latest_path.exists()
-    assert first.latest_path.read_text(encoding="utf-8") == original_latest
-
-
-def test_run_import_different_month_failure_keeps_previous_latest(tmp_path: Path) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    data_dir = tmp_path / "data"
-
-    first = run_import(
-        month="2026-05",
-        statement_paths={"fake": source},
-        parsers=[FakeParser()],
-        data_dir=data_dir,
-        fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
-    )
-    original_latest = first.latest_path.read_text(encoding="utf-8")
-
-    with pytest.raises(KeyError, match="SGD"):
-        run_import(
-            month="2026-06",
-            statement_paths={"fake": source},
-            parsers=[FakeParser(position_currency="SGD")],
-            data_dir=data_dir,
-            fx_provider=StaticMonthEndFxProvider("2026-06", {"USD": Decimal("7.8")}),
-        )
-
-    assert first.latest_path.exists()
-    assert first.latest_path.read_text(encoding="utf-8") == original_latest
-    assert not (data_dir / "runs" / "2026-06").exists()
-
-
-def test_run_import_rejects_missing_broker_path(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="missing.*fake"):
-        run_import(
-            month="2026-05",
-            statement_paths={},
-            parsers=[FakeParser()],
-            data_dir=tmp_path / "data",
-            fx_provider=StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")}),
-        )
 
 
 def test_run_import_rejects_extra_statement_path_key(tmp_path: Path) -> None:
@@ -1209,9 +953,6 @@ def test_run_import_rerun_replaces_outputs(tmp_path: Path) -> None:
     )
 
     assert second.portfolio_path.read_text(encoding="utf-8") != "stale\n"
-    assert second.latest_path.read_text(encoding="utf-8") == second.portfolio_path.read_text(
-        encoding="utf-8"
-    )
 
 
 def test_run_import_write_failure_keeps_previous_outputs_and_cleans_temp_dir(
@@ -1231,7 +972,6 @@ def test_run_import_write_failure_keeps_previous_outputs_and_cleans_temp_dir(
         fx_provider=fx_provider,
     )
     original_portfolio = first.portfolio_path.read_text(encoding="utf-8")
-    original_latest = first.latest_path.read_text(encoding="utf-8")
     real_write_rows = pipeline.write_rows
 
     def fail_on_cash(path: Path, fieldnames: list[str], rows: object) -> None:
@@ -1252,199 +992,7 @@ def test_run_import_write_failure_keeps_previous_outputs_and_cleans_temp_dir(
 
     assert first.run_dir.exists()
     assert first.portfolio_path.read_text(encoding="utf-8") == original_portfolio
-    assert first.latest_path.read_text(encoding="utf-8") == original_latest
     assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
-
-
-def test_run_import_latest_copy_failure_keeps_previous_latest_and_run_dir(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    data_dir = tmp_path / "data"
-    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
-
-    first = run_import(
-        month="2026-05",
-        statement_paths={"fake": source},
-        parsers=[FakeParser()],
-        data_dir=data_dir,
-        fx_provider=fx_provider,
-    )
-    original_portfolio = first.portfolio_path.read_text(encoding="utf-8")
-    original_latest = first.latest_path.read_text(encoding="utf-8")
-    real_copyfile = pipeline.copyfile
-
-    def fail_latest_copy(src: Path, dst: Path) -> None:
-        if dst.parent.name == "latest":
-            dst.write_text("partial latest\n", encoding="utf-8")
-            raise OSError("simulated latest copy failure")
-        real_copyfile(src, dst)
-
-    monkeypatch.setattr(pipeline, "copyfile", fail_latest_copy)
-
-    with pytest.raises(OSError, match="simulated latest copy failure"):
-        run_import(
-            month="2026-05",
-            statement_paths={"fake": source},
-            parsers=[FakeParser()],
-            data_dir=data_dir,
-            fx_provider=fx_provider,
-        )
-
-    assert first.run_dir.exists()
-    assert first.portfolio_path.read_text(encoding="utf-8") == original_portfolio
-    assert first.latest_path.read_text(encoding="utf-8") == original_latest
-    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
-    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
-
-
-def test_run_import_promotion_rename_failure_restores_previous_outputs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    data_dir = tmp_path / "data"
-    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
-
-    first = run_import(
-        month="2026-05",
-        statement_paths={"fake": source},
-        parsers=[FakeParser()],
-        data_dir=data_dir,
-        fx_provider=fx_provider,
-    )
-    first.portfolio_path.write_text("previous run\n", encoding="utf-8")
-    first.latest_path.write_text("previous latest\n", encoding="utf-8")
-    real_rename = Path.rename
-    latest_replace_attempted = False
-
-    def fail_temp_run_promotion(self: Path, target: Path) -> Path:
-        if self.name.startswith(".2026-05.") and self.suffix == ".tmp":
-            raise OSError("simulated run promotion failure")
-        return real_rename(self, target)
-
-    real_replace = Path.replace
-
-    def track_latest_replace(self: Path, target: Path) -> Path:
-        nonlocal latest_replace_attempted
-        if self.name.startswith(".portfolio.") and self.suffix == ".tmp":
-            latest_replace_attempted = True
-        return real_replace(self, target)
-
-    monkeypatch.setattr(Path, "rename", fail_temp_run_promotion)
-    monkeypatch.setattr(Path, "replace", track_latest_replace)
-
-    with pytest.raises(OSError, match="simulated run promotion failure"):
-        run_import(
-            month="2026-05",
-            statement_paths={"fake": source},
-            parsers=[FakeParser()],
-            data_dir=data_dir,
-            fx_provider=fx_provider,
-        )
-
-    assert latest_replace_attempted
-    assert first.run_dir.exists()
-    assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
-    assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
-    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
-    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
-    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
-    assert list((data_dir / "latest").glob(".portfolio.csv.*.backup")) == []
-
-
-def test_run_import_latest_replace_failure_restores_previous_outputs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    data_dir = tmp_path / "data"
-    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
-
-    first = run_import(
-        month="2026-05",
-        statement_paths={"fake": source},
-        parsers=[FakeParser()],
-        data_dir=data_dir,
-        fx_provider=fx_provider,
-    )
-    first.portfolio_path.write_text("previous run\n", encoding="utf-8")
-    first.latest_path.write_text("previous latest\n", encoding="utf-8")
-    real_replace = Path.replace
-
-    def fail_latest_replace(self: Path, target: Path) -> Path:
-        if self.name.startswith(".portfolio.") and self.suffix == ".tmp":
-            raise OSError("simulated latest replace failure")
-        return real_replace(self, target)
-
-    monkeypatch.setattr(Path, "replace", fail_latest_replace)
-
-    with pytest.raises(OSError, match="simulated latest replace failure"):
-        run_import(
-            month="2026-05",
-            statement_paths={"fake": source},
-            parsers=[FakeParser()],
-            data_dir=data_dir,
-            fx_provider=fx_provider,
-        )
-
-    assert first.run_dir.exists()
-    assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
-    assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
-    assert list((data_dir / "runs").glob(".2026-05*.tmp")) == []
-    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
-    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
-    assert list((data_dir / "latest").glob(".portfolio.csv.*.backup")) == []
-
-
-def test_run_import_rollback_cleanup_failure_preserves_original_error_and_outputs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "statement.pdf"
-    source.write_bytes(b"fake pdf contents")
-    data_dir = tmp_path / "data"
-    fx_provider = StaticMonthEndFxProvider("2026-05", {"USD": Decimal("7.8")})
-
-    first = run_import(
-        month="2026-05",
-        statement_paths={"fake": source},
-        parsers=[FakeParser()],
-        data_dir=data_dir,
-        fx_provider=fx_provider,
-    )
-    first.portfolio_path.write_text("previous run\n", encoding="utf-8")
-    first.latest_path.write_text("previous latest\n", encoding="utf-8")
-    real_rmtree = pipeline.rmtree
-
-    def fail_backup_and_failed_cleanup(path: Path) -> None:
-        if path.suffix == ".backup":
-            raise OSError("simulated post-promotion backup cleanup failure")
-        if path.suffix == ".failed":
-            raise OSError("simulated failed run cleanup failure")
-        real_rmtree(path)
-
-    monkeypatch.setattr(pipeline, "rmtree", fail_backup_and_failed_cleanup)
-
-    with pytest.raises(OSError, match="simulated post-promotion backup cleanup failure"):
-        run_import(
-            month="2026-05",
-            statement_paths={"fake": source},
-            parsers=[FakeParser()],
-            data_dir=data_dir,
-            fx_provider=fx_provider,
-        )
-
-    assert first.run_dir.exists()
-    assert first.portfolio_path.read_text(encoding="utf-8") == "previous run\n"
-    assert first.latest_path.read_text(encoding="utf-8") == "previous latest\n"
-    assert list((data_dir / "runs").glob(".2026-05*.backup")) == []
-    assert list((data_dir / "latest").glob(".portfolio.*.tmp")) == []
-    assert list((data_dir / "latest").glob(".portfolio.csv.*.backup")) == []
 
 
 def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1461,7 +1009,7 @@ def test_import_statements_help_includes_usd_hkd(capsys: pytest.CaptureFixture[s
     assert "--config" in output
     assert "--cny-hkd" in output
     assert "--fx-date" in output
-    assert "--update-latest" in output
+    assert "--update-latest" not in output
     assert "--futu" not in output
     assert "--tiger" not in output
 
@@ -1489,7 +1037,7 @@ def test_cli_imports_phillips_and_eastmoney_together(
 
     def fake_run_import(**kwargs: object) -> ImportResult:
         captured.update(kwargs)
-        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", 1, 0, 0)
 
     monkeypatch.setattr(cli, "getpass", lambda _: "test-password")
     monkeypatch.setattr(cli, "run_import", fake_run_import)
@@ -1532,21 +1080,20 @@ def test_cli_imports_only_eastmoney_and_prompts_password(
 
     def fake_run_import(**kwargs: object) -> ImportResult:
         captured.update(kwargs)
-        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", 1, 0, 0)
 
     monkeypatch.setattr(cli, "getpass", lambda _: "secret")
     monkeypatch.setattr(cli, "run_import", fake_run_import)
     assert cli.main([
         "import-statements", "--month", "2026-07", "--eastmoney", str(statement),
         "--cny-hkd", "1.08", "--fx-date", "2026-06-30",
-        "--data-dir", str(tmp_path), "--update-latest",
+        "--data-dir", str(tmp_path),
     ]) == 0
 
     assert captured["statement_paths"] == {"eastmoney": statement}
     assert [parser.broker for parser in captured["parsers"]] == ["eastmoney"]
     assert captured["fx_provider"].get_rate_to_hkd("CNY").rate == Decimal("1.08")
     assert captured["fx_provider"].get_rate_to_hkd("CNY").fx_date == "2026-06-30"
-    assert captured["update_latest"] is True
     assert "secret" not in capsys.readouterr().out
 
 
@@ -1567,7 +1114,7 @@ def test_cli_imports_eastmoney_path_and_password_from_local_config(
 
     def fake_run_import(**kwargs: object) -> ImportResult:
         captured.update(kwargs)
-        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", 1, 0, 0)
 
     def fake_eastmoney_parser(value: str) -> object:
         captured["password"] = value
@@ -1602,7 +1149,7 @@ def test_cli_explicit_eastmoney_path_overrides_config(
 
     def fake_run_import(**kwargs: object) -> ImportResult:
         captured.update(kwargs)
-        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", 1, 0, 0)
 
     def fake_eastmoney_parser(value: str) -> object:
         captured["password"] = value
@@ -1637,7 +1184,7 @@ def test_cli_prompts_when_config_password_is_blank(
 
     def fake_run_import(**kwargs: object) -> ImportResult:
         captured.update(kwargs)
-        return ImportResult(tmp_path, tmp_path / "portfolio.csv", tmp_path / "latest.csv", 1, 0, 0)
+        return ImportResult(tmp_path, tmp_path / "portfolio.csv", 1, 0, 0)
 
     def fake_eastmoney_parser(value: str) -> object:
         captured["password"] = value
@@ -1764,7 +1311,6 @@ def test_import_statements_main_calls_pipeline_and_prints_summary(
         return ImportResult(
             run_dir=data_dir / "runs" / "2026-05",
             portfolio_path=data_dir / "runs" / "2026-05" / "portfolio.csv",
-            latest_path=data_dir / "latest" / "portfolio.csv",
             positions_count=3,
             cash_count=2,
             warnings_count=1,
@@ -1794,7 +1340,6 @@ def test_import_statements_main_calls_pipeline_and_prints_summary(
     assert captured["fx_provider"].get_rate_to_hkd("USD").rate == Decimal("7.8")
     output = capsys.readouterr().out
     assert f"portfolio: {tmp_path / 'data' / 'runs' / '2026-05' / 'portfolio.csv'}" in output
-    assert f"latest: {tmp_path / 'data' / 'latest' / 'portfolio.csv'}" in output
     assert "positions: 3" in output
     assert "cash: 2" in output
     assert "warnings: 1" in output

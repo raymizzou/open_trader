@@ -252,7 +252,7 @@ def write_existing_portfolio(path: Path) -> None:
         writer.writerow(row)
 
 
-def test_import_pdf_archives_and_replaces_only_target_broker(
+def test_import_pdf_archives_candidate_without_replacing_latest_portfolio(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -260,11 +260,12 @@ def test_import_pdf_archives_and_replaces_only_target_broker(
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", FakePhillipsParser
     )
-    portfolio_path = tmp_path / "current" / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    sentinel = b"accepted portfolio must stay untouched\n"
+    portfolio_path.parent.mkdir(parents=True)
+    portfolio_path.write_bytes(sentinel)
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
@@ -280,12 +281,14 @@ def test_import_pdf_archives_and_replaces_only_target_broker(
         "trades": 0,
         "actual_rounds": 0,
         "statistics_cutoff_at": "2026-07-10T23:59:59+08:00",
+        "run_path": str(tmp_path / "data/runs/2026-07"),
     }
     assert (
         tmp_path / "data/statements/phillips/2026-07-10/statement.pdf"
     ).read_bytes() == PDF_BYTES
-    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
-    assert {row["brokers"] for row in rows} == {"futu", "phillips"}
+    assert portfolio_path.read_bytes() == sentinel
+    assert (tmp_path / "data/runs/2026-07/extracted_positions.csv").is_file()
+    assert (tmp_path / "data/runs/2026-07/extracted_cash.csv").is_file()
 
 
 def test_import_pdf_rejects_fill_only_statement_and_preserves_portfolio(
@@ -296,12 +299,12 @@ def test_import_pdf_rejects_fill_only_statement_and_preserves_portfolio(
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", FakeFillOnlyParser
     )
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
+    portfolio_path = tmp_path / "data/latest/portfolio.csv"
+    portfolio_path.parent.mkdir(parents=True)
+    portfolio_path.write_bytes(b"accepted portfolio\n")
     before = portfolio_path.read_bytes()
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
@@ -323,7 +326,6 @@ def test_import_pdf_rejects_older_statement_and_preserves_current_data(
     write_existing_portfolio(portfolio_path)
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)
@@ -360,7 +362,6 @@ def test_latest_statement_period_uses_newest_statement_id_across_runs(
             writer.writerow({"statement_id": statement_id, "broker": "phillips"})
     service = statement_import.StatementImportService(
         data_dir=data_dir,
-        portfolio_path=tmp_path / "portfolio.csv",
         eastmoney_password="secret",
     )
 
@@ -385,7 +386,6 @@ def test_latest_statement_period_ignores_fill_execution_date(tmp_path: Path) -> 
         )
     service = statement_import.StatementImportService(
         data_dir=data_dir,
-        portfolio_path=tmp_path / "portfolio.csv",
         eastmoney_password="secret",
     )
 
@@ -412,7 +412,6 @@ def test_import_pdf_restores_archive_when_pipeline_fails(
     )
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
@@ -435,7 +434,6 @@ def test_import_pdf_rejects_empty_parse_without_archiving(
     monkeypatch.setattr(statement_import, "PhillipsStatementParser", EmptyParser)
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=tmp_path / "portfolio.csv",
         eastmoney_password="secret",
     )
 
@@ -449,7 +447,6 @@ def test_import_pdf_rejects_unsupported_broker(tmp_path: Path) -> None:
     statement_import = importlib.import_module("open_trader.statement_import")
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=tmp_path / "portfolio.csv",
         eastmoney_password="secret",
     )
 
@@ -470,7 +467,6 @@ def test_import_pdf_uses_eastmoney_password_month_archive_and_fixed_fx(
     write_existing_portfolio(portfolio_path)
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="local-secret",
     )
 
@@ -483,7 +479,9 @@ def test_import_pdf_uses_eastmoney_password_month_archive_and_fixed_fx(
     ).read_bytes() == PDF_BYTES
     eastmoney = next(
         row
-        for row in csv.DictReader(portfolio_path.open(encoding="utf-8"))
+        for row in csv.DictReader(
+            (tmp_path / "data/runs/2026-07/portfolio.csv").open(encoding="utf-8")
+        )
         if row["brokers"] == "eastmoney"
     )
     assert eastmoney["fx_to_hkd"] == "1.08"
@@ -500,17 +498,17 @@ def test_same_month_eastmoney_then_phillips_upload_keeps_both_brokers(
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", FakePhillipsParser
     )
-    portfolio_path = tmp_path / "portfolio.csv"
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
     service.import_pdf("eastmoney", PDF_BYTES)
     service.import_pdf("phillips", PDF_BYTES)
 
-    rows = list(csv.DictReader(portfolio_path.open(encoding="utf-8")))
+    rows = list(
+        csv.DictReader((tmp_path / "data/runs/2026-07/portfolio.csv").open(encoding="utf-8"))
+    )
     assert {row["brokers"] for row in rows} == {"eastmoney", "phillips"}
 
 
@@ -523,7 +521,6 @@ def test_import_pdf_allows_same_date_replacement(tmp_path: Path, monkeypatch) ->
     write_existing_portfolio(portfolio_path)
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)
@@ -549,7 +546,6 @@ def test_statement_upload_immediately_rebuilds_actual_stats_and_is_idempotent(
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
         reports_dir=reports_dir,
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
@@ -590,7 +586,6 @@ def test_corrected_statement_replaces_period_facts_instead_of_appending(
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
         reports_dir=reports_dir,
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)
@@ -625,7 +620,6 @@ def test_new_statement_without_trades_keeps_samples_and_advances_source_cutoff(
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
         reports_dir=reports_dir,
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)
@@ -659,7 +653,6 @@ def test_stats_write_failure_rolls_back_archive_portfolio_run_and_stats(
     service = statement_import.StatementImportService(
         data_dir=data_dir,
         reports_dir=reports_dir,
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)
@@ -723,7 +716,6 @@ def test_same_day_statement_buy_and_sell_are_excluded_when_time_is_unavailable(
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
         reports_dir=reports_dir,
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
 
@@ -756,7 +748,6 @@ def test_statement_parse_failure_preserves_previous_stats_and_cutoff(
     service = statement_import.StatementImportService(
         data_dir=data_dir,
         reports_dir=reports_dir,
-        portfolio_path=portfolio_path,
         eastmoney_password="secret",
     )
     service.import_pdf("phillips", PDF_BYTES)

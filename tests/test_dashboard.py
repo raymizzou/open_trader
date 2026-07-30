@@ -22,6 +22,7 @@ from open_trader.dashboard import (
     _futu_skill_signal_detail,
     load_dashboard_state,
 )
+from open_trader.account_sync_state import empty_account_sync_state
 from open_trader.decision_facts import (
     KLINE_FIELDS,
     MISSING_VALUE,
@@ -72,6 +73,75 @@ CASH_FIELDNAMES = [
 ]
 MISSING_FRESH = object()
 MISSING_ATTENTION = object()
+
+
+def seed_accepted_account_sync(
+    config: DashboardConfig,
+    *,
+    tiger_position_count: int,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    accepted_at = (now or datetime.now().astimezone()).isoformat()
+    state = empty_account_sync_state()
+    brokers = state["brokers"]
+    assert isinstance(brokers, dict)
+    for broker, source in brokers.items():
+        assert isinstance(source, dict)
+        source.update(
+            status="ok",
+            attempted_at=accepted_at,
+            last_success_at=accepted_at,
+            data_as_of=accepted_at if broker in {"futu", "tiger"} else "2026-07-30",
+            period="2026-07",
+        )
+    tiger = brokers["tiger"]
+    assert isinstance(tiger, dict)
+    tiger["positions"] = [
+        {
+            "statement_id": "2026-07-tiger-live",
+            "broker": "tiger",
+            "account_alias": "tiger_main",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": f"ACCEPTED{index}",
+            "name": f"Accepted {index}",
+            "currency": "USD",
+            "quantity": "1",
+            "cost_price": "10",
+            "last_price": "11",
+            "market_value": "11",
+            "cost_value": "10",
+            "unrealized_pnl": "1",
+            "confidence": "high",
+            "notes": "",
+        }
+        for index in range(tiger_position_count)
+    ]
+    tiger["cash"] = [
+        {
+            "statement_id": "2026-07-tiger-live",
+            "broker": "tiger",
+            "account_alias": "tiger_main",
+            "currency": "USD",
+            "cash_balance": "100",
+            "available_balance": "90",
+            "confidence": "high",
+            "notes": "",
+        }
+    ]
+    tiger["fx_rates"] = [
+        {
+            "account_alias": "tiger_main",
+            "currency": "USD",
+            "rate_to_hkd": "7.8",
+        }
+    ]
+    tiger["summary"] = {"position_count": tiger_position_count, "cash_count": 1}
+    state["generation"] = accepted_at
+    path = config.data_dir / "latest" / "account_sync_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
+    return state
 
 
 def test_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:
@@ -2286,163 +2356,6 @@ def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
     assert report["drawdown_summary"] == payload["drawdown_summary"]
 
 
-def test_dashboard_actual_overlay_refreshes_without_mutating_frozen_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from open_trader.trend_review import _report_hash
-
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
-    monkeypatch.setattr(
-        dashboard_module, "_shanghai_date", lambda: date(2026, 7, 15)
-    )
-    report_path = config.reports_dir / "trend_a_share/2026-07-15.json"
-    report_path.parent.mkdir(parents=True)
-    payload = _valid_v4_dashboard_trend_payload()
-    judgments = payload["strategy_judgments"]
-    assert isinstance(judgments, dict)
-    buy = judgments["formal_actions"][0]
-    assert isinstance(buy, dict)
-    buy["name"] = "测试"
-    buy["estimated_initial_line"] = "9"
-    sell = {
-        "action": "SELL_ALL",
-        "symbol": "600003",
-        "name": "待卖",
-        "reason": "danger_signal",
-        "close": "20",
-        "active_line": "18",
-    }
-    hold = {
-        "action": "HOLD",
-        "symbol": "600004",
-        "name": "持有",
-        "reason": "trend_intact",
-        "close": "30",
-        "active_line": "29",
-    }
-    judgments["formal_actions"].insert(0, sell)
-    judgments["holding_decisions"] = [sell, hold]
-    report_path.write_text(json.dumps(payload), encoding="utf-8")
-    frozen_bytes = report_path.read_bytes()
-    frozen_hash = _report_hash(payload)
-
-    detail_dir = config.data_dir / "runs/2026-07-15"
-    positions = [
-        ("600001", "200", "10", "2000"),
-        ("600002", "100", "10", "1000"),
-        ("600003", "50", "20", "1000"),
-        ("600004", "100", "30", "3000"),
-        ("600099", "10", "50", "500"),
-    ]
-
-    def write_actual_rows(buy_quantity: str) -> None:
-        rows = []
-        for symbol, quantity, last_price, market_value in positions:
-            if symbol == "600001":
-                quantity, market_value = buy_quantity, str(Decimal(buy_quantity) * 10)
-            rows.append({
-                "statement_id": "2026-07-eastmoney",
-                "broker": "eastmoney",
-                "account_alias": "eastmoney_main",
-                "market": "CN",
-                "asset_class": "stock",
-                "symbol": symbol,
-                "name": symbol,
-                "currency": "CNY",
-                "quantity": quantity,
-                "last_price": last_price,
-                "market_value": market_value,
-            })
-        write_csv(detail_dir / "extracted_positions.csv", POSITION_FIELDNAMES, rows)
-        invested = sum(Decimal(row["market_value"]) for row in rows)
-        write_csv(
-            detail_dir / "extracted_cash.csv",
-            CASH_FIELDNAMES,
-            [{
-                "statement_id": "2026-07-eastmoney",
-                "broker": "eastmoney",
-                "account_alias": "eastmoney_main",
-                "currency": "CNY",
-                "cash_balance": str(Decimal("100000") - invested),
-                "available_balance": str(Decimal("100000") - invested),
-            }],
-        )
-
-    write_actual_rows("200")
-    first = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
-    write_actual_rows("500")
-    second = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
-    write_actual_rows("0")
-    third = load_dashboard_state(config).to_dict()["trend_reports"]["eastmoney"]
-
-    assert report_path.read_bytes() == frozen_bytes
-    assert (
-        first["report_sha256"]
-        == second["report_sha256"]
-        == third["report_sha256"]
-        == frozen_hash
-    )
-    for key in ("buy_actions", "sell_actions", "hold_actions", "risk_skips"):
-        assert first[key] == second[key] == third[key]
-    assert {
-        key: value
-        for key, value in first["risk_summary"].items()
-        if key != "trade_stats"
-    } == payload["risk_summary"]
-    assert first["risk_summary"] == second["risk_summary"] == third["risk_summary"]
-
-    first_overlay = first["actual_overlay"]
-    assert first_overlay["available"] is True
-    assert first_overlay["broker_label"] == "东方财富"
-    assert first_overlay["account_nav_hkd"] == "108000.00"
-    assert first_overlay["status_text"] == "结单数据，非实时"
-    first_by_symbol = {
-        item["symbol"]: item for item in first_overlay["items"]
-    }
-    assert first_by_symbol["600001"] == {
-        "symbol": "600001",
-        "name": "测试",
-        "frozen_action": "BUY",
-        "frozen_action_label": "正式买入",
-        "target_weight": "0.04",
-        "simulation_quantity": "300",
-        "actual_reference_quantity": "400",
-        "actual_quantity": "200",
-        "actual_market_value": "2000",
-        "currency": "CNY",
-        "deviation": "underbought",
-        "deviation_label": "少买",
-        "frozen_reference_price": "10",
-        "protection_line": "9",
-        "protection_line_label": "预计保护线",
-        "estimated_exit_loss": "200.00",
-        "risk_note": "若按策略保护线退出，预计损失 CNY 200.00（按冻结参考价估算，不代表实时风险上限）",
-    }
-    assert first_by_symbol["600002"]["deviation_label"] == "追买"
-    assert first_by_symbol["600003"]["deviation_label"] == "漏卖"
-    assert first_by_symbol["600004"]["deviation_label"] == "已跟随"
-    assert first_by_symbol["600004"]["risk_note"] == (
-        "若按策略保护线退出，预计损失 CNY 100.00（按冻结参考价估算，不代表实时风险上限）"
-    )
-    assert first_overlay["outside_positions"] == [{
-        "symbol": "600099",
-        "name": "600099",
-        "actual_quantity": "10",
-        "actual_market_value": "500",
-        "currency": "CNY",
-        "deviation": "outside_report_addition",
-        "deviation_label": "报告外加仓",
-        "attribution_status": "unconfirmed",
-        "risk_note": "风险未纳入估算",
-    }]
-    assert second["actual_overlay"]["items"][1]["deviation_label"] == "超买"
-    assert third["actual_overlay"]["items"][1]["deviation_label"] == "跳过"
-    assert "真实最大风险" not in json.dumps(first_overlay, ensure_ascii=False)
-    assert "已挂" not in json.dumps(first_overlay, ensure_ascii=False)
-
-
 def test_dashboard_projects_partial_sell_goal_and_manual_real_account_guidance(
     tmp_path: Path,
 ) -> None:
@@ -4489,135 +4402,59 @@ def portfolio_rows() -> list[dict[str, str]]:
     ]
 
 
-def test_load_dashboard_state_merges_portfolio_details_cash_and_trade_actions(
+def test_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    run_dir = config.data_dir / "runs" / "2026-05"
+    seed_accepted_account_sync(config, tiger_position_count=14)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows()[:1])
     write_csv(
-        run_dir / "extracted_positions.csv",
+        config.data_dir / "runs" / "2026-07-31" / "extracted_positions.csv",
         POSITION_FIELDNAMES,
         [
             {
-                "statement_id": "2026-05-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "ProShares VIX Short-Term Futures ETF",
-                "currency": "USD",
-                "quantity": "40",
-                "cost_price": "44.00",
-                "last_price": "48.50",
-                "market_value": "1940.00",
-                "cost_value": "1760.00",
-                "unrealized_pnl": "180.00",
-                "confidence": "high",
-                "notes": "",
-            },
-            {
-                "statement_id": "2026-05-tiger",
+                "statement_id": "2026-07-31-tiger-live",
                 "broker": "tiger",
-                "account_alias": "growth",
+                "account_alias": "failed_run",
                 "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "ProShares VIX Short-Term Futures ETF",
+                "asset_class": "stock",
+                "symbol": f"FAILED{index}",
+                "name": f"Failed {index}",
                 "currency": "USD",
-                "quantity": "60",
-                "cost_price": "45.67",
-                "last_price": "48.50",
-                "market_value": "2910.00",
-                "cost_value": "2740.00",
-                "unrealized_pnl": "170.00",
-                "confidence": "high",
-                "notes": "",
-            },
-        ],
-    )
-    write_csv(
-        run_dir / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-05-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "currency": "HKD",
-                "cash_balance": "850.00",
-                "available_balance": "850.00",
+                "quantity": "1",
+                "cost_price": "10",
+                "last_price": "11",
+                "market_value": "11",
+                "cost_value": "10",
+                "unrealized_pnl": "1",
                 "confidence": "high",
                 "notes": "",
             }
+            for index in range(8)
         ],
     )
-    write_csv(
-        config.data_dir / "latest" / "trade_actions.csv",
-        TRADE_ACTION_FIELDNAMES,
-        [
-            {
-                "run_date": "2026-06-18",
-                "symbol": "VIXY",
-                "market": "US",
-                "futu_symbol": "US.VIXY",
-                "action": "TRIM",
-                "priority": "medium",
-                "last_price": "48.50",
-                "trigger_status": "target_1_hit",
-                "status": "ready",
-                "reason": "trim into strength",
-            }
-        ],
+    write_trend_history_report(
+        config.reports_dir,
+        "2026-07-30.json",
+        execution_date="2026-07-30",
+        generated_at="2026-07-30T12:00:00+08:00",
     )
 
     state = load_dashboard_state(config).to_dict()
 
-    assert state["portfolio_path"] == str(config.portfolio_path)
-    assert state["data_dir"] == str(config.data_dir)
-    assert state["reports_dir"] == str(config.reports_dir)
-    assert state["poll_seconds"] == 1.5
-    assert state["futu_host"] == "127.0.0.1"
-    assert state["futu_port"] == 11111
-    assert state["broker_detail_month"] == "2026-05"
-    assert state["detail_available"] is True
-    assert state["summary"]["holding_count"] == 1
-    assert state["summary"]["portfolio_value_hkd"] == "38680.00"
-    assert state["summary"]["holding_value_hkd"] == "37830.00"
-    assert state["summary"]["cash_like_value_hkd"] == "850.00"
-    assert state["summary"]["holding_weight_hkd"] == "97.80%"
-    assert state["summary"]["cash_like_weight_hkd"] == "2.20%"
-    assert state["summary"]["broker_count"] == 2
-    assert len(state["broker_positions"]) == 2
+    assert {row["symbol"] for row in state["holdings"]} == {
+        f"ACCEPTED{index}" for index in range(14)
+    }
+    assert len(state["cash_rows"]) == 1
+    assert state["summary"]["holding_count"] == 14
+    assert state["summary"]["portfolio_value_hkd"] == "1981.20"
+    assert len(state["broker_positions"]) == 14
+    tiger = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
+    assert tiger["holding_count"] == 14
+    assert tiger["holding_value_hkd"] == "1201.20"
     assert len(state["cash_details"]) == 1
-    assert len(state["trade_actions"]) == 1
-
-    holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
-    assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 2
-    assert [
-        {
-            "broker": row["broker"],
-            "account_alias": row["account_alias"],
-            "quantity": row["quantity"],
-            "market_value": row["market_value"],
-        }
-        for row in holdings_by_symbol["VIXY"]["broker_details"]
-    ] == [
-        {
-            "broker": "futu",
-            "account_alias": "main",
-            "quantity": "40",
-            "market_value": "1940.00",
-        },
-        {
-            "broker": "tiger",
-            "account_alias": "growth",
-            "quantity": "60",
-            "market_value": "2910.00",
-        },
-    ]
-    assert holdings_by_symbol["VIXY"]["trade_action"]["action"] == "TRIM"
+    assert state["source_statuses"][1]["status"] == "ok"
+    assert len(state["trend_reports"]["tiger"]["actual_overlay"]["outside_positions"]) == 14
 
 
 def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
@@ -6332,207 +6169,6 @@ def test_load_dashboard_state_marks_missing_research_view(tmp_path: Path) -> Non
     }
 
 
-def test_load_dashboard_state_prefers_latest_daily_sync_details(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    write_csv(
-        config.data_dir / "runs" / "2026-05" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-05-futu",
-                "broker": "futu",
-                "account_alias": "old",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "VIXY",
-                "currency": "USD",
-                "quantity": "165",
-                "cost_price": "",
-                "last_price": "24.41",
-                "market_value": "4027.65",
-                "cost_value": "",
-                "unrealized_pnl": "",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-    write_csv(
-        config.data_dir / "runs" / "2026-06-19" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-futu-live",
-                "broker": "futu",
-                "account_alias": "live",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "VIXY",
-                "currency": "USD",
-                "quantity": "100",
-                "cost_price": "42.62",
-                "last_price": "21.93",
-                "market_value": "2193.00",
-                "cost_value": "4261.60",
-                "unrealized_pnl": "-2068.60",
-                "confidence": "high",
-                "notes": "Futu live account position",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert state["broker_detail_month"] == "2026-06-19"
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["broker_details"][0]["account_alias"] == "live"
-    assert vixy["broker_details"][0]["quantity"] == "100"
-
-
-def test_load_dashboard_state_keeps_latest_details_for_each_broker(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    base = {
-        "account_alias": "main",
-        "market": "HK",
-        "asset_class": "stock",
-        "symbol": "00001",
-        "name": "Holding",
-        "currency": "HKD",
-        "quantity": "1",
-        "cost_price": "",
-        "last_price": "100",
-        "market_value": "100",
-        "cost_value": "",
-        "unrealized_pnl": "",
-        "confidence": "high",
-        "notes": "",
-    }
-    write_csv(
-        config.data_dir / "runs" / "2026-06" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [{**base, "statement_id": "2026-06-phillips", "broker": "phillips"}],
-    )
-    write_csv(
-        config.data_dir / "runs" / "2026-07" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [{**base, "statement_id": "2026-07-eastmoney", "broker": "eastmoney"}],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-    summaries = {row["broker"]: row for row in state["broker_summaries"]}
-
-    assert summaries["phillips"]["portfolio_value_hkd"] == "100.00"
-    assert summaries["eastmoney"]["portfolio_value_hkd"] == "100.00"
-
-
-def test_load_dashboard_state_builds_broker_summaries_from_detail_rows(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    run_dir = config.data_dir / "runs" / "2026-06-19"
-    write_csv(
-        run_dir / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "ProShares VIX Short-Term Futures ETF",
-                "currency": "USD",
-                "quantity": "40",
-                "cost_price": "44.00",
-                "last_price": "48.50",
-                "market_value": "1940.00",
-                "cost_value": "1760.00",
-                "unrealized_pnl": "180.00",
-                "confidence": "high",
-                "notes": "",
-            },
-            {
-                "statement_id": "2026-06-19-tiger",
-                "broker": "tiger",
-                "account_alias": "growth",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "ProShares VIX Short-Term Futures ETF",
-                "currency": "USD",
-                "quantity": "60",
-                "cost_price": "45.67",
-                "last_price": "48.50",
-                "market_value": "2910.00",
-                "cost_value": "2740.00",
-                "unrealized_pnl": "170.00",
-                "confidence": "high",
-                "notes": "",
-            },
-        ],
-    )
-    write_csv(
-        run_dir / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "currency": "HKD",
-                "cash_balance": "850.00",
-                "available_balance": "850.00",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
-    vixy_details = {
-        row["broker"]: row for row in holdings_by_symbol["VIXY"]["broker_details"]
-    }
-    assert vixy_details["futu"]["market_value_hkd"] == "15132.00"
-    assert vixy_details["tiger"]["market_value_hkd"] == "22698.00"
-
-    summaries = {row["broker"]: row for row in state["broker_summaries"]}
-    assert summaries["futu"]["label"] == "富途"
-    assert summaries["futu"]["source_kind"] == "live_account"
-    assert summaries["futu"]["holding_value_hkd"] == "15132.00"
-    assert summaries["futu"]["cash_like_value_hkd"] == "850.00"
-    assert summaries["futu"]["portfolio_value_hkd"] == "15982.00"
-    assert summaries["futu"]["holding_count"] == 1
-    assert summaries["tiger"]["label"] == "老虎"
-    assert summaries["tiger"]["holding_value_hkd"] == "22698.00"
-    assert summaries["tiger"]["cash_like_value_hkd"] == "0.00"
-    assert summaries["tiger"]["portfolio_value_hkd"] == "22698.00"
-    assert summaries["tiger"]["holding_count"] == 1
-    assert summaries["phillips"]["label"] == "辉立"
-    assert summaries["phillips"]["portfolio_value_hkd"] == ""
-    assert summaries["phillips"]["source_kind"] == "statement"
-    assert summaries["phillips"]["detail_available"] is False
-
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["futu"]["display_text"] == "仅月结单明细"
-    assert statuses["futu"]["status"] == "non_realtime"
-    assert statuses["tiger"]["display_text"] == "仅月结单明细"
-    assert statuses["tiger"]["status"] == "non_realtime"
-    assert statuses["phillips"]["display_text"] == "暂无月结单明细"
-    assert statuses["phillips"]["status"] == "non_realtime"
-
-
 def test_broker_summary_counts_cash_classified_positions_as_cash() -> None:
     futu = dashboard_module._build_broker_summary(
         "futu",
@@ -6549,112 +6185,12 @@ def test_broker_summary_counts_cash_classified_positions_as_cash() -> None:
             "currency": "HKD",
             "cash_balance": "100",
         }],
-        {},
     )
 
     assert futu["holding_value_hkd"] == "0.00"
     assert futu["cash_like_value_hkd"] == "1000.00"
     assert futu["portfolio_value_hkd"] == "1000.00"
     assert futu["holding_count"] == 0
-
-
-def test_tiger_broker_summary_counts_money_market_fund_as_cash_like(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    run_dir = config.data_dir / "runs" / "2026-07-16"
-    base_position = {
-        "statement_id": "2026-07-16-tiger-live",
-        "broker": "tiger",
-        "account_alias": "tiger_5683",
-        "market": "US",
-        "asset_class": "stock",
-        "symbol": "MSFT",
-        "name": "Microsoft",
-        "currency": "USD",
-        "quantity": "1",
-        "cost_price": "90",
-        "last_price": "100",
-        "market_value": "100",
-        "fx_to_hkd": "7.84",
-        "cost_value": "90",
-        "unrealized_pnl": "10",
-        "confidence": "high",
-        "notes": "",
-    }
-    write_csv(
-        run_dir / "extracted_positions.csv",
-        [*POSITION_FIELDNAMES, "fx_to_hkd"],
-        [
-            base_position,
-            {
-                **base_position,
-                "market": "HK",
-                "asset_class": "fund",
-                "symbol": "ORDINARY_FUND",
-                "name": "环球股票基金",
-                "currency": "HKD",
-                "market_value": "200",
-                "fx_to_hkd": "1",
-            },
-            {
-                **base_position,
-                "market": "HK",
-                "asset_class": "money_market_fund",
-                "symbol": "HK0000951506.HKD",
-                "name": "华泰港元货币市场基金A",
-                "currency": "HKD",
-                "market_value": "1000",
-                "fx_to_hkd": "1",
-            },
-        ],
-    )
-    write_csv(
-        run_dir / "extracted_cash.csv",
-        [*CASH_FIELDNAMES, "fx_to_hkd"],
-        [
-            {
-                "statement_id": "2026-07-16-tiger-live",
-                "broker": "tiger",
-                "account_alias": "tiger_5683",
-                "currency": "USD",
-                "cash_balance": "-10",
-                "fx_to_hkd": "7.84",
-                "available_balance": "-10",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-    (run_dir / "tiger_account_snapshot.json").write_text(
-        json.dumps(
-            {
-                "cash_records": [
-                    {
-                        "record_type": "account_total",
-                        "currency": "USD",
-                        "cash_available_for_trade": "62",
-                        "fx_to_hkd": "7.84",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    summary = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
-    assert summary["holding_count"] == 2
-    assert summary["holding_value_hkd"] == "984.00"
-    assert summary["cash_like_value_hkd"] == "921.60"
-    assert summary["portfolio_value_hkd"] == "1905.60"
-    assert summary["available_to_trade_hkd"] == "486.08"
-    assert summary["cash_components"] == [
-        {"label": "USD 现金", "value_hkd": "-78.40"},
-        {"label": "华泰港元货币市场基金A", "value_hkd": "1000.00"},
-    ]
 
 
 def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
@@ -6668,254 +6204,6 @@ def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
     assert [row["symbol"] for row in state["cash_rows"]] == ["HKD_CASH"]
     assert state["cash_rows"][0]["market_value_hkd"] == "850.00"
     assert state["cash_rows"][0]["brokers"] == "futu"
-
-
-def test_load_dashboard_state_discovers_cash_only_detail_runs(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    write_csv(
-        config.data_dir / "runs" / "2026-06-19" / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-tiger",
-                "broker": "tiger",
-                "account_alias": "growth",
-                "currency": "USD",
-                "cash_balance": "10.00",
-                "available_balance": "10.00",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert state["broker_detail_month"] == "2026-06-19"
-    assert state["detail_available"] is True
-    assert len(state["cash_details"]) == 1
-    summaries = {row["broker"]: row for row in state["broker_summaries"]}
-    assert summaries["tiger"]["detail_available"] is True
-    assert summaries["tiger"]["holding_value_hkd"] == "0.00"
-    assert summaries["tiger"]["cash_like_value_hkd"] == "78.00"
-    assert summaries["tiger"]["portfolio_value_hkd"] == "78.00"
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["tiger"]["status"] == "non_realtime"
-    assert statuses["tiger"]["display_text"] == "仅月结单明细"
-
-
-def test_tiger_live_detail_without_fx_does_not_guess_cash_value(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    write_csv(
-        config.data_dir / "runs" / "2026-07-16" / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-07-16-tiger-live",
-                "broker": "tiger",
-                "account_alias": "tiger_5683",
-                "currency": "USD",
-                "cash_balance": "10",
-                "available_balance": "10",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    summary = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
-    assert summary["cash_like_value_hkd"] == ""
-    assert summary["portfolio_value_hkd"] == ""
-
-
-def test_load_dashboard_state_marks_futu_and_tiger_live_only_from_live_statement_ids(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    run_dir = config.data_dir / "runs" / "2026-06-19"
-    write_csv(
-        run_dir / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-futu-live",
-                "broker": "futu",
-                "account_alias": "main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "ProShares VIX Short-Term Futures ETF",
-                "currency": "USD",
-                "quantity": "40",
-                "cost_price": "44.00",
-                "last_price": "48.50",
-                "market_value": "1940.00",
-                "cost_value": "1760.00",
-                "unrealized_pnl": "180.00",
-                "confidence": "high",
-                "notes": "",
-            },
-        ],
-    )
-    write_csv(
-        run_dir / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-tiger-live",
-                "broker": "tiger",
-                "account_alias": "growth",
-                "currency": "USD",
-                "cash_balance": "10.00",
-                "available_balance": "10.00",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["futu"]["status"] == "ok"
-    assert statuses["futu"]["display_text"] == "账户实时同步"
-    assert statuses["tiger"]["status"] == "ok"
-    assert statuses["tiger"]["display_text"] == "账户实时同步，行情走富途"
-
-
-def test_load_dashboard_state_rejects_live_marker_unless_statement_id_suffix(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    run_dir = config.data_dir / "runs" / "2026-06-19"
-    row = {
-        "statement_id": "2026-05-futu-live-statement-import",
-        "broker": "futu",
-        "account_alias": "main",
-        "market": "US",
-        "asset_class": "etf",
-        "symbol": "VIXY",
-        "name": "ProShares VIX Short-Term Futures ETF",
-        "currency": "USD",
-        "quantity": "40",
-        "cost_price": "44.00",
-        "last_price": "48.50",
-        "market_value": "1940.00",
-        "cost_value": "1760.00",
-        "unrealized_pnl": "180.00",
-        "confidence": "high",
-        "notes": "",
-    }
-    write_csv(run_dir / "extracted_positions.csv", POSITION_FIELDNAMES, [row])
-
-    state = load_dashboard_state(config).to_dict()
-
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["futu"]["status"] == "non_realtime"
-    assert statuses["futu"]["display_text"] == "仅月结单明细"
-
-    write_csv(
-        run_dir / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [{**row, "statement_id": "2026-06-19-futu-live"}],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["futu"]["status"] == "ok"
-    assert statuses["futu"]["display_text"] == "账户实时同步"
-
-
-def test_load_dashboard_state_uses_phillips_statement_id_for_source_status(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    write_csv(
-        config.data_dir / "runs" / "2026-06-19" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-05-phillips",
-                "broker": "phillips",
-                "account_alias": "cash",
-                "market": "HK",
-                "asset_class": "stock",
-                "symbol": "00700",
-                "name": "Tencent",
-                "currency": "HKD",
-                "quantity": "100",
-                "cost_price": "100.00",
-                "last_price": "150.00",
-                "market_value": "15000.00",
-                "cost_value": "10000.00",
-                "unrealized_pnl": "5000.00",
-                "confidence": "high",
-                "notes": "",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["phillips"]["display_text"] == "2026-05 月结单导入"
-
-
-def test_load_dashboard_state_prefers_newer_statement_over_newer_daily_copy(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-
-    def phillips_row(statement_id: str, symbol: str) -> dict[str, str]:
-        return {
-            "statement_id": statement_id,
-            "broker": "phillips",
-            "account_alias": "phillips_main",
-            "market": "HK",
-            "asset_class": "stock",
-            "symbol": symbol,
-            "name": symbol,
-            "currency": "HKD",
-            "quantity": "1",
-            "cost_price": "80",
-            "last_price": "100",
-            "market_value": "100",
-            "cost_value": "80",
-            "unrealized_pnl": "20",
-            "confidence": "high",
-            "notes": "",
-        }
-
-    write_csv(
-        config.data_dir / "runs" / "2026-07-16" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [phillips_row("2026-07-10-phillips", "OLD")],
-    )
-    write_csv(
-        config.data_dir / "runs" / "2026-07" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [phillips_row("2026-07-15-phillips", "NEW")],
-    )
-
-    details, _ = dashboard_module._latest_broker_details(config.data_dir)
-    details = [row for row in details if row["broker"] == "phillips"]
-    assert [row["symbol"] for row in details] == ["NEW"]
-    state = load_dashboard_state(config).to_dict()
-    statuses = {row["broker"]: row for row in state["source_statuses"]}
-    assert statuses["phillips"]["display_text"] == "2026-07-15 月结单导入"
 
 
 def test_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(

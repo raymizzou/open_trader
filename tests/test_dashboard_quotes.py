@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import pytest
 
 from open_trader.dashboard import DashboardConfig
 from open_trader.dashboard_acceptance import validate_quotes_payload
-from open_trader.dashboard_quotes import DashboardQuoteService
+from open_trader.dashboard_quotes import DashboardQuoteService, load_published_quotes
 from open_trader.futu_quote import DashboardQuoteSnapshot, FutuQuoteError
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
@@ -55,6 +57,34 @@ class FakeQuoteClient:
     def close(self) -> None:
         self.closed = True
         self.close_count += 1
+
+
+def test_load_published_quotes_rejects_missing_or_malformed_files_and_derives_staleness(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "quotes.json"
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    assert load_published_quotes(path, now=now)["status"] == "unknown"
+    path.write_text("not json", encoding="utf-8")
+    assert load_published_quotes(path, now=now)["status"] == "unknown"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "last_success_at": (now - timedelta(seconds=16)).isoformat(),
+                "stale": False,
+                "quotes": {"US.MSFT": {"last_price": "500", "stale": False}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = load_published_quotes(path, now=now)
+
+    assert payload["status"] == "ok"
+    assert payload["stale"] is True
+    assert payload["quotes"] == {"US.MSFT": {"last_price": "500", "stale": True}}
 
 
 def write_portfolio(path: Path) -> None:
@@ -429,7 +459,7 @@ def test_quote_service_caches_complete_us_subset_despite_sh_failure(
     result = service.refresh().to_dict()
 
     assert validate_quotes_payload(result) == []
-    assert first_result["last_success_at"] == first_result["fetched_at"]
+    assert first_result["last_success_at"] == ""
     assert result["last_success_at"] == first_result["last_success_at"]
     assert result["fetched_at"] != result["last_success_at"]
     assert result["status"] == "partial"
@@ -536,7 +566,7 @@ def test_quote_service_batches_holdings_by_futu_exchange_prefix(
     assert result.quotes["SH.600025"]["last_price"] == "9.81"
 
 
-def test_quote_service_keeps_us_quotes_when_sh_snapshot_prefix_fails(
+def test_quote_service_retains_stale_quotes_for_a_failed_prefix(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -560,8 +590,18 @@ def test_quote_service_keeps_us_quotes_when_sh_snapshot_prefix_fails(
         {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: full_client)
-    service.refresh()
+    first_result = service.refresh().to_dict()
     cached_quotes = {symbol: dict(quote) for symbol, quote in service.last_quotes.items()}
+    with config.portfolio_path.open("a", encoding="utf-8", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES).writerow(
+            {
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "600901",
+                "name": "新标的",
+                "total_quantity": "100",
+            }
+        )
 
     client = FakeQuoteClient(
         {
@@ -591,27 +631,32 @@ def test_quote_service_keeps_us_quotes_when_sh_snapshot_prefix_fails(
 
     assert created_clients == [client]
     assert client.requested_batches == [
-        ["SH.600900"],
+        ["SH.600900", "SH.600901"],
         ["US.AAPL", "US.MSFT"],
     ]
     assert client.requested_state_symbols == ["US.AAPL", "US.MSFT"]
     assert client.close_count == 1
     assert result["status"] == "partial"
-    assert result["quote_count"] == 2
+    assert result["quote_count"] == 3
     assert result["missing_count"] == 1
-    assert result["quotes"]["SH.600900"]["status"] == "missing_quote"
+    assert result["stale"] is True
+    assert result["quotes"]["SH.600900"] == {
+        **cached_quotes["SH.600900"],
+        "stale": True,
+    }
+    assert result["quotes"]["SH.600901"]["status"] == "missing_quote"
     assert result["quotes"]["US.AAPL"]["last_price"] == "165"
     assert result["quotes"]["US.MSFT"]["last_price"] == "510"
     assert result["us_session_status"] == "active"
     assert result["diagnostic"]["market"] == "SH"
     assert "无权限获取SH.600900的行情" in result["diagnostic"]["message"]
-    assert result["last_success_at"] == result["fetched_at"]
+    assert result["last_success_at"] == first_result["last_success_at"]
     assert service.last_quotes["SH.600900"] == cached_quotes["SH.600900"]
     assert service.last_quotes["US.AAPL"] == result["quotes"]["US.AAPL"]
     assert service.last_quotes["US.MSFT"] == result["quotes"]["US.MSFT"]
 
 
-def test_quote_service_does_not_reuse_cached_us_quotes_when_us_snapshot_prefix_fails(
+def test_quote_service_retains_stale_quotes_when_us_snapshot_prefix_fails(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -660,23 +705,29 @@ def test_quote_service_does_not_reuse_cached_us_quotes_when_us_snapshot_prefix_f
     assert client.requested_state_symbols == []
     assert client.close_count == 1
     assert result["status"] == "partial"
-    assert result["quote_count"] == 1
-    assert result["missing_count"] == 2
-    assert result["stale"] is False
+    assert result["quote_count"] == 3
+    assert result["missing_count"] == 0
+    assert result["stale"] is True
     assert result["quotes"]["SH.600900"]["last_price"] == "31"
-    assert result["quotes"]["US.AAPL"]["status"] == "missing_quote"
-    assert result["quotes"]["US.AAPL"]["stale"] is False
-    assert result["quotes"]["US.MSFT"]["status"] == "missing_quote"
-    assert result["quotes"]["US.MSFT"]["stale"] is False
+    assert result["quotes"]["US.AAPL"] == {
+        **cached_quotes["US.AAPL"],
+        "stale": True,
+    }
+    assert result["quotes"]["US.MSFT"] == {
+        **cached_quotes["US.MSFT"],
+        "stale": True,
+    }
     assert result["us_session_status"] == "unknown"
     assert result["diagnostic"]["market"] == "US"
     assert result["diagnostic"]["error_type"] == "us_snapshot_failed"
     assert "无权限获取美股行情" in result["diagnostic"]["message"]
     assert result["last_success_at"] == first_result["last_success_at"]
-    assert service.last_quotes == cached_quotes
+    assert service.last_quotes["SH.600900"] == result["quotes"]["SH.600900"]
+    assert service.last_quotes["US.AAPL"] == cached_quotes["US.AAPL"]
+    assert service.last_quotes["US.MSFT"] == cached_quotes["US.MSFT"]
 
 
-def test_quote_service_does_not_return_cached_us_quotes_when_only_us_snapshot_fails(
+def test_quote_service_retains_all_stale_quotes_when_every_prefix_fails(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -699,8 +750,11 @@ def test_quote_service_does_not_return_cached_us_quotes_when_only_us_snapshot_fa
     result = service.refresh().to_dict()
 
     assert result["status"] == "failed"
-    assert result["quotes"] == {}
-    assert result["stale"] is False
+    assert result["quotes"] == {
+        symbol: {**quote, "stale": True}
+        for symbol, quote in first_result["quotes"].items()
+    }
+    assert result["stale"] is True
     assert result["last_success_at"] == first_result["last_success_at"]
 
 
@@ -884,5 +938,4 @@ def test_quote_service_all_prefix_batches_fail_with_first_error_and_stale_cache(
     assert result["quotes"] == {
         symbol: {**quote, "stale": True}
         for symbol, quote in first_result["quotes"].items()
-        if not symbol.startswith("US.")
     }

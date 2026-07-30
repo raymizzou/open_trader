@@ -28,6 +28,11 @@ from .a_share_trend import (
     load_futu_simulate_trend_account,
 )
 from .backtest import run_backtest
+from .account_sync_controller import (
+    AccountSyncControllerConfig,
+    run_account_sync_controller,
+)
+from .account_sync_state import project_account_sync_health
 from .daily_premarket import (
     DailyPremarketRunner,
     _optional_positive_tm_id,
@@ -37,7 +42,6 @@ from .daily_premarket import (
     load_env_config,
     require_trend_executor,
     require_trend_review_config,
-    refresh_live_portfolio,
     send_notification_with_results,
 )
 from .dashboard import DashboardConfig
@@ -45,7 +49,6 @@ from .dashboard_web import serve_dashboard
 from .decision_facts import LLMDecisionFactsExtractor, generate_decision_facts
 from .decision_plan import load_decision_plans
 from .decision_plan_watch import run_decision_plan_watch
-from .futu_account import FutuAccountClient, FutuAccountError, sync_futu_portfolio
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
 from .kelly_paper_order_sync import (
@@ -94,7 +97,6 @@ from .kelly_order_execution import (
 from .t_signal import TSignalInterpreter
 from .t_signal_futu import FutuTSignalMarketDataClient
 from .t_signal_runner import run_t_signal_watch_once
-from .futu_universe import load_futu_quote_universe
 from .futu_watch import run_futu_watch
 from .fx import StaticMonthEndFxProvider
 from .market_scope import parse_market_scope
@@ -112,14 +114,7 @@ from .polymarket_trading import (
 )
 from .polymarket_monitor import monitor_once_diagnostic
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
-from .tiger_account import (
-    TigerAccountClient,
-    TigerAccountError,
-    TigerPortfolioSyncResult,
-    load_tiger_account_config,
-    mask_account_id,
-    sync_tiger_portfolio,
-)
+from .tiger_account import load_tiger_account_config
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
 from .trend_api_stats import (
     FutuSimulateFillClient,
@@ -333,19 +328,6 @@ def _kelly_sync_trd_markets(
     return sorted(markets)
 
 
-def _print_tiger_sync_result(result: TigerPortfolioSyncResult) -> None:
-    print(f"run_date: {result.run_date}")
-    print(f"accounts: {result.account_count}")
-    print(f"positions: {result.position_count}")
-    print(f"cash: {result.cash_count}")
-    print(f"merged_rows: {result.merged_row_count}")
-    print(f"snapshot: {result.snapshot_path}")
-    print(f"portfolio: {result.portfolio_path}")
-    print(f"report: {result.report_path}")
-    print(f"latest: {result.latest_path}")
-    print(f"updated_latest: {'true' if result.updated_latest else 'false'}")
-
-
 def _active_trade_action_plans_for_quotes(
     plans: list[TradingPlanRow],
     run_date: str | None,
@@ -403,7 +385,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_parser.add_argument("--cny-hkd", type=positive_decimal)
     import_parser.add_argument("--fx-date", type=canonical_date)
-    import_parser.add_argument("--update-latest", action="store_true")
 
     premarket_parser = subparsers.add_parser(
         "run-premarket",
@@ -857,89 +838,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch one market-data snapshot and exit",
     )
 
-    check_futu_quotes_parser = subparsers.add_parser(
-        "check-futu-quotes",
-        help="Fetch Futu quote snapshots for quoteable portfolio positions",
+    account_sync_controller = subparsers.add_parser(
+        "account-sync-controller", help="Run the sole account and quote publisher"
     )
-    check_futu_quotes_parser.add_argument(
-        "--portfolio",
-        type=Path,
-        default=Path("data/latest/portfolio.csv"),
+    account_sync_controller.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    check_futu_quotes_parser.add_argument("--host", default="127.0.0.1")
-    check_futu_quotes_parser.add_argument("--port", type=positive_int, default=11111)
+    account_sync_controller.add_argument("--data-dir", type=Path, default=Path("data"))
+    account_sync_controller.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    account_sync_controller.add_argument(
+        "--portfolio", type=Path, default=Path("data/latest/portfolio.csv")
+    )
+    account_sync_controller.add_argument(
+        "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
+    )
+    account_sync_controller.add_argument(
+        "--account-interval-seconds", type=positive_float, default=60.0
+    )
+    account_sync_controller.add_argument(
+        "--quote-interval-seconds", type=positive_float, default=5.0
+    )
+    account_sync_controller.add_argument("--once", action="store_true")
 
-    check_futu_account_parser = subparsers.add_parser(
-        "check-futu-account",
-        help="Diagnose read-only Futu real-account access",
+    account_sync_status = subparsers.add_parser(
+        "account-sync-status", help="Show accepted account-sync file health"
     )
-    check_futu_account_parser.add_argument("--host", default="127.0.0.1")
-    check_futu_account_parser.add_argument("--port", type=positive_int, default=11111)
-
-    sync_futu_portfolio_parser = subparsers.add_parser(
-        "sync-futu-portfolio",
-        help="Merge live Futu real-account data into portfolio.csv",
-    )
-    sync_futu_portfolio_parser.add_argument(
-        "--portfolio",
-        type=Path,
-        default=Path("data/latest/portfolio.csv"),
-    )
-    sync_futu_portfolio_parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    sync_futu_portfolio_parser.add_argument(
-        "--reports-dir",
-        type=Path,
-        default=Path("reports"),
-    )
-    sync_futu_portfolio_parser.add_argument("--date", type=canonical_date, required=True)
-    sync_futu_portfolio_parser.add_argument("--host", default="127.0.0.1")
-    sync_futu_portfolio_parser.add_argument("--port", type=positive_int, default=11111)
-    sync_futu_portfolio_parser.add_argument(
-        "--update-latest",
-        action="store_true",
-        help="Update data/latest/portfolio.csv after writing dated artifacts",
-    )
-
-    check_tiger_account_parser = subparsers.add_parser(
-        "check-tiger-account",
-        help="Diagnose read-only Tiger OpenAPI account access",
-    )
-    check_tiger_account_parser.add_argument(
-        "--config-dir",
-        type=Path,
-        default=Path("~/.tigeropen/"),
-    )
-    check_tiger_account_parser.add_argument("--account")
-    check_tiger_account_parser.add_argument("--sandbox", action="store_true")
-
-    sync_tiger_portfolio_parser = subparsers.add_parser(
-        "sync-tiger-portfolio",
-        help="Merge live Tiger OpenAPI account data into portfolio.csv",
-    )
-    sync_tiger_portfolio_parser.add_argument(
-        "--portfolio",
-        type=Path,
-        default=Path("data/latest/portfolio.csv"),
-    )
-    sync_tiger_portfolio_parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    sync_tiger_portfolio_parser.add_argument(
-        "--reports-dir",
-        type=Path,
-        default=Path("reports"),
-    )
-    sync_tiger_portfolio_parser.add_argument("--date", type=canonical_date, required=True)
-    sync_tiger_portfolio_parser.add_argument(
-        "--config-dir",
-        type=Path,
-        default=Path("~/.tigeropen/"),
-    )
-    sync_tiger_portfolio_parser.add_argument("--account")
-    sync_tiger_portfolio_parser.add_argument("--sandbox", action="store_true")
-    sync_tiger_portfolio_parser.add_argument(
-        "--update-latest",
-        action="store_true",
-        help="Update data/latest/portfolio.csv after writing dated artifacts",
-    )
+    account_sync_status.add_argument("--data-dir", type=Path, default=Path("data"))
+    account_sync_status.add_argument("--json", action="store_true")
 
     kelly_parser = subparsers.add_parser(
         "kelly",
@@ -1353,6 +1278,49 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "account-sync-controller":
+        try:
+            values = _read_env_file(args.config)
+            config = AccountSyncControllerConfig(
+                data_dir=args.data_dir,
+                reports_dir=args.reports_dir,
+                portfolio_path=args.portfolio,
+                futu_host=values.get("OPEN_TRADER_FUTU_HOST", "127.0.0.1"),
+                futu_port=positive_int(values.get("OPEN_TRADER_FUTU_PORT", "11111")),
+                tiger_config_dir=args.tiger_config_dir.expanduser(),
+                tiger_account=None,
+                account_interval_seconds=args.account_interval_seconds,
+                quote_interval_seconds=args.quote_interval_seconds,
+            )
+        except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
+            parser.error(str(exc))
+        return run_account_sync_controller(config, once=args.once)
+
+    if args.command == "account-sync-status":
+        state = _load_optional_json(args.data_dir / "latest" / "account_sync_state.json") or {}
+        controller = _load_optional_json(args.data_dir / "account_sync" / "controller_status.json") or {}
+        quotes = _load_optional_json(args.data_dir / "latest" / "quotes.json") or {}
+        health = project_account_sync_health(
+            state, controller, quotes, now=datetime.now().astimezone()
+        )
+        if args.json:
+            print(json.dumps(health, ensure_ascii=False))
+        else:
+            print(f"status: {health['status']}")
+            print(f"reason: {health['reason']}")
+            controller_status = health["controller"]
+            assert isinstance(controller_status, dict)
+            print(
+                "controller: "
+                f"pid={controller_status.get('pid', '')} "
+                f"sha={controller_status.get('git_sha', '')} "
+                f"heartbeat={controller_status.get('heartbeat_at', '')}"
+            )
+            print(f"quotes: {health['quotes']['status']}")
+            for broker, source in health["brokers"].items():
+                print(f"{broker}: {source['status']}")
+        return 0
 
     if args.command == "prediction-arb":
         if args.prediction_command == "wallet" and args.wallet_command == "setup":
@@ -1809,10 +1777,8 @@ def main(argv: list[str] | None = None) -> int:
             fx_provider=StaticMonthEndFxProvider(
                 args.month, rates, fx_date=args.fx_date
             ),
-            update_latest=args.update_latest,
         )
         print(f"portfolio: {result.portfolio_path}")
-        print(f"latest: {result.latest_path}")
         print(f"positions: {result.positions_count}")
         print(f"cash: {result.cash_count}")
         print(f"warnings: {result.warnings_count}")
@@ -1913,9 +1879,6 @@ def main(argv: list[str] | None = None) -> int:
             result = DailyPremarketRunner(
                 config=config,
                 notifier=build_notifier(config),
-                portfolio_refresher=(
-                    None if args.dry_run else refresh_live_portfolio
-                ),
             ).run(
                 run_date=run_date,
                 market=args.market,
@@ -2125,6 +2088,8 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 result = run_t_signal_watch_once(
                     portfolio_path=args.portfolio,
+                    account_state_path=args.data_dir / "latest" / "account_sync_state.json",
+                    controller_status_path=args.data_dir / "account_sync" / "controller_status.json",
                     data_dir=args.data_dir,
                     run_date=args.date,
                     market=args.market,
@@ -2139,6 +2104,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"run_date: {result.run_date}")
                 print(f"market: {result.market}")
                 print(f"signals: {result.signal_count}")
+                print(f"blocked: {result.blocked_count}")
                 print(f"notified: {result.notified_count}")
                 print(f"signals_json: {result.run_path}")
                 print(f"latest: {result.latest_path}")
@@ -2149,168 +2115,6 @@ def main(argv: list[str] | None = None) -> int:
             return 130
         except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
             parser.error(str(exc))
-
-    if args.command == "check-futu-quotes":
-        quote_client = None
-        try:
-            universe = load_futu_quote_universe(args.portfolio)
-            quote_client = FutuQuoteClient(host=args.host, port=args.port)
-            print(f"connected to Futu OpenD at {args.host}:{args.port}")
-            print(f"loaded {len(universe.items)} quoteable position(s)")
-            symbols = sorted({item.futu_symbol for item in universe.items})
-            snapshots = quote_client.get_snapshots(symbols) if symbols else {}
-            quote_count = 0
-            missing_count = 0
-            for futu_symbol in symbols:
-                quote = snapshots.get(futu_symbol)
-                if quote is None:
-                    missing_count += 1
-                    print(f"warning: missing quote for {futu_symbol}")
-                    continue
-                quote_count += 1
-                print(f"quote {futu_symbol} last_price={quote.last_price}")
-            for skipped in universe.skipped:
-                skipped_symbol = (
-                    f"{skipped.market}.{skipped.symbol}"
-                    if skipped.market and skipped.symbol
-                    else skipped.symbol
-                )
-                print(
-                    f"skipped {skipped_symbol} "
-                    f"asset_class={skipped.asset_class} "
-                    f"reason={skipped.reason}"
-                )
-        except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
-            parser.error(str(exc))
-        finally:
-            if quote_client is not None:
-                quote_client.close()
-        print(f"quotes: {quote_count}")
-        print(f"missing: {missing_count}")
-        print(f"skipped: {len(universe.skipped)}")
-        return 0
-
-    if args.command == "check-futu-account":
-        account_client = None
-        try:
-            account_client = FutuAccountClient(host=args.host, port=args.port)
-            print(f"connected to Futu OpenD at {args.host}:{args.port}")
-            snapshot = account_client.fetch_snapshot()
-        except (RuntimeError, FutuAccountError) as exc:
-            parser.error(str(exc))
-        finally:
-            if account_client is not None:
-                account_client.close()
-        print(f"real_accounts: {len(snapshot.accounts)}")
-        print(f"positions: {len(snapshot.position_records)}")
-        print(f"cash_records: {len(snapshot.cash_records)}")
-        return 0
-
-    if args.command == "sync-futu-portfolio":
-        account_client = None
-        try:
-            account_client = FutuAccountClient(host=args.host, port=args.port)
-            print(f"connected to Futu OpenD at {args.host}:{args.port}")
-            snapshot = account_client.fetch_snapshot()
-            result = sync_futu_portfolio(
-                snapshot=snapshot,
-                portfolio_path=args.portfolio,
-                data_dir=args.data_dir,
-                reports_dir=args.reports_dir,
-                run_date=args.date,
-                update_latest=args.update_latest,
-            )
-        except (FileNotFoundError, ValueError, RuntimeError, FutuAccountError) as exc:
-            parser.error(str(exc))
-        finally:
-            if account_client is not None:
-                account_client.close()
-        print(f"run_date: {result.run_date}")
-        print(f"real_accounts: {result.account_count}")
-        print(f"positions: {result.position_count}")
-        print(f"cash: {result.cash_count}")
-        print(f"merged_rows: {result.merged_row_count}")
-        print(f"snapshot: {result.snapshot_path}")
-        print(f"portfolio: {result.portfolio_path}")
-        print(f"report: {result.report_path}")
-        print(f"latest: {result.latest_path}")
-        print(f"updated_latest: {'true' if result.updated_latest else 'false'}")
-        return 0
-
-    if args.command == "check-tiger-account":
-        account_client = None
-        try:
-            config = load_tiger_account_config(
-                config_dir=args.config_dir,
-                account=args.account,
-                sandbox=args.sandbox,
-            )
-            account_client = TigerAccountClient(config=config)
-            print(
-                "connected to Tiger OpenAPI account "
-                f"{mask_account_id(config.account)}"
-            )
-            snapshot = account_client.fetch_snapshot()
-        except (FileNotFoundError, ValueError, RuntimeError, TigerAccountError) as exc:
-            parser.error(str(exc))
-        finally:
-            if account_client is not None:
-                account_client.close()
-        print(f"accounts: {len(snapshot.accounts)}")
-        for account in snapshot.accounts:
-            print(
-                "account: "
-                f"alias={account.account_alias} "
-                f"account_type={account.account_type} "
-                f"status={account.status} "
-                f"asset_method={account.asset_method}"
-            )
-        print(f"positions: {len(snapshot.position_records)}")
-        print(f"cash_records: {len(snapshot.cash_records)}")
-        cash_currencies = sorted(
-            {
-                str(record.get("currency", "")).strip().upper()
-                for record in snapshot.cash_records
-                if str(record.get("currency", "")).strip()
-            }
-        )
-        if cash_currencies:
-            print(f"cash_currencies: {','.join(cash_currencies)}")
-        return 0
-
-    if args.command == "sync-tiger-portfolio":
-        account_client = None
-        try:
-            config = load_tiger_account_config(
-                config_dir=args.config_dir,
-                account=args.account,
-                sandbox=args.sandbox,
-            )
-            account_client = TigerAccountClient(config=config)
-            print(
-                "connected to Tiger OpenAPI account "
-                f"{mask_account_id(config.account)}"
-            )
-            snapshot = account_client.fetch_snapshot()
-            result = sync_tiger_portfolio(
-                snapshot=snapshot,
-                portfolio_path=args.portfolio,
-                data_dir=args.data_dir,
-                reports_dir=args.reports_dir,
-                run_date=args.date,
-                update_latest=args.update_latest,
-            )
-        except TigerAccountError as exc:
-            if exc.error_type == "blocking_data_error" and exc.sync_result is not None:
-                _print_tiger_sync_result(exc.sync_result)
-            parser.error(str(exc))
-        except (FileNotFoundError, ValueError, RuntimeError) as exc:
-            parser.error(str(exc))
-        finally:
-            if account_client is not None:
-                account_client.close()
-        _print_tiger_sync_result(result)
-        return 0
 
     if args.command == "kelly" and args.kelly_command == "sync-paper-orders":
         client = None

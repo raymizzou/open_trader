@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -406,103 +406,6 @@ def test_build_notifier_rejects_unknown_notifier(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unknown notifier: email"):
         build_notifier(config)
-
-
-def test_refresh_live_portfolio_syncs_futu_then_tiger(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = DailyPremarketConfig(
-        repo=tmp_path,
-        python=tmp_path / ".venv/bin/python",
-        timezone="Asia/Shanghai",
-        deadline="21:10",
-        futu_host="127.0.0.1",
-        futu_port=11111,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        logs_dir=tmp_path / "logs",
-        portfolio=tmp_path / "data/latest/portfolio.csv",
-    )
-    futu_path = tmp_path / "data/runs/2026-07-09/futu-portfolio.csv"
-    tiger_path = tmp_path / "data/runs/2026-07-09/portfolio.csv"
-    calls: list[str] = []
-    closed: list[str] = []
-
-    class FakeFutuClient:
-        def __init__(self, *, host: str, port: int) -> None:
-            calls.append(f"futu_client:{host}:{port}")
-
-        def fetch_snapshot(self) -> object:
-            calls.append("futu_snapshot")
-            return object()
-
-        def close(self) -> None:
-            closed.append("futu")
-
-    class FakeTigerClient:
-        def __init__(self, *, config: object) -> None:
-            calls.append(f"tiger_client:{config}")
-
-        def fetch_snapshot(self) -> object:
-            calls.append("tiger_snapshot")
-            return object()
-
-        def close(self) -> None:
-            closed.append("tiger")
-
-    def fake_sync_futu_portfolio(**kwargs: object) -> object:
-        calls.append("sync_futu")
-        assert kwargs["portfolio_path"] == config.portfolio
-        assert kwargs["data_dir"] == config.data_dir
-        assert kwargs["reports_dir"] == config.reports_dir
-        assert kwargs["run_date"] == "2026-07-09"
-        assert kwargs["update_latest"] is True
-        return type("Result", (), {"portfolio_path": futu_path})()
-
-    def fake_sync_tiger_portfolio(**kwargs: object) -> object:
-        calls.append("sync_tiger")
-        assert kwargs["portfolio_path"] == config.portfolio
-        assert kwargs["data_dir"] == config.data_dir
-        assert kwargs["reports_dir"] == config.reports_dir
-        assert kwargs["run_date"] == "2026-07-09"
-        assert kwargs["update_latest"] is True
-        return type("Result", (), {"portfolio_path": tiger_path})()
-
-    monkeypatch.setattr(daily_premarket, "FutuAccountClient", FakeFutuClient)
-    monkeypatch.setattr(
-        daily_premarket,
-        "sync_futu_portfolio",
-        fake_sync_futu_portfolio,
-    )
-    monkeypatch.setattr(
-        daily_premarket,
-        "load_tiger_account_config",
-        lambda **kwargs: "tiger-config",
-    )
-    monkeypatch.setattr(daily_premarket, "TigerAccountClient", FakeTigerClient)
-    monkeypatch.setattr(
-        daily_premarket,
-        "sync_tiger_portfolio",
-        fake_sync_tiger_portfolio,
-    )
-
-    result = daily_premarket.refresh_live_portfolio(
-        run_date="2026-07-09",
-        market="US",
-        config=config,
-    )
-
-    assert result == tiger_path
-    assert calls == [
-        "futu_client:127.0.0.1:11111",
-        "futu_snapshot",
-        "sync_futu",
-        "tiger_client:tiger-config",
-        "tiger_snapshot",
-        "sync_tiger",
-    ]
-    assert closed == ["futu", "tiger"]
 
 
 def test_build_notifier_requires_feishu_webhook(tmp_path: Path) -> None:
@@ -1393,6 +1296,173 @@ def _daily_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+def _write_published_account_state(
+    config: DailyPremarketConfig,
+    *,
+    now: datetime,
+    futu_status: str = "ok",
+    controller_heartbeat: datetime | None = None,
+    write_state: bool = True,
+) -> None:
+    from open_trader.account_sync_state import empty_account_sync_state
+
+    config.portfolio.parent.mkdir(parents=True, exist_ok=True)
+    config.portfolio.write_text("market,brokers\nUS,futu\n", encoding="utf-8")
+    if write_state:
+        state = empty_account_sync_state()
+        state["generation"] = now.isoformat()
+        for broker, source in state["brokers"].items():
+            source.update(
+                status="ok",
+                attempted_at=now.isoformat(),
+                last_success_at=now.isoformat(),
+                data_as_of=now.date().isoformat(),
+                period=now.date().isoformat(),
+            )
+        if futu_status == "stale":
+            state["brokers"]["futu"]["last_success_at"] = (
+                now - timedelta(seconds=181)
+            ).isoformat()
+        else:
+            state["brokers"]["futu"]["status"] = futu_status
+        state_path = config.data_dir / "latest/account_sync_state.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    heartbeat = controller_heartbeat or now
+    controller_path = config.data_dir / "account_sync/controller_status.json"
+    controller_path.parent.mkdir(parents=True, exist_ok=True)
+    controller_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.account_sync.controller.v1",
+                "pid": 1,
+                "started_at": now.isoformat(),
+                "heartbeat_at": heartbeat.isoformat(),
+                "working_directory": str(config.repo),
+                "git_sha": "test",
+                "phase": "running",
+                "account_loop": {},
+                "quote_loop": {},
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("futu_status", "write_state", "controller_age", "reason"),
+    [
+        ("failed", True, 0, "futu failed"),
+        ("stale", True, 0, "futu stale"),
+        ("unknown", True, 0, "futu unknown"),
+        ("ok", False, 0, "futu unknown"),
+        ("ok", True, 16, "controller stale"),
+    ],
+)
+def test_daily_runner_blocks_unhealthy_published_portfolio_before_premarket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    futu_status: str,
+    write_state: bool,
+    controller_age: int,
+    reason: str,
+) -> None:
+    def unexpected_broker_client(*_: object, **__: object) -> object:
+        pytest.fail("daily premarket must not construct broker account clients")
+
+    monkeypatch.setattr(
+        daily_premarket, "FutuAccountClient", unexpected_broker_client, raising=False
+    )
+    monkeypatch.setattr(
+        daily_premarket, "TigerAccountClient", unexpected_broker_client, raising=False
+    )
+    now = datetime.now(timezone(timedelta(hours=8)))
+    config = _daily_config(tmp_path)
+    _write_published_account_state(
+        config,
+        now=now,
+        futu_status=futu_status,
+        controller_heartbeat=now - timedelta(seconds=controller_age),
+        write_state=write_state,
+    )
+    premarket_calls: list[dict[str, object]] = []
+
+    def premarket_runner(**kwargs: object) -> object:
+        premarket_calls.append(kwargs)
+        raise AssertionError("premarket runner must not run")
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=premarket_runner,
+        portfolio_validator=daily_premarket.require_published_portfolio,
+    ).run("2026-07-30", market="US", dry_run=True)
+
+    assert result.status == "failed"
+    assert premarket_calls == []
+    assert reason in result.status_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("quote_case", "reason"),
+    [
+        ("failed", "quotes failed"),
+        ("stale", "quotes stale"),
+        ("derived_stale", "quotes stale"),
+        ("missing", "quotes unknown"),
+        ("malformed", "quotes unknown"),
+    ],
+)
+def test_daily_runner_blocks_unhealthy_published_quotes_before_premarket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quote_case: str,
+    reason: str,
+) -> None:
+    monkeypatch.setattr(
+        daily_premarket, "OpenAIClassifierClient", lambda **_: object()
+    )
+    now = datetime.now(timezone(timedelta(hours=8)))
+    config = _daily_config(tmp_path)
+    _write_published_account_state(config, now=now)
+    quotes_path = config.data_dir / "latest/quotes.json"
+    if quote_case != "missing":
+        quotes_path.parent.mkdir(parents=True, exist_ok=True)
+        if quote_case == "malformed":
+            quotes_path.write_text("not json", encoding="utf-8")
+        else:
+            quotes_path.write_text(
+                json.dumps(
+                    {
+                        "status": "failed" if quote_case == "failed" else "ok",
+                        "last_success_at": (
+                            now - timedelta(seconds=121)
+                            if quote_case == "derived_stale"
+                            else now
+                        ).isoformat(),
+                        "stale": quote_case == "stale",
+                        "quotes": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+    premarket_calls: list[dict[str, object]] = []
+
+    def premarket_runner(**kwargs: object) -> object:
+        premarket_calls.append(kwargs)
+        raise AssertionError("premarket runner must not run")
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=premarket_runner,
+        portfolio_validator=daily_premarket.require_published_portfolio,
+    ).run("2026-07-30", market="US", dry_run=True)
+
+    assert result.status == "failed"
+    assert premarket_calls == []
+    assert reason in result.status_path.read_text(encoding="utf-8")
+
+
 def test_require_trend_review_config_returns_selected_market_values(
     tmp_path: Path,
 ) -> None:
@@ -1456,6 +1526,8 @@ def _daily_runner(
     decision_plan_generator: object | None = None,
     **kwargs: object,
 ) -> _DailyPremarketRunner:
+    if "portfolio_validator" not in kwargs:
+        kwargs["portfolio_validator"] = lambda **values: values["portfolio_path"]
     return _DailyPremarketRunner(
         **kwargs,
         summary_generator=summary_generator or FakeTradingAgentsSummaryGenerator(),
@@ -1481,7 +1553,7 @@ def test_daily_runner_status_excludes_retired_tiger_strategy(
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
-        portfolio_refresher=lambda **_: refreshed,
+        portfolio_validator=lambda **_: refreshed,
     ).run("2026-06-19", market="US")
 
     assert result.status == "success"
@@ -1520,7 +1592,7 @@ def test_daily_runner_generates_futu_facts_from_refreshed_portfolio(tmp_path: Pa
         plan_builder=FakePlanBuilder(),
         quote_client_factory=FakeQuoteClient,
         trade_action_generator=FakeTradeActionGenerator(),
-        portfolio_refresher=lambda **_: refreshed_portfolio,
+        portfolio_validator=lambda **_: refreshed_portfolio,
         futu_facts_generator=futu_facts,
     ).run("2026-06-19", market="US")
 
@@ -1674,49 +1746,6 @@ def test_daily_runner_hk_uses_market_scoped_paths_and_calls_market_filter(
         tmp_path / "data/latest/HK/trading_plan.csv"
     )
     assert "data/latest/trading_plan.csv" not in status["artifacts"].values()
-
-
-def test_daily_runner_refreshes_portfolio_before_premarket(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
-    config = _daily_config(tmp_path)
-    stale_portfolio = config.portfolio
-    stale_portfolio.parent.mkdir(parents=True, exist_ok=True)
-    stale_portfolio.write_text("stale\n", encoding="utf-8")
-    refreshed_portfolio = tmp_path / "data/runs/2026-06-19/portfolio.csv"
-    refreshed_portfolio.parent.mkdir(parents=True, exist_ok=True)
-    refreshed_portfolio.write_text("fresh\n", encoding="utf-8")
-    refresh_calls: list[dict[str, object]] = []
-    premarket = FakePremarket(market="US", symbol="MSFT")
-    trade_actions = FakeTradeActionGenerator(market="US", symbol="MSFT")
-
-    def refresh_portfolio(**kwargs: object) -> Path:
-        refresh_calls.append(kwargs)
-        return refreshed_portfolio
-
-    _daily_runner(
-        config=config,
-        portfolio_refresher=refresh_portfolio,
-        premarket_runner=premarket,
-        plan_builder=FakePlanBuilder(market="US", symbol="MSFT"),
-        quote_client_factory=lambda **kwargs: FakeQuoteClient(
-            {"US.MSFT": QuoteSnapshot("US.MSFT", Decimal("390"))},
-            **kwargs,
-        ),
-        trade_action_generator=trade_actions,
-    ).run(run_date="2026-06-19", market="US")
-
-    assert refresh_calls == [
-        {
-            "run_date": "2026-06-19",
-            "market": "US",
-            "config": config,
-        }
-    ]
-    assert premarket.calls[0]["portfolio_path"] == refreshed_portfolio
-    assert trade_actions.calls[0]["portfolio_path"] == refreshed_portfolio
 
 
 def test_daily_runner_uses_real_premarket_fact_generators(

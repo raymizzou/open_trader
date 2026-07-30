@@ -25,16 +25,37 @@ const rgb = {
   success: 'rgb(47, 133, 90)',
 } as const;
 
-async function installLedgerFixture(page: Page) {
+async function installLedgerFixture(page: Page, tigerStatus: 'ok' | 'failed' | 'stale' | 'unknown' = 'ok') {
   await page.route('**/api/dashboard', async (route) => {
     const response = await route.fetch();
     const fixture = await response.json();
     fixture.summary = { portfolio_value_hkd: '3064187.62', holding_value_hkd: '647547.98', cash_like_value_hkd: '2416639.64', holding_count: 4 };
     fixture.broker_summaries = [
       { broker: 'futu', display_name: '富途', portfolio_value_hkd: '971244.73', holding_value_hkd: '960926.44', cash_like_value_hkd: '10318.30', holding_count: 1 },
-      { broker: 'tiger', display_name: '老虎', portfolio_value_hkd: '726091.55', holding_value_hkd: '700000.00', cash_like_value_hkd: '26091.55', holding_count: 1 },
+      { broker: 'tiger', display_name: '老虎', portfolio_value_hkd: '726091.55', holding_value_hkd: '700000.00', cash_like_value_hkd: '26091.55', holding_count: 14 },
       { broker: 'phillips', display_name: '辉立', portfolio_value_hkd: '628554.06', holding_value_hkd: '600000.00', cash_like_value_hkd: '28554.06', holding_count: 1 },
       { broker: 'eastmoney', display_name: '东方财富', portfolio_value_hkd: '730673.51', holding_value_hkd: '700000.00', cash_like_value_hkd: '30673.51', holding_count: 1 },
+    ];
+    const tigerDisplay = tigerStatus === 'ok' ? '同步正常'
+      : tigerStatus === 'failed' ? '同步失败 · 数据截至 11:56'
+      : tigerStatus === 'stale' ? '数据已过期 · 数据截至 11:56'
+      : '同步状态未知 · 数据未验证';
+    fixture.account_sync = {
+      status: tigerStatus === 'ok' ? 'ok' : 'abnormal',
+      label: tigerStatus === 'ok' ? '同步正常' : '同步异常',
+      controller: { status: 'ok', heartbeat_at: '2026-07-30 12:10' },
+      brokers: {
+        futu: { status: 'ok', display: '同步正常', data_as_of: '12:10' },
+        tiger: { status: tigerStatus, display: tigerDisplay, data_as_of: tigerStatus === 'unknown' ? '' : '11:56' },
+        phillips: { status: 'ok', display: '同步正常', data_as_of: '2026-07' },
+        eastmoney: { status: 'ok', display: '同步正常', data_as_of: '2026-07' },
+      },
+    };
+    fixture.broker_positions = [
+      { broker: 'futu', market: 'US', symbol: 'AAPL', name: 'Apple', currency: 'USD', quantity: '10000', cost_price: '200', last_price: '210', market_value_hkd: '16380000', cost_value: '15600000', unrealized_pnl: '780000' },
+      ...Array.from({ length: 14 }, (_, index) => ({ broker: 'tiger', account_alias: 'tiger_main', market: 'US', symbol: `ACCEPTED${index}`, name: `Accepted ${index}`, currency: 'USD', quantity: '1', cost_price: '10', last_price: '11', market_value_hkd: '85.8', cost_value: '78', unrealized_pnl: '7.8' })),
+      { broker: 'phillips', market: 'HK', symbol: '02840', name: 'SPDR 金', currency: 'HKD', quantity: '1', cost_price: '2932', last_price: '2932', market_value_hkd: '2932', cost_value: '2932', unrealized_pnl: '0' },
+      { broker: 'eastmoney', market: 'CN', symbol: '600519', name: '贵州茅台', currency: 'CNY', quantity: '1', cost_price: '1800', last_price: '1800', market_value_hkd: '1944', cost_value: '1944', unrealized_pnl: '0' },
     ];
     fixture.trend_reports = {
       futu: {
@@ -220,7 +241,7 @@ test('renders the exact approved warm-ledger contract', async ({ page }) => {
   });
   await expect(page.locator('body')).toHaveCSS('background-color', rgb.bg);
   await expect(page.locator('body')).toHaveCSS('color', rgb.text);
-  await expect(page.locator('#refresh-quotes')).toHaveCSS('background-color', rgb.accent);
+  await expect(page.locator('#account-sync-status')).toContainText('同步正常');
   await expect(page.locator('.current-view-card')).toHaveCSS('background-color', rgb.primary);
   await expectWarmSurface(page, '.header-brand-panel');
   await expectWarmSurface(page, '.holdings-panel');
@@ -287,7 +308,9 @@ test('switches every broker tab and card while preserving US-filtered ledgers', 
     await expect(page.getByText('02840', { exact: true })).toHaveCount(0);
     await expect(page.getByText('600519', { exact: true })).toHaveCount(0);
     if (broker.key === 'futu' || broker.key === 'tiger') {
-      await expect(page.locator('.account-holding-row')).toHaveCount(1);
+      await expect(page.locator('.account-holding-row')).toHaveCount(
+        broker.key === 'tiger' ? 14 : 1,
+      );
       await expect(account).toContainText(broker.symbol);
     } else {
       await expect(page.locator('.account-holding-row')).toHaveCount(0);
@@ -441,7 +464,6 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
     '#account-tabs [role="tab"]:visible',
     '#header-market-filters button:visible',
     '.strategy-tools button:visible',
-    '#refresh-quotes:visible',
     '.account-holding-actions button:visible',
     '.trend-option-button:visible',
   ].join(','));
@@ -500,6 +522,19 @@ test('keeps four equal tabs and workspaces usable on mobile', async ({ page }) =
   await expectMobileTargetsAtLeast44(page, '.research-chat-modal', 'button:visible, input:visible');
   await page.getByRole('button', { name: '关闭' }).click();
   await page.getByRole('button', { name: '收起' }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('renders 14 accepted Tiger rows and blocks actions for stale account data', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 844 });
+  await installLedgerFixture(page, 'stale');
+  await page.goto('/');
+  await page.getByRole('tab', { name: /老虎/ }).click();
+
+  await expect(page.locator('.account-holding-row:visible')).toHaveCount(14);
+  await expect(page.locator('#account-tiger')).toContainText('数据已过期 · 数据截至 11:56');
+  await expect(page.locator('#account-tiger')).toContainText('人工复核');
+  await expect(page.locator('#account-tiger [data-detail-mode="t_signal"]')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 

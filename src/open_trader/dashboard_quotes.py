@@ -4,9 +4,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+import json
+from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from .account_sync_state import QUOTE_STALE_SECONDS
 from .dashboard import DashboardConfig
 from .futu_quote import DashboardQuoteSnapshot, FutuQuoteClient, FutuQuoteError
 from .futu_universe import FutuUniverseItem, load_futu_quote_universe
@@ -26,6 +29,62 @@ INACTIVE_US_SESSION_ORDERS = {
     "AFTER_HOURS_END": ("after_hours", "regular", "pre_market", "overnight"),
 }
 CLOSED_US_SESSION_ORDER = ("after_hours", "regular", "pre_market", "overnight")
+
+
+def load_published_quotes(path: Path, *, now: datetime) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _unknown_published_quotes()
+    if not isinstance(payload, dict):
+        return _unknown_published_quotes()
+    status = payload.get("status")
+    last_success_at = payload.get("last_success_at")
+    stale = payload.get("stale")
+    quotes = payload.get("quotes")
+    if (
+        status not in {"ok", "partial", "failed"}
+        or not isinstance(last_success_at, str)
+        or not isinstance(stale, bool)
+        or not isinstance(quotes, dict)
+        or any(
+            not isinstance(symbol, str) or not isinstance(quote, dict)
+            for symbol, quote in quotes.items()
+        )
+    ):
+        return _unknown_published_quotes()
+    last_success = _parse_aware_datetime(last_success_at)
+    if last_success_at and last_success is None:
+        return _unknown_published_quotes()
+    effective_stale = stale or (
+        last_success is not None
+        and (now - last_success).total_seconds() > QUOTE_STALE_SECONDS
+    )
+    return {
+        **payload,
+        "stale": effective_stale,
+        "quotes": {
+            symbol: {**quote, "stale": True} if effective_stale else dict(quote)
+            for symbol, quote in quotes.items()
+        },
+    }
+
+
+def _unknown_published_quotes() -> dict[str, object]:
+    return {
+        "status": "unknown",
+        "last_success_at": "",
+        "stale": False,
+        "quotes": {},
+    }
+
+
+def _parse_aware_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 class DashboardQuoteClient(Protocol):
@@ -114,22 +173,32 @@ class DashboardQuoteService:
                     except FutuQuoteError as exc:
                         state_error = exc
         except FutuQuoteError as exc:
-            failed_quotes = self.last_quotes
-            if any(prefix == "US" for prefix, _ in snapshot_errors):
-                failed_quotes = {
-                    symbol: quote
-                    for symbol, quote in failed_quotes.items()
-                    if not symbol.startswith("US.")
-                }
+            retained_quotes = _mark_stale(_accepted_quotes(self.last_quotes))
+            quotes = {
+                symbol: _quote_row(
+                    item=items_by_symbol[symbol],
+                    snapshot=None,
+                    market_state="",
+                    use_us_session=False,
+                    fetched_at=fetched_at,
+                    stale=False,
+                )
+                for symbol in requested_symbols
+                if symbol not in retained_quotes
+            }
+            quotes.update(retained_quotes)
+            missing_count = sum(
+                1 for quote in quotes.values() if quote["status"] == "missing_quote"
+            )
             return QuoteRefreshResult(
                 status="failed",
                 requested_count=len(requested_symbols),
-                quote_count=0,
-                missing_count=0,
+                quote_count=len(quotes) - missing_count,
+                missing_count=missing_count,
                 fetched_at=fetched_at,
                 last_success_at=self.last_success_at,
-                stale=bool(failed_quotes),
-                quotes=_mark_stale(failed_quotes),
+                stale=bool(retained_quotes),
+                quotes=quotes,
                 diagnostic=_error_diagnostic(exc),
             )
         finally:
@@ -166,6 +235,13 @@ class DashboardQuoteService:
             if us_snapshots_succeeded and state_error is not None
             else {}
         )
+        failed_prefixes = {prefix for prefix, _ in snapshot_errors}
+        retained_quotes = {
+            symbol: quote
+            for symbol, quote in _mark_stale(_accepted_quotes(self.last_quotes)).items()
+            if symbol in requested_symbols
+            and symbol.split(".", 1)[0] in failed_prefixes
+        }
         if reused_us_quotes:
             quotes.update(reused_us_quotes)
             market_states.update(
@@ -174,6 +250,7 @@ class DashboardQuoteService:
                     for symbol, quote in reused_us_quotes.items()
                 }
             )
+        quotes.update(retained_quotes)
         missing_count = sum(
             1 for quote in quotes.values() if quote["status"] == "missing_quote"
         )
@@ -198,27 +275,21 @@ class DashboardQuoteService:
             bool(reused_us_quotes),
         )
         cacheable = not snapshot_errors and missing_count == 0 and state_error is None
-        us_cacheable = (
-            bool(us_symbols)
-            and us_snapshots_succeeded
-            and state_error is None
-            and all(quotes[symbol]["status"] == "ok" for symbol in us_symbols)
-        )
         if cacheable:
             self.last_success_at = fetched_at
             self.last_quotes = {
                 futu_symbol: dict(quote)
                 for futu_symbol, quote in quotes.items()
             }
-        elif us_cacheable:
-            self.last_success_at = fetched_at
+        elif snapshot_errors and state_error is None:
             self.last_quotes = {
+                **self.last_quotes,
                 **{
                     symbol: dict(quote)
-                    for symbol, quote in self.last_quotes.items()
-                    if not symbol.startswith("US.")
+                    for symbol, quote in quotes.items()
+                    if symbol.split(".", 1)[0] not in failed_prefixes
+                    and quote["status"] == "ok"
                 },
-                **{symbol: dict(quotes[symbol]) for symbol in us_symbols},
             }
 
         return QuoteRefreshResult(
@@ -228,7 +299,7 @@ class DashboardQuoteService:
             missing_count=missing_count,
             fetched_at=fetched_at,
             last_success_at=self.last_success_at,
-            stale=bool(reused_us_quotes),
+            stale=bool(reused_us_quotes or retained_quotes),
             quotes=quotes,
             diagnostic=diagnostic,
             fallback_count=fallback_count,
@@ -362,6 +433,16 @@ def _mark_stale(
         row["stale"] = True
         stale_quotes[futu_symbol] = row
     return stale_quotes
+
+
+def _accepted_quotes(
+    quotes: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    return {
+        symbol: quote
+        for symbol, quote in quotes.items()
+        if quote.get("status") != "missing_quote"
+    }
 
 
 def _last_good_us_quotes(

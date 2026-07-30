@@ -34,12 +34,10 @@ class StatementImportService:
         self,
         *,
         data_dir: Path,
-        portfolio_path: Path,
         eastmoney_password: str,
         reports_dir: Path | None = None,
     ) -> None:
         self.data_dir = data_dir
-        self.portfolio_path = portfolio_path
         self.eastmoney_password = eastmoney_password
         self.reports_dir = reports_dir or data_dir
 
@@ -74,7 +72,6 @@ class StatementImportService:
             )
             archive = self._archive_path(broker, statement_date)
             snapshots = [
-                _snapshot_path(self.portfolio_path, Path(name) / "rollback", "portfolio"),
                 _snapshot_path(
                     self.data_dir / "runs" / statement_date[:7],
                     Path(name) / "rollback",
@@ -88,12 +85,11 @@ class StatementImportService:
             ]
             backup = _promote_archive(uploaded, archive)
             try:
-                run_uploaded_statement(
+                imported = run_uploaded_statement(
                     statement_date=statement_date,
                     statement_path=archive,
                     parser=parser,
                     data_dir=self.data_dir,
-                    portfolio_path=self.portfolio_path,
                     fx_provider=StaticMonthEndFxProvider(
                         statement_date[:7],
                         RATES_TO_HKD[broker],
@@ -124,6 +120,7 @@ class StatementImportService:
                 for round_ in stats["rounds"]
             ),
             "statistics_cutoff_at": statistics_cutoff_at,
+            "run_path": str(imported.run_dir),
         }
         if parsed.fills:
             result["fills"] = len(parsed.fills)

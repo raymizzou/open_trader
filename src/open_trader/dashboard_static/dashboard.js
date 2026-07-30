@@ -161,7 +161,7 @@ function bindElements() {
     "dashboard-header",
     "quote-status",
     "last-refresh",
-    "refresh-quotes",
+    "account-sync-status",
     "header-market-filters",
     "current-view-label",
     "current-view-value",
@@ -258,7 +258,6 @@ function bindEvents() {
       syncCnTrendBuyAccessibility,
     );
   }
-  elements["refresh-quotes"].addEventListener("click", () => refreshQuotes({refreshSimulation: true}));
   if (elements["kelly-lab-panel"]) {
     elements["kelly-lab-panel"].addEventListener("click", (event) => {
       const strategyTab = event.target.closest("[data-kelly-experiment]");
@@ -943,13 +942,11 @@ function scheduleQuotePolling(pollSeconds) {
   state.quoteIntervalId = window.setInterval(refreshQuotes, intervalMs);
 }
 
-async function refreshQuotes({refreshSimulation = false} = {}) {
+async function refreshQuotes() {
   if (state.refreshActive) {
     return;
   }
   state.refreshActive = true;
-  elements["refresh-quotes"].disabled = true;
-  elements["refresh-quotes"].textContent = "刷新中";
   try {
     const response = await fetch("/api/quotes", { cache: "no-store" });
     if (!response.ok) {
@@ -958,17 +955,8 @@ async function refreshQuotes({refreshSimulation = false} = {}) {
     const payload = await response.json();
     state.quotePayload = payload;
     state.quotes = payload.quotes || {};
-    const simulateBroker = refreshSimulation
-      && TREND_ACCOUNT_BROKERS.includes(state.brokerFilter)
-      && state.accountViews[state.brokerFilter] === "simulate"
-      ? state.brokerFilter
-      : "";
-    if (refreshSimulation) state.trendSimulatePositions = {};
-    if (accountSyncReloadNeeded(payload.account_sync)) {
-      await loadDashboard({preserveOnError: true});
-    }
+    await loadDashboard({preserveOnError: true});
     renderQuoteStatus(payload);
-    if (simulateBroker) await loadTrendSimulatePositions(simulateBroker);
   } catch (error) {
     state.quotePayload = {
       status: "failed",
@@ -981,20 +969,11 @@ async function refreshQuotes({refreshSimulation = false} = {}) {
   } finally {
     if (!["report", "review"].includes(state.accountViews[state.brokerFilter])) renderHoldings();
     state.refreshActive = false;
-    elements["refresh-quotes"].disabled = false;
-    elements["refresh-quotes"].textContent = "刷新账户与行情";
   }
-}
-
-function accountSyncReloadNeeded(accountSync) {
-  if (!accountSync || typeof accountSync !== "object") {
-    return false;
-  }
-  const status = String(accountSync.status || "").trim();
-  return Boolean(status) && status !== "skipped";
 }
 
 function renderDashboard() {
+  renderAccountSyncStatusIntoHeader();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
   renderWorkspaceChrome();
@@ -4752,7 +4731,8 @@ function renderAccountSection(group) {
   const headingId = `account-${group.broker}-title`;
   const rows = group.rows;
   const alias = brokerAccountAlias(group.broker, group.summary);
-  const source = firstPresent(brokerSummarySourceText(group.summary), "-");
+  const sync = brokerSyncStatus(group.broker);
+  const source = sync.display;
   const sourceTime = firstPresent(
     group.summary.generated_at, group.summary.as_of, state.dashboard?.broker_detail_month, "-",
   );
@@ -4778,10 +4758,20 @@ function renderAccountSection(group) {
       </div>
       ${TREND_ACCOUNT_BROKERS.includes(group.broker) ? renderAccountViewTabs(group.broker) : ""}
     </header>
+    ${renderAccountSyncAlert(group.broker)}
     ${TREND_ACCOUNT_BROKERS.includes(group.broker)
       ? `<div id="account-${escapeHtml(group.broker)}-view-panel" class="account-view-panel" role="tabpanel" aria-labelledby="account-${escapeHtml(group.broker)}-view-${escapeHtml(state.accountViews[group.broker] || "real")}">${renderAccountViewPanel(group)}</div>`
       : rows.length ? renderAccountTable(rows) : '<p class="account-empty">当前筛选下没有持仓</p>'}
   </section>`;
+}
+
+function renderAccountSyncAlert(broker) {
+  const sync = brokerSyncStatus(broker);
+  if (!sync.unsafe) return "";
+  const title = sync.status === "failed" ? `${brokerDisplayName(broker)}账户同步失败。`
+    : sync.status === "stale" ? `${brokerDisplayName(broker)}账户数据已过期。`
+    : `${brokerDisplayName(broker)}账户同步状态未知。`;
+  return `<div class="account-sync-alert ${escapeHtml(sourceStatusClass(sync.status))}" role="status"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(sync.display)}。以下为已接受数据；新做T提醒及依赖当前持仓的动作已暂停。</span></div>`;
 }
 
 function renderAccountViewPanel(group) {
@@ -4956,8 +4946,8 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
   const isSelected = !simulated && row.key === state.selectedHoldingKey;
   const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
   const pnlTone = pnlClass(display.unrealized_pnl_pct);
-  const detailActions = simulated
-    ? ""
+  const detailActions = simulated ? "" : brokerSyncStatus(row.broker).unsafe
+    ? '<span class="account-review-action">人工复核</span>'
     : `<button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
   const attribution = simulated ? renderSimulationAttribution(holding, row.broker) : "";
   const quote = simulated && hasValue(display.last_price)
@@ -8337,21 +8327,30 @@ function accountHoldingGroups() {
   const portfolioTotal = state.dashboard?.summary?.portfolio_value_hkd;
   const groups = Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
     const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
-    const rows = [];
-    getHoldings().forEach((holding, index) => {
-      const details = (Array.isArray(holding.broker_details) ? holding.broker_details : [])
-        .filter((detail) => brokerKey(detail) === broker);
-      details.forEach((detail) => rows.push({
-        key: accountHoldingKey(broker, holding, index), broker, holding,
-        display: accountDisplayRow(holding, detail, summary, portfolioTotal),
-        snapshot_market_value_hkd: detail.market_value_hkd, index,
-      }));
-      if (!details.length && rowBrokers(holding).length === 1 && rowBrokers(holding)[0] === broker) {
-        rows.push({key: accountHoldingKey(broker, holding, index), broker, holding,
-          display: accountDisplayRow(holding, null, summary, portfolioTotal),
-          snapshot_market_value_hkd: holding.snapshot_market_value_hkd, index});
-      }
-    });
+    const rows = (Array.isArray(state.dashboard?.broker_positions)
+      ? state.dashboard.broker_positions : [])
+      .filter((position) => brokerKey(position) === broker && isAccountHoldingPosition(position))
+      .map((position, index) => {
+        const accepted = acceptedPositionForDisplay(position);
+        const matching = getHoldings().find((holding) => (
+          rowBrokers(holding).includes(broker)
+          && String(holding.market || "").toUpperCase() === String(accepted.market || "").toUpperCase()
+          && String(holding.symbol || "").toUpperCase() === String(accepted.symbol || "").toUpperCase()
+        )) || {};
+        const holding = {
+          ...matching,
+          ...accepted,
+          brokers: broker,
+          total_quantity: accepted.total_quantity,
+          avg_cost_price: accepted.avg_cost_price,
+        };
+        return {
+          key: accountHoldingKey(broker, holding, index), broker, holding,
+          acceptedPosition: accepted,
+          display: accountDisplayRow(holding, accepted, summary, portfolioTotal),
+          snapshot_market_value_hkd: accepted.market_value_hkd, index,
+        };
+      });
     return {broker, profile, summary, rows};
   });
   const livePortfolioTotal = quoteAdjustedTotal(
@@ -8362,11 +8361,43 @@ function accountHoldingGroups() {
     const liveAccountTotal = quoteAdjustedTotal(group.summary.portfolio_value_hkd, group.rows);
     group.rows.forEach((row) => {
       const marketValue = numericValue(row.display.market_value_hkd);
-      row.display.account_weight = percentValue(marketValue, liveAccountTotal);
-      row.display.portfolio_weight = percentValue(marketValue, livePortfolioTotal);
+      if (!hasValue(row.acceptedPosition?.account_weight)
+          && !hasValue(row.acceptedPosition?.account_weight_hkd)) {
+        row.display.account_weight = percentValue(marketValue, liveAccountTotal);
+      }
+      if (!hasValue(row.acceptedPosition?.portfolio_weight)
+          && !hasValue(row.acceptedPosition?.portfolio_weight_hkd)) {
+        row.display.portfolio_weight = percentValue(marketValue, livePortfolioTotal);
+      }
     });
   });
   return groups;
+}
+
+function acceptedPositionForDisplay(position) {
+  const existingMarketValueHkd = firstPresent(
+    position.market_value_hkd,
+    position.market_value_in_hkd,
+    position.value_hkd,
+  );
+  const marketValue = numericValue(position.market_value);
+  const fxToHkd = numericValue(position.fx_to_hkd);
+  const marketValueHkd = hasValue(existingMarketValueHkd)
+    ? existingMarketValueHkd
+    : marketValue !== null && fxToHkd !== null && fxToHkd > 0
+      ? (marketValue * fxToHkd).toFixed(2)
+      : "";
+  return {
+    ...position,
+    market_value_hkd: marketValueHkd,
+    total_quantity: firstPresent(position.total_quantity, position.quantity),
+    avg_cost_price: firstPresent(position.avg_cost_price, position.cost_price),
+    last_price: firstPresent(position.last_price, position.price),
+    unrealized_pnl: firstPresent(position.unrealized_pnl, position.pnl),
+    unrealized_pnl_pct: firstPresent(position.unrealized_pnl_pct, position.pnl_pct),
+    account_weight: firstPresent(position.account_weight, position.account_weight_hkd),
+    portfolio_weight: firstPresent(position.portfolio_weight, position.portfolio_weight_hkd),
+  };
 }
 
 function quoteAdjustedTotal(snapshotTotal, rows) {
@@ -8384,20 +8415,48 @@ function quoteAdjustedTotal(snapshotTotal, rows) {
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {
   const quote = quoteForHolding(holding);
   const hasQuotePrice = numericValue(quote && quote.last_price) > 0;
+  const quantity = firstPresent(detail?.quantity, detail?.total_quantity, holding.total_quantity);
+  const costPrice = firstPresent(detail?.cost_price, detail?.avg_cost_price, holding.avg_cost_price);
+  const acceptedPnlPercent = firstPresent(
+    detail?.unrealized_pnl_pct,
+    detail?.pnl_pct,
+  );
+  const acceptedAccountWeight = firstPresent(
+    detail?.account_weight,
+    detail?.account_weight_hkd,
+    holding.account_weight,
+    holding.account_weight_hkd,
+  );
+  const acceptedPortfolioWeight = firstPresent(
+    detail?.portfolio_weight,
+    detail?.portfolio_weight_hkd,
+    holding.portfolio_weight,
+    holding.portfolio_weight_hkd,
+  );
   const display = quoteAdjustedHolding({
     ...holding,
     ...(detail || {}),
-    total_quantity: detail ? detail.quantity : holding.total_quantity,
+    total_quantity: quantity,
+    avg_cost_price: costPrice,
   }, quote);
   const marketValue = numericValue(display.market_value_hkd);
   return {
     ...display,
-    total_quantity: formatPlain(detail ? detail.quantity : holding.total_quantity),
-    avg_cost_price: formatPlain(detail ? detail.cost_price : holding.avg_cost_price),
-    account_weight: percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
-    portfolio_weight: percentValue(marketValue, numericValue(portfolioTotal)),
+    total_quantity: formatPlain(quantity),
+    avg_cost_price: formatPlain(costPrice),
+    account_weight: firstPresent(
+      acceptedAccountWeight,
+      percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
+    ) || "-",
+    portfolio_weight: firstPresent(
+      acceptedPortfolioWeight,
+      percentValue(marketValue, numericValue(portfolioTotal)),
+    ) || "-",
     unrealized_pnl_pct: detail && !hasQuotePrice
-      ? percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value))
+      ? firstPresent(
+        acceptedPnlPercent,
+        percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value)),
+      ) || "-"
       : formatPlain(display.unrealized_pnl_pct),
   };
 }
@@ -8435,6 +8494,37 @@ function brokerSummaries() {
     : [];
 }
 
+function brokerSyncStatus(broker) {
+  const source = state.dashboard?.account_sync?.brokers?.[broker];
+  const status = String(source?.status || "unknown").trim().toLowerCase();
+  const dataAsOf = formatPlain(source?.data_as_of);
+  const fallback = status === "ok" ? "同步正常"
+    : status === "failed" ? `同步失败${dataAsOf !== "-" ? ` · 数据截至 ${dataAsOf}` : ""}`
+    : status === "stale" ? `数据已过期${dataAsOf !== "-" ? ` · 数据截至 ${dataAsOf}` : ""}`
+    : "同步状态未知 · 数据未验证";
+  return {
+    status,
+    display: formatPlain(source?.display || fallback),
+    unsafe: ["failed", "stale", "unknown"].includes(status),
+  };
+}
+
+function renderAccountSyncStatus() {
+  const sync = state.dashboard?.account_sync || {};
+  const controller = sync.controller || {};
+  const status = String(sync.status || "unknown").toLowerCase();
+  const label = formatPlain(sync.label || (status === "ok" ? "同步正常" : "同步异常"));
+  const heartbeat = formatPlain(controller.heartbeat_at);
+  return `<strong class="${escapeHtml(status === "ok" ? "status-ok" : "status-failed")}">${escapeHtml(label)}</strong><span>控制器心跳 ${escapeHtml(heartbeat)}</span>`;
+}
+
+function renderAccountSyncStatusIntoHeader() {
+  const target = elements["account-sync-status"];
+  if (!target) return;
+  target.className = `account-sync-status ${state.dashboard?.account_sync?.status === "ok" ? "status-ok" : "status-failed"}`;
+  target.innerHTML = renderAccountSyncStatus();
+}
+
 function renderBrokerCards() {
   elements["broker-summary-cards"].innerHTML = renderBrokerSummaryCards();
 }
@@ -8444,7 +8534,7 @@ function renderBrokerSummaryCards() {
   return ACCOUNT_BROKERS.map((broker) => {
     const summary = summaries.find((item) => brokerKey(item) === broker) || {broker};
     const profile = ACCOUNT_STRATEGY_PROFILES[broker] || {horizon: "-", strategy: "-"};
-    return `<button class="broker-summary-card" type="button" data-broker="${escapeHtml(broker)}">
+    return `<button class="broker-summary-card ${escapeHtml(sourceStatusClass(brokerSyncStatus(broker).status))}" type="button" data-broker="${escapeHtml(broker)}">
       <span class="summary-label">${escapeHtml(brokerDisplayName(summary))}</span>
       <span class="account-horizon-label">${escapeHtml(profile.horizon)} · ${escapeHtml(profile.strategy)}</span>
       <span class="broker-account-alias">账户 ${escapeHtml(formatPlain(brokerAccountAlias(broker, summary)))}</span>
@@ -8456,19 +8546,16 @@ function renderBrokerSummaryCards() {
 
 function brokerAccountAlias(broker, summary = {}) {
   const cash = getCashRows().find((row) => brokerKey(row) === broker) || {};
+  const position = (state.dashboard?.broker_positions || []).find((row) => brokerKey(row) === broker) || {};
   const detail = (state.dashboard?.holdings || []).flatMap((holding) => (
     Array.isArray(holding.broker_details) ? holding.broker_details : []
   )).find((row) => brokerKey(row) === broker) || {};
-  return firstPresent(summary.account_alias, summary.accounts, cash.account_alias, cash.accounts,
+  return firstPresent(summary.account_alias, summary.accounts, cash.account_alias, cash.accounts, position.account_alias,
     detail.account_alias, detail.accounts, "-");
 }
 
 function brokerSummarySourceText(summary) {
-  const source = sourceStatuses().find((row) => brokerKey(row) === brokerKey(summary));
-  if (source) {
-    return sourceDisplayText(source);
-  }
-  return sourceKindText(summary.source_kind || summary.source_status);
+  return brokerSyncStatus(brokerKey(summary)).display;
 }
 
 function renderSourceStatusListIntoHeader() {
@@ -8476,19 +8563,22 @@ function renderSourceStatusListIntoHeader() {
 }
 
 function renderSourceStatusList() {
-  const rows = sourceStatuses();
-  if (!rows.length) {
-    return `<div class="source-status-row status-muted"><strong>数据来源</strong><span>-</span></div>`;
-  }
-  return rows.map((row) => {
-    const status = sourceStatusValue(row);
+  const controller = state.dashboard?.account_sync?.controller || {};
+  const controllerStatus = String(controller.status || "unknown").toLowerCase();
+  const controllerClass = sourceStatusClass(controllerStatus);
+  const controllerText = controller.heartbeat_at
+    ? `心跳 ${formatPlain(controller.heartbeat_at)}`
+    : "同步状态未知 · 数据未验证";
+  return [`<div class="source-status-row ${escapeHtml(controllerClass)}"><strong>控制器</strong><span>${escapeHtml(controllerText)}</span></div>`,
+    ...ACCOUNT_BROKERS.map((broker) => {
+    const sync = brokerSyncStatus(broker);
     return `
-      <div class="source-status-row ${escapeHtml(sourceStatusClass(row.status))}" data-broker="${escapeHtml(brokerKey(row))}">
-        <strong>${escapeHtml(sourceStatusLabel(row))}</strong>
-        <span>${escapeHtml(status)}</span>
+      <div class="source-status-row ${escapeHtml(sourceStatusClass(sync.status))}" data-broker="${escapeHtml(broker)}">
+        <strong>${escapeHtml(brokerDisplayName(broker))}账户</strong>
+        <span>${escapeHtml(sync.display)}</span>
       </div>
     `;
-  }).join("");
+  })].join("");
 }
 
 function sourceStatuses() {
@@ -8525,6 +8615,9 @@ function sourceStatusClass(status) {
   }
   if (normalized === "non_realtime" || normalized === "statement") {
     return "status-partial";
+  }
+  if (normalized === "stale") {
+    return "status-stale";
   }
   if (normalized === "missing" || normalized === "failed" || normalized === "error") {
     return "status-failed";
@@ -8646,6 +8739,11 @@ function quoteNotApplicable(holding) {
   const market = String(holding.market || "").toUpperCase();
   const assetClass = String(holding.asset_class || "").toLowerCase();
   return market === "CASH" || assetClass === "cash" || assetClass === "money_market_fund";
+}
+
+function isAccountHoldingPosition(position) {
+  const quantity = numericValue(firstPresent(position.total_quantity, position.quantity));
+  return !quoteNotApplicable(position) && quantity !== 0;
 }
 
 function detailLivePrice(holding, quote) {

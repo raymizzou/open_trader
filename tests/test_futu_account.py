@@ -11,8 +11,8 @@ from open_trader import futu_account as futu_account_module
 from open_trader.futu_account import (
     FutuAccountClient,
     FutuAccountError,
+    build_futu_account_candidate,
     map_snapshot_to_portfolio_inputs,
-    sync_futu_portfolio,
 )
 from open_trader.models import AssetClass, Market
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
@@ -619,6 +619,222 @@ def client_snapshot_from_records(
     )
 
 
+def test_build_futu_account_candidate_normalizes_complete_snapshot() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "100.25",
+                "available_cash": "88.50",
+            }
+        ],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": f"US.TEST{index}",
+                "stock_name": f"Test {index}",
+                "stock_type": "STOCK",
+                "currency": "USD",
+                "qty": "1",
+                "cost_price": "10",
+                "nominal_price": "11",
+                "market_val": "11",
+            }
+            for index in range(14)
+        ],
+    )
+
+    candidate = build_futu_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+        fallback_fx_to_hkd={"USD": Decimal("7.8123")},
+    )
+
+    assert len(candidate.positions) == 14
+    assert candidate.summary == {
+        "account_count": 1,
+        "position_count": 14,
+        "cash_count": 1,
+        "account_aliases": ["futu_***"],
+    }
+    assert candidate.data_as_of == "2026-07-30T11:56:54+08:00"
+    assert candidate.positions[0].asset_class is AssetClass.STOCK
+    assert candidate.cash[0].currency == "USD"
+    assert candidate.fx_rates == (
+        {"account_alias": "futu_***", "currency": "USD", "rate_to_hkd": "7.8123"},
+    )
+
+
+def test_build_futu_account_candidate_complete_zero_positions_is_valid() -> None:
+    candidate = build_futu_account_candidate(
+        client_snapshot_from_records(cash_records=[], position_records=[]),
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+        fallback_fx_to_hkd={},
+    )
+
+    assert candidate.positions == ()
+    assert candidate.summary["position_count"] == 0
+
+
+def test_build_futu_account_candidate_rejects_missing_real_account() -> None:
+    snapshot = client_snapshot_from_records(cash_records=[], position_records=[])
+    snapshot = snapshot.__class__(
+        accounts=[],
+        cash_records=snapshot.cash_records,
+        position_records=snapshot.position_records,
+    )
+
+    with pytest.raises(FutuAccountError) as exc_info:
+        build_futu_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+            fallback_fx_to_hkd={},
+        )
+
+    assert exc_info.value.error_type == "no_real_accounts"
+
+
+def test_build_futu_account_candidate_rejects_malformed_or_duplicate_identity() -> None:
+    malformed = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[{"_account_alias": "futu_111", "code": "US.MSFT"}],
+    )
+    duplicate = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.MSFT",
+                "qty": "1",
+                "market_val": "11",
+                "cost_price": "10",
+            },
+            {
+                "_account_alias": "futu_111",
+                "code": "US.MSFT",
+                "qty": "1",
+                "market_val": "11",
+                "cost_price": "10",
+            },
+        ],
+    )
+
+    for snapshot, error_type in ((malformed, "blocking_data_error"), (duplicate, "duplicate_identity")):
+        with pytest.raises(FutuAccountError) as exc_info:
+            build_futu_account_candidate(
+                snapshot,
+                run_date="2026-07-30",
+                data_as_of="2026-07-30T11:56:54+08:00",
+                fallback_fx_to_hkd={"USD": Decimal("7.8123")},
+            )
+
+        assert exc_info.value.error_type == error_type
+
+
+def test_build_futu_account_candidate_rejects_malformed_total_assets() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "0",
+                "total_assets": "bad",
+            }
+        ],
+        position_records=[],
+    )
+
+    with pytest.raises(FutuAccountError) as exc_info:
+        build_futu_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+            fallback_fx_to_hkd={},
+        )
+
+    assert exc_info.value.error_type == "blocking_data_error"
+
+
+def test_build_futu_account_candidate_rejects_raw_record_account_alias() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "123456789",
+                "currency": "HKD",
+                "cash": "10",
+                "total_assets": "100",
+            }
+        ],
+        position_records=[],
+    )
+
+    with pytest.raises(FutuAccountError) as exc_info:
+        build_futu_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+            fallback_fx_to_hkd={},
+        )
+
+    assert exc_info.value.error_type == "account_query_failed"
+    assert "123456789" not in str(exc_info.value)
+
+
+def test_build_futu_account_candidate_normalizes_self_consistent_raw_account_alias() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_acc_id": "123456789",
+                "_account_alias": "123456789",
+                "currency": "USD",
+                "cash": "10",
+            }
+        ],
+        position_records=[
+            {
+                "_acc_id": "123456789",
+                "_account_alias": "123456789",
+                "code": "US.MSFT",
+                "qty": "1",
+                "cost_price": "10",
+                "market_val": "11",
+            }
+        ],
+    )
+    snapshot = snapshot.__class__(
+        accounts=[
+            futu_account_module.FutuAccount(
+                acc_id=123456789,
+                acc_index=0,
+                trd_env="REAL",
+                acc_type="CASH",
+                account_alias="123456789",
+            )
+        ],
+        cash_records=snapshot.cash_records,
+        position_records=snapshot.position_records,
+    )
+
+    candidate = build_futu_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+        fallback_fx_to_hkd={"USD": Decimal("7.8123")},
+    )
+
+    assert {position.account_alias for position in candidate.positions} == {
+        "futu_*****6789"
+    }
+    assert {cash.account_alias for cash in candidate.cash} == {"futu_*****6789"}
+    assert candidate.fx_rates[0]["account_alias"] == "futu_*****6789"
+    assert candidate.summary["account_aliases"] == ["futu_*****6789"]
+    assert "123456789" not in repr(candidate)
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -775,744 +991,3 @@ def tiger_unmapped_assets_row() -> dict[str, str]:
         "accounts": "tiger_main",
         "notes": "Tiger account_total reconciliation for locked funds or fund assets not returned as positions",
     }
-
-
-def test_sync_futu_portfolio_replaces_old_futu_rows_and_preserves_other_brokers(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [old_futu_row(), tiger_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "_acc_id": 111,
-                "currency": "USD",
-                "cash": "100",
-                "available_cash": "90",
-            }
-        ],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "_acc_id": 111,
-                "code": "US.MSFT",
-                "stock_name": "Microsoft",
-                "qty": "2",
-                "cost_price": "300",
-                "nominal_price": "410",
-                "market_val": "820",
-                "currency": "USD",
-                "stock_type": "STOCK",
-            }
-        ],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    symbols = {row["symbol"] for row in rows}
-    assert "OLD" not in symbols
-    assert {"AAPL", "MSFT", "USD_CASH"} <= symbols
-    msft = next(row for row in rows if row["symbol"] == "MSFT")
-    assert msft["brokers"] == "futu"
-    assert msft["market_value_hkd"] == "6396.00"
-    assert msft["portfolio_weight_hkd"] == "73.21%"
-    aapl = next(row for row in rows if row["symbol"] == "AAPL")
-    assert aapl["brokers"] == "tiger"
-    assert aapl["portfolio_weight_hkd"] == "17.86%"
-    assert result.latest_path == tmp_path / "data/latest/portfolio.csv"
-    assert result.snapshot_path == (
-        tmp_path / "data/runs/2026-06-18/futu_account_snapshot.json"
-    )
-    assert result.portfolio_path == tmp_path / "data/runs/2026-06-18/portfolio.csv"
-    assert result.report_path == tmp_path / "reports/futu_account/2026-06-18.md"
-    assert read_portfolio(result.latest_path)[0]["symbol"] == "OLD"
-    assert result.updated_latest is False
-
-    snapshot_payload = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
-    snapshot_text = result.snapshot_path.read_text(encoding="utf-8")
-    assert snapshot_payload["accounts"][0]["acc_id"] == "***"
-    assert snapshot_payload["accounts"][0]["account_alias"] == "futu_***"
-    assert snapshot_payload["cash_records"][0]["_acc_id"] == "***"
-    assert snapshot_payload["cash_records"][0]["_account_alias"] == "futu_***"
-    assert snapshot_payload["position_records"][0]["_acc_id"] == "***"
-    assert snapshot_payload["position_records"][0]["_account_alias"] == "futu_***"
-    assert "111" not in snapshot_text
-    report = result.report_path.read_text(encoding="utf-8")
-    assert "富途账户同步" in report
-    assert "真实账户：1" in report
-    assert "未更新 latest" in report
-
-
-def test_sync_futu_portfolio_builds_live_only_portfolio_without_existing_portfolio(
-    tmp_path: Path,
-) -> None:
-    missing_portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    snapshot = client_snapshot_from_records(
-        cash_records=[],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "code": "US.DRAM",
-                "stock_name": "Roundhill Memory ETF",
-                "qty": "300",
-                "cost_price": "70",
-                "nominal_price": "79",
-                "market_val": "23700",
-                "pl_val": "2700",
-                "currency": "USD",
-                "stock_type": "STOCK",
-            }
-        ],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=missing_portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-25",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    assert len(rows) == 1
-    assert rows[0]["symbol"] == "DRAM"
-    assert rows[0]["total_quantity"] == "300"
-    assert rows[0]["fx_to_hkd"] == "7.85"
-    assert missing_portfolio_path.exists() is False
-
-
-def test_sync_futu_portfolio_infers_asset_class_when_futu_type_is_missing(
-    tmp_path: Path,
-) -> None:
-    missing_portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    snapshot = client_snapshot_from_records(
-        cash_records=[],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "code": "US.RAM",
-                "stock_name": "2倍做多DRAM ETF-T-REX",
-                "qty": "470",
-                "cost_price": "19.69",
-                "nominal_price": "16.96",
-                "market_val": "7971.20",
-                "currency": "USD",
-            },
-            {
-                "_account_alias": "futu_111",
-                "code": "US.AMAT",
-                "stock_name": "应用材料",
-                "qty": "3",
-                "cost_price": "718.76",
-                "nominal_price": "603.04",
-                "market_val": "1809.12",
-                "currency": "USD",
-            },
-            {
-                "_account_alias": "futu_111",
-                "code": "HK.03661",
-                "stock_name": "圣邦股份",
-                "qty": "300",
-                "cost_price": "85.2",
-                "nominal_price": "120",
-                "market_val": "36000",
-                "currency": "HKD",
-            },
-            {
-                "_account_alias": "futu_111",
-                "code": "US.DRAM260731P55000",
-                "stock_name": "DRAM 260731 55.00P",
-                "qty": "-2",
-                "cost_price": "2.735",
-                "nominal_price": "4.339",
-                "market_val": "-867.78",
-                "currency": "USD",
-            },
-        ],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=missing_portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-07-04",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    by_symbol = {row["symbol"]: row for row in rows}
-    assert by_symbol["RAM"]["asset_class"] == "etf"
-    assert by_symbol["RAM"]["ai_eligible"] == "true"
-    assert by_symbol["RAM"]["analysis_symbol"] == "RAM"
-    assert by_symbol["AMAT"]["asset_class"] == "stock"
-    assert by_symbol["AMAT"]["ai_eligible"] == "true"
-    assert by_symbol["03661"]["asset_class"] == "stock"
-    assert by_symbol["03661"]["analysis_symbol"] == "03661"
-    assert by_symbol["DRAM260731P55000"]["asset_class"] == "option"
-    assert by_symbol["DRAM260731P55000"]["ai_eligible"] == "false"
-    assert by_symbol["DRAM260731P55000"]["analysis_symbol"] == ""
-
-
-def test_sync_futu_portfolio_deduplicates_unknown_zero_position_against_tiger_stock(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [hk_tiger_stock_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "code": "HK.01688",
-                "stock_name": "领益智造",
-                "qty": "0",
-                "cost_price": "0",
-                "nominal_price": "9.71",
-                "market_val": "0",
-                "cost_value": "0",
-                "pl_val": "-277.2",
-                "currency": "HKD",
-            }
-        ],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-29",
-        update_latest=True,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    matching = [
-        row for row in rows if row["market"] == "HK" and row["symbol"] == "01688"
-    ]
-    assert len(matching) == 1
-    row = matching[0]
-    assert row["asset_class"] == "stock"
-    assert row["total_quantity"] == "2640"
-    assert row["market_value_hkd"] == "25634.40"
-    assert row["brokers"] == "futu;tiger"
-    assert result.updated_latest is True
-    latest_rows = read_portfolio(result.latest_path)
-    assert (
-        len(
-            [
-                row
-                for row in latest_rows
-                if row["market"] == "HK" and row["symbol"] == "01688"
-            ]
-        )
-        == 1
-    )
-
-
-def test_sync_futu_portfolio_rebuilds_mixed_symbols_from_statement_details(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    mixed_vixy_row = {
-        **old_futu_row(),
-        "asset_class": "etf",
-        "symbol": "VIXY",
-        "name": "VIXY",
-        "total_quantity": "200",
-        "market_value": "4842.8",
-        "market_value_hkd": "38015.98",
-        "brokers": "futu;tiger",
-        "accounts": "futu_main;tiger_main",
-        "fx_to_hkd": "7.85",
-    }
-    write_portfolio(portfolio_path, [mixed_vixy_row])
-    write_csv(
-        tmp_path / "data/runs/2026-05/extracted_positions.csv",
-        [
-            {
-                "statement_id": "2026-05-futu",
-                "broker": "futu",
-                "account_alias": "futu_main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "VIXY",
-                "currency": "USD",
-                "quantity": "165",
-                "cost_price": "",
-                "last_price": "24.41",
-                "market_value": "4027.65",
-                "cost_value": "",
-                "unrealized_pnl": "",
-                "confidence": "high",
-                "notes": "",
-            },
-            {
-                "statement_id": "2026-05-tiger",
-                "broker": "tiger",
-                "account_alias": "tiger_main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "VIXY",
-                "currency": "USD",
-                "quantity": "35",
-                "cost_price": "28.7408571",
-                "last_price": "23.29",
-                "market_value": "815.15",
-                "cost_value": "1005.9299985",
-                "unrealized_pnl": "-190.78",
-                "confidence": "high",
-                "notes": "",
-            },
-        ],
-    )
-    snapshot = client_snapshot_from_records(
-        cash_records=[],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "code": "US.VIXY",
-                "stock_name": "VIXY",
-                "qty": "100",
-                "cost_price": "42.616",
-                "nominal_price": "21.925",
-                "market_val": "2192.5",
-                "pl_val": "-2069.07",
-                "currency": "USD",
-            }
-        ],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-19",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    assert len(rows) == 1
-    assert rows[0]["symbol"] == "VIXY"
-    assert rows[0]["brokers"] == "futu;tiger"
-    assert rows[0]["total_quantity"] == "135"
-    assert rows[0]["market_value"] == "3007.65"
-    assert read_portfolio(portfolio_path)[0]["total_quantity"] == "200"
-    with (tmp_path / "data/runs/2026-06-19/extracted_positions.csv").open(
-        encoding="utf-8",
-        newline="",
-    ) as handle:
-        detail_rows = list(csv.DictReader(handle))
-    assert [
-        {
-            "broker": row["broker"],
-            "symbol": row["symbol"],
-            "quantity": row["quantity"],
-        }
-        for row in detail_rows
-    ] == [
-        {"broker": "tiger", "symbol": "VIXY", "quantity": "35"},
-        {"broker": "futu", "symbol": "VIXY", "quantity": "100"},
-    ]
-
-
-def test_sync_futu_portfolio_cash_count_uses_expanded_currency_balances(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [tiger_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "HKD",
-                "cash": "-114156.26",
-                "hk_cash": "-125409.59",
-                "hk_avl_withdrawal_cash": "-125409.59",
-                "us_cash": "1435.8",
-                "us_avl_withdrawal_cash": "1400.50",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=False,
-    )
-
-    assert result.cash_count == 2
-    rows = read_portfolio(result.portfolio_path)
-    assert {"HKD_CASH", "USD_CASH"} <= {row["symbol"] for row in rows}
-    report = result.report_path.read_text(encoding="utf-8")
-    assert "现金币种：2" in report
-
-
-def test_sync_futu_portfolio_reconciles_unmapped_futu_total_assets(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [tiger_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "HKD",
-                "total_assets": "1000",
-                "cash": "-100",
-                "hk_cash": "-100",
-                "hk_avl_withdrawal_cash": "0",
-            }
-        ],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "code": "HK.00700",
-                "stock_name": "Tencent",
-                "qty": "1",
-                "cost_price": "200",
-                "nominal_price": "200",
-                "market_val": "200",
-                "pl_val": "0",
-                "currency": "HKD",
-                "stock_type": "STOCK",
-            }
-        ],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    adjustment = next(row for row in rows if row["symbol"] == "FUTU_UNMAPPED_ASSETS")
-    assert adjustment["market"] == "CASH"
-    assert adjustment["asset_class"] == "cash"
-    assert adjustment["name"] == "富途未明细账户资产"
-    assert adjustment["market_value_hkd"] == "900.00"
-    assert adjustment["brokers"] == "futu"
-    assert adjustment["accounts"] == "futu_111"
-    total_hkd = sum(Decimal(row["market_value_hkd"]) for row in rows)
-    assert total_hkd == Decimal("2560.00")
-
-
-def test_sync_futu_portfolio_updates_latest_only_when_requested(tmp_path: Path) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [old_futu_row(), tiger_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "USD",
-                "cash": "100",
-                "available_cash": "90",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=True,
-    )
-
-    rows = read_portfolio(result.latest_path)
-    assert {row["symbol"] for row in rows} == {"AAPL", "USD_CASH"}
-    assert result.updated_latest is True
-
-
-def test_sync_futu_portfolio_promotes_latest_through_atomic_helper(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [old_futu_row(), tiger_row()])
-    calls: list[tuple[Path, set[str]]] = []
-
-    def spy_write_latest(path: Path, rows: list[dict[str, str]]) -> None:
-        rows_list = list(rows)
-        calls.append((path, {row["symbol"] for row in rows_list}))
-        write_portfolio(path, rows_list)
-
-    monkeypatch.setattr(
-        futu_account_module,
-        "_write_latest_portfolio_atomic",
-        spy_write_latest,
-        raising=False,
-    )
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "USD",
-                "cash": "100",
-                "available_cash": "90",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=True,
-    )
-
-    assert calls == [(result.latest_path, {"AAPL", "USD_CASH"})]
-    assert result.updated_latest is True
-
-
-def test_sync_futu_portfolio_clears_stale_preserved_overweight_flag(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    stale_overweight = {**tiger_row(), "risk_flag": "overweight"}
-    write_portfolio(portfolio_path, [old_futu_row(), stale_overweight])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "USD",
-                "cash": "2000",
-                "available_cash": "2000",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    aapl = next(row for row in rows if row["symbol"] == "AAPL")
-    assert aapl["portfolio_weight_hkd"] == "9.09%"
-    assert aapl["risk_flag"] == "normal"
-
-
-def test_sync_futu_portfolio_blocks_latest_when_required_fields_are_malformed(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [old_futu_row(), tiger_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "USD",
-                "cash": "100",
-            }
-        ],
-        position_records=[
-            {
-                "_account_alias": "futu_111",
-                "code": "US.BROKEN",
-                "stock_name": "Broken",
-                "qty": "bad",
-                "currency": "USD",
-                "stock_type": "STOCK",
-            }
-        ],
-    )
-
-    with pytest.raises(FutuAccountError) as exc_info:
-        sync_futu_portfolio(
-            snapshot=snapshot,
-            portfolio_path=portfolio_path,
-            data_dir=tmp_path / "data",
-            reports_dir=tmp_path / "reports",
-            run_date="2026-06-18",
-            update_latest=True,
-        )
-
-    assert exc_info.value.error_type == "blocking_data_error"
-    assert read_portfolio(portfolio_path)[0]["symbol"] == "OLD"
-    run_dir = tmp_path / "data/runs/2026-06-18"
-    snapshot_path = run_dir / "futu_account_snapshot.json"
-    merged_portfolio_path = run_dir / "portfolio.csv"
-    report_path = tmp_path / "reports/futu_account/2026-06-18.md"
-    assert snapshot_path.exists()
-    assert merged_portfolio_path.exists()
-    assert report_path.exists()
-    snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert snapshot_payload["position_records"][0]["qty"] == "bad"
-    report = report_path.read_text(encoding="utf-8")
-    assert "富途账户同步" in report
-    assert "数据检查：需要复核" in report
-    assert "未更新 latest" in report
-
-
-@pytest.mark.parametrize("market_value_hkd", ["", "not-a-number"])
-def test_sync_futu_portfolio_marks_all_rows_data_check_when_preserved_hkd_value_is_invalid(
-    tmp_path: Path,
-    market_value_hkd: str,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    malformed_tiger = {**tiger_row(), "market_value_hkd": market_value_hkd}
-    write_portfolio(portfolio_path, [malformed_tiger])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "USD",
-                "cash": "100",
-                "available_cash": "90",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=False,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    assert {row["portfolio_weight_hkd"] for row in rows} == {""}
-    assert {row["risk_flag"] for row in rows} == {"data_check"}
-
-
-def test_sync_futu_portfolio_preserves_malformed_cash_value_from_valid_hkd_value(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    malformed_cash = {**usd_cash_row(), "market_value": "bad"}
-    write_portfolio(portfolio_path, [malformed_cash])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "HKD",
-                "cash": "100",
-                "available_cash": "90",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=True,
-    )
-
-    rows = read_portfolio(result.portfolio_path)
-    usd_cash = next(row for row in rows if row["symbol"] == "USD_CASH")
-    assert usd_cash["market_value_hkd"] == "7800.00"
-    assert usd_cash["market_value_hkd"] != "0.00"
-    assert {row["portfolio_weight_hkd"] for row in rows} == {""}
-    assert {row["risk_flag"] for row in rows} == {"data_check"}
-    assert result.updated_latest is True
-    latest_usd_cash = next(
-        row for row in read_portfolio(result.latest_path) if row["symbol"] == "USD_CASH"
-    )
-    assert latest_usd_cash["market_value_hkd"] == "7800.00"
-
-
-def test_sync_futu_portfolio_preserves_special_cash_class_position_rows(
-    tmp_path: Path,
-) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    write_portfolio(portfolio_path, [tiger_unmapped_assets_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[
-            {
-                "_account_alias": "futu_111",
-                "currency": "HKD",
-                "cash": "100",
-                "available_cash": "90",
-            }
-        ],
-        position_records=[],
-    )
-
-    result = sync_futu_portfolio(
-        snapshot=snapshot,
-        portfolio_path=portfolio_path,
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        run_date="2026-06-18",
-        update_latest=True,
-    )
-
-    rows = {row["symbol"]: row for row in read_portfolio(result.portfolio_path)}
-    assert "TIGER_UNMAPPED_ASSETS" in rows
-    assert rows["TIGER_UNMAPPED_ASSETS"]["name"] == "Tiger unmapped assets"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["market"] == "CASH"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["asset_class"] == "cash"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["market_value"] == "900"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["cost_value"] == "900"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["market_value_hkd"] == "900.00"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["cost_value_hkd"] == "900.00"
-    assert rows["TIGER_UNMAPPED_ASSETS"]["brokers"] == "tiger"
-    assert rows["HKD_CASH"]["market_value_hkd"] == "100.00"
-    latest_rows = {
-        row["symbol"]: row for row in read_portfolio(result.latest_path)
-    }
-    assert "TIGER_UNMAPPED_ASSETS" in latest_rows
-    assert latest_rows["TIGER_UNMAPPED_ASSETS"]["market_value_hkd"] == "900.00"
-    assert latest_rows["TIGER_UNMAPPED_ASSETS"]["cost_value_hkd"] == "900.00"
-
-
-def test_sync_futu_portfolio_blocks_mixed_futu_broker_rows(tmp_path: Path) -> None:
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    mixed_row = {**old_futu_row(), "brokers": "futu;tiger"}
-    write_portfolio(portfolio_path, [mixed_row, tiger_row()])
-    snapshot = client_snapshot_from_records(
-        cash_records=[],
-        position_records=[],
-    )
-
-    with pytest.raises(FutuAccountError) as exc_info:
-        sync_futu_portfolio(
-            snapshot=snapshot,
-            portfolio_path=portfolio_path,
-            data_dir=tmp_path / "data",
-            reports_dir=tmp_path / "reports",
-            run_date="2026-06-18",
-            update_latest=True,
-        )
-
-    assert exc_info.value.error_type == "mixed_futu_broker_row"
-    assert read_portfolio(portfolio_path)[0]["brokers"] == "futu;tiger"

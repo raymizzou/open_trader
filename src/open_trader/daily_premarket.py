@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from .advice.change_classifier import ChangeClassifier, OpenAIClassifierClient
 from .advice.premarket import run_premarket
 from .advice.tradingagents_adapter import TradingAgentsSubprocessRunner
-from .futu_account import FutuAccountClient, sync_futu_portfolio
+from .account_sync_state import load_account_sync_state, project_account_sync_health
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .notifications import (
     CompositeNotifier,
@@ -34,11 +34,6 @@ from .notifications import (
 )
 from .futu_watch import QuoteSnapshot
 from .market_scope import MarketScope, parse_market_scope
-from .tiger_account import (
-    TigerAccountClient,
-    load_tiger_account_config,
-    sync_tiger_portfolio,
-)
 from .decision_facts import (
     index_decision_facts_by_market_symbol,
     load_decision_facts_cache,
@@ -74,7 +69,7 @@ from .trading_plan import (
 
 LOGGER = logging.getLogger(__name__)
 
-PortfolioRefresher = Callable[..., Path]
+PortfolioValidator = Callable[..., Path]
 
 
 @dataclass(frozen=True)
@@ -450,59 +445,66 @@ def build_notifier(config: DailyPremarketConfig) -> Notifier:
     return CompositeNotifier(notifiers)
 
 
-def _no_op_portfolio_refresher(
+def require_published_portfolio(
     *,
-    run_date: str,
+    data_dir: Path,
+    portfolio_path: Path,
     market: str,
-    config: DailyPremarketConfig,
+    now: datetime,
 ) -> Path:
-    return config.portfolio
+    from .dashboard_quotes import load_published_quotes
 
-
-def refresh_live_portfolio(
-    *,
-    run_date: str,
-    market: str,
-    config: DailyPremarketConfig,
-) -> Path:
-    futu_client = None
-    tiger_client = None
+    if not portfolio_path.is_file():
+        raise FileNotFoundError(f"published portfolio not found: {portfolio_path}")
     try:
-        futu_client = FutuAccountClient(
-            host=config.futu_host,
-            port=config.futu_port,
+        controller_status = json.loads(
+            (data_dir / "account_sync" / "controller_status.json").read_text(
+                encoding="utf-8"
+            )
         )
-        sync_futu_portfolio(
-            snapshot=futu_client.fetch_snapshot(),
-            portfolio_path=config.portfolio,
-            data_dir=config.data_dir,
-            reports_dir=config.reports_dir,
-            run_date=run_date,
-            update_latest=True,
-        )
-    finally:
-        if futu_client is not None:
-            futu_client.close()
+    except (OSError, json.JSONDecodeError):
+        controller_status = {}
+    published_quotes = load_published_quotes(
+        data_dir / "latest" / "quotes.json", now=now
+    )
+    health = project_account_sync_health(
+        load_account_sync_state(data_dir / "latest" / "account_sync_state.json"),
+        controller_status,
+        published_quotes,
+        now=now,
+    )
+    controller = health["controller"]
+    assert isinstance(controller, dict)
+    if controller.get("status") != "ok":
+        raise RuntimeError(f"account sync controller {controller.get('status', 'unknown')}")
 
-    try:
-        tiger_config = load_tiger_account_config(
-            config_dir=Path("~/.tigeropen/"),
-            account=None,
-            sandbox=False,
-        )
-        tiger_client = TigerAccountClient(config=tiger_config)
-        tiger_result = sync_tiger_portfolio(
-            snapshot=tiger_client.fetch_snapshot(),
-            portfolio_path=config.portfolio,
-            data_dir=config.data_dir,
-            reports_dir=config.reports_dir,
-            run_date=run_date,
-            update_latest=True,
-        )
-        return tiger_result.portfolio_path
-    finally:
-        if tiger_client is not None:
-            tiger_client.close()
+    brokers: set[str] = set()
+    with portfolio_path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("market", "").strip().upper() != market.upper():
+                continue
+            brokers.update(
+                broker.strip().lower()
+                for broker in row.get("brokers", "").replace(",", ";").split(";")
+                if broker.strip()
+            )
+    projected_brokers = health["brokers"]
+    assert isinstance(projected_brokers, dict)
+    for broker in sorted(brokers):
+        source = projected_brokers.get(broker, {})
+        status = source.get("status", "unknown") if isinstance(source, dict) else "unknown"
+        if status != "ok":
+            last_success = (
+                source.get("last_success_at", "") if isinstance(source, dict) else ""
+            ) or "never"
+            raise RuntimeError(f"{broker} {status}; last success {last_success}")
+    projected_quotes = health["quotes"]
+    assert isinstance(projected_quotes, dict)
+    quote_status = projected_quotes.get("status", "unknown")
+    if quote_status != "ok":
+        last_success = published_quotes.get("last_success_at") or "never"
+        raise RuntimeError(f"quotes {quote_status}; last success {last_success}")
+    return portfolio_path
 
 
 def send_notification_with_results(
@@ -574,7 +576,7 @@ class DailyPremarketRunner:
             ...,
             TradeActionsResult,
         ] = generate_trade_actions,
-        portfolio_refresher: PortfolioRefresher | None = None,
+        portfolio_validator: PortfolioValidator = require_published_portfolio,
         summary_generator: Callable[..., object] | None = None,
         summary_extractor_factory: Callable[
             [],
@@ -590,7 +592,7 @@ class DailyPremarketRunner:
         self.plan_builder = plan_builder
         self.quote_client_factory = quote_client_factory
         self.trade_action_generator = trade_action_generator
-        self.portfolio_refresher = portfolio_refresher or _no_op_portfolio_refresher
+        self.portfolio_validator = portfolio_validator
         self.summary_generator = summary_generator or generate_tradingagents_summary
         self.summary_extractor_factory = summary_extractor_factory
         self.futu_facts_generator = futu_facts_generator
@@ -712,10 +714,11 @@ class DailyPremarketRunner:
         log_path: Path,
         dry_run: bool,
     ) -> DailyRunResult:
-        portfolio_path = self.portfolio_refresher(
-            run_date=run_date,
+        portfolio_path = self.portfolio_validator(
+            data_dir=config.data_dir,
+            portfolio_path=config.portfolio,
             market=market,
-            config=config,
+            now=started_at,
         )
         if not portfolio_path.exists():
             raise FileNotFoundError(f"portfolio not found: {portfolio_path}")

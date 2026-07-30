@@ -1,6 +1,9 @@
 # Monthly Portfolio Import
 
 Run this once per month after placing the latest broker statement PDFs on disk.
+Statement parsing writes dated candidate artifacts; the account-sync controller
+is the only process that publishes the accepted Dashboard portfolio and quote
+files.
 
 ```bash
 .venv/bin/python -m open_trader import-statements \
@@ -10,14 +13,40 @@ Run this once per month after placing the latest broker statement PDFs on disk.
 ```
 
 Update `--month` and `--usd-hkd` for the target statement month. Replace the
-Phillips PDF path if the file is stored elsewhere. Futu and Tiger current
-holdings are refreshed through their live account sync commands.
+Phillips PDF path if the file is stored elsewhere.
 
-Main output:
+Main candidate output:
 
 ```text
-data/latest/portfolio.csv
+data/runs/<YYYY-MM>/portfolio.csv
 ```
+
+After reviewing the candidate and ensuring the controller is installed, inspect
+the accepted publication with:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m open_trader account-sync-status --data-dir data
+scripts/install_account_sync_launchd.sh --repo-root "$PWD"
+```
+
+The production chain is:
+
+```text
+Futu account / Futu quotes / Tiger account
+                   |
+                   v
+      account-sync-controller (single PID)
+                   |
+                   v
+ account_sync_state.json / portfolio.csv / quotes.json
+                   |
+                   v
+             Dashboard reads
+```
+
+If a source fails, its last accepted holdings remain visible but are marked
+failed or stale. Account-dependent actions are paused until a later successful
+cycle; do not promote a failed candidate by hand.
 
 Trace outputs for the month:
 
@@ -181,122 +210,22 @@ To compare live quotes against the structured trader plan, run:
 This reports whether each live quote is in the entry zone, near the add price,
 at a stop loss, at a target, or only on watch.
 
-## Futu Live Account Sync
+## Live Account Configuration
 
-`sync-futu-portfolio` operates on the current `data/latest/portfolio.csv` and
-replaces Futu-only rows with live Futu holdings and cash from Futu OpenD. It
-keeps non-Futu broker rows from the current portfolio.
-
-Operational order today: keep `data/latest/portfolio.csv` current enough to
-preserve non-Futu rows, verify read-only account access, write dated sync
-artifacts, review them, and only then promote with `--update-latest`.
-
-If an existing aggregate row mixes Futu with another broker, for example
-`brokers=futu;tiger`, the command stops for manual review before promotion
-instead of guessing how to split it.
-
-First verify read-only account access:
+The sole controller reads Futu and Tiger using the existing OpenD and Tiger
+configuration. Keep credentials in their normal local configuration locations;
+the Dashboard and `account-sync-status` expose sanitized health only. To
+change the controller's Tiger configuration, update the configuration consumed
+by launchd and reinstall the same controller:
 
 ```bash
-.venv/bin/python -m open_trader check-futu-account
+scripts/install_account_sync_launchd.sh --repo-root "$PWD"
+PYTHONPATH=src .venv/bin/python -m open_trader account-sync-status --data-dir data
 ```
 
-Then generate a dated merged portfolio without changing `data/latest`:
-
-```bash
-.venv/bin/python -m open_trader sync-futu-portfolio \
-  --date 2026-06-18
-```
-
-Review:
-
-- `data/runs/2026-06-18/futu_account_snapshot.json`
-- `data/runs/2026-06-18/portfolio.csv`
-- `reports/futu_account/2026-06-18.md`
-
-After confirming the merged portfolio, promote it:
-
-```bash
-.venv/bin/python -m open_trader sync-futu-portfolio \
-  --date 2026-06-18 \
-  --update-latest
-```
-
-The command is read-only against Futu. It does not unlock trading, does not
-store a trading password, and does not place orders.
-
-## Tiger Live Account Sync
-
-`sync-tiger-portfolio` operates on the current `data/latest/portfolio.csv`,
-replaces Tiger-only rows with current Tiger OpenAPI holdings and cash, and
-preserves non-Tiger rows from the current portfolio.
-
-The command is read-only against Tiger OpenAPI. It fetches account, position,
-and cash data, writes review artifacts, and does not place orders.
-
-Configuration is read from:
-
-- Tiger's official `~/.tigeropen/tiger_openapi_config.properties` file.
-- CLI `--account`, which overrides the account selected from config or env.
-- `TIGEROPEN_TIGER_ID`.
-- `TIGEROPEN_ACCOUNT`.
-- `TIGEROPEN_PRIVATE_KEY_PATH` or `TIGEROPEN_PRIVATE_KEY`.
-- Optional `TIGEROPEN_SECRET_KEY`.
-- Optional `TIGEROPEN_TOKEN`.
-
-Prefer Tiger's properties file or `TIGEROPEN_PRIVATE_KEY_PATH` over putting the
-raw private key in `TIGEROPEN_PRIVATE_KEY`. If both a private key path and raw
-private key are present, the path is used and the raw key is ignored.
-
-Operational order today: keep `data/latest/portfolio.csv` current enough to
-preserve non-Tiger rows, verify read-only Tiger OpenAPI access, write dated
-sync artifacts without latest promotion, review them, and only then promote
-with `--update-latest`.
-
-If an existing aggregate row mixes Tiger with another broker, for example
-`brokers=futu;tiger`, the command stops for manual review instead of guessing
-how to split it automatically.
-
-First verify read-only account access:
-
-```bash
-.venv/bin/python -m open_trader check-tiger-account
-```
-
-Use `--account` when the Tiger config contains more than one account or when
-you want to override `TIGEROPEN_ACCOUNT`:
-
-```bash
-.venv/bin/python -m open_trader check-tiger-account \
-  --account <account-id>
-```
-
-Then generate a dated merged portfolio without changing `data/latest`. This is
-the no-latest review run; omit `--update-latest` until after review.
-
-```bash
-.venv/bin/python -m open_trader sync-tiger-portfolio \
-  --date 2026-06-19
-```
-
-Review:
-
-- `data/runs/2026-06-19/tiger_account_snapshot.json`
-- `data/runs/2026-06-19/portfolio.csv`
-- `reports/tiger_account/2026-06-19.md`
-
-After confirming the merged portfolio, promote it:
-
-```bash
-.venv/bin/python -m open_trader sync-tiger-portfolio \
-  --date 2026-06-19 \
-  --update-latest
-```
-
-If Tiger returns malformed position or cash data, the command still writes the
-dated snapshot, merged portfolio candidate, and Markdown report, then stops
-before latest promotion. Review the dated report and source data before
-rerunning.
+Do not run a broker-specific sync command or manually promote a statement
+artifact. A failed or incomplete candidate is visible as a source failure and
+never overwrites the accepted rows.
 
 ### Troubleshooting OpenD `网络中断`
 

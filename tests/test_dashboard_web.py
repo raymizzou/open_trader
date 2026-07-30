@@ -28,6 +28,7 @@ from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from tests.test_dashboard import (
     dashboard_config,
     portfolio_rows,
+    seed_accepted_account_sync,
     write_csv,
     write_trend_history_report,
 )
@@ -554,7 +555,7 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
     for element_id in (
         "open-standard-backtest", "header-market-filters",
         "current-view-value",
-        "broker-summary-cards", "quote-status", "refresh-quotes",
+        "broker-summary-cards", "quote-status", "account-sync-status",
         "source-status-list", "last-refresh", "kelly-lab-panel",
         "open-kelly-lab", "return-to-portfolio", "account-tabs",
         "account-holdings", "symbol-detail-panel",
@@ -620,7 +621,7 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert "transition-duration: 0.01ms !important;" in css
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
     assert "min-height: 44px;" in mobile
-    assert 'grid-template-areas: "brand" "assets" "source";' in mobile
+    assert 'grid-template-areas: "brand" "source" "assets";' in mobile
     assert ".account-tab-list" in mobile
     assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in mobile
     assert "overflow-x: hidden;" in mobile
@@ -1098,7 +1099,7 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1137,7 +1138,7 @@ def test_dashboard_server_ignores_client_disconnect_while_writing_json(
         dashboard_web, "build_standard_backtest_options_payload", delayed_options
     )
     server = dashboard_web.create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     unhandled_errors: list[BaseException | None] = []
     handler_completed = threading.Event()
@@ -1189,7 +1190,7 @@ def test_standard_backtest_http_rejects_invalid_json_objects_with_chinese_400(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1222,7 +1223,7 @@ def test_dashboard_http_rejects_invalid_or_oversized_content_length_before_read(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1316,7 +1317,7 @@ def test_standard_backtest_http_maps_owned_provider_lifecycle_errors_to_502(
     monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: Provider())
     monkeypatch.setattr(dashboard_web, "run_standard_backtest", run)
     server = dashboard_web.create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1573,21 +1574,6 @@ class FakeTrendSimulatePositionService:
         return {"broker": broker, "positions": []}
 
 
-class FakeAccountSyncService:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-        self.refresh_count = 0
-
-    def refresh_if_due(self) -> object:
-        self.refresh_count += 1
-
-        class Result:
-            def to_dict(inner_self) -> dict[str, Any]:
-                return dict(self.payload)
-
-        return Result()
-
-
 class FakeStatementImportService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bytes]] = []
@@ -1810,7 +1796,6 @@ def test_prediction_arbitrage_state_is_schema_valid_when_unavailable(tmp_path: P
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1855,7 +1840,6 @@ def test_prediction_arbitrage_mutation_rejects_before_reading_body(tmp_path: Pat
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1953,7 +1937,6 @@ def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path:
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_store=FakeStore(),
         prediction_monitor=FakeMonitor(),
         prediction_execution_service=execution,
@@ -2690,7 +2673,6 @@ def test_prediction_arbitrage_mutation_security_matrix_rejects_before_body(
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -2751,7 +2733,6 @@ def test_prediction_arbitrage_mutation_body_cap_and_idempotency_are_server_owned
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -2881,7 +2862,6 @@ def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -2959,7 +2939,6 @@ def test_prediction_arbitrage_localhost_host_and_origin_are_accepted(tmp_path: P
         config=dashboard_config(tmp_path),
         host="localhost",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -3033,7 +3012,6 @@ def test_prediction_arbitrage_json_redacts_nested_secret_keys(tmp_path: Path) ->
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_store=FakeStore(),
         prediction_monitor=FakeMonitor(),
         prediction_execution_service=execution,
@@ -3362,7 +3340,7 @@ console.log(JSON.stringify({header,summary:{cash:elements["summary-cash-note"].t
 
 def test_dashboard_account_count_renderers_format_each_count_field() -> None:
     output = run_dashboard_js(r'''
-state.dashboard = {broker_summaries:[{
+state.dashboard = {account_sync:{brokers:{futu:{status:"ok",display:"同步正常"}}},broker_summaries:[{
   broker:"futu",display_name:"富途",portfolio_value_hkd:"30000.00",holding_count:"10000",source_status:"real_time",
 }],source_statuses:[]};
 const tabs = renderAccountTabs([{broker:"futu",rows:new Array(10000)}]);
@@ -3375,7 +3353,7 @@ console.log(JSON.stringify({tabs,section,cards:renderBrokerSummaryCards(),label:
     rendered = json.loads(output)
     assert "富途<span>10,000</span>" in rendered["tabs"]
     assert "<span>持仓 10,000</span>" in rendered["section"]
-    assert '<span class="summary-note">持仓 10,000 · 实时</span>' in rendered["cards"]
+    assert '<span class="summary-note">持仓 10,000 · 同步正常</span>' in rendered["cards"]
     assert rendered["label"].endswith("10,000 条")
 
 
@@ -3409,8 +3387,12 @@ def test_dashboard_broker_cards_always_render_four_accounts_and_derive_aliases()
     output = run_dashboard_js(r'''
 state.dashboard={
   broker_summaries:[{broker:"futu",account_alias:"futu_summary",portfolio_value_hkd:"1000"}],
-  source_statuses:[{broker:"eastmoney",status:"failed",display_text:"同步失败：账单缺失"}],
+  account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"},phillips:{status:"ok",display:"同步正常"},eastmoney:{status:"failed",display:"同步失败 · 数据截至 11:56"}}},
   cash_rows:[{broker:"tiger",account_alias:"tiger_cash"}],
+  broker_positions:[
+    {broker:"phillips",market:"HK",symbol:"02840",account_alias:"phillips_detail"},
+    {broker:"eastmoney",market:"CN",symbol:"600519",account_alias:"eastmoney_detail"},
+  ],
   holdings:[
     {market:"HK",symbol:"02840",brokers:"phillips",broker_details:[{broker:"phillips",account_alias:"phillips_detail"}]},
     {market:"CN",symbol:"600519",brokers:"eastmoney",broker_details:[{broker:"eastmoney",account_alias:"eastmoney_detail"}]},
@@ -3421,7 +3403,7 @@ const groups=accountHoldingGroups();
 console.log(JSON.stringify({cards,sections:Object.fromEntries(groups.map((group)=>[group.broker,renderAccountSection(group)]))}));
 ''')
     rendered = json.loads(output)
-    assert rendered["cards"].count('class="broker-summary-card"') == 4
+    assert rendered["cards"].count("broker-summary-card") == 4
     for broker, label, alias in (
         ("futu", "富途", "futu_summary"),
         ("tiger", "老虎", "tiger_cash"),
@@ -3432,16 +3414,16 @@ console.log(JSON.stringify({cards,sections:Object.fromEntries(groups.map((group)
         assert label in rendered["cards"]
         assert alias in rendered["cards"]
         assert alias in rendered["sections"][broker]
-    assert "同步失败：账单缺失" in rendered["cards"]
+    assert "同步失败 · 数据截至 11:56" in rendered["cards"]
 
 
 def test_dashboard_empty_payload_keeps_all_broker_cards_and_static_placeholders() -> None:
     output = run_dashboard_js(r'''
-state.dashboard={broker_summaries:[],source_statuses:[],cash_rows:[],holdings:[]};
+state.dashboard={broker_summaries:[],account_sync:{brokers:{}},broker_positions:[],cash_rows:[],holdings:[]};
 console.log(renderBrokerSummaryCards());
 ''')
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    assert output.count('class="broker-summary-card"') == 4
+    assert output.count("broker-summary-card") == 4
     for broker, label in (
         ("futu", "富途"), ("tiger", "老虎"),
         ("phillips", "辉立"), ("eastmoney", "东方财富"),
@@ -3763,7 +3745,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
+def test_dashboard_derives_account_groups_from_accepted_broker_positions() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
   summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "700"}, broker_summaries: [
@@ -3771,7 +3753,13 @@ state.dashboard = {
     {broker: "tiger", portfolio_value_hkd: "2000", cash_like_value_hkd: "400"},
     {broker: "phillips", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
     {broker: "eastmoney", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
-  ], source_statuses: [], cash_rows: [],
+  ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
+  broker_positions: [
+    {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
+    {broker: "tiger", account_alias: "tiger_1", market: "CASH", symbol: "USD", asset_class: "cash", quantity: "1", market_value_hkd: "400"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "MONEY", asset_class: "money_market_fund", quantity: "1", market_value_hkd: "100"},
+  ],
   holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
     {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
     {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
@@ -3788,13 +3776,58 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
     assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
 
 
+def test_dashboard_preserves_orphan_accepted_position_fields_and_derives_hkd_value() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  summary: {portfolio_value_hkd: "6240"},
+  broker_summaries: [{broker: "tiger", portfolio_value_hkd: "6240", holding_count: 1}],
+  account_sync: {brokers: {tiger: {status: "ok", display: "同步正常"}}},
+  broker_positions: [{
+    broker: "tiger", market: "US", symbol: "ORPHAN", name: "Orphan accepted",
+    currency: "USD", quantity: "2", cost_price: "40", last_price: "50",
+    market_value: "100", cost_value: "80", fx_to_hkd: "7.8",
+    unrealized_pnl: "20", unrealized_pnl_pct: "25.00%",
+    account_weight: "7.80%", portfolio_weight_hkd: "1.25%",
+  }],
+  holdings: [], cash_rows: [],
+};
+state.quotes = {};
+const row = accountHoldingGroups().find((group) => group.broker === "tiger").rows[0].display;
+console.log(JSON.stringify({
+  marketValueHkd: row.market_value_hkd,
+  quantity: row.total_quantity,
+  costPrice: row.avg_cost_price,
+  lastPrice: row.last_price,
+  pnl: row.unrealized_pnl,
+  pnlPercent: row.unrealized_pnl_pct,
+  accountWeight: row.account_weight,
+  portfolioWeight: row.portfolio_weight,
+}));
+''')
+
+    assert json.loads(output) == {
+        "marketValueHkd": "780.00",
+        "quantity": "2",
+        "costPrice": "40",
+        "lastPrice": "50",
+        "pnl": "20",
+        "pnlPercent": "25.00%",
+        "accountWeight": "7.80%",
+        "portfolioWeight": "1.25%",
+    }
+
+
 def test_dashboard_account_rows_reprice_with_unmapped_assets_and_negative_cash() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
   summary: {portfolio_value_hkd: "5000", cash_like_value_hkd: "300"}, broker_summaries: [
     {broker: "futu", portfolio_value_hkd: "2000", cash_like_value_hkd: "100"},
     {broker: "tiger", portfolio_value_hkd: "3000", cash_like_value_hkd: "-200"},
-  ], cash_rows: [], holdings: [{
+  ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
+  broker_positions: [
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1",cost_value:"60",fx_to_hkd:"7.8",market_value_hkd:"700",unrealized_pnl:"30"},
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2",cost_value:"150",fx_to_hkd:"8",market_value_hkd:"1600",unrealized_pnl:"50"},
+  ], holdings: [{
     market: "US", symbol: "QQQ", brokers: "futu;tiger", total_quantity: "3",
     cost_value: "210", fx_to_hkd: "7.8", market_value_hkd: "2300",
     broker_details: [
@@ -4330,8 +4363,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
 
     assert "Open Trader" in html
     assert "持仓实时看板" in html
-    assert "刷新账户与行情" in html
-    assert "accountSyncReloadNeeded" in js
+    assert 'id="refresh-quotes"' not in html
+    assert "刷新账户与行情" not in html + js
+    assert 'id="account-sync-status"' in html
+    assert "accountSyncReloadNeeded" not in js
     assert "renderBacktestPriceSyncStatus" not in js
     assert "全部市场" in html
     assert "symbol-detail-panel" in html
@@ -4529,7 +4564,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' not in css
-    assert 'grid-template-areas: "brand" "assets" "source";' in css
+    assert 'grid-template-areas: "brand" "source" "assets";' in css
     assert ".symbol-detail-panel" in css
     assert ".language-toggle" in css
     assert ".english-source" in css
@@ -4583,6 +4618,56 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_renders_file_backed_account_sync_health_and_accepted_positions() -> None:
+    """Changing the accepted broker status must change the visible review boundary."""
+    output = run_dashboard_js(r'''
+const positions=Array.from({length:14},(_,index)=>({
+  broker:"tiger",account_alias:"tiger_main",market:"US",asset_class:"stock",
+  symbol:`ACCEPTED${index}`,name:`Accepted ${index}`,currency:"USD",quantity:"1",
+  cost_price:"10",last_price:"11",market_value_hkd:"85.8",cost_value:"78",
+  unrealized_pnl:"7.8",
+}));
+state.dashboard={
+  summary:{portfolio_value_hkd:"1201.2"},
+  broker_summaries:[{broker:"tiger",account_alias:"tiger_main",portfolio_value_hkd:"1201.2",holding_value_hkd:"1201.2",cash_like_value_hkd:"0",holding_count:14}],
+  broker_positions:positions,
+  holdings:[],cash_rows:[],source_statuses:[],
+  account_sync:{status:"ok",label:"同步正常",controller:{status:"ok",heartbeat_at:"2026-07-30 12:10"},brokers:{
+    futu:{status:"ok",display:"同步正常",data_as_of:"12:10"},
+    tiger:{status:"ok",display:"同步正常",data_as_of:"12:10"},
+    phillips:{status:"ok",display:"同步正常",data_as_of:"2026-07"},
+    eastmoney:{status:"ok",display:"同步正常",data_as_of:"2026-07"},
+  }},
+};
+function render(status){
+  const source=state.dashboard.account_sync.brokers.tiger;
+  source.status=status;
+  source.data_as_of=status==="unknown"?"":"11:56";
+  source.display=status==="ok"?"同步正常":status==="failed"?"同步失败 · 数据截至 11:56":status==="stale"?"数据已过期 · 数据截至 11:56":"同步状态未知 · 数据未验证";
+  state.dashboard.account_sync.status=status==="ok"?"ok":"abnormal";
+  state.dashboard.account_sync.label=status==="ok"?"同步正常":"同步异常";
+  const group=accountHoldingGroups().find((item)=>item.broker==="tiger");
+  return {status:renderAccountSyncStatus(),card:renderBrokerSummaryCards(),sources:renderSourceStatusList(),section:renderAccountSection(group)};
+}
+console.log(JSON.stringify({ok:render("ok"),failed:render("failed"),stale:render("stale"),unknown:render("unknown")}));
+''')
+    rendered = json.loads(output)
+
+    assert "同步正常" in rendered["ok"]["status"]
+    assert "心跳 2026-07-30 12:10" in rendered["ok"]["status"]
+    assert rendered["ok"]["section"].count("account-holding-row") == 14
+    assert "同步失败 · 数据截至 11:56" in rendered["failed"]["card"]
+    assert "同步异常" in rendered["failed"]["status"]
+    assert "同步失败 · 数据截至 11:56" in rendered["failed"]["sources"]
+    assert "人工复核" in rendered["failed"]["section"]
+    assert 'data-detail-mode="t_signal"' not in rendered["failed"]["section"]
+    assert "数据已过期 · 数据截至 11:56" in rendered["stale"]["section"]
+    assert "同步状态未知 · 数据未验证" in rendered["unknown"]["section"]
+    assert "status-failed" in rendered["failed"]["sources"]
+    assert "status-stale" in rendered["stale"]["sources"]
+    assert "status-muted" in rendered["unknown"]["sources"]
 
 
 def test_trading_decision_tab_css() -> None:
@@ -4785,7 +4870,11 @@ def test_dashboard_decision_deep_link_prefers_account_broker_order() -> None:
     output = run_dashboard_js(r'''
 globalThis.window={location:{search:"?market=US&symbol=QQQ&decision_tab=news"}};
 state.dashboard={
-  summary:{portfolio_value_hkd:"3000"},broker_summaries:[],source_statuses:[],cash_rows:[],
+  summary:{portfolio_value_hkd:"3000"},broker_summaries:[],account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}},cash_rows:[],
+  broker_positions:[
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"},
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1"},
+  ],
   holdings:[{market:"US",symbol:"QQQ",brokers:"tiger;futu",broker_details:[
     {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"},
     {broker:"futu",market:"US",symbol:"QQQ",quantity:"1"},
@@ -5131,30 +5220,25 @@ console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:call
     assert rendered["attributionStates"].count("报告关联冲突") == 1
 
 
-def test_dashboard_manual_refresh_reloads_active_simulated_positions() -> None:
+def test_dashboard_quote_poll_reloads_published_dashboard_without_simulation_refresh() -> None:
     output = run_dashboard_js(r'''
-elements["refresh-quotes"]={disabled:false,textContent:""};
 renderQuoteStatus=()=>{};
 renderHoldings=()=>{};
-state.brokerFilter="tiger";
-state.accountViews.tiger="simulate";
 state.trendSimulatePositions={tiger:{available:true,positions:[
   {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
 ]}};
-const refreshed={available:true,positions:[
-  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
-  {symbol:"HST",quantity:"1633"},
-]};
 const requests=[];
 globalThis.fetch=async(url)=>{
   requests.push(url);
   return {ok:true,json:async()=>url==="/api/quotes"
-    ? {quotes:{},account_sync:{status:"skipped"}}
-    : refreshed};
+    ? {quotes:{}}
+    : {poll_seconds:0,marker:"published"}};
 };
-await refreshQuotes({refreshSimulation:true});
+renderDashboard=()=>{};
+await refreshQuotes();
 console.log(JSON.stringify({
   requests,
+  dashboard:state.dashboard.marker,
   symbols:state.trendSimulatePositions.tiger.positions.map((position)=>position.symbol),
 }));
 ''')
@@ -5162,9 +5246,10 @@ console.log(JSON.stringify({
 
     assert rendered["requests"] == [
         "/api/quotes",
-        "/api/trend-simulate-positions/tiger",
+        "/api/dashboard",
     ]
-    assert rendered["symbols"] == ["GPN", "TOST", "HST"]
+    assert rendered["dashboard"] == "published"
+    assert rendered["symbols"] == ["GPN", "TOST"]
 
 
 def test_dashboard_report_does_not_load_simulation_positions_or_render_overlays() -> None:
@@ -5311,7 +5396,6 @@ console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restored
 
 def test_dashboard_quote_refresh_does_not_replace_active_report_view() -> None:
     output = run_dashboard_js(r'''
-elements["refresh-quotes"]={disabled:false,textContent:""};
 state.brokerFilter="tiger";
 state.accountViews.tiger="report";
 state.trendReportHistories.tiger={open:true};
@@ -7225,6 +7309,15 @@ def test_dashboard_account_holdings_mobile_layout_css() -> None:
     assert "overflow-x: hidden;" in mobile
 
 
+def test_dashboard_mobile_fallback_quote_wraps_inside_price_cell() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    price_css = mobile.split(".account-holding-price .session-quote {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap: wrap;" in price_css
+    assert "max-width: 100%;" in price_css
+
+
 def test_dashboard_has_no_removed_header_broker_filter_references() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
@@ -7249,7 +7342,11 @@ state.dashboard = {
     {broker: "tiger", portfolio_value_hkd: "2000"},
     {broker: "phillips", portfolio_value_hkd: "0"},
     {broker: "eastmoney", portfolio_value_hkd: "0"},
-  ], source_statuses: [], cash_rows: [],
+  ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
+  broker_positions:[
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1",market_value_hkd:"700"},
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2",market_value_hkd:"1600"},
+  ],
   holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
     {broker: "futu", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700"},
     {broker: "tiger", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600"},
@@ -10218,6 +10315,18 @@ state.dashboard = {
       updated_at: "2026-05",
     },
   ],
+  account_sync: {brokers: {
+    futu: {status: "ok", display: "同步正常"}, tiger: {status: "ok", display: "同步正常"},
+    phillips: {status: "ok", display: "同步正常"}, eastmoney: {status: "ok", display: "同步正常"},
+  }},
+  broker_positions: [
+    {broker: "futu", market: "US", symbol: "VIXY", quantity: "10", market_value: "1940.00", market_value_hkd: "15132.00"},
+    {broker: "futu", market: "US", symbol: "VIXY260821C22000", quantity: "1", market_value_hkd: "300.00"},
+    {broker: "futu", market: "HK", symbol: "HKOPT", quantity: "1", market_value_hkd: "200.00"},
+    {broker: "tiger", market: "US", symbol: "VIXY", quantity: "2", market_value_hkd: "22698.00"},
+    {broker: "tiger", market: "US", symbol: "BND", quantity: "2", market_value_hkd: "100.00"},
+    {broker: "phillips", market: "HK", symbol: "00700", quantity: "100", market_value_hkd: "15982.00"},
+  ],
 };
 state.marketFilter = "US";
 state.brokerFilter = "futu";
@@ -10235,12 +10344,12 @@ const brokerCards = renderBrokerSummaryCards();
 if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99,071.35")) {
   throw new Error("broker card missing expected text: " + brokerCards);
 }
-if (!brokerCards.includes("老虎") || !brokerCards.includes("账户实时同步，行情走富途")) {
-  throw new Error("broker card should distinguish Tiger account data from Futu quotes: " + brokerCards);
+if (!brokerCards.includes("老虎") || !brokerCards.includes("同步正常")) {
+  throw new Error("broker card should show the published account sync status: " + brokerCards);
 }
 let sourceList = renderSourceStatusList();
-if (!sourceList.includes("辉立") || !sourceList.includes("非实时")) {
-  throw new Error("source list missing statement status: " + sourceList);
+if (!sourceList.includes("辉立账户") || !sourceList.includes("同步正常")) {
+  throw new Error("source list missing published account status: " + sourceList);
 }
 state.quotePayload = {
   status: "failed",
@@ -10248,8 +10357,8 @@ state.quotePayload = {
   diagnostic: { message: "网络中断" },
 };
 sourceList = renderSourceStatusList();
-if (!sourceList.includes("富途") || !sourceList.includes("网络中断")) {
-  throw new Error("source list missing quote diagnostic: " + sourceList);
+if (!sourceList.includes("富途账户") || sourceList.includes("网络中断")) {
+  throw new Error("source list should remain file-backed during quote errors: " + sourceList);
 }
 state.quotePayload = {
   status: "partial",
@@ -10257,8 +10366,8 @@ state.quotePayload = {
   diagnostic: { message: "缺失 1 个标的行情。" },
 };
 sourceList = renderSourceStatusList();
-if (!sourceList.includes("富途") || !sourceList.includes("缺失 1 个标的行情。")) {
-  throw new Error("source list missing partial quote diagnostic: " + sourceList);
+if (!sourceList.includes("富途账户") || sourceList.includes("缺失 1 个标的行情。")) {
+  throw new Error("source list should not replace account status with quote diagnostics: " + sourceList);
 }
 function makeElement() {
   const classes = new Set();
@@ -10301,7 +10410,7 @@ state.dashboardError = null;
 state.quotes = {};
 state.marketFilter = "ALL";
 state.brokerFilter = "futu";
-state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
+state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.broker_positions[0], 0);
 renderHoldings();
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
@@ -10337,7 +10446,7 @@ for (const broker of ["futu", "tiger", "phillips", "eastmoney"]) {
   renderedRowCount += (accountHtml.match(/account-holding-row/g) || []).length;
 }
 state.brokerFilter = "futu";
-state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
+state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.broker_positions[0], 0);
 renderHoldings();
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
@@ -10382,6 +10491,7 @@ state.dashboard.holdings.push({
   portfolio_weight_hkd: "1.50%",
   unrealized_pnl_pct: "0.00%",
 });
+state.dashboard.broker_positions.push({broker: "phillips", market: "JP", symbol: "7203", quantity: "1", market_value_hkd: "300.00"});
 state.selectedHoldingKey = "";
 selectBroker("phillips");
 const renderedWithOther = elements["holdings-body"].innerHTML;
@@ -10892,22 +11002,24 @@ def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     assert payload["holdings"][0]["symbol"] == "VIXY"
 
 
-def test_build_quotes_payload_returns_service_refresh() -> None:
+def test_build_quotes_payload_reads_published_quotes_file(tmp_path) -> None:
     from open_trader.dashboard_web import build_quotes_payload
 
-    service = FakeQuoteService(quote_result())
-    account_sync = FakeAccountSyncService({"status": "ok", "interval_seconds": 60})
+    config = dashboard_config(tmp_path)
+    payload_path = config.data_dir / "latest" / "quotes.json"
+    seeded = {
+        "status": "ok",
+        "last_success_at": datetime.now().astimezone().isoformat(),
+        "stale": False,
+        "quotes": {"US.MSFT": {"last_price": "500"}},
+    }
+    payload_path.parent.mkdir(parents=True)
+    payload_path.write_text(json.dumps(seeded), encoding="utf-8")
 
-    payload = build_quotes_payload(service, account_sync_service=account_sync)
+    payload = build_quotes_payload(config)
 
     json.dumps(payload)
-    assert service.refresh_count == 1
-    assert account_sync.refresh_count == 1
-    assert payload["status"] == "ok"
-    assert payload["account_sync"]["status"] == "ok"
-    assert payload["account_sync"]["interval_seconds"] == 60
-    assert list(payload["quotes"]) == ["US.MSFT"]
-    assert payload["quotes"]["US.MSFT"]["last_price"] == "500"
+    assert payload == seeded
 
 
 def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> None:
@@ -10948,7 +11060,6 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11109,7 +11220,6 @@ def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11164,7 +11274,6 @@ def obsolete_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         backtest_price_provider=provider,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11234,7 +11343,6 @@ def obsolete_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         backtest_price_provider=provider,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11298,7 +11406,6 @@ def obsolete_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         backtest_price_provider=provider,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11338,20 +11445,65 @@ def obsolete_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails
     assert vixy["backtest_readiness"]["status"] == "missing_prices"
 
 
-def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
-    from open_trader.dashboard_web import create_dashboard_server
+def test_dashboard_server_projects_accepted_files_without_side_effects(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import open_trader.account_sync_controller as account_sync_controller
+    import open_trader.dashboard_quotes as dashboard_quotes
+    import open_trader.futu_account as futu_account
+    import open_trader.tiger_account as tiger_account
+    import open_trader.dashboard_web as dashboard_web
+
+    def unexpected_side_effect(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dashboard API must not instantiate or refresh account data")
 
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
-    quote_service = FakeQuoteService(quote_result())
-    account_sync = FakeAccountSyncService({"status": "skipped", "interval_seconds": 60})
-    server = create_dashboard_server(
-        config=config,
-        host="127.0.0.1",
-        port=0,
-        quote_service=quote_service,
-        account_sync_service=account_sync,
+    seed_accepted_account_sync(config, tiger_position_count=14)
+    quotes_path = config.data_dir / "latest" / "quotes.json"
+    seeded_quotes_payload = {
+        "status": "ok",
+        "last_success_at": datetime.now().astimezone().isoformat(),
+        "stale": False,
+        "quotes": {"US.MSFT": {"last_price": "500"}},
+    }
+    quotes_path.write_text(json.dumps(seeded_quotes_payload), encoding="utf-8")
+    controller_path = config.data_dir / "account_sync" / "controller_status.json"
+    controller_path.parent.mkdir(parents=True)
+    controller_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.account_sync.controller.v1",
+                "pid": 123,
+                "started_at": datetime.now().astimezone().isoformat(),
+                "working_directory": str(tmp_path),
+                "git_sha": "abc123",
+                "heartbeat_at": datetime.now().astimezone().isoformat(),
+                "phase": "idle",
+                "account_loop": {},
+                "quote_loop": {},
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
     )
+    accepted_paths = [
+        config.data_dir / "latest" / "account_sync_state.json",
+        config.portfolio_path,
+        quotes_path,
+        controller_path,
+    ]
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in accepted_paths}
+    monkeypatch.setattr(futu_account.FutuAccountClient, "__init__", unexpected_side_effect)
+    monkeypatch.setattr(tiger_account.TigerAccountClient, "__init__", unexpected_side_effect)
+    monkeypatch.setattr(account_sync_controller, "AccountSyncController", unexpected_side_effect)
+    monkeypatch.setattr(
+        dashboard_quotes.DashboardQuoteService,
+        "refresh",
+        unexpected_side_effect,
+    )
+    server = dashboard_web.create_dashboard_server(config=config, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -11365,12 +11517,12 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert dashboard_payload["summary"]["holding_count"] == 1
-    assert dashboard_payload["holdings"][0]["symbol"] == "VIXY"
-    assert quotes_payload["quotes"]["US.MSFT"]["last_price"] == "500"
-    assert quotes_payload["account_sync"]["status"] == "skipped"
-    assert quote_service.refresh_count == 1
-    assert account_sync.refresh_count == 1
+    assert dashboard_payload["account_sync"]["status"] == "ok"
+    assert len(dashboard_payload["broker_positions"]) == 14
+    assert quotes_payload == seeded_quotes_payload
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in accepted_paths
+    } == before
 
 
 def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None:
@@ -11383,7 +11535,6 @@ def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None
         config,
         "127.0.0.1",
         0,
-        quote_service=FakeQuoteService(quote_result()),
         trend_simulate_position_service=FakeTrendSimulatePositionService(calls),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11439,7 +11590,7 @@ def test_dashboard_http_serves_report_history_and_exact_artifact(tmp_path) -> No
         encoding="utf-8",
     )
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11479,7 +11630,7 @@ def test_dashboard_http_report_history_enforces_read_only_route_errors(
         "{broken", encoding="utf-8"
     )
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11533,7 +11684,6 @@ def test_dashboard_http_rejects_unknown_simulated_broker(tmp_path) -> None:
         config,
         "127.0.0.1",
         0,
-        quote_service=FakeQuoteService(quote_result()),
         trend_simulate_position_service=TrendSimulatePositionService(
             host=config.futu_host,
             port=config.futu_port,
@@ -11593,11 +11743,6 @@ def test_serve_dashboard_configures_simulate_accounts_once(
         raising=False,
     )
     monkeypatch.setattr(
-        dashboard_web,
-        "DashboardAccountSyncService",
-        lambda **_: type("FakeAccountSync", (), {"interval_seconds": 60})(),
-    )
-    monkeypatch.setattr(
         dashboard_web, "create_dashboard_server", fake_create_dashboard_server
     )
     config = dashboard_config(
@@ -11625,6 +11770,7 @@ def test_serve_dashboard_configures_simulate_accounts_once(
     assert server_kwargs["trend_simulate_position_service"].__class__ is (
         FakeTrendSimulatePositionServiceFactory
     )
+    assert "account_sync_service" not in server_kwargs
 
 
 def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
@@ -11636,7 +11782,6 @@ def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=importer,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11657,6 +11802,39 @@ def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
     assert importer.calls == [("phillips", b"%PDF-1.7\nstatement")]
 
 
+def test_dashboard_server_builds_candidate_only_statement_import_service(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader import dashboard_web
+
+    captured: dict[str, object] = {}
+
+    class CandidateOnlyStatementImportService:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def import_pdf(self, broker: str, body: bytes) -> dict[str, object]:
+            return {"broker": broker}
+
+    monkeypatch.setattr(
+        dashboard_web, "StatementImportService", CandidateOnlyStatementImportService
+    )
+    config = dashboard_config(tmp_path)
+    server = dashboard_web.create_dashboard_server(
+        config=config,
+        host="127.0.0.1",
+        port=0,
+    )
+    try:
+        assert captured == {
+            "data_dir": config.data_dir,
+            "reports_dir": config.reports_dir,
+            "eastmoney_password": "",
+        }
+    finally:
+        server.server_close()
+
+
 def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
@@ -11668,7 +11846,6 @@ def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> No
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=FailingStatementImportService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11707,7 +11884,6 @@ def test_dashboard_server_rejects_invalid_statement_body(
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=FakeStatementImportService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11735,7 +11911,6 @@ def test_dashboard_server_rejects_statement_larger_than_twenty_mib(tmp_path) -> 
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=FakeStatementImportService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11779,7 +11954,6 @@ def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=chat_service,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11842,7 +12016,6 @@ def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=FakeResearchChatService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11880,7 +12053,6 @@ def test_dashboard_server_returns_404_for_invalid_research_chat_get_subroute(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=FakeResearchChatService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11922,7 +12094,6 @@ def test_dashboard_server_returns_404_for_empty_session_research_chat_post_route
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=chat_service,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11957,7 +12128,6 @@ def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=RaisingResearchChatService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11983,7 +12153,7 @@ def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
     }
 
 
-def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(
+def test_dashboard_server_projects_unknown_when_quotes_file_is_missing(
     tmp_path,
 ) -> None:
     from open_trader.dashboard_web import create_dashboard_server
@@ -11994,28 +12164,24 @@ def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=RaisingQuoteService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     try:
         host, port = server.server_address
-        status, content_type, payload = read_error_json(
-            f"http://{host}:{port}/api/quotes"
-        )
+        payload = read_json(f"http://{host}:{port}/api/quotes")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert status == 500
-    assert content_type == "application/json; charset=utf-8"
     assert payload == {
-        "status": "error",
-        "error_type": "RuntimeError",
-        "message": "boom",
+        "status": "unknown",
+        "last_success_at": "",
+        "stale": False,
+        "quotes": {},
     }
 
 
@@ -12038,7 +12204,6 @@ def test_dashboard_server_returns_json_500_when_dashboard_payload_raises(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -12081,7 +12246,6 @@ def test_dashboard_server_keeps_unrelated_file_not_found_as_json_500(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -12123,7 +12287,6 @@ def test_dashboard_server_serves_static_routes_when_files_exist(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

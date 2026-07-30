@@ -29,7 +29,11 @@ from .a_share_trend import (
     valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
-from .broker_details import load_broker_detail_snapshot
+from .account_sync_state import (
+    accepted_portfolio_rows,
+    load_account_sync_state,
+    project_account_sync_health,
+)
 from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
@@ -91,7 +95,6 @@ from .tradingagents_summary import (
 from .trading_plan import backtest_plan_side, load_trading_plan_rows
 
 
-DETAIL_DIR_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])(-([0-2]\d|3[01]))?$")
 BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 BROKER_LABELS = {
     "futu": "富途",
@@ -214,6 +217,7 @@ class DashboardState:
     trend_reports: dict[str, dict[str, Any]]
     trend_reviews: dict[str, dict[str, Any]]
     trend_controllers: dict[str, dict[str, object]]
+    account_sync: dict[str, object]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,14 +242,30 @@ class DashboardState:
             "trend_reports": self.trend_reports,
             "trend_reviews": self.trend_reviews,
             "trend_controllers": self.trend_controllers,
+            "account_sync": self.account_sync,
         }
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
-    portfolio_rows = _read_csv_rows(config.portfolio_path)
-    detail_month = latest_broker_detail_month(config.data_dir)
-    broker_positions, raw_cash_details = _latest_broker_details(config.data_dir)
+    account_state = load_account_sync_state(
+        config.data_dir / "latest" / "account_sync_state.json"
+    )
+    portfolio_rows = (
+        accepted_portfolio_rows(account_state)
+        if account_state["generation"]
+        else _read_csv_rows(config.portfolio_path)
+    )
+    broker_positions, raw_cash_details = _accepted_broker_details(account_state)
+    detail_month = _accepted_statement_period(account_state)
     cash_details = [_cash_detail_row(row) for row in raw_cash_details]
+    now = datetime.now(SHANGHAI)
+    quotes = _load_published_quotes(config.data_dir / "latest" / "quotes.json", now=now)
+    account_sync = project_account_sync_health(
+        account_state,
+        _read_json_mapping(config.data_dir / "account_sync" / "controller_status.json"),
+        quotes,
+        now=now,
+    )
     holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
     holding_markets = _markets_from_rows(holding_rows)
     trade_actions, _ = _latest_rows_for_markets(
@@ -342,13 +362,8 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             portfolio_rows,
             broker_positions,
             cash_details,
-            _latest_tiger_account_metrics(config.data_dir),
         ),
-        source_statuses=_build_source_statuses(
-            broker_positions,
-            cash_details,
-            detail_month,
-        ),
+        source_statuses=_build_source_statuses(account_sync),
         cash_rows=cash_rows,
         broker_positions=broker_positions,
         cash_details=cash_details,
@@ -370,7 +385,81 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             config.data_dir,
             executor_host=config.trend_executor_host,
         ),
+        account_sync=account_sync,
     )
+
+
+def _load_published_quotes(path: Path, *, now: datetime) -> dict[str, object]:
+    from .dashboard_quotes import load_published_quotes
+
+    return load_published_quotes(path, now=now)
+
+
+def _read_json_mapping(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _accepted_broker_details(
+    state: Mapping[str, object],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    brokers = state.get("brokers")
+    if not isinstance(brokers, dict):
+        return [], []
+    positions: list[dict[str, str]] = []
+    cash: list[dict[str, str]] = []
+    for broker in BROKERS:
+        source = brokers.get(broker)
+        if not isinstance(source, dict) or source.get("status") == "unknown":
+            continue
+        fx_rates = {
+            (str(rate.get("account_alias") or ""), str(rate.get("currency") or "").upper()): str(
+                rate.get("rate_to_hkd") or ""
+            )
+            for rate in source.get("fx_rates", [])
+            if isinstance(rate, dict)
+        }
+
+        def accepted_row(row: dict[str, str]) -> dict[str, str]:
+            accepted = dict(row)
+            rate = fx_rates.get(
+                (accepted.get("account_alias", ""), accepted.get("currency", "").upper())
+            )
+            if rate:
+                accepted["fx_to_hkd"] = rate
+            return accepted
+
+        positions.extend(
+            accepted_row(row)
+            for row in source.get("positions", [])
+            if isinstance(row, dict)
+            and all(isinstance(key, str) and isinstance(value, str) for key, value in row.items())
+            and _optional_decimal(row.get("quantity", "")) != Decimal("0")
+        )
+        cash.extend(
+            accepted_row(row)
+            for row in source.get("cash", [])
+            if isinstance(row, dict)
+            and all(isinstance(key, str) and isinstance(value, str) for key, value in row.items())
+        )
+    return positions, cash
+
+
+def _accepted_statement_period(state: Mapping[str, object]) -> str:
+    brokers = state.get("brokers")
+    if not isinstance(brokers, dict):
+        return ""
+    periods = [
+        str(source.get("period") or "")
+        for broker in BROKERS
+        if isinstance(source := brokers.get(broker), dict)
+        and source.get("source_kind") == "statement"
+        and source.get("status") != "unknown"
+    ]
+    return max((period for period in periods if period), default="")
 
 
 def _load_trend_controllers(
@@ -669,7 +758,9 @@ def _load_trend_reports(
     current_candidate_pool_ids: Mapping[str, tuple[int, ...]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if broker_positions is None or cash_details is None:
-        broker_positions, cash_details = _latest_broker_details(data_dir)
+        broker_positions, cash_details = _accepted_broker_details(
+            load_account_sync_state(data_dir / "latest" / "account_sync_state.json")
+        )
     reports = {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
@@ -819,7 +910,9 @@ def load_historical_trend_report(
         generated_at,
         _,
     ) = selected
-    broker_positions, cash_details = _latest_broker_details(config.data_dir)
+    broker_positions, cash_details = _accepted_broker_details(
+        load_account_sync_state(config.data_dir / "latest" / "account_sync_state.json")
+    )
     return _project_broker_trend_report(
         selected=(
             path,
@@ -2339,9 +2432,7 @@ def _project_trend_actual_overlay(
             "outside_positions": [],
         }
 
-    summary = _build_broker_summary(
-        broker, [], broker_positions, cash_details, {}
-    )
+    summary = _build_broker_summary(broker, [], broker_positions, cash_details)
     nav_hkd = _optional_decimal(summary.get("portfolio_value_hkd", ""))
     actual_rows = [*broker_rows, *broker_cash]
     price_fx_to_hkd, price_fx_note = _trend_actual_price_fx_to_hkd(
@@ -2866,44 +2957,6 @@ def _build_backtest_universe(
     for row in watchlist_rows:
         append_valid(watchlist, row)
     return {"holdings": holdings, "watchlist": watchlist}
-
-
-def latest_broker_detail_month(data_dir: Path) -> str:
-    runs_dir = data_dir / "runs"
-    if not runs_dir.exists():
-        return ""
-
-    months = [
-        path.name
-        for path in runs_dir.iterdir()
-        if path.is_dir()
-        and DETAIL_DIR_PATTERN.fullmatch(path.name)
-        and _has_broker_detail_files(path)
-    ]
-    return max(months) if months else ""
-
-
-def _latest_broker_details(
-    data_dir: Path,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    positions: list[dict[str, str]] = []
-    cash: list[dict[str, str]] = []
-    for broker in BROKERS:
-        snapshot = load_broker_detail_snapshot(data_dir, broker)
-        positions.extend(
-            row
-            for row in snapshot.positions
-            if _optional_decimal(row.get("quantity", "")) != Decimal("0")
-        )
-        cash.extend(snapshot.cash)
-    return positions, cash
-
-
-def _has_broker_detail_files(path: Path) -> bool:
-    return (
-        (path / "extracted_positions.csv").is_file()
-        or (path / "extracted_cash.csv").is_file()
-    )
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -4177,7 +4230,6 @@ def _build_broker_summaries(
     portfolio_rows: list[dict[str, str]],
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
-    tiger_account_metrics: dict[str, str],
 ) -> list[dict[str, Any]]:
     return [
         _build_broker_summary(
@@ -4185,7 +4237,6 @@ def _build_broker_summaries(
             portfolio_rows,
             broker_positions,
             cash_details,
-            tiger_account_metrics if broker == "tiger" else {},
         )
         for broker in BROKERS
     ]
@@ -4196,7 +4247,6 @@ def _build_broker_summary(
     portfolio_rows: list[dict[str, str]],
     broker_positions: list[dict[str, str]],
     cash_details: list[dict[str, str]],
-    account_metrics: dict[str, str],
 ) -> dict[str, Any]:
     broker_detail_positions = [
         row for row in broker_positions if _broker_key(row.get("broker", "")) == broker
@@ -4264,43 +4314,16 @@ def _build_broker_summary(
         "label": BROKER_LABELS[broker],
         "source_kind": BROKER_SOURCE_KINDS[broker],
         "detail_available": detail_available,
-        **account_metrics,
+        **(
+            {"available_to_trade_hkd": _money_text(available_to_trade)}
+            if broker == "tiger"
+            and (available_to_trade := _sum_detail_hkd(detail_cash_rows, "available_balance"))
+            is not None
+            else {}
+        ),
         **({"cash_components": cash_components} if cash_components else {}),
         **money,
     }
-
-
-def _latest_tiger_account_metrics(data_dir: Path) -> dict[str, str]:
-    runs_dir = data_dir / "runs"
-    if not runs_dir.exists():
-        return {}
-    snapshot_paths = sorted(
-        (
-            path / "tiger_account_snapshot.json"
-            for path in runs_dir.iterdir()
-            if path.is_dir() and DETAIL_DIR_PATTERN.fullmatch(path.name)
-        ),
-        reverse=True,
-    )
-    for path in snapshot_paths:
-        if not path.exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        records = payload.get("cash_records") if isinstance(payload, dict) else None
-        if not isinstance(records, list):
-            continue
-        for record in records:
-            if not isinstance(record, dict) or record.get("record_type") != "account_total":
-                continue
-            available = _optional_decimal(record.get("cash_available_for_trade", ""))
-            fx_to_hkd = _optional_decimal(record.get("fx_to_hkd", ""))
-            if available is None or fx_to_hkd is None or fx_to_hkd <= 0:
-                continue
-            return {"available_to_trade_hkd": _money_text(available * fx_to_hkd)}
-    return {}
 
 
 def _sum_detail_hkd(
@@ -4403,30 +4426,17 @@ def _empty_broker_money() -> dict[str, Any]:
 
 
 def _build_source_statuses(
-    broker_positions: list[dict[str, str]],
-    cash_details: list[dict[str, str]],
-    detail_month: str,
+    account_sync: Mapping[str, object],
 ) -> list[dict[str, str]]:
-    detail_rows = [*broker_positions, *cash_details]
-    detail_brokers: set[str] = set()
-    for row in detail_rows:
-        broker = _broker_key(row.get("broker", ""))
-        if broker:
-            detail_brokers.add(broker)
-
+    health_brokers = account_sync.get("brokers")
+    health_brokers = health_brokers if isinstance(health_brokers, dict) else {}
     statuses: list[dict[str, str]] = []
     for broker in BROKERS:
-        detail_available = broker in detail_brokers
+        source = health_brokers.get(broker)
+        source = source if isinstance(source, dict) else {}
+        status = str(source.get("status") or "unknown")
+        display_text = str(source.get("display") or "同步状态未知 · 数据未验证")
         if broker == "futu":
-            live_available = _has_live_statement_row(detail_rows, broker)
-            status = "ok" if live_available else "non_realtime" if detail_available else "missing"
-            display_text = (
-                "账户实时同步"
-                if live_available
-                else "仅月结单明细"
-                if detail_available
-                else "未检测到账户同步"
-            )
             statuses.append(
                 {
                     "broker": broker,
@@ -4438,15 +4448,6 @@ def _build_source_statuses(
             )
             continue
         if broker == "tiger":
-            live_available = _has_live_statement_row(detail_rows, broker)
-            status = "ok" if live_available else "non_realtime" if detail_available else "missing"
-            display_text = (
-                "账户实时同步，行情走富途"
-                if live_available
-                else "仅月结单明细"
-                if detail_available
-                else "未检测到账户同步"
-            )
             statuses.append(
                 {
                     "broker": broker,
@@ -4457,12 +4458,6 @@ def _build_source_statuses(
                 }
             )
             continue
-        statement_period = _latest_statement_period(detail_rows, broker) or detail_month
-        display_text = (
-            f"{statement_period} 月结单导入"
-            if detail_available and statement_period
-            else "暂无月结单明细"
-        )
         statuses.append(
             {
                 "broker": broker,
@@ -4477,25 +4472,11 @@ def _build_source_statuses(
 
 def _has_live_statement_row(rows: list[dict[str, str]], broker: str) -> bool:
     suffix = f"-{broker}-live"
-    for row in rows:
-        if _broker_key(row.get("broker", "")) != broker:
-            continue
-        statement_id = row.get("statement_id", "").strip().lower()
-        if statement_id.endswith(suffix):
-            return True
-    return False
-
-
-def _latest_statement_period(rows: list[dict[str, str]], broker: str) -> str:
-    periods: list[str] = []
-    for row in rows:
-        if _broker_key(row.get("broker", "")) != broker:
-            continue
-        statement_id = row.get("statement_id", "")
-        match = re.search(r"\d{4}-(?:0[1-9]|1[0-2])(?:-(?:[0-2]\d|3[01]))?", statement_id)
-        if match:
-            periods.append(match.group(0))
-    return max(periods) if periods else ""
+    return any(
+        _broker_key(row.get("broker", "")) == broker
+        and row.get("statement_id", "").strip().lower().endswith(suffix)
+        for row in rows
+    )
 
 
 def _broker_list(value: str) -> list[str]:

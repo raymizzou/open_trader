@@ -26,8 +26,7 @@ from .dashboard import (
     load_dashboard_state,
     load_trend_report_history,
 )
-from .dashboard_account_sync import DashboardAccountSyncService
-from .dashboard_quotes import DashboardQuoteService
+from .dashboard_quotes import SHANGHAI_TZ, load_published_quotes
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_relation_discovery import CodexRelationValidator, discover_threshold_relations
@@ -787,18 +786,12 @@ def build_dashboard_payload(
 
 
 def build_quotes_payload(
-    quote_service: DashboardQuoteService,
-    account_sync_service: DashboardAccountSyncService | None = None,
-) -> dict[str, Any]:
-    account_sync_payload = (
-        account_sync_service.refresh_if_due().to_dict()
-        if account_sync_service is not None
-        else {}
+    config: DashboardConfig,
+) -> dict[str, object]:
+    return load_published_quotes(
+        config.data_dir / "latest" / "quotes.json",
+        now=datetime.now(SHANGHAI_TZ),
     )
-    payload = quote_service.refresh().to_dict()
-    if account_sync_payload:
-        payload["account_sync"] = account_sync_payload
-    return payload
 
 
 def build_backtest_run_payload(
@@ -884,8 +877,6 @@ def create_dashboard_server(
     config: DashboardConfig,
     host: str,
     port: int,
-    quote_service: DashboardQuoteService | None = None,
-    account_sync_service: DashboardAccountSyncService | None = None,
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
     statement_import_service: StatementImportService | None = None,
@@ -897,12 +888,10 @@ def create_dashboard_server(
     prediction_session_token: str | None = None,
     prediction_csrf_token: str | None = None,
 ) -> ThreadingHTTPServer:
-    service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
     import_service = statement_import_service or StatementImportService(
         data_dir=config.data_dir,
         reports_dir=config.reports_dir,
-        portfolio_path=config.portfolio_path,
         eastmoney_password=eastmoney_password,
     )
     portfolio_update_lock = threading.Lock()
@@ -961,13 +950,7 @@ def create_dashboard_server(
                 return
             if path == "/api/quotes":
                 try:
-                    with portfolio_update_lock:
-                        self._send_json(
-                            build_quotes_payload(
-                                service,
-                                account_sync_service=account_sync_service,
-                            )
-                        )
+                    self._send_json(build_quotes_payload(config))
                 except Exception as exc:
                     self._send_error_json(exc)
                 return
@@ -1354,7 +1337,6 @@ def serve_dashboard(
     eastmoney_password: str = "",
     prediction_notifier: object | None = None,
 ) -> None:
-    account_sync_service = DashboardAccountSyncService(config=config)
     trend_simulate_position_service = TrendSimulatePositionService(
         host=config.futu_host,
         port=config.futu_port,
@@ -1429,7 +1411,6 @@ def serve_dashboard(
         config=config,
         host=host,
         port=port,
-        account_sync_service=account_sync_service,
         trend_simulate_position_service=trend_simulate_position_service,
         eastmoney_password=eastmoney_password,
         prediction_store=prediction_store,
@@ -1446,7 +1427,6 @@ def serve_dashboard(
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")
-        print(f"account_sync_seconds: {account_sync_service.interval_seconds}")
         server.serve_forever()
     finally:
         if prediction_monitor is not None:

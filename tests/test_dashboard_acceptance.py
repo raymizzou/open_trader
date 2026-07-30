@@ -422,6 +422,11 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
+        "_account_sync_controller_errors",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
         "_configured_simulate_account_ids",
         lambda *_args: {"tiger": 1, "phillips": 2, "eastmoney": 3},
     )
@@ -1187,6 +1192,14 @@ def valid_payload() -> dict[str, object]:
     return {
         "holdings": cn + other,
         "cash_rows": [],
+        "account_sync": {
+            "status": "ok",
+            "controller": {"status": "ok", "heartbeat_at": "2026-07-21T09:31:00+08:00"},
+            "brokers": {
+                broker: {"status": "ok", "display": "同步正常"}
+                for broker in dashboard_acceptance.ACCOUNT_BROKERS
+            },
+        },
         "backtest_universe": {"holdings": [
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
@@ -2489,9 +2502,15 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown click selector: {self.selector}")
 
     def count(self) -> int:
+        if self.selector == "#refresh-quotes":
+            return 0
+        if self.selector == "text=刷新账户与行情":
+            return 0
+        if self.selector == "#account-sync-status":
+            return 1
         target_selectors = {
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
-            ".strategy-tools button:visible, #refresh-quotes:visible, "
+            ".strategy-tools button:visible, "
             ".broker-summary-card:visible, .account-holding-actions button:visible",
             ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
@@ -2936,6 +2955,8 @@ class TabbedAccountLocator:
         return not bool(self.page.reports[broker]["available"])
 
     def inner_text(self) -> str:
+        if self.selector == "#account-sync-status":
+            return "同步正常 · 控制器心跳 2026-07-30 12:00"
         if self.selector == "#account-holdings":
             return self.page.section_texts[self.page.selected]
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
@@ -3582,7 +3603,7 @@ def test_acceptance_rejects_missing_trend_controller_card() -> None:
         )
 
 
-def test_acceptance_rejects_unavailable_executor_controller() -> None:
+def test_acceptance_projects_unavailable_executor_controller() -> None:
     payload = valid_payload()
     controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
     controller.update({  # type: ignore[union-attr]
@@ -3595,13 +3616,12 @@ def test_acceptance_rejects_unavailable_executor_controller() -> None:
 
     page = tabbed_account_page(payload)
     page.trend_broker = "tiger"
-    with pytest.raises(AssertionError, match="控制器不可用"):
-        dashboard_acceptance._check_trend_controller_status(
-            page,
-            page.locator("#trend-report-workspace:visible"),
-            "tiger",
-            controller,
-        )
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_acceptance_allows_readonly_controller_without_heartbeat() -> None:
@@ -3663,7 +3683,7 @@ def test_acceptance_browser_allows_progress_before_first_success(
 
 
 @pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
-def test_acceptance_browser_rejects_stable_phase_without_first_success(
+def test_acceptance_browser_projects_stable_phase_without_first_success(
     phase: str,
 ) -> None:
     payload = valid_payload()
@@ -3672,13 +3692,12 @@ def test_acceptance_browser_rejects_stable_phase_without_first_success(
     page = tabbed_account_page(payload)
     page.trend_broker = "tiger"
 
-    with pytest.raises(AssertionError, match="尚无首次成功"):
-        dashboard_acceptance._check_trend_controller_status(
-            page,
-            page.locator("#trend-report-workspace:visible"),
-            "tiger",
-            controller,
-        )
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
@@ -3739,9 +3758,9 @@ def test_acceptance_uses_browser_snapshot_when_controller_phase_advances() -> No
 
 @pytest.mark.parametrize(
     "rendered_heartbeat",
-    ["not-a-time", "2026-07-21T09:30:59+08:00", "2026-07-21T09:37:00+08:00"],
+    ["not-a-time", "2026-07-21T09:30:59+08:00"],
 )
-def test_acceptance_rejects_invalid_or_unbounded_rendered_controller_heartbeat(
+def test_acceptance_rejects_invalid_or_regressed_rendered_controller_heartbeat(
     rendered_heartbeat: str,
 ) -> None:
     payload = valid_payload()
@@ -3757,6 +3776,22 @@ def test_acceptance_rejects_invalid_or_unbounded_rendered_controller_heartbeat(
             "tiger",
             controller,
         )
+
+
+def test_acceptance_allows_controller_time_to_advance_beyond_one_poll_window() -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["heartbeat_at"] = "2026-07-21T09:37:00+08:00"
+    page.controllers["tiger"]["next_check_at"] = "2026-07-21T09:37:10+08:00"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
@@ -3967,9 +4002,15 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             return self
 
         def count(self) -> int:
+            if self.selector == "#refresh-quotes":
+                return 0
+            if self.selector == "text=刷新账户与行情":
+                return 0
+            if self.selector == "#account-sync-status":
+                return 1
             target_selectors = {
                 '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
-                ".strategy-tools button:visible, #refresh-quotes:visible, "
+                ".strategy-tools button:visible, "
                 ".broker-summary-card:visible, .account-holding-actions button:visible",
                 ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
                 ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
@@ -3983,7 +4024,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             if self.selector in target_selectors:
                 return 1
             counts = {
-                '.account-holding-actions button[data-detail-mode="t_signal"]:visible': 1,
+                '.account-holding-actions button[data-detail-mode="t_signal"]:visible': self.page.t_signal_count,
+                ".account-review-action:visible": int(self.page.t_signal_count == 0),
                 "[data-back-to-holdings]:visible": int(self.page.view == "detail"),
                 '#main-navigation [data-workspace="kelly_lab"]': 1,
                 ".kelly-lab-panel:visible": int(self.page.view == "kelly"),
@@ -4024,9 +4066,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     class Page:
         viewport_size = {"width": 375, "height": 844}
 
-        def __init__(self) -> None:
+        def __init__(self, *, t_signal_count: int = 1) -> None:
             self.view = "portfolio"
             self.research_open = False
+            self.t_signal_count = t_signal_count
             self.clicks: list[str] = []
             self.evaluations: list[tuple[str, object | None]] = []
             self.target_checks: list[str] = []
@@ -4061,7 +4104,7 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     assert len(page.evaluations) == 1
     assert page.target_checks == [
         "#account-tabs [role=\"tab\"]:visible, #header-market-filters button:visible, "
-        ".strategy-tools button:visible, #refresh-quotes:visible, "
+        ".strategy-tools button:visible, "
         ".broker-summary-card:visible, .account-holding-actions button:visible",
         ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
         ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
@@ -4072,6 +4115,16 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
         "#standard-backtest-workspace select:visible",
         ".research-chat-modal button:visible, .research-chat-modal input:visible",
     ]
+
+    degraded_page = Page(t_signal_count=0)
+    dashboard_acceptance._check_tool_workspaces(
+        degraded_page, "US:MSFT:Microsoft:5"
+    )
+    assert (
+        '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        not in degraded_page.clicks
+    )
+    assert "[data-back-to-holdings]:visible" not in degraded_page.clicks
 
 
 @pytest.mark.parametrize(
@@ -4218,10 +4271,6 @@ VISUAL_CONTRACT_STYLES = {
         "backgroundColor": "rgb(247, 245, 241)",
         "color": "rgb(32, 29, 24)",
     },
-    "#refresh-quotes": {
-        "backgroundColor": "rgb(139, 94, 52)",
-        "borderTopColor": "rgb(139, 94, 52)",
-    },
     ".current-view-card": {
         "backgroundColor": "rgb(36, 33, 29)",
         "borderTopColor": "rgb(36, 33, 29)",
@@ -4261,21 +4310,19 @@ def visual_contract_page(*, accent: str = "#8B5E34") -> object:
             self.selector = selector
 
         def count(self) -> int:
+            if self.selector == "text=刷新账户与行情":
+                return 0
+            if self.selector == "#account-sync-status":
+                return 1
             return int(self.selector in VISUAL_CONTRACT_STYLES)
 
-        def focus(self) -> None:
-            assert self.selector in VISUAL_CONTRACT_STYLES
-            self.page.focused_selectors.append(self.selector)
+        def inner_text(self) -> str:
+            assert self.selector == "#account-sync-status"
+            return "同步正常 · 控制器心跳 2026-07-30 12:00"
 
         def evaluate(self, expression: str) -> dict[str, str]:
             assert self.selector in VISUAL_CONTRACT_STYLES
             self.page.evaluated_selectors.append(self.selector)
-            if "outlineColor" in expression:
-                assert self.selector == "#refresh-quotes"
-                return {
-                    "outlineColor": "rgb(139, 94, 52)",
-                    "outlineStyle": "solid", "outlineWidth": "3px",
-                }
             assert "backgroundColor" in expression
             return dict(VISUAL_CONTRACT_STYLES[self.selector])
 
@@ -4285,7 +4332,6 @@ def visual_contract_page(*, accent: str = "#8B5E34") -> object:
             self.expected["--accent"] = accent
             self.token_evaluations: list[list[str]] = []
             self.evaluated_selectors: list[str] = []
-            self.focused_selectors: list[str] = []
 
         def evaluate(
             self, expression: str, names: list[str] | None = None
@@ -4311,9 +4357,7 @@ def test_acceptance_visual_contract_accepts_exact_warm_ledger() -> None:
     ]
     assert page.evaluated_selectors == [  # type: ignore[attr-defined]
         *VISUAL_CONTRACT_STYLES,
-        "#refresh-quotes",
     ]
-    assert page.focused_selectors == ["#refresh-quotes"]  # type: ignore[attr-defined]
 
 
 def test_acceptance_visual_contract_rejects_palette_drift() -> None:
@@ -4500,10 +4544,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     screenshots: list[tuple[str, str]] = []
     visual_token_evaluations: list[str] = []
     visual_surface_evaluations: list[tuple[str, str]] = []
-    visual_focus_calls: list[tuple[str, str]] = []
-    visual_focus_evaluations: list[tuple[str, str]] = []
     geometry_evaluations: list[str] = []
     buy_overflow_evaluations: list[str] = []
+    polling_freezes: list[str] = []
     state = {
         "fail_wide_desktop_navigation": True,
         "fail_trend_account_views": False,
@@ -4513,12 +4556,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def click(self) -> None:
             clicks.append((self.page.name, self.selector))  # type: ignore[attr-defined]
             super().click()
-
-        def focus(self) -> None:
-            if self.selector == "#refresh-quotes":
-                visual_focus_calls.append((self.page.name, self.selector))  # type: ignore[attr-defined]
-                return
-            super().focus()
 
         def evaluate(self, expression: str) -> object:
             if "getComputedStyle" in expression:
@@ -4537,16 +4574,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
                         "clientWidth": 1500,
                         "scrollWidth": 1600,
                         "overflowX": "auto",
-                    }
-                if "outlineColor" in expression:
-                    assert self.selector == "#refresh-quotes"
-                    visual_focus_evaluations.append(
-                        (self.page.name, self.selector)  # type: ignore[attr-defined]
-                    )
-                    return {
-                        "outlineColor": "rgb(139, 94, 52)",
-                        "outlineStyle": "solid",
-                        "outlineWidth": "3px",
                     }
                 assert self.selector in VISUAL_CONTRACT_STYLES, self.selector
                 visual_surface_evaluations.append(
@@ -4579,6 +4606,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def evaluate(
             self, expression: str, argument: object | None = None
         ) -> object:
+            if "clearInterval(state.quoteIntervalId)" in expression:
+                polling_freezes.append(self.name)
+                return True
             if (
                 "trend-review-style-contract" in expression
                 or "trend-review-geometry-contract" in expression
@@ -4711,10 +4741,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     screenshots.clear()
     visual_token_evaluations.clear()
     visual_surface_evaluations.clear()
-    visual_focus_calls.clear()
-    visual_focus_evaluations.clear()
     geometry_evaluations.clear()
     buy_overflow_evaluations.clear()
+    polling_freezes.clear()
     errors, blocker = dashboard_acceptance._browser_check(
         "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
@@ -4773,14 +4802,13 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     assert visual_token_evaluations == [
         "wide_desktop", "desktop", "tablet", "mobile",
     ]
+    assert polling_freezes == ["wide_desktop", "desktop", "tablet", "mobile"]
     for viewport in ("wide_desktop", "desktop", "tablet", "mobile"):
         assert [
             selector
             for name, selector in visual_surface_evaluations
             if name == viewport
         ] == list(VISUAL_CONTRACT_STYLES)
-        assert (viewport, "#refresh-quotes") in visual_focus_calls
-        assert (viewport, "#refresh-quotes") in visual_focus_evaluations
     assert geometry_evaluations == []
     assert buy_overflow_evaluations == []
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
@@ -4815,6 +4843,111 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
     assert validate_dashboard_payload(valid_payload(), expected_cn=5) == []
+
+
+def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accepted_count() -> None:
+    payload = valid_payload()
+    payload["account_sync"] = {
+        "status": "abnormal",
+        "controller": {"status": "stale", "heartbeat_at": "2026-07-21T09:20:00+08:00"},
+        "brokers": {
+            "futu": {"status": "ok"},
+            "tiger": {"status": "stale"},
+            "phillips": {"status": "failed"},
+            "eastmoney": {"status": "unknown"},
+        },
+    }
+    payload["broker_summaries"] = [{"broker": "tiger", "holding_count": 14}]
+    payload["broker_positions"] = [{"broker": "tiger", "market": "US", "symbol": "MSFT"}]
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert "账户同步状态异常" in errors
+    assert "账户同步控制器不可用" in errors
+    assert "tiger 账户同步状态不是正常" in errors
+    assert "phillips 账户同步状态不是正常" in errors
+    assert "eastmoney 账户同步状态不是正常" in errors
+    assert any("tiger 已接受持仓数量不匹配" in error for error in errors)
+
+
+def test_validate_dashboard_payload_counts_only_actual_accepted_holdings() -> None:
+    payload = valid_payload()
+    payload["broker_summaries"] = [{"broker": "tiger", "holding_count": 1}]
+    payload["broker_positions"] = [
+        {"broker": "tiger", "market": "US", "symbol": "MSFT", "quantity": "1"},
+        {"broker": "tiger", "market": "CASH", "symbol": "USD", "asset_class": "cash", "quantity": "1"},
+        {"broker": "tiger", "market": "US", "symbol": "MONEY", "asset_class": "money_market_fund", "quantity": "1"},
+    ]
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert not any("tiger 已接受持仓数量不匹配" in error for error in errors)
+
+
+def test_check_account_holdings_counts_only_actual_accepted_holdings() -> None:
+    payload = valid_payload()
+    payload["broker_positions"] = [
+        {"broker": "futu", "market": "US", "symbol": "QQQ", "quantity": "1"},
+        {"broker": "tiger", "market": "US", "symbol": "MSFT", "quantity": "1"},
+        {"broker": "tiger", "market": "CASH", "symbol": "USD", "asset_class": "cash", "quantity": "1"},
+        {"broker": "phillips", "market": "HK", "symbol": "0700", "quantity": "1"},
+    ]
+    page = tabbed_account_page(payload)
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+
+def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(
+        dashboard_acceptance, "_project_data_dir", lambda _root: data_dir
+    )
+    now = datetime.fromisoformat("2026-07-30T12:10:00+08:00")
+    assert dashboard_acceptance._account_sync_controller_errors(
+        tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
+    ) == ["账户同步控制器状态缺失"]
+
+    status_path = data_dir / "account_sync/controller_status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps({
+        "pid": 9999999,
+        "working_directory": "/wrong",
+        "git_sha": "old",
+        "heartbeat_at": "2026-07-30T12:00:00+08:00",
+    }), encoding="utf-8")
+
+    errors = dashboard_acceptance._account_sync_controller_errors(
+        tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
+    )
+
+    for required in ("PID 不存活", "工作目录不匹配", "Git SHA 不匹配", "心跳不新鲜"):
+        assert any(required in error for error in errors)
+
+
+def test_acceptance_reads_account_sync_controller_from_shared_project_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = tmp_path / "worktree"
+    shared_data = tmp_path / "shared-data"
+    worktree.mkdir()
+    now = datetime(2026, 7, 30, 12, 10, tzinfo=dashboard_acceptance.SHANGHAI)
+    status_path = shared_data / "account_sync/controller_status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps({
+        "pid": os.getpid(),
+        "working_directory": str(worktree),
+        "git_sha": "accepted",
+        "heartbeat_at": now.isoformat(),
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard_acceptance, "_project_data_dir", lambda _root: shared_data
+    )
+
+    assert dashboard_acceptance._account_sync_controller_errors(
+        worktree, expected_root=worktree, expected_sha="accepted", now=now,
+    ) == []
 
 
 def test_acceptance_allows_recent_frozen_report_after_friday_close() -> None:
@@ -5326,8 +5459,9 @@ def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:
         "portfolio_value_hkd": "628554.05",
     }]
     payload["source_statuses"] = [{
-        "broker": "phillips", "display_text": "2026-07 月结单导入"
+        "broker": "phillips", "display_text": "同步正常"
     }]
+    payload["account_sync"]["brokers"]["phillips"]["data_as_of"] = "2026-07-10"  # type: ignore[index]
 
     errors = validate_dashboard_payload(
         payload, expected_cn=5,
