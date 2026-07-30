@@ -1201,7 +1201,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         ),
     ],
 )
-def test_current_market_report_fail_closes_industry_data_from_buy_views(
+def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_views(
     tmp_path: Path,
     market: str,
     run_date: str,

@@ -33,6 +33,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
   three market reports, while the separate process gate still rejects unhealthy
   controllers. Browser acceptance confirms file polling started, then freezes
   its page snapshot so a background refresh cannot detach controls mid-check.
+- Restored the current HK and US trend-report entry discipline to the same
+  fail-closed gates used by A shares: individual temperature, strength, phase,
+  industry temperature, right-side/tradability/danger flags, candidate age,
+  ATR, and CNY-normalized market-cap and turnover thresholds. Reports now fetch
+  and freeze industry evidence before selecting candidates, so an industry
+  below `温` cannot appear in any buy view. Historical HK/US v4-v6 strategy
+  identities remain unchanged. Verified 3 focused below-warm report scenarios
+  and the full suite with 3,897 passing tests.
 - Sorted CN/HK/US real and simulated trend-report holding rows by report
   strength. Rows now reuse the existing light green, light pink, and soft gray
   backgrounds to distinguish current buy/hold membership, non-trend holdings,
