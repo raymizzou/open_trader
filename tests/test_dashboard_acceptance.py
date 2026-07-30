@@ -642,7 +642,7 @@ def test_acceptance_rejects_api_projection_that_drops_frozen_action(
         )
 
 
-def test_acceptance_uses_dashboard_legacy_holding_phase_projection(
+def test_acceptance_allows_dashboard_only_holding_projection_fields(
     tmp_path: Path,
 ) -> None:
     reports = tmp_path / "reports"
@@ -678,6 +678,7 @@ def test_acceptance_uses_dashboard_legacy_holding_phase_projection(
         "hold_actions": [{
             "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
             "phase": "立夏",
+            "trend_report_state": "included",
             "option_anomaly": {
                 "available": False,
                 "status": "missing",
