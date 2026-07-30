@@ -31,6 +31,7 @@ from .a_share_trend import (
     valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
+from .broker_details import load_broker_detail_snapshot
 from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
@@ -2868,62 +2869,16 @@ def latest_broker_detail_month(data_dir: Path) -> str:
 def _latest_broker_details(
     data_dir: Path,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    runs_dir = data_dir / "runs"
-    if not runs_dir.exists():
-        return [], []
     positions: list[dict[str, str]] = []
     cash: list[dict[str, str]] = []
-    found: set[str] = set()
-    statement_candidates: dict[
-        str,
-        tuple[tuple[str, str], list[dict[str, str]], list[dict[str, str]]],
-    ] = {}
-    run_dirs = sorted(
-        (
-            path
-            for path in runs_dir.iterdir()
-            if path.is_dir() and DETAIL_DIR_PATTERN.fullmatch(path.name)
-        ),
-        reverse=True,
-    )
-    for run_dir in run_dirs:
-        run_positions = _read_csv_rows(run_dir / "extracted_positions.csv")
-        run_cash = _read_csv_rows(run_dir / "extracted_cash.csv")
-        for broker in BROKERS:
-            if broker in found:
-                continue
-            broker_positions = [
-                row
-                for row in run_positions
-                if _broker_key(row.get("broker", "")) == broker
-                and _optional_decimal(row.get("quantity", "")) != Decimal("0")
-            ]
-            broker_cash = [
-                row for row in run_cash if _broker_key(row.get("broker", "")) == broker
-            ]
-            if broker_positions or broker_cash:
-                if broker in {"phillips", "eastmoney"}:
-                    period = _latest_statement_period(
-                        [*broker_positions, *broker_cash], broker
-                    )
-                    key = (period, run_dir.name)
-                    current = statement_candidates.get(broker)
-                    if current is None or key > current[0]:
-                        statement_candidates[broker] = (
-                            key,
-                            broker_positions,
-                            broker_cash,
-                        )
-                    continue
-                positions.extend(broker_positions)
-                cash.extend(broker_cash)
-                found.add(broker)
-    for broker in ("phillips", "eastmoney"):
-        candidate = statement_candidates.get(broker)
-        if candidate is None:
-            continue
-        positions.extend(candidate[1])
-        cash.extend(candidate[2])
+    for broker in BROKERS:
+        snapshot = load_broker_detail_snapshot(data_dir, broker)
+        positions.extend(
+            row
+            for row in snapshot.positions
+            if _optional_decimal(row.get("quantity", "")) != Decimal("0")
+        )
+        cash.extend(snapshot.cash)
     return positions, cash
 
 

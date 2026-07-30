@@ -49,6 +49,7 @@ from .a_share_trend import (
     render_markdown,
     write_protection_state,
 )
+from .broker_details import load_broker_detail_snapshot
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
@@ -145,21 +146,8 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
 def _latest_broker_rows(
     data_dir: Path, broker: str
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    runs = data_dir / "runs"
-    if not runs.exists():
-        return [], []
-    for run_dir in sorted((item for item in runs.iterdir() if item.is_dir()), reverse=True):
-        positions = [
-            row for row in _read_rows(run_dir / "extracted_positions.csv")
-            if row.get("broker", "").strip().lower() == broker
-        ]
-        cash = [
-            row for row in _read_rows(run_dir / "extracted_cash.csv")
-            if row.get("broker", "").strip().lower() == broker
-        ]
-        if positions or cash:
-            return positions, cash
-    return [], []
+    snapshot = load_broker_detail_snapshot(data_dir, broker)
+    return list(snapshot.positions), list(snapshot.cash)
 
 
 def _decimal(value: object, *, default: Decimal | None = None) -> Decimal:
