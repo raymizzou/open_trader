@@ -235,6 +235,7 @@ def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
     attempts = context.Value("i", 0)
     finished = context.Value("i", 0)
     release = context.Event()
+    entered = context.Event()
     identity = "|".join(("US", "2026-07-22", "controller", "snapshot_failed"))
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     path = (
@@ -263,20 +264,17 @@ def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
     processes = [
         context.Process(
             target=_retry_pending_feishu_notifications_in_process,
-            args=(config, start, finished, attempts, release),
+            args=(config, start, finished, attempts, release, entered),
         )
         for _ in range(3)
     ]
     for process in processes:
         process.start()
     start.set()
+    assert entered.wait(timeout=5)
     deadline = time.monotonic() + 5
     try:
-        while (
-            attempts.value < 3
-            and finished.value < 2
-            and time.monotonic() < deadline
-        ):
+        while finished.value < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert attempts.value == 1
         assert finished.value == 2
