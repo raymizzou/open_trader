@@ -554,6 +554,21 @@ Equity XHKG 002476 VGT 300 12/05/26 300 378.8000 113,640.00 0.5000 56,820.00
     assert position.market_value == Decimal("113640.00")
 
 
+def test_parse_phillips_text_keeps_equity_without_last_buy_date() -> None:
+    result = parse_phillips_text(
+        """Securities Portfolio
+Equity XHKG 003308 ZHONGJI INNOLIGHT 150 150 980.0000 147,000.00 0.5000 73,500.00
+股票 CO., LTD.
+""",
+        "2026-07-29",
+    )
+
+    assert [
+        (position.symbol, position.quantity, position.market_value)
+        for position in result.positions
+    ] == [("03308", Decimal("150"), Decimal("147000.00"))]
+
+
 def test_parse_phillips_text_uses_base_cash_and_drops_closed_positions() -> None:
     result = parse_phillips_text(
         """戶口資料 Account Details
