@@ -4546,6 +4546,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     visual_surface_evaluations: list[tuple[str, str]] = []
     geometry_evaluations: list[str] = []
     buy_overflow_evaluations: list[str] = []
+    polling_freezes: list[str] = []
     state = {
         "fail_wide_desktop_navigation": True,
         "fail_trend_account_views": False,
@@ -4605,6 +4606,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def evaluate(
             self, expression: str, argument: object | None = None
         ) -> object:
+            if "clearInterval(state.quoteIntervalId)" in expression:
+                polling_freezes.append(self.name)
+                return True
             if (
                 "trend-review-style-contract" in expression
                 or "trend-review-geometry-contract" in expression
@@ -4739,6 +4743,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     visual_surface_evaluations.clear()
     geometry_evaluations.clear()
     buy_overflow_evaluations.clear()
+    polling_freezes.clear()
     errors, blocker = dashboard_acceptance._browser_check(
         "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
@@ -4797,6 +4802,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     assert visual_token_evaluations == [
         "wide_desktop", "desktop", "tablet", "mobile",
     ]
+    assert polling_freezes == ["wide_desktop", "desktop", "tablet", "mobile"]
     for viewport in ("wide_desktop", "desktop", "tablet", "mobile"):
         assert [
             selector

@@ -13,7 +13,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `account-sync-status` and `install_account_sync_launchd.sh` operator paths;
   Dashboard acceptance now verifies those degraded states without skipping the
   three market reports, while the separate process gate still rejects unhealthy
-  controllers.
+  controllers. Browser acceptance confirms file polling started, then freezes
+  its page snapshot so a background refresh cannot detach controls mid-check.
 - Sorted CN/HK/US real and simulated trend-report holding rows by report
   strength. Rows now reuse the existing light green, light pink, and soft gray
   backgrounds to distinguish current buy/hold membership, non-trend holdings,

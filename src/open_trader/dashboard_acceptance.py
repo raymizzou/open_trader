@@ -4093,6 +4093,14 @@ def _browser_check(
                         f"HTTP {response.status} {response.url}"
                     ) if response.status >= 400 else None)
                     page.goto(url, wait_until="networkidle")
+                    assert page.evaluate(
+                        """() => {
+                          const active = state.quoteIntervalId !== null;
+                          clearInterval(state.quoteIntervalId);
+                          state.quoteIntervalId = null;
+                          return active;
+                        }"""
+                    ), "Dashboard 未启动文件轮询"
                     _check_visual_contract(page)
                     page.screenshot(
                         path=str(
