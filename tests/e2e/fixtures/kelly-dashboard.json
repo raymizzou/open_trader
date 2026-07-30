@@ -3,6 +3,18 @@
   "broker_detail_month": "",
   "detail_available": false,
   "broker_source_statuses": [],
+  "account_sync": {
+    "status": "ok",
+    "label": "同步正常",
+    "controller": {"status": "ok", "heartbeat_at": "2026-07-30 12:10"},
+    "brokers": {
+      "futu": {"status": "ok", "display": "同步正常", "data_as_of": "12:10"},
+      "tiger": {"status": "ok", "display": "同步正常", "data_as_of": "12:10"},
+      "phillips": {"status": "ok", "display": "同步正常", "data_as_of": "2026-07"},
+      "eastmoney": {"status": "ok", "display": "同步正常", "data_as_of": "2026-07"}
+    }
+  },
+  "broker_positions": [],
   "summary": {
     "portfolio_value_hkd": "1000000.00",
     "holding_value_hkd": "1000000.00",

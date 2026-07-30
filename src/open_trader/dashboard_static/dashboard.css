@@ -270,6 +270,11 @@ select:focus-visible {
   outline-offset: 2px;
 }
 
+.broker-summary-card.status-ok { border-left-color: var(--ok); }
+.broker-summary-card.status-stale { border-left-color: var(--warning); }
+.broker-summary-card.status-failed { border-left-color: var(--danger); }
+.broker-summary-card.status-muted { border-left-color: var(--line); }
+
 .broker-summary-card.active,
 .broker-summary-card[aria-current="true"],
 .broker-summary-card[aria-selected="true"] {
@@ -293,6 +298,19 @@ select:focus-visible {
   justify-content: space-between;
   min-width: 0;
 }
+
+.account-sync-status {
+  align-items: center;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  text-align: right;
+}
+
+.account-sync-status strong,
+.account-sync-status span { overflow-wrap: anywhere; }
+.account-sync-status strong { font-size: 13px; }
+.account-sync-status span { color: var(--muted); font-size: 12px; }
 
 .source-status-list {
   display: grid;
@@ -1278,6 +1296,27 @@ table {
   gap: 16px;
   grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr) minmax(0, 1fr) auto;
   padding: 12px;
+}
+
+.account-sync-alert {
+  border-left: 3px solid var(--line);
+  display: grid;
+  gap: 4px;
+  margin: 10px 12px 0;
+  padding: 10px 12px;
+}
+
+.account-sync-alert.status-failed { background: #fdf0ed; border-left-color: var(--danger); }
+.account-sync-alert.status-stale { background: #fff7e6; border-left-color: var(--warning); }
+.account-sync-alert.status-muted { background: var(--surface-soft); }
+.account-sync-alert span { color: var(--muted); overflow-wrap: anywhere; }
+
+.account-review-action {
+  align-items: center;
+  color: var(--danger);
+  display: inline-flex;
+  font-weight: 700;
+  min-height: 38px;
 }
 
 .account-view-tabs {
@@ -4842,6 +4881,7 @@ tbody tr.active-row,
 .trend-discipline-card,
 .trend-industry-context-card,
 .trend-discipline-category,
+.account-sync-alert.status-muted,
 .trend-discipline-workspace > summary small,
 .trend-controller-status > summary small,
 .trend-risk-summary > summary small,
@@ -4944,7 +4984,7 @@ table {
 
   .dashboard-header {
     gap: 10px;
-    grid-template-areas: "brand" "assets" "source";
+    grid-template-areas: "brand" "source" "assets";
   }
 
   .trend-report-workspace {
@@ -5407,6 +5447,8 @@ table {
   .source-status-row span {
     text-align: left;
   }
+
+  .account-sync-status { text-align: left; }
 
   .topbar {
     align-items: stretch;

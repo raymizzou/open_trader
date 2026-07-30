@@ -314,7 +314,81 @@ def validate_dashboard_payload(
                 )
     if "tiger_" + "long_term_strategy" in payload:
         errors.append("Dashboard API 仍包含已退役策略")
+    errors.extend(_account_sync_errors(payload))
     errors.extend(_trend_execution_batch_errors(payload))
+    return errors
+
+
+def _account_sync_errors(payload: Mapping[str, Any]) -> list[str]:
+    account_sync = payload.get("account_sync")
+    if not isinstance(account_sync, Mapping):
+        return ["Dashboard 缺少账户同步状态"]
+    errors: list[str] = []
+    if account_sync.get("status") != "ok":
+        errors.append("账户同步状态异常")
+    controller = account_sync.get("controller")
+    if not isinstance(controller, Mapping) or controller.get("status") != "ok":
+        errors.append("账户同步控制器不可用")
+    brokers = account_sync.get("brokers")
+    if not isinstance(brokers, Mapping):
+        return [*errors, "账户同步券商状态缺失"]
+    for broker in ACCOUNT_BROKERS:
+        source = brokers.get(broker)
+        if not isinstance(source, Mapping) or source.get("status") != "ok":
+            errors.append(f"{broker} 账户同步状态不是正常")
+
+    positions = payload.get("broker_positions")
+    summaries = payload.get("broker_summaries")
+    if isinstance(positions, list) and isinstance(summaries, list):
+        for summary in summaries:
+            if not isinstance(summary, Mapping):
+                continue
+            broker = str(summary.get("broker") or "")
+            expected = summary.get("holding_count")
+            if broker not in ACCOUNT_BROKERS or not isinstance(expected, int):
+                continue
+            actual = sum(
+                1 for row in positions
+                if isinstance(row, Mapping) and str(row.get("broker") or "") == broker
+            )
+            if actual != expected:
+                errors.append(f"{broker} 已接受持仓数量不匹配：{actual} != {expected}")
+    return errors
+
+
+def _account_sync_controller_errors(
+    root: Path, *, expected_root: Path, expected_sha: str, now: datetime | None = None,
+) -> list[str]:
+    path = root / "data/account_sync/controller_status.json"
+    try:
+        controller = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["账户同步控制器状态缺失"]
+    if not isinstance(controller, Mapping):
+        return ["账户同步控制器状态缺失"]
+
+    errors: list[str] = []
+    pid = controller.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        errors.append("账户同步控制器 PID 无效")
+    else:
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            errors.append(f"账户同步控制器 PID 不存活：{pid}（{exc}）")
+    working_directory = controller.get("working_directory")
+    if not isinstance(working_directory, str) or Path(working_directory).resolve() != expected_root.resolve():
+        errors.append("账户同步控制器工作目录不匹配")
+    if controller.get("git_sha") != expected_sha:
+        errors.append("账户同步控制器 Git SHA 不匹配")
+    try:
+        heartbeat = datetime.fromisoformat(str(controller.get("heartbeat_at") or ""))
+        if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
+            raise ValueError
+        if abs((now or datetime.now().astimezone()) - heartbeat) > timedelta(minutes=2):
+            errors.append("账户同步控制器心跳不新鲜")
+    except (TypeError, ValueError):
+        errors.append("账户同步控制器心跳无效")
     return errors
 
 
@@ -1864,7 +1938,7 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
         _check_mobile_targets(
             page,
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
-            ".strategy-tools button:visible, #refresh-quotes:visible, "
+            ".strategy-tools button:visible, "
             ".broker-summary-card:visible, .account-holding-actions button:visible",
         )
         t_signal_button = page.locator(
@@ -2822,6 +2896,10 @@ def _check_account_holdings(
 
     reports = payload.get("trend_reports") or {}
     reviews = payload.get("trend_reviews") or {}
+    account_sync = payload.get("account_sync") or {}
+    broker_sync = account_sync.get("brokers") if isinstance(account_sync, Mapping) else {}
+    positions = payload.get("broker_positions") or []
+    check_accepted_counts = isinstance(payload.get("broker_positions"), list) and bool(positions)
     profiles = {
         "futu": ("富途", "期权增强"),
         "tiger": ("老虎", "趋势", "美股趋势交易"),
@@ -2844,6 +2922,25 @@ def _check_account_holdings(
         ):
             assert forbidden not in text, f"账户持仓视图泄漏内部代码 {forbidden}"
         rows = section.locator(".account-holding-row:visible")
+        if check_accepted_counts:
+            expected_rows = sum(
+                1 for row in positions
+                if isinstance(row, Mapping) and row.get("broker") == broker
+            )
+            assert rows.count() == expected_rows, (
+                f"{broker} 已接受持仓行数不匹配：{rows.count()} != {expected_rows}"
+            )
+        source = broker_sync.get(broker) if isinstance(broker_sync, Mapping) else {}
+        source_status = source.get("status") if isinstance(source, Mapping) else "unknown"
+        if source_status in {"failed", "stale", "unknown"}:
+            banner = section.locator(".account-sync-alert:visible")
+            assert banner.count() == 1, f"{broker} 异常账户缺少状态横幅"
+            assert section.locator('[data-detail-mode="t_signal"]').count() == 0, (
+                f"{broker} 异常账户仍暴露做T动作"
+            )
+            assert section.locator(".account-review-action").count() == rows.count(), (
+                f"{broker} 异常账户缺少人工复核动作"
+            )
         empty = section.locator(".account-empty:visible")
         if rows.count() == 0:
             assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
@@ -3717,10 +3814,7 @@ def _check_visual_contract(page: Any) -> None:
             "backgroundColor": "rgb(247, 245, 241)",
             "color": "rgb(32, 29, 24)",
         },
-        "#refresh-quotes": {
-            "backgroundColor": "rgb(139, 94, 52)",
-            "borderTopColor": "rgb(139, 94, 52)",
-        },
+        "#account-sync-status": {"color": "rgb(32, 29, 24)"},
         ".current-view-card": {
             "backgroundColor": "rgb(36, 33, 29)",
             "borderTopColor": "rgb(36, 33, 29)",
@@ -3754,17 +3848,10 @@ def _check_visual_contract(page: Any) -> None:
             actual_style.get(key) == value for key, value in required.items()
         ), f"{selector} 未使用 A 色板：{actual_style}"
 
-    focus_target = page.locator("#refresh-quotes")
-    focus_target.focus()
-    focus = focus_target.evaluate(
-        "element => { const styles = getComputedStyle(element); return {"
-        "outlineColor: styles.outlineColor, outlineStyle: styles.outlineStyle, "
-        "outlineWidth: styles.outlineWidth}; }"
-    )
-    assert focus == {
-        "outlineColor": "rgb(139, 94, 52)",
-        "outlineStyle": "solid", "outlineWidth": "3px",
-    }, f"主操作焦点未使用 A 色板：{focus}"
+    assert page.locator("#refresh-quotes").count() == 0, "页面仍包含账户刷新按钮"
+    assert page.locator("text=刷新账户与行情").count() == 0, "页面仍包含旧账户刷新文案"
+    status = page.locator("#account-sync-status")
+    assert status.count() == 1 and "同步" in status.inner_text(), "缺少只读账户同步状态"
 
 
 def _check_open_report_layout(
@@ -4337,6 +4424,9 @@ def main(argv: list[str] | None = None) -> int:
         ).strip()
         if running_sha != expected_sha:
             errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
+        errors.extend(_account_sync_controller_errors(
+            args.expected_root, expected_root=args.expected_root, expected_sha=expected_sha,
+        ))
         process_started_at = _process_started_at(pid)
         source_changes = _source_changes(cwd)
         if source_changes:

@@ -422,6 +422,11 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
+        "_account_sync_controller_errors",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
         "_configured_simulate_account_ids",
         lambda *_args: {"tiger": 1, "phillips": 2, "eastmoney": 3},
     )
@@ -1186,6 +1191,14 @@ def valid_payload() -> dict[str, object]:
     return {
         "holdings": cn + other,
         "cash_rows": [],
+        "account_sync": {
+            "status": "ok",
+            "controller": {"status": "ok", "heartbeat_at": "2026-07-21T09:31:00+08:00"},
+            "brokers": {
+                broker: {"status": "ok", "display": "同步正常"}
+                for broker in dashboard_acceptance.ACCOUNT_BROKERS
+            },
+        },
         "backtest_universe": {"holdings": [
             {"market": "CN", "symbol": row["symbol"]} for row in cn
         ]},
@@ -2488,9 +2501,15 @@ class TabbedAccountLocator:
         raise AssertionError(f"unknown click selector: {self.selector}")
 
     def count(self) -> int:
+        if self.selector == "#refresh-quotes":
+            return 0
+        if self.selector == "text=刷新账户与行情":
+            return 0
+        if self.selector == "#account-sync-status":
+            return 1
         target_selectors = {
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
-            ".strategy-tools button:visible, #refresh-quotes:visible, "
+            ".strategy-tools button:visible, "
             ".broker-summary-card:visible, .account-holding-actions button:visible",
             ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
             ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
@@ -2935,6 +2954,8 @@ class TabbedAccountLocator:
         return not bool(self.page.reports[broker]["available"])
 
     def inner_text(self) -> str:
+        if self.selector == "#account-sync-status":
+            return "同步正常 · 控制器心跳 2026-07-30 12:00"
         if self.selector == "#account-holdings":
             return self.page.section_texts[self.page.selected]
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
@@ -3966,9 +3987,15 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             return self
 
         def count(self) -> int:
+            if self.selector == "#refresh-quotes":
+                return 0
+            if self.selector == "text=刷新账户与行情":
+                return 0
+            if self.selector == "#account-sync-status":
+                return 1
             target_selectors = {
                 '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
-                ".strategy-tools button:visible, #refresh-quotes:visible, "
+                ".strategy-tools button:visible, "
                 ".broker-summary-card:visible, .account-holding-actions button:visible",
                 ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
                 ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
@@ -4060,7 +4087,7 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     assert len(page.evaluations) == 1
     assert page.target_checks == [
         "#account-tabs [role=\"tab\"]:visible, #header-market-filters button:visible, "
-        ".strategy-tools button:visible, #refresh-quotes:visible, "
+        ".strategy-tools button:visible, "
         ".broker-summary-card:visible, .account-holding-actions button:visible",
         ".symbol-detail-panel.inline-symbol-detail:visible button:visible, "
         ".symbol-detail-panel.inline-symbol-detail:visible input:visible, "
@@ -4217,10 +4244,7 @@ VISUAL_CONTRACT_STYLES = {
         "backgroundColor": "rgb(247, 245, 241)",
         "color": "rgb(32, 29, 24)",
     },
-    "#refresh-quotes": {
-        "backgroundColor": "rgb(139, 94, 52)",
-        "borderTopColor": "rgb(139, 94, 52)",
-    },
+    "#account-sync-status": {"color": "rgb(32, 29, 24)"},
     ".current-view-card": {
         "backgroundColor": "rgb(36, 33, 29)",
         "borderTopColor": "rgb(36, 33, 29)",
@@ -4260,21 +4284,17 @@ def visual_contract_page(*, accent: str = "#8B5E34") -> object:
             self.selector = selector
 
         def count(self) -> int:
+            if self.selector == "text=刷新账户与行情":
+                return 0
             return int(self.selector in VISUAL_CONTRACT_STYLES)
 
-        def focus(self) -> None:
-            assert self.selector in VISUAL_CONTRACT_STYLES
-            self.page.focused_selectors.append(self.selector)
+        def inner_text(self) -> str:
+            assert self.selector == "#account-sync-status"
+            return "同步正常 · 控制器心跳 2026-07-30 12:00"
 
         def evaluate(self, expression: str) -> dict[str, str]:
             assert self.selector in VISUAL_CONTRACT_STYLES
             self.page.evaluated_selectors.append(self.selector)
-            if "outlineColor" in expression:
-                assert self.selector == "#refresh-quotes"
-                return {
-                    "outlineColor": "rgb(139, 94, 52)",
-                    "outlineStyle": "solid", "outlineWidth": "3px",
-                }
             assert "backgroundColor" in expression
             return dict(VISUAL_CONTRACT_STYLES[self.selector])
 
@@ -4284,7 +4304,6 @@ def visual_contract_page(*, accent: str = "#8B5E34") -> object:
             self.expected["--accent"] = accent
             self.token_evaluations: list[list[str]] = []
             self.evaluated_selectors: list[str] = []
-            self.focused_selectors: list[str] = []
 
         def evaluate(
             self, expression: str, names: list[str] | None = None
@@ -4310,9 +4329,7 @@ def test_acceptance_visual_contract_accepts_exact_warm_ledger() -> None:
     ]
     assert page.evaluated_selectors == [  # type: ignore[attr-defined]
         *VISUAL_CONTRACT_STYLES,
-        "#refresh-quotes",
     ]
-    assert page.focused_selectors == ["#refresh-quotes"]  # type: ignore[attr-defined]
 
 
 def test_acceptance_visual_contract_rejects_palette_drift() -> None:
@@ -4499,8 +4516,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     screenshots: list[tuple[str, str]] = []
     visual_token_evaluations: list[str] = []
     visual_surface_evaluations: list[tuple[str, str]] = []
-    visual_focus_calls: list[tuple[str, str]] = []
-    visual_focus_evaluations: list[tuple[str, str]] = []
     geometry_evaluations: list[str] = []
     buy_overflow_evaluations: list[str] = []
     state = {
@@ -4512,12 +4527,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def click(self) -> None:
             clicks.append((self.page.name, self.selector))  # type: ignore[attr-defined]
             super().click()
-
-        def focus(self) -> None:
-            if self.selector == "#refresh-quotes":
-                visual_focus_calls.append((self.page.name, self.selector))  # type: ignore[attr-defined]
-                return
-            super().focus()
 
         def evaluate(self, expression: str) -> object:
             if "getComputedStyle" in expression:
@@ -4536,16 +4545,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
                         "clientWidth": 1500,
                         "scrollWidth": 1600,
                         "overflowX": "auto",
-                    }
-                if "outlineColor" in expression:
-                    assert self.selector == "#refresh-quotes"
-                    visual_focus_evaluations.append(
-                        (self.page.name, self.selector)  # type: ignore[attr-defined]
-                    )
-                    return {
-                        "outlineColor": "rgb(139, 94, 52)",
-                        "outlineStyle": "solid",
-                        "outlineWidth": "3px",
                     }
                 assert self.selector in VISUAL_CONTRACT_STYLES, self.selector
                 visual_surface_evaluations.append(
@@ -4710,8 +4709,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
     screenshots.clear()
     visual_token_evaluations.clear()
     visual_surface_evaluations.clear()
-    visual_focus_calls.clear()
-    visual_focus_evaluations.clear()
     geometry_evaluations.clear()
     buy_overflow_evaluations.clear()
     errors, blocker = dashboard_acceptance._browser_check(
@@ -4778,8 +4775,6 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             for name, selector in visual_surface_evaluations
             if name == viewport
         ] == list(VISUAL_CONTRACT_STYLES)
-        assert (viewport, "#refresh-quotes") in visual_focus_calls
-        assert (viewport, "#refresh-quotes") in visual_focus_evaluations
     assert geometry_evaluations == []
     assert buy_overflow_evaluations == []
     screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
@@ -4814,6 +4809,54 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
 
 def test_validate_dashboard_payload_accepts_real_contract() -> None:
     assert validate_dashboard_payload(valid_payload(), expected_cn=5) == []
+
+
+def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accepted_count() -> None:
+    payload = valid_payload()
+    payload["account_sync"] = {
+        "status": "abnormal",
+        "controller": {"status": "stale", "heartbeat_at": "2026-07-21T09:20:00+08:00"},
+        "brokers": {
+            "futu": {"status": "ok"},
+            "tiger": {"status": "stale"},
+            "phillips": {"status": "failed"},
+            "eastmoney": {"status": "unknown"},
+        },
+    }
+    payload["broker_summaries"] = [{"broker": "tiger", "holding_count": 14}]
+    payload["broker_positions"] = [{"broker": "tiger", "market": "US", "symbol": "MSFT"}]
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert "账户同步状态异常" in errors
+    assert "账户同步控制器不可用" in errors
+    assert "tiger 账户同步状态不是正常" in errors
+    assert "phillips 账户同步状态不是正常" in errors
+    assert "eastmoney 账户同步状态不是正常" in errors
+    assert any("tiger 已接受持仓数量不匹配" in error for error in errors)
+
+
+def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(tmp_path: Path) -> None:
+    now = datetime.fromisoformat("2026-07-30T12:10:00+08:00")
+    assert dashboard_acceptance._account_sync_controller_errors(
+        tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
+    ) == ["账户同步控制器状态缺失"]
+
+    status_path = tmp_path / "data/account_sync/controller_status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps({
+        "pid": 9999999,
+        "working_directory": "/wrong",
+        "git_sha": "old",
+        "heartbeat_at": "2026-07-30T12:00:00+08:00",
+    }), encoding="utf-8")
+
+    errors = dashboard_acceptance._account_sync_controller_errors(
+        tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
+    )
+
+    for required in ("PID 不存活", "工作目录不匹配", "Git SHA 不匹配", "心跳不新鲜"):
+        assert any(required in error for error in errors)
 
 
 def test_acceptance_allows_recent_frozen_report_after_friday_close() -> None:

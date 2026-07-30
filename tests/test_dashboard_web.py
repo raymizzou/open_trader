@@ -555,7 +555,7 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
     for element_id in (
         "open-standard-backtest", "header-market-filters",
         "current-view-value",
-        "broker-summary-cards", "quote-status", "refresh-quotes",
+        "broker-summary-cards", "quote-status", "account-sync-status",
         "source-status-list", "last-refresh", "kelly-lab-panel",
         "open-kelly-lab", "return-to-portfolio", "account-tabs",
         "account-holdings", "symbol-detail-panel",
@@ -621,7 +621,7 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert "transition-duration: 0.01ms !important;" in css
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
     assert "min-height: 44px;" in mobile
-    assert 'grid-template-areas: "brand" "assets" "source";' in mobile
+    assert 'grid-template-areas: "brand" "source" "assets";' in mobile
     assert ".account-tab-list" in mobile
     assert "grid-template-columns: repeat(4, minmax(0, 1fr));" in mobile
     assert "overflow-x: hidden;" in mobile
@@ -3340,7 +3340,7 @@ console.log(JSON.stringify({header,summary:{cash:elements["summary-cash-note"].t
 
 def test_dashboard_account_count_renderers_format_each_count_field() -> None:
     output = run_dashboard_js(r'''
-state.dashboard = {broker_summaries:[{
+state.dashboard = {account_sync:{brokers:{futu:{status:"ok",display:"同步正常"}}},broker_summaries:[{
   broker:"futu",display_name:"富途",portfolio_value_hkd:"30000.00",holding_count:"10000",source_status:"real_time",
 }],source_statuses:[]};
 const tabs = renderAccountTabs([{broker:"futu",rows:new Array(10000)}]);
@@ -3353,7 +3353,7 @@ console.log(JSON.stringify({tabs,section,cards:renderBrokerSummaryCards(),label:
     rendered = json.loads(output)
     assert "富途<span>10,000</span>" in rendered["tabs"]
     assert "<span>持仓 10,000</span>" in rendered["section"]
-    assert '<span class="summary-note">持仓 10,000 · 实时</span>' in rendered["cards"]
+    assert '<span class="summary-note">持仓 10,000 · 同步正常</span>' in rendered["cards"]
     assert rendered["label"].endswith("10,000 条")
 
 
@@ -3387,8 +3387,12 @@ def test_dashboard_broker_cards_always_render_four_accounts_and_derive_aliases()
     output = run_dashboard_js(r'''
 state.dashboard={
   broker_summaries:[{broker:"futu",account_alias:"futu_summary",portfolio_value_hkd:"1000"}],
-  source_statuses:[{broker:"eastmoney",status:"failed",display_text:"同步失败：账单缺失"}],
+  account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"},phillips:{status:"ok",display:"同步正常"},eastmoney:{status:"failed",display:"同步失败 · 数据截至 11:56"}}},
   cash_rows:[{broker:"tiger",account_alias:"tiger_cash"}],
+  broker_positions:[
+    {broker:"phillips",market:"HK",symbol:"02840",account_alias:"phillips_detail"},
+    {broker:"eastmoney",market:"CN",symbol:"600519",account_alias:"eastmoney_detail"},
+  ],
   holdings:[
     {market:"HK",symbol:"02840",brokers:"phillips",broker_details:[{broker:"phillips",account_alias:"phillips_detail"}]},
     {market:"CN",symbol:"600519",brokers:"eastmoney",broker_details:[{broker:"eastmoney",account_alias:"eastmoney_detail"}]},
@@ -3399,7 +3403,7 @@ const groups=accountHoldingGroups();
 console.log(JSON.stringify({cards,sections:Object.fromEntries(groups.map((group)=>[group.broker,renderAccountSection(group)]))}));
 ''')
     rendered = json.loads(output)
-    assert rendered["cards"].count('class="broker-summary-card"') == 4
+    assert rendered["cards"].count("broker-summary-card") == 4
     for broker, label, alias in (
         ("futu", "富途", "futu_summary"),
         ("tiger", "老虎", "tiger_cash"),
@@ -3410,16 +3414,16 @@ console.log(JSON.stringify({cards,sections:Object.fromEntries(groups.map((group)
         assert label in rendered["cards"]
         assert alias in rendered["cards"]
         assert alias in rendered["sections"][broker]
-    assert "同步失败：账单缺失" in rendered["cards"]
+    assert "同步失败 · 数据截至 11:56" in rendered["cards"]
 
 
 def test_dashboard_empty_payload_keeps_all_broker_cards_and_static_placeholders() -> None:
     output = run_dashboard_js(r'''
-state.dashboard={broker_summaries:[],source_statuses:[],cash_rows:[],holdings:[]};
+state.dashboard={broker_summaries:[],account_sync:{brokers:{}},broker_positions:[],cash_rows:[],holdings:[]};
 console.log(renderBrokerSummaryCards());
 ''')
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    assert output.count('class="broker-summary-card"') == 4
+    assert output.count("broker-summary-card") == 4
     for broker, label in (
         ("futu", "富途"), ("tiger", "老虎"),
         ("phillips", "辉立"), ("eastmoney", "东方财富"),
@@ -3741,7 +3745,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_dashboard_derives_account_groups_from_existing_broker_details() -> None:
+def test_dashboard_derives_account_groups_from_accepted_broker_positions() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
   summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "700"}, broker_summaries: [
@@ -3749,7 +3753,11 @@ state.dashboard = {
     {broker: "tiger", portfolio_value_hkd: "2000", cash_like_value_hkd: "400"},
     {broker: "phillips", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
     {broker: "eastmoney", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
-  ], source_statuses: [], cash_rows: [],
+  ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
+  broker_positions: [
+    {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
+  ],
   holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
     {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
     {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
@@ -3772,7 +3780,11 @@ state.dashboard = {
   summary: {portfolio_value_hkd: "5000", cash_like_value_hkd: "300"}, broker_summaries: [
     {broker: "futu", portfolio_value_hkd: "2000", cash_like_value_hkd: "100"},
     {broker: "tiger", portfolio_value_hkd: "3000", cash_like_value_hkd: "-200"},
-  ], cash_rows: [], holdings: [{
+  ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
+  broker_positions: [
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1",cost_value:"60",fx_to_hkd:"7.8",market_value_hkd:"700",unrealized_pnl:"30"},
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2",cost_value:"150",fx_to_hkd:"8",market_value_hkd:"1600",unrealized_pnl:"50"},
+  ], holdings: [{
     market: "US", symbol: "QQQ", brokers: "futu;tiger", total_quantity: "3",
     cost_value: "210", fx_to_hkd: "7.8", market_value_hkd: "2300",
     broker_details: [
@@ -4308,8 +4320,10 @@ def test_dashboard_static_assets_include_local_shell() -> None:
 
     assert "Open Trader" in html
     assert "持仓实时看板" in html
-    assert "刷新账户与行情" in html
-    assert "accountSyncReloadNeeded" in js
+    assert 'id="refresh-quotes"' not in html
+    assert "刷新账户与行情" not in html + js
+    assert 'id="account-sync-status"' in html
+    assert "accountSyncReloadNeeded" not in js
     assert "renderBacktestPriceSyncStatus" not in js
     assert "全部市场" in html
     assert "symbol-detail-panel" in html
@@ -4507,7 +4521,7 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "grid-template-columns: minmax(0, 1fr) 300px;" not in css
     assert ".right-rail" not in css
     assert 'grid-template-areas: "brand source" "assets assets";' not in css
-    assert 'grid-template-areas: "brand" "assets" "source";' in css
+    assert 'grid-template-areas: "brand" "source" "assets";' in css
     assert ".symbol-detail-panel" in css
     assert ".language-toggle" in css
     assert ".english-source" in css
@@ -4561,6 +4575,56 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".workspace-grid.detail-mode {" in mobile_css
     assert ".compact-kv div {\n    display: grid;\n    gap: 3px;\n  }" in mobile_css
     assert ".compact-kv dd {\n    text-align: left;\n  }" in mobile_css
+
+
+def test_dashboard_renders_file_backed_account_sync_health_and_accepted_positions() -> None:
+    """Changing the accepted broker status must change the visible review boundary."""
+    output = run_dashboard_js(r'''
+const positions=Array.from({length:14},(_,index)=>({
+  broker:"tiger",account_alias:"tiger_main",market:"US",asset_class:"stock",
+  symbol:`ACCEPTED${index}`,name:`Accepted ${index}`,currency:"USD",quantity:"1",
+  cost_price:"10",last_price:"11",market_value_hkd:"85.8",cost_value:"78",
+  unrealized_pnl:"7.8",
+}));
+state.dashboard={
+  summary:{portfolio_value_hkd:"1201.2"},
+  broker_summaries:[{broker:"tiger",account_alias:"tiger_main",portfolio_value_hkd:"1201.2",holding_value_hkd:"1201.2",cash_like_value_hkd:"0",holding_count:14}],
+  broker_positions:positions,
+  holdings:[],cash_rows:[],source_statuses:[],
+  account_sync:{status:"ok",label:"同步正常",controller:{status:"ok",heartbeat_at:"2026-07-30 12:10"},brokers:{
+    futu:{status:"ok",display:"同步正常",data_as_of:"12:10"},
+    tiger:{status:"ok",display:"同步正常",data_as_of:"12:10"},
+    phillips:{status:"ok",display:"同步正常",data_as_of:"2026-07"},
+    eastmoney:{status:"ok",display:"同步正常",data_as_of:"2026-07"},
+  }},
+};
+function render(status){
+  const source=state.dashboard.account_sync.brokers.tiger;
+  source.status=status;
+  source.data_as_of=status==="unknown"?"":"11:56";
+  source.display=status==="ok"?"同步正常":status==="failed"?"同步失败 · 数据截至 11:56":status==="stale"?"数据已过期 · 数据截至 11:56":"同步状态未知 · 数据未验证";
+  state.dashboard.account_sync.status=status==="ok"?"ok":"abnormal";
+  state.dashboard.account_sync.label=status==="ok"?"同步正常":"同步异常";
+  const group=accountHoldingGroups().find((item)=>item.broker==="tiger");
+  return {status:renderAccountSyncStatus(),card:renderBrokerSummaryCards(),sources:renderSourceStatusList(),section:renderAccountSection(group)};
+}
+console.log(JSON.stringify({ok:render("ok"),failed:render("failed"),stale:render("stale"),unknown:render("unknown")}));
+''')
+    rendered = json.loads(output)
+
+    assert "同步正常" in rendered["ok"]["status"]
+    assert "心跳 2026-07-30 12:10" in rendered["ok"]["status"]
+    assert rendered["ok"]["section"].count("account-holding-row") == 14
+    assert "同步失败 · 数据截至 11:56" in rendered["failed"]["card"]
+    assert "同步异常" in rendered["failed"]["status"]
+    assert "同步失败 · 数据截至 11:56" in rendered["failed"]["sources"]
+    assert "人工复核" in rendered["failed"]["section"]
+    assert 'data-detail-mode="t_signal"' not in rendered["failed"]["section"]
+    assert "数据已过期 · 数据截至 11:56" in rendered["stale"]["section"]
+    assert "同步状态未知 · 数据未验证" in rendered["unknown"]["section"]
+    assert "status-failed" in rendered["failed"]["sources"]
+    assert "status-stale" in rendered["stale"]["sources"]
+    assert "status-muted" in rendered["unknown"]["sources"]
 
 
 def test_trading_decision_tab_css() -> None:
@@ -4763,7 +4827,11 @@ def test_dashboard_decision_deep_link_prefers_account_broker_order() -> None:
     output = run_dashboard_js(r'''
 globalThis.window={location:{search:"?market=US&symbol=QQQ&decision_tab=news"}};
 state.dashboard={
-  summary:{portfolio_value_hkd:"3000"},broker_summaries:[],source_statuses:[],cash_rows:[],
+  summary:{portfolio_value_hkd:"3000"},broker_summaries:[],account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}},cash_rows:[],
+  broker_positions:[
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"},
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1"},
+  ],
   holdings:[{market:"US",symbol:"QQQ",brokers:"tiger;futu",broker_details:[
     {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2"},
     {broker:"futu",market:"US",symbol:"QQQ",quantity:"1"},
@@ -5109,30 +5177,25 @@ console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:call
     assert rendered["attributionStates"].count("报告关联冲突") == 1
 
 
-def test_dashboard_manual_refresh_reloads_active_simulated_positions() -> None:
+def test_dashboard_quote_poll_reloads_published_dashboard_without_simulation_refresh() -> None:
     output = run_dashboard_js(r'''
-elements["refresh-quotes"]={disabled:false,textContent:""};
 renderQuoteStatus=()=>{};
 renderHoldings=()=>{};
-state.brokerFilter="tiger";
-state.accountViews.tiger="simulate";
 state.trendSimulatePositions={tiger:{available:true,positions:[
   {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
 ]}};
-const refreshed={available:true,positions:[
-  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
-  {symbol:"HST",quantity:"1633"},
-]};
 const requests=[];
 globalThis.fetch=async(url)=>{
   requests.push(url);
   return {ok:true,json:async()=>url==="/api/quotes"
-    ? {quotes:{},account_sync:{status:"skipped"}}
-    : refreshed};
+    ? {quotes:{}}
+    : {poll_seconds:0,marker:"published"}};
 };
-await refreshQuotes({refreshSimulation:true});
+renderDashboard=()=>{};
+await refreshQuotes();
 console.log(JSON.stringify({
   requests,
+  dashboard:state.dashboard.marker,
   symbols:state.trendSimulatePositions.tiger.positions.map((position)=>position.symbol),
 }));
 ''')
@@ -5140,9 +5203,10 @@ console.log(JSON.stringify({
 
     assert rendered["requests"] == [
         "/api/quotes",
-        "/api/trend-simulate-positions/tiger",
+        "/api/dashboard",
     ]
-    assert rendered["symbols"] == ["GPN", "TOST", "HST"]
+    assert rendered["dashboard"] == "published"
+    assert rendered["symbols"] == ["GPN", "TOST"]
 
 
 def test_dashboard_report_does_not_load_simulation_positions_or_render_overlays() -> None:
@@ -5289,7 +5353,6 @@ console.log(JSON.stringify({urls,currentHtml,historyHtml,historicalHtml,restored
 
 def test_dashboard_quote_refresh_does_not_replace_active_report_view() -> None:
     output = run_dashboard_js(r'''
-elements["refresh-quotes"]={disabled:false,textContent:""};
 state.brokerFilter="tiger";
 state.accountViews.tiger="report";
 state.trendReportHistories.tiger={open:true};
@@ -7201,7 +7264,11 @@ state.dashboard = {
     {broker: "tiger", portfolio_value_hkd: "2000"},
     {broker: "phillips", portfolio_value_hkd: "0"},
     {broker: "eastmoney", portfolio_value_hkd: "0"},
-  ], source_statuses: [], cash_rows: [],
+  ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
+  broker_positions:[
+    {broker:"futu",market:"US",symbol:"QQQ",quantity:"1",market_value_hkd:"700"},
+    {broker:"tiger",market:"US",symbol:"QQQ",quantity:"2",market_value_hkd:"1600"},
+  ],
   holdings: [{market: "US", symbol: "QQQ", brokers: "futu;tiger", broker_details: [
     {broker: "futu", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700"},
     {broker: "tiger", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600"},
@@ -10170,6 +10237,18 @@ state.dashboard = {
       updated_at: "2026-05",
     },
   ],
+  account_sync: {brokers: {
+    futu: {status: "ok", display: "同步正常"}, tiger: {status: "ok", display: "同步正常"},
+    phillips: {status: "ok", display: "同步正常"}, eastmoney: {status: "ok", display: "同步正常"},
+  }},
+  broker_positions: [
+    {broker: "futu", market: "US", symbol: "VIXY", quantity: "10", market_value: "1940.00", market_value_hkd: "15132.00"},
+    {broker: "futu", market: "US", symbol: "VIXY260821C22000", quantity: "1", market_value_hkd: "300.00"},
+    {broker: "futu", market: "HK", symbol: "HKOPT", quantity: "1", market_value_hkd: "200.00"},
+    {broker: "tiger", market: "US", symbol: "VIXY", quantity: "2", market_value_hkd: "22698.00"},
+    {broker: "tiger", market: "US", symbol: "BND", quantity: "2", market_value_hkd: "100.00"},
+    {broker: "phillips", market: "HK", symbol: "00700", quantity: "100", market_value_hkd: "15982.00"},
+  ],
 };
 state.marketFilter = "US";
 state.brokerFilter = "futu";
@@ -10187,12 +10266,12 @@ const brokerCards = renderBrokerSummaryCards();
 if (!brokerCards.includes("富途") || !brokerCards.includes("HKD -99,071.35")) {
   throw new Error("broker card missing expected text: " + brokerCards);
 }
-if (!brokerCards.includes("老虎") || !brokerCards.includes("账户实时同步，行情走富途")) {
-  throw new Error("broker card should distinguish Tiger account data from Futu quotes: " + brokerCards);
+if (!brokerCards.includes("老虎") || !brokerCards.includes("同步正常")) {
+  throw new Error("broker card should show the published account sync status: " + brokerCards);
 }
 let sourceList = renderSourceStatusList();
-if (!sourceList.includes("辉立") || !sourceList.includes("非实时")) {
-  throw new Error("source list missing statement status: " + sourceList);
+if (!sourceList.includes("辉立账户") || !sourceList.includes("同步正常")) {
+  throw new Error("source list missing published account status: " + sourceList);
 }
 state.quotePayload = {
   status: "failed",
@@ -10200,8 +10279,8 @@ state.quotePayload = {
   diagnostic: { message: "网络中断" },
 };
 sourceList = renderSourceStatusList();
-if (!sourceList.includes("富途") || !sourceList.includes("网络中断")) {
-  throw new Error("source list missing quote diagnostic: " + sourceList);
+if (!sourceList.includes("富途账户") || sourceList.includes("网络中断")) {
+  throw new Error("source list should remain file-backed during quote errors: " + sourceList);
 }
 state.quotePayload = {
   status: "partial",
@@ -10209,8 +10288,8 @@ state.quotePayload = {
   diagnostic: { message: "缺失 1 个标的行情。" },
 };
 sourceList = renderSourceStatusList();
-if (!sourceList.includes("富途") || !sourceList.includes("缺失 1 个标的行情。")) {
-  throw new Error("source list missing partial quote diagnostic: " + sourceList);
+if (!sourceList.includes("富途账户") || sourceList.includes("缺失 1 个标的行情。")) {
+  throw new Error("source list should not replace account status with quote diagnostics: " + sourceList);
 }
 function makeElement() {
   const classes = new Set();
@@ -10253,7 +10332,7 @@ state.dashboardError = null;
 state.quotes = {};
 state.marketFilter = "ALL";
 state.brokerFilter = "futu";
-state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
+state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.broker_positions[0], 0);
 renderHoldings();
 if (!elements["symbol-detail-panel"].classList.contains("hidden")) {
   throw new Error("trading decision should keep bottom symbol detail panel hidden");
@@ -10289,7 +10368,7 @@ for (const broker of ["futu", "tiger", "phillips", "eastmoney"]) {
   renderedRowCount += (accountHtml.match(/account-holding-row/g) || []).length;
 }
 state.brokerFilter = "futu";
-state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.holdings[1], 1);
+state.selectedHoldingKey = accountHoldingKey("futu", state.dashboard.broker_positions[0], 0);
 renderHoldings();
 if (renderedHoldings.includes("美股正股") || renderedHoldings.includes("美股期权")) {
   throw new Error("account tables should not contain nested market sections: " + renderedHoldings);
@@ -10334,6 +10413,7 @@ state.dashboard.holdings.push({
   portfolio_weight_hkd: "1.50%",
   unrealized_pnl_pct: "0.00%",
 });
+state.dashboard.broker_positions.push({broker: "phillips", market: "JP", symbol: "7203", quantity: "1", market_value_hkd: "300.00"});
 state.selectedHoldingKey = "";
 selectBroker("phillips");
 const renderedWithOther = elements["holdings-body"].innerHTML;
