@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
+import fcntl
+import os
 from pathlib import Path
+import subprocess
+import sys
 import time
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -19,6 +23,8 @@ from .account_sync_state import (
     write_json_atomic,
     write_portfolio_atomic,
 )
+from .dashboard import DashboardConfig
+from .dashboard_quotes import DashboardQuoteService, load_published_quotes
 from .futu_account import FutuAccountClient, build_futu_account_candidate
 from .fx import DEFAULT_RATES_TO_HKD
 from .tiger_account import (
@@ -56,13 +62,31 @@ class AccountSyncController:
         self.clock = clock
         self.now_text = now_text or _now_text
         self._last_account_attempt: float | None = None
+        self._last_quote_attempt: float | None = None
+        self._quote_service: DashboardQuoteService | None = None
+        self.account_loop: dict[str, object] = {}
+        self.quote_loop: dict[str, object] = {}
+        self._started_at = self.now_text()
+        self._process_metadata = {
+            "pid": os.getpid(),
+            "started_at": self._started_at,
+            "working_directory": str(Path.cwd()),
+            "git_sha": _git_sha(),
+        }
+
+    def account_due(self, now: float) -> bool:
+        return _is_due(
+            self._last_account_attempt, now, self.config.account_interval_seconds
+        )
+
+    def quote_due(self, now: float) -> bool:
+        return _is_due(
+            self._last_quote_attempt, now, self.config.quote_interval_seconds
+        )
 
     def sync_accounts_once(self) -> dict[str, object]:
         now = self.clock()
-        if (
-            self._last_account_attempt is not None
-            and now - self._last_account_attempt < self.config.account_interval_seconds
-        ):
+        if not self.account_due(now):
             return {"status": "skipped", "brokers": {}}
         self._last_account_attempt = now
         attempted_at = self.now_text()
@@ -131,10 +155,76 @@ class AccountSyncController:
         }
 
     def sync_quotes_once(self) -> dict[str, object]:
-        return {"status": "pending"}
+        now = self.clock()
+        if not self.quote_due(now):
+            return {"status": "skipped"}
+        self._last_quote_attempt = now
+        if self._quote_service is None:
+            published = load_published_quotes(
+                self._quotes_path(), now=datetime.now(SHANGHAI_TZ)
+            )
+            self._quote_service = DashboardQuoteService(
+                self._dashboard_config(),
+                last_success_at=str(published["last_success_at"]),
+                last_quotes={
+                    symbol: dict(quote)
+                    for symbol, quote in dict(published["quotes"]).items()
+                    if isinstance(symbol, str) and isinstance(quote, dict)
+                },
+            )
+        try:
+            payload = self._quote_service.refresh().to_dict()
+        except Exception as exc:
+            payload = self._quote_failure_payload(str(exc))
+        write_json_atomic(self._quotes_path(), payload)
+        return payload
 
     def write_heartbeat(self, *, blocker: str | None = None) -> None:
-        return None
+        write_json_atomic(
+            self.config.data_dir / "account_sync" / "controller_status.json",
+            {
+                "schema_version": "open_trader.account_sync.controller.v1",
+                **self._process_metadata,
+                "heartbeat_at": self.now_text(),
+                "phase": "blocked" if blocker else "idle",
+                "account_loop": dict(self.account_loop),
+                "quote_loop": dict(self.quote_loop),
+                "blocker": blocker,
+            },
+        )
+
+    def _dashboard_config(self) -> DashboardConfig:
+        return DashboardConfig(
+            portfolio_path=self.config.portfolio_path,
+            data_dir=self.config.data_dir,
+            reports_dir=self.config.reports_dir,
+            poll_seconds=self.config.quote_interval_seconds,
+            futu_host=self.config.futu_host,
+            futu_port=self.config.futu_port,
+        )
+
+    def _quotes_path(self) -> Path:
+        return self.config.data_dir / "latest" / "quotes.json"
+
+    def _quote_failure_payload(self, message: str) -> dict[str, object]:
+        service = self._quote_service
+        assert service is not None
+        return {
+            "status": "failed",
+            "requested_count": 0,
+            "quote_count": 0,
+            "missing_count": 0,
+            "fetched_at": self.now_text(),
+            "last_success_at": service.last_success_at,
+            "stale": bool(service.last_quotes),
+            "quotes": {
+                symbol: {**quote, "stale": True}
+                for symbol, quote in service.last_quotes.items()
+            },
+            "diagnostic": {"error_type": "quote_refresh_failed", "message": message},
+            "fallback_count": 0,
+            "us_session_status": "",
+        }
 
     def _candidate_for(
         self, broker: str, attempted_at: str
@@ -188,6 +278,79 @@ class AccountSyncController:
 
 def _now_text() -> str:
     return datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds")
+
+
+def run_account_sync_controller(
+    config: AccountSyncControllerConfig,
+    *,
+    once: bool = False,
+    clock: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int:
+    lock_path = config.data_dir / "account_sync" / "controller.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("已有同步控制器运行", file=sys.stderr)
+            return 1
+        try:
+            controller = AccountSyncController(config, clock=clock)
+            while True:
+                now = clock()
+                if controller.account_due(now):
+                    controller.account_loop = _run_loop(controller.sync_accounts_once)
+                if controller.quote_due(now):
+                    controller.quote_loop = _run_loop(controller.sync_quotes_once)
+                controller.write_heartbeat()
+                if once:
+                    return 0
+                sleep_fn(_next_sleep(controller, clock()))
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _run_loop(operation: Callable[[], dict[str, object]]) -> dict[str, object]:
+    try:
+        return operation()
+    except Exception as exc:
+        return {"status": "failed", "message": str(exc)}
+
+
+def _is_due(last_attempt: float | None, now: float, interval: float) -> bool:
+    return last_attempt is None or now - last_attempt >= interval
+
+
+def _next_sleep(controller: AccountSyncController, now: float) -> float:
+    account_due = _next_due(
+        controller._last_account_attempt,
+        now,
+        controller.config.account_interval_seconds,
+    )
+    quote_due = _next_due(
+        controller._last_quote_attempt,
+        now,
+        controller.config.quote_interval_seconds,
+    )
+    return max(0.0, min(account_due, quote_due) - now)
+
+
+def _next_due(last_attempt: float | None, now: float, interval: float) -> float:
+    return now if last_attempt is None else last_attempt + interval
+
+
+def _git_sha() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=Path.cwd(),
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
 
 
 def _diagnostic_value(value: object) -> object:

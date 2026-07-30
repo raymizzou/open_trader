@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import pytest
 
 from open_trader.dashboard import DashboardConfig
 from open_trader.dashboard_acceptance import validate_quotes_payload
-from open_trader.dashboard_quotes import DashboardQuoteService
+from open_trader.dashboard_quotes import DashboardQuoteService, load_published_quotes
 from open_trader.futu_quote import DashboardQuoteSnapshot, FutuQuoteError
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
@@ -55,6 +57,34 @@ class FakeQuoteClient:
     def close(self) -> None:
         self.closed = True
         self.close_count += 1
+
+
+def test_load_published_quotes_rejects_missing_or_malformed_files_and_derives_staleness(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "quotes.json"
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    assert load_published_quotes(path, now=now)["status"] == "unknown"
+    path.write_text("not json", encoding="utf-8")
+    assert load_published_quotes(path, now=now)["status"] == "unknown"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "last_success_at": (now - timedelta(seconds=16)).isoformat(),
+                "stale": False,
+                "quotes": {"US.MSFT": {"last_price": "500", "stale": False}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = load_published_quotes(path, now=now)
+
+    assert payload["status"] == "ok"
+    assert payload["stale"] is True
+    assert payload["quotes"] == {"US.MSFT": {"last_price": "500", "stale": True}}
 
 
 def write_portfolio(path: Path) -> None:

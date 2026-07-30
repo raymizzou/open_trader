@@ -4,9 +4,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+import json
+from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from .account_sync_state import QUOTE_STALE_SECONDS
 from .dashboard import DashboardConfig
 from .futu_quote import DashboardQuoteSnapshot, FutuQuoteClient, FutuQuoteError
 from .futu_universe import FutuUniverseItem, load_futu_quote_universe
@@ -26,6 +29,62 @@ INACTIVE_US_SESSION_ORDERS = {
     "AFTER_HOURS_END": ("after_hours", "regular", "pre_market", "overnight"),
 }
 CLOSED_US_SESSION_ORDER = ("after_hours", "regular", "pre_market", "overnight")
+
+
+def load_published_quotes(path: Path, *, now: datetime) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _unknown_published_quotes()
+    if not isinstance(payload, dict):
+        return _unknown_published_quotes()
+    status = payload.get("status")
+    last_success_at = payload.get("last_success_at")
+    stale = payload.get("stale")
+    quotes = payload.get("quotes")
+    if (
+        status not in {"ok", "partial", "failed"}
+        or not isinstance(last_success_at, str)
+        or not isinstance(stale, bool)
+        or not isinstance(quotes, dict)
+        or any(
+            not isinstance(symbol, str) or not isinstance(quote, dict)
+            for symbol, quote in quotes.items()
+        )
+    ):
+        return _unknown_published_quotes()
+    last_success = _parse_aware_datetime(last_success_at)
+    if last_success_at and last_success is None:
+        return _unknown_published_quotes()
+    effective_stale = stale or (
+        last_success is not None
+        and (now - last_success).total_seconds() > QUOTE_STALE_SECONDS
+    )
+    return {
+        **payload,
+        "stale": effective_stale,
+        "quotes": {
+            symbol: {**quote, "stale": True} if effective_stale else dict(quote)
+            for symbol, quote in quotes.items()
+        },
+    }
+
+
+def _unknown_published_quotes() -> dict[str, object]:
+    return {
+        "status": "unknown",
+        "last_success_at": "",
+        "stale": False,
+        "quotes": {},
+    }
+
+
+def _parse_aware_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 class DashboardQuoteClient(Protocol):

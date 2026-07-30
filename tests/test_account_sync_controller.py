@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import pytest
@@ -17,8 +19,15 @@ from open_trader.account_sync_state import (
 from open_trader.account_sync_controller import (
     AccountSyncController,
     AccountSyncControllerConfig,
+    run_account_sync_controller,
 )
+from open_trader.dashboard_quotes import DashboardQuoteService
+from open_trader.futu_quote import FutuQuoteError
 from open_trader.models import AssetClass, Market, Position
+
+
+class StopLoop(Exception):
+    pass
 
 
 def test_sync_accounts_publishes_full_tiger_generation_before_state(
@@ -200,6 +209,163 @@ def test_validation_failure_writes_diagnostic_without_replacing_accepted_data(
     assert len(diagnostics) == 1
 
 
+def test_quote_failure_restores_published_quotes_without_mutating_account_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_controller as controller_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest" / "portfolio.csv"
+    _seed_state(data_dir, {"futu": _candidate("futu", 1, "FUTU")})
+    state_path = data_dir / "latest" / "account_sync_state.json"
+    account_before = state_path.read_bytes()
+    _write_quote_portfolio(portfolio_path)
+    previous_success = "2026-07-30T11:59:50+08:00"
+    previous_quotes = {"US.MSFT": {"last_price": "500", "stale": False}}
+    quotes_path = data_dir / "latest" / "quotes.json"
+    write_json_atomic(
+        quotes_path,
+        {
+            "status": "ok",
+            "last_success_at": previous_success,
+            "stale": False,
+            "quotes": previous_quotes,
+        },
+    )
+
+    def unavailable_client() -> object:
+        raise FutuQuoteError("quote unavailable", error_type="quote_failed")
+
+    monkeypatch.setattr(
+        controller_module,
+        "DashboardQuoteService",
+        lambda config, **kwargs: DashboardQuoteService(
+            config, client_factory=unavailable_client, **kwargs
+        ),
+    )
+
+    result = AccountSyncController(_config(data_dir, portfolio_path)).sync_quotes_once()
+    payload = json.loads(quotes_path.read_text(encoding="utf-8"))
+
+    assert result["status"] == "failed"
+    assert payload["status"] == "failed"
+    assert payload["last_success_at"] == previous_success
+    assert payload["quotes"] == {"US.MSFT": {"last_price": "500", "stale": True}}
+    assert account_before == state_path.read_bytes()
+
+
+def test_account_failure_does_not_mutate_published_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_controller as controller_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest" / "portfolio.csv"
+    quotes_path = data_dir / "latest" / "quotes.json"
+    write_json_atomic(
+        quotes_path,
+        {
+            "status": "ok",
+            "last_success_at": "2026-07-30T12:00:00+08:00",
+            "stale": False,
+            "quotes": {},
+        },
+    )
+    before = quotes_path.read_bytes()
+    _configure_sources(monkeypatch, controller_module, futu_error=RuntimeError("down"))
+
+    AccountSyncController(_config(data_dir, portfolio_path)).sync_accounts_once()
+
+    assert quotes_path.read_bytes() == before
+
+
+def test_run_account_sync_controller_runs_account_and_quote_on_their_cadences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    events: list[str] = []
+    account_attempts: list[float] = []
+    quote_attempts: list[float] = []
+    heartbeat_attempts: list[float] = []
+    config = _config(tmp_path / "data", tmp_path / "data/latest/portfolio.csv")
+
+    def sync_accounts(self: AccountSyncController) -> dict[str, object]:
+        events.append("account")
+        account_attempts.append(clock[0])
+        self._last_account_attempt = clock[0]
+        return {"status": "failed"}
+
+    def sync_quotes(self: AccountSyncController) -> dict[str, object]:
+        events.append("quote")
+        quote_attempts.append(clock[0])
+        self._last_quote_attempt = clock[0]
+        return {"status": "failed"}
+
+    def heartbeat(self: AccountSyncController, *, blocker: str | None = None) -> None:
+        events.append("heartbeat")
+        heartbeat_attempts.append(clock[0])
+
+    def advance(seconds: float) -> None:
+        if clock[0] >= 120:
+            raise StopLoop
+        clock[0] += seconds
+
+    monkeypatch.setattr(AccountSyncController, "sync_accounts_once", sync_accounts)
+    monkeypatch.setattr(AccountSyncController, "sync_quotes_once", sync_quotes)
+    monkeypatch.setattr(AccountSyncController, "write_heartbeat", heartbeat)
+
+    with pytest.raises(StopLoop):
+        run_account_sync_controller(config, clock=lambda: clock[0], sleep_fn=advance)
+
+    assert events[:3] == ["account", "quote", "heartbeat"]
+    assert account_attempts == [0.0, 60.0, 120.0]
+    assert quote_attempts == list(range(0, 121, 5))
+    assert heartbeat_attempts == quote_attempts
+
+
+def test_run_account_sync_controller_refuses_a_second_lock_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _config(tmp_path / "data", tmp_path / "data/latest/portfolio.csv")
+    lock_path = config.data_dir / "account_sync" / "controller.lock"
+    lock_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(AccountSyncController, "sync_accounts_once", pytest.fail)
+    monkeypatch.setattr(AccountSyncController, "sync_quotes_once", pytest.fail)
+
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert run_account_sync_controller(config, once=True) != 0
+
+    assert "已有同步控制器运行" in capsys.readouterr().err
+
+
+def test_run_account_sync_controller_writes_independent_loop_results_and_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path / "data", tmp_path / "data/latest/portfolio.csv")
+    monkeypatch.setattr(
+        AccountSyncController, "sync_accounts_once", lambda self: {"status": "failed"}
+    )
+    monkeypatch.setattr(
+        AccountSyncController, "sync_quotes_once", lambda self: {"status": "ok"}
+    )
+
+    assert run_account_sync_controller(config, once=True) == 0
+    status = json.loads(
+        (config.data_dir / "account_sync" / "controller_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert status["schema_version"] == "open_trader.account_sync.controller.v1"
+    assert status["account_loop"] == {"status": "failed"}
+    assert status["quote_loop"] == {"status": "ok"}
+    assert status["heartbeat_at"] >= status["started_at"]
+    assert status["pid"] > 0
+    assert status["working_directory"]
+    assert status["git_sha"]
+
+
 def _config(data_dir: Path, portfolio_path: Path) -> AccountSyncControllerConfig:
     return AccountSyncControllerConfig(
         data_dir=data_dir,
@@ -210,6 +376,48 @@ def _config(data_dir: Path, portfolio_path: Path) -> AccountSyncControllerConfig
         tiger_config_dir=data_dir / "tiger",
         tiger_account=None,
     )
+
+
+def _write_quote_portfolio(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "sort_group",
+        "market",
+        "asset_class",
+        "symbol",
+        "name",
+        "currency",
+        "total_quantity",
+        "avg_cost_price",
+        "last_price",
+        "market_value",
+        "cost_value",
+        "unrealized_pnl",
+        "unrealized_pnl_pct",
+        "fx_source",
+        "fx_date",
+        "fx_to_hkd",
+        "market_value_hkd",
+        "cost_value_hkd",
+        "portfolio_weight_hkd",
+        "brokers",
+        "accounts",
+        "ai_eligible",
+        "analysis_symbol", "risk_flag", "confidence", "notes",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "market": "US",
+                "asset_class": "stock",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "currency": "USD",
+                "total_quantity": "1",
+            }
+        )
 
 
 def _configure_sources(
