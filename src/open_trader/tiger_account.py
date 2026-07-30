@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Iterable
 
+from .account_sync_state import BrokerAccountCandidate
 from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .portfolio import (
@@ -1340,6 +1341,117 @@ def _unmapped_total_asset_positions(
             )
         )
     return adjustments
+
+
+def build_tiger_account_candidate(
+    snapshot: TigerAccountSnapshot,
+    *,
+    run_date: str,
+    data_as_of: str,
+) -> BrokerAccountCandidate:
+    if not snapshot.accounts:
+        raise TigerAccountError(
+            "no active Tiger accounts matched snapshot",
+            error_type="no_matching_accounts",
+        )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date=run_date,
+    )
+    if blocking_errors:
+        raise TigerAccountError(
+            "; ".join(blocking_errors),
+            error_type="blocking_data_error",
+        )
+    if any(
+        _text(record, "record_type") == "account_total"
+        and (account_total := _get_attr(record, "account_total", None)) not in (None, "")
+        and _optional_decimal(record, ("account_total",)) is None
+        for record in snapshot.cash_records
+    ):
+        raise TigerAccountError(
+            "Tiger account_total is invalid",
+            error_type="blocking_data_error",
+        )
+
+    fx_to_hkd = _snapshot_fx_to_hkd(snapshot)
+    required_fx = {
+        (item.account_alias, item.currency.upper())
+        for item in [*positions, *cash_balances]
+    }
+    required_fx.update(
+        (
+            _text(record, "account_alias", "tiger_unknown"),
+            _text(record, "currency", "USD").upper() or "USD",
+        )
+        for record in snapshot.cash_records
+        if _text(record, "record_type") == "account_total"
+        and _optional_decimal(record, ("account_total",)) is not None
+    )
+    missing_fx = required_fx - fx_to_hkd.keys()
+    if missing_fx:
+        account_alias, currency = sorted(missing_fx)[0]
+        raise TigerAccountError(
+            f"missing live FX rate for {account_alias} {currency}",
+            error_type="fx_rate_missing",
+        )
+
+    positions = [
+        *positions,
+        *_unmapped_total_asset_positions(
+            snapshot=snapshot,
+            positions=positions,
+            cash_balances=cash_balances,
+            fx_to_hkd=fx_to_hkd,
+            run_date=run_date,
+        ),
+    ]
+    position_keys = {
+        (
+            item.broker,
+            item.account_alias,
+            item.market,
+            item.asset_class,
+            item.symbol.upper(),
+            item.currency.upper(),
+        )
+        for item in positions
+    }
+    cash_keys = {
+        (item.broker, item.account_alias, item.currency.upper())
+        for item in cash_balances
+    }
+    if len(position_keys) != len(positions) or len(cash_keys) != len(cash_balances):
+        raise TigerAccountError(
+            "duplicate broker snapshot identity",
+            error_type="duplicate_identity",
+        )
+
+    return BrokerAccountCandidate(
+        broker="tiger",
+        source_kind="live",
+        data_as_of=data_as_of,
+        period=run_date[:7],
+        positions=tuple(positions),
+        cash=tuple(cash_balances),
+        fx_rates=tuple(
+            {
+                "account_alias": account_alias,
+                "currency": currency,
+                "rate_to_hkd": format(rate, "f"),
+            }
+            for (account_alias, currency), rate in sorted(fx_to_hkd.items())
+        ),
+        summary={
+            "account_count": len(snapshot.accounts),
+            "position_count": len(positions),
+            "cash_count": len(cash_balances),
+            "account_aliases": sorted(
+                {item.account_alias for item in [*positions, *cash_balances]}
+            ),
+        },
+    )
 
 
 def _required_decimal(

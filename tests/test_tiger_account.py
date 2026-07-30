@@ -17,6 +17,7 @@ from open_trader.tiger_account import (
     TigerAccountClient,
     TigerAccountSnapshot,
     TigerPortfolioSyncResult,
+    build_tiger_account_candidate,
     sync_tiger_portfolio,
     map_snapshot_to_portfolio_inputs,
     load_tiger_account_config,
@@ -1526,6 +1527,146 @@ def tiger_snapshot_from_records(
         cash_records=cash_records,
         position_records=position_records,
     )
+
+
+def test_build_tiger_account_candidate_normalizes_reconciliation_and_live_fx() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "100",
+                "available_balance": "80",
+                "fx_to_hkd": "7.84",
+            },
+            {
+                "record_type": "account_total",
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "account_total": "1200",
+                "fx_to_hkd": "7.84",
+            },
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "name": "Microsoft",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "2",
+                "average_cost": "300",
+                "market_price": "410",
+                "market_value": "820",
+            }
+        ],
+    )
+
+    candidate = build_tiger_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+    )
+
+    assert [position.symbol for position in candidate.positions] == [
+        "MSFT",
+        "TIGER_UNMAPPED_ASSETS",
+    ]
+    assert candidate.summary == {
+        "account_count": 1,
+        "position_count": 2,
+        "cash_count": 1,
+        "account_aliases": ["tiger_6789"],
+    }
+    assert candidate.fx_rates == (
+        {"account_alias": "tiger_6789", "currency": "USD", "rate_to_hkd": "7.84"},
+    )
+    assert all("account" not in item for item in candidate.fx_rates)
+    assert "123456789" not in repr(candidate)
+
+
+def test_build_tiger_account_candidate_complete_zero_positions_is_valid() -> None:
+    candidate = build_tiger_account_candidate(
+        tiger_snapshot_from_records(cash_records=[], position_records=[]),
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+    )
+
+    assert candidate.positions == ()
+    assert candidate.summary["position_count"] == 0
+
+
+def test_build_tiger_account_candidate_rejects_malformed_or_duplicate_identity() -> None:
+    malformed = tiger_snapshot_from_records(
+        cash_records=[],
+        position_records=[{"account_alias": "tiger_6789", "symbol": "MSFT"}],
+    )
+    duplicate = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "cash_balance": "0",
+                "available_balance": "0",
+                "fx_to_hkd": "7.84",
+            }
+        ],
+        position_records=[
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "market_value": "11",
+            },
+            {
+                "account_alias": "tiger_6789",
+                "symbol": "MSFT",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "market_value": "11",
+            },
+        ],
+    )
+
+    for snapshot, error_type in ((malformed, "blocking_data_error"), (duplicate, "duplicate_identity")):
+        with pytest.raises(TigerAccountError) as exc_info:
+            build_tiger_account_candidate(
+                snapshot,
+                run_date="2026-07-30",
+                data_as_of="2026-07-30T11:56:54+08:00",
+            )
+
+        assert exc_info.value.error_type == error_type
+
+
+def test_build_tiger_account_candidate_rejects_malformed_account_total() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "record_type": "account_total",
+                "account_alias": "tiger_6789",
+                "currency": "USD",
+                "account_total": "bad",
+                "fx_to_hkd": "7.84",
+            }
+        ],
+        position_records=[],
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        build_tiger_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+        )
+
+    assert exc_info.value.error_type == "blocking_data_error"
 
 
 def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:

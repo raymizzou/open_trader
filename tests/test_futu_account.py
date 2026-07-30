@@ -11,6 +11,7 @@ from open_trader import futu_account as futu_account_module
 from open_trader.futu_account import (
     FutuAccountClient,
     FutuAccountError,
+    build_futu_account_candidate,
     map_snapshot_to_portfolio_inputs,
     sync_futu_portfolio,
 )
@@ -617,6 +618,146 @@ def client_snapshot_from_records(
         cash_records=cash_records,
         position_records=position_records,
     )
+
+
+def test_build_futu_account_candidate_normalizes_complete_snapshot() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "USD",
+                "cash": "100.25",
+                "available_cash": "88.50",
+            }
+        ],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": f"US.TEST{index}",
+                "stock_name": f"Test {index}",
+                "stock_type": "STOCK",
+                "currency": "USD",
+                "qty": "1",
+                "cost_price": "10",
+                "nominal_price": "11",
+                "market_val": "11",
+            }
+            for index in range(14)
+        ],
+    )
+
+    candidate = build_futu_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+        fallback_fx_to_hkd={"USD": Decimal("7.8123")},
+    )
+
+    assert len(candidate.positions) == 14
+    assert candidate.summary == {
+        "account_count": 1,
+        "position_count": 14,
+        "cash_count": 1,
+        "account_aliases": ["futu_111"],
+    }
+    assert candidate.data_as_of == "2026-07-30T11:56:54+08:00"
+    assert candidate.positions[0].asset_class is AssetClass.STOCK
+    assert candidate.cash[0].currency == "USD"
+    assert candidate.fx_rates == (
+        {"account_alias": "futu_111", "currency": "USD", "rate_to_hkd": "7.8123"},
+    )
+
+
+def test_build_futu_account_candidate_complete_zero_positions_is_valid() -> None:
+    candidate = build_futu_account_candidate(
+        client_snapshot_from_records(cash_records=[], position_records=[]),
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+        fallback_fx_to_hkd={},
+    )
+
+    assert candidate.positions == ()
+    assert candidate.summary["position_count"] == 0
+
+
+def test_build_futu_account_candidate_rejects_missing_real_account() -> None:
+    snapshot = client_snapshot_from_records(cash_records=[], position_records=[])
+    snapshot = snapshot.__class__(
+        accounts=[],
+        cash_records=snapshot.cash_records,
+        position_records=snapshot.position_records,
+    )
+
+    with pytest.raises(FutuAccountError) as exc_info:
+        build_futu_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+            fallback_fx_to_hkd={},
+        )
+
+    assert exc_info.value.error_type == "no_real_accounts"
+
+
+def test_build_futu_account_candidate_rejects_malformed_or_duplicate_identity() -> None:
+    malformed = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[{"_account_alias": "futu_111", "code": "US.MSFT"}],
+    )
+    duplicate = client_snapshot_from_records(
+        cash_records=[],
+        position_records=[
+            {
+                "_account_alias": "futu_111",
+                "code": "US.MSFT",
+                "qty": "1",
+                "market_val": "11",
+                "cost_price": "10",
+            },
+            {
+                "_account_alias": "futu_111",
+                "code": "US.MSFT",
+                "qty": "1",
+                "market_val": "11",
+                "cost_price": "10",
+            },
+        ],
+    )
+
+    for snapshot, error_type in ((malformed, "blocking_data_error"), (duplicate, "duplicate_identity")):
+        with pytest.raises(FutuAccountError) as exc_info:
+            build_futu_account_candidate(
+                snapshot,
+                run_date="2026-07-30",
+                data_as_of="2026-07-30T11:56:54+08:00",
+                fallback_fx_to_hkd={"USD": Decimal("7.8123")},
+            )
+
+        assert exc_info.value.error_type == error_type
+
+
+def test_build_futu_account_candidate_rejects_malformed_total_assets() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "futu_111",
+                "currency": "HKD",
+                "cash": "0",
+                "total_assets": "bad",
+            }
+        ],
+        position_records=[],
+    )
+
+    with pytest.raises(FutuAccountError) as exc_info:
+        build_futu_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+            fallback_fx_to_hkd={},
+        )
+
+    assert exc_info.value.error_type == "blocking_data_error"
 
 
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:

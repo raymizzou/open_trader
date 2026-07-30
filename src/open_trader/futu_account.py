@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
+from .account_sync_state import BrokerAccountCandidate
 from .csv_io import write_rows
 from .fx import DEFAULT_RATES_TO_HKD, StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
@@ -480,6 +481,113 @@ def _unmapped_total_asset_positions(
             )
         )
     return adjustments
+
+
+def build_futu_account_candidate(
+    snapshot: FutuAccountSnapshot,
+    *,
+    run_date: str,
+    data_as_of: str,
+    fallback_fx_to_hkd: Mapping[str, Decimal],
+) -> BrokerAccountCandidate:
+    if not snapshot.accounts or any(
+        not _is_real_security_account(account) for account in snapshot.accounts
+    ):
+        raise FutuAccountError(
+            "no REAL Futu securities accounts found",
+            error_type="no_real_accounts",
+        )
+
+    positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
+        snapshot,
+        run_date=run_date,
+    )
+    if blocking_errors:
+        raise FutuAccountError(
+            "; ".join(blocking_errors),
+            error_type="blocking_data_error",
+        )
+    if any(
+        (total_assets := _first_raw_value(record, ("total_assets",))) not in (None, "")
+        and _optional_decimal(record, ("total_assets",)) is None
+        for record in snapshot.cash_records
+    ):
+        raise FutuAccountError(
+            "Futu account total_assets is invalid",
+            error_type="blocking_data_error",
+        )
+
+    fx_provider = StaticMonthEndFxProvider(
+        run_date[:7], {**DEFAULT_RATES_TO_HKD, **fallback_fx_to_hkd}
+    )
+    try:
+        positions = [
+            *positions,
+            *_unmapped_total_asset_positions(
+                snapshot=snapshot,
+                positions=positions,
+                cash_balances=cash_balances,
+                fx_provider=fx_provider,
+                run_date=run_date,
+            ),
+        ]
+        fx_rates = tuple(
+            {
+                "account_alias": account_alias,
+                "currency": currency,
+                "rate_to_hkd": format(
+                    fx_provider.get_rate_to_hkd(currency).rate,
+                    "f",
+                ),
+            }
+            for account_alias, currency in sorted(
+                {
+                    (item.account_alias, item.currency.upper())
+                    for item in [*positions, *cash_balances]
+                }
+            )
+        )
+    except KeyError as exc:
+        raise FutuAccountError(str(exc), error_type="fx_rate_missing") from exc
+
+    position_keys = {
+        (
+            item.broker,
+            item.account_alias,
+            item.market,
+            item.asset_class,
+            item.symbol.upper(),
+            item.currency.upper(),
+        )
+        for item in positions
+    }
+    cash_keys = {
+        (item.broker, item.account_alias, item.currency.upper())
+        for item in cash_balances
+    }
+    if len(position_keys) != len(positions) or len(cash_keys) != len(cash_balances):
+        raise FutuAccountError(
+            "duplicate broker snapshot identity",
+            error_type="duplicate_identity",
+        )
+
+    return BrokerAccountCandidate(
+        broker="futu",
+        source_kind="live",
+        data_as_of=data_as_of,
+        period=run_date[:7],
+        positions=tuple(positions),
+        cash=tuple(cash_balances),
+        fx_rates=fx_rates,
+        summary={
+            "account_count": len(snapshot.accounts),
+            "position_count": len(positions),
+            "cash_count": len(cash_balances),
+            "account_aliases": sorted(
+                {item.account_alias for item in [*positions, *cash_balances]}
+            ),
+        },
+    )
 
 
 def _required_decimal(
