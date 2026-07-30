@@ -383,7 +383,7 @@ def test_t_signal_runner_blocks_mixed_broker_row_when_one_named_broker_is_unsafe
     now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest/portfolio.csv"
-    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="tiger; futu")
+    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="tiger,futu")
     write_account_sync_inputs(data_dir, now=now, futu_status="failed")
     client = FakeMarketDataClient()
 
@@ -403,6 +403,34 @@ def test_t_signal_runner_blocks_mixed_broker_row_when_one_named_broker_is_unsafe
 
     assert result.blocked_count == 1
     assert client.calls == []
+
+
+def test_t_signal_runner_accepts_comma_separated_healthy_mixed_broker_row(
+    tmp_path: Path,
+) -> None:
+    now = datetime.fromisoformat("2026-07-30T12:00:00+08:00")
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    write_portfolio_row(portfolio_path, symbol="VIXY", brokers="tiger,futu")
+    write_account_sync_inputs(data_dir, now=now)
+    client = FakeMarketDataClient()
+
+    result = run_t_signal_watch_once(
+        portfolio_path=portfolio_path,
+        account_state_path=data_dir / "latest/account_sync_state.json",
+        controller_status_path=data_dir / "account_sync/controller_status.json",
+        data_dir=data_dir,
+        run_date="2026-07-30",
+        market="US",
+        session_phase="regular",
+        market_data_client=client,
+        interpreter=RecordingInterpreter(),
+        notifier=NullNotifier(),
+        now_fn=lambda: now,
+    )
+
+    assert result.blocked_count == 0
+    assert [call["symbol"] for call in client.calls] == ["VIXY"]
 
 
 def test_t_signal_runner_keeps_previous_facts_visible_when_a_broker_becomes_unsafe(

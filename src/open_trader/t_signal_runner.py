@@ -205,7 +205,13 @@ def _load_t_signal_portfolio_rows(
 
 
 def _canonical_brokers(value: str | None) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(part.strip().lower() for part in (value or "").split(";") if part.strip()))
+    return tuple(
+        dict.fromkeys(
+            part.strip().lower()
+            for part in (value or "").replace(",", ";").split(";")
+            if part.strip()
+        )
+    )
 
 
 def _source_statuses(account_state_path: Path, now: datetime) -> dict[str, tuple[str, str]]:
