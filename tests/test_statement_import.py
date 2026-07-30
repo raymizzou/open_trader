@@ -652,6 +652,18 @@ def test_stats_write_failure_keeps_accepted_source_and_previous_stats(
     archive = data_dir / "statements/phillips/2026-07-12/statement.pdf"
     stats_path = data_dir / "latest/trend_api_stats.json"
     before_stats = stats_path.read_bytes()
+    original_parse = parser.parse
+
+    def parse_corrected(path: Path, period: str) -> ParseResult:
+        parsed = original_parse(path, period)
+        return replace(
+            parsed,
+            positions=[
+                replace(parsed.positions[0], quantity=Decimal("2")),
+            ],
+        )
+
+    monkeypatch.setattr(parser, "parse", parse_corrected)
     parser.sell_price = Decimal("9")
     monkeypatch.setattr(
         statement_import,
@@ -668,6 +680,15 @@ def test_stats_write_failure_keeps_accepted_source_and_previous_stats(
     assert archive.read_bytes() == b"%PDF-1.7\ncorrected"
     assert Path(result["run_path"]).is_dir()
     assert stats_path.read_bytes() == before_stats
+    rows = list(
+        csv.DictReader(
+            (Path(result["run_path"]) / "extracted_positions.csv").open(
+                encoding="utf-8"
+            )
+        )
+    )
+    phillips = next(row for row in rows if row["broker"] == "phillips")
+    assert phillips["quantity"] == "2"
 
 
 def test_eastmoney_statistics_clock_failure_keeps_same_period_statement(

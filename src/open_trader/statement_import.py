@@ -86,13 +86,9 @@ class StatementImportService:
                 raise
             if backup is not None:
                 backup.unlink(missing_ok=True)
-            statistics_cutoff_at = _statement_cutoff(statement_date, broker)
-            stats_snapshot = _snapshot_path(
-                self.data_dir / "latest" / "trend_api_stats.json",
-                Path(name) / "rollback",
-                "stats",
-            )
+            statistics_cutoff_at: str | None = None
             try:
+                statistics_cutoff_at = _statement_cutoff(statement_date, broker)
                 generated_at = datetime.now().astimezone().isoformat(
                     timespec="seconds"
                 )
@@ -110,7 +106,6 @@ class StatementImportService:
                 )
                 write_trend_api_stats(self.data_dir, stats)
             except Exception:
-                _restore_snapshot(stats_snapshot)
                 stats = None
         result = {
             "status": "ok",
@@ -130,9 +125,7 @@ class StatementImportService:
                 if stats is not None
                 else None
             ),
-            "statistics_cutoff_at": (
-                statistics_cutoff_at if stats is not None else None
-            ),
+            "statistics_cutoff_at": statistics_cutoff_at if stats is not None else None,
             "run_path": str(imported.run_dir),
         }
         if parsed.fills:

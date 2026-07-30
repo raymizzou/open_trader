@@ -24,7 +24,7 @@
 2. 与该券商当前已接受结单期间比较，只拒绝更旧期间。
 3. 原子归档 PDF 并生成该期间的导入 run；这一步成功后，结单即为已接受来源。
 4. 基于已接受来源重建 `trend_api_stats.json`。
-5. 统计成功时返回 `statistics_status="updated"`；失败时恢复旧统计文件并返回 `statistics_status="failed"`，但保留新结单及导入 run。
+5. 统计成功时返回 `statistics_status="updated"`；失败时由现有原子统计写入保留旧统计文件并返回 `statistics_status="failed"`，但保留新结单及导入 run。
 
 Dashboard 对统计失败显示简短的“统计待重建”，不把结单上传显示为失败。
 
@@ -37,7 +37,7 @@ Dashboard 对统计失败显示简短的“统计待重建”，不把结单上�
 ## 错误与回滚
 
 - 解析、期间比较、归档或导入 run 失败：回滚本次来源变更并返回上传失败。
-- 统计重建失败：保留新来源，恢复旧统计文件，返回上传成功及 `statistics_status="failed"`。
+- 统计重建失败：保留新来源和旧统计文件，返回上传成功及 `statistics_status="failed"`。
 - 不新增队列、后台任务、数据库或依赖。
 
 ## 测试

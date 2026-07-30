@@ -4,7 +4,7 @@
 
 **Goal:** Make an accepted Eastmoney or Phillips PDF statement authoritative based only on broker statement-period freshness, while reporting downstream statistics rebuild failure without rolling back the statement.
 
-**Architecture:** `StatementImportService.import_pdf` keeps one source transaction for archive plus imported run, then performs the derived statistics rebuild in a separate best-effort transaction that can restore only the old statistics file. The Phillips parser narrows incomplete-execution warnings to rows that explicitly contain `Bought` or `Sold`, and the Dashboard reports a successful import with `统计待重建` when the derived rebuild fails.
+**Architecture:** `StatementImportService.import_pdf` keeps one source transaction for archive plus imported run, then performs the derived statistics rebuild through the existing atomic statistics writer in a separate best-effort boundary. The Phillips parser narrows incomplete-execution warnings to rows that explicitly contain `Bought` or `Sold`, and the Dashboard reports a successful import with `统计待重建` when the derived rebuild fails.
 
 **Tech Stack:** Python 3.12, pytest, pdfplumber, stdlib filesystem snapshots, browser JavaScript exercised through the existing Node test harness.
 
@@ -13,7 +13,7 @@
 - Uploaded PDF statements are the source of truth after parse and statement-period freshness validation.
 - Reject only a statement period older than the broker's current accepted period; allow same-period replacement.
 - Do not use server current time, `generated_at`, or `statistics_cutoff_at` to accept or reject a statement.
-- A statistics build or write failure must keep the new statement archive and imported run, restore the previous statistics file, and return `statistics_status="failed"`.
+- A statistics build or atomic-write failure must keep the new statement archive and imported run, retain the previous statistics file, and return `statistics_status="failed"`.
 - Only an unparseable `Bought` or `Sold` row may create a Phillips `invalid_execution_row` warning; Payment, Deposit, balances, headings, and wrapped non-trade text do not reduce fill completeness.
 - Do not add a queue, background job, database, dependency, or global relaxation of the trend statistics time invariant.
 
@@ -132,8 +132,8 @@ In `import_pdf`:
 1. Snapshot the broker period run, promote the archive, and call `run_uploaded_statement`.
 2. On source failure, restore only that archive and run snapshot, then re-raise.
 3. After source success, delete the archive backup.
-4. Snapshot `latest/trend_api_stats.json`, then build and write statistics inside a separate `try`.
-5. On statistics failure, restore only the statistics snapshot and set `stats=None`.
+4. Build and atomically write statistics inside a separate `try`.
+5. On statistics failure, rely on the existing atomic writer to retain the previous file and set `stats=None`.
 6. Return `statistics_status="updated"` with the new counts/cutoff when `stats` exists; otherwise return `statistics_status="failed"`, `actual_rounds=None`, and `statistics_cutoff_at=None`.
 
 Do not change `_statement_cutoff` or the validation inside `build_statement_actual_stats_payload`.

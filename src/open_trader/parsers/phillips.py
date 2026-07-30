@@ -31,6 +31,7 @@ from open_trader.parsers.base import (
 BROKER = "phillips"
 ACCOUNT_ALIAS = "phillips_main"
 NUMERIC = r"(?:-?[\d,.]+|\([\d,.]+\))"
+TRADE_SIDE = r"(?:Bought|Sold)"
 ISSUE_DATE = re.compile(
     r"(?:日期\s*)?Issue Date\s*[:：]\s*(\d{2})/(\d{2})/(\d{2})",
     re.IGNORECASE,
@@ -39,7 +40,7 @@ TRANSACTION_LINE = re.compile(
     rf"(?P<trade_date>\d{{2}}/\d{{2}}/\d{{2}})\s+"
     rf"(?P<settlement_date>\d{{2}}/\d{{2}}/\d{{2}})\s+"
     r"Equity\s+(?P<reference>[A-Z0-9@#*.-]+)\s+"
-    r"(?P<side>Bought|Sold)\s+"
+    rf"(?P<side>{TRADE_SIDE})\s+"
     r"(?P<description>.+?)\s+"
     rf"(?P<quantity>{NUMERIC})\s+"
     rf"(?P<price>{NUMERIC})\s+"
@@ -119,7 +120,7 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         if in_transactions:
             if _is_ignored_transaction_line(line):
                 continue
-            if re.search(r"\b(?:Bought|Sold)\b", line, re.IGNORECASE) is None:
+            if re.search(rf"\b{TRADE_SIDE}\b", line, re.IGNORECASE) is None:
                 continue
             occurrence = occurrences.get(line, 0)
             occurrences[line] = occurrence + 1
@@ -203,7 +204,7 @@ def _parse_transaction_lines(
         r"(?P<trade_date>\d{2}/\d{2}/\d{2})\s+"
         r"(?P<settlement_date>\d{2}/\d{2}/\d{2})\s+"
         r"Equity\s+(?P<reference>\d+)\s+"
-        r"(?P<side>Bought|Sold)\s+.+?\s+"
+        rf"(?P<side>{TRADE_SIDE})\s+.+?\s+"
         rf"(?P<quantity>{NUMERIC})\s+"
         rf"(?P<price>{NUMERIC})\s+"
         rf"(?P<gross>{NUMERIC})\s+"
