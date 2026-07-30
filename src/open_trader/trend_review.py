@@ -477,6 +477,7 @@ def freeze_report_evidence(
     option_attention_broker_label: str | None,
     kelly_rounds: object = (),
     kelly_data_reason: str = "",
+    real_holdings_input: object | None = None,
 ) -> dict[str, str]:
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
@@ -534,6 +535,11 @@ def freeze_report_evidence(
             ),
             "kelly_rounds": kelly_rounds,
             "kelly_data_reason": kelly_data_reason,
+            **(
+                {"real_holdings": real_holdings_input}
+                if real_holdings_input is not None
+                else {}
+            ),
         },
     }
     return freeze_trend_evidence(data_dir, evidence)
@@ -5535,6 +5541,7 @@ def rebuild_trend_report_from_evidence(
         AccountSnapshot,
         CandidateInput,
         HoldingSnapshot,
+        RealHoldingInput,
         _finalize_market_report,
         _report_payload,
         build_report,
@@ -5730,6 +5737,103 @@ def rebuild_trend_report_from_evidence(
         for symbol, rows in bars_raw.items()
         if rows is None or isinstance(rows, list)
     }
+    real_holdings_input = None
+    real_raw = inputs.get("real_holdings")
+    if real_raw is not None:
+        if not isinstance(real_raw, Mapping):
+            raise TrendReplayIncompleteError(
+                "invalid original input: real_holdings"
+            )
+        real_status = real_raw.get("status")
+        real_reason = real_raw.get("reason", "")
+        real_source = real_raw.get("source", {})
+        if (
+            real_status not in {"available", "unavailable"}
+            or not isinstance(real_reason, str)
+            or not isinstance(real_source, Mapping)
+            or not all(isinstance(key, str) and isinstance(value, str)
+                       for key, value in real_source.items())
+        ):
+            raise TrendReplayIncompleteError(
+                "invalid original input: real_holdings"
+            )
+        real_positions: list[AccountPosition] = []
+        real_snapshots: dict[str, HoldingSnapshot | None] = {}
+        real_bars: dict[str, tuple[DailyKlineBar, ...] | None] = {}
+        real_prior_state = real_raw.get("prior_state")
+        if real_status == "available":
+            raw_positions = real_raw.get("positions")
+            raw_snapshots = real_raw.get("holding_snapshots")
+            raw_bars = real_raw.get("bars_by_symbol")
+            if (
+                not isinstance(raw_positions, list)
+                or not isinstance(raw_snapshots, Mapping)
+                or not isinstance(raw_bars, Mapping)
+            ):
+                raise TrendReplayIncompleteError(
+                    "invalid original input: real_holdings"
+                )
+            try:
+                for raw_position in raw_positions:
+                    if not isinstance(raw_position, Mapping):
+                        raise ValueError
+                    real_positions.append(
+                        AccountPosition(
+                            symbol=str(raw_position["symbol"]),
+                            name=str(raw_position["name"]),
+                            asset_class=str(raw_position["asset_class"]),
+                            quantity=Decimal(str(raw_position["quantity"])),
+                            avg_cost_price=decimal_or_none(
+                                raw_position.get("avg_cost_price")
+                            ),
+                            market_value=Decimal(
+                                str(raw_position.get("market_value", "0"))
+                            ),
+                        )
+                    )
+                for symbol, raw_snapshot in raw_snapshots.items():
+                    if raw_snapshot is None:
+                        real_snapshots[str(symbol)] = None
+                        continue
+                    if not isinstance(raw_snapshot, Mapping):
+                        raise ValueError
+                    snapshot_values = dict(raw_snapshot)
+                    for field in ("filter_price", "market_cap", "strength"):
+                        snapshot_values[field] = decimal_or_none(
+                            snapshot_values.get(field)
+                        )
+                    real_snapshots[str(symbol)] = HoldingSnapshot(
+                        **snapshot_values
+                    )
+                for symbol, raw_rows in raw_bars.items():
+                    real_bars[str(symbol)] = (
+                        None
+                        if raw_rows is None
+                        else tuple(
+                            DailyKlineBar(**dict(row)) for row in raw_rows
+                        )
+                    )
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                raise TrendReplayIncompleteError(
+                    "invalid original input: real_holdings"
+                ) from None
+            if real_prior_state is not None and not isinstance(
+                real_prior_state, Mapping
+            ):
+                raise TrendReplayIncompleteError(
+                    "invalid original input: real_holdings.prior_state"
+                )
+        else:
+            real_prior_state = None
+        real_holdings_input = RealHoldingInput(
+            status=str(real_status),
+            reason=real_reason,
+            source={str(key): str(value) for key, value in real_source.items()},
+            positions=tuple(real_positions),
+            holding_snapshots=real_snapshots,
+            bars_by_symbol=real_bars,
+            prior_state=real_prior_state,
+        )
     process_version = str(evidence.get("process_version") or "")
     normalize_trend_strategy_snapshot(snapshot, str(inputs["market"]))
     replay_snapshot = {
@@ -5836,6 +5940,7 @@ def rebuild_trend_report_from_evidence(
             dict(status_raw) if isinstance(status_raw, Mapping) else None
         ),
         estimated_api_cost_complete=estimated_api_cost_complete,
+        real_holdings=real_holdings_input,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:
