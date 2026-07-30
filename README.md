@@ -14,10 +14,8 @@ Futu simulated orders from one explicitly designated executor host.
 ## Features
 
 - Import monthly broker statements into a normalized portfolio CSV.
-- Pull live Futu real-account holdings and cash into the standard portfolio CSV
-  while keeping other brokers on statement imports.
-- Pull live Tiger OpenAPI holdings and cash into the standard portfolio CSV
-  while preserving non-Tiger rows.
+- Publish accepted Futu/Tiger account snapshots and quotes through one
+  account-sync controller.
 - Generate per-symbol premarket advice with TradingAgents and DeepSeek.
 - Preserve raw model output and normalized trader templates for auditability.
 - Extract K-line technical facts from TradingAgents advice/report output into
@@ -31,8 +29,8 @@ Futu simulated orders from one explicitly designated executor host.
 - Run one self-reconciling Trend Animals controller per market on a named host,
   with broker reconciliation before every simulated order.
 - Show Futu as a read-only US/HK options-attention aggregate in the dashboard.
-- View a local realtime portfolio dashboard with live quote refresh and stale
-  data warnings.
+- View a local portfolio dashboard backed only by published files, with truthful
+  fresh, failed, stale, and unverified status.
 - Run the daily premarket workflow automatically on macOS with `launchd`.
 - Monitor Polymarket binary-market arbitrage locally, with one explicit confirmation, two FOK legs, and merge handling.
 
@@ -190,6 +188,39 @@ private key environment value.
 
 ## Common Workflows
 
+### Account and Quote Sync Controller
+
+Account reads, quote reads, and publication have one owner. The production chain
+is:
+
+```text
+Futu account / Futu quotes / Tiger account
+                   |
+                   v
+      account-sync-controller (single PID)
+                   |
+                   v
+ account_sync_state.json / portfolio.csv / quotes.json
+                   |
+                   v
+             Dashboard reads
+```
+
+Install or refresh the sole launchd controller and inspect the files it
+publishes:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m open_trader account-sync-status --data-dir data
+scripts/install_account_sync_launchd.sh --repo-root "$PWD"
+```
+
+The Dashboard has no account or quote write path and no manual refresh action.
+It only projects `data/latest/account_sync_state.json`,
+`data/latest/portfolio.csv`, `data/latest/quotes.json`, and
+`data/account_sync/controller_status.json`. A source failure keeps its last
+accepted rows visible while marking the source failed or stale; affected
+account-dependent actions remain paused until a later successful cycle.
+
 ### Import Monthly Statements
 
 ```bash
@@ -199,14 +230,15 @@ private key environment value.
   --usd-hkd 7.85
 ```
 
-Main output:
+Main candidate output:
 
 ```text
-data/latest/portfolio.csv
+data/runs/<YYYY-MM>/portfolio.csv
 ```
 
-Futu and Tiger current holdings are refreshed through live account sync
-commands, not monthly statement import.
+Statement imports create dated candidate artifacts. The sole account-sync
+controller is the only process that publishes the accepted aggregate
+`data/latest/portfolio.csv` consumed by the Dashboard.
 
 ### Run Premarket Advice Manually
 
@@ -320,38 +352,6 @@ After login, rerun `get_global_state()` and confirm `qot_logined=True`, then
 rerun `check-futu-plan`. A healthy check prints `last_price=...` for active
 plan symbols.
 
-### Sync Tiger OpenAPI Portfolio
-
-Tiger live account sync is read-only and does not place orders. Real holdings
-and cash come directly from Tiger OpenAPI, not from `portfolio.csv`.
-`data/latest/portfolio.csv` is only the default merge baseline: when present it
-preserves non-Tiger rows and replaces Tiger-only rows; when missing the sync
-still writes a dated broker-only portfolio from live Tiger data. Monthly
-`import-statements` handles brokers that still rely on statements; Tiger sync is
-the current-account refresh path.
-
-```bash
-.venv/bin/python -m open_trader check-tiger-account
-
-.venv/bin/python -m open_trader sync-tiger-portfolio \
-  --date 2026-06-19
-```
-
-The sync command above is the no-latest review run by default. Review
-`data/runs/2026-06-19/tiger_account_snapshot.json`,
-`data/runs/2026-06-19/portfolio.csv`, and
-`reports/tiger_account/2026-06-19.md`. Then promote after review:
-
-```bash
-.venv/bin/python -m open_trader sync-tiger-portfolio \
-  --date 2026-06-19 \
-  --update-latest
-```
-
-Rows that mix Tiger with another broker stop for manual review instead of
-being split automatically. Malformed Tiger data writes dated artifacts and a
-report, then blocks latest promotion.
-
 ### Generate Trade Actions
 
 ```bash
@@ -443,9 +443,9 @@ The watcher writes `data/runs/<YYYY-MM-DD>/<market>/t_signals.json` and promotes
 ratio, evidence, current status, and notification timeline. Alerts are
 deduplicated by signal cycle, and the workflow remains read-only.
 
-When Futu OpenD quotes are available, the dashboard refreshes prices from OpenD.
-If a quote refresh fails, it keeps the last successful quote snapshot and shows
-a failure or stale warning instead of hiding the problem.
+The account-sync controller refreshes the published quote snapshot. If a quote
+refresh fails, it keeps the last successful snapshot and the Dashboard shows a
+failure or stale warning instead of hiding the problem.
 
 The dashboard also reads technical facts from `technical_facts.json` when
 available. Symbol details show both the facts run date and the underlying market
