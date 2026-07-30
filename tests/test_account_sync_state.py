@@ -10,6 +10,7 @@ import pytest
 
 from open_trader.account_sync_state import (
     ACCOUNT_STATE_VERSION,
+    LIVE_BROKERS,
     REQUIRED_BROKERS,
     BrokerAccountCandidate,
     accept_candidate,
@@ -206,6 +207,27 @@ def test_failure_preserves_accepted_data_and_sanitizes_sensitive_error(tmp_path)
     assert "/Users/ray/projects/open_trader" not in after["message"]
 
 
+def test_failure_sanitizes_unlisted_credential_values(tmp_path) -> None:
+    failed = record_source_failure(
+        load_account_sync_state(tmp_path / "missing.json"),
+        "futu",
+        attempted_at="2026-07-30T12:03:00+08:00",
+        message=(
+            "Authorization: Bearer bearer-secret password=plain-password "
+            "api_key: api-key-secret client_secret=client-secret"
+        ),
+    )
+
+    message = failed["brokers"]["futu"]["message"]
+    for credential in (
+        "bearer-secret",
+        "plain-password",
+        "api-key-secret",
+        "client-secret",
+    ):
+        assert credential not in message
+
+
 def test_effective_source_status_uses_live_freshness_only() -> None:
     now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
     live_ok_179_seconds_old = _source(
@@ -227,13 +249,42 @@ def test_effective_source_status_uses_live_freshness_only() -> None:
     assert effective_source_status(unknown_source, now=now) == "unknown"
 
 
+def test_invalid_source_kind_is_untrusted_and_cannot_be_accepted(tmp_path) -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+    invalid_source = _source(
+        source_kind="unexpected",
+        last_success_at=(now - timedelta(days=1)).isoformat(),
+    )
+
+    assert effective_source_status(invalid_source, now=now) == "unknown"
+    with pytest.raises(ValueError, match="invalid source_kind"):
+        accept_candidate(
+            load_account_sync_state(tmp_path / "missing.json"),
+            replace(_candidate(), source_kind="unexpected"),
+            attempted_at=now.isoformat(),
+        )
+
+    accepted = accept_candidate(
+        load_account_sync_state(tmp_path / "missing.json"),
+        _candidate(),
+        attempted_at=now.isoformat(),
+    )
+    accepted["brokers"]["futu"]["source_kind"] = "unexpected"
+    path = tmp_path / "state.json"
+    write_json_atomic(path, accepted)
+    assert load_account_sync_state(path) == load_account_sync_state(tmp_path / "missing.json")
+
+
 def test_health_is_ok_only_with_current_controller_sources_quotes_and_generation() -> None:
     now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
     state = {
         "version": 1,
         "generation": "2026-07-30T11:59:59+08:00",
         "brokers": {
-            broker: _source(last_success_at=(now - timedelta(seconds=1)).isoformat())
+            broker: _source(
+                source_kind="live" if broker in LIVE_BROKERS else "statement",
+                last_success_at=(now - timedelta(seconds=1)).isoformat(),
+            )
             for broker in REQUIRED_BROKERS
         },
     }

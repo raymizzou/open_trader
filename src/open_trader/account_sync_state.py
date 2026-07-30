@@ -43,9 +43,13 @@ class BrokerAccountCandidate:
     summary: dict[str, object]
 
 
-def _empty_source() -> dict[str, object]:
+def _source_kind_for_broker(broker: str) -> str:
+    return "live" if broker in LIVE_BROKERS else "statement"
+
+
+def _empty_source(broker: str) -> dict[str, object]:
     return {
-        "source_kind": "",
+        "source_kind": _source_kind_for_broker(broker),
         "status": "unknown",
         "attempted_at": "",
         "last_success_at": "",
@@ -63,7 +67,7 @@ def empty_account_sync_state() -> dict[str, object]:
     return {
         "version": ACCOUNT_STATE_VERSION,
         "generation": "",
-        "brokers": {broker: _empty_source() for broker in REQUIRED_BROKERS},
+        "brokers": {broker: _empty_source(broker) for broker in REQUIRED_BROKERS},
     }
 
 
@@ -83,6 +87,8 @@ def accept_candidate(
 ) -> dict[str, object]:
     if candidate.broker not in REQUIRED_BROKERS:
         raise ValueError(f"unknown broker: {candidate.broker}")
+    if candidate.source_kind != _source_kind_for_broker(candidate.broker):
+        raise ValueError(f"invalid source_kind: {candidate.source_kind}")
     accepted = deepcopy(state) if _is_valid_state(state) else empty_account_sync_state()
     brokers = accepted["brokers"]
     assert isinstance(brokers, dict)
@@ -153,6 +159,18 @@ def sanitize_sync_error(
         sanitized = sanitized.replace(value, "<redacted>")
     for root in sorted((str(item) for item in sensitive_roots), key=len, reverse=True):
         sanitized = sanitized.replace(root, "<path>")
+    sanitized = re.sub(
+        r"(?i)(\bauthorization\s*:\s*bearer\s+)[^\s,;]+",
+        r"\1<redacted>",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(\b(?:password|passwd|api[_-]?key|(?:access|refresh)[_-]?token|"
+        r"client[_-]?secret|private[_-]?key|credential(?:s)?|secret|token)\s*(?:=|:)\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1<redacted>",
+        sanitized,
+    )
     sanitized = re.sub(r"\d{6,}", "<redacted>", sanitized)
     sanitized = re.sub(r"(?:~|/Users/[^/\s]+|/home/[^/\s]+)(?:/[^\s:]+)+", "<path>", sanitized)
     return re.sub(r"(?i)\b[^\s]*tiger[^\s]*(?:\.json|\.ini|\.cfg|\.config)\b", "<path>", sanitized)
@@ -166,7 +184,10 @@ def effective_source_status(
         return "unknown"
     if status != "ok":
         return str(status)
-    if source.get("source_kind") != "live":
+    source_kind = source.get("source_kind")
+    if source_kind not in {"live", "statement"}:
+        return "unknown"
+    if source_kind == "statement":
         return "ok"
     last_success = _parse_aware_datetime(source.get("last_success_at"))
     if last_success is None:
@@ -513,6 +534,8 @@ def _is_valid_source(value: object, broker: str) -> bool:
         "message",
     }
     if any(not isinstance(value.get(field), str) for field in required_strings):
+        return False
+    if value["source_kind"] != _source_kind_for_broker(broker):
         return False
     if not (
         value["status"] in {"ok", "failed", "unknown"}
