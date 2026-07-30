@@ -3263,10 +3263,11 @@ def run_trend_market_controller(
                 or review_retry_after
                 or cycle.next_check_at
             )
+            status_now = max(now, last_reconciliation_heartbeat or now)
             status_payload = _record_status(
                 config,
                 market,
-                now=now,
+                now=status_now,
                 phase=phase,
                 last_success=last_success,
                 blocker=blocker,

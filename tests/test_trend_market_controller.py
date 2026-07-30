@@ -2868,6 +2868,47 @@ def test_controller_process_version_is_fixed_across_status_updates(
     )
 
 
+def test_final_cycle_status_does_not_regress_reconciliation_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    delayed = NOW + timedelta(minutes=1)
+    times = iter((NOW, NOW, delayed, delayed))
+
+    def reconcile(
+        _config: DailyPremarketConfig,
+        cycle: ControllerCycle,
+        _now: datetime,
+        **kwargs: object,
+    ) -> ControllerCycle:
+        progress = kwargs.get("progress")
+        assert callable(progress)
+        progress()
+        return cycle
+
+    monkeypatch.setattr(controller, "_cycle_to_reconcile", reconcile)
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
+    )
+
+    result = run_trend_market_controller(
+        config,
+        "CN",
+        once=True,
+        now_fn=lambda: next(times),
+    )
+
+    assert result["phase"] == "monitoring"
+    assert result["heartbeat_at"] == delayed.isoformat(timespec="seconds")
+
+
 def test_heartbeat_refreshes_before_each_calendar_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
