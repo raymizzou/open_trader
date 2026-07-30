@@ -11,7 +11,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   path; failed, stale, and unverified sources retain visible last-accepted data
   but pause account-dependent actions and show `人工复核`. Added the
   `account-sync-status` and `install_account_sync_launchd.sh` operator paths;
-  the focused account-sync and Dashboard suites pass.
+  Dashboard acceptance now verifies those degraded states without skipping the
+  three market reports, while the separate process gate still rejects unhealthy
+  controllers.
 - Sorted CN/HK/US real and simulated trend-report holding rows by report
   strength. Rows now reuse the existing light green, light pink, and soft gray
   backgrounds to distinguish current buy/hold membership, non-trend holdings,

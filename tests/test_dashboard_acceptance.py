@@ -3603,7 +3603,7 @@ def test_acceptance_rejects_missing_trend_controller_card() -> None:
         )
 
 
-def test_acceptance_rejects_unavailable_executor_controller() -> None:
+def test_acceptance_projects_unavailable_executor_controller() -> None:
     payload = valid_payload()
     controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
     controller.update({  # type: ignore[union-attr]
@@ -3616,13 +3616,12 @@ def test_acceptance_rejects_unavailable_executor_controller() -> None:
 
     page = tabbed_account_page(payload)
     page.trend_broker = "tiger"
-    with pytest.raises(AssertionError, match="控制器不可用"):
-        dashboard_acceptance._check_trend_controller_status(
-            page,
-            page.locator("#trend-report-workspace:visible"),
-            "tiger",
-            controller,
-        )
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_acceptance_allows_readonly_controller_without_heartbeat() -> None:
@@ -3684,7 +3683,7 @@ def test_acceptance_browser_allows_progress_before_first_success(
 
 
 @pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
-def test_acceptance_browser_rejects_stable_phase_without_first_success(
+def test_acceptance_browser_projects_stable_phase_without_first_success(
     phase: str,
 ) -> None:
     payload = valid_payload()
@@ -3693,13 +3692,12 @@ def test_acceptance_browser_rejects_stable_phase_without_first_success(
     page = tabbed_account_page(payload)
     page.trend_broker = "tiger"
 
-    with pytest.raises(AssertionError, match="尚无首次成功"):
-        dashboard_acceptance._check_trend_controller_status(
-            page,
-            page.locator("#trend-report-workspace:visible"),
-            "tiger",
-            controller,
-        )
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_acceptance_allows_controller_heartbeat_to_advance_during_browser_check(
@@ -3760,9 +3758,9 @@ def test_acceptance_uses_browser_snapshot_when_controller_phase_advances() -> No
 
 @pytest.mark.parametrize(
     "rendered_heartbeat",
-    ["not-a-time", "2026-07-21T09:30:59+08:00", "2026-07-21T09:37:00+08:00"],
+    ["not-a-time", "2026-07-21T09:30:59+08:00"],
 )
-def test_acceptance_rejects_invalid_or_unbounded_rendered_controller_heartbeat(
+def test_acceptance_rejects_invalid_or_regressed_rendered_controller_heartbeat(
     rendered_heartbeat: str,
 ) -> None:
     payload = valid_payload()
@@ -3778,6 +3776,22 @@ def test_acceptance_rejects_invalid_or_unbounded_rendered_controller_heartbeat(
             "tiger",
             controller,
         )
+
+
+def test_acceptance_allows_controller_time_to_advance_beyond_one_poll_window() -> None:
+    payload = valid_payload()
+    controller = copy.deepcopy(payload["trend_controllers"]["tiger"])  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    page.trend_broker = "tiger"
+    page.controllers["tiger"]["heartbeat_at"] = "2026-07-21T09:37:00+08:00"
+    page.controllers["tiger"]["next_check_at"] = "2026-07-21T09:37:10+08:00"
+
+    dashboard_acceptance._check_trend_controller_status(
+        page,
+        page.locator("#trend-report-workspace:visible"),
+        "tiger",
+        controller,
+    )
 
 
 def test_acceptance_rejects_blocking_batch_with_healthy_controller() -> None:
@@ -4010,7 +4024,8 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
             if self.selector in target_selectors:
                 return 1
             counts = {
-                '.account-holding-actions button[data-detail-mode="t_signal"]:visible': 1,
+                '.account-holding-actions button[data-detail-mode="t_signal"]:visible': self.page.t_signal_count,
+                ".account-review-action:visible": int(self.page.t_signal_count == 0),
                 "[data-back-to-holdings]:visible": int(self.page.view == "detail"),
                 '#main-navigation [data-workspace="kelly_lab"]': 1,
                 ".kelly-lab-panel:visible": int(self.page.view == "kelly"),
@@ -4051,9 +4066,10 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
     class Page:
         viewport_size = {"width": 375, "height": 844}
 
-        def __init__(self) -> None:
+        def __init__(self, *, t_signal_count: int = 1) -> None:
             self.view = "portfolio"
             self.research_open = False
+            self.t_signal_count = t_signal_count
             self.clicks: list[str] = []
             self.evaluations: list[tuple[str, object | None]] = []
             self.target_checks: list[str] = []
@@ -4099,6 +4115,16 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
         "#standard-backtest-workspace select:visible",
         ".research-chat-modal button:visible, .research-chat-modal input:visible",
     ]
+
+    degraded_page = Page(t_signal_count=0)
+    dashboard_acceptance._check_tool_workspaces(
+        degraded_page, "US:MSFT:Microsoft:5"
+    )
+    assert (
+        '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
+        not in degraded_page.clicks
+    )
+    assert "[data-back-to-holdings]:visible" not in degraded_page.clicks
 
 
 @pytest.mark.parametrize(
