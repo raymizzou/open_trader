@@ -463,6 +463,42 @@ def test_trend_report_projects_only_same_day_futu_derivatives(
     assert report["hold_actions"][0]["option_anomaly"]["reason"] == "富途未返回该标的期权异动"
 
 
+@pytest.mark.parametrize(
+    ("market", "report_symbol", "holding_symbol"),
+    [
+        ("CN", "600000", "SH.600000"),
+        ("HK", "700", "HK.00700"),
+        ("US", "BRK.B", "US.BRK.B"),
+    ],
+)
+def test_trend_holding_membership_state_is_market_aware(
+    market: str,
+    report_symbol: str,
+    holding_symbol: str,
+) -> None:
+    included_symbols = {
+        dashboard_module._canonical_trend_symbol(
+            {"symbol": report_symbol}, market
+        )
+    }
+
+    assert dashboard_module._project_trend_membership_state(
+        {"symbol": holding_symbol},
+        market=market,
+        included_symbols=included_symbols,
+    ) == "included"
+    assert dashboard_module._project_trend_membership_state(
+        {"symbol": "INVALID"},
+        market=market,
+        included_symbols=included_symbols,
+    ) == "excluded"
+    assert dashboard_module._project_trend_membership_state(
+        {"symbol": holding_symbol, "reason": "holding_trend_excluded"},
+        market=market,
+        included_symbols=included_symbols,
+    ) == "blacklisted"
+
+
 def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
     tmp_path: Path,
 ) -> None:
@@ -477,6 +513,15 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
     judgments = payload["strategy_judgments"]
     assert isinstance(judgments, dict)
     judgments.update({
+        "holding_decisions": [
+            {
+                "action": "HOLD",
+                "symbol": "SPY",
+                "name": "标普ETF",
+                "reason": "trend_intact",
+                "strength": "50",
+            },
+        ],
         "real_holding_decisions_status": "available",
         "real_holding_decisions_source": {
             "broker": "tiger", "broker_label": "老虎",
@@ -484,19 +529,25 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
             "freshness_text": "非实时", "read_only_text": "只读，不自动下单",
         },
         "real_holding_decisions": [
-            {"action": "HOLD", "symbol": "SPY", "name": "标普ETF", "reason": "trend_intact"},
-            {"action": "SELL_ALL", "symbol": "VIXY", "name": "波动率ETF", "reason": "danger_signal"},
-            {"action": "MANUAL_REVIEW", "symbol": "QQQ", "name": "纳指ETF", "reason": "holding_signal_unknown"},
             {
-                "action": "MANUAL_REVIEW",
-                "symbol": "US.AGRZ",
-                "name": "AGRZ",
-                "reason": "holding_trend_excluded",
-                "temperature_prev": None,
-                "temperature_curr": None,
-                "phase": None,
-                "strength": None,
-                "industry": "",
+                "action": "HOLD", "symbol": "SPY", "name": "标普ETF",
+                "reason": "trend_intact", "strength": "50",
+            },
+            {
+                "action": "SELL_ALL", "symbol": "VIXY", "name": "波动率ETF",
+                "reason": "danger_signal", "strength": "20",
+            },
+            {
+                "action": "MANUAL_REVIEW", "symbol": "QQQ", "name": "纳指ETF",
+                "reason": "holding_signal_unknown", "strength": "90",
+            },
+            {
+                "action": "MANUAL_REVIEW", "symbol": "EUV", "name": "EUV",
+                "reason": "holding_signal_unknown", "strength": None,
+            },
+            {
+                "action": "MANUAL_REVIEW", "symbol": "US.AGRZ", "name": "AGRZ",
+                "reason": "holding_trend_excluded", "strength": "99",
             },
         ],
     })
@@ -519,9 +570,20 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
     assert report["real_position_reason"] == ""
     assert report["real_position_source"]["source_kind"] == "statement"
     assert [item["symbol"] for item in report["real_position_actions"]] == [
-        "VIXY", "QQQ", "SPY", "US.AGRZ"
+        "QQQ", "SPY", "VIXY", "EUV", "US.AGRZ",
     ]
-    assert report["counts"] == {"sell": 0, "buy": 1, "hold": 0, "review": 0}
+    assert {
+        item["symbol"]: item["trend_report_state"]
+        for item in report["real_position_actions"]
+    } == {
+        "QQQ": "excluded",
+        "SPY": "included",
+        "VIXY": "included",
+        "EUV": "excluded",
+        "US.AGRZ": "blacklisted",
+    }
+    assert report["hold_actions"][0]["trend_report_state"] == "included"
+    assert report["counts"] == {"sell": 0, "buy": 1, "hold": 1, "review": 0}
 
 
 def test_trend_report_disables_mismatched_futu_derivatives(
@@ -2525,7 +2587,7 @@ def test_dashboard_holding_phase_projection_uses_frozen_snapshot() -> None:
 
 
 @pytest.mark.parametrize("market", ["CN", "HK", "US"])
-def test_dashboard_projects_holdings_with_frozen_industry_order(
+def test_dashboard_projects_holdings_in_strength_order(
     market: str,
 ) -> None:
     payload = {
@@ -2578,55 +2640,11 @@ def test_dashboard_projects_holdings_with_frozen_industry_order(
 
     _, _, holds, _ = dashboard_module._project_trend_actions(payload, {})
 
-    assert [item["symbol"] for item in holds] == ["FIN", "MED"]
-    assert holds[0]["industry"] == "金融"
-    assert holds[0]["industry_tm_id"] == 2
-    assert holds[0]["days"] == 8
-    assert payload == original_payload
-
-
-def test_dashboard_falls_back_to_individual_holding_order_for_invalid_context() -> None:
-    payload = {
-        "metadata": {"market": "CN"},
-        "strategy_judgments": {
-            "formal_actions": [],
-            "holding_decisions": [
-                {"action": "HOLD", "symbol": "FIN", "strength": "80", "reason": "trend_intact"},
-                {"action": "HOLD", "symbol": "MED", "strength": "95", "reason": "trend_intact"},
-            ],
-        },
-        "signal_snapshots": {
-            "holdings": {
-                "FIN": {"industry": "金融", "industry_tm_id": 2, "days": 8},
-                "MED": {"industry": "医疗保健", "industry_tm_id": 1, "days": 7},
-            },
-        },
-        "industry_contexts": [
-            {
-                "industry_tm_id": 2,
-                "industry": "金融",
-                "temperature": "热",
-                "strength": "100",
-                "warm_to_hot_count": 11,
-                "right_share": "0.25",
-                "valid": False,
-                "invalid_reasons": ["context_invalid"],
-            },
-            {
-                "industry_tm_id": 1,
-                "industry": "医疗保健",
-                "temperature": "平",
-                "strength": "10",
-                "warm_to_hot_count": 0,
-                "right_share": "0.05",
-                "valid": True,
-            },
-        ],
-    }
-
-    _, _, holds, _ = dashboard_module._project_trend_actions(payload, {})
-
     assert [item["symbol"] for item in holds] == ["MED", "FIN"]
+    assert holds[0]["industry"] == "医疗保健"
+    assert holds[0]["industry_tm_id"] == 1
+    assert holds[0]["days"] == 7
+    assert payload == original_payload
 
 
 def test_dashboard_preserves_frozen_trend_cny_money_fields() -> None:
