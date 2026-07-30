@@ -256,6 +256,22 @@ def test_phillips_non_trade_equity_activity_does_not_block_completeness() -> Non
     assert result.warnings == []
 
 
+def test_phillips_payment_and_deposit_rows_do_not_claim_invalid_execution() -> None:
+    result = parse_phillips_text(
+        "Transaction Details\n"
+        "29/07/26 29/07/26 HKD Payment Balance Forward 10,000.00\n"
+        "29/07/26 29/07/26 UT Deposit FUND-CODE 1,000.00\n"
+        "Opening Balance 0.00\n"
+        "Closing Balance 10,000.00\n",
+        "2026-07",
+    )
+
+    assert result.trades == []
+    assert result.fills == []
+    assert result.fills_complete is True
+    assert result.warnings == []
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -275,7 +291,7 @@ def test_phillips_statement_warns_for_incomplete_execution_row(line: str) -> Non
     ]
 
 
-def test_phillips_trade_shaped_row_without_known_side_is_incomplete() -> None:
+def test_phillips_trade_shaped_row_without_execution_side_is_ignored() -> None:
     result = parse_phillips_text(
         "Transaction Details\n"
         "10/07/26 14/07/26 Equity REF00001 Pending 000700 Tencent "
@@ -283,21 +299,18 @@ def test_phillips_trade_shaped_row_without_known_side_is_incomplete() -> None:
         "2026-07",
     )
 
-    assert result.fills_complete is False
-    assert [warning.code for warning in result.warnings] == [
-        "invalid_execution_row"
-    ]
+    assert result.fills_complete is True
+    assert result.warnings == []
 
 
 @pytest.mark.parametrize(
     "line",
     [
-        "10/07/26 14/07/26 Equity REF00001 Sold 000700 Tencent",
         "10/07/26 14/07/26 Equity REF00001 000700 Tencent",
         "BROKEN TRANSACTION ACTIVITY",
     ],
 )
-def test_phillips_any_nonempty_unparsed_transaction_activity_is_incomplete(
+def test_phillips_non_execution_transaction_activity_is_ignored(
     line: str,
 ) -> None:
     result = parse_phillips_text(
@@ -305,13 +318,11 @@ def test_phillips_any_nonempty_unparsed_transaction_activity_is_incomplete(
         "2026-07",
     )
 
-    assert result.fills_complete is False
-    assert [warning.code for warning in result.warnings] == [
-        "invalid_execution_row"
-    ]
+    assert result.fills_complete is True
+    assert result.warnings == []
 
 
-def test_phillips_repeated_transaction_heading_does_not_restore_completeness() -> None:
+def test_phillips_repeated_transaction_heading_keeps_valid_completeness() -> None:
     result = parse_phillips_text(
         "Transaction Details\n"
         "BROKEN TRANSACTION ACTIVITY\n"
@@ -322,10 +333,8 @@ def test_phillips_repeated_transaction_heading_does_not_restore_completeness() -
     )
 
     assert len(result.fills) == 1
-    assert result.fills_complete is False
-    assert [warning.code for warning in result.warnings] == [
-        "invalid_execution_row"
-    ]
+    assert result.fills_complete is True
+    assert result.warnings == []
 
 
 def test_phillips_cash_section_ends_transaction_validation() -> None:

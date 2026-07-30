@@ -119,6 +119,8 @@ def parse_phillips_text(text: str, month: str) -> ParseResult:
         if in_transactions:
             if _is_ignored_transaction_line(line):
                 continue
+            if re.search(r"\b(?:Bought|Sold)\b", line, re.IGNORECASE) is None:
+                continue
             occurrence = occurrences.get(line, 0)
             occurrences[line] = occurrence + 1
             match = TRANSACTION_LINE.fullmatch(line)
