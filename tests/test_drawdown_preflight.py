@@ -136,7 +136,7 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
-    old_versions = {"CN": "v9", "HK": "v6", "US": "v6"}
+    old_versions = {"CN": "v9", "HK": "v7", "US": "v7"}
     equities = {"CN": "100", "HK": "200", "US": "300"}
     for market, version in old_versions.items():
         automatic_bootstrap_strategy_drawdown(
@@ -162,7 +162,7 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
             observed_at="2026-07-19T08:00:00+08:00",
         )
 
-    target_versions = {"CN": "v10", "HK": "v7", "US": "v7"}
+    target_versions = {"CN": "v10", "HK": "v8", "US": "v8"}
     inputs = {
         market: replace(
             market_input(market),

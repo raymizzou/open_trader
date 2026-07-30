@@ -123,19 +123,21 @@ POSITION_LIMIT = 10
 CANDIDATE_LIMIT = 10
 LEGACY_CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.04")}
-CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v10", "US": "v7", "HK": "v7"}
+CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v10", "US": "v8", "HK": "v8"}
 CURRENT_TREND_EFFECTIVE_FROM = "2026-07-27"
 CURRENT_ENTRY_DISCIPLINES = frozenset({
-    ("US", "v7"),
-    ("HK", "v7"),
+    ("US", "v8"),
+    ("HK", "v8"),
 })
 CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v9"),
     ("CN", "v10"),
     ("US", "v6"),
     ("US", "v7"),
+    ("US", "v8"),
     ("HK", "v6"),
     ("HK", "v7"),
+    ("HK", "v8"),
 })
 REAL_HOLDING_TREND_EXCLUDED_SYMBOLS = frozenset({"US.AGRZ"})
 OVERHEAT_PARAMETER_NAMES = frozenset({
@@ -672,7 +674,7 @@ def live_trend_strategy_snapshot(
         version = "v4"
     if (
         version not in {"v4", "v5", "v6", "v7", "v8", "v9", "v10"}
-        or version in {"v8", "v9", "v10"} and market != "CN"
+        or version in {"v9", "v10"} and market != "CN"
         or version == "v5" and market == "CN"
     ):
         raise ValueError("unsupported live trend strategy version")
@@ -772,7 +774,7 @@ def live_trend_strategy_snapshot(
             "strategy_id": "trend_animals_warm_to_hot/CN/v4",
             "opening_strategy_version": "v4",
         }]
-    if version == "v8":
+    if version == "v8" and market == "CN":
         parameters["kelly_sample_inherits"] = [
             {
                 "market": "CN",
@@ -875,6 +877,15 @@ def live_trend_strategy_snapshot(
                 "opening_strategy_version": item,
             }
             for item in ("v4", "v5", "v6", "v7")
+        ]
+    if version == "v8" and market in {"US", "HK"}:
+        parameters["kelly_sample_inherits"] = [
+            {
+                "market": market,
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/{item}",
+                "opening_strategy_version": item,
+            }
+            for item in ("v4", "v5", "v6", "v7", "v8")
         ]
     current_discipline = (market, version) in CURRENT_EXIT_DISCIPLINES
     if current_discipline:

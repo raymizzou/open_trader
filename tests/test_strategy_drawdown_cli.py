@@ -252,8 +252,8 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
     [
         ("CN", "2026-07-26", "2026-07-27", "v10"),
         ("US", "2026-07-23", "2026-07-24", "v5"),
-        ("US", "2026-07-26", "2026-07-27", "v7"),
-        ("HK", "2026-07-26", "2026-07-27", "v7"),
+        ("US", "2026-07-26", "2026-07-27", "v8"),
+        ("HK", "2026-07-26", "2026-07-27", "v8"),
     ],
 )
 def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(

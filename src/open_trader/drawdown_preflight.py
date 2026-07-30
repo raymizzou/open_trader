@@ -34,8 +34,10 @@ APPROVED_DRAWDOWN_PREDECESSORS = {
     ("CN", "v10"): ("trend_animals_warm_to_hot/CN/v9", "v9"),
     ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
     ("US", "v7"): ("trend_animals_warm_to_hot/US/v6", "v6"),
+    ("US", "v8"): ("trend_animals_warm_to_hot/US/v7", "v7"),
     ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
     ("HK", "v7"): ("trend_animals_warm_to_hot/HK/v6", "v6"),
+    ("HK", "v8"): ("trend_animals_warm_to_hot/HK/v7", "v7"),
 }
 _DRAWDOWN_FAILURE_LABELS = {
     "baseline_unavailable": "历史基线不可用",

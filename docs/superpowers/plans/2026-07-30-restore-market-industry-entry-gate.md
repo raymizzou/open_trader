@@ -11,8 +11,8 @@
 ## Global Constraints
 
 - Use the approved design in `docs/superpowers/specs/2026-07-24-unified-trend-discipline-design.md`.
-- Current CN v10, US v7, and HK v7 entries share: 温→热/沸, strength `>= 95`, industry temperature in 温/热/沸, phase in 谷雨/立夏/夏至, CNY-equivalent market cap `>= 100` hundred-million, CNY-equivalent amount `>= 2` hundred-million, right side, tradable, no danger, matching date, not held, right-side days present, and ATR14 present.
-- Preserve historical US/HK v4, v5, and v6 replay and parameter-hash behavior.
+- Current CN v10, US v8, and HK v8 entries share: 温→热/沸, strength `>= 95`, industry temperature in 温/热/沸, phase in 谷雨/立夏/夏至, CNY-equivalent market cap `>= 100` hundred-million, CNY-equivalent amount `>= 2` hundred-million, right side, tradable, no danger, matching date, not held, right-side days present, and ATR14 present.
+- Preserve historical US/HK v4, v5, v6, and v7 replay and parameter-hash behavior.
 - Preserve market-specific pools, exchange scope, lot sizes, account currencies, and buy windows.
 - Missing or failed industry temperature data fails new entries closed but must not suppress holding exits.
 - Do not add dependencies, configuration, a new policy module, or unrelated refactors.
@@ -35,7 +35,7 @@
 
 - [ ] **Step 1: Add current-version snapshot and behavioral gate tests**
 
-Add parameterized tests for US v7 and HK v7. Assert their strategy snapshots contain literal shared values:
+Add parameterized tests for US v8 and HK v8. Assert their strategy snapshots contain literal shared values:
 
 ```python
 {
@@ -80,13 +80,13 @@ Expected: failures showing US/HK snapshots retain old `> 90`/`< 10 days` paramet
 
 - [ ] **Step 3: Restore the minimal shared decision**
 
-Treat CN plus the current US/HK v7 versions as shared discipline. Preserve v4,
-v5, and v6 snapshots because their parameter hashes and frozen reports are
+Treat CN plus the current US/HK v8 versions as shared discipline. Preserve v4,
+v5, v6, and v7 snapshots because their parameter hashes and frozen reports are
 historical audit identities:
 
 ```python
 shared_discipline = market == "CN" or (
-    market in {"US", "HK"} and strategy_version == "v7"
+    market in {"US", "HK"} and strategy_version == "v8"
 )
 ```
 

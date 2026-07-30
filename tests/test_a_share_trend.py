@@ -628,8 +628,8 @@ def test_live_cn_strategy_snapshot_defaults_to_v10_with_all_approved_inheritance
     ("market", "version", "inherits"),
     [
         ("CN", "v10", ("v4", "v7", "v8", "v9", "v10")),
-        ("US", "v7", ("v4", "v5", "v6", "v7")),
-        ("HK", "v7", ("v4", "v5", "v6", "v7")),
+        ("US", "v8", ("v4", "v5", "v6", "v7", "v8")),
+        ("HK", "v8", ("v4", "v5", "v6", "v7", "v8")),
     ],
 )
 def test_current_live_snapshots_publish_exit_discipline_without_partial_profit(
@@ -725,9 +725,9 @@ def test_current_cn_boiling_entry_uses_four_percent() -> None:
 
 @pytest.mark.parametrize(
     ("market", "expected_version"),
-    [("US", "v7"), ("HK", "v7")],
+    [("US", "v8"), ("HK", "v8")],
 )
-def test_live_non_cn_strategy_snapshot_defaults_to_v7_with_exact_inheritance(
+def test_live_non_cn_strategy_snapshot_defaults_to_v8_with_exact_inheritance(
     market: str, expected_version: str,
 ) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
@@ -744,8 +744,24 @@ def test_live_non_cn_strategy_snapshot_defaults_to_v7_with_exact_inheritance(
             "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v5", "v6", "v7")
+        for version in ("v4", "v5", "v6", "v7", "v8")
     ]
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+def test_historical_market_v7_keeps_legacy_entry_parameters(market: str) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (622460,) if market == "US" else (622494,),
+        strategy_version="v7",
+    )
+
+    assert snapshot["strategy_version"] == "v7"
+    assert snapshot["parameters"]["min_strength_exclusive"] == "90"
+    assert snapshot["parameters"]["max_right_side_days_exclusive"] == 10
+    assert snapshot["parameters"]["min_amount_100m"] == "1"
+    assert "allowed_industry_temperatures" not in snapshot["parameters"]
 
 
 @pytest.mark.parametrize(
@@ -835,7 +851,7 @@ def test_current_market_entry_rejects_cn_discipline_failure(
         held_symbols=set(),
         expected_date="2026-07-14",
         market=market,
-        strategy_version="v7",
+        strategy_version="v8",
         cny_per_local_currency=trend_module.CNY_PER_LOCAL_CURRENCY[market],
     )
 
@@ -883,15 +899,15 @@ def test_current_market_report_keeps_cool_industry_out_of_every_buy_view(
         market,
         "abc123",
         (pool_id,),
-        strategy_version="v7",
+        strategy_version="v8",
     )
     drawdown_summary = {
         "schema_version": "open_trader.strategy_drawdown.v1",
         "market": market,
         "strategy_id": strategy_snapshot["strategy_id"],
-        "strategy_version": "v7",
+        "strategy_version": "v8",
         "kelly_sample_key": (
-            f"{market}|trend_animals_warm_to_hot/{market}/v7|v7"
+            f"{market}|trend_animals_warm_to_hot/{market}/v8|v8"
         ),
         "state_status": "ok",
         "status": "active",
@@ -943,7 +959,7 @@ def test_current_market_industry_failure_keeps_holding_exit_decisions() -> None:
         "US",
         "abc123",
         (622460,),
-        strategy_version="v7",
+        strategy_version="v8",
     )
     item = candidate(
         "620001",

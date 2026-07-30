@@ -218,7 +218,7 @@ def test_market_strategy_snapshot_matches_runtime_rules(
     )
     live = trend_module.live_trend_strategy_snapshot(market, "abc123", pool_ids)
     assert (live["strategy_id"], live["strategy_version"]) == (
-        f"trend_animals_warm_to_hot/{market}/v7", "v7"
+        f"trend_animals_warm_to_hot/{market}/v8", "v8"
     )
     assert "overheat_trim_fraction" not in live["parameters"]
     assert not {
@@ -233,21 +233,21 @@ def test_market_strategy_snapshot_matches_runtime_rules(
 
 
 @pytest.mark.parametrize("market", ["US", "HK"])
-def test_live_market_strategy_snapshot_defaults_to_v7_with_exact_inheritance(
+def test_live_market_strategy_snapshot_defaults_to_v8_with_exact_inheritance(
     market: str,
 ) -> None:
     pools = (622460,) if market == "US" else (622494,)
     snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
 
-    assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/v7"
-    assert snapshot["strategy_version"] == "v7"
+    assert snapshot["strategy_id"] == f"trend_animals_warm_to_hot/{market}/v8"
+    assert snapshot["strategy_version"] == "v8"
     assert snapshot["parameters"]["kelly_sample_inherits"] == [
         {
             "market": market,
             "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
             "opening_strategy_version": version,
         }
-        for version in ("v4", "v5", "v6", "v7")
+        for version in ("v4", "v5", "v6", "v7", "v8")
     ]
 
 
@@ -1213,7 +1213,7 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     expected_reason: str,
 ) -> None:
     cfg = config(tmp_path)
-    unlock_live_drawdown(cfg.data_dir, market, version="v7")
+    unlock_live_drawdown(cfg.data_dir, market, version="v8")
     industry_calls: list[dict[str, object]] = []
 
     class Api:
@@ -1336,7 +1336,7 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     assert result.json_path is not None
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     judgments = payload["strategy_judgments"]
-    assert payload["strategy_snapshot"]["strategy_version"] == "v7"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v8"
     assert payload["excluded"][symbol] == [expected_reason]
     assert judgments["formal_actions"] == []
     assert judgments["risk_skips"] == []
