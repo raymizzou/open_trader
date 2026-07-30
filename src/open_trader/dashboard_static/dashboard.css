@@ -2715,6 +2715,18 @@ table {
   font-size: 12px;
 }
 
+.cn-trend-table .cn-trend-card.trend-holding-included td {
+  background: #e7f4ec;
+}
+
+.cn-trend-table .cn-trend-card.trend-holding-excluded td {
+  background: #fae8e6;
+}
+
+.cn-trend-table .cn-trend-card.trend-holding-blacklisted td {
+  background: var(--surface-soft);
+}
+
 .trend-discipline {
   background: var(--surface-soft);
   border: 1px solid var(--line);
@@ -4870,6 +4882,7 @@ tbody tr.active-row,
 .trend-execution-batch-error,
 .trend-risk-summary dl div,
 .cn-trend-card td:nth-child(-n + 2),
+.cn-trend-table .cn-trend-card.trend-holding-blacklisted td,
 .trend-option-button:disabled,
 .trend-option-dialog-meta div,
 .trend-option-dialog-signal div,

@@ -16,13 +16,11 @@ from zoneinfo import ZoneInfo
 from .a_share_trend import (
     ACTION_LABELS,
     CNY_PER_LOCAL_CURRENCY,
-    KNOWN_TEMPERATURE_ORDER,
     NON_REALTIME_ACCOUNT_WARNING,
     PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
     SINGLE_ENTRY_RISK_LIMIT,
     TREND_API_COST_UNIT,
-    TEMPERATURE_DIRECTION_ORDER,
     live_trend_strategy_snapshot,
     trend_api_cost_label,
     valid_serialized_account,
@@ -1046,11 +1044,23 @@ def _trend_action_needs_review(item: dict[str, Any]) -> bool:
     )
 
 
-def _canonical_trend_sell_symbol(item: dict[str, Any], market: str) -> str:
+def _canonical_trend_symbol(item: dict[str, Any], market: str) -> str:
     try:
         return to_futu_symbol(market, str(item.get("symbol") or ""))
     except ValueError:
         return ""
+
+
+def _project_trend_membership_state(
+    item: dict[str, Any],
+    *,
+    market: str,
+    included_symbols: set[str],
+) -> str:
+    if item.get("reason") == "holding_trend_excluded":
+        return "blacklisted"
+    symbol = _canonical_trend_symbol(item, market)
+    return "included" if symbol and symbol in included_symbols else "excluded"
 
 
 def _project_trend_money_fields(
@@ -1115,52 +1125,6 @@ def _project_trend_order_int(value: object) -> int | None:
     return int(parsed)
 
 
-def _project_trend_holding_context(
-    item: dict[str, Any], contexts: list[dict[str, Any]]
-) -> dict[str, Any] | None:
-    industry_tm_id = item.get("industry_tm_id")
-    industry = item.get("industry")
-    if industry_tm_id not in (None, ""):
-        for context in contexts:
-            context_id = context.get("industry_tm_id")
-            if context_id == industry_tm_id or str(context_id) == str(industry_tm_id):
-                return context
-    if industry not in (None, ""):
-        for context in contexts:
-            if context.get("industry") == industry:
-                return context
-    return None
-
-
-def _project_trend_valid_holding_context(context: object) -> bool:
-    if not isinstance(context, dict) or context.get("valid") is not True:
-        return False
-    temperature = context.get("temperature")
-    strength = _project_trend_order_decimal(context.get("strength"))
-    warm_to_hot_count = _project_trend_order_int(context.get("warm_to_hot_count"))
-    right_share = _project_trend_order_decimal(context.get("right_share"))
-    return (
-        temperature in KNOWN_TEMPERATURE_ORDER
-        and strength is not None
-        and Decimal("0") <= strength <= Decimal("100")
-        and warm_to_hot_count is not None
-        and warm_to_hot_count >= 0
-        and right_share is not None
-        and Decimal("0") <= right_share <= Decimal("1")
-    )
-
-
-def _project_trend_holding_has_history(context: dict[str, Any]) -> bool:
-    return (
-        context.get("prior_as_of_date") not in (None, "")
-        and context.get("prior_temperature") in KNOWN_TEMPERATURE_ORDER
-        and _project_trend_order_decimal(context.get("prior_right_share")) is not None
-        and context.get("temperature_direction") in TEMPERATURE_DIRECTION_ORDER
-        and _project_trend_order_decimal(context.get("right_share_change_pp"))
-        is not None
-    )
-
-
 def _project_trend_holding_individual_key(item: dict[str, Any]) -> tuple[object, ...]:
     strength = _project_trend_order_decimal(item.get("strength"))
     days = _project_trend_order_int(item.get("days"))
@@ -1178,65 +1142,6 @@ def _project_trend_holding_individual_key(item: dict[str, Any]) -> tuple[object,
         -(amount or Decimal("0")),
         str(item.get("symbol") or ""),
     )
-
-
-def _project_trend_holding_context_key(
-    item: dict[str, Any], context: dict[str, Any], *, include_history: bool
-) -> tuple[object, ...]:
-    key: list[object] = []
-    if include_history:
-        key.append(TEMPERATURE_DIRECTION_ORDER[context["temperature_direction"]])
-    key.extend(
-        (
-            -KNOWN_TEMPERATURE_ORDER[context["temperature"]],
-            -(_project_trend_order_decimal(context["strength"]) or Decimal("0")),
-            -(_project_trend_order_int(context["warm_to_hot_count"]) or 0),
-        )
-    )
-    if include_history:
-        key.append(
-            -(
-                _project_trend_order_decimal(context["right_share_change_pp"])
-                or Decimal("0")
-            )
-        )
-    key.extend(
-        (
-            -(_project_trend_order_decimal(context["right_share"]) or Decimal("0")),
-            *_project_trend_holding_individual_key(item),
-        )
-    )
-    return tuple(key)
-
-
-def _project_trend_sorted_holdings(
-    items: list[dict[str, Any]], payload: dict[str, Any]
-) -> list[dict[str, Any]]:
-    if len(items) < 2:
-        return items
-    raw_contexts = payload.get("industry_contexts")
-    contexts = (
-        [context for context in raw_contexts if isinstance(context, dict)]
-        if isinstance(raw_contexts, list)
-        else []
-    )
-    resolved = [_project_trend_holding_context(item, contexts) for item in items]
-    if any(not _project_trend_valid_holding_context(context) for context in resolved):
-        return sorted(items, key=_project_trend_holding_individual_key)
-    valid_contexts = [context for context in resolved if isinstance(context, dict)]
-    include_history = all(
-        _project_trend_holding_has_history(context) for context in valid_contexts
-    )
-    pairs = list(zip(items, valid_contexts))
-    return [
-        item
-        for item, _ in sorted(
-            pairs,
-            key=lambda pair: _project_trend_holding_context_key(
-                pair[0], pair[1], include_history=include_history
-            ),
-        )
-    ]
 
 
 def _project_trend_actions(
@@ -1302,7 +1207,7 @@ def _project_trend_actions(
         for item in formal
         if item.get("action") == "SELL_ALL"
         and not _trend_action_needs_review(item)
-        if (symbol := _canonical_trend_sell_symbol(item, market))
+        if (symbol := _canonical_trend_symbol(item, market))
     }
     sell_actions = [
         item
@@ -1311,7 +1216,7 @@ def _project_trend_actions(
         and not _trend_action_needs_review(item)
         and not (
             item.get("action") == "SELL_PARTIAL"
-            and _canonical_trend_sell_symbol(item, market) in full_exit_symbols
+            and _canonical_trend_symbol(item, market) in full_exit_symbols
         )
     ]
     buy_actions = [
@@ -1320,12 +1225,15 @@ def _project_trend_actions(
         if item.get("action") == "BUY"
         and not _trend_action_needs_review(item)
     ]
-    hold_actions = _project_trend_sorted_holdings([
-        item
-        for item in holdings
-        if item.get("action") == "HOLD"
-        and not _trend_action_needs_review(item)
-    ], payload)
+    hold_actions = sorted(
+        [
+            item
+            for item in holdings
+            if item.get("action") == "HOLD"
+            and not _trend_action_needs_review(item)
+        ],
+        key=_project_trend_holding_individual_key,
+    )
     review_actions: list[dict[str, Any]] = []
     for item in formal + holdings:
         if _trend_action_needs_review(item) and item not in review_actions:
@@ -1366,16 +1274,10 @@ def _project_trend_real_actions(payload: dict[str, Any]) -> list[dict[str, Any]]
                 if projected.get(key) in (None, "") and snapshot.get(key) not in (None, ""):
                     projected[key] = snapshot[key]
         projected_items.append(projected)
-    urgency = {
-        "SELL_ALL": 0,
-        "SELL_PARTIAL": 1,
-        "MANUAL_REVIEW": 2,
-        "HOLD": 3,
-    }
     return sorted(
         projected_items,
         key=lambda item: (
-            urgency.get(str(item.get("action") or ""), 4),
+            item.get("reason") == "holding_trend_excluded",
             *_project_trend_holding_individual_key(item),
         ),
     )
@@ -2243,6 +2145,17 @@ def _project_broker_trend_report(
         _project_trend_actions(payload, executions)
     )
     real_position_actions = _project_trend_real_actions(payload)
+    included_symbols = {
+        symbol
+        for item in [*buy_actions, *hold_actions]
+        if (symbol := _canonical_trend_symbol(item, market))
+    }
+    for item in [*hold_actions, *real_position_actions]:
+        item["trend_report_state"] = _project_trend_membership_state(
+            item,
+            market=market,
+            included_symbols=included_symbols,
+        )
     if market in {"US", "HK"}:
         option_anomalies = _trend_option_anomalies(
             data_dir,

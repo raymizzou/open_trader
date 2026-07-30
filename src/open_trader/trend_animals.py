@@ -19,6 +19,11 @@ from .futu_symbols import (
 
 BASE_URL = "https://www.trendtrader.cn/apiData/data"
 MAX_REQUEST_URL_LENGTH = 3_500
+SEARCH_ASSETS_BY_MARKET = {
+    "CN": frozenset({"A股", "ETF基金"}),
+    "HK": frozenset({"港股", "香港ETF"}),
+    "US": frozenset({"美股", "美国ETF"}),
+}
 Transport = Callable[[str, float], dict[str, object]]
 
 
@@ -97,10 +102,24 @@ class TrendAnimalsClient:
             raise TrendAnimalsError("getAccountBalance returned no unique summary")
         return rows[0]
 
-    def search_exact_symbol(self, symbol: str, *, market: str) -> int:
+    def search_exact_symbol(
+        self,
+        symbol: str,
+        *,
+        market: str,
+        expected_date: str,
+    ) -> int:
         if not isinstance(symbol, str):
             raise TypeError("symbol must be a string")
+        self._validate_expected_date(expected_date)
+        try:
+            expected_day = date.fromisoformat(expected_date)
+        except ValueError:
+            expected_day = None
+        if expected_day is None or expected_day.isoformat() != expected_date:
+            raise ValueError("expected_date must be an ISO date")
         target = to_futu_symbol(market, symbol)
+        normalized_market = market.strip().upper()
         normalized = target.split(".", 1)[1]
         query = to_trend_animals_symbol(market, target)
         if self._api_key in normalized:
@@ -116,13 +135,40 @@ class TrendAnimalsClient:
                 raise TrendAnimalsError("symbol cache has an invalid shape")
             return cached["tmId"]
 
+        miss_payload = {
+            "market": normalized_market,
+            "date": expected_date,
+            "symbol": normalized,
+            "error": "no_unique_exact_match",
+        }
+        miss_path = (
+            self.cache_dir
+            / "symbol_misses"
+            / normalized_market
+            / expected_date
+            / f"{normalized}.json"
+        )
+        cached_miss = self._read_cache(miss_path)
+        if cached_miss is not None:
+            if cached_miss != miss_payload:
+                raise TrendAnimalsError("symbol miss cache has an invalid shape")
+            raise TrendAnimalsLookupError(
+                f"searchTicker found no unique exact match for {normalized}"
+            )
+
         rows = self._get("searchTicker", {"keyword": query})
         matches: set[int] = set()
+        allowed_assets = SEARCH_ASSETS_BY_MARKET[normalized_market]
         for row in rows:
             ticker_symbol = row.get("tickerSymbol")
             tm_id = row.get("tmId")
             if not isinstance(ticker_symbol, str) or not self._valid_tm_id(tm_id):
                 raise TrendAnimalsError("searchTicker returned an invalid row")
+            asset = row.get("asset")
+            if asset is not None and (
+                not isinstance(asset, str) or asset.strip() not in allowed_assets
+            ):
+                continue
             try:
                 candidate = from_trend_animals_symbol(market, ticker_symbol)
             except ValueError:
@@ -130,6 +176,7 @@ class TrendAnimalsClient:
             if candidate == target:
                 matches.add(tm_id)
         if len(matches) != 1:
+            self._write_cache(miss_path, miss_payload)
             raise TrendAnimalsLookupError(
                 f"searchTicker found no unique exact match for {normalized}"
             )

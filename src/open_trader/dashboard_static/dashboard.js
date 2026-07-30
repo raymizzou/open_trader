@@ -3026,6 +3026,7 @@ const TREND_REASON_LABELS = {
   danger_signal: "危险信号触发",
   left_trend_right_side: "右侧趋势已结束",
   holding_signal_unknown: "趋势信号不完整",
+  holding_trend_excluded: "已排除趋势查询",
   holding_kline_unavailable: "持仓日线数据不可用",
   holding_lot_size_unavailable: "持仓整手信息不可用",
   trend_intact: "趋势保持完好",
@@ -3589,9 +3590,17 @@ function trendRealHoldingSource(report) {
   return source && typeof source === "object" ? source : {};
 }
 
+function trendHoldingRowClass(item) {
+  return {
+    included: "trend-holding-included",
+    excluded: "trend-holding-excluded",
+    blacklisted: "trend-holding-blacklisted",
+  }[item?.trend_report_state] || "trend-holding-excluded";
+}
+
 function renderTrendHoldingRows(items, report) {
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
-  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
+  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card ${trendHoldingRowClass(item)}">
     ${optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
     ${renderTrendCell("动作", trendHoldingActionLabel(item))}
     ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}

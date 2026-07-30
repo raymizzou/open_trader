@@ -7175,12 +7175,22 @@ const report = (market) => ({
   report_date:"2026-07-30", data_date:"2026-07-29", generated_at:"now",
   account_status:"已更新", buy_window:"常规时段", counts:{},
   sell_actions:[], buy_actions:[], review_actions:[], risk_skips:[], audit:{},
-  hold_actions:[{action:"HOLD",symbol:"SIM",name:"模拟",reason:"trend_intact"}],
+  hold_actions:[
+    {action:"HOLD",symbol:"SIM-IN",name:"模拟趋势",reason:"trend_intact",trend_report_state:"included"},
+    {action:"HOLD",symbol:"SIM-OUT",name:"模拟非趋势",reason:"trend_intact",trend_report_state:"excluded"},
+    {action:"MANUAL_REVIEW",symbol:"SIM-BLACK",name:"模拟黑名单",reason:"holding_trend_excluded",trend_report_state:"blacklisted"},
+  ],
   real_position_status:"available",
   real_position_source:{broker_label:"老虎",snapshot_period:"2026-07-29",source_kind:"statement",freshness_text:"非实时",read_only_text:"只读，不自动下单"},
   real_position_actions:[
-    {action:"HOLD",symbol:"REAL",name:"真实",reason:"trend_intact"},
-    {action:"MANUAL_REVIEW",symbol:"CHECK",name:"复核",reason:"holding_signal_unknown"},
+    {action:"HOLD",symbol:"REAL-IN",name:"真实趋势",reason:"trend_intact",trend_report_state:"included"},
+    {action:"MANUAL_REVIEW",symbol:"REAL-OUT",name:"真实非趋势",reason:"holding_signal_unknown",trend_report_state:"excluded"},
+    {
+      action:"MANUAL_REVIEW",symbol:"US.AGRZ",name:"AGRZ",
+      reason:"holding_trend_excluded",trend_report_state:"blacklisted",temperature_prev:null,
+      temperature_curr:null,phase:null,strength:null,industry:"",
+      close:null,active_line:null,
+    },
   ],
 });
 for (const market of ["CN", "HK", "US"]) {
@@ -7192,11 +7202,27 @@ for (const market of ["CN", "HK", "US"]) {
   const holding = html.match(/<section class="trend-stage cn-trend-stage cn-trend-hold"[\s\S]*?<\/section>/)?.[0] || "";
   if ((holding.match(/<th scope="col">标的<\/th>/g) || []).length !== 2) throw new Error(html);
   if ((holding.match(/<th scope="col">持仓提示<\/th>/g) || []).length !== 2) throw new Error(html);
+  for (const state of ["included", "excluded", "blacklisted"]) {
+    const rows = holding.match(new RegExp(`class="cn-trend-card trend-holding-${state}"`, "g")) || [];
+    if (rows.length !== 2) throw new Error(`${market}:${state}:${holding}`);
+  }
+  if (holding.includes("非趋势报告标的")) throw new Error(holding);
+  const agrz = (holding.match(/<tr class="cn-trend-card[^"]*">[\s\S]*?<\/tr>/g) || [])
+    .find((row) => row.includes("US.AGRZ")) || "";
+  if (!agrz.includes("已排除趋势查询")) throw new Error(agrz);
+  if ((agrz.match(/>数据未提供<\/td>/g) || []).length < 6) throw new Error(agrz);
 }
 console.log("ok");
 ''')
 
     assert "ok" in output
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".trend-holding-included td" in css
+    assert "background: #e7f4ec;" in css
+    assert ".trend-holding-excluded td" in css
+    assert "background: #fae8e6;" in css
+    assert ".trend-holding-blacklisted td" in css
+    assert "background: var(--surface-soft);" in css
 
 
 def test_dashboard_trend_option_button_mobile_layout_css() -> None:
