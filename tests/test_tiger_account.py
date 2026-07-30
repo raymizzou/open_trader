@@ -1720,7 +1720,7 @@ def test_build_tiger_account_candidate_rejects_malformed_account_total() -> None
     assert exc_info.value.error_type == "blocking_data_error"
 
 
-def test_build_tiger_account_candidate_rejects_raw_record_account_alias() -> None:
+def test_build_tiger_account_candidate_normalizes_raw_record_account_alias() -> None:
     snapshot = tiger_snapshot_from_records(
         cash_records=[
             {
@@ -1741,15 +1741,78 @@ def test_build_tiger_account_candidate_rejects_raw_record_account_alias() -> Non
         position_records=[],
     )
 
-    with pytest.raises(TigerAccountError) as exc_info:
-        build_tiger_account_candidate(
-            snapshot,
-            run_date="2026-07-30",
-            data_as_of="2026-07-30T11:56:54+08:00",
-        )
+    candidate = build_tiger_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+    )
 
-    assert exc_info.value.error_type == "account_query_failed"
-    assert "123456789" not in str(exc_info.value)
+    assert {position.account_alias for position in candidate.positions} == {"tiger_6789"}
+    assert {cash.account_alias for cash in candidate.cash} == {"tiger_6789"}
+    assert candidate.fx_rates[0]["account_alias"] == "tiger_6789"
+    assert candidate.summary["account_aliases"] == ["tiger_6789"]
+    assert "123456789" not in repr(candidate)
+
+
+def test_build_tiger_account_candidate_normalizes_self_consistent_raw_account_alias() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account": "123456789",
+                "account_alias": "123456789",
+                "currency": "USD",
+                "cash_balance": "10",
+                "available_balance": "10",
+                "fx_to_hkd": "7.84",
+            },
+            {
+                "record_type": "account_total",
+                "account": "123456789",
+                "account_alias": "123456789",
+                "currency": "USD",
+                "account_total": "100",
+                "fx_to_hkd": "7.84",
+            },
+        ],
+        position_records=[
+            {
+                "account": "123456789",
+                "account_alias": "123456789",
+                "symbol": "MSFT",
+                "sec_type": "STK",
+                "currency": "USD",
+                "market": "US",
+                "position_qty": "1",
+                "market_value": "11",
+            }
+        ],
+    )
+    snapshot = TigerAccountSnapshot(
+        accounts=[
+            TigerAccount(
+                account="123456789",
+                account_alias="123456789",
+                account_type="STANDARD",
+                capability="RegTMargin",
+                status="FUNDED",
+                asset_method="get_prime_assets",
+            )
+        ],
+        cash_records=snapshot.cash_records,
+        position_records=snapshot.position_records,
+    )
+
+    candidate = build_tiger_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+    )
+
+    assert {position.account_alias for position in candidate.positions} == {"tiger_6789"}
+    assert {cash.account_alias for cash in candidate.cash} == {"tiger_6789"}
+    assert candidate.fx_rates[0]["account_alias"] == "tiger_6789"
+    assert candidate.summary["account_aliases"] == ["tiger_6789"]
+    assert "123456789" not in repr(candidate)
 
 
 def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:

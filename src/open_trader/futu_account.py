@@ -497,18 +497,43 @@ def build_futu_account_candidate(
             "no REAL Futu securities accounts found",
             error_type="no_real_accounts",
         )
-    account_aliases = {account.account_alias for account in snapshot.accounts}
-    if any(
-        _first_text(record, ("_account_alias",)) not in account_aliases
-        for record in [*snapshot.cash_records, *snapshot.position_records]
-    ):
-        raise FutuAccountError(
-            "Futu snapshot has an unrecognized account alias",
-            error_type="account_query_failed",
-        )
+    aliases_by_identity: dict[str, str] = {}
+    for account in snapshot.accounts:
+        account_id = str(account.acc_id)
+        safe_alias = _mask_futu_account_alias(f"futu_{account_id}")
+        for identity in (account_id, f"futu_{account_id}", safe_alias):
+            if identity in aliases_by_identity:
+                raise FutuAccountError(
+                    "Futu snapshot has ambiguous account aliases",
+                    error_type="account_query_failed",
+                )
+            aliases_by_identity[identity] = safe_alias
+
+    def normalize_record(record: dict[str, object]) -> dict[str, object]:
+        account_id = _first_text(record, ("_acc_id",))
+        account_alias = _first_text(record, ("_account_alias",))
+        safe_alias = aliases_by_identity.get(account_id or account_alias)
+        if safe_alias is None or (
+            account_id
+            and account_alias
+            and aliases_by_identity.get(account_alias) != safe_alias
+        ):
+            raise FutuAccountError(
+                "Futu snapshot has an unrecognized account alias",
+                error_type="account_query_failed",
+            )
+        return {**record, "_account_alias": safe_alias}
+
+    normalized_snapshot = FutuAccountSnapshot(
+        accounts=snapshot.accounts,
+        cash_records=[normalize_record(record) for record in snapshot.cash_records],
+        position_records=[
+            normalize_record(record) for record in snapshot.position_records
+        ],
+    )
 
     positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
-        snapshot,
+        normalized_snapshot,
         run_date=run_date,
     )
     if blocking_errors:
@@ -519,7 +544,7 @@ def build_futu_account_candidate(
     if any(
         (total_assets := _first_raw_value(record, ("total_assets",))) not in (None, "")
         and _optional_decimal(record, ("total_assets",)) is None
-        for record in snapshot.cash_records
+        for record in normalized_snapshot.cash_records
     ):
         raise FutuAccountError(
             "Futu account total_assets is invalid",
@@ -533,7 +558,7 @@ def build_futu_account_candidate(
         positions = [
             *positions,
             *_unmapped_total_asset_positions(
-                snapshot=snapshot,
+                snapshot=normalized_snapshot,
                 positions=positions,
                 cash_balances=cash_balances,
                 fx_provider=fx_provider,

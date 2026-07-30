@@ -658,13 +658,13 @@ def test_build_futu_account_candidate_normalizes_complete_snapshot() -> None:
         "account_count": 1,
         "position_count": 14,
         "cash_count": 1,
-        "account_aliases": ["futu_111"],
+        "account_aliases": ["futu_***"],
     }
     assert candidate.data_as_of == "2026-07-30T11:56:54+08:00"
     assert candidate.positions[0].asset_class is AssetClass.STOCK
     assert candidate.cash[0].currency == "USD"
     assert candidate.fx_rates == (
-        {"account_alias": "futu_111", "currency": "USD", "rate_to_hkd": "7.8123"},
+        {"account_alias": "futu_***", "currency": "USD", "rate_to_hkd": "7.8123"},
     )
 
 
@@ -783,6 +783,57 @@ def test_build_futu_account_candidate_rejects_raw_record_account_alias() -> None
 
     assert exc_info.value.error_type == "account_query_failed"
     assert "123456789" not in str(exc_info.value)
+
+
+def test_build_futu_account_candidate_normalizes_self_consistent_raw_account_alias() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_acc_id": "123456789",
+                "_account_alias": "123456789",
+                "currency": "USD",
+                "cash": "10",
+            }
+        ],
+        position_records=[
+            {
+                "_acc_id": "123456789",
+                "_account_alias": "123456789",
+                "code": "US.MSFT",
+                "qty": "1",
+                "cost_price": "10",
+                "market_val": "11",
+            }
+        ],
+    )
+    snapshot = snapshot.__class__(
+        accounts=[
+            futu_account_module.FutuAccount(
+                acc_id=123456789,
+                acc_index=0,
+                trd_env="REAL",
+                acc_type="CASH",
+                account_alias="123456789",
+            )
+        ],
+        cash_records=snapshot.cash_records,
+        position_records=snapshot.position_records,
+    )
+
+    candidate = build_futu_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+        fallback_fx_to_hkd={"USD": Decimal("7.8123")},
+    )
+
+    assert {position.account_alias for position in candidate.positions} == {
+        "futu_*****6789"
+    }
+    assert {cash.account_alias for cash in candidate.cash} == {"futu_*****6789"}
+    assert candidate.fx_rates[0]["account_alias"] == "futu_*****6789"
+    assert candidate.summary["account_aliases"] == ["futu_*****6789"]
+    assert "123456789" not in repr(candidate)
 
 
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
