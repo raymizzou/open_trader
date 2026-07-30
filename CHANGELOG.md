@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Made real-holding Trend Animals lookup market-aware so same-code crypto rows
+  no longer hide valid US stocks or ETFs. Successful mappings remain persistent;
+  exact misses are cached per market and report data date, then retried on the
+  next data date. A missing real symbol now degrades only its own row.
+- Excluded `US.AGRZ` from real-holding trend requests while keeping the position
+  visible, read-only, with empty trend fields and sorted last. Simulated strategy,
+  Kelly, risk, execution, the existing ten Dashboard columns, and Feishu output
+  are unchanged. Verified the focused provider/report/replay/Dashboard suites
+  with 1,526 passing tests and live US stock/ETF lookup results.
 - Added read-only `真实持仓` / `模拟盘持仓` tabs to the existing CN/HK/US
   `盘中持续 · 已有持仓` report stage. Real-account decisions are frozen per
   report and never affect simulated strategy actions, counts, risk, Kelly,
