@@ -40,8 +40,10 @@ from .a_share_trend import (
     _write_frozen_industry_context_history,
     build_report,
     collect_industry_contexts,
+    enrich_real_holding_input,
     evaluate_candidate,
     load_futu_simulate_trend_account,
+    load_real_holding_input,
     live_trend_strategy_snapshot,
     load_watch_events,
     render_trend_failure_text,
@@ -49,6 +51,7 @@ from .a_share_trend import (
     render_markdown,
     write_protection_state,
 )
+from .broker_details import load_broker_detail_snapshot
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
@@ -107,6 +110,7 @@ class MarketTrendPaths:
     root: Path
     reports: Path
     state: Path
+    real_state: Path
     events: Path
     log: Path
     report_lock: Path
@@ -128,6 +132,7 @@ def market_paths(data_dir: Path, reports_dir: Path, market: str) -> MarketTrendP
         root=root,
         reports=reports_dir / f"trend_{suffix}",
         state=root / "protection_state.json",
+        real_state=root / "real_protection_state.json",
         events=root / "watch_events.jsonl",
         log=root / "run.log",
         report_lock=data_dir / "runs" / f".trend_{suffix}_report.lock",
@@ -145,21 +150,8 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
 def _latest_broker_rows(
     data_dir: Path, broker: str
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    runs = data_dir / "runs"
-    if not runs.exists():
-        return [], []
-    for run_dir in sorted((item for item in runs.iterdir() if item.is_dir()), reverse=True):
-        positions = [
-            row for row in _read_rows(run_dir / "extracted_positions.csv")
-            if row.get("broker", "").strip().lower() == broker
-        ]
-        cash = [
-            row for row in _read_rows(run_dir / "extracted_cash.csv")
-            if row.get("broker", "").strip().lower() == broker
-        ]
-        if positions or cash:
-            return positions, cash
-    return [], []
+    snapshot = load_broker_detail_snapshot(data_dir, broker)
+    return list(snapshot.positions), list(snapshot.cash)
 
 
 def _decimal(value: object, *, default: Decimal | None = None) -> Decimal:
@@ -818,6 +810,11 @@ def _recover_market_receipt(
             write_protection_state(
                 paths.state, receipt["protection_state"]  # type: ignore[arg-type]
             )
+            if isinstance(receipt.get("real_protection_state"), Mapping):
+                write_protection_state(
+                    paths.real_state,
+                    receipt["real_protection_state"],  # type: ignore[arg-type]
+                )
         receipt = _transition_delivery_receipt(
             receipt_path, receipt, status="pending", delivery_status="pending"
         )
@@ -922,6 +919,11 @@ def _attempt_market_report(
             market=market,
             expected_date=as_of_date,
             account_factory=account_factory or FutuSimulateOrderExecutionClient,
+        )
+        real_holdings = load_real_holding_input(
+            config.data_dir,
+            market,
+            state_path=paths.real_state,
         )
 
         balance_before = _balance(api.get_account_balance())
@@ -1040,6 +1042,21 @@ def _attempt_market_report(
                 except ValueError:
                     pass
 
+        real_holdings, real_snapshot_rows, real_bars_by_symbol, real_only_count = (
+            enrich_real_holding_input(
+                real_holdings,
+                api=api,
+                quote=quote,
+                market=market,
+                as_of_date=as_of_date,
+                kline_start=start,
+                existing_holding_ids=holding_ids,
+                existing_rows_by_tm_id=rows_by_id,
+                existing_holding_snapshots=holding_snapshots,
+                existing_bars_by_symbol=bars_by_symbol,
+            )
+        )
+
         candidate_pool_rows = [
             rows_by_id[tm_id] for tm_id in sorted(component_ids)
             if tm_id in rows_by_id
@@ -1068,7 +1085,7 @@ def _attempt_market_report(
                 wire.split(".", 1)[1]: size for wire, size in wire_lots.items()
             }
         estimated_cost = (
-            unified_unit_cost * len(requested_ids)
+            unified_unit_cost * (len(requested_ids) + real_only_count)
             + sum(
                 (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
                 Decimal("0"),
@@ -1151,6 +1168,7 @@ def _attempt_market_report(
                 "Trend Animals",
                 f"Futu {market} calendar/QFQ daily K-line",
                 f"Futu {market} SIMULATE account",
+                f"{settings['broker']} frozen real account snapshot (read-only)",
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost if actual_cost >= 0 else None,
@@ -1185,6 +1203,7 @@ def _attempt_market_report(
             },
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
+            real_holdings=real_holdings,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         previous_attention_rows = _previous_attention_rows(
@@ -1209,6 +1228,7 @@ def _attempt_market_report(
                 "update_status": update_rows,
                 "components": component_rows,
                 "snapshots": snapshot_rows,
+                "real_snapshots": list(real_snapshot_rows.values()),
                 "industry_components": [
                     row
                     for rows in industry_facts["component_rows_by_industry"].values()
@@ -1224,6 +1244,7 @@ def _attempt_market_report(
             option_attention_broker_label=option_attention_broker_label,
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
+            real_holdings_input=real_holdings,
         )
         report = replace(
             report,
@@ -1252,8 +1273,11 @@ def _attempt_market_report(
                 payload, ensure_ascii=False, indent=2, sort_keys=True
             ) + "\n",
             protection_state=report.protection_state,
+            real_protection_state=report.real_protection_state,
         )
         write_protection_state(paths.state, report.protection_state)
+        if report.real_protection_state is not None:
+            write_protection_state(paths.real_state, report.real_protection_state)
         receipt = _transition_delivery_receipt(
             receipt_path, receipt, status="pending", delivery_status="pending"
         )

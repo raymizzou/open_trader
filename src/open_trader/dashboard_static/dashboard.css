@@ -1307,7 +1307,7 @@ table {
 }
 
 .account-view-tab[aria-selected="true"]::after {
-  background: var(--broker-accent);
+  background: var(--broker-accent, var(--accent));
   bottom: -1px;
   content: "";
   height: 2px;

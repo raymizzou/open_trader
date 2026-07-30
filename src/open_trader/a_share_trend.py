@@ -21,6 +21,7 @@ from .daily_premarket import (
     require_trend_review_config,
     send_notification_with_results,
 )
+from .broker_details import load_broker_detail_snapshot
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
@@ -28,6 +29,7 @@ from .kline_technical_facts import DailyKlineBar
 from .notifications import Notifier, NullNotifier
 from .notification_policy import render_attention, render_daily_title
 from .portfolio_risk import size_entry_by_risk
+from .parsers.base import detect_asset_class
 from .strategy_drawdown import (
     DRAWDOWN_LIMIT,
     observe_strategy_equity,
@@ -1108,6 +1110,25 @@ class HoldingDecision:
 
 
 @dataclass(frozen=True)
+class RealHoldingInput:
+    status: str
+    reason: str
+    source: dict[str, str]
+    positions: tuple[AccountPosition, ...]
+    holding_snapshots: Mapping[str, HoldingSnapshot | None]
+    bars_by_symbol: Mapping[str, Sequence[DailyKlineBar] | None]
+    prior_state: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
+class HoldingEvaluation:
+    decisions: tuple[HoldingDecision, ...]
+    protection_state: dict[str, object]
+    industry_counts: Counter[str]
+    industry_values: dict[str, Decimal]
+
+
+@dataclass(frozen=True)
 class TrendReport:
     schema_version: int
     generated_at: str
@@ -1134,6 +1155,11 @@ class TrendReport:
     estimated_api_cost_complete: bool
     drawdown_summary: dict[str, object] | None = None
     replay_evidence: dict[str, str] | None = None
+    real_holdings: tuple[HoldingDecision, ...] = ()
+    real_holdings_status: str | None = None
+    real_holdings_reason: str = ""
+    real_holdings_source: dict[str, str] = field(default_factory=dict)
+    real_protection_state: dict[str, object] | None = None
 
 
 def _broker_set(value: str) -> set[str]:
@@ -1235,6 +1261,277 @@ def _account_exceptions(rows: Sequence[Mapping[str, str]]) -> list[str]:
             f"unsupported Eastmoney asset: {symbol} {name} ({market}/{asset_class})"
         )
     return exceptions
+
+
+def load_real_holding_input(
+    data_dir: Path,
+    market: str,
+    *,
+    state_path: Path,
+) -> RealHoldingInput:
+    normalized_market = market.strip().upper()
+    broker_by_market = {
+        "CN": ("eastmoney", "东方财富"),
+        "HK": ("phillips", "辉立"),
+        "US": ("tiger", "老虎"),
+    }
+    try:
+        broker, broker_label = broker_by_market[normalized_market]
+    except KeyError:
+        raise ValueError(f"unsupported real holding market: {market}") from None
+    detail = load_broker_detail_snapshot(data_dir, broker)
+    source = {
+        "broker": broker,
+        "broker_label": broker_label,
+        "snapshot_period": detail.snapshot_period,
+        "source_kind": detail.source_kind,
+        "freshness_text": (
+            "实时" if detail.source_kind == "live_account" else "非实时"
+        ),
+        "read_only_text": "只读，不自动下单",
+    }
+    if not detail.available:
+        return RealHoldingInput(
+            status="unavailable",
+            reason=detail.reason,
+            source=source,
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+        )
+    try:
+        prior_state = load_protection_state(state_path)
+    except ValueError as exc:
+        return RealHoldingInput(
+            status="unavailable",
+            reason=f"真实持仓保护线不可用：{exc}",
+            source=source,
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+        )
+    positions: list[AccountPosition] = []
+    for row in detail.positions:
+        if row.get("market", "").strip().upper() != normalized_market:
+            continue
+        symbol_text = row.get("symbol", "").strip()
+        name = row.get("name", "").strip() or symbol_text
+        asset_class = row.get("asset_class", "").strip().lower()
+        if not asset_class:
+            asset_class = detect_asset_class(symbol_text, name).value
+        if asset_class not in {"stock", "etf"}:
+            continue
+        try:
+            quantity = _decimal(row.get("quantity", ""))
+            market_value_text = row.get("market_value", "").strip()
+            market_value = (
+                Decimal("0")
+                if not market_value_text
+                else _decimal(market_value_text)
+            )
+            avg_cost_price = _optional_decimal(row.get("cost_price", ""))
+            if quantity <= 0:
+                continue
+            futu_symbol = to_futu_symbol(normalized_market, symbol_text)
+            symbol = futu_symbol.split(".", 1)[1]
+        except (ValueError, InvalidOperation) as exc:
+            return RealHoldingInput(
+                status="unavailable",
+                reason=f"真实持仓数量或标的不可用：{symbol_text or '<missing>'}（{exc}）",
+                source=source,
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
+            )
+        if market_value < 0:
+            return RealHoldingInput(
+                status="unavailable",
+                reason=f"真实持仓市值不可用：{symbol}",
+                source=source,
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
+            )
+        positions.append(
+            AccountPosition(
+                symbol=symbol,
+                name=name,
+                asset_class=asset_class,
+                quantity=quantity,
+                avg_cost_price=avg_cost_price,
+                market_value=market_value,
+            )
+        )
+    return RealHoldingInput(
+        status="available",
+        reason="",
+        source=source,
+        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=prior_state,
+    )
+
+
+def enrich_real_holding_input(
+    real_input: RealHoldingInput,
+    *,
+    api: object,
+    quote: object,
+    market: str,
+    as_of_date: str,
+    kline_start: str,
+    existing_holding_ids: Mapping[str, int],
+    existing_rows_by_tm_id: Mapping[int, Mapping[str, object]],
+    existing_holding_snapshots: Mapping[str, HoldingSnapshot | None],
+    existing_bars_by_symbol: Mapping[
+        str, Sequence[DailyKlineBar] | None
+    ],
+) -> tuple[
+    RealHoldingInput,
+    dict[int, Mapping[str, object]],
+    dict[str, Sequence[DailyKlineBar] | None],
+    int,
+]:
+    """Best-effort Trend Animals/Futu enrichment for the frozen real snapshot.
+
+    Simulated account requests are deliberately passed in separately. A failure
+    while resolving or loading real-only symbols degrades the real tab to
+    ``unavailable`` and leaves the simulated report path untouched.
+    """
+    if real_input.status != "available":
+        return real_input, {}, {}, 0
+    real_ids: dict[str, int] = {}
+    unresolved: list[str] = []
+    search_exact_symbol = getattr(api, "search_exact_symbol", None)
+    if not callable(search_exact_symbol):
+        degraded = replace(
+            real_input,
+            status="unavailable",
+            reason="Trend Animals 标的搜索接口不可用",
+            holding_snapshots={},
+            bars_by_symbol={},
+        )
+        return degraded, {}, {}, 0
+    for position in real_input.positions:
+        if position.symbol in existing_holding_ids:
+            real_ids[position.symbol] = existing_holding_ids[position.symbol]
+            continue
+        try:
+            real_ids[position.symbol] = int(
+                search_exact_symbol(position.symbol, market=market)
+            )
+        except Exception:
+            unresolved.append(position.symbol)
+    if unresolved:
+        degraded = replace(
+            real_input,
+            status="unavailable",
+            reason="真实持仓标的无法在 Trend Animals 定位："
+            + ", ".join(sorted(unresolved)),
+            holding_snapshots={},
+            bars_by_symbol={},
+        )
+        return degraded, {}, {}, 0
+
+    real_only_ids = sorted(
+        set(real_ids.values()) - set(existing_rows_by_tm_id)
+    )
+    real_rows: dict[int, Mapping[str, object]] = {}
+    if real_only_ids:
+        get_snapshots = getattr(api, "get_snapshots", None)
+        if not callable(get_snapshots):
+            degraded = replace(
+                real_input,
+                status="unavailable",
+                reason="Trend Animals 持仓快照接口不可用",
+                holding_snapshots={},
+                bars_by_symbol={},
+            )
+            return degraded, {}, {}, len(real_only_ids)
+        try:
+            response = get_snapshots(
+                tm_ids=real_only_ids,
+                fields=UNIFIED_TREND_FIELDS,
+                expected_date=as_of_date,
+            )
+            response_ids = [_row_tm_id(row) for row in response]
+            if (
+                len(response_ids) != len(set(response_ids))
+                or sorted(response_ids) != real_only_ids
+                or any(row.get("asOfDate") != as_of_date for row in response)
+            ):
+                raise ValueError("真实持仓快照日期或 tmId 不一致")
+            real_rows = {_row_tm_id(row): row for row in response}
+        except Exception as exc:
+            degraded = replace(
+                real_input,
+                status="unavailable",
+                reason=f"真实持仓快照不可用：{exc}",
+                holding_snapshots={},
+                bars_by_symbol={},
+            )
+            return degraded, {}, {}, len(real_only_ids)
+
+    real_bars: dict[str, Sequence[DailyKlineBar] | None] = {}
+    get_daily_kline = getattr(quote, "get_daily_kline", None)
+    for position in real_input.positions:
+        if position.symbol in existing_bars_by_symbol:
+            real_bars[position.symbol] = existing_bars_by_symbol[position.symbol]
+            continue
+        if not callable(get_daily_kline):
+            real_bars[position.symbol] = None
+            continue
+        try:
+            real_bars[position.symbol] = get_daily_kline(
+                to_futu_symbol(market, position.symbol),
+                start=kline_start,
+                end=as_of_date,
+            )
+        except Exception:
+            # Real holdings are read-only enrichment; a quote outage must not
+            # turn a valid simulated report into a failed run.
+            real_bars[position.symbol] = None
+
+    real_snapshots: dict[str, HoldingSnapshot | None] = {}
+    for position in real_input.positions:
+        if position.symbol in existing_holding_snapshots:
+            real_snapshots[position.symbol] = existing_holding_snapshots[
+                position.symbol
+            ]
+            continue
+        tm_id = real_ids[position.symbol]
+        row = real_rows.get(tm_id)
+        if row is None:
+            real_snapshots[position.symbol] = None
+            continue
+        try:
+            if from_trend_animals_symbol(
+                market, str(row.get("tickerSymbol") or "")
+            ) != to_futu_symbol(market, position.symbol):
+                real_snapshots[position.symbol] = None
+                continue
+            real_snapshots[position.symbol] = _holding_snapshot(
+                row,
+                market=market,
+                bars=tuple(real_bars.get(position.symbol) or ()),
+            )
+        except (TypeError, ValueError):
+            real_snapshots[position.symbol] = None
+    return (
+        replace(
+            real_input,
+            holding_snapshots=real_snapshots,
+            bars_by_symbol=real_bars,
+        ),
+        real_rows,
+        real_bars,
+        len(real_only_ids),
+    )
 
 
 def load_eastmoney_account(
@@ -2664,6 +2961,250 @@ def _post_sell_planned_risk(
     return planned_risk, ""
 
 
+def _evaluate_holding_positions(
+    *,
+    positions: Sequence[AccountPosition],
+    holding_snapshots: Mapping[str, HoldingSnapshot | None],
+    bars_by_symbol: Mapping[str, Sequence[DailyKlineBar] | None],
+    prior_state: Mapping[str, object] | None,
+    watch_events: Sequence[Mapping[str, object]],
+    as_of_date: str,
+    market: str,
+    lot_sizes: Mapping[str, int] | None,
+    current_exit_discipline: bool,
+    read_only_real: bool,
+) -> HoldingEvaluation:
+    old_positions = _state_positions(prior_state)
+    decisions: list[HoldingDecision] = []
+    new_positions: dict[str, object] = {}
+    industries: Counter[str] = Counter()
+    industry_values: defaultdict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    for position in positions:
+        symbol = position.symbol
+        returned_snapshot = holding_snapshots.get(symbol)
+        snapshot = (
+            returned_snapshot
+            if returned_snapshot is not None
+            and returned_snapshot.as_of_date == as_of_date
+            else None
+        )
+        old = old_positions.get(symbol)
+        old_state = old if isinstance(old, Mapping) else {}
+        state_started_for = old_state.get("position_started_for")
+        position_started_for = (
+            state_started_for
+            if isinstance(state_started_for, str) and state_started_for
+            else as_of_date
+        )
+        overheat_trim_terminal = (
+            state_started_for == position_started_for
+            and old_state.get("overheat_trim_status") in {"complete", "below_lot"}
+        )
+        triggered = (
+            {symbol}
+            if _protection_was_triggered(symbol, old_state, watch_events)
+            else set()
+        )
+        action, reason = _holding_action(
+            symbol=symbol,
+            snapshot=snapshot,
+            triggered=triggered,
+            market=market,
+            overheat_trim_terminal=overheat_trim_terminal,
+            current_exit_discipline=current_exit_discipline,
+        )
+        initial_line = _state_decimal(old_state, "initial_line")
+        active_line = _state_decimal(old_state, "active_line")
+        old_atr = _state_decimal(old_state, "atr14")
+        tracking_active = old_state.get("tracking_active") is True
+        if not current_exit_discipline and snapshot is not None and (
+            snapshot.boiling is True or snapshot.champagne is True
+        ):
+            tracking_active = True
+        if current_exit_discipline:
+            tracking_active = False
+        historical = not old_state
+        daily_bars = tuple(bars_by_symbol.get(symbol) or ())
+        current_atr, close, lows = _kline_metrics(
+            daily_bars, before=as_of_date, expected_date=as_of_date
+        )
+        stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
+        signal_complete = snapshot is not None and all(
+            value is not None
+            for value in (
+                snapshot.right_side,
+                snapshot.danger,
+                snapshot.boiling,
+                snapshot.champagne,
+            )
+        ) and (
+            market != "CN"
+            or (
+                snapshot.temperature_prev in KNOWN_TEMPERATURES
+                and snapshot.temperature_curr in KNOWN_TEMPERATURES
+            )
+        )
+        can_build_line = (
+            current_atr is not None
+            and close is not None
+            and not stale_kline
+            and (not read_only_real or signal_complete)
+        )
+        if active_line is None and can_build_line:
+            protection_anchor = (
+                position.avg_cost_price
+                if (
+                    (read_only_real or current_exit_discipline)
+                    and position.avg_cost_price is not None
+                    and position.avg_cost_price.is_finite()
+                    and position.avg_cost_price > 0
+                )
+                else close
+            )
+            initial_line = active_line = (
+                protection_anchor - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
+            )
+        elif read_only_real and active_line is not None and can_build_line:
+            protection_anchor = (
+                position.avg_cost_price
+                if position.avg_cost_price is not None
+                and position.avg_cost_price.is_finite()
+                and position.avg_cost_price > 0
+                else close
+            )
+            recalculated_line = (
+                protection_anchor - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
+            )
+            active_line = max(active_line, recalculated_line)
+        if active_line is not None and tracking_active and action in {
+            "HOLD", "SELL_PARTIAL"
+        }:
+            active_line = update_protection_line(
+                old_line=active_line,
+                boiling=True,
+                champagne=False,
+                prior_five_lows=lows,
+            )
+        if (active_line is None or stale_kline) and action == "HOLD":
+            action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
+        if read_only_real and not signal_complete and action == "HOLD":
+            action, reason = "MANUAL_REVIEW", "holding_signal_unknown"
+        effective_atr = current_atr if current_atr is not None else old_atr
+        target_fraction: Decimal | None = None
+        estimated_shares: int | None = None
+        lot_size: int | None = None
+        overheat_signals: tuple[str, ...] = ()
+        warnings: tuple[str, ...] = ()
+        if action == "SELL_PARTIAL":
+            lot_size = (
+                100
+                if market == "CN"
+                else (lot_sizes or {}).get(symbol, 0)
+                if market == "HK"
+                else 1
+            )
+            if not isinstance(lot_size, int) or lot_size <= 0:
+                action, reason = "MANUAL_REVIEW", "holding_lot_size_unavailable"
+                lot_size = None
+            else:
+                target_fraction = OVERHEAT_TRIM_FRACTION
+                estimated_shares = _floor_to_lot(
+                    position.quantity * target_fraction, lot_size
+                )
+                overheat_signals = tuple(
+                    signal
+                    for signal in OVERHEAT_TRIM_SIGNALS
+                    if getattr(snapshot, signal) is True
+                )
+                signal_unknown = snapshot is None or any(
+                    signal is None
+                    for signal in (
+                        snapshot.right_side,
+                        snapshot.danger,
+                        snapshot.boiling,
+                        snapshot.champagne,
+                    )
+                ) or (
+                    market == "CN"
+                    and (
+                        snapshot.temperature_prev not in KNOWN_TEMPERATURES
+                        or snapshot.temperature_curr not in KNOWN_TEMPERATURES
+                    )
+                )
+                kline_unavailable = (
+                    not daily_bars
+                    or stale_kline
+                    or current_atr is None
+                    or close is None
+                )
+                warnings = tuple(
+                    warning
+                    for warning, present in (
+                        ("holding_signal_unknown", signal_unknown),
+                        ("holding_kline_unavailable", kline_unavailable),
+                    )
+                    if present
+                )
+        industry = snapshot.industry if snapshot else ""
+        if industry:
+            industries[industry] += 1
+            industry_values[industry] += position.market_value
+        decisions.append(
+            HoldingDecision(
+                symbol=symbol,
+                name=position.name,
+                industry=industry,
+                action=action,
+                reason=reason,
+                initial_line=initial_line,
+                active_line=active_line,
+                atr=effective_atr,
+                close=close,
+                temperature_prev=snapshot.temperature_prev if snapshot else None,
+                temperature_curr=snapshot.temperature_curr if snapshot else None,
+                strength=snapshot.strength if snapshot else None,
+                phase=snapshot.phase if snapshot else None,
+                entry_hints=(
+                    _holding_entry_hints(snapshot) if market == "CN" else ()
+                ),
+                historical=historical,
+                position_started_for=(
+                    position_started_for if action == "SELL_PARTIAL" else None
+                ),
+                target_fraction=target_fraction,
+                estimated_shares=estimated_shares,
+                lot_size=lot_size,
+                overheat_signals=overheat_signals,
+                warnings=warnings,
+            )
+        )
+        new_state: dict[str, object] = {
+            "atr14": str(effective_atr) if effective_atr is not None else "",
+            "position_started_for": position_started_for,
+            "tracking_active": tracking_active,
+            "updated_for": as_of_date,
+        }
+        if initial_line is not None:
+            new_state["initial_line"] = str(initial_line)
+        if active_line is not None:
+            new_state["active_line"] = str(active_line)
+        for key in (
+            "overheat_trim_status",
+            "overheat_trim_target_qty",
+            "overheat_trim_filled_qty",
+            "overheat_trim_started_for",
+        ):
+            if isinstance(old_state.get(key), str):
+                new_state[key] = old_state[key]
+        new_positions[symbol] = new_state
+    return HoldingEvaluation(
+        decisions=tuple(decisions),
+        protection_state={"schema_version": 1, "positions": new_positions},
+        industry_counts=industries,
+        industry_values=dict(industry_values),
+    )
+
+
 def build_report(
     *,
     as_of_date: str,
@@ -2695,6 +3236,7 @@ def build_report(
     industry_contexts: Sequence[IndustryContext] = (),
     industry_context_status: Mapping[str, object] | None = None,
     estimated_api_cost_complete: bool = True,
+    real_holdings: RealHoldingInput | None = None,
 ) -> TrendReport:
     resolved_process_version = process_version or str(
         (metadata or {}).get("process_version")
@@ -2814,192 +3356,42 @@ def build_report(
             }
         )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
-    old_positions = _state_positions(prior_state)
-    holdings: list[HoldingDecision] = []
-    new_positions: dict[str, object] = {}
-    industries: Counter[str] = Counter()
-    industry_values: defaultdict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    for position in account.positions:
-        symbol = position.symbol
-        returned_snapshot = holding_snapshots.get(symbol)
-        snapshot = (
-            returned_snapshot
-            if returned_snapshot is not None
-            and returned_snapshot.as_of_date == as_of_date
-            else None
-        )
-        old = old_positions.get(symbol)
-        old_state = old if isinstance(old, Mapping) else {}
-        state_started_for = old_state.get("position_started_for")
-        position_started_for = (
-            state_started_for
-            if isinstance(state_started_for, str) and state_started_for
-            else as_of_date
-        )
-        overheat_trim_terminal = (
-            state_started_for == position_started_for
-            and old_state.get("overheat_trim_status") in {"complete", "below_lot"}
-        )
-        triggered = (
-            {symbol}
-            if _protection_was_triggered(symbol, old_state, watch_events)
-            else set()
-        )
-        action, reason = _holding_action(
-            symbol=symbol,
-            snapshot=snapshot,
-            triggered=triggered,
+    simulated_evaluation = _evaluate_holding_positions(
+        positions=account.positions,
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol=bars_by_symbol,
+        prior_state=prior_state,
+        watch_events=watch_events,
+        as_of_date=as_of_date,
+        market=market,
+        lot_sizes=lot_sizes,
+        current_exit_discipline=current_exit_discipline,
+        read_only_real=False,
+    )
+    holdings = list(simulated_evaluation.decisions)
+    new_positions = simulated_evaluation.protection_state["positions"]
+    assert isinstance(new_positions, dict)
+    industries = simulated_evaluation.industry_counts
+    industry_values = defaultdict(
+        lambda: Decimal("0"), simulated_evaluation.industry_values
+    )
+    real_decisions: tuple[HoldingDecision, ...] = ()
+    real_protection_state: dict[str, object] | None = None
+    if real_holdings is not None and real_holdings.status == "available":
+        real_evaluation = _evaluate_holding_positions(
+            positions=real_holdings.positions,
+            holding_snapshots=real_holdings.holding_snapshots,
+            bars_by_symbol=real_holdings.bars_by_symbol,
+            prior_state=real_holdings.prior_state,
+            watch_events=(),
+            as_of_date=as_of_date,
             market=market,
-            overheat_trim_terminal=overheat_trim_terminal,
+            lot_sizes=lot_sizes,
             current_exit_discipline=current_exit_discipline,
+            read_only_real=True,
         )
-        initial_line = _state_decimal(old_state, "initial_line")
-        active_line = _state_decimal(old_state, "active_line")
-        old_atr = _state_decimal(old_state, "atr14")
-        tracking_active = old_state.get("tracking_active") is True
-        if not current_exit_discipline and snapshot is not None and (
-            snapshot.boiling is True or snapshot.champagne is True
-        ):
-            tracking_active = True
-        if current_exit_discipline:
-            tracking_active = False
-        historical = not old_state
-        daily_bars = tuple(bars_by_symbol.get(symbol) or ())
-        current_atr, close, lows = _kline_metrics(
-            daily_bars, before=as_of_date, expected_date=as_of_date
-        )
-        stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
-        if active_line is None and current_atr is not None and close is not None:
-            protection_anchor = (
-                position.avg_cost_price
-                if current_exit_discipline
-                and position.avg_cost_price is not None
-                and position.avg_cost_price.is_finite()
-                and position.avg_cost_price > 0
-                else close
-            )
-            initial_line = active_line = (
-                protection_anchor - INITIAL_PROTECTION_ATR_MULTIPLE * current_atr
-            )
-        if active_line is not None and tracking_active and action in {
-            "HOLD", "SELL_PARTIAL"
-        }:
-            active_line = update_protection_line(
-                old_line=active_line,
-                boiling=True,
-                champagne=False,
-                prior_five_lows=lows,
-            )
-        if (active_line is None or stale_kline) and action == "HOLD":
-            action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
-        effective_atr = current_atr if current_atr is not None else old_atr
-        target_fraction: Decimal | None = None
-        estimated_shares: int | None = None
-        lot_size: int | None = None
-        overheat_signals: tuple[str, ...] = ()
-        warnings: tuple[str, ...] = ()
-        if action == "SELL_PARTIAL":
-            lot_size = (
-                100
-                if market == "CN"
-                else (lot_sizes or {}).get(symbol, 0)
-                if market == "HK"
-                else 1
-            )
-            if not isinstance(lot_size, int) or lot_size <= 0:
-                action, reason = "MANUAL_REVIEW", "holding_lot_size_unavailable"
-                lot_size = None
-            else:
-                target_fraction = OVERHEAT_TRIM_FRACTION
-                estimated_shares = _floor_to_lot(
-                    position.quantity * target_fraction, lot_size
-                )
-                overheat_signals = tuple(
-                    signal
-                    for signal in OVERHEAT_TRIM_SIGNALS
-                    if getattr(snapshot, signal) is True
-                )
-                signal_unknown = snapshot is None or any(
-                    signal is None
-                    for signal in (
-                        snapshot.right_side,
-                        snapshot.danger,
-                        snapshot.boiling,
-                        snapshot.champagne,
-                    )
-                ) or (
-                    market == "CN"
-                    and (
-                        snapshot.temperature_prev not in KNOWN_TEMPERATURES
-                        or snapshot.temperature_curr not in KNOWN_TEMPERATURES
-                    )
-                )
-                kline_unavailable = (
-                    not daily_bars
-                    or stale_kline
-                    or current_atr is None
-                    or close is None
-                )
-                warnings = tuple(
-                    warning
-                    for warning, present in (
-                        ("holding_signal_unknown", signal_unknown),
-                        ("holding_kline_unavailable", kline_unavailable),
-                    )
-                    if present
-                )
-        industry = snapshot.industry if snapshot else ""
-        if industry:
-            industries[industry] += 1
-            industry_values[industry] += position.market_value
-        holdings.append(
-            HoldingDecision(
-                symbol=symbol,
-                name=position.name,
-                industry=industry,
-                action=action,
-                reason=reason,
-                initial_line=initial_line,
-                active_line=active_line,
-                atr=effective_atr,
-                close=close,
-                temperature_prev=snapshot.temperature_prev if snapshot else None,
-                temperature_curr=snapshot.temperature_curr if snapshot else None,
-                strength=snapshot.strength if snapshot else None,
-                phase=snapshot.phase if snapshot else None,
-                entry_hints=(
-                    _holding_entry_hints(snapshot) if market == "CN" else ()
-                ),
-                historical=historical,
-                position_started_for=(
-                    position_started_for if action == "SELL_PARTIAL" else None
-                ),
-                target_fraction=target_fraction,
-                estimated_shares=estimated_shares,
-                lot_size=lot_size,
-                overheat_signals=overheat_signals,
-                warnings=warnings,
-            )
-        )
-        new_state: dict[str, object] = {
-            "atr14": str(effective_atr) if effective_atr is not None else "",
-            "position_started_for": position_started_for,
-            "tracking_active": tracking_active,
-            "updated_for": as_of_date,
-        }
-        if initial_line is not None:
-            new_state["initial_line"] = str(initial_line)
-        if active_line is not None:
-            new_state["active_line"] = str(active_line)
-        for key in (
-            "overheat_trim_status",
-            "overheat_trim_target_qty",
-            "overheat_trim_filled_qty",
-            "overheat_trim_started_for",
-        ):
-            if isinstance(old_state.get(key), str):
-                new_state[key] = old_state[key]
-        new_positions[symbol] = new_state
+        real_decisions = real_evaluation.decisions
+        real_protection_state = real_evaluation.protection_state
     sell_symbols = {
         holding.symbol for holding in holdings if holding.action == "SELL_ALL"
     }
@@ -3119,6 +3511,17 @@ def build_report(
         )
         for position in account.positions
     }
+    real_holding_signals = {
+        position.symbol: (
+            _holding_signal(
+                real_holdings.holding_snapshots[position.symbol],
+                market=market,
+            )
+            if real_holdings.holding_snapshots.get(position.symbol) is not None
+            else None
+        )
+        for position in real_holdings.positions
+    } if real_holdings is not None and real_holdings.status == "available" else {}
     excluded_signals = {
         symbol: [
             _candidate_signal(item, market=market)
@@ -3171,6 +3574,11 @@ def build_report(
             "holdings": holding_signals,
             "excluded": excluded_signals,
             "candidates": candidate_signals,
+            **(
+                {"real_holdings": real_holding_signals}
+                if real_holdings is not None and real_holdings.status == "available"
+                else {}
+            ),
         },
         metadata={
             **dict(metadata or {}),
@@ -3185,6 +3593,11 @@ def build_report(
             dict(drawdown_summary) if drawdown_summary is not None else None
         ),
         replay_evidence=None,
+        real_holdings=real_decisions,
+        real_holdings_status=(real_holdings.status if real_holdings is not None else None),
+        real_holdings_reason=(real_holdings.reason if real_holdings is not None else ""),
+        real_holdings_source=(dict(real_holdings.source) if real_holdings is not None else {}),
+        real_protection_state=real_protection_state,
     )
 
 
@@ -4268,6 +4681,28 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
     }
     if not legacy_v1:
         strategy_judgments["risk_skips"] = _json_value(report.risk_skips)
+    if report.real_holdings_status == "available":
+        strategy_judgments.update(
+            {
+                "real_holding_decisions": [
+                    _json_value(asdict(item)) for item in report.real_holdings
+                ],
+                "real_holding_decisions_status": "available",
+                "real_holding_decisions_source": _json_value(
+                    report.real_holdings_source
+                ),
+            }
+        )
+    elif report.real_holdings_status == "unavailable":
+        strategy_judgments.update(
+            {
+                "real_holding_decisions_status": "unavailable",
+                "real_holding_decisions_reason": report.real_holdings_reason,
+                "real_holding_decisions_source": _json_value(
+                    report.real_holdings_source
+                ),
+            }
+        )
     payload = {
         "schema_version": report.schema_version,
         "generated_at": report.generated_at,
@@ -4524,6 +4959,7 @@ def _payload_hashes(
     markdown: str,
     report_json: str,
     protection_state: Mapping[str, object] | None = None,
+    real_protection_state: Mapping[str, object] | None = None,
 ) -> dict[str, str]:
     markdown_bytes = markdown.encode("utf-8")
     json_bytes = report_json.encode("utf-8")
@@ -4541,6 +4977,17 @@ def _payload_hashes(
         ).encode("utf-8")
         payload["protection_state_sha256"] = hashlib.sha256(state_bytes).hexdigest()
         content += b"\0" + state_bytes
+    if real_protection_state is not None:
+        real_state_bytes = json.dumps(
+            real_protection_state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        payload["real_protection_state_sha256"] = hashlib.sha256(
+            real_state_bytes
+        ).hexdigest()
+        content += b"\0" + real_state_bytes
     payload["content_hash"] = hashlib.sha256(content).hexdigest()
     return payload
 
@@ -4554,10 +5001,18 @@ def _write_delivery_receipt(
     markdown: str,
     report_json: str,
     protection_state: Mapping[str, object],
+    real_protection_state: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     path.parent.mkdir(parents=True, exist_ok=True)
     frozen_state = json.loads(
         json.dumps(protection_state, ensure_ascii=False, sort_keys=True)
+    )
+    frozen_real_state = (
+        json.loads(
+            json.dumps(real_protection_state, ensure_ascii=False, sort_keys=True)
+        )
+        if real_protection_state is not None
+        else None
     )
     payload = {
         "status": status,
@@ -4566,7 +5021,17 @@ def _write_delivery_receipt(
         "markdown": markdown,
         "report_json": report_json,
         "protection_state": frozen_state,
-        **_payload_hashes(markdown, report_json, frozen_state),
+        **(
+            {"real_protection_state": frozen_real_state}
+            if frozen_real_state is not None
+            else {}
+        ),
+        **_payload_hashes(
+            markdown,
+            report_json,
+            frozen_state,
+            frozen_real_state,
+        ),
     }
     temp_path: Path | None = None
     try:
@@ -4613,6 +5078,11 @@ def read_delivery_receipt(
     if not isinstance(report_payload, dict):
         raise ValueError("delivery receipt report JSON must be an object")
     protection_state = payload.get("protection_state")
+    real_protection_state = payload.get("real_protection_state")
+    if real_protection_state is not None:
+        if not isinstance(real_protection_state, dict):
+            raise ValueError("delivery receipt real protection state is invalid")
+        _validate_protection_state(real_protection_state)
     if "protection_state" not in payload and "protection_state_sha256" not in payload:
         if status == "prepared":
             raise ValueError("delivery receipt has no embedded protection state")
@@ -4636,7 +5106,12 @@ def read_delivery_receipt(
     if protection_state != report_payload.get("protection_state"):
         raise ValueError("delivery receipt protection state mismatch")
     _validate_protection_state(protection_state)
-    hashes = _payload_hashes(markdown, report_json, protection_state)
+    hashes = _payload_hashes(
+        markdown,
+        report_json,
+        protection_state,
+        real_protection_state,
+    )
     if any(payload.get(key) != value for key, value in hashes.items()):
         raise ValueError("delivery receipt content hash mismatch")
     return payload
@@ -4668,6 +5143,9 @@ def _transition_delivery_receipt(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ),
         protection_state=receipt["protection_state"],  # type: ignore[arg-type]
+        real_protection_state=receipt.get("real_protection_state")  # type: ignore[arg-type]
+        if isinstance(receipt.get("real_protection_state"), Mapping)
+        else None,
     )
 
 
@@ -4903,6 +5381,11 @@ def _recover_receipt_report(
                 config.data_dir / "trend_a_share/protection_state.json",
                 receipt["protection_state"],  # type: ignore[arg-type]
             )
+            if isinstance(receipt.get("real_protection_state"), Mapping):
+                write_protection_state(
+                    config.data_dir / "trend_a_share/real_protection_state.json",
+                    receipt["real_protection_state"],  # type: ignore[arg-type]
+                )
         receipt = _transition_delivery_receipt(
             receipt_path,
             receipt,
@@ -5163,6 +5646,12 @@ def _attempt_report(
             expected_date=run_date,
             account_factory=account_factory,
         )
+        real_holdings = load_real_holding_input(
+            config.data_dir,
+            "CN",
+            state_path=config.data_dir
+            / "trend_a_share/real_protection_state.json",
+        )
         holding_ids: dict[str, int] = {}
         for position in account.positions:
             try:
@@ -5298,6 +5787,21 @@ def _attempt_report(
                 except ValueError:
                     holding_snapshots[symbol] = None
 
+        real_holdings, real_snapshot_rows, real_bars_by_symbol, real_only_count = (
+            enrich_real_holding_input(
+                real_holdings,
+                api=api,
+                quote=quote,
+                market="CN",
+                as_of_date=run_date,
+                kline_start=kline_start,
+                existing_holding_ids=holding_ids,
+                existing_rows_by_tm_id=rows_by_tm_id,
+                existing_holding_snapshots=holding_snapshots,
+                existing_bars_by_symbol=bars_by_symbol,
+            )
+        )
+
         candidate_pool_rows = [
             rows_by_tm_id[tm_id] for tm_id in sorted(component_ids)
             if tm_id in rows_by_tm_id
@@ -5317,7 +5821,7 @@ def _attempt_report(
         balance_after = _balance(api.get_account_balance())
 
         estimated_cost = (
-            unified_unit_cost * len(requested_ids)
+            unified_unit_cost * (len(requested_ids) + real_only_count)
             + sum(
                 (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
                 Decimal("0"),
@@ -5404,6 +5908,7 @@ def _attempt_report(
                 "Trend Animals",
                 "Futu CN calendar/QFQ daily K-line",
                 "Futu CN SIMULATE account",
+                "Eastmoney frozen real account snapshot (read-only)",
             ),
             estimated_api_cost=estimated_cost,
             actual_api_cost=actual_cost,
@@ -5426,6 +5931,7 @@ def _attempt_report(
             },
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
+            real_holdings=real_holdings,
         )
         report = replace(
             report,
@@ -5454,6 +5960,7 @@ def _attempt_report(
                 "update_status": update_rows,
                 "components": component_rows,
                 "snapshots": snapshot_rows,
+                "real_snapshots": list(real_snapshot_rows.values()),
                 "industries": industry_rows,
                 "industry_components": [
                     row
@@ -5470,6 +5977,7 @@ def _attempt_report(
             option_attention_broker_label=None,
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
+            real_holdings_input=real_holdings,
         )
         report = replace(
             report,
@@ -5496,11 +6004,17 @@ def _attempt_report(
                 + "\n"
             ),
             protection_state=report.protection_state,
+            real_protection_state=report.real_protection_state,
         )
         write_protection_state(
             config.data_dir / "trend_a_share/protection_state.json",
             report.protection_state,
         )
+        if report.real_protection_state is not None:
+            write_protection_state(
+                config.data_dir / "trend_a_share/real_protection_state.json",
+                report.real_protection_state,
+            )
         receipt = _transition_delivery_receipt(
             receipt_path,
             receipt,

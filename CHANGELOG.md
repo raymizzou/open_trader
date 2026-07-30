@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Added read-only `真实持仓` / `模拟盘持仓` tabs to the existing CN/HK/US
+  `盘中持续 · 已有持仓` report stage. Real-account decisions are frozen per
+  report and never affect simulated strategy actions, counts, risk, Kelly,
+  Feishu, or execution; legacy and unavailable snapshots remain explicit.
+- Hidden unavailable or missing 富途期权异动 buttons instead of rendering
+  misleading disabled controls; available rows retain the existing native
+  detail dialog. Verified the dashboard, acceptance, and three-market report
+  suites before the final live acceptance gate.
 - Prevented the final CN/HK/US cycle-status write from moving a live heartbeat
   backward after a long strict historical audit finishes. The phase transition
   now preserves the latest audit heartbeat until the next controller poll.

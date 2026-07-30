@@ -25,6 +25,7 @@ from open_trader.a_share_trend import (
     AccountSnapshot,
     CandidateInput,
     HoldingSnapshot,
+    RealHoldingInput,
     TrendReport,
     atr14,
     build_candidate_list,
@@ -3383,6 +3384,179 @@ def test_current_holding_without_state_becomes_historical_with_close_based_line(
     assert decision.historical is True
     assert (decision.initial_line, decision.active_line) == (Decimal("6"), Decimal("6"))
     assert built.protection_state["positions"]["600001"]["active_line"] == "6"
+
+
+def test_build_report_freezes_real_holding_decision_without_strategy_side_effect() -> None:
+    held = account("600001")
+    held = replace(
+        held,
+        positions=(
+            replace(held.positions[0], avg_cost_price=Decimal("9.5")),
+        ),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={
+                "broker": "eastmoney",
+                "broker_label": "东方财富",
+                "snapshot_period": "2026-07-14",
+                "source_kind": "statement",
+                "freshness_text": "非实时",
+                "read_only_text": "只读，不自动下单",
+            },
+            positions=held.positions,
+            holding_snapshots={"600001": holding("600001")},
+            bars_by_symbol={"600001": bars()},
+            prior_state=None,
+        ),
+    )
+
+    assert built.real_holdings[0].action == "HOLD"
+    assert built.real_holdings[0].active_line == Decimal("5.5")
+    assert built.real_protection_state["positions"]["600001"]["active_line"] == "5.5"
+    assert built.protection_state == {"schema_version": 1, "positions": {}}
+    assert built.buy_actions == ()
+    payload = trend_module._report_payload(built)
+    judgments = payload["strategy_judgments"]
+    assert judgments["real_holding_decisions"][0]["symbol"] == "600001"
+    assert judgments["real_holding_decisions_status"] == "available"
+    assert judgments["real_holding_decisions_source"]["broker"] == "eastmoney"
+    assert judgments["formal_actions"] == []
+    assert payload["signal_snapshots"]["real_holdings"]["600001"]["symbol"] == "600001"
+
+
+def test_real_continuing_protection_line_never_decreases() -> None:
+    held = account("600001")
+    held = replace(
+        held,
+        positions=(
+            replace(held.positions[0], avg_cost_price=Decimal("9.5")),
+        ),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={},
+            positions=held.positions,
+            holding_snapshots={"600001": holding("600001")},
+            bars_by_symbol={"600001": bars()},
+            prior_state={
+                "schema_version": 1,
+                "positions": {
+                    "600001": {
+                        "initial_line": "5.8",
+                        "active_line": "6",
+                        "atr14": "1",
+                        "position_started_for": "2026-07-01",
+                        "updated_for": "2026-07-13",
+                    }
+                },
+            },
+        ),
+    )
+
+    assert built.real_holdings[0].active_line == Decimal("6")
+    assert built.real_holdings[0].position_started_for is None
+    assert built.real_protection_state["positions"]["600001"]["position_started_for"] == (
+        "2026-07-01"
+    )
+
+
+def test_real_missing_signal_does_not_invent_a_protection_line() -> None:
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={},
+            positions=account("600001").positions,
+            holding_snapshots={
+                "600001": replace(holding("600001"), right_side=None)
+            },
+            bars_by_symbol={"600001": bars()},
+            prior_state=None,
+        ),
+    )
+
+    assert (built.real_holdings[0].action, built.real_holdings[0].reason) == (
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+    )
+    assert built.real_holdings[0].active_line is None
+    assert built.real_protection_state["positions"]["600001"].get("active_line") is None
+
+
+def test_unavailable_real_snapshot_is_distinct_from_empty_available_snapshot() -> None:
+    source = {
+        "broker": "phillips",
+        "broker_label": "辉立",
+        "snapshot_period": "",
+        "source_kind": "statement",
+        "freshness_text": "非实时",
+        "read_only_text": "只读，不自动下单",
+    }
+    unavailable = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=RealHoldingInput(
+            status="unavailable",
+            reason="未找到可用的辉立持仓结单",
+            source=source,
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state={"schema_version": 1, "positions": {"00700": {}}},
+        ),
+    )
+    available_empty = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source=source,
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+        ),
+    )
+
+    assert unavailable.real_holdings_status == "unavailable"
+    assert unavailable.real_holdings_reason == "未找到可用的辉立持仓结单"
+    assert unavailable.real_holdings == ()
+    assert unavailable.real_protection_state is None
+    assert available_empty.real_holdings_status == "available"
+    assert available_empty.real_holdings == ()
+    assert available_empty.real_protection_state == {"schema_version": 1, "positions": {}}
 
 
 def test_new_holding_protection_line_uses_merged_average_fill() -> None:

@@ -2653,23 +2653,30 @@ def _check_trend_option_buttons(
 ) -> None:
     actions = [
         item
-        for key in ("buy_actions", "hold_actions")
+        for key in ("buy_actions", "real_position_actions", "hold_actions")
         for item in (report.get(key) if isinstance(report.get(key), list) else [])
         if isinstance(item, Mapping)
     ]
+    available_actions = [
+        item
+        for item in actions
+        if isinstance(item.get("option_anomaly"), Mapping)
+        and item["option_anomaly"].get("available") is True
+    ]
     buttons = workspace.locator(".trend-option-button")
-    assert buttons.count() == len(actions), (
-        f"{broker} 正式买入和继续持有标的的期权按钮数量不匹配"
+    assert buttons.count() == len(available_actions), (
+        f"{broker} 可用期权按钮数量与已提供期权异动的标的不匹配"
+    )
+    assert workspace.locator(".trend-option-button:disabled").count() == 0, (
+        f"{broker} 仍显示不可用的期权按钮"
     )
     first_enabled: tuple[Any, Mapping[str, Any]] | None = None
-    for index, action in enumerate(actions):
+    for index, action in enumerate(available_actions):
         button = buttons.nth(index)
-        anomaly = action.get("option_anomaly")
-        available = isinstance(anomaly, Mapping) and anomaly.get("available") is True
-        assert button.is_disabled() is (not available), (
-            f"{broker} {action.get('symbol')} 期权按钮可用状态不匹配"
+        assert not button.is_disabled(), (
+            f"{broker} {action.get('symbol')} 可用期权按钮错误置灰"
         )
-        if available and first_enabled is None:
+        if first_enabled is None:
             first_enabled = (button, action)
 
     headings = workspace.locator(".cn-trend-table thead th").count()
@@ -2697,6 +2704,103 @@ def _check_trend_option_buttons(
     )
     assert workspace.locator(".cn-trend-table thead th").count() == headings, (
         f"{broker} 打开期权详情后趋势表头数量发生变化"
+    )
+
+
+def _check_trend_holding_tabs(
+    workspace: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    """Check the read-only real-account tab without changing strategy facts."""
+    section = workspace.locator("[data-trend-holding-section]")
+    assert section.count() == 1, f"{broker} 趋势报告持仓区块数量不是 1"
+    tabs = section.locator("[data-trend-holding-view]")
+    assert tabs.count() == 2, f"{broker} 趋势报告持仓 Tab 数量不是 2"
+    assert [tabs.nth(index).inner_text().strip() for index in range(2)] == [
+        "真实持仓", "模拟盘持仓",
+    ], f"{broker} 趋势报告持仓 Tab 文案或顺序不正确"
+    assert tabs.nth(0).get_attribute("aria-selected") == "true", (
+        f"{broker} 趋势报告默认未展示真实持仓"
+    )
+    assert tabs.nth(1).get_attribute("aria-selected") == "false", (
+        f"{broker} 趋势报告模拟盘 Tab 默认状态不正确"
+    )
+
+    headings = (
+        "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+        "当前判断", "活动保护线", "持仓提示",
+    )
+    real_panel = section.locator('[data-trend-holding-panel="real"]')
+    simulate_panel = section.locator('[data-trend-holding-panel="simulate"]')
+    assert real_panel.count() == 1 and simulate_panel.count() == 1, (
+        f"{broker} 趋势报告持仓面板缺失"
+    )
+    status = report.get("real_position_status")
+    real_table = real_panel.locator(".cn-trend-table")
+    if status == "available":
+        assert real_table.count() == 1, f"{broker} 真实持仓表格缺失"
+        assert real_panel.locator(".cn-trend-table thead th").all_inner_texts() == list(headings), (
+            f"{broker} 真实持仓列定义发生变化"
+        )
+        source = report.get("real_position_source")
+        if isinstance(source, Mapping) and source:
+            source_text = real_panel.inner_text()
+            assert "只读" in source_text, f"{broker} 真实持仓未标明只读"
+        real_items = report.get("real_position_actions")
+        real_items = real_items if isinstance(real_items, list) else []
+        real_rows = real_panel.locator(".cn-trend-card")
+        assert real_rows.count() == len(real_items), (
+            f"{broker} 真实持仓行数与 API 不一致"
+        )
+        real_text = real_panel.inner_text()
+        for item in real_items:
+            if not isinstance(item, Mapping):
+                continue
+            for value in (item.get("symbol"), item.get("name")):
+                if value:
+                    assert str(value) in real_text, f"{broker} 真实持仓缺少 {value}"
+    elif status == "unavailable":
+        assert real_table.count() == 0, f"{broker} 不可用真实持仓仍显示表格"
+        reason = str(report.get("real_position_reason") or "数据未提供")
+        assert reason in real_panel.inner_text(), f"{broker} 真实持仓缺少不可用原因"
+    elif status == "legacy":
+        assert real_table.count() == 0, f"{broker} 旧报告错误显示真实持仓表格"
+        assert "当前报告未包含真实持仓判断" in real_panel.inner_text(), (
+            f"{broker} 旧报告缺少真实持仓兼容提示"
+        )
+    elif status is not None:
+        raise AssertionError(f"{broker} 真实持仓状态无效")
+
+    assert simulate_panel.locator(".cn-trend-table").count() == 1, (
+        f"{broker} 模拟盘持仓表格缺失"
+    )
+    assert simulate_panel.locator(".cn-trend-table thead th").all_inner_texts() == list(headings), (
+        f"{broker} 模拟盘持仓列定义发生变化"
+    )
+    simulated_items = report.get("hold_actions")
+    simulated_items = simulated_items if isinstance(simulated_items, list) else []
+    assert simulate_panel.locator(".cn-trend-card").count() == len(simulated_items), (
+        f"{broker} 模拟盘持仓行数与 API 不一致"
+    )
+
+    tabs.nth(1).click()
+    assert tabs.nth(0).get_attribute("aria-selected") == "false", (
+        f"{broker} 切换模拟盘后真实持仓仍被选中"
+    )
+    assert tabs.nth(1).get_attribute("aria-selected") == "true", (
+        f"{broker} 模拟盘 Tab 未选中"
+    )
+    assert section.locator('[data-trend-holding-panel="simulate"]:visible').count() == 1, (
+        f"{broker} 模拟盘持仓面板切换失败"
+    )
+    assert section.locator('[data-trend-holding-panel="real"]:visible').count() == 0, (
+        f"{broker} 切换模拟盘后真实持仓面板仍可见"
+    )
+    tabs.nth(0).click()
+    assert tabs.nth(0).get_attribute("aria-selected") == "true", (
+        f"{broker} 无法切回真实持仓"
+    )
+    assert section.locator('[data-trend-holding-panel="real"]:visible').count() == 1, (
+        f"{broker} 无法恢复真实持仓面板"
     )
 
 
@@ -2779,6 +2883,7 @@ def _check_account_holdings(
                         f"{broker} 趋势报告缺少 {label}日期"
                     )
                 _check_trend_option_buttons(page, workspace, report, broker)
+                _check_trend_holding_tabs(workspace, report, broker)
                 if reports_dir is not None and broker in TREND_REPORT_BROKERS:
                     _check_trend_artifact_projection(reports_dir, broker, report)
                 if (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760:
@@ -2899,10 +3004,11 @@ def _check_account_holdings(
         )
         stage_texts = workspace.locator(".cn-trend-stage").all_inner_texts()
         _check_action_trend_stages(stage_texts, report, broker)
+        _check_trend_holding_tabs(workspace, report, broker)
         expected_stage_tables = 3 + int(
             isinstance(report.get("review_actions"), list)
             and bool(report.get("review_actions"))
-        )
+        ) + int(report.get("real_position_status") == "available")
         assert workspace.locator(".cn-trend-table").count() == expected_stage_tables, (
             f"{broker} 趋势报告动作表数量与 API 不一致"
         )
