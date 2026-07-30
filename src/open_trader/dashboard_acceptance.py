@@ -359,7 +359,7 @@ def _account_sync_errors(payload: Mapping[str, Any]) -> list[str]:
 def _account_sync_controller_errors(
     root: Path, *, expected_root: Path, expected_sha: str, now: datetime | None = None,
 ) -> list[str]:
-    path = root / "data/account_sync/controller_status.json"
+    path = _project_data_dir(root) / "account_sync/controller_status.json"
     try:
         controller = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

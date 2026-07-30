@@ -8322,22 +8322,24 @@ function accountHoldingGroups() {
       ? state.dashboard.broker_positions : [])
       .filter((position) => brokerKey(position) === broker)
       .map((position, index) => {
+        const accepted = acceptedPositionForDisplay(position);
         const matching = getHoldings().find((holding) => (
           rowBrokers(holding).includes(broker)
-          && String(holding.market || "").toUpperCase() === String(position.market || "").toUpperCase()
-          && String(holding.symbol || "").toUpperCase() === String(position.symbol || "").toUpperCase()
+          && String(holding.market || "").toUpperCase() === String(accepted.market || "").toUpperCase()
+          && String(holding.symbol || "").toUpperCase() === String(accepted.symbol || "").toUpperCase()
         )) || {};
         const holding = {
           ...matching,
-          ...position,
+          ...accepted,
           brokers: broker,
-          total_quantity: position.quantity,
-          avg_cost_price: position.cost_price,
+          total_quantity: accepted.total_quantity,
+          avg_cost_price: accepted.avg_cost_price,
         };
         return {
           key: accountHoldingKey(broker, holding, index), broker, holding,
-          display: accountDisplayRow(holding, position, summary, portfolioTotal),
-          snapshot_market_value_hkd: position.market_value_hkd, index,
+          acceptedPosition: accepted,
+          display: accountDisplayRow(holding, accepted, summary, portfolioTotal),
+          snapshot_market_value_hkd: accepted.market_value_hkd, index,
         };
       });
     return {broker, profile, summary, rows};
@@ -8350,11 +8352,43 @@ function accountHoldingGroups() {
     const liveAccountTotal = quoteAdjustedTotal(group.summary.portfolio_value_hkd, group.rows);
     group.rows.forEach((row) => {
       const marketValue = numericValue(row.display.market_value_hkd);
-      row.display.account_weight = percentValue(marketValue, liveAccountTotal);
-      row.display.portfolio_weight = percentValue(marketValue, livePortfolioTotal);
+      if (!hasValue(row.acceptedPosition?.account_weight)
+          && !hasValue(row.acceptedPosition?.account_weight_hkd)) {
+        row.display.account_weight = percentValue(marketValue, liveAccountTotal);
+      }
+      if (!hasValue(row.acceptedPosition?.portfolio_weight)
+          && !hasValue(row.acceptedPosition?.portfolio_weight_hkd)) {
+        row.display.portfolio_weight = percentValue(marketValue, livePortfolioTotal);
+      }
     });
   });
   return groups;
+}
+
+function acceptedPositionForDisplay(position) {
+  const existingMarketValueHkd = firstPresent(
+    position.market_value_hkd,
+    position.market_value_in_hkd,
+    position.value_hkd,
+  );
+  const marketValue = numericValue(position.market_value);
+  const fxToHkd = numericValue(position.fx_to_hkd);
+  const marketValueHkd = hasValue(existingMarketValueHkd)
+    ? existingMarketValueHkd
+    : marketValue !== null && fxToHkd !== null && fxToHkd > 0
+      ? (marketValue * fxToHkd).toFixed(2)
+      : "";
+  return {
+    ...position,
+    market_value_hkd: marketValueHkd,
+    total_quantity: firstPresent(position.total_quantity, position.quantity),
+    avg_cost_price: firstPresent(position.avg_cost_price, position.cost_price),
+    last_price: firstPresent(position.last_price, position.price),
+    unrealized_pnl: firstPresent(position.unrealized_pnl, position.pnl),
+    unrealized_pnl_pct: firstPresent(position.unrealized_pnl_pct, position.pnl_pct),
+    account_weight: firstPresent(position.account_weight, position.account_weight_hkd),
+    portfolio_weight: firstPresent(position.portfolio_weight, position.portfolio_weight_hkd),
+  };
 }
 
 function quoteAdjustedTotal(snapshotTotal, rows) {
@@ -8372,20 +8406,48 @@ function quoteAdjustedTotal(snapshotTotal, rows) {
 function accountDisplayRow(holding, detail, summary, portfolioTotal) {
   const quote = quoteForHolding(holding);
   const hasQuotePrice = numericValue(quote && quote.last_price) > 0;
+  const quantity = firstPresent(detail?.quantity, detail?.total_quantity, holding.total_quantity);
+  const costPrice = firstPresent(detail?.cost_price, detail?.avg_cost_price, holding.avg_cost_price);
+  const acceptedPnlPercent = firstPresent(
+    detail?.unrealized_pnl_pct,
+    detail?.pnl_pct,
+  );
+  const acceptedAccountWeight = firstPresent(
+    detail?.account_weight,
+    detail?.account_weight_hkd,
+    holding.account_weight,
+    holding.account_weight_hkd,
+  );
+  const acceptedPortfolioWeight = firstPresent(
+    detail?.portfolio_weight,
+    detail?.portfolio_weight_hkd,
+    holding.portfolio_weight,
+    holding.portfolio_weight_hkd,
+  );
   const display = quoteAdjustedHolding({
     ...holding,
     ...(detail || {}),
-    total_quantity: detail ? detail.quantity : holding.total_quantity,
+    total_quantity: quantity,
+    avg_cost_price: costPrice,
   }, quote);
   const marketValue = numericValue(display.market_value_hkd);
   return {
     ...display,
-    total_quantity: formatPlain(detail ? detail.quantity : holding.total_quantity),
-    avg_cost_price: formatPlain(detail ? detail.cost_price : holding.avg_cost_price),
-    account_weight: percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
-    portfolio_weight: percentValue(marketValue, numericValue(portfolioTotal)),
+    total_quantity: formatPlain(quantity),
+    avg_cost_price: formatPlain(costPrice),
+    account_weight: firstPresent(
+      acceptedAccountWeight,
+      percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
+    ) || "-",
+    portfolio_weight: firstPresent(
+      acceptedPortfolioWeight,
+      percentValue(marketValue, numericValue(portfolioTotal)),
+    ) || "-",
     unrealized_pnl_pct: detail && !hasQuotePrice
-      ? percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value))
+      ? firstPresent(
+        acceptedPnlPercent,
+        percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value)),
+      ) || "-"
       : formatPlain(display.unrealized_pnl_pct),
   };
 }

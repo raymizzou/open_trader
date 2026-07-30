@@ -4836,13 +4836,19 @@ def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accept
     assert any("tiger 已接受持仓数量不匹配" in error for error in errors)
 
 
-def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(tmp_path: Path) -> None:
+def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(
+        dashboard_acceptance, "_project_data_dir", lambda _root: data_dir
+    )
     now = datetime.fromisoformat("2026-07-30T12:10:00+08:00")
     assert dashboard_acceptance._account_sync_controller_errors(
         tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
     ) == ["账户同步控制器状态缺失"]
 
-    status_path = tmp_path / "data/account_sync/controller_status.json"
+    status_path = data_dir / "account_sync/controller_status.json"
     status_path.parent.mkdir(parents=True)
     status_path.write_text(json.dumps({
         "pid": 9999999,
@@ -4857,6 +4863,30 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(tmp_pat
 
     for required in ("PID 不存活", "工作目录不匹配", "Git SHA 不匹配", "心跳不新鲜"):
         assert any(required in error for error in errors)
+
+
+def test_acceptance_reads_account_sync_controller_from_shared_project_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = tmp_path / "worktree"
+    shared_data = tmp_path / "shared-data"
+    worktree.mkdir()
+    now = datetime(2026, 7, 30, 12, 10, tzinfo=dashboard_acceptance.SHANGHAI)
+    status_path = shared_data / "account_sync/controller_status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps({
+        "pid": os.getpid(),
+        "working_directory": str(worktree),
+        "git_sha": "accepted",
+        "heartbeat_at": now.isoformat(),
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard_acceptance, "_project_data_dir", lambda _root: shared_data
+    )
+
+    assert dashboard_acceptance._account_sync_controller_errors(
+        worktree, expected_root=worktree, expected_sha="accepted", now=now,
+    ) == []
 
 
 def test_acceptance_allows_recent_frozen_report_after_friday_close() -> None:

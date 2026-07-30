@@ -3774,6 +3774,47 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
     assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
 
 
+def test_dashboard_preserves_orphan_accepted_position_fields_and_derives_hkd_value() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  summary: {portfolio_value_hkd: "6240"},
+  broker_summaries: [{broker: "tiger", portfolio_value_hkd: "6240", holding_count: 1}],
+  account_sync: {brokers: {tiger: {status: "ok", display: "同步正常"}}},
+  broker_positions: [{
+    broker: "tiger", market: "US", symbol: "ORPHAN", name: "Orphan accepted",
+    currency: "USD", quantity: "2", cost_price: "40", last_price: "50",
+    market_value: "100", cost_value: "80", fx_to_hkd: "7.8",
+    unrealized_pnl: "20", unrealized_pnl_pct: "25.00%",
+    account_weight: "7.80%", portfolio_weight_hkd: "1.25%",
+  }],
+  holdings: [], cash_rows: [],
+};
+state.quotes = {};
+const row = accountHoldingGroups().find((group) => group.broker === "tiger").rows[0].display;
+console.log(JSON.stringify({
+  marketValueHkd: row.market_value_hkd,
+  quantity: row.total_quantity,
+  costPrice: row.avg_cost_price,
+  lastPrice: row.last_price,
+  pnl: row.unrealized_pnl,
+  pnlPercent: row.unrealized_pnl_pct,
+  accountWeight: row.account_weight,
+  portfolioWeight: row.portfolio_weight,
+}));
+''')
+
+    assert json.loads(output) == {
+        "marketValueHkd": "780.00",
+        "quantity": "2",
+        "costPrice": "40",
+        "lastPrice": "50",
+        "pnl": "20",
+        "pnlPercent": "25.00%",
+        "accountWeight": "7.80%",
+        "portfolioWeight": "1.25%",
+    }
+
+
 def test_dashboard_account_rows_reprice_with_unmapped_assets_and_negative_cash() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
