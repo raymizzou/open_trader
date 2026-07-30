@@ -5207,7 +5207,7 @@ console.log(JSON.stringify({urls,html:panel.innerHTML}));
         "老虎", "GPN", "TOST", "正式买入计划",
     ):
         assert text in html
-    for text in ("模拟盘执行状态", "模拟持仓", "实盘执行辅助", "真实持仓"):
+    for text in ("模拟盘执行状态", "模拟持仓", "实盘执行辅助"):
         assert text not in html
 
 
@@ -5812,12 +5812,12 @@ window.fetch=async (input)=>{{
             "真实持仓", "模拟盘持仓", "趋势报告",
         ]
         assert all((tab.bounding_box() or {})["height"] >= 44 for tab in tabs.all())
-        assert section.locator('[aria-selected="true"]').inner_text().strip() == "真实持仓"
+        assert section.locator('[role="tab"][data-account-view][aria-selected="true"]').inner_text().strip() == "真实持仓"
         header = section.locator(".account-section-header")
         header.evaluate("node => { node.dataset.viewStable = 'yes'; }")
         tabs.first.focus()
         tabs.first.press("End")
-        assert section.locator('[aria-selected="true"]').inner_text().strip() == "趋势报告"
+        assert section.locator('[role="tab"][data-account-view][aria-selected="true"]').inner_text().strip() == "趋势报告"
         assert header.get_attribute("data-view-stable") == "yes"
         assert page.evaluate("document.activeElement.dataset.accountView") == "report"
         review_disclosure = section.locator("details.trend-review-disclosure")
@@ -6165,7 +6165,7 @@ const usOrder=["优先处理 · 卖出触发","美股常规交易时段 · 正�
 if (usOrder.some((index)=>index<0) ||
     !usOrder.every((index,i)=>i===0||usOrder[i-1]<index)) throw new Error(us);
 if (!us.includes('class="cn-trend-report"') ||
-    (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
+        (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
     !us.includes('class="cn-trend-card"') ||
     us.includes("今日执行检查") || !us.includes("筛选价（Trend Animals）") ||
     us.includes('class="trend-discipline"') ||
@@ -6560,7 +6560,7 @@ const html = renderTrendReportWorkspace({
 });
 const forbidden = [
   "允许 · 建议", "跳过 · 建议", "计划止损风险", "正常成本", "决定性约束",
-  "待执行", "模拟盘执行状态", "模拟持仓", "实盘执行辅助", "真实持仓",
+    "待执行", "模拟盘执行状态", "模拟持仓", "实盘执行辅助",
 ];
 for (const text of forbidden) {
   if (html.includes(text)) throw new Error(text + "\n" + html);
@@ -6985,10 +6985,10 @@ const html=renderTrendReportWorkspace({
   market:"CN",buy_window:"09:30–10:00",counts:{},sell_actions:[],buy_actions:[],
   hold_actions:[],audit:{},
 });
-if ((html.match(/class="cn-trend-table"/g) || []).length !== 3 ||
+    if ((html.match(/class="cn-trend-table"/g) || []).length !== 3 ||
     !html.includes("筛选价（Trend Animals）") ||
     !html.includes("执行参考价") ||
-    (html.match(/<p>无<\/p>/g) || []).length !== 3 ||
+        (html.match(/<p>无<\/p>/g) || []).length !== 3 ||
     html.includes("需要确认 · 人工复核")) throw new Error(html);
 console.log("ok");
 ''')
@@ -7060,7 +7060,8 @@ if ((usBuyHold.match(/data-option-anomaly-open/g) || []).length !== 2) throw new
 if ((usBuyHold.match(/<dialog class="trend-option-dialog"/g) || []).length !== 2) throw new Error(usBuyHold);
 if (!usBuyHold.includes('aria-label="富途期权异动详情：VIXY 波动率ETF"')) throw new Error(usBuyHold);
 if (!usBuyHold.includes("&lt;b&gt;不得执行&lt;/b&gt;") || !usBuyHold.includes("&lt;img src=x onerror=alert(1)&gt;")) throw new Error(usBuyHold);
-if (!usBuyHold.includes('disabled title="富途未返回该标的期权异动"')) throw new Error(usBuyHold);
+if (usBuyHold.includes('disabled title="富途未返回该标的期权异动"')) throw new Error(usBuyHold);
+if ((usBuyHold.match(/>期权异动<\/button>/g) || []).length !== 2) throw new Error(usBuyHold);
 if (usSell.includes("期权异动") || usReview.includes("期权异动")) throw new Error(usSell + usReview);
 if (cn.includes("期权异动")) throw new Error(cn);
 if ((usBuy.match(/<th scope="col">/g) || []).length !== 16) throw new Error(usBuy);
@@ -7076,6 +7077,38 @@ const closeTarget = {
 };
 if (!handleTrendOptionDialog({target:openTarget}) || opened !== 1) throw new Error("dialog did not open");
 if (!handleTrendOptionDialog({target:closeTarget}) || closed !== 1) throw new Error("dialog did not close");
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_renders_real_and_simulated_trend_holding_tabs() -> None:
+    output = run_dashboard_js(r'''
+const report = (market) => ({
+  available:true, market, broker_label:market === "CN" ? "东方财富" : "老虎",
+  market_label:market === "CN" ? "A股" : market === "HK" ? "港股" : "美股",
+  report_date:"2026-07-30", data_date:"2026-07-29", generated_at:"now",
+  account_status:"已更新", buy_window:"常规时段", counts:{},
+  sell_actions:[], buy_actions:[], review_actions:[], risk_skips:[], audit:{},
+  hold_actions:[{action:"HOLD",symbol:"SIM",name:"模拟",reason:"trend_intact"}],
+  real_position_status:"available",
+  real_position_source:{broker_label:"老虎",snapshot_period:"2026-07-29",source_kind:"statement",freshness_text:"非实时",read_only_text:"只读，不自动下单"},
+  real_position_actions:[
+    {action:"HOLD",symbol:"REAL",name:"真实",reason:"trend_intact"},
+    {action:"MANUAL_REVIEW",symbol:"CHECK",name:"复核",reason:"holding_signal_unknown"},
+  ],
+});
+for (const market of ["CN", "HK", "US"]) {
+  const html = renderTrendReportWorkspace(report(market));
+  const tabs = html.match(/data-trend-holding-view="[^"]+"/g) || [];
+  if (tabs.length !== 2 || !html.includes(">真实持仓</button>") || !html.includes(">模拟盘持仓</button>")) throw new Error(html);
+  if (!html.includes('data-trend-holding-view="real" aria-selected="true"')) throw new Error(html);
+  if (html.includes("我的真实持仓") || html.includes("我的模拟盘持仓")) throw new Error(html);
+  const holding = html.match(/<section class="trend-stage cn-trend-stage cn-trend-hold"[\s\S]*?<\/section>/)?.[0] || "";
+  if ((holding.match(/<th scope="col">标的<\/th>/g) || []).length !== 2) throw new Error(html);
+  if ((holding.match(/<th scope="col">持仓提示<\/th>/g) || []).length !== 2) throw new Error(html);
+}
 console.log("ok");
 ''')
 

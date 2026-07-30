@@ -287,6 +287,7 @@ function bindEvents() {
   elements["broker-summary-cards"].addEventListener("click", handleBrokerSelection);
   elements["account-holdings"].addEventListener("click", (event) => {
     if (handleTrendOptionDialog(event)) return;
+    if (handleTrendHoldingTab(event)) return;
     const industryMetric = event.target.closest?.("[data-trend-industry-help]");
     if (industryMetric) {
       if (industryMetric.dataset.trendIndustryHelpOpen === "pinned") {
@@ -373,6 +374,7 @@ function bindEvents() {
     if (event.key === "Escape") closeTrendIndustryHelp();
   });
   elements["account-holdings"].addEventListener("keydown", handleAccountViewTabKeydown);
+  elements["account-holdings"].addEventListener("keydown", handleTrendHoldingTabKeydown);
   elements["account-holdings"].addEventListener("change", handleStatementFileSelection);
   if (elements["trade-actions"]) {
     elements["trade-actions"].addEventListener("click", (event) => {
@@ -397,8 +399,10 @@ function bindEvents() {
   elements["return-to-portfolio"].addEventListener("click", returnToPortfolio);
   elements["trend-report-workspace"].addEventListener("click", (event) => {
     if (handleTrendOptionDialog(event)) return;
+    if (handleTrendHoldingTab(event)) return;
     if (event.target.closest("[data-close-trend-report]")) returnToPortfolio();
   });
+  elements["trend-report-workspace"].addEventListener("keydown", handleTrendHoldingTabKeydown);
   elements["open-standard-backtest"].addEventListener("click", openStandardBacktest);
   elements["backtest-symbol-source"].addEventListener("click", handleBacktestChoice);
   elements["backtest-strategy-cards"].addEventListener("click", handleBacktestChoice);
@@ -3343,13 +3347,10 @@ function renderTrendOptionIdentityCell(item) {
   const anomaly = item?.option_anomaly && typeof item.option_anomaly === "object"
     ? item.option_anomaly : {};
   const identity = escapeHtml(trendIdentity(item) || "数据未提供");
-  const reason = hasValue(anomaly.reason)
-    ? formatPlain(anomaly.reason)
-    : "富途未返回该标的期权异动";
   const available = anomaly.available === true;
   const button = available
     ? `<button class="trend-option-button" type="button" data-option-anomaly-open aria-haspopup="dialog">期权异动</button>`
-    : `<button class="trend-option-button" type="button" disabled title="${escapeHtml(reason)}" aria-label="期权异动不可用：${escapeHtml(reason)}">期权异动</button>`;
+    : "";
   return `<td data-label="标的"><strong>${identity}</strong>${button}${available ? renderTrendOptionDialog(item, anomaly) : ""}</td>`;
 }
 
@@ -3580,7 +3581,145 @@ function syncCnTrendBuyAccessibility() {
   );
 }
 
+function trendHoldingActionLabel(item) {
+  return {
+    SELL_ALL: "全部卖出",
+    SELL_PARTIAL: "止盈减仓 30%",
+    MANUAL_REVIEW: "人工复核",
+    HOLD: "继续持有",
+  }[item?.action] || (hasValue(item?.action) ? "数据未提供" : "继续持有");
+}
+
+function trendHoldingHeadings() {
+  return [
+    "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+    "当前判断", "活动保护线", "持仓提示",
+  ];
+}
+
+function trendRealHoldingStatus(report) {
+  return report?.real_position_status ?? report?.real_holdings_status;
+}
+
+function trendRealHoldingReason(report) {
+  return report?.real_position_reason ?? report?.real_holdings_reason;
+}
+
+function trendRealHoldingSource(report) {
+  const source = report?.real_position_source ?? report?.real_holdings_source;
+  return source && typeof source === "object" ? source : {};
+}
+
+function renderTrendHoldingRows(items, report) {
+  const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
+  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
+    ${optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
+    ${renderTrendCell("动作", trendHoldingActionLabel(item))}
+    ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
+    ${renderTrendCell("温度变化", trendTemperature(item))}
+    ${renderTrendCell("节气", item.phase)}
+    ${renderTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : null)}
+    ${renderTrendCell("行业", item.industry)}
+    ${renderTrendCell("当前判断", trendReasonLabel(item, report))}
+    ${renderTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : null)}
+    ${renderTrendCell("持仓提示", trendHints(item))}
+  </tr>`);
+}
+
+function renderTrendHoldingTable(items, report) {
+  const headings = trendHoldingHeadings();
+  const rows = renderTrendHoldingRows(items, report);
+  return `<table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>${rows.length ? "" : "<p>无</p>"}`;
+}
+
+function renderTrendHoldingSource(report) {
+  const status = trendRealHoldingStatus(report);
+  if (status !== "available") return "";
+  const source = trendRealHoldingSource(report);
+  const broker = source.broker_label || report?.broker_label || "数据源";
+  const period = source.snapshot_period || "数据未提供";
+  const kind = source.source_kind === "live_account" ? "账户" : "结单";
+  const freshness = source.freshness_text || "数据未提供";
+  const readOnly = source.read_only_text || "只读，不自动下单";
+  return `<p class="cn-trend-price-sources">${escapeHtml(formatPlain(`${broker} · ${kind} ${period} · ${freshness} · ${readOnly}`))}</p>`;
+}
+
+function renderTrendHoldingPanel(report, view, items) {
+  const status = trendRealHoldingStatus(report);
+  if (view === "real") {
+    if (status === undefined || status === null) {
+      return '<p class="account-empty">当前报告未包含真实持仓判断</p>';
+    }
+    if (status === "legacy") {
+      return '<p class="account-empty">当前报告未包含真实持仓判断</p>';
+    }
+    if (status === "unavailable") {
+      const reason = trendRealHoldingReason(report) || "数据未提供";
+      return `<p class="account-empty missing-text">真实持仓数据不可用：${escapeHtml(formatPlain(reason))}</p>`;
+    }
+    const rows = Array.isArray(items) ? items : [];
+    return `${renderTrendHoldingSource(report)}${renderTrendHoldingTable(rows, report)}`;
+  }
+  const rows = Array.isArray(items) ? items : [];
+  return renderTrendHoldingTable(rows, report);
+}
+
+function renderTrendHoldingStage(report) {
+  const realItems = Array.isArray(report?.real_position_actions) ? report.real_position_actions : [];
+  const simulatedItems = Array.isArray(report?.hold_actions) ? report.hold_actions : [];
+  return `<section class="trend-stage cn-trend-stage cn-trend-hold" data-trend-holding-section>
+    <h2>盘中持续 · 已有持仓</h2>
+    <div class="account-view-tabs" role="tablist" aria-label="趋势报告持仓视图">
+      <button id="trend-holding-real-tab" class="account-view-tab" type="button" role="tab" data-trend-holding-view="real" aria-selected="true" tabindex="0" aria-controls="trend-holding-real-panel">真实持仓</button>
+      <button id="trend-holding-simulate-tab" class="account-view-tab" type="button" role="tab" data-trend-holding-view="simulate" aria-selected="false" tabindex="-1" aria-controls="trend-holding-simulate-panel">模拟盘持仓</button>
+    </div>
+    <div id="trend-holding-real-panel" class="trend-holding-panel" role="tabpanel" aria-labelledby="trend-holding-real-tab" data-trend-holding-panel="real">
+      ${renderTrendHoldingPanel(report, "real", realItems)}
+    </div>
+    <div id="trend-holding-simulate-panel" class="trend-holding-panel" role="tabpanel" aria-labelledby="trend-holding-simulate-tab" data-trend-holding-panel="simulate" hidden>
+      ${renderTrendHoldingPanel(report, "simulate", simulatedItems)}
+    </div>
+  </section>`;
+}
+
+function handleTrendHoldingTab(event) {
+  const button = event?.target?.closest?.("[data-trend-holding-view]");
+  if (!button) return false;
+  const section = button.closest("[data-trend-holding-section]");
+  if (!section) return false;
+  const view = button.dataset.trendHoldingView;
+  if (!["real", "simulate"].includes(view)) return false;
+  section.querySelectorAll("[data-trend-holding-view]").forEach((tab) => {
+    const selected = tab.dataset.trendHoldingView === view;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+  section.querySelectorAll("[data-trend-holding-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.trendHoldingPanel !== view;
+  });
+  return true;
+}
+
+function handleTrendHoldingTabKeydown(event) {
+  const tab = event?.target?.closest?.("[data-trend-holding-view]");
+  if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const section = tab.closest("[data-trend-holding-section]");
+  if (!section) return;
+  event.preventDefault();
+  const tabs = [...section.querySelectorAll("[data-trend-holding-view]")];
+  const current = tabs.indexOf(tab);
+  const index = event.key === "Home" ? 0
+    : event.key === "End" ? tabs.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  handleTrendHoldingTab({target: tabs[index]});
+  tabs[index].focus();
+}
+
 function renderTrendSellOrHoldStage(title, items, kind, report) {
+  if (kind === "hold") {
+    const rows = renderTrendHoldingRows(items, report);
+    return renderCnTrendTable(title, kind, trendHoldingHeadings(), rows);
+  }
   const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
@@ -4165,7 +4304,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const reviewStage = Array.isArray(report.review_actions) && report.review_actions.length
     ? sellOrHold("需要确认 · 人工复核", report.review_actions, "review", report)
     : "";
-  const holdStage = sellOrHold("盘中持续 · 已有持仓", report.hold_actions, "hold", report);
+  const holdStage = renderTrendHoldingStage(report);
   const disciplineCards = renderTrendDisciplineCards(report);
   const industryContext = renderTrendIndustryContext(report);
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.report_date);
