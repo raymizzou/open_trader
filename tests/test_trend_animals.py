@@ -200,8 +200,9 @@ def test_components_distinguish_all_stale_rows_from_invalid_dates(
         ),
     )
 
-    with pytest.raises(TrendAnimalsNoCurrentRowsError):
+    with pytest.raises(TrendAnimalsNoCurrentRowsError) as error:
         client.get_components(tm_id=622460, expected_date="2026-07-15")
+    assert "tmId=622460" in str(error.value)
 
 
 def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:
