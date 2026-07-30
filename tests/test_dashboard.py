@@ -117,6 +117,14 @@ def test_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> No
     assert futu["holding_count"] == 0
 
 
+def test_dashboard_does_not_project_futu_option_attention(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+
+    state = load_dashboard_state(config).to_dict()
+
+    assert "futu" not in state["trend_reports"]
+
+
 def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
     detail = _futu_skill_signal_detail(
         {
@@ -417,6 +425,105 @@ def test_exact_historical_report_includes_its_immutable_execution(
     assert report["audit"]["artifact"] == "2026-07-16.json"
     assert report["report_sha256"] == _report_hash(payload)
     assert report["strategy_version"] == "v1"
+
+
+def test_trend_report_projects_only_same_day_futu_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+08:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    payload["strategy_judgments"]["holding_decisions"] = [
+        {"action": "HOLD", "reason": "trend_intact", "symbol": "SPY"},
+    ]
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-15",
+    )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    assert report["buy_actions"][0]["option_anomaly"]["available"] is True
+    assert report["buy_actions"][0]["option_anomaly"]["summary"] == "期权波动率偏高。"
+    assert report["hold_actions"][0]["option_anomaly"]["available"] is False
+    assert report["hold_actions"][0]["option_anomaly"]["reason"] == "富途未返回该标的期权异动"
+
+
+def test_trend_report_disables_mismatched_futu_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+08:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-14",
+    )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["tiger"]
+
+    option_anomaly = report["buy_actions"][0]["option_anomaly"]
+    assert option_anomaly["available"] is False
+    assert option_anomaly["status"] == "stale_run_date"
+    assert option_anomaly["reason"] == "富途期权异动日期与趋势报告不一致"
+
+
+def test_historical_trend_report_uses_archived_futu_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = write_trend_history_report(
+        config.reports_dir,
+        "2026-07-15.json",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T09:00:00+08:00",
+    )
+    payload["as_of_date"] = "2026-07-15"
+    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    write_futu_skill_facts(
+        config.data_dir / "latest/US/futu_skill_facts.json",
+        run_date="2026-07-14",
+    )
+    write_futu_skill_facts(
+        config.data_dir / "runs/2026-07-15/US/futu_skill_facts.json",
+        run_date="2026-07-15",
+    )
+
+    report = dashboard_module.load_historical_trend_report(
+        config,
+        broker="tiger",
+        artifact="2026-07-15.json",
+    )
+
+    option_anomaly = report["buy_actions"][0]["option_anomaly"]
+    assert option_anomaly["available"] is True
+    assert option_anomaly["run_date"] == "2026-07-15"
 
 
 @pytest.mark.parametrize("artifact", ["../secret.json", "/tmp/secret.json"])
@@ -956,7 +1063,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     state = load_dashboard_state(config).to_dict()
     reports = state["trend_reports"]
 
-    assert set(reports) == {"tiger", "phillips", "eastmoney", "futu"}
+    assert set(reports) == {"tiger", "phillips", "eastmoney"}
     assert "trend_market_summaries" not in state
     assert reports["tiger"]["report_date"] == "2026-07-15"
     assert reports["tiger"]["data_date"] == "2026-07-14"
@@ -1269,9 +1376,6 @@ def test_dashboard_hk_friday_report_is_current_then_stale_then_current_for_execu
     assert saturday["data_status"] == "stale"
     assert monday["data_status"] == "current"
     assert monday["status_text"] == "今日执行（数据截至 2026-07-17）"
-    assert monday_reports["futu"]["attention_markets"][1]["status_text"] == (
-        "今日执行（数据截至 2026-07-17）"
-    )
 
 
 def test_dashboard_legacy_hk_friday_report_uses_generated_date_for_freshness(
@@ -1303,68 +1407,6 @@ def test_dashboard_legacy_hk_friday_report_uses_generated_date_for_freshness(
     assert saturday["data_status"] == "stale"
     assert saturday["report_date"] == "2026-07-20"
     assert saturday["status_text"] == "数据截至 2026-07-17；今日未更新"
-
-
-def test_dashboard_projects_futu_attention_from_tiger_us_and_phillips_hk(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    stale_us = [option_attention("QQQ")]
-    current_hk = [
-        option_attention("00700", market="HK", source_broker="辉立")
-    ]
-    for directory, market, broker, execution_date, attention in (
-        ("trend_us_tiger", "US", "tiger", "2026-07-14", stale_us),
-        ("trend_hk_phillips", "HK", "phillips", "2026-07-15", current_hk),
-    ):
-        path = config.reports_dir / directory / f"{execution_date}.json"
-        path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({
-            "execution_date": execution_date,
-            "as_of_date": execution_date,
-            "generated_at": f"{execution_date}T18:00:00+08:00",
-            "account": serialized_trend_account(fresh=True),
-            "metadata": {"market": market, "broker": broker},
-            "strategy_judgments": {
-                "formal_actions": [],
-                "holding_decisions": [],
-                "top10_candidates": [],
-            },
-            "option_attention": attention,
-        }), encoding="utf-8")
-
-    reports = dashboard_module._load_trend_reports(
-        config.data_dir,
-        config.reports_dir,
-        today=date(2026, 7, 15),
-    )
-
-    assert reports["futu"] == {
-        "available": True,
-        "broker": "futu",
-        "broker_label": "富途",
-        "market": "US_HK",
-        "market_label": "美股 / 港股",
-        "status_text": "期权关注",
-        "attention_markets": [
-            {
-                "market": "US",
-                "market_label": "美股",
-                "data_status": "stale",
-                "data_date": "2026-07-14",
-                "status_text": "数据截至 2026-07-14；今日未更新",
-                "items": stale_us,
-            },
-            {
-                "market": "HK",
-                "market_label": "港股",
-                "data_status": "current",
-                "data_date": "2026-07-15",
-                "status_text": "今日已更新",
-                "items": current_hk,
-            },
-        ],
-    }
 
 
 def _valid_v2_dashboard_trend_payload() -> dict[str, object]:
@@ -3007,38 +3049,6 @@ def test_dashboard_v2_risk_state_invariants_fail_closed(
     assert report["available"] is False
 
 
-def test_dashboard_futu_projection_keeps_both_unavailable_market_rows(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-
-    futu = dashboard_module._load_trend_reports(
-        config.data_dir,
-        config.reports_dir,
-        today=date(2026, 7, 15),
-    )["futu"]
-
-    assert futu["available"] is False
-    assert futu["attention_markets"] == [
-        {
-            "market": "US",
-            "market_label": "美股",
-            "data_status": "unavailable",
-            "data_date": "",
-            "status_text": "暂时不可用",
-            "items": [],
-        },
-        {
-            "market": "HK",
-            "market_label": "港股",
-            "data_status": "unavailable",
-            "data_date": "",
-            "status_text": "暂时不可用",
-            "items": [],
-        },
-    ]
-
-
 def test_dashboard_trend_report_today_uses_shanghai_date_at_utc_boundary() -> None:
     assert dashboard_module._shanghai_date(
         datetime(2026, 7, 14, 16, 30, tzinfo=UTC)
@@ -3335,7 +3345,10 @@ def test_dashboard_trend_report_keeps_buy_for_non_realtime_account(
 
     assert report["account_fresh"] is False
     assert report["account_status"] == "账户数据非实时，执行前核对现金与持仓"
-    assert report["buy_actions"] == [stale_buy]
+    assert report["buy_actions"][0]["action"] == stale_buy["action"]
+    assert report["buy_actions"][0]["symbol"] == stale_buy["symbol"]
+    assert report["buy_actions"][0]["name"] == stale_buy["name"]
+    assert report["buy_actions"][0]["option_anomaly"]["available"] is False
     assert report["review_actions"] == []
     assert report["counts"]["buy"] == 1
     assert report["counts"]["review"] == 0

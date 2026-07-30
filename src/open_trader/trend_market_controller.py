@@ -2507,17 +2507,29 @@ def _cycle_to_reconcile(
     now: datetime,
     *,
     quote_client: object | None = None,
+    completed_execution_dates: set[str] | None = None,
 ) -> ControllerCycle:
     durable = _durable_report_cycles(config, cycle, now)
     completion: dict[str, bool] = {}
     if durable:
         for item in durable:
+            if (
+                completed_execution_dates is not None
+                and item.execution_date in completed_execution_dates
+            ):
+                completion[item.execution_date] = True
+                continue
             try:
                 completion[item.execution_date] = _execution_completed(
                     config, item
                 )
             except ValueError:
                 completion[item.execution_date] = False
+            if (
+                completion[item.execution_date]
+                and completed_execution_dates is not None
+            ):
+                completed_execution_dates.add(item.execution_date)
         unfinished = [
             item for item in durable if not completion[item.execution_date]
         ]
@@ -2648,6 +2660,7 @@ def run_trend_market_controller(
     cycle_retry_after: datetime | None = None
     cycle_blocker: str | None = None
     last_success: object = None
+    completed_execution_dates: set[str] = set()
     quote_client: object | None = None
     account_client: object | None = None
 
@@ -2827,7 +2840,11 @@ def run_trend_market_controller(
             try:
                 if report_target is None:
                     work_cycle = _cycle_to_reconcile(
-                        config, cycle, now, quote_client=shared_quote()
+                        config,
+                        cycle,
+                        now,
+                        quote_client=shared_quote(),
+                        completed_execution_dates=completed_execution_dates,
                     )
                 request, completion = _revision_state(
                     config,

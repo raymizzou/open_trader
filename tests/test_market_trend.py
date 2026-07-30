@@ -1056,7 +1056,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["option_attention"][0]["days"] == 3
     assert payload["signal_snapshots"]["holdings"]["00700"]["name"] == "腾讯"
     assert payload["signal_snapshots"]["holdings"]["00700"]["days"] == 3
-    assert "\n期权关注\n" in message
+    assert "\n期权关注\n" not in message
     assert payload["option_attention"][0]["source_broker"] == "辉立"
     candidate_snapshot = payload["signal_snapshots"]["candidates"][0]
     assert candidate_snapshot["boiling"] is False

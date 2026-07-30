@@ -50,6 +50,8 @@ from .decision_source_availability import (
 )
 from .decision_plan import load_decision_plans
 from .futu_skill_facts import (
+    futu_skill_facts_latest_path,
+    futu_skill_facts_run_path,
     index_futu_skill_facts_by_market_symbol,
     load_futu_skill_facts_cache,
 )
@@ -688,9 +690,6 @@ def _load_trend_reports(
         for broker, (market, market_label, broker_label, directory, buy_window)
         in TREND_REPORT_SOURCES.items()
     }
-    reports["futu"] = _project_futu_attention(
-        reports["tiger"], reports["phillips"]
-    )
     return reports
 
 
@@ -842,33 +841,8 @@ def load_historical_trend_report(
         broker_positions=broker_positions,
         cash_details=cash_details,
         current_candidate_pool_ids=config.trend_candidate_pool_ids(market),
+        historical=True,
     )
-
-
-def _project_futu_attention(
-    tiger: dict[str, Any], phillips: dict[str, Any]
-) -> dict[str, Any]:
-    def project(source: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "market": source["market"],
-            "market_label": source["market_label"],
-            "data_status": source["data_status"],
-            "data_date": source.get("data_date", ""),
-            "status_text": source["status_text"],
-            "items": source.get("option_attention", [])
-            if source["available"]
-            else [],
-        }
-
-    return {
-        "available": tiger["available"] or phillips["available"],
-        "broker": "futu",
-        "broker_label": "富途",
-        "market": "US_HK",
-        "market_label": "美股 / 港股",
-        "status_text": "期权关注",
-        "attention_markets": [project(tiger), project(phillips)],
-    }
 
 
 def _shanghai_date(now: datetime | None = None) -> date:
@@ -1950,6 +1924,7 @@ def _project_broker_trend_report(
     cash_details: list[dict[str, str]] | None = None,
     current_candidate_pool_ids: tuple[int, ...] = (),
     use_execution_batch: bool = False,
+    historical: bool = False,
 ) -> dict[str, Any]:
     _, latest_payload, *_ = selected
     latest_report_sha256 = _report_hash(latest_payload)
@@ -2086,6 +2061,31 @@ def _project_broker_trend_report(
     sell_actions, buy_actions, hold_actions, review_actions = (
         _project_trend_actions(payload, executions)
     )
+    if market in {"US", "HK"}:
+        option_anomalies = _trend_option_anomalies(
+            data_dir,
+            market=market,
+            report_date=execution_date.isoformat(),
+            historical=historical,
+        )
+
+        def attach_option_anomaly(item: dict[str, Any]) -> None:
+            symbol = str(item.get("symbol") or "").strip().upper()
+            try:
+                normalized_symbol = normalize_backtest_symbol(market, symbol)
+            except ValueError:
+                normalized_symbol = symbol
+            option_anomaly = option_anomalies.get((market, normalized_symbol))
+            if option_anomaly is None:
+                option_anomaly = {
+                    **_missing_futu_skill_signal(),
+                    "run_date": "",
+                    "reason": "富途未返回该标的期权异动",
+                }
+            item["option_anomaly"] = option_anomaly
+
+        for action in [*buy_actions, *hold_actions]:
+            attach_option_anomaly(action)
     risk_skips = _project_trend_money_items(
         payload["strategy_judgments"].get("risk_skips", []),
         payload=payload,
@@ -2236,6 +2236,49 @@ def _project_broker_trend_report(
             "artifact": path.name,
         },
     }
+
+
+def _trend_option_anomalies(
+    data_dir: Path,
+    *,
+    market: str,
+    report_date: str,
+    historical: bool,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    path = (
+        futu_skill_facts_run_path(data_dir, report_date, market)
+        if historical
+        else futu_skill_facts_latest_path(data_dir, market)
+    )
+    records = index_futu_skill_facts_by_market_symbol(
+        load_futu_skill_facts_cache(path)
+    )
+    projected: dict[tuple[str, str], dict[str, Any]] = {}
+    for (record_market, symbol), record in records.items():
+        try:
+            normalized_symbol = normalize_backtest_symbol(record_market, symbol)
+        except ValueError:
+            normalized_symbol = symbol
+        run_date = str(record.get("run_date") or "")
+        detail = _futu_skill_signal_detail(
+            record.get("derivatives_anomaly"),
+            run_date,
+            {"run_date": report_date},
+        )
+        if detail["available"]:
+            reason = ""
+        elif detail["status"] == "stale_run_date":
+            reason = "富途期权异动日期与趋势报告不一致"
+        elif detail.get("unsupported"):
+            reason = "富途不支持该标的期权异动"
+        else:
+            reason = str(detail.get("error") or "富途未返回该标的期权异动")
+        projected[(record_market, normalized_symbol)] = {
+            **detail,
+            "run_date": run_date,
+            "reason": reason,
+        }
+    return projected
 
 
 def _project_trend_actual_overlay(
@@ -4082,6 +4125,7 @@ def _missing_futu_skill_signal() -> dict[str, Any]:
     return {
         "available": False,
         "status": "missing",
+        "unsupported": False,
         "signal": "",
         "confidence": "",
         "suggested_constraint": "",

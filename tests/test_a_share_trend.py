@@ -3886,7 +3886,7 @@ def test_trend_feishu_text_uses_short_no_trade_template() -> None:
 
 
 @pytest.mark.parametrize("market", ["US", "HK"])
-def test_trend_feishu_text_appends_raw_option_attention(market: str) -> None:
+def test_trend_feishu_text_omits_raw_option_attention(market: str) -> None:
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
@@ -3942,9 +3942,8 @@ def test_trend_feishu_text_appends_raw_option_attention(market: str) -> None:
         payload, broker_label="老虎" if market == "US" else "辉立", market_label=market
     )
 
-    assert message.count("期权关注") == 1
-    assert "1. QQQ｜右侧 否→是｜温度 温→热｜节气 谷雨→立夏" in message
-    assert "危险" not in message
+    assert "期权关注" not in message
+    assert "QQQ｜右侧" not in message
 
 
 def test_trend_feishu_text_never_appends_option_attention_to_cn() -> None:

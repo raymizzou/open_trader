@@ -1052,6 +1052,39 @@ def test_repeated_controller_and_watcher_calendar_queries_stay_below_futu_quota(
     assert len(requests) == 10
 
 
+def test_cycle_reconciliation_reuses_completed_historical_audits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    current = active_cn_cycle()
+    historical = replace(
+        current,
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        report_run_date="2026-07-16",
+    )
+    calls: list[str] = []
+    completed_execution_dates: set[str] = set()
+    monkeypatch.setattr(
+        controller, "_durable_report_cycles", lambda *_args: [historical]
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execution_completed",
+        lambda _config, cycle: calls.append(cycle.execution_date) or True,
+    )
+
+    for _ in range(2):
+        assert controller._cycle_to_reconcile(
+            config,
+            current,
+            NOW,
+            completed_execution_dates=completed_execution_dates,
+        ) == current
+
+    assert calls == [historical.execution_date]
+
+
 def test_controller_reuses_quote_and_account_clients_across_loops(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

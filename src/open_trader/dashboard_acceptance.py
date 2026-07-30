@@ -67,18 +67,6 @@ SIMULATE_POSITIONS_READY_EXPRESSION = """
     || panel.querySelectorAll(".account-holding-row").length === expected;
 }
 """
-OPTION_ATTENTION_COLUMN_LABELS = (
-    "标的",
-    "分类",
-    "右侧状态",
-    "趋势温度",
-    "趋势节气",
-    "本地 / 全球强度",
-    "上周 / 上月",
-    "右侧天数 / 累计涨幅",
-    "危险 / 沸腾 / 开香槟",
-    "来源动作",
-)
 WARM_LEDGER_TOKENS = {
     "--bg": "#F7F5F1",
     "--surface": "#FFFEFA",
@@ -1877,8 +1865,7 @@ def _check_tool_workspaces(page: Any, detail_key: str) -> None:
             page,
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
             ".strategy-tools button:visible, #refresh-quotes:visible, "
-            ".broker-summary-card:visible, .account-holding-actions button:visible, "
-            ".trend-report-entry button:visible",
+            ".broker-summary-card:visible, .account-holding-actions button:visible",
         )
         t_signal_button = page.locator(
             '.account-holding-actions button[data-detail-mode="t_signal"]:visible'
@@ -2260,7 +2247,7 @@ def _check_trend_artifact_projection(
             {
                 field: field_value
                 for field, field_value in item.items()
-                if field != "execution"
+                if field not in {"execution", "option_anomaly"}
             }
             for item in projected
         ] == value
@@ -2661,6 +2648,58 @@ def _check_statement_upload(section: Any, broker: str, width: int) -> None:
     )
 
 
+def _check_trend_option_buttons(
+    page: Any, workspace: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    actions = [
+        item
+        for key in ("buy_actions", "hold_actions")
+        for item in (report.get(key) if isinstance(report.get(key), list) else [])
+        if isinstance(item, Mapping)
+    ]
+    buttons = workspace.locator(".trend-option-button")
+    assert buttons.count() == len(actions), (
+        f"{broker} 正式买入和继续持有标的的期权按钮数量不匹配"
+    )
+    first_enabled: tuple[Any, Mapping[str, Any]] | None = None
+    for index, action in enumerate(actions):
+        button = buttons.nth(index)
+        anomaly = action.get("option_anomaly")
+        available = isinstance(anomaly, Mapping) and anomaly.get("available") is True
+        assert button.is_disabled() is (not available), (
+            f"{broker} {action.get('symbol')} 期权按钮可用状态不匹配"
+        )
+        if available and first_enabled is None:
+            first_enabled = (button, action)
+
+    headings = workspace.locator(".cn-trend-table thead th").count()
+    assert headings >= 3, f"{broker} 趋势表格表头缺失"
+    if first_enabled is None:
+        return
+    button, action = first_enabled
+    button.click()
+    dialog = workspace.locator("dialog.trend-option-dialog:visible")
+    assert dialog.count() == 1, f"{broker} 可用期权按钮未打开原生详情弹窗"
+    assert "富途" in dialog.inner_text(), f"{broker} 期权详情未标明富途数据源"
+    identity = " ".join(
+        str(action.get(key)).strip()
+        for key in ("symbol", "name")
+        if action.get(key)
+    )
+    assert identity in str(dialog.get_attribute("aria-label") or ""), (
+        f"{broker} 期权详情标的与按钮行不一致"
+    )
+    close = dialog.locator('button[data-option-anomaly-close]')
+    assert close.count() >= 1, f"{broker} 期权详情缺少关闭按钮"
+    close.first.click()
+    assert workspace.locator("dialog.trend-option-dialog:visible").count() == 0, (
+        f"{broker} 期权详情关闭失败"
+    )
+    assert workspace.locator(".cn-trend-table thead th").count() == headings, (
+        f"{broker} 打开期权详情后趋势表头数量发生变化"
+    )
+
+
 def _check_account_holdings(
     page: Any,
     payload: dict[str, Any],
@@ -2680,7 +2719,7 @@ def _check_account_holdings(
     reports = payload.get("trend_reports") or {}
     reviews = payload.get("trend_reviews") or {}
     profiles = {
-        "futu": ("富途", "期权增强", "跨市场期权关注"),
+        "futu": ("富途", "期权增强"),
         "tiger": ("老虎", "趋势", "美股趋势交易"),
         "phillips": ("辉立", "趋势", "港股趋势交易"),
         "eastmoney": ("东方财富", "偏短线", "趋势交易"),
@@ -2711,18 +2750,60 @@ def _check_account_holdings(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"
-        if broker in TREND_REPORT_BROKERS:
-            report = reports.get(broker) if isinstance(reports, Mapping) else None
-            assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
-            assert report.get("available") is True, f"{broker} 当前趋势报告不可用"
+        if broker == "futu":
+            assert section.locator(".trend-report-entry").count() == 0, (
+                "futu 仍显示旧期权关注入口"
+            )
+            continue
+        entry_label = "当天趋势报告"
+        report = reports.get(broker) if isinstance(reports, Mapping) else None
+        assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
+        if broker == "eastmoney":
+            assert report.get("available") is True, "eastmoney 当前趋势报告不可用"
             if reports_dir is not None:
                 _check_trend_artifact_projection(reports_dir, broker, report)
             continue
-        entry_label = "期权关注" if broker == "futu" else "当天趋势报告"
-        assert entry_label in text, f"{broker} 账户区块缺少 {entry_label}"
-        report = reports.get(broker) if isinstance(reports, Mapping) else None
-        assert isinstance(report, Mapping), f"API 缺少 {broker} 趋势报告状态"
         entry = section.locator(".trend-report-entry")
+        if entry.count() == 0:
+            report_tab = section.locator('[data-account-view="report"]')
+            assert report_tab.count() == 1, f"{broker} 账户缺少趋势报告视图"
+            report_tab.click()
+            panel = section.locator(f"#account-{broker}-view-panel:visible")
+            assert panel.count() == 1, f"{broker} 趋势报告视图面板未显示"
+            if report.get("available") is True:
+                workspace = panel.locator(".cn-trend-report:visible")
+                assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
+                workspace_text = workspace.inner_text()
+                for label, key in (("报告", "report_date"), ("数据", "data_date")):
+                    assert _plain(report.get(key)) in workspace_text, (
+                        f"{broker} 趋势报告缺少 {label}日期"
+                    )
+                _check_trend_option_buttons(page, workspace, report, broker)
+                if reports_dir is not None and broker in TREND_REPORT_BROKERS:
+                    _check_trend_artifact_projection(reports_dir, broker, report)
+                if (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760:
+                    _check_mobile_targets(
+                        page,
+                        f"#account-{broker}-view-panel:visible .cn-trend-report button:visible, "
+                        f"#account-{broker}-view-panel:visible .cn-trend-report summary:visible",
+                    )
+                    assert page.evaluate(
+                        "document.documentElement.scrollWidth <= window.innerWidth"
+                    ), f"{broker} 趋势报告工作区出现横向滚动"
+            else:
+                status_text = _plain(report.get("status_text") or "今日暂无趋势报告")
+                assert status_text in panel.inner_text(), (
+                    f"{broker} 不可用趋势报告缺少状态文案"
+                )
+            review = reviews.get(broker) if isinstance(reviews, Mapping) else None
+            assert isinstance(review, Mapping), f"API 缺少 {broker} 趋势复盘状态"
+            review_disclosure = panel.locator("details.trend-review-disclosure")
+            assert review_disclosure.count() == 1, f"{broker} 趋势复盘折叠栏目数量不是 1"
+            review_disclosure.locator(":scope > summary").click()
+            assert review.get("available") is True, f"{broker} 趋势复盘不可用"
+            section.locator('[data-account-view="real"]').click()
+            continue
+        assert entry_label in text, f"{broker} 账户区块缺少 {entry_label}"
         assert entry.count() == 1, f"{broker} 趋势报告入口数量不是 1"
         trigger = entry.locator("[data-trend-report]")
         if report.get("available") is not True:
@@ -2747,13 +2828,10 @@ def _check_account_holdings(
         if reports_dir is not None and broker in TREND_REPORT_BROKERS:
             _check_trend_artifact_projection(reports_dir, broker, report)
         entry_text = entry.inner_text()
-        if broker == "futu":
-            assert "期权关注" in entry_text, "futu 入口缺少期权关注"
-        else:
-            for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
-                assert f"{label} {_plain(report.get(key))}" in entry_text, (
-                    f"{broker} 入口缺少 {label}"
-                )
+        for label, key in (("报告日期", "report_date"), ("数据截至", "data_date")):
+            assert f"{label} {_plain(report.get(key))}" in entry_text, (
+                f"{broker} 入口缺少 {label}"
+            )
         trigger.click()
         workspace = page.locator("#trend-report-workspace:visible")
         assert workspace.count() == 1, f"{broker} 趋势报告工作区未显示"
@@ -2762,129 +2840,13 @@ def _check_account_holdings(
         assert close.evaluate("element => element === document.activeElement"), (
             f"{broker} 趋势报告打开后焦点未进入工作区"
         )
-        if broker == "futu":
-            workspace_text = workspace.inner_text()
-            assert "期权关注" in workspace_text, "futu 期权关注工作区标题缺失"
-            markets = report.get("attention_markets")
-            assert isinstance(markets, list) and [
-                market.get("market") for market in markets if isinstance(market, Mapping)
-            ] == ["US", "HK"], "futu 期权关注市场顺序不是 US、HK"
-            column_headings = workspace.locator(
-                '.option-attention-table thead th[scope="col"]'
-            )
-            assert (
-                column_headings.count() == len(OPTION_ATTENTION_COLUMN_LABELS)
-                and tuple(column_headings.all_inner_texts())
-                == OPTION_ATTENTION_COLUMN_LABELS
-            ), "futu 期权关注列标题不匹配"
-            rowgroups = workspace.locator(".option-attention-table tbody")
-            assert rowgroups.count() == 2, "futu 期权关注市场分组数量不是 2"
-            for index, market in enumerate(markets):
-                assert isinstance(market, Mapping)
-                market_name = _plain(market.get("market"))
-                rowgroup = rowgroups.nth(index)
-                data_status = market.get("data_status")
-                assert data_status in {"current", "stale", "unavailable"}, (
-                    f"futu 期权关注 {market_name} 数据状态无效"
-                )
-                data_date = str(market.get("data_date") or "").strip()
-                status_text = str(market.get("status_text") or "").strip()
-                if data_status == "current":
-                    assert status_text == "今日已更新" or (
-                        data_date
-                        and status_text == f"今日执行（数据截至 {data_date}）"
-                    ), f"futu 期权关注 {market_name} 当前状态文案无效"
-                elif data_status == "stale":
-                    assert data_date, "futu 期权关注过期市场缺少数据日期"
-                    assert status_text == f"数据截至 {data_date}；今日未更新", (
-                        f"futu 期权关注 {market_name} 过期状态文案无效"
-                    )
-                else:
-                    assert status_text == "暂时不可用", (
-                        f"futu 期权关注 {market_name} 不可用状态文案无效"
-                    )
-                header = rowgroup.locator(
-                    ".option-attention-market-content span"
-                )
-                assert header.count() == 2 and header.all_inner_texts() == [
-                    _plain(market.get("market_label")), status_text,
-                ], (
-                    f"futu 期权关注 {market_name} 分组市场或状态不匹配"
-                )
-                items = market.get("items")
-                assert isinstance(items, list), "futu 期权关注项目不是列表"
-                assert all(isinstance(item, Mapping) for item in items), (
-                    "futu 期权关注项目无效"
-                )
-                rows = rowgroup.locator(".option-attention-row")
-                for row_index in range(rows.count()):
-                    cells = rows.nth(row_index).locator("td")
-                    data_labels = tuple(
-                        cells.nth(cell_index).get_attribute("data-label")
-                        for cell_index in range(cells.count())
-                    )
-                    assert data_labels == OPTION_ATTENTION_COLUMN_LABELS, (
-                        f"futu 期权关注 {market_name} 第 {row_index + 1} 行列标签不匹配"
-                    )
-                expected_symbols = [_plain(item.get("symbol")) for item in items]
-                symbol_texts = rowgroup.locator(
-                    '.option-attention-row td[data-label="标的"]'
-                ).all_inner_texts()
-                actual_symbols = [
-                    text.strip().split(maxsplit=1)[0] if text.strip() else ""
-                    for text in symbol_texts
-                ]
-                assert actual_symbols == expected_symbols, (
-                    f"futu 期权关注 {market_name} 分组标的不匹配"
-                )
-            width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
-            if width <= 760:
-                column_counts = page.evaluate(
-                    r"""() => [...document.querySelectorAll('.option-attention-row')]
-                    .map(row => getComputedStyle(row).gridTemplateColumns
-                        .trim().split(/\s+/)
-                        .filter(column => parseFloat(column) > 0).length)"""
-                )
-                expected_columns = 1 if width <= 460 else 2
-                assert isinstance(column_counts, list) and all(
-                    count == expected_columns for count in column_counts
-                ), (
-                    f"futu 期权关注卡片应为 {expected_columns} 列，实际为 "
-                    f"{column_counts}"
-                )
-                _check_mobile_targets(
-                    page,
-                    "#return-to-portfolio:visible, "
-                    "#trend-report-workspace:visible button:visible, "
-                    "#trend-report-workspace:visible summary:visible",
-                )
-                assert page.evaluate(
-                    "document.documentElement.scrollWidth <= window.innerWidth"
-                ), "futu 期权关注工作区出现横向滚动"
-                boxes = page.locator(
-                    "#trend-report-workspace:visible .option-attention-workspace, "
-                    "#trend-report-workspace:visible .option-attention-table, "
-                    "#trend-report-workspace:visible .option-attention-market, "
-                    "#trend-report-workspace:visible .option-attention-row"
-                ).evaluate_all(
-                    "nodes => nodes.map(node => node.getBoundingClientRect())"
-                    ".map(r => ({x:r.x,width:r.width}))"
-                )
-                assert boxes and all(
-                    box is not None
-                    and box["x"] >= -1
-                    and box["x"] + box["width"] <= width + 1
-                    for box in boxes
-                ), "futu 期权关注工作区元素超出移动端视口"
-            close.click()
-            assert page.locator("#trend-report-workspace:visible").count() == 0
-            assert trigger.evaluate("element => element === document.activeElement")
-            continue
         buy_actions = report.get("buy_actions")
         expected_buy_count = len(buy_actions) if isinstance(buy_actions, list) else 0
         _check_open_report_layout(
             page, workspace, broker, expected_buy_count=expected_buy_count
         )
+        if broker in {"tiger", "phillips"}:
+            _check_trend_option_buttons(page, workspace, report, broker)
         if (
             (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760
         ):
