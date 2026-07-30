@@ -1067,6 +1067,7 @@ def test_cycle_reconciliation_reuses_completed_audits_without_new_quote_client(
         report_run_date="2026-07-16",
     )
     calls: list[str] = []
+    progress_calls: list[None] = []
     completed_execution_dates: set[str] = set()
     quote = SimpleNamespace(
         get_trading_days=lambda **_kwargs: [
@@ -1079,11 +1080,18 @@ def test_cycle_reconciliation_reuses_completed_audits_without_new_quote_client(
     monkeypatch.setattr(
         controller, "_durable_report_cycles", lambda *_args: [historical]
     )
-    monkeypatch.setattr(
-        controller,
-        "_execution_completed",
-        lambda _config, cycle: calls.append(cycle.execution_date) or True,
-    )
+    def execution_completed(
+        _config: DailyPremarketConfig,
+        cycle: ControllerCycle,
+        *,
+        progress: Callable[[], None] | None = None,
+    ) -> bool:
+        assert progress is not None
+        progress()
+        calls.append(cycle.execution_date)
+        return True
+
+    monkeypatch.setattr(controller, "_execution_completed", execution_completed)
 
     for _ in range(2):
         assert controller._cycle_to_reconcile(
@@ -1092,9 +1100,11 @@ def test_cycle_reconciliation_reuses_completed_audits_without_new_quote_client(
             NOW,
             quote_client=quote,
             completed_execution_dates=completed_execution_dates,
+            progress=lambda: progress_calls.append(None),
         ) == current
 
     assert calls == [historical.execution_date]
+    assert progress_calls == [None]
 
 
 def test_controller_reuses_quote_and_account_clients_across_loops(
@@ -1107,6 +1117,7 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
     write_report(config)
     quote_clients: list[object] = []
     account_clients: list[object] = []
+    reconciliation_progress_calls: list[None] = []
 
     class Quote:
         closed = False
@@ -1161,11 +1172,14 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
         else pytest.fail("controller did not borrow its account client"),
     )
     monkeypatch.setattr(controller, "_run_protection_pass", protect)
-    monkeypatch.setattr(
-        controller,
-        "_cycle_to_reconcile",
-        lambda *_args, **_kwargs: active_cn_cycle(),
-    )
+    def reconcile(*_args: object, **kwargs: object) -> ControllerCycle:
+        progress = kwargs.get("progress")
+        assert callable(progress)
+        progress()
+        reconciliation_progress_calls.append(None)
+        return active_cn_cycle()
+
+    monkeypatch.setattr(controller, "_cycle_to_reconcile", reconcile)
     monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
     monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
     monkeypatch.setattr(
@@ -1200,6 +1214,7 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
     assert len(account_clients) == 1
     assert quote_clients[0].closed is True
     assert account_clients[0].closed is True
+    assert reconciliation_progress_calls == [None, None]
 
 
 def test_new_order_client_does_not_construct_trade_context_when_gate_fails(

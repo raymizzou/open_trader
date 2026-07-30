@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Kept CN/HK/US controller heartbeats fresh while the first strict historical
+  action-audit pass is still reading large immutable ledgers. Progress updates
+  are throttled to five seconds and do not skip or weaken any audit checks.
 - Isolated the completed-audit cache regression test from live Futu OpenD and
   made the concurrent Feishu retry test wait for the sending process explicitly,
   so Dashboard acceptance no longer hangs or races on test-process timing.

@@ -887,16 +887,19 @@ def test_legacy_sell_all_immutable_facts_remain_compatible(tmp_path: Path) -> No
         quote_prices={},
     )
 
+    progress: list[None] = []
     events, _ = trend_review.load_trend_action_audit(
         tmp_path,
         market="CN",
         execution_date="2026-07-17",
         symbol="600001",
         side="sell",
+        progress=lambda: progress.append(None),
     )
 
     assert events[-1]["status"] == "submitted"
     assert events[-1]["sell_goal"] == "position_zero"
+    assert len(progress) >= len(events)
 
 
 @pytest.mark.parametrize(

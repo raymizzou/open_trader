@@ -1168,7 +1168,9 @@ def _write_action_event(
     )
 
 
-def _action_events(root: Path) -> list[dict[str, object]]:
+def _action_events(
+    root: Path, *, progress: Callable[[], None] | None = None
+) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     for path in sorted(root.glob("*.json")):
         try:
@@ -1178,6 +1180,8 @@ def _action_events(root: Path) -> list[dict[str, object]]:
         if not isinstance(payload, dict):
             raise ValueError(f"invalid trend action event: {path}")
         events.append(payload)
+        if progress is not None:
+            progress()
     return events
 
 
@@ -2027,6 +2031,7 @@ def load_trend_action_audit(
     execution_date: str,
     symbol: str,
     side: str,
+    progress: Callable[[], None] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     market = _market(market)
     execution_date = date.fromisoformat(execution_date).isoformat()
@@ -2059,7 +2064,7 @@ def load_trend_action_audit(
         futu_code=futu_code,
         side=side,
     )
-    events = _action_events(action_root)
+    events = _action_events(action_root, progress=progress)
     filled_terminal = False
     for event in events:
         try:
@@ -2263,6 +2268,8 @@ def load_trend_action_audit(
         *protection_identities,
     }
     for event in events:
+        if progress is not None:
+            progress()
         event_identity = (
             event.get("report_sha256"),
             event.get("action_index"),

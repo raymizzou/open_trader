@@ -2325,6 +2325,8 @@ def _execution_due(cycle: ControllerCycle, now: datetime) -> bool:
 def _execution_completed(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
+    *,
+    progress: Callable[[], None] | None = None,
 ) -> bool:
     if _legacy_cycle_cutover(config, cycle):
         return True
@@ -2374,6 +2376,7 @@ def _execution_completed(
             execution_date=cycle.execution_date,
             symbol=symbol,
             side="buy" if action_name == "BUY" else "sell",
+            progress=progress,
         )
         position_zero_events = [
             item for item in events if item.get("sell_goal") == "position_zero"
@@ -2508,7 +2511,13 @@ def _cycle_to_reconcile(
     *,
     quote_client: object | None = None,
     completed_execution_dates: set[str] | None = None,
+    progress: Callable[[], None] | None = None,
 ) -> ControllerCycle:
+    def execution_completed(item: ControllerCycle) -> bool:
+        if progress is None:
+            return _execution_completed(config, item)
+        return _execution_completed(config, item, progress=progress)
+
     durable = _durable_report_cycles(config, cycle, now)
     completion: dict[str, bool] = {}
     if durable:
@@ -2520,9 +2529,7 @@ def _cycle_to_reconcile(
                 completion[item.execution_date] = True
                 continue
             try:
-                completion[item.execution_date] = _execution_completed(
-                    config, item
-                )
+                completion[item.execution_date] = execution_completed(item)
             except ValueError:
                 completion[item.execution_date] = False
             if (
@@ -2568,7 +2575,7 @@ def _cycle_to_reconcile(
         if cursor.execution_date in completion:
             if not completion[cursor.execution_date]:
                 return cursor
-        elif not _execution_completed(config, cursor):
+        elif not execution_completed(cursor):
             return cursor
         execution = date.fromisoformat(cursor.execution_date)
         local = now.astimezone(TIMEZONES[cycle.market])
@@ -2725,6 +2732,30 @@ def run_trend_market_controller(
             reset_account()
             raise
 
+    last_reconciliation_heartbeat: datetime | None = None
+
+    def reconciliation_progress() -> None:
+        nonlocal last_reconciliation_heartbeat
+        heartbeat_now = _localized(now_fn(), config.timezone)
+        if (
+            last_reconciliation_heartbeat is not None
+            and timedelta(0)
+            <= heartbeat_now - last_reconciliation_heartbeat
+            < timedelta(seconds=5)
+        ):
+            return
+        last_reconciliation_heartbeat = heartbeat_now
+        _record_status(
+            config,
+            market,
+            now=heartbeat_now,
+            phase="reconciling",
+            last_success=last_success,
+            blocker=cycle_blocker or report_blocker or operation_blocker,
+            next_check_at=heartbeat_now + timedelta(seconds=5),
+            fixed_process_version=process_version,
+        )
+
     try:
         _record_status(
             config,
@@ -2845,6 +2876,7 @@ def run_trend_market_controller(
                         now,
                         quote_client=shared_quote(),
                         completed_execution_dates=completed_execution_dates,
+                        progress=reconciliation_progress,
                     )
                 request, completion = _revision_state(
                     config,
@@ -2987,7 +3019,14 @@ def run_trend_market_controller(
                         if isinstance(judgments, dict)
                         else None
                     )
-                    if _execution_completed(config, work_cycle) and formal_actions:
+                    if (
+                        _execution_completed(
+                            config,
+                            work_cycle,
+                            progress=reconciliation_progress,
+                        )
+                        and formal_actions
+                    ):
                         execution = {
                             "status": "reconciled",
                             "market": market,
