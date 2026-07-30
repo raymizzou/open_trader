@@ -751,6 +751,26 @@ class FakePrimeAssetTradeBlankTradeClient(FakeTradeClient):
         return FakePrimeAssetsWithTradeBlankAndWithdrawalValue()
 
 
+class FakeEmptyPrimeAssetsTradeClient(FakeTradeClient):
+    def get_prime_assets(self, **kwargs: object) -> object:
+        self.prime_asset_calls.append(kwargs)
+        return type("EmptyPrimeAssets", (), {"segments": {}})()
+
+
+class FakeCompleteZeroPrimeAssetsTradeClient(FakeTradeClient):
+    def get_positions(self, **kwargs: object) -> list[FakePosition]:
+        self.position_calls.append(kwargs)
+        return []
+
+    def get_prime_assets(self, **kwargs: object) -> object:
+        self.prime_asset_calls.append(kwargs)
+        return type(
+            "CompleteZeroPrimeAssets",
+            (),
+            {"segments": {"S": FakeSegment(category="S", currency_assets={})}},
+        )()
+
+
 class FakeGlobalTradeClient(FakeTradeClient):
     def get_managed_accounts(self, account: str | None = None) -> list[object]:
         return [
@@ -1494,6 +1514,37 @@ def test_tiger_account_client_prime_asset_falls_back_to_withdrawal_when_trade_is
     ]
 
 
+def test_tiger_account_client_rejects_empty_prime_asset_response() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakeEmptyPrimeAssetsTradeClient,
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        client.fetch_snapshot()
+
+    assert exc_info.value.error_type == "asset_query_failed"
+    assert "123456789" not in str(exc_info.value)
+
+
+def test_tiger_account_client_accepts_explicit_complete_zero_assets() -> None:
+    client = TigerAccountClient(
+        config=tiger_config(),
+        trade_client_factory=FakeCompleteZeroPrimeAssetsTradeClient,
+    )
+
+    snapshot = client.fetch_snapshot()
+    candidate = build_tiger_account_candidate(
+        snapshot,
+        run_date="2026-07-30",
+        data_as_of="2026-07-30T11:56:54+08:00",
+    )
+
+    assert snapshot.cash_records == []
+    assert candidate.summary["position_count"] == 0
+    assert candidate.summary["cash_count"] == 0
+
+
 def test_default_factory_reports_tigeropen_missing_when_sdk_not_available(monkeypatch: pytest.MonkeyPatch) -> None:
     for module_name in (
         "tigeropen.trade.trade_client",
@@ -1667,6 +1718,38 @@ def test_build_tiger_account_candidate_rejects_malformed_account_total() -> None
         )
 
     assert exc_info.value.error_type == "blocking_data_error"
+
+
+def test_build_tiger_account_candidate_rejects_raw_record_account_alias() -> None:
+    snapshot = tiger_snapshot_from_records(
+        cash_records=[
+            {
+                "account_alias": "123456789",
+                "currency": "USD",
+                "cash_balance": "10",
+                "available_balance": "10",
+                "fx_to_hkd": "7.84",
+            },
+            {
+                "record_type": "account_total",
+                "account_alias": "123456789",
+                "currency": "USD",
+                "account_total": "100",
+                "fx_to_hkd": "7.84",
+            },
+        ],
+        position_records=[],
+    )
+
+    with pytest.raises(TigerAccountError) as exc_info:
+        build_tiger_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+        )
+
+    assert exc_info.value.error_type == "account_query_failed"
+    assert "123456789" not in str(exc_info.value)
 
 
 def test_map_snapshot_to_portfolio_inputs_maps_positions_and_cash() -> None:

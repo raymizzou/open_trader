@@ -965,9 +965,12 @@ class TigerAccountClient:
         payload: object,
     ) -> list[dict[str, object]]:
         records: list[dict[str, object]] = []
-        segments = _get_attr(payload, "segments", {})
+        segments = _get_attr(payload, "segments", None)
         if not isinstance(segments, dict):
-            return records
+            raise TigerAccountError(
+                "Tiger assets response is incomplete",
+                error_type="asset_query_failed",
+            )
         segment = segments.get("S")
         if segment is None:
             segment = next(
@@ -979,18 +982,28 @@ class TigerAccountClient:
                 None,
             )
         if segment is None:
-            return records
+            raise TigerAccountError(
+                "Tiger assets response is incomplete",
+                error_type="asset_query_failed",
+            )
 
-        currency_assets = _get_attr(segment, "currency_assets", {})
-        has_currency_assets = isinstance(currency_assets, dict)
-        if not has_currency_assets:
-            currency_assets = {}
+        currency_assets = _get_attr(segment, "currency_assets", None)
+        if not isinstance(currency_assets, dict):
+            raise TigerAccountError(
+                "Tiger assets response is incomplete",
+                error_type="asset_query_failed",
+            )
         account_total = _first_present_value(
             segment,
             "equity_with_loan",
             "net_liquidation",
         )
         if account_total is not None:
+            if not _text(segment, "currency"):
+                raise TigerAccountError(
+                    "Tiger assets response is incomplete",
+                    error_type="asset_query_failed",
+                )
             record = {
                 "record_type": "account_total",
                 "account": account.account,
@@ -1016,9 +1029,12 @@ class TigerAccountClient:
                 record["fx_to_hkd"] = fx_to_hkd
             records.append(record)
 
-        if not has_currency_assets:
-            return records
         for currency_asset in currency_assets.values():
+            if not _text(currency_asset, "currency"):
+                raise TigerAccountError(
+                    "Tiger assets response is incomplete",
+                    error_type="asset_query_failed",
+                )
             if not self._has_non_zero_balance(currency_asset):
                 continue
             record = {
@@ -1071,13 +1087,23 @@ class TigerAccountClient:
         else:
             payload_accounts = [payload]
 
+        matched_account = False
         for payload_account in payload_accounts:
             if _text(payload_account, "account") != account.account:
                 continue
-            market_values = _get_attr(payload_account, "market_values", {})
+            matched_account = True
+            market_values = _get_attr(payload_account, "market_values", None)
             if not isinstance(market_values, dict):
-                continue
+                raise TigerAccountError(
+                    "Tiger assets response is incomplete",
+                    error_type="asset_query_failed",
+                )
             for market_value in market_values.values():
+                if not _text(market_value, "currency"):
+                    raise TigerAccountError(
+                        "Tiger assets response is incomplete",
+                        error_type="asset_query_failed",
+                    )
                 records.append(
                     {
                         "account": account.account,
@@ -1098,6 +1124,11 @@ class TigerAccountClient:
                         "source": account.asset_method,
                     }
                 )
+        if not matched_account:
+            raise TigerAccountError(
+                "Tiger assets response is incomplete",
+                error_type="asset_query_failed",
+            )
         return records
 
 
@@ -1353,6 +1384,15 @@ def build_tiger_account_candidate(
         raise TigerAccountError(
             "no active Tiger accounts matched snapshot",
             error_type="no_matching_accounts",
+        )
+    account_aliases = {account.account_alias for account in snapshot.accounts}
+    if any(
+        _text(record, "account_alias") not in account_aliases
+        for record in [*snapshot.cash_records, *snapshot.position_records]
+    ):
+        raise TigerAccountError(
+            "Tiger snapshot has an unrecognized account alias",
+            error_type="account_query_failed",
         )
 
     positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(

@@ -760,6 +760,31 @@ def test_build_futu_account_candidate_rejects_malformed_total_assets() -> None:
     assert exc_info.value.error_type == "blocking_data_error"
 
 
+def test_build_futu_account_candidate_rejects_raw_record_account_alias() -> None:
+    snapshot = client_snapshot_from_records(
+        cash_records=[
+            {
+                "_account_alias": "123456789",
+                "currency": "HKD",
+                "cash": "10",
+                "total_assets": "100",
+            }
+        ],
+        position_records=[],
+    )
+
+    with pytest.raises(FutuAccountError) as exc_info:
+        build_futu_account_candidate(
+            snapshot,
+            run_date="2026-07-30",
+            data_as_of="2026-07-30T11:56:54+08:00",
+            fallback_fx_to_hkd={},
+        )
+
+    assert exc_info.value.error_type == "account_query_failed"
+    assert "123456789" not in str(exc_info.value)
+
+
 def write_portfolio(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:

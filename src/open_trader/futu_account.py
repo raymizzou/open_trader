@@ -497,6 +497,15 @@ def build_futu_account_candidate(
             "no REAL Futu securities accounts found",
             error_type="no_real_accounts",
         )
+    account_aliases = {account.account_alias for account in snapshot.accounts}
+    if any(
+        _first_text(record, ("_account_alias",)) not in account_aliases
+        for record in [*snapshot.cash_records, *snapshot.position_records]
+    ):
+        raise FutuAccountError(
+            "Futu snapshot has an unrecognized account alias",
+            error_type="account_query_failed",
+        )
 
     positions, cash_balances, blocking_errors = map_snapshot_to_portfolio_inputs(
         snapshot,
