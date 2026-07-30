@@ -1392,9 +1392,70 @@ def test_daily_runner_blocks_unhealthy_published_portfolio_before_premarket(
         premarket_calls.append(kwargs)
         raise AssertionError("premarket runner must not run")
 
-    result = _DailyPremarketRunner(
+    result = _daily_runner(
         config=config,
         premarket_runner=premarket_runner,
+        portfolio_validator=daily_premarket.require_published_portfolio,
+    ).run("2026-07-30", market="US", dry_run=True)
+
+    assert result.status == "failed"
+    assert premarket_calls == []
+    assert reason in result.status_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("quote_case", "reason"),
+    [
+        ("failed", "quotes failed"),
+        ("stale", "quotes stale"),
+        ("derived_stale", "quotes stale"),
+        ("missing", "quotes unknown"),
+        ("malformed", "quotes unknown"),
+    ],
+)
+def test_daily_runner_blocks_unhealthy_published_quotes_before_premarket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quote_case: str,
+    reason: str,
+) -> None:
+    monkeypatch.setattr(
+        daily_premarket, "OpenAIClassifierClient", lambda **_: object()
+    )
+    now = datetime.now(timezone(timedelta(hours=8)))
+    config = _daily_config(tmp_path)
+    _write_published_account_state(config, now=now)
+    quotes_path = config.data_dir / "latest/quotes.json"
+    if quote_case != "missing":
+        quotes_path.parent.mkdir(parents=True, exist_ok=True)
+        if quote_case == "malformed":
+            quotes_path.write_text("not json", encoding="utf-8")
+        else:
+            quotes_path.write_text(
+                json.dumps(
+                    {
+                        "status": "failed" if quote_case == "failed" else "ok",
+                        "last_success_at": (
+                            now - timedelta(seconds=121)
+                            if quote_case == "derived_stale"
+                            else now
+                        ).isoformat(),
+                        "stale": quote_case == "stale",
+                        "quotes": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+    premarket_calls: list[dict[str, object]] = []
+
+    def premarket_runner(**kwargs: object) -> object:
+        premarket_calls.append(kwargs)
+        raise AssertionError("premarket runner must not run")
+
+    result = _daily_runner(
+        config=config,
+        premarket_runner=premarket_runner,
+        portfolio_validator=daily_premarket.require_published_portfolio,
     ).run("2026-07-30", market="US", dry_run=True)
 
     assert result.status == "failed"

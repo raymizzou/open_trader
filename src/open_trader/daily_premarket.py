@@ -452,6 +452,8 @@ def require_published_portfolio(
     market: str,
     now: datetime,
 ) -> Path:
+    from .dashboard_quotes import load_published_quotes
+
     if not portfolio_path.is_file():
         raise FileNotFoundError(f"published portfolio not found: {portfolio_path}")
     try:
@@ -462,10 +464,13 @@ def require_published_portfolio(
         )
     except (OSError, json.JSONDecodeError):
         controller_status = {}
+    published_quotes = load_published_quotes(
+        data_dir / "latest" / "quotes.json", now=now
+    )
     health = project_account_sync_health(
         load_account_sync_state(data_dir / "latest" / "account_sync_state.json"),
         controller_status,
-        {},
+        published_quotes,
         now=now,
     )
     controller = health["controller"]
@@ -493,6 +498,12 @@ def require_published_portfolio(
                 source.get("last_success_at", "") if isinstance(source, dict) else ""
             ) or "never"
             raise RuntimeError(f"{broker} {status}; last success {last_success}")
+    projected_quotes = health["quotes"]
+    assert isinstance(projected_quotes, dict)
+    quote_status = projected_quotes.get("status", "unknown")
+    if quote_status != "ok":
+        last_success = published_quotes.get("last_success_at") or "never"
+        raise RuntimeError(f"quotes {quote_status}; last success {last_success}")
     return portfolio_path
 
 
