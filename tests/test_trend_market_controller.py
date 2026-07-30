@@ -1052,10 +1052,15 @@ def test_repeated_controller_and_watcher_calendar_queries_stay_below_futu_quota(
     assert len(requests) == 10
 
 
-def test_cycle_reconciliation_reuses_completed_historical_audits(
+def test_cycle_reconciliation_reuses_completed_audits_without_new_quote_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = controller_config(tmp_path)
+    monkeypatch.setattr(
+        controller,
+        "FutuQuoteClient",
+        lambda **_kwargs: pytest.fail("opened an unowned Futu quote client"),
+    )
     current = active_cn_cycle()
     historical = replace(
         current,
@@ -1065,6 +1070,14 @@ def test_cycle_reconciliation_reuses_completed_historical_audits(
     )
     calls: list[str] = []
     completed_execution_dates: set[str] = set()
+    quote = SimpleNamespace(
+        get_trading_days=lambda **_kwargs: [
+            "2026-07-16",
+            "2026-07-17",
+            "2026-07-20",
+            "2026-07-21",
+        ]
+    )
     monkeypatch.setattr(
         controller, "_durable_report_cycles", lambda *_args: [historical]
     )
@@ -1079,6 +1092,7 @@ def test_cycle_reconciliation_reuses_completed_historical_audits(
             config,
             current,
             NOW,
+            quote_client=quote,
             completed_execution_dates=completed_execution_dates,
         ) == current
 

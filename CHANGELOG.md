@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Isolated the completed-audit cache regression test from live Futu OpenD so
+  pytest no longer leaves a reconnect thread waiting during Dashboard
+  acceptance; the full trend-controller suite now exits cleanly.
 - Corrected the CN/HK/US Dashboard `盘中持续 · 已有持仓` projection: holding
   rows now recover industry and available right-side days from frozen snapshots,
   show the shared `行业` column, and use the frozen industry-first discipline
