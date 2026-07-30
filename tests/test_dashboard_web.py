@@ -7283,6 +7283,15 @@ def test_dashboard_account_holdings_mobile_layout_css() -> None:
     assert "overflow-x: hidden;" in mobile
 
 
+def test_dashboard_mobile_fallback_quote_wraps_inside_price_cell() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 760px) {", 1)[1]
+
+    price_css = mobile.split(".account-holding-price .session-quote {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap: wrap;" in price_css
+    assert "max-width: 100%;" in price_css
+
+
 def test_dashboard_has_no_removed_header_broker_filter_references() -> None:
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")

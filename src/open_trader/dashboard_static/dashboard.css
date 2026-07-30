@@ -5393,6 +5393,11 @@ table {
   .account-holding-market { grid-area: market; }
   .account-holding-quantity { grid-area: quantity; }
   .account-holding-price { grid-area: price; }
+  .account-holding-price .session-quote {
+    flex-wrap: wrap;
+    max-width: 100%;
+    white-space: normal;
+  }
   .account-holding-actions { grid-area: actions; }
 
   .account-holding-row .account-holding-cost,
