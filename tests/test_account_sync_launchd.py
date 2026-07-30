@@ -6,7 +6,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -83,36 +83,44 @@ def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
     ).stdout.strip()
     launchctl.write_text(
         "#!/bin/sh\n"
+        "if [ \"$1\" = print ]; then\n"
+        "  echo \"pid = $FAKE_LAUNCHD_PID\"\n"
+        "fi\n"
         "if [ \"$1\" = bootstrap ]; then\n"
         "  count=$(cat \"$FAKE_BOOTSTRAP_COUNT\" 2>/dev/null || echo 0)\n"
         "  count=$((count + 1)); echo \"$count\" > \"$FAKE_BOOTSTRAP_COUNT\"\n"
         "  [ \"$count\" -lt 3 ] && exit 1\n"
         "fi\n"
         "if [ \"$1\" = kickstart ]; then\n"
-        "  mkdir -p \"$(dirname \"$FAKE_STATUS_PATH\")\"\n"
-        "  printf '%s' \"$FAKE_STATUS_JSON\" > \"$FAKE_STATUS_PATH\"\n"
+        "  $FAKE_PYTHON - \"$FAKE_STATUS_PATH\" \"$FAKE_LAUNCHD_PID\" \"$FAKE_REPO\" \"$FAKE_SHA\" <<'PY'\n"
+        "from datetime import datetime, timezone\n"
+        "import json\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "path, pid, repo, sha = sys.argv[1:]\n"
+        "Path(path).parent.mkdir(parents=True, exist_ok=True)\n"
+        "now = datetime.now(timezone.utc).isoformat()\n"
+        "Path(path).write_text(json.dumps({\n"
+        "  'schema_version': 'open_trader.account_sync.controller.v1',\n"
+        "  'pid': int(pid), 'started_at': now, 'working_directory': repo,\n"
+        "  'git_sha': sha, 'heartbeat_at': now, 'phase': 'idle',\n"
+        "  'account_loop': {'status': 'ok'}, 'quote_loop': {'status': 'ok'},\n"
+        "  'blocker': None,\n"
+        "}), encoding='utf-8')\n"
+        "PY\n"
         "fi\n",
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
-    status = {
-        "schema_version": "open_trader.account_sync.controller.v1",
-        "pid": 99,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "working_directory": str(repo),
-        "git_sha": expected_sha,
-        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
-        "phase": "idle",
-        "account_loop": {"status": "ok"},
-        "quote_loop": {"status": "ok"},
-        "blocker": None,
-    }
     env = {
         **os.environ,
         "LAUNCHCTL_BIN": str(launchctl),
         "FAKE_BOOTSTRAP_COUNT": str(bootstrap_count),
         "FAKE_STATUS_PATH": str(status_path),
-        "FAKE_STATUS_JSON": json.dumps(status),
+        "FAKE_LAUNCHD_PID": "4242",
+        "FAKE_PYTHON": sys.executable,
+        "FAKE_REPO": str(repo),
+        "FAKE_SHA": expected_sha,
     }
 
     result = subprocess.run(
@@ -137,6 +145,69 @@ def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
 
     assert bootstrap_count.read_text(encoding="utf-8").strip() == "3"
     assert f"installed launchd agent: {LABEL}" in result.stdout
+
+
+def test_installer_rejects_a_preinstall_status_without_kickstart_write(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_repo(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    status_path = runtime / "data/account_sync/controller_status.json"
+    expected_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    _write_status(
+        status_path,
+        pid=4242,
+        repo=repo,
+        sha=expected_sha,
+        heartbeat=datetime.now(timezone.utc) - timedelta(seconds=10),
+    )
+    launchctl = tmp_path / "launchctl"
+    calls = tmp_path / "launchctl-calls"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "echo \"$1\" >> \"$FAKE_LAUNCHCTL_CALLS\"\n"
+        "[ \"$1\" = print ] && echo 'pid = 4242'\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_account_sync_launchd.sh"),
+            "--repo-root",
+            str(repo),
+            "--runtime-root",
+            str(runtime),
+            "--python",
+            sys.executable,
+            "--launch-agents-dir",
+            str(agents),
+            "--wait-seconds",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "LAUNCHCTL_BIN": str(launchctl),
+            "FAKE_LAUNCHCTL_CALLS": str(calls),
+        },
+    )
+
+    assert result.returncode == 1
+    assert "account sync controller did not publish a matching fresh status" in result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "bootout",
+        "bootstrap",
+        "kickstart",
+        "print",
+        "bootout",
+    ]
 
 
 def test_uninstaller_preserves_a_still_loaded_plist(tmp_path: Path) -> None:
@@ -175,3 +246,27 @@ def _copy_repo(tmp_path: Path) -> Path:
         check=True,
     )
     return repo
+
+
+def _write_status(
+    path: Path, *, pid: int, repo: Path, sha: str, heartbeat: datetime
+) -> None:
+    now = heartbeat.isoformat()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.account_sync.controller.v1",
+                "pid": pid,
+                "started_at": now,
+                "working_directory": str(repo),
+                "git_sha": sha,
+                "heartbeat_at": now,
+                "phase": "idle",
+                "account_loop": {"status": "ok"},
+                "quote_loop": {"status": "ok"},
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
+    )

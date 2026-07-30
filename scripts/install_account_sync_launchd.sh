@@ -77,33 +77,50 @@ bootstrap_agent() {
   done
 }
 
+controller_status_matches() {
+  "$PYTHON_BIN" - "$@" <<'PY'
+from datetime import datetime
+import json
+from pathlib import Path
+import sys
+
+path, pid, cwd, git_sha, loaded_at = sys.argv[1:]
+try:
+    status = json.loads(Path(path).read_text(encoding="utf-8"))
+    heartbeat = datetime.fromisoformat(str(status["heartbeat_at"]))
+    working_directory = status.get("working_directory")
+    valid = (
+        status.get("schema_version") == "open_trader.account_sync.controller.v1"
+        and type(status.get("pid")) is int
+        and status["pid"] == int(pid)
+        and isinstance(working_directory, str)
+        and bool(working_directory.strip())
+        and Path(working_directory).resolve() == Path(cwd).resolve()
+        and status.get("git_sha") == git_sha
+        and heartbeat.tzinfo is not None
+        and heartbeat.utcoffset() is not None
+        and heartbeat.timestamp() >= int(loaded_at)
+        and abs((datetime.now().astimezone() - heartbeat).total_seconds()) <= 120
+    )
+except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 wait_ready() {
-  local expected_sha attempt
+  local loaded_at="$1" expected_sha attempt output pid
   expected_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
-    if "$PYTHON_BIN" - "$STATUS_PATH" "$REPO_ROOT" "$expected_sha" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-try:
-    status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    heartbeat = datetime.fromisoformat(status["heartbeat_at"])
-    assert heartbeat.tzinfo is not None
-    assert (datetime.now(timezone.utc) - heartbeat.astimezone(timezone.utc)).total_seconds() <= 120
-    assert status["schema_version"] == "open_trader.account_sync.controller.v1"
-    assert isinstance(status["pid"], int) and status["pid"] > 0
-    assert status["working_directory"] == sys.argv[2]
-    assert status["git_sha"] == sys.argv[3]
-except (AssertionError, KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
-    raise SystemExit(1)
-PY
-    then
+    output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1 || true)"
+    pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
+    if [[ -n "$pid" ]] && controller_status_matches \
+      "$STATUS_PATH" "$pid" "$REPO_ROOT" "$expected_sha" "$loaded_at"; then
       return 0
     fi
     sleep 1
   done
+  "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
   echo "account sync controller did not publish a matching fresh status" >&2
   return 1
 }
@@ -121,7 +138,8 @@ printf '%s\n' "$rendered" > "$PLIST_PATH"
 "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
 : > "$OUT_LOG"
 : > "$ERR_LOG"
+loaded_at="$(date +%s)"
 bootstrap_agent
 "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LABEL"
-wait_ready
+wait_ready "$loaded_at"
 echo "installed launchd agent: $LABEL"
