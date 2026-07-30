@@ -59,6 +59,21 @@ Provide that URL so the user can open it directly.
 This post-acceptance restart does not require another acceptance run when it
 deploys the exact already-accepted SHA and makes no source or data changes.
 
+## UI Screenshot Handoff Gate
+
+For any UI change that alters visible content or interaction, `make acceptance`
+and deployment proof are not sufficient by themselves. After deploying the
+exact accepted SHA, capture the affected view from the live review URL and
+include the screenshot inline in the final user-facing response.
+
+If responsive behavior or mobile layout changed, include both desktop and
+mobile screenshots. Otherwise, screenshots only need to show the affected view
+clearly. User confirmation is not required after the screenshots are sent.
+
+Missing, empty, unreadable, stale, wrong-SHA, or irrelevant screenshots block
+the task from being described as accepted, complete, or deployed successfully.
+A URL or textual description does not replace the screenshot.
+
 ## Task Handoff Gate
 
 Before asking the user to review any completed Dashboard task, the agent must
@@ -68,4 +83,5 @@ asked to run it manually.
 - On `FAIL`, continue diagnosing and fixing, then rerun the gate.
 - On `BLOCKED`, report the blocker; do not present the task for acceptance.
 - Only on `PASS` may the agent provide the deployed URL and ask the user to
-  review the result.
+  review the result. UI changes must also satisfy the UI Screenshot Handoff
+  Gate before the task may be called accepted or complete.

@@ -9,6 +9,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   A real Phillips upload now shows four securities including `03308`, dated
   2026-07-29, with HKD 628,326.07 total assets; final acceptance was skipped at
   operator request.
+- Required every user-visible UI change to include screenshots from the exact
+  deployed and accepted SHA in the final response. Responsive or mobile changes
+  require desktop and mobile views; missing, stale, or irrelevant screenshots
+  now block an accepted/completed claim without adding a user-approval wait.
 
 ## 2026-07-30
 
