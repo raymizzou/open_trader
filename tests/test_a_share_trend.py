@@ -748,6 +748,173 @@ def test_live_non_cn_strategy_snapshot_defaults_to_v7_with_exact_inheritance(
     ]
 
 
+@pytest.mark.parametrize(
+    ("market", "currency", "rate"),
+    [
+        ("US", "USD", "7.268518518518518518518518519"),
+        ("HK", "HKD", "0.9259259259259259259259259259"),
+    ],
+)
+def test_current_market_strategy_snapshot_shares_cn_entry_rules(
+    market: str, currency: str, rate: str,
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market, "abc123", (622460,) if market == "US" else (622494,)
+    )
+    parameters = snapshot["parameters"]
+
+    assert {
+        key: parameters[key]
+        for key in (
+            "temperature_transition",
+            "min_strength",
+            "allowed_industry_temperatures",
+            "allowed_phases",
+            "min_market_cap_cny_100m",
+            "min_amount_cny_100m",
+            "market_value_currency",
+            "cny_per_local_currency",
+            "requires_right_side_days",
+        )
+    } == {
+        "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+        "min_strength": "95",
+        "allowed_industry_temperatures": ["温", "热", "沸"],
+        "allowed_phases": ["谷雨", "立夏", "夏至"],
+        "min_market_cap_cny_100m": "100",
+        "min_amount_cny_100m": "2",
+        "market_value_currency": currency,
+        "cny_per_local_currency": rate,
+        "requires_right_side_days": True,
+    }
+    assert "max_right_side_days_exclusive" not in parameters
+    rows = {
+        row["name"]: row["value"]
+        for row in snapshot["parameter_rows"]
+        if row["group"] == "入场过滤"
+    }
+    assert {
+        "趋势温度": "前一状态为温；当前状态为热或沸",
+        "趋势强度": "不低于 95",
+        "行业温度": "温、热或沸",
+        "趋势节气": "谷雨、立夏或夏至",
+        "总市值": "不低于人民币 100 亿元（按冻结汇率换算）",
+        "单日成交额": "不低于人民币 2 亿元（按冻结汇率换算）",
+    }.items() <= rows.items()
+
+
+@pytest.mark.parametrize("market", ["US", "HK"])
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"temperature_prev": "平"}, "temperature_transition_not_entry"),
+        ({"strength": Decimal("94.9")}, "strength_below_95"),
+        ({"industry_temperature": "凉"}, "industry_temperature_not_hot"),
+        ({"phase": "小暑"}, "phase_after_summer_solstice"),
+        ({"market_cap": Decimal("0")}, "market_cap_below_100_cny"),
+        ({"amount": Decimal("0")}, "amount_below_2_cny"),
+        ({"days": None}, "right_side_days_missing"),
+    ],
+)
+def test_current_market_entry_rejects_cn_discipline_failure(
+    market: str, changes: dict[str, object], reason: str,
+) -> None:
+    item = replace(
+        candidate(
+            "620001",
+            exchange=market,
+            asset="美股" if market == "US" else "港股",
+            market_cap="200",
+            amount="3",
+        ),
+        **changes,
+    )
+
+    decision = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        expected_date="2026-07-14",
+        market=market,
+        strategy_version="v7",
+        cny_per_local_currency=trend_module.CNY_PER_LOCAL_CURRENCY[market],
+    )
+
+    assert reason in decision.excluded[item.symbol]
+
+
+@pytest.mark.parametrize(
+    ("market", "asset", "pool_id"),
+    [("US", "美股", 622460), ("HK", "港股", 622494)],
+)
+def test_current_market_report_keeps_cool_industry_out_of_every_buy_view(
+    market: str, asset: str, pool_id: int,
+) -> None:
+    item = candidate(
+        "620001",
+        exchange=market,
+        asset=asset,
+        name="GRMN" if market == "US" else "港股测试标的",
+        industry_temperature="凉",
+        market_cap="200",
+        amount="3",
+    )
+    strategy_snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (pool_id,),
+        strategy_version="v7",
+    )
+    drawdown_summary = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": market,
+        "strategy_id": strategy_snapshot["strategy_id"],
+        "strategy_version": "v7",
+        "kelly_sample_key": (
+            f"{market}|trend_animals_warm_to_hot/{market}/v7|v7"
+        ),
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "676549.55",
+        "high_water_mark": "676549.55",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-14T18:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(item,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market=market,
+        process_version="abc123",
+        candidate_pool_ids=(pool_id,),
+        strategy_snapshot=strategy_snapshot,
+        drawdown_summary=drawdown_summary,
+        metadata={"market": market},
+    )
+    payload = trend_module._report_payload(built)
+
+    assert built.candidates == ()
+    assert built.buy_actions == ()
+    assert built.risk_skips == ()
+    assert built.excluded[item.symbol] == ["industry_temperature_not_hot"]
+    assert payload["strategy_judgments"]["top10_candidates"] == []
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert payload["signal_snapshots"]["candidates"][0] | {
+        "eligible": False,
+        "excluded_reasons": ["industry_temperature_not_hot"],
+    } == payload["signal_snapshots"]["candidates"][0]
+
+
 @pytest.mark.parametrize("version", ["v4", "v6", "v7", "v8", "v9", "v10"])
 def test_live_cn_supported_versions_remain_replay_valid(version: str) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
@@ -5189,6 +5356,10 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "close",
         "atr",
         "market_cap",
+        "market_value_currency",
+        "cny_per_local_currency",
+        "market_cap_cny_100m",
+        "amount_cny_100m",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",
@@ -5258,6 +5429,10 @@ def test_candidate_audit_includes_all_ranked_and_excluded_pool_facts() -> None:
         "close",
         "atr",
         "market_cap",
+        "market_value_currency",
+        "cny_per_local_currency",
+        "market_cap_cny_100m",
+        "amount_cny_100m",
         "industry_tm_id",
         "industry_temperature",
         "temperature_prev",

@@ -41,6 +41,7 @@ from open_trader.notifications import (
 )
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.a_share_trend import (
+    A_SHARE_INDUSTRY_FIELDS,
     INDUSTRY_MEMBER_FIELDS,
     INDUSTRY_STATE_FIELDS,
     UNIFIED_TREND_FIELDS,
@@ -928,6 +929,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
 
     api_instances = 0
     lot_requests: list[list[str]] = []
+    snapshot_calls: list[dict[str, object]] = []
 
     class Api:
         ignored_stale_components = (
@@ -988,6 +990,14 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            snapshot_calls.append(dict(kwargs))
+            if kwargs["fields"] == A_SHARE_INDUSTRY_FIELDS:
+                assert kwargs["tm_ids"] == [700001]
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": kwargs["expected_date"],
+                    "trendTemperatureCurr": "温",
+                }]
             if kwargs["fields"] == INDUSTRY_MEMBER_FIELDS:
                 return [
                     {
@@ -1113,6 +1123,12 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     candidate_snapshot = payload["signal_snapshots"]["candidates"][0]
     assert candidate_snapshot["boiling"] is False
     assert candidate_snapshot["champagne"] is False
+    assert candidate_snapshot["industry_temperature"] == "温"
+    assert len([
+        call
+        for call in snapshot_calls
+        if call["fields"] == A_SHARE_INDUSTRY_FIELDS
+    ]) == 2
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert (
         f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows=2 "
@@ -1149,6 +1165,12 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["protection_state"]["managed_symbols"] == ["00700", "02800"]
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = __import__("json").loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["query"]["industry_fields"] == list(A_SHARE_INDUSTRY_FIELDS)
+    assert evidence["responses"]["industries"] == [{
+        "tmId": 700001,
+        "asOfDate": "2026-07-15",
+        "trendTemperatureCurr": "温",
+    }]
     assert evidence["market"] == "HK"
     assert evidence["query"]["component_pool_ids"] == [622494]
     assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
@@ -1439,6 +1461,12 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             ]
 
         def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            if kwargs["fields"] == A_SHARE_INDUSTRY_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": kwargs["expected_date"],
+                    "trendTemperatureCurr": "热",
+                }]
             if kwargs["fields"] == INDUSTRY_MEMBER_FIELDS:
                 return [
                     {

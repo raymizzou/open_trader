@@ -183,6 +183,7 @@ CNY_PER_LOCAL_CURRENCY = {
     "US": Decimal("7.85") / Decimal("1.08"),
     "HK": Decimal("1") / Decimal("1.08"),
 }
+MARKET_CURRENCY = {"CN": "CNY", "US": "USD", "HK": "HKD"}
 MARKET_V5_EFFECTIVE_FROM = {"US": "2026-07-24", "HK": "2026-07-27"}
 KNOWN_TEMPERATURE_ORDER = {
     value: index for index, value in enumerate(INDUSTRY_KNOWN_TEMPERATURES)
@@ -668,6 +669,76 @@ def live_trend_strategy_snapshot(
     )
     parameters = dict(snapshot["parameters"])
     rows = [dict(row) for row in snapshot["parameter_rows"]]
+    if market in {"US", "HK"} and version in {"v5", "v6", "v7"}:
+        rate = CNY_PER_LOCAL_CURRENCY[market]
+        parameters.pop("min_strength_exclusive", None)
+        parameters.pop("max_right_side_days_exclusive", None)
+        parameters.pop("min_amount_100m", None)
+        parameters.update(
+            {
+                "temperature_transition": {"from": ["温"], "to": ["热", "沸"]},
+                "min_strength": str(CN_MIN_STRENGTH),
+                "allowed_industry_temperatures": ["温", "热", "沸"],
+                "allowed_phases": ["谷雨", "立夏", "夏至"],
+                "min_market_cap_cny_100m": str(CN_MIN_MARKET_CAP_100M),
+                "min_amount_cny_100m": str(CN_MIN_AMOUNT_100M),
+                "market_value_currency": MARKET_CURRENCY[market],
+                "cny_per_local_currency": str(rate),
+                "requires_right_side_days": True,
+            }
+        )
+        rows = [
+            row
+            for row in rows
+            if row["name"]
+            not in {
+                "趋势温度",
+                "趋势强度",
+                "行业温度",
+                "趋势节气",
+                "总市值",
+                "右侧天数",
+                "单日成交额",
+            }
+        ]
+        insert_at = next(
+            (index for index, row in enumerate(rows) if row["name"] == "其他要求"),
+            len(rows),
+        )
+        rows[insert_at:insert_at] = [
+            {
+                "group": "入场过滤",
+                "name": "趋势温度",
+                "value": "前一状态为温；当前状态为热或沸",
+            },
+            {"group": "入场过滤", "name": "趋势强度", "value": "不低于 95"},
+            {
+                "group": "入场过滤",
+                "name": "行业温度",
+                "value": "温、热或沸",
+            },
+            {
+                "group": "入场过滤",
+                "name": "趋势节气",
+                "value": "谷雨、立夏或夏至",
+            },
+            {
+                "group": "入场过滤",
+                "name": "总市值",
+                "value": "不低于人民币 100 亿元（按冻结汇率换算）",
+            },
+            {
+                "group": "入场过滤",
+                "name": "单日成交额",
+                "value": "不低于人民币 2 亿元（按冻结汇率换算）",
+            },
+        ]
+        for row in rows:
+            if row["name"] == "其他要求":
+                row["value"] = (
+                    "趋势右侧、可交易、无危险信号、日期一致、非当前持仓、"
+                    "右侧天数存在、ATR14 可计算"
+                )
     if market == "CN" and version in {"v6", "v7", "v8", "v9", "v10"}:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
@@ -1900,15 +1971,24 @@ def _candidate_reasons(
     *,
     market: str = "CN",
     strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
 ) -> list[str]:
     reasons: list[str] = []
-    if market == "CN":
+    shared_discipline = market == "CN" or (
+        market in {"US", "HK"} and strategy_version in {"v5", "v6", "v7"}
+    )
+    cny_rate = (
+        cny_per_local_currency
+        if cny_per_local_currency is not None
+        else CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
+    )
+    if shared_discipline:
         allowed_assets = (
             {"A股", "ETF基金"}
             if strategy_version in {"v9", "v10"}
             else {"A股"}
         )
-        if item.asset not in allowed_assets:
+        if market == "CN" and item.asset not in allowed_assets:
             reasons.append("a_share_only")
         if item.temperature_prev is None or item.temperature_curr is None:
             reasons.append("temperature_missing")
@@ -1930,12 +2010,18 @@ def _candidate_reasons(
             reasons.append("phase_after_summer_solstice")
         if item.market_cap is None:
             reasons.append("market_cap_missing")
-        elif item.market_cap < CN_MIN_MARKET_CAP_100M:
-            reasons.append("market_cap_below_100")
+        elif item.market_cap * cny_rate < CN_MIN_MARKET_CAP_100M:
+            reasons.append(
+                "market_cap_below_100"
+                if market == "CN"
+                else "market_cap_below_100_cny"
+            )
         if item.amount is None:
             reasons.append("amount_missing")
-        elif item.amount < CN_MIN_AMOUNT_100M:
-            reasons.append("amount_below_2")
+        elif item.amount * cny_rate < CN_MIN_AMOUNT_100M:
+            reasons.append(
+                "amount_below_2" if market == "CN" else "amount_below_2_cny"
+            )
         if item.days is None:
             reasons.append("right_side_days_missing")
     else:
@@ -2168,6 +2254,7 @@ def build_candidate_list(
     market: str = "CN",
     industry_contexts: Mapping[int, IndustryContext] | None = None,
     strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
 ) -> CandidateDecision:
     eligible: list[CandidateInput] = []
     excluded: dict[str, list[str]] = {}
@@ -2186,6 +2273,7 @@ def build_candidate_list(
                     expected_date,
                     market=market,
                     strategy_version=strategy_version,
+                    cny_per_local_currency=cny_per_local_currency,
                 )
             )
         )
@@ -2217,6 +2305,7 @@ def collect_industry_contexts(
     market: str,
     history_root: Path,
     strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
 ) -> tuple[tuple[IndustryContext, ...], dict[str, object], dict[str, object]]:
     """Collect breadth/state only for industries that pass existing hard gates."""
     candidate_decision = build_candidate_list(
@@ -2225,6 +2314,7 @@ def collect_industry_contexts(
         expected_date=expected_date,
         market=market,
         strategy_version=strategy_version,
+        cny_per_local_currency=cny_per_local_currency,
     )
     eligible = candidate_decision.eligible
     eligible_industry_ids = sorted(
@@ -2333,6 +2423,7 @@ def collect_industry_contexts(
         market=market,
         industry_contexts=context_map,
         strategy_version=strategy_version,
+        cny_per_local_currency=cny_per_local_currency,
     )
     facts = {
         "eligible_industry_ids": tuple(eligible_industry_ids),
@@ -3311,6 +3402,11 @@ def build_report(
         market.upper(), snapshot_version
     ) in CURRENT_EXIT_DISCIPLINES
     snapshot_parameters = resolved_strategy_snapshot.get("parameters")
+    cny_per_local_currency = CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
+    if isinstance(snapshot_parameters, Mapping):
+        frozen_rate = snapshot_parameters.get("cny_per_local_currency")
+        if frozen_rate is not None:
+            cny_per_local_currency = _decimal(frozen_rate)
     raw_cn_weights = (
         snapshot_parameters.get("target_weight")
         if isinstance(snapshot_parameters, Mapping)
@@ -3365,6 +3461,7 @@ def build_report(
         market=market,
         industry_contexts=industry_context_map,
         strategy_version=snapshot_version,
+        cny_per_local_currency=cny_per_local_currency,
     )
     resolved_industry_context_status = dict(
         candidate_decision.industry_context_status
@@ -3555,7 +3652,12 @@ def build_report(
     } if real_holdings is not None and real_holdings.status == "available" else {}
     excluded_signals = {
         symbol: [
-            _candidate_signal(item, market=market)
+            _candidate_signal(
+                item,
+                market=market,
+                strategy_version=snapshot_version,
+                cny_per_local_currency=cny_per_local_currency,
+            )
             for item in candidates
             if item.symbol == symbol
         ]
@@ -3567,7 +3669,12 @@ def build_report(
     }
     candidate_signals = [
         {
-            **_candidate_signal(item, market=market),
+            **_candidate_signal(
+                item,
+                market=market,
+                strategy_version=snapshot_version,
+                cny_per_local_currency=cny_per_local_currency,
+            ),
             "eligible": (item.tm_id, item.symbol) in ranks,
             "excluded_reasons": _candidate_reasons(
                 item,
@@ -3575,6 +3682,7 @@ def build_report(
                 as_of_date,
                 market=market,
                 strategy_version=snapshot_version,
+                cny_per_local_currency=cny_per_local_currency,
             ),
             "rank": ranks.get((item.tm_id, item.symbol)),
             "pools": list(item.pools),
@@ -3704,7 +3812,13 @@ def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
     return signal
 
 
-def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]:
+def _candidate_signal(
+    item: CandidateInput,
+    *,
+    market: str,
+    strategy_version: str | None = None,
+    cny_per_local_currency: Decimal | None = None,
+) -> dict[str, object]:
     signal = {
         "tm_id": item.tm_id,
         "symbol": item.symbol,
@@ -3730,6 +3844,28 @@ def _candidate_signal(item: CandidateInput, *, market: str) -> dict[str, object]
         "phase": item.phase,
         **_paid_expansion_signal(item),
     }
+    shared_discipline = market.upper() == "CN" or (
+        market.upper() in {"US", "HK"}
+        and strategy_version in {"v5", "v6", "v7"}
+    )
+    if shared_discipline:
+        rate = (
+            cny_per_local_currency
+            if cny_per_local_currency is not None
+            else CNY_PER_LOCAL_CURRENCY.get(market.upper(), Decimal("1"))
+        )
+        signal.update(
+            {
+                "market_value_currency": MARKET_CURRENCY[market.upper()],
+                "cny_per_local_currency": rate,
+                "market_cap_cny_100m": (
+                    item.market_cap * rate if item.market_cap is not None else None
+                ),
+                "amount_cny_100m": (
+                    item.amount * rate if item.amount is not None else None
+                ),
+            }
+        )
     if market.upper() in {"US", "HK"}:
         signal.update(boiling=item.boiling, champagne=item.champagne)
     return signal
@@ -3777,8 +3913,10 @@ REASON_LABELS = {
     "phase_after_summer_solstice": "趋势节气晚于夏至",
     "market_cap_missing": "市值缺失",
     "market_cap_below_100": "市值低于 100 亿元",
+    "market_cap_below_100_cny": "市值折算人民币后低于 100 亿元",
     "amount_missing": "日成交额缺失",
     "amount_below_2": "日成交额不足 2 亿元",
+    "amount_below_2_cny": "日成交额折算人民币后不足 2 亿元",
     "right_side_days_missing": "右侧天数缺失",
     "right_side_not_true": "尚未进入右侧趋势",
     "strength_not_above_90": "趋势强度未超过 90",
@@ -5613,6 +5751,39 @@ def _holding_snapshot(
         days=_optional_int(row.get("daysSinceTrendEntry")),
         **paid_expansion,
     )
+
+
+def load_industry_temperatures(
+    api: object,
+    *,
+    tm_ids: Sequence[int],
+    expected_date: str,
+) -> tuple[list[Mapping[str, object]], dict[int, str | None]]:
+    requested_ids = sorted(set(tm_ids))
+    rows = (
+        api.get_snapshots(
+            tm_ids=requested_ids,
+            fields=A_SHARE_INDUSTRY_FIELDS,
+            expected_date=expected_date,
+        )
+        if requested_ids
+        else []
+    )
+    returned_ids = [_row_tm_id(row) for row in rows]
+    if len(returned_ids) != len(set(returned_ids)) or any(
+        tm_id not in requested_ids for tm_id in returned_ids
+    ):
+        raise TrendAnimalsError("industry snapshot returned mismatched tmIds")
+    if any(row.get("asOfDate") != expected_date for row in rows):
+        raise TrendAnimalsError("industry snapshot returned a stale data date")
+    return rows, {
+        _row_tm_id(row): (
+            str(row["trendTemperatureCurr"])
+            if row.get("trendTemperatureCurr") in KNOWN_TEMPERATURES
+            else None
+        )
+        for row in rows
+    }
 
 
 def _attempt_report(

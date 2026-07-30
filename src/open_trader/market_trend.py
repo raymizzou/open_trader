@@ -14,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
+    A_SHARE_INDUSTRY_FIELDS,
     AShareTrendRunResult,
     AccountPosition,
     AccountSnapshot,
@@ -28,6 +29,7 @@ from .a_share_trend import (
     _finalize_market_report,
     _holding_snapshot,
     _is_systemic_futu_error,
+    _optional_int,
     _process_version,
     read_delivery_receipt,
     _redact_api_key,
@@ -43,6 +45,7 @@ from .a_share_trend import (
     enrich_real_holding_input,
     evaluate_candidate,
     load_futu_simulate_trend_account,
+    load_industry_temperatures,
     load_real_holding_input,
     live_trend_strategy_snapshot,
     load_watch_events,
@@ -978,7 +981,10 @@ def _attempt_market_report(
         billing = {
             _billing_field(row): row for row in api.get_snapshot_billing()
         }
-        missing = [field for field in UNIFIED_TREND_FIELDS if field not in billing]
+        requested_fields = tuple(
+            dict.fromkeys(UNIFIED_TREND_FIELDS + A_SHARE_INDUSTRY_FIELDS)
+        )
+        missing = [field for field in requested_fields if field not in billing]
         if missing:
             raise ValueError(
                 "getSnapshotColumnBilling missing requested field(s): "
@@ -999,6 +1005,25 @@ def _attempt_market_report(
             raise ValueError("getTickerSnapshot returned mismatched tmIds")
         if any(row.get("asOfDate") != as_of_date for row in snapshot_rows):
             raise ValueError("getTickerSnapshot returned a stale data date")
+        industry_ids = sorted(
+            {
+                industry_id
+                for row in snapshot_rows
+                if (industry_id := _optional_int(row.get("industryTmId")))
+                is not None and industry_id > 0
+            }
+        )
+        industry_rows: list[Mapping[str, object]] = []
+        industry_temperatures: dict[int, str | None] = {}
+        industry_data_reason = ""
+        try:
+            industry_rows, industry_temperatures = load_industry_temperatures(
+                api,
+                tm_ids=industry_ids,
+                expected_date=as_of_date,
+            )
+        except TrendAnimalsError as exc:
+            industry_data_reason = f"行业温度数据不可用，暂停新开仓：{exc}"
         rows_by_id = {_row_tm_id(row): row for row in snapshot_rows}
         start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         candidates = []
@@ -1022,7 +1047,13 @@ def _attempt_market_report(
                 bars = None
             candidates.append(
                 evaluate_candidate(
-                    row, bars, pools=component_pools[tm_id], market=market
+                    row,
+                    bars,
+                    pools=component_pools[tm_id],
+                    market=market,
+                    industry_temperature=industry_temperatures.get(
+                        _optional_int(row.get("industryTmId"))
+                    ),
                 )
             )
         holding_snapshots = {position.symbol: None for position in account.positions}
@@ -1049,7 +1080,12 @@ def _attempt_market_report(
                     ) != to_futu_symbol(market, symbol):
                         continue
                     holding_snapshots[symbol] = _holding_snapshot(
-                        row, market=market, bars=tuple(bars or ())
+                        row,
+                        market=market,
+                        industry_temperature=industry_temperatures.get(
+                            _optional_int(row.get("industryTmId"))
+                        ),
+                        bars=tuple(bars or ()),
                     )
                 except ValueError:
                     pass
@@ -1073,6 +1109,18 @@ def _attempt_market_report(
             rows_by_id[tm_id] for tm_id in sorted(component_ids)
             if tm_id in rows_by_id
         ]
+        process_version = _process_version(config.repo)
+        strategy_snapshot = live_trend_strategy_snapshot(
+            market,
+            process_version,
+            pool_ids,
+            execution_date=execution_date,
+        )
+        strategy_parameters = strategy_snapshot["parameters"]
+        assert isinstance(strategy_parameters, Mapping)
+        cny_per_local_currency = _decimal(
+            strategy_parameters.get("cny_per_local_currency", "1")
+        )
         industry_contexts, industry_context_status, industry_facts = (
             collect_industry_contexts(
                 api=api,
@@ -1082,6 +1130,8 @@ def _attempt_market_report(
                 expected_date=as_of_date,
                 market=market,
                 history_root=paths.root.parent / "trend_industry_context",
+                strategy_version=str(strategy_snapshot["strategy_version"]),
+                cny_per_local_currency=cny_per_local_currency,
             )
         )
         balance_after = _balance(api.get_account_balance())
@@ -1098,6 +1148,11 @@ def _attempt_market_report(
             }
         estimated_cost = (
             unified_unit_cost * (len(requested_ids) + real_only_count)
+            + sum(
+                (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
+                Decimal("0"),
+            )
+            * len(industry_ids)
             + sum(
                 (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
                 Decimal("0"),
@@ -1141,14 +1196,7 @@ def _attempt_market_report(
         except ValueError as exc:
             kelly_rounds = ()
             kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
-        process_version = _process_version(config.repo)
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
-        strategy_snapshot = live_trend_strategy_snapshot(
-            market,
-            process_version,
-            pool_ids,
-            execution_date=execution_date,
-        )
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
             market=market,
@@ -1172,6 +1220,12 @@ def _attempt_market_report(
                 *_component_api_facts(api, len(component_rows)),
                 *pool_resolution_facts,
                 f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
+                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
+                *(
+                    (f"industry_data_reason={industry_data_reason}",)
+                    if industry_data_reason
+                    else ()
+                ),
                 f"getComponentTicker eligible_industries={industry_facts['component_requests']} rows={industry_facts['component_rows']} cache=client-managed",
                 f"getTickerSnapshot fields={','.join(INDUSTRY_MEMBER_FIELDS)} ids={len(industry_facts['member_ids'])} rows={industry_facts['member_rows']} cache=client-managed",
                 f"getTickerSnapshot fields={','.join(INDUSTRY_STATE_FIELDS)} ids={len(industry_facts['state_ids'])} rows={industry_facts['state_rows']} cache=client-managed",
@@ -1203,6 +1257,7 @@ def _attempt_market_report(
                 "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "process_version": process_version,
+                "industry_data_reason": industry_data_reason,
                 "paid_response_cache": cache_metadata,
                 **(
                     {
@@ -1214,7 +1269,7 @@ def _attempt_market_report(
                 ),
             },
             kelly_rounds=kelly_rounds,
-            kelly_data_reason=kelly_data_reason,
+            kelly_data_reason=kelly_data_reason or industry_data_reason,
             real_holdings=real_holdings,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
@@ -1233,6 +1288,7 @@ def _attempt_market_report(
             query={
                 "component_pool_ids": list(pool_ids),
                 "snapshot_fields": list(UNIFIED_TREND_FIELDS),
+                "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
                 "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
                 "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
             },
@@ -1240,6 +1296,7 @@ def _attempt_market_report(
                 "update_status": update_rows,
                 "components": component_rows,
                 "snapshots": snapshot_rows,
+                "industries": industry_rows,
                 "real_snapshots": list(real_snapshot_rows.values()),
                 "industry_components": [
                     row
@@ -1255,7 +1312,7 @@ def _attempt_market_report(
             previous_attention_rows=previous_attention_rows,
             option_attention_broker_label=option_attention_broker_label,
             kelly_rounds=kelly_rounds,
-            kelly_data_reason=kelly_data_reason,
+            kelly_data_reason=kelly_data_reason or industry_data_reason,
             real_holdings_input=real_holdings,
         )
         report = replace(
