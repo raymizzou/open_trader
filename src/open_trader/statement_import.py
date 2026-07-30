@@ -78,14 +78,14 @@ class StatementImportService:
                         fx_date=statement_date,
                     ),
                 )
+                if backup is not None:
+                    backup.unlink()
             except Exception:
                 try:
                     _restore_archive(archive, backup)
                 finally:
                     _restore_snapshot(run_snapshot)
                 raise
-            if backup is not None:
-                backup.unlink(missing_ok=True)
             statistics_cutoff_at: str | None = None
             try:
                 statistics_cutoff_at = _statement_cutoff(statement_date, broker)

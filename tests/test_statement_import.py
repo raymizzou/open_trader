@@ -414,6 +414,60 @@ def test_import_pdf_restores_archive_when_pipeline_fails(
     assert archive.read_bytes() == b"old statement"
 
 
+def test_import_pdf_restores_source_when_archive_backup_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statement_import = importlib.import_module("open_trader.statement_import")
+    parser = FakePhillipsParser()
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", lambda: parser
+    )
+    data_dir = tmp_path / "data"
+    service = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    )
+    service.import_pdf("phillips", PDF_BYTES)
+    archive = data_dir / "statements/phillips/2026-07-10/statement.pdf"
+    original_parse = parser.parse
+
+    def parse_corrected(path: Path, period: str) -> ParseResult:
+        parsed = original_parse(path, period)
+        return replace(
+            parsed,
+            positions=[
+                replace(parsed.positions[0], quantity=Decimal("2")),
+            ],
+        )
+
+    monkeypatch.setattr(parser, "parse", parse_corrected)
+    original_unlink = Path.unlink
+
+    def fail_backup_unlink(
+        path: Path, missing_ok: bool = False
+    ) -> None:
+        if path.name.endswith(".backup"):
+            raise OSError("backup cleanup failed")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_backup_unlink)
+
+    with pytest.raises(OSError, match="backup cleanup failed"):
+        service.import_pdf("phillips", b"%PDF-1.7\ncorrected")
+
+    assert archive.read_bytes() == PDF_BYTES
+    rows = list(
+        csv.DictReader(
+            (data_dir / "runs/2026-07/extracted_positions.csv").open(
+                encoding="utf-8"
+            )
+        )
+    )
+    phillips_row = next(row for row in rows if row["broker"] == "phillips")
+    assert phillips_row["quantity"] == "1"
+
+
 def test_import_pdf_rejects_empty_parse_without_archiving(
     tmp_path: Path,
     monkeypatch,
@@ -687,8 +741,8 @@ def test_stats_write_failure_keeps_accepted_source_and_previous_stats(
             )
         )
     )
-    phillips = next(row for row in rows if row["broker"] == "phillips")
-    assert phillips["quantity"] == "2"
+    phillips_row = next(row for row in rows if row["broker"] == "phillips")
+    assert phillips_row["quantity"] == "2"
 
 
 def test_eastmoney_statistics_clock_failure_keeps_same_period_statement(
