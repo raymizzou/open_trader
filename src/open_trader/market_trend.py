@@ -958,7 +958,9 @@ def _attempt_market_report(
         for position in account.positions:
             try:
                 holding_ids[position.symbol] = api.search_exact_symbol(
-                    position.symbol, market=market
+                    position.symbol,
+                    market=market,
+                    expected_date=as_of_date,
                 )
             except TrendAnimalsError:
                 continue

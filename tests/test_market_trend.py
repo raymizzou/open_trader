@@ -910,8 +910,14 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             assert tm_id == 622494
             return [{"tmId": 1, "tickerSymbol": "2800.HK", "asOfDate": expected_date}]
 
-        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
-            assert (symbol, market) == ("00700", "HK")
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str
+        ) -> int:
+            assert (symbol, market, expected_date) == (
+                "00700",
+                "HK",
+                "2026-07-15",
+            )
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
@@ -1140,8 +1146,14 @@ def test_market_report_keeps_futu_holding_price_when_trend_mapping_is_unavailabl
         ) -> list[dict[str, object]]:
             return []
 
-        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
-            assert (symbol, market) == ("VIXY", "US")
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str
+        ) -> int:
+            assert (symbol, market, expected_date) == (
+                "VIXY",
+                "US",
+                "2026-07-14",
+            )
             if lookup_fails:
                 raise TrendAnimalsLookupError("missing")
             return 2
@@ -1349,8 +1361,14 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             assert (tm_id, expected_date) == (622460, "2026-07-14")
             return [{"tmId": 1, "tickerSymbol": "QQQ.US", "asOfDate": expected_date}]
 
-        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
-            assert (symbol, market) == ("VIXY", "US")
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str
+        ) -> int:
+            assert (symbol, market, expected_date) == (
+                "VIXY",
+                "US",
+                "2026-07-14",
+            )
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
@@ -1560,7 +1578,14 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
         ) -> list[dict[str, object]]:
             return [{"tmId": 1, "tickerSymbol": "VIXY.US", "asOfDate": expected_date}]
 
-        def search_exact_symbol(self, symbol: str, *, market: str) -> int:
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str
+        ) -> int:
+            assert (symbol, market, expected_date) == (
+                "VIXY",
+                "US",
+                "2026-07-14",
+            )
             return 2
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:

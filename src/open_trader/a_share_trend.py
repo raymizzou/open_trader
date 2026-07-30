@@ -56,6 +56,7 @@ from .trend_industry_context import (
 from .trend_animals import (
     TrendAnimalsClient,
     TrendAnimalsError,
+    TrendAnimalsLookupError,
 )
 from .trend_delivery import deliver_daily_trend_text
 from .trend_review import (
@@ -131,6 +132,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("HK", "v6"),
     ("HK", "v7"),
 })
+REAL_HOLDING_TREND_EXCLUDED_SYMBOLS = frozenset({"US.AGRZ"})
 OVERHEAT_PARAMETER_NAMES = frozenset({
     "overheat_trim_fraction",
     "overheat_trim_once_per_position",
@@ -1118,6 +1120,7 @@ class RealHoldingInput:
     holding_snapshots: Mapping[str, HoldingSnapshot | None]
     bars_by_symbol: Mapping[str, Sequence[DailyKlineBar] | None]
     prior_state: Mapping[str, object] | None
+    trend_excluded_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1401,12 +1404,14 @@ def enrich_real_holding_input(
 
     Simulated account requests are deliberately passed in separately. A failure
     while resolving or loading real-only symbols degrades the real tab to
-    ``unavailable`` and leaves the simulated report path untouched.
+    ``unavailable`` and leaves the simulated report path untouched. An exact
+    symbol miss only degrades that real position.
     """
     if real_input.status != "available":
         return real_input, {}, {}, 0
     real_ids: dict[str, int] = {}
-    unresolved: list[str] = []
+    unresolved: set[str] = set()
+    excluded = set(real_input.trend_excluded_symbols)
     search_exact_symbol = getattr(api, "search_exact_symbol", None)
     if not callable(search_exact_symbol):
         degraded = replace(
@@ -1418,25 +1423,32 @@ def enrich_real_holding_input(
         )
         return degraded, {}, {}, 0
     for position in real_input.positions:
+        canonical_symbol = to_futu_symbol(market, position.symbol)
+        if canonical_symbol in REAL_HOLDING_TREND_EXCLUDED_SYMBOLS:
+            excluded.add(position.symbol)
+            continue
         if position.symbol in existing_holding_ids:
             real_ids[position.symbol] = existing_holding_ids[position.symbol]
             continue
         try:
             real_ids[position.symbol] = int(
-                search_exact_symbol(position.symbol, market=market)
+                search_exact_symbol(
+                    position.symbol,
+                    market=market,
+                    expected_date=as_of_date,
+                )
             )
-        except Exception:
-            unresolved.append(position.symbol)
-    if unresolved:
-        degraded = replace(
-            real_input,
-            status="unavailable",
-            reason="真实持仓标的无法在 Trend Animals 定位："
-            + ", ".join(sorted(unresolved)),
-            holding_snapshots={},
-            bars_by_symbol={},
-        )
-        return degraded, {}, {}, 0
+        except TrendAnimalsLookupError:
+            unresolved.add(position.symbol)
+        except Exception as exc:
+            degraded = replace(
+                real_input,
+                status="unavailable",
+                reason=f"真实持仓趋势服务不可用：{exc}",
+                holding_snapshots={},
+                bars_by_symbol={},
+            )
+            return degraded, {}, {}, 0
 
     real_only_ids = sorted(
         set(real_ids.values()) - set(existing_rows_by_tm_id)
@@ -1499,12 +1511,18 @@ def enrich_real_holding_input(
 
     real_snapshots: dict[str, HoldingSnapshot | None] = {}
     for position in real_input.positions:
+        if position.symbol in excluded or position.symbol in unresolved:
+            real_snapshots[position.symbol] = None
+            continue
         if position.symbol in existing_holding_snapshots:
             real_snapshots[position.symbol] = existing_holding_snapshots[
                 position.symbol
             ]
             continue
-        tm_id = real_ids[position.symbol]
+        tm_id = real_ids.get(position.symbol)
+        if tm_id is None:
+            real_snapshots[position.symbol] = None
+            continue
         row = real_rows.get(tm_id)
         if row is None:
             real_snapshots[position.symbol] = None
@@ -1527,6 +1545,7 @@ def enrich_real_holding_input(
             real_input,
             holding_snapshots=real_snapshots,
             bars_by_symbol=real_bars,
+            trend_excluded_symbols=tuple(sorted(excluded)),
         ),
         real_rows,
         real_bars,
@@ -2973,6 +2992,7 @@ def _evaluate_holding_positions(
     lot_sizes: Mapping[str, int] | None,
     current_exit_discipline: bool,
     read_only_real: bool,
+    trend_excluded_symbols: Sequence[str] = (),
 ) -> HoldingEvaluation:
     old_positions = _state_positions(prior_state)
     decisions: list[HoldingDecision] = []
@@ -3089,6 +3109,8 @@ def _evaluate_holding_positions(
             action, reason = "MANUAL_REVIEW", "holding_kline_unavailable"
         if read_only_real and not signal_complete and action == "HOLD":
             action, reason = "MANUAL_REVIEW", "holding_signal_unknown"
+        if read_only_real and symbol in trend_excluded_symbols:
+            action, reason = "MANUAL_REVIEW", "holding_trend_excluded"
         effective_atr = current_atr if current_atr is not None else old_atr
         target_fraction: Decimal | None = None
         estimated_shares: int | None = None
@@ -3367,6 +3389,7 @@ def build_report(
         lot_sizes=lot_sizes,
         current_exit_discipline=current_exit_discipline,
         read_only_real=False,
+        trend_excluded_symbols=(),
     )
     holdings = list(simulated_evaluation.decisions)
     new_positions = simulated_evaluation.protection_state["positions"]
@@ -3389,6 +3412,7 @@ def build_report(
             lot_sizes=lot_sizes,
             current_exit_discipline=current_exit_discipline,
             read_only_real=True,
+            trend_excluded_symbols=real_holdings.trend_excluded_symbols,
         )
         real_decisions = real_evaluation.decisions
         real_protection_state = real_evaluation.protection_state
@@ -3725,6 +3749,7 @@ REASON_LABELS = {
     "danger_signal": "危险信号触发",
     "left_trend_right_side": "右侧趋势已结束",
     "holding_signal_unknown": "趋势信号不完整",
+    "holding_trend_excluded": "已排除趋势查询",
     "holding_kline_unavailable": "持仓日线数据不可用",
     "holding_lot_size_unavailable": "持仓整手信息不可用",
     "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
@@ -5656,7 +5681,9 @@ def _attempt_report(
         for position in account.positions:
             try:
                 holding_ids[position.symbol] = api.search_exact_symbol(
-                    position.symbol, market="CN"
+                    position.symbol,
+                    market="CN",
+                    expected_date=run_date,
                 )
             except TrendAnimalsError:
                 continue

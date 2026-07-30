@@ -14,8 +14,10 @@ import pytest
 from open_trader import market_trend
 import open_trader.trend_review as trend_review
 from open_trader.a_share_trend import (
+    AccountPosition,
     AccountSnapshot,
     CandidateInput,
+    RealHoldingInput,
     _report_payload,
     build_report,
     live_trend_strategy_snapshot,
@@ -203,6 +205,76 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
+
+
+def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
+    strategy = trend_strategy_snapshot("US", "oldsha", (1,))
+    real_input = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "tiger"},
+        positions=(
+            AccountPosition(
+                symbol="US.AGRZ",
+                name="AGRZ",
+                asset_class="etf",
+                quantity=Decimal("1"),
+                avg_cost_price=Decimal("20"),
+                market_value=Decimal("20"),
+            ),
+        ),
+        holding_snapshots={"US.AGRZ": None},
+        bars_by_symbol={"US.AGRZ": None},
+        prior_state=None,
+        trend_excluded_symbols=("US.AGRZ",),
+    )
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=AccountSnapshot(
+            source_date="2026-07-16",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+            position_count=0,
+        ),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        generated_at="2026-07-16T17:00:00+08:00",
+        metadata={"market": "US", "broker": "tiger"},
+        market="US",
+        process_version="oldsha",
+        candidate_pool_ids=(1,),
+        strategy_snapshot=strategy,
+        real_holdings=real_input,
+    )
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=(),
+        query={"component_pool_ids": [1]},
+        responses={},
+        candidate_pool_ids=(1,),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=[],
+        option_attention_broker_label="老虎",
+        real_holdings_input=real_input,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    assert rebuilt["strategy_judgments"]["real_holding_decisions"][0][
+        "reason"
+    ] == "holding_trend_excluded"
 
 
 @pytest.mark.parametrize("strategy_version", ["v4", "v9"])

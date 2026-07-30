@@ -5747,12 +5747,18 @@ def rebuild_trend_report_from_evidence(
         real_status = real_raw.get("status")
         real_reason = real_raw.get("reason", "")
         real_source = real_raw.get("source", {})
+        real_excluded = real_raw.get("trend_excluded_symbols", [])
         if (
             real_status not in {"available", "unavailable"}
             or not isinstance(real_reason, str)
             or not isinstance(real_source, Mapping)
             or not all(isinstance(key, str) and isinstance(value, str)
                        for key, value in real_source.items())
+            or not isinstance(real_excluded, list)
+            or not all(
+                isinstance(symbol, str) and symbol
+                for symbol in real_excluded
+            )
         ):
             raise TrendReplayIncompleteError(
                 "invalid original input: real_holdings"
@@ -5833,6 +5839,7 @@ def rebuild_trend_report_from_evidence(
             holding_snapshots=real_snapshots,
             bars_by_symbol=real_bars,
             prior_state=real_prior_state,
+            trend_excluded_symbols=tuple(real_excluded),
         )
     process_version = str(evidence.get("process_version") or "")
     normalize_trend_strategy_snapshot(snapshot, str(inputs["market"]))

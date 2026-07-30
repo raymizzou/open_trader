@@ -3506,6 +3506,168 @@ def test_real_missing_signal_does_not_invent_a_protection_line() -> None:
     assert built.real_protection_state["positions"]["600001"].get("active_line") is None
 
 
+def test_real_symbol_misses_are_per_position_and_agrz_skips_trend_lookup() -> None:
+    class MissingApi:
+        def __init__(self) -> None:
+            self.searches: list[tuple[str, str, str]] = []
+
+        def search_exact_symbol(
+            self,
+            symbol: str,
+            *,
+            market: str,
+            expected_date: str,
+        ) -> int:
+            self.searches.append((symbol, market, expected_date))
+            raise TrendAnimalsLookupError(f"missing {symbol}")
+
+    class Quote:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, str]] = []
+
+        def get_daily_kline(
+            self,
+            symbol: str,
+            *,
+            start: str,
+            end: str,
+        ) -> list[DailyKlineBar]:
+            self.requests.append((symbol, start, end))
+            return bars(end_date=end)
+
+    real_input = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "tiger"},
+        positions=(
+            AccountPosition(
+                symbol="US.AGRZ",
+                name="AGRZ",
+                asset_class="etf",
+                quantity=Decimal("10"),
+                avg_cost_price=Decimal("20"),
+                market_value=Decimal("200"),
+            ),
+            AccountPosition(
+                symbol="US.EUV",
+                name="EUV",
+                asset_class="etf",
+                quantity=Decimal("10"),
+                avg_cost_price=Decimal("20"),
+                market_value=Decimal("200"),
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+    )
+    api = MissingApi()
+    quote = Quote()
+
+    enriched, rows, real_bars, request_count = (
+        trend_module.enrich_real_holding_input(
+            real_input,
+            api=api,
+            quote=quote,
+            market="US",
+            as_of_date="2026-07-29",
+            kline_start="2026-04-30",
+            existing_holding_ids={},
+            existing_rows_by_tm_id={},
+            existing_holding_snapshots={},
+            existing_bars_by_symbol={},
+        )
+    )
+
+    assert enriched.status == "available"
+    assert enriched.trend_excluded_symbols == ("US.AGRZ",)
+    assert api.searches == [("US.EUV", "US", "2026-07-29")]
+    assert enriched.holding_snapshots == {
+        "US.AGRZ": None,
+        "US.EUV": None,
+    }
+    assert set(enriched.bars_by_symbol) == {"US.AGRZ", "US.EUV"}
+    assert [request[0] for request in quote.requests] == ["US.AGRZ", "US.EUV"]
+    assert rows == {}
+    assert set(real_bars) == {"US.AGRZ", "US.EUV"}
+    assert request_count == 0
+
+    built = build_report(
+        as_of_date="2026-07-29",
+        execution_date="2026-07-30",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        real_holdings=enriched,
+    )
+    decisions = {item.symbol: item for item in built.real_holdings}
+
+    assert (
+        decisions["US.AGRZ"].action,
+        decisions["US.AGRZ"].reason,
+    ) == ("MANUAL_REVIEW", "holding_trend_excluded")
+    assert decisions["US.AGRZ"].industry == ""
+    assert decisions["US.AGRZ"].temperature_prev is None
+    assert decisions["US.AGRZ"].temperature_curr is None
+    assert decisions["US.AGRZ"].strength is None
+    assert decisions["US.AGRZ"].phase is None
+    assert decisions["US.EUV"].reason == "holding_signal_unknown"
+
+
+def test_real_symbol_system_failure_still_degrades_entire_real_input() -> None:
+    class BrokenApi:
+        def search_exact_symbol(
+            self,
+            symbol: str,
+            *,
+            market: str,
+            expected_date: str,
+        ) -> int:
+            raise TrendAnimalsError("service unavailable")
+
+    real_input = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "tiger"},
+        positions=(
+            AccountPosition(
+                symbol="US.MSFT",
+                name="Microsoft",
+                asset_class="stock",
+                quantity=Decimal("1"),
+                avg_cost_price=Decimal("500"),
+                market_value=Decimal("500"),
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+    )
+
+    enriched, rows, real_bars, request_count = (
+        trend_module.enrich_real_holding_input(
+            real_input,
+            api=BrokenApi(),
+            quote=object(),
+            market="US",
+            as_of_date="2026-07-29",
+            kline_start="2026-04-30",
+            existing_holding_ids={},
+            existing_rows_by_tm_id={},
+            existing_holding_snapshots={},
+            existing_bars_by_symbol={},
+        )
+    )
+
+    assert enriched.status == "unavailable"
+    assert enriched.reason == "真实持仓趋势服务不可用：service unavailable"
+    assert rows == {}
+    assert real_bars == {}
+    assert request_count == 0
+
+
 def test_unavailable_real_snapshot_is_distinct_from_empty_available_snapshot() -> None:
     source = {
         "broker": "phillips",
@@ -5271,8 +5433,10 @@ class ReadyApi:
         component_id = 1 if tm_id == 622466 else 2
         return [{"tmId": component_id, "tickerSymbol": f"60000{component_id}.SH", "asOfDate": expected_date}]
 
-    def search_exact_symbol(self, symbol: str, *, market: str) -> int:
-        assert market == "CN"
+    def search_exact_symbol(
+        self, symbol: str, *, market: str, expected_date: str
+    ) -> int:
+        assert (market, expected_date) == ("CN", "2026-07-14")
         self.calls.append(f"api.search.{symbol}")
         if self.holding_error:
             raise self.holding_error
