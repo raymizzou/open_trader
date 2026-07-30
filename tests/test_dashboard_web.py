@@ -813,6 +813,38 @@ console.log(JSON.stringify({loading,error,ready}));
     assert rendered["ready"]["labelledBy"] == "account-tab-futu"
 
 
+def test_dashboard_account_header_uses_its_broker_statement_date() -> None:
+    output = run_dashboard_js(r'''
+state.statementUpload={broker:"",busy:false,message:"",error:false};
+state.accountViews={eastmoney:"real"};
+state.dashboard={
+  broker_detail_month:"2026-07-29",
+  broker_summaries:[],
+  broker_positions:[],
+  cash_rows:[],
+  holdings:[],
+  account_sync:{brokers:{eastmoney:{
+    status:"ok",display:"同步正常",data_as_of:"2026-07-30",
+  }}},
+};
+const html=renderAccountSection({
+  broker:"eastmoney",
+  rows:[],
+  summary:{
+    broker:"eastmoney",label:"东方财富",holding_count:12,
+    holding_value_hkd:"1",cash_like_value_hkd:"2",portfolio_value_hkd:"3",
+  },
+  profile:{horizon:"偏短线",strategy:"趋势交易"},
+});
+console.log(JSON.stringify({
+  brokerDate:html.includes("时间 2026-07-30"),
+  globalDate:html.includes("时间 2026-07-29"),
+}));
+''')
+
+    assert json.loads(output) == {"brokerDate": True, "globalDate": False}
+
+
 def test_dashboard_statement_upload_controls_only_render_for_statement_brokers() -> None:
     output = run_dashboard_js(r'''
 state.statementUpload={broker:"",busy:false,message:"",error:false};

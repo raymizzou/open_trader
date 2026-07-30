@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Made each statement account header show that broker's accepted statement date
+  instead of the shared detail month, so a newer 东方财富 upload is no longer
+  labeled with 辉立's older date.
 - Made uploaded 东方财富 and 辉立 statements authoritative after broker-period
   freshness validation: same-period replacements no longer fail or roll back
   when derived trade statistics cannot yet satisfy their cutoff-time invariant.

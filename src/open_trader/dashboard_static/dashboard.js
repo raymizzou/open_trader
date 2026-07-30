@@ -4734,6 +4734,7 @@ function renderAccountSection(group) {
   const sync = brokerSyncStatus(group.broker);
   const source = sync.display;
   const sourceTime = firstPresent(
+    state.dashboard?.account_sync?.brokers?.[group.broker]?.data_as_of,
     group.summary.generated_at, group.summary.as_of, state.dashboard?.broker_detail_month, "-",
   );
   return `<section id="account-${escapeHtml(group.broker)}" class="account-section">
