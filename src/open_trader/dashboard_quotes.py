@@ -173,22 +173,32 @@ class DashboardQuoteService:
                     except FutuQuoteError as exc:
                         state_error = exc
         except FutuQuoteError as exc:
-            failed_quotes = self.last_quotes
-            if any(prefix == "US" for prefix, _ in snapshot_errors):
-                failed_quotes = {
-                    symbol: quote
-                    for symbol, quote in failed_quotes.items()
-                    if not symbol.startswith("US.")
-                }
+            retained_quotes = _mark_stale(_accepted_quotes(self.last_quotes))
+            quotes = {
+                symbol: _quote_row(
+                    item=items_by_symbol[symbol],
+                    snapshot=None,
+                    market_state="",
+                    use_us_session=False,
+                    fetched_at=fetched_at,
+                    stale=False,
+                )
+                for symbol in requested_symbols
+                if symbol not in retained_quotes
+            }
+            quotes.update(retained_quotes)
+            missing_count = sum(
+                1 for quote in quotes.values() if quote["status"] == "missing_quote"
+            )
             return QuoteRefreshResult(
                 status="failed",
                 requested_count=len(requested_symbols),
-                quote_count=0,
-                missing_count=0,
+                quote_count=len(quotes) - missing_count,
+                missing_count=missing_count,
                 fetched_at=fetched_at,
                 last_success_at=self.last_success_at,
-                stale=bool(failed_quotes),
-                quotes=_mark_stale(failed_quotes),
+                stale=bool(retained_quotes),
+                quotes=quotes,
                 diagnostic=_error_diagnostic(exc),
             )
         finally:
@@ -225,6 +235,13 @@ class DashboardQuoteService:
             if us_snapshots_succeeded and state_error is not None
             else {}
         )
+        failed_prefixes = {prefix for prefix, _ in snapshot_errors}
+        retained_quotes = {
+            symbol: quote
+            for symbol, quote in _mark_stale(_accepted_quotes(self.last_quotes)).items()
+            if symbol in requested_symbols
+            and symbol.split(".", 1)[0] in failed_prefixes
+        }
         if reused_us_quotes:
             quotes.update(reused_us_quotes)
             market_states.update(
@@ -233,6 +250,7 @@ class DashboardQuoteService:
                     for symbol, quote in reused_us_quotes.items()
                 }
             )
+        quotes.update(retained_quotes)
         missing_count = sum(
             1 for quote in quotes.values() if quote["status"] == "missing_quote"
         )
@@ -257,27 +275,21 @@ class DashboardQuoteService:
             bool(reused_us_quotes),
         )
         cacheable = not snapshot_errors and missing_count == 0 and state_error is None
-        us_cacheable = (
-            bool(us_symbols)
-            and us_snapshots_succeeded
-            and state_error is None
-            and all(quotes[symbol]["status"] == "ok" for symbol in us_symbols)
-        )
         if cacheable:
             self.last_success_at = fetched_at
             self.last_quotes = {
                 futu_symbol: dict(quote)
                 for futu_symbol, quote in quotes.items()
             }
-        elif us_cacheable:
-            self.last_success_at = fetched_at
+        elif snapshot_errors and state_error is None:
             self.last_quotes = {
+                **self.last_quotes,
                 **{
                     symbol: dict(quote)
-                    for symbol, quote in self.last_quotes.items()
-                    if not symbol.startswith("US.")
+                    for symbol, quote in quotes.items()
+                    if symbol.split(".", 1)[0] not in failed_prefixes
+                    and quote["status"] == "ok"
                 },
-                **{symbol: dict(quotes[symbol]) for symbol in us_symbols},
             }
 
         return QuoteRefreshResult(
@@ -287,7 +299,7 @@ class DashboardQuoteService:
             missing_count=missing_count,
             fetched_at=fetched_at,
             last_success_at=self.last_success_at,
-            stale=bool(reused_us_quotes),
+            stale=bool(reused_us_quotes or retained_quotes),
             quotes=quotes,
             diagnostic=diagnostic,
             fallback_count=fallback_count,
@@ -421,6 +433,16 @@ def _mark_stale(
         row["stale"] = True
         stale_quotes[futu_symbol] = row
     return stale_quotes
+
+
+def _accepted_quotes(
+    quotes: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    return {
+        symbol: quote
+        for symbol, quote in quotes.items()
+        if quote.get("status") != "missing_quote"
+    }
 
 
 def _last_good_us_quotes(
