@@ -444,7 +444,7 @@ def _match_equity_position_line(line: str) -> re.Match[str] | None:
         r"(?P<symbol>[A-Z0-9.-]+)\s+"
         r"(?P<name>.+?)\s+"
         rf"(?P<previous_quantity>{NUMERIC})\s+"
-        r"(?P<last_buy_date>(?:\d{2}/\d{2}/\d{2}|\d{4}/\d{2}/\d{2}))\s+"
+        r"(?:(?P<last_buy_date>(?:\d{2}/\d{2}/\d{2}|\d{4}/\d{2}/\d{2}))\s+)?"
         rf"(?P<quantity>{NUMERIC})\s+"
         rf"(?P<last_price>{NUMERIC})\s+"
         rf"(?P<market_value>{NUMERIC})\s+"

@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Kept Phillips equity holdings whose statement row omits `LastBoughtOn`, so
+  uploaded statements no longer silently drop transferred positions such as
+  `03308`.
 - Made each statement account header show that broker's accepted statement date
   instead of the shared detail month, so a newer 东方财富 upload is no longer
   labeled with 辉立's older date.
