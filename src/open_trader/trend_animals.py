@@ -35,6 +35,10 @@ class TrendAnimalsLookupError(TrendAnimalsError):
     pass
 
 
+class TrendAnimalsNoCurrentRowsError(TrendAnimalsError):
+    pass
+
+
 def _default_transport(url: str, timeout: float) -> dict[str, object]:
     with urlopen(url, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -370,7 +374,9 @@ class TrendAnimalsClient:
                 f"expected {self._redact(expected_date)}"
             )
         if ignore_older and not current_rows:
-            raise TrendAnimalsError(f"{endpoint} returned no current-date rows")
+            raise TrendAnimalsNoCurrentRowsError(
+                f"{endpoint} returned no current-date rows"
+            )
         self._ignored_stale_components.extend(ignored_rows)
         if cached is None and not ignored_rows:
             self._write_cache(cache_path, current_rows)

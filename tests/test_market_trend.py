@@ -29,7 +29,11 @@ from open_trader.market_trend import (
     run_market_trend_report,
     updates_ready,
 )
-from open_trader.trend_animals import TrendAnimalsError, TrendAnimalsLookupError
+from open_trader.trend_animals import (
+    TrendAnimalsError,
+    TrendAnimalsLookupError,
+    TrendAnimalsNoCurrentRowsError,
+)
 from open_trader.notifications import (
     FeishuWebhookNotifier,
     NotificationError,
@@ -663,6 +667,24 @@ def test_hk_etf_root_missing_warm_to_hot_is_empty() -> None:
         market="HK",
         pool_id=707617,
         expected_date="2026-07-24",
+    ) == ([], None)
+
+
+def test_hk_etf_root_with_only_stale_children_is_empty() -> None:
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            assert (tm_id, expected_date) == (707617, "2026-07-30")
+            raise TrendAnimalsNoCurrentRowsError(
+                "getComponentTicker returned no current-date rows"
+            )
+
+    assert _candidate_pool_components(
+        Api(),
+        market="HK",
+        pool_id=707617,
+        expected_date="2026-07-30",
     ) == ([], None)
 
 

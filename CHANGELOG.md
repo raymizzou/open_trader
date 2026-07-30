@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-30
 
+- Kept statement-only Phillips and Eastmoney holdings out of the Futu live-quote
+  universe while preserving their accepted positions and labeling their
+  statement prices explicitly in the Dashboard. A stale-only Hong Kong ETF
+  dynamic root now means zero ETF candidates, as designed, without weakening
+  current-date validation for any real candidate pool; verified 419 focused
+  account-sync, quote, Dashboard, and market-report tests.
 - Added the sole account/quote sync controller: broker reads now validate a
   candidate before atomic publication, while the Dashboard only projects
   accepted files. Removed the Dashboard refresh action and the old rollback

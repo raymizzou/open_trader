@@ -3200,6 +3200,43 @@ console.log(renderAccountTable([{key:"futu:HK:02840:0",holding:{},display:{
     assert 'class="number-cell account-holding-pnl pnl-loss"' in output
 
 
+def test_dashboard_labels_statement_price_instead_of_missing_live_quote() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  broker_summaries: [
+    {broker: "eastmoney", source_kind: "statement"},
+    {broker: "futu", source_kind: "live_account"},
+  ],
+  account_sync: {brokers: {
+    eastmoney: {status: "ok", display: "同步正常"},
+    futu: {status: "ok", display: "同步正常"},
+  }},
+};
+state.quotes = {};
+const statement = renderAccountHoldingRow({
+  key: "eastmoney:CN:600900:0", broker: "eastmoney", holding: {},
+  display: {
+    market: "CN", symbol: "600900", name: "长江电力", total_quantity: "2000",
+    avg_cost_price: "25.653", last_price: "27.99", market_value_hkd: "55980",
+  },
+});
+const live = renderAccountHoldingRow({
+  key: "futu:HK:02840:0", broker: "futu", holding: {},
+  display: {
+    market: "HK", symbol: "02840", name: "SPDR金", total_quantity: "11",
+    avg_cost_price: "2932", last_price: "2907", market_value_hkd: "31977",
+  },
+});
+console.log(JSON.stringify({statement, live}));
+''')
+    rows = json.loads(output)
+    assert "结单" in rows["statement"]
+    assert "27.99" in rows["statement"]
+    assert "缺行情" not in rows["statement"]
+    assert "缺行情" in rows["live"]
+    assert "结单" not in rows["live"]
+
+
 def test_dashboard_formats_named_read_only_numeric_surfaces_only() -> None:
     output = run_dashboard_js(r'''
 const quote = renderQuotePrice({market:"HK"}, {last_price:"1234567.50"});

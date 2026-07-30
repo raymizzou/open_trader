@@ -10,6 +10,7 @@ from .futu_symbols import to_futu_symbol
 
 QUOTEABLE_ASSET_CLASSES = {"stock", "etf", "fund", "option", "unknown"}
 SUPPORTED_MARKETS = {"US", "HK", "CN"}
+STATEMENT_BROKERS = {"eastmoney", "phillips"}
 
 
 @dataclass(frozen=True)
@@ -48,11 +49,17 @@ def load_futu_quote_universe(portfolio_path: Path) -> FutuQuoteUniverse:
             symbol = row.get("symbol", "").strip().upper()
             name = row.get("name", "").strip()
             quantity_text = row.get("total_quantity", "").strip()
+            brokers = {
+                broker.strip().lower()
+                for broker in row.get("brokers", "").replace(",", ";").split(";")
+                if broker.strip()
+            }
             reason = _skip_reason(
                 market=market,
                 asset_class=asset_class,
                 symbol=symbol,
                 quantity_text=quantity_text,
+                brokers=brokers,
             )
             if reason is not None:
                 skipped.append(
@@ -84,6 +91,7 @@ def _skip_reason(
     asset_class: str,
     symbol: str,
     quantity_text: str,
+    brokers: set[str],
 ) -> str | None:
     if not symbol:
         return "blank_symbol"
@@ -99,6 +107,8 @@ def _skip_reason(
         return "excluded_asset_class"
     if market not in SUPPORTED_MARKETS:
         return "unsupported_market"
+    if brokers and brokers <= STATEMENT_BROKERS:
+        return "statement_only_source"
     try:
         to_futu_symbol(market, symbol)
     except ValueError:

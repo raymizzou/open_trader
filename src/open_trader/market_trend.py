@@ -64,7 +64,11 @@ from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .parsers.base import detect_asset_class
-from .trend_animals import TrendAnimalsClient, TrendAnimalsError
+from .trend_animals import (
+    TrendAnimalsClient,
+    TrendAnimalsError,
+    TrendAnimalsNoCurrentRowsError,
+)
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
 from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
 from .strategy_drawdown import observe_strategy_equity
@@ -514,10 +518,15 @@ def _candidate_pool_components(
     pool_id: int,
     expected_date: str,
 ) -> tuple[list[Mapping[str, object]], int | None]:
-    rows = api.get_components(  # type: ignore[attr-defined]
-        tm_id=pool_id,
-        expected_date=expected_date,
-    )
+    try:
+        rows = api.get_components(  # type: ignore[attr-defined]
+            tm_id=pool_id,
+            expected_date=expected_date,
+        )
+    except TrendAnimalsNoCurrentRowsError:
+        if market == "HK" and pool_id == HK_ETF_ROOT_TM_ID:
+            return [], None
+        raise
     if market != "HK" or pool_id != HK_ETF_ROOT_TM_ID:
         return list(rows), pool_id
     matches: list[Mapping[str, object]] = []
