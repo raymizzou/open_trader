@@ -7097,6 +7097,12 @@ const report = (market) => ({
   real_position_actions:[
     {action:"HOLD",symbol:"REAL",name:"真实",reason:"trend_intact"},
     {action:"MANUAL_REVIEW",symbol:"CHECK",name:"复核",reason:"holding_signal_unknown"},
+    {
+      action:"MANUAL_REVIEW",symbol:"US.AGRZ",name:"AGRZ",
+      reason:"holding_trend_excluded",temperature_prev:null,
+      temperature_curr:null,phase:null,strength:null,industry:"",
+      close:null,active_line:null,
+    },
   ],
 });
 for (const market of ["CN", "HK", "US"]) {
@@ -7108,6 +7114,10 @@ for (const market of ["CN", "HK", "US"]) {
   const holding = html.match(/<section class="trend-stage cn-trend-stage cn-trend-hold"[\s\S]*?<\/section>/)?.[0] || "";
   if ((holding.match(/<th scope="col">标的<\/th>/g) || []).length !== 2) throw new Error(html);
   if ((holding.match(/<th scope="col">持仓提示<\/th>/g) || []).length !== 2) throw new Error(html);
+  const agrz = (holding.match(/<tr class="cn-trend-card">[\s\S]*?<\/tr>/g) || [])
+    .find((row) => row.includes("US.AGRZ")) || "";
+  if (!agrz.includes("已排除趋势查询")) throw new Error(agrz);
+  if ((agrz.match(/>数据未提供<\/td>/g) || []).length < 6) throw new Error(agrz);
 }
 console.log("ok");
 ''')

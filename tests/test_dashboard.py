@@ -487,6 +487,17 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
             {"action": "HOLD", "symbol": "SPY", "name": "标普ETF", "reason": "trend_intact"},
             {"action": "SELL_ALL", "symbol": "VIXY", "name": "波动率ETF", "reason": "danger_signal"},
             {"action": "MANUAL_REVIEW", "symbol": "QQQ", "name": "纳指ETF", "reason": "holding_signal_unknown"},
+            {
+                "action": "MANUAL_REVIEW",
+                "symbol": "US.AGRZ",
+                "name": "AGRZ",
+                "reason": "holding_trend_excluded",
+                "temperature_prev": None,
+                "temperature_curr": None,
+                "phase": None,
+                "strength": None,
+                "industry": "",
+            },
         ],
     })
     payload["signal_snapshots"] = {
@@ -507,8 +518,8 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
     assert report["real_position_status"] == "available"
     assert report["real_position_reason"] == ""
     assert report["real_position_source"]["source_kind"] == "statement"
-    assert [item["action"] for item in report["real_position_actions"]] == [
-        "SELL_ALL", "MANUAL_REVIEW", "HOLD"
+    assert [item["symbol"] for item in report["real_position_actions"]] == [
+        "VIXY", "QQQ", "SPY", "US.AGRZ"
     ]
     assert report["counts"] == {"sell": 0, "buy": 1, "hold": 0, "review": 0}
 

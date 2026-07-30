@@ -1282,6 +1282,7 @@ def _project_trend_real_actions(payload: dict[str, Any]) -> list[dict[str, Any]]
     return sorted(
         projected_items,
         key=lambda item: (
+            item.get("reason") == "holding_trend_excluded",
             urgency.get(str(item.get("action") or ""), 4),
             *_project_trend_holding_individual_key(item),
         ),

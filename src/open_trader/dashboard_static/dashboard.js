@@ -3047,6 +3047,7 @@ const TREND_REASON_LABELS = {
   danger_signal: "危险信号触发",
   left_trend_right_side: "右侧趋势已结束",
   holding_signal_unknown: "趋势信号不完整",
+  holding_trend_excluded: "已排除趋势查询",
   holding_kline_unavailable: "持仓日线数据不可用",
   holding_lot_size_unavailable: "持仓整手信息不可用",
   trend_intact: "趋势保持完好",
