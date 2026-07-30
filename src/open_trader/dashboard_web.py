@@ -26,7 +26,7 @@ from .dashboard import (
     load_dashboard_state,
     load_trend_report_history,
 )
-from .dashboard_quotes import DashboardQuoteService
+from .dashboard_quotes import SHANGHAI_TZ, load_published_quotes
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_relation_discovery import CodexRelationValidator, discover_threshold_relations
@@ -786,9 +786,12 @@ def build_dashboard_payload(
 
 
 def build_quotes_payload(
-    quote_service: DashboardQuoteService,
-) -> dict[str, Any]:
-    return quote_service.refresh().to_dict()
+    config: DashboardConfig,
+) -> dict[str, object]:
+    return load_published_quotes(
+        config.data_dir / "latest" / "quotes.json",
+        now=datetime.now(SHANGHAI_TZ),
+    )
 
 
 def build_backtest_run_payload(
@@ -874,7 +877,6 @@ def create_dashboard_server(
     config: DashboardConfig,
     host: str,
     port: int,
-    quote_service: DashboardQuoteService | None = None,
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
     statement_import_service: StatementImportService | None = None,
@@ -886,7 +888,6 @@ def create_dashboard_server(
     prediction_session_token: str | None = None,
     prediction_csrf_token: str | None = None,
 ) -> ThreadingHTTPServer:
-    service = quote_service or DashboardQuoteService(config=config)
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
     import_service = statement_import_service or StatementImportService(
         data_dir=config.data_dir,
@@ -949,10 +950,7 @@ def create_dashboard_server(
                 return
             if path == "/api/quotes":
                 try:
-                    with portfolio_update_lock:
-                        self._send_json(
-                            build_quotes_payload(service)
-                        )
+                    self._send_json(build_quotes_payload(config))
                 except Exception as exc:
                     self._send_error_json(exc)
                 return

@@ -28,6 +28,7 @@ from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
 from tests.test_dashboard import (
     dashboard_config,
     portfolio_rows,
+    seed_accepted_account_sync,
     write_csv,
     write_trend_history_report,
 )
@@ -1098,7 +1099,7 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1137,7 +1138,7 @@ def test_dashboard_server_ignores_client_disconnect_while_writing_json(
         dashboard_web, "build_standard_backtest_options_payload", delayed_options
     )
     server = dashboard_web.create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     unhandled_errors: list[BaseException | None] = []
     handler_completed = threading.Event()
@@ -1189,7 +1190,7 @@ def test_standard_backtest_http_rejects_invalid_json_objects_with_chinese_400(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1222,7 +1223,7 @@ def test_dashboard_http_rejects_invalid_or_oversized_content_length_before_read(
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1316,7 +1317,7 @@ def test_standard_backtest_http_maps_owned_provider_lifecycle_errors_to_502(
     monkeypatch.setattr(dashboard_web, "FutuQuoteClient", lambda **_: Provider())
     monkeypatch.setattr(dashboard_web, "run_standard_backtest", run)
     server = dashboard_web.create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1795,7 +1796,6 @@ def test_prediction_arbitrage_state_is_schema_valid_when_unavailable(tmp_path: P
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1840,7 +1840,6 @@ def test_prediction_arbitrage_mutation_rejects_before_reading_body(tmp_path: Pat
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1938,7 +1937,6 @@ def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path:
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_store=FakeStore(),
         prediction_monitor=FakeMonitor(),
         prediction_execution_service=execution,
@@ -2675,7 +2673,6 @@ def test_prediction_arbitrage_mutation_security_matrix_rejects_before_body(
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -2736,7 +2733,6 @@ def test_prediction_arbitrage_mutation_body_cap_and_idempotency_are_server_owned
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -2866,7 +2862,6 @@ def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -2944,7 +2939,6 @@ def test_prediction_arbitrage_localhost_host_and_origin_are_accepted(tmp_path: P
         config=dashboard_config(tmp_path),
         host="localhost",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_execution_service=execution,
         prediction_session_token="session-token",
         prediction_csrf_token="csrf-token",
@@ -3018,7 +3012,6 @@ def test_prediction_arbitrage_json_redacts_nested_secret_keys(tmp_path: Path) ->
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         prediction_store=FakeStore(),
         prediction_monitor=FakeMonitor(),
         prediction_execution_service=execution,
@@ -10851,19 +10844,24 @@ def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     assert payload["holdings"][0]["symbol"] == "VIXY"
 
 
-def test_build_quotes_payload_returns_service_refresh_without_account_sync_writer() -> None:
+def test_build_quotes_payload_reads_published_quotes_file(tmp_path) -> None:
     from open_trader.dashboard_web import build_quotes_payload
 
-    service = FakeQuoteService(quote_result())
+    config = dashboard_config(tmp_path)
+    payload_path = config.data_dir / "latest" / "quotes.json"
+    seeded = {
+        "status": "ok",
+        "last_success_at": datetime.now().astimezone().isoformat(),
+        "stale": False,
+        "quotes": {"US.MSFT": {"last_price": "500"}},
+    }
+    payload_path.parent.mkdir(parents=True)
+    payload_path.write_text(json.dumps(seeded), encoding="utf-8")
 
-    payload = build_quotes_payload(service)
+    payload = build_quotes_payload(config)
 
     json.dumps(payload)
-    assert service.refresh_count == 1
-    assert payload["status"] == "ok"
-    assert "account_sync" not in payload
-    assert list(payload["quotes"]) == ["US.MSFT"]
-    assert payload["quotes"]["US.MSFT"]["last_price"] == "500"
+    assert payload == seeded
 
 
 def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> None:
@@ -10904,7 +10902,6 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11065,7 +11062,6 @@ def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11120,7 +11116,6 @@ def obsolete_dashboard_server_fetches_backtest_prices_api(tmp_path) -> None:
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         backtest_price_provider=provider,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11190,7 +11185,6 @@ def obsolete_dashboard_server_auto_fetches_missing_backtest_prices_on_dashboard_
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         backtest_price_provider=provider,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11254,7 +11248,6 @@ def obsolete_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         backtest_price_provider=provider,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11294,18 +11287,65 @@ def obsolete_dashboard_server_keeps_payload_when_auto_backtest_price_fetch_fails
     assert vixy["backtest_readiness"]["status"] == "missing_prices"
 
 
-def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
-    from open_trader.dashboard_web import create_dashboard_server
+def test_dashboard_server_projects_accepted_files_without_side_effects(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import open_trader.account_sync_controller as account_sync_controller
+    import open_trader.dashboard_quotes as dashboard_quotes
+    import open_trader.futu_account as futu_account
+    import open_trader.tiger_account as tiger_account
+    import open_trader.dashboard_web as dashboard_web
+
+    def unexpected_side_effect(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dashboard API must not instantiate or refresh account data")
 
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
-    quote_service = FakeQuoteService(quote_result())
-    server = create_dashboard_server(
-        config=config,
-        host="127.0.0.1",
-        port=0,
-        quote_service=quote_service,
+    seed_accepted_account_sync(config, tiger_position_count=14)
+    quotes_path = config.data_dir / "latest" / "quotes.json"
+    seeded_quotes_payload = {
+        "status": "ok",
+        "last_success_at": datetime.now().astimezone().isoformat(),
+        "stale": False,
+        "quotes": {"US.MSFT": {"last_price": "500"}},
+    }
+    quotes_path.write_text(json.dumps(seeded_quotes_payload), encoding="utf-8")
+    controller_path = config.data_dir / "account_sync" / "controller_status.json"
+    controller_path.parent.mkdir(parents=True)
+    controller_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.account_sync.controller.v1",
+                "pid": 123,
+                "started_at": datetime.now().astimezone().isoformat(),
+                "working_directory": str(tmp_path),
+                "git_sha": "abc123",
+                "heartbeat_at": datetime.now().astimezone().isoformat(),
+                "phase": "idle",
+                "account_loop": {},
+                "quote_loop": {},
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
     )
+    accepted_paths = [
+        config.data_dir / "latest" / "account_sync_state.json",
+        config.portfolio_path,
+        quotes_path,
+        controller_path,
+    ]
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in accepted_paths}
+    monkeypatch.setattr(futu_account.FutuAccountClient, "__init__", unexpected_side_effect)
+    monkeypatch.setattr(tiger_account.TigerAccountClient, "__init__", unexpected_side_effect)
+    monkeypatch.setattr(account_sync_controller, "AccountSyncController", unexpected_side_effect)
+    monkeypatch.setattr(
+        dashboard_quotes.DashboardQuoteService,
+        "refresh",
+        unexpected_side_effect,
+    )
+    server = dashboard_web.create_dashboard_server(config=config, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -11319,11 +11359,12 @@ def test_dashboard_server_serves_dashboard_and_quotes_api(tmp_path) -> None:
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert dashboard_payload["summary"]["holding_count"] == 1
-    assert dashboard_payload["holdings"][0]["symbol"] == "VIXY"
-    assert quotes_payload["quotes"]["US.MSFT"]["last_price"] == "500"
-    assert "account_sync" not in quotes_payload
-    assert quote_service.refresh_count == 1
+    assert dashboard_payload["account_sync"]["status"] == "ok"
+    assert len(dashboard_payload["broker_positions"]) == 14
+    assert quotes_payload == seeded_quotes_payload
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in accepted_paths
+    } == before
 
 
 def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None:
@@ -11336,7 +11377,6 @@ def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None
         config,
         "127.0.0.1",
         0,
-        quote_service=FakeQuoteService(quote_result()),
         trend_simulate_position_service=FakeTrendSimulatePositionService(calls),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11392,7 +11432,7 @@ def test_dashboard_http_serves_report_history_and_exact_artifact(tmp_path) -> No
         encoding="utf-8",
     )
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11432,7 +11472,7 @@ def test_dashboard_http_report_history_enforces_read_only_route_errors(
         "{broken", encoding="utf-8"
     )
     server = create_dashboard_server(
-        config, "127.0.0.1", 0, quote_service=FakeQuoteService(quote_result())
+        config, "127.0.0.1", 0
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -11486,7 +11526,6 @@ def test_dashboard_http_rejects_unknown_simulated_broker(tmp_path) -> None:
         config,
         "127.0.0.1",
         0,
-        quote_service=FakeQuoteService(quote_result()),
         trend_simulate_position_service=TrendSimulatePositionService(
             host=config.futu_host,
             port=config.futu_port,
@@ -11585,7 +11624,6 @@ def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=importer,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11628,7 +11666,6 @@ def test_dashboard_server_builds_candidate_only_statement_import_service(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     try:
         assert captured == {
@@ -11651,7 +11688,6 @@ def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> No
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=FailingStatementImportService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11690,7 +11726,6 @@ def test_dashboard_server_rejects_invalid_statement_body(
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=FakeStatementImportService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11718,7 +11753,6 @@ def test_dashboard_server_rejects_statement_larger_than_twenty_mib(tmp_path) -> 
         config=dashboard_config(tmp_path),
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         statement_import_service=FakeStatementImportService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11762,7 +11796,6 @@ def test_dashboard_server_serves_research_chat_apis(tmp_path) -> None:
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=chat_service,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11825,7 +11858,6 @@ def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=FakeResearchChatService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11863,7 +11895,6 @@ def test_dashboard_server_returns_404_for_invalid_research_chat_get_subroute(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=FakeResearchChatService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11905,7 +11936,6 @@ def test_dashboard_server_returns_404_for_empty_session_research_chat_post_route
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=chat_service,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11940,7 +11970,6 @@ def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
         research_chat_service=RaisingResearchChatService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11966,7 +11995,7 @@ def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
     }
 
 
-def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(
+def test_dashboard_server_projects_unknown_when_quotes_file_is_missing(
     tmp_path,
 ) -> None:
     from open_trader.dashboard_web import create_dashboard_server
@@ -11977,28 +12006,24 @@ def test_dashboard_server_returns_json_500_when_quotes_refresh_raises(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=RaisingQuoteService(),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     try:
         host, port = server.server_address
-        status, content_type, payload = read_error_json(
-            f"http://{host}:{port}/api/quotes"
-        )
+        payload = read_json(f"http://{host}:{port}/api/quotes")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert status == 500
-    assert content_type == "application/json; charset=utf-8"
     assert payload == {
-        "status": "error",
-        "error_type": "RuntimeError",
-        "message": "boom",
+        "status": "unknown",
+        "last_success_at": "",
+        "stale": False,
+        "quotes": {},
     }
 
 
@@ -12021,7 +12046,6 @@ def test_dashboard_server_returns_json_500_when_dashboard_payload_raises(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -12064,7 +12088,6 @@ def test_dashboard_server_keeps_unrelated_file_not_found_as_json_500(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -12106,7 +12129,6 @@ def test_dashboard_server_serves_static_routes_when_files_exist(
         config=config,
         host="127.0.0.1",
         port=0,
-        quote_service=FakeQuoteService(quote_result()),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
