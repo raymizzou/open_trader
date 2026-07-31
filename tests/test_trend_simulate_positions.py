@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -200,6 +202,8 @@ def _service(
     clients: Any,
     *,
     account_ids: dict[str, int] | None = None,
+    now: Any = None,
+    refresh_seconds: int = 30,
 ) -> TrendSimulatePositionService:
     return TrendSimulatePositionService(
         host="127.0.0.1",
@@ -217,7 +221,8 @@ def _service(
         data_dir=root / "data",
         reports_dir=root / "reports",
         client_factory=clients,
-        now=lambda: datetime.fromisoformat("2026-07-18T12:34:56+08:00"),
+        now=now or (lambda: datetime.fromisoformat("2026-07-18T12:34:56+08:00")),
+        refresh_seconds=refresh_seconds,
     )
 
 
@@ -276,6 +281,62 @@ def test_simulated_positions_route_each_broker_account(
     assert clients.calls == [{"market": market, "simulate_acc_id": account_id}]
     assert payload["broker"] == broker
     assert payload["market"] == market
+
+
+def test_simulated_positions_reuse_fresh_cached_snapshot(tmp_path: Path) -> None:
+    clients = FakeClientFactory(positions=[_position()])
+    service = _service(tmp_path, clients)
+
+    first = service.load("tiger")
+    second = service.load("tiger")
+
+    assert first == second
+    assert len(clients.calls) == 1
+
+
+def test_simulated_positions_return_stale_cache_while_refreshing(
+    tmp_path: Path,
+) -> None:
+    current = [datetime.fromisoformat("2026-07-18T12:34:56+08:00")]
+    entered = threading.Event()
+    release = threading.Event()
+
+    class ChangingFactory(FakeClientFactory):
+        def __call__(self, **kwargs: Any) -> FakeClient:
+            call_number = len(self.calls) + 1
+            self.positions = [
+                _position("US.TRV" if call_number == 1 else "US.NEW")
+            ]
+            if call_number == 2:
+                entered.set()
+                assert release.wait(timeout=2)
+            return super().__call__(**kwargs)
+
+    clients = ChangingFactory(positions=[])
+    service = _service(
+        tmp_path,
+        clients,
+        now=lambda: current[0],
+        refresh_seconds=30,
+    )
+    first = service.load("tiger")
+    current[0] = datetime.fromisoformat("2026-07-18T12:35:27+08:00")
+
+    stale = service.load("tiger")
+
+    assert entered.wait(timeout=1)
+    assert stale == first
+    assert len(clients.calls) == 1
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        refreshed = service.load("tiger")
+        if refreshed["positions"][0]["symbol"] == "NEW":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("background simulate-position refresh did not publish")
+    assert len(clients.calls) == 2
 
 
 def test_simulated_positions_reject_unsupported_broker(tmp_path: Path) -> None:

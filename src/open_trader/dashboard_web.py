@@ -1403,6 +1403,7 @@ def serve_dashboard(
         data_dir=config.data_dir,
         reports_dir=config.reports_dir,
     )
+    trend_simulate_position_service.prewarm()
     prediction_store: PredictionArbitrageStore | None = None
     prediction_monitor: object | None = None
     prediction_execution: object | None = None

@@ -12070,11 +12070,15 @@ def test_serve_dashboard_configures_simulate_accounts_once(
     from open_trader.dashboard import DETAIL_FX_TO_HKD
 
     created: list[dict[str, object]] = []
+    prewarmed: list[bool] = []
     server_kwargs: dict[str, object] = {}
 
     class FakeTrendSimulatePositionServiceFactory:
         def __init__(self, **kwargs: object) -> None:
             created.append(kwargs)
+
+        def prewarm(self) -> None:
+            prewarmed.append(True)
 
     class FakeServer:
         server_address = ("127.0.0.1", 8765)
@@ -12114,6 +12118,7 @@ def test_serve_dashboard_configures_simulate_accounts_once(
     assert f'"pid": {os.getpid()}' in output
     assert f'"git_sha": "{sha}"' in output
     assert len(created) == 1
+    assert prewarmed == [True]
     assert created[0]["account_ids"] == {
         "eastmoney": 101,
         "tiger": 102,
