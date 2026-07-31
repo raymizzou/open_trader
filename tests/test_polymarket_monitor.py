@@ -864,6 +864,35 @@ def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
     asyncio.run(exercise())
 
 
+def test_codex_worker_queues_negative_two_percent_pool_relation(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.52", high_no_ask="0.50")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation_id = next(iter(monitor._active_relation_ids))
+    assert monitor._activity["rejection_counts"]["eligible"] == 1
+
+    async def exercise() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_relation_id == relation_id
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+
+    asyncio.run(exercise())
+    assert validator.relation_ids == [relation_id]
+    assert monitor._codex_statuses[relation_id] == "approved"
+
+
 def test_transient_codex_failure_retries_once_at_the_retry_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1138,7 +1167,9 @@ def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relatio
     assert monitor.snapshot()["relation_discovery"]["status"] == "healthy"
 
 
-def test_nonpositive_threshold_economics_never_calls_codex(tmp_path: Path) -> None:
+def test_nonpositive_threshold_economics_enters_codex_but_stays_invisible(
+    tmp_path: Path,
+) -> None:
     setup_public([threshold_event()])
     setup_threshold_books(low_ask="0.52", high_no_ask="0.50")
     validator = FakeRelationValidator()
@@ -1151,7 +1182,7 @@ def test_nonpositive_threshold_economics_never_calls_codex(tmp_path: Path) -> No
     asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     monitor.refresh_once()
 
-    assert validator.calls == 0
+    assert validator.calls == 1
     assert not [
         row
         for row in monitor.snapshot()["opportunities"]

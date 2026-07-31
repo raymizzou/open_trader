@@ -1853,7 +1853,7 @@ class PolymarketMonitor:
                 minimum_net_edge=RELATION_ACTIVITY_MIN_EDGE,
             )
             candidate = assessment.intent
-            if candidate is None or candidate.net_edge < Decimal("-0.01"):
+            if candidate is None:
                 continue
             candidates.append((candidate.net_edge, relation_id, relation))
             self._codex_wait_started_at.setdefault(relation_id, now)
