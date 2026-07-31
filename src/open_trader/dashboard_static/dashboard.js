@@ -163,9 +163,6 @@ function bindElements() {
     "main-topbar",
     "main-navigation",
     "dashboard-header",
-    "quote-status",
-    "last-refresh",
-    "account-sync-status",
     "header-market-filters",
     "current-view-label",
     "current-view-value",
@@ -960,7 +957,6 @@ async function refreshQuotes() {
     state.quotePayload = payload;
     state.quotes = payload.quotes || {};
     await loadDashboard({preserveOnError: true});
-    renderQuoteStatus(payload);
   } catch (error) {
     state.quotePayload = {
       status: "failed",
@@ -969,7 +965,7 @@ async function refreshQuotes() {
       diagnostic: { message: error.message },
       quotes: state.quotes,
     };
-    renderQuoteStatus(state.quotePayload);
+    renderConnectionPanel();
   } finally {
     if (!["report", "review"].includes(state.accountViews[state.brokerFilter])) renderHoldings();
     state.refreshActive = false;
@@ -977,7 +973,6 @@ async function refreshQuotes() {
 }
 
 function renderDashboard() {
-  renderAccountSyncStatusIntoHeader();
   renderBrokerCards();
   renderSourceStatusListIntoHeader();
   renderWorkspaceChrome();
@@ -8240,19 +8235,6 @@ function renderActionCard(action) {
   `;
 }
 
-function renderQuoteStatus(payload) {
-  const label = quoteStatusText(payload);
-  const stale = Boolean(payload.stale);
-  const statusClass = stale ? "status-stale" : quoteStatusClass(payload.status);
-  elements["quote-status"].className = `status-pill ${statusClass}`;
-  elements["quote-status"].textContent = stale && payload.last_success_at
-    ? "数据已过期"
-    : label;
-  elements["last-refresh"].textContent = quoteRefreshText(payload);
-  renderSourceStatusListIntoHeader();
-  renderConnectionPanel();
-}
-
 function renderConnectionPanel() {
   const payload = state.quotePayload || {};
   setElementText(
@@ -8273,9 +8255,6 @@ function renderLoadError(error) {
     window.clearInterval(state.quoteIntervalId);
     state.quoteIntervalId = null;
   }
-  elements["last-refresh"].textContent = error.message
-    ? `看板加载失败：${error.message}`
-    : "看板加载失败";
   setElementText("connection-poll", "-");
   renderHeaderSummary();
   renderSourceStatusListIntoHeader();
@@ -8412,22 +8391,6 @@ function brokerSourceStatus(broker) {
         ? `数据已过期${time ? ` · 截至 ${time}` : ""}`
         : "同步状态未知 · 数据未验证";
   return {...sync, display};
-}
-
-function renderAccountSyncStatus() {
-  const sync = state.dashboard?.account_sync || {};
-  const controller = sync.controller || {};
-  const status = String(sync.status || "unknown").toLowerCase();
-  const label = formatPlain(sync.label || (status === "ok" ? "同步正常" : "同步异常"));
-  const heartbeat = formatPlain(controller.heartbeat_at);
-  return `<strong class="${escapeHtml(status === "ok" ? "status-ok" : "status-failed")}">${escapeHtml(label)}</strong><span>控制器心跳 ${escapeHtml(heartbeat)}</span>`;
-}
-
-function renderAccountSyncStatusIntoHeader() {
-  const target = elements["account-sync-status"];
-  if (!target) return;
-  target.className = `account-sync-status ${state.dashboard?.account_sync?.status === "ok" ? "status-ok" : "status-failed"}`;
-  target.innerHTML = renderAccountSyncStatus();
 }
 
 function renderBrokerCards() {
@@ -8654,24 +8617,6 @@ function sessionQuoteLabel(value) {
 function quoteTimeEt(value) {
   const match = String(value || "").match(/\b\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2})/);
   return match ? `${match[1]} ET` : "";
-}
-
-function quoteRefreshText(payload) {
-  const stale = Boolean(payload && payload.stale);
-  const raw = stale ? payload.last_success_at : (payload.fetched_at || payload.last_success_at);
-  if (!hasValue(raw)) return stale ? "尚无成功行情" : "尚未刷新";
-  const text = String(raw).replace("T", " ").replace(/[+-]\d{2}:\d{2}$/, "");
-  return `${stale ? "上次成功" : "刷新于"} ${text} CST`;
-}
-
-function quoteStatusText(payload) {
-  if (payload && payload.fallback_count > 0 && payload.missing_count === 0) {
-    return "部分标的当前时段无报价";
-  }
-  if (payload && payload.status === "ok" && payload.us_session_status === "closed") {
-    return "美股休市";
-  }
-  return quoteStatusLabel(payload && payload.status);
 }
 
 function renderActionBadge(action, status) {

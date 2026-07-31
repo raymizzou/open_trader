@@ -1204,8 +1204,22 @@ def valid_payload() -> dict[str, object]:
             "status": "ok",
             "controller": {"status": "ok", "heartbeat_at": "2026-07-21T09:31:00+08:00"},
             "brokers": {
-                broker: {"status": "ok", "display": "同步正常"}
-                for broker in dashboard_acceptance.ACCOUNT_BROKERS
+                "futu": {
+                    "status": "ok", "display": "同步正常",
+                    "data_as_of": "2026-07-31T13:48:44+08:00",
+                },
+                "tiger": {
+                    "status": "ok", "display": "同步正常",
+                    "data_as_of": "2026-07-31T13:49:01+08:00",
+                },
+                "phillips": {
+                    "status": "ok", "display": "同步正常",
+                    "data_as_of": "2026-07-29",
+                },
+                "eastmoney": {
+                    "status": "ok", "display": "同步正常",
+                    "data_as_of": "2026-07-30",
+                },
             },
         },
         "backtest_universe": {"holdings": [
@@ -1215,6 +1229,38 @@ def valid_payload() -> dict[str, object]:
         "trend_reviews": trend_reviews(),
         "trend_controllers": trend_controllers(),
     }
+
+
+def test_acceptance_checks_grouped_broker_source_times() -> None:
+    payload = valid_payload()
+    text_by_selector = {
+        "#source-status-list": (
+            "实时账户 富途账户 同步正常 · 13:48 老虎账户 同步正常 · 13:49 "
+            "券商结单 辉立账户 数据截至 · 07-29 "
+            "东方财富账户 数据截至 · 07-30"
+        ),
+        '#source-status-list [data-broker="futu"]': "富途账户 同步正常 · 13:48",
+        '#source-status-list [data-broker="tiger"]': "老虎账户 同步正常 · 13:49",
+        '#source-status-list [data-broker="phillips"]': "辉立账户 数据截至 · 07-29",
+        '#source-status-list [data-broker="eastmoney"]': "东方财富账户 数据截至 · 07-30",
+    }
+
+    class Locator:
+        def __init__(self, text: str | None) -> None:
+            self.text = text
+
+        def count(self) -> int:
+            return int(self.text is not None)
+
+        def inner_text(self) -> str:
+            assert self.text is not None
+            return self.text
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            return Locator(text_by_selector.get(selector))
+
+    dashboard_acceptance._check_source_status_panel(Page(), payload)
 
 
 def trend_controllers() -> dict[str, dict[str, object]]:
@@ -2514,7 +2560,11 @@ class TabbedAccountLocator:
             return 0
         if self.selector == "text=刷新账户与行情":
             return 0
-        if self.selector == "#account-sync-status":
+        if self.selector in {"#quote-status", "#account-sync-status", "#last-refresh"}:
+            return 0
+        if self.selector == "#source-status-list":
+            return 1
+        if re.fullmatch(r'#source-status-list \[data-broker="(\w+)"\]', self.selector):
             return 1
         target_selectors = {
             '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
@@ -2963,8 +3013,27 @@ class TabbedAccountLocator:
         return not bool(self.page.reports[broker]["available"])
 
     def inner_text(self) -> str:
-        if self.selector == "#account-sync-status":
-            return "同步正常 · 控制器心跳 2026-07-30 12:00"
+        if self.selector == "#source-status-list":
+            return "实时账户 富途账户 同步正常 · 13:48 老虎账户 同步正常 · 13:49 券商结单 辉立账户 数据截至 · 07-29 东方财富账户 数据截至 · 07-30"
+        source_match = re.fullmatch(
+            r'#source-status-list \[data-broker="(\w+)"\]', self.selector
+        )
+        if source_match:
+            broker = self._require_known_broker(source_match.group(1))
+            labels = {
+                "futu": "富途", "tiger": "老虎",
+                "phillips": "辉立", "eastmoney": "东方财富",
+            }
+            source = self.page.payload.get("account_sync", {})
+            source = source if isinstance(source, Mapping) else {}
+            brokers = source.get("brokers", {})
+            brokers = brokers if isinstance(brokers, Mapping) else {}
+            broker_source = brokers.get(broker)
+            broker_source = broker_source if isinstance(broker_source, Mapping) else {}
+            return (
+                f"{labels[broker]}账户 "
+                f"{dashboard_acceptance._expected_source_copy(broker, broker_source)}"
+            )
         if self.selector == "#account-holdings":
             return self.page.section_texts[self.page.selected]
         match = re.fullmatch(r"#account-(\w+):visible", self.selector)
@@ -3078,8 +3147,6 @@ class TabbedAccountLocator:
             return "当前筛选下没有持仓"
         if self.selector == "#visible-count":
             return f"{self.page.visible_rows():,} 条"
-        if self.selector == "#last-refresh":
-            return "刷新于 2026-07-15 15:03:13 CST"
         if re.fullmatch(
             r'\.account-holding-row:visible:has\('
             r'\.account-holding-market:has-text\("US"\)\) '
@@ -3297,6 +3364,7 @@ class TabbedAccountPage:
         cn_rows: dict[str, int] | None = None,
     ) -> None:
         source = payload or valid_payload()
+        self.payload = source
         self.reports = source["trend_reports"]  # type: ignore[assignment]
         self.reviews = source["trend_reviews"]  # type: ignore[assignment]
         self.controllers = source.get("trend_controllers", trend_controllers())  # type: ignore[assignment]
@@ -4017,7 +4085,9 @@ def test_acceptance_opens_real_tool_workspaces_and_checks_mobile_targets() -> No
                 return 0
             if self.selector == "text=刷新账户与行情":
                 return 0
-            if self.selector == "#account-sync-status":
+            if self.selector in {"#quote-status", "#account-sync-status", "#last-refresh"}:
+                return 0
+            if self.selector == "#source-status-list":
                 return 1
             target_selectors = {
                 '#account-tabs [role="tab"]:visible, #header-market-filters button:visible, '
@@ -4286,9 +4356,6 @@ VISUAL_CONTRACT_STYLES = {
         "backgroundColor": "rgb(36, 33, 29)",
         "borderTopColor": "rgb(36, 33, 29)",
     },
-    "#last-refresh": {
-        "color": "rgb(116, 110, 100)",
-    },
     ".research-chat-context .status-ok": {
         "backgroundColor": "rgb(231, 244, 236)",
         "color": "rgb(32, 29, 24)",
@@ -4323,13 +4390,15 @@ def visual_contract_page(*, accent: str = "#8B5E34") -> object:
         def count(self) -> int:
             if self.selector == "text=刷新账户与行情":
                 return 0
-            if self.selector == "#account-sync-status":
+            if self.selector in {"#quote-status", "#account-sync-status", "#last-refresh"}:
+                return 0
+            if self.selector == "#source-status-list":
                 return 1
             return int(self.selector in VISUAL_CONTRACT_STYLES)
 
         def inner_text(self) -> str:
-            assert self.selector == "#account-sync-status"
-            return "同步正常 · 控制器心跳 2026-07-30 12:00"
+            assert self.selector == "#source-status-list"
+            return "实时账户 · 券商结单"
 
         def evaluate(self, expression: str) -> dict[str, str]:
             assert self.selector in VISUAL_CONTRACT_STYLES
@@ -4769,7 +4838,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         assert (viewport, '[data-market="CN"]') in clicks
         assert (viewport, 'button[data-broker="eastmoney"]') not in selectors
         assert (viewport, '#visible-count') in selectors
-        assert (viewport, '#last-refresh') in selectors
+        assert (viewport, '#source-status-list') in selectors
         assert (
             viewport,
             '.account-holding-row:visible:has('
@@ -5266,7 +5335,7 @@ def test_check_account_holdings_rejects_legacy_trend_summary_copy(legacy: str) -
 
 
 def session_price_page(
-    *, header: str = "刷新于 2026-07-15 15:03:13 CST",
+    *,
     cells: tuple[tuple[str, ...], ...] = (("夜盘 61.50 · 03:03 ET",),),
     viewport_width: int = 1440,
     box: dict[str, float] | None = None,
@@ -5295,8 +5364,6 @@ def session_price_page(
         viewport_size = {"width": viewport_width, "height": 844}
 
         def locator(self, selector: str) -> Locator:
-            if selector == "#last-refresh":
-                return Locator((header,))
             if selector == (
                 ".account-holding-row:visible "
                 ".account-holding-price .session-quote"
@@ -5336,7 +5403,6 @@ def test_check_session_prices_requires_exactly_one_quote_per_us_price_cell(
             session_price_page(cells=(("夜盘 61.50 盘前 62.00 · 03:03 ET",),)),
             "多个时段",
         ),
-        (session_price_page(header="刷新于 2026-07-15 15:03:13"), "Header"),
         (session_price_page(cells=(("夜盘 61.50 · 03:03",),)), "时间或回退说明"),
         (session_price_page(cells=(("夜盘 61.50 · 15:03 CST",),)), "重复展示"),
         (

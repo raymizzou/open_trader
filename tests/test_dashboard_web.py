@@ -555,13 +555,18 @@ def test_dashboard_warm_ledger_theme_and_broker_accents() -> None:
     for element_id in (
         "open-standard-backtest", "header-market-filters",
         "current-view-value",
-        "broker-summary-cards", "quote-status", "account-sync-status",
-        "source-status-list", "last-refresh", "kelly-lab-panel",
+        "broker-summary-cards", "source-status-list", "kelly-lab-panel",
         "open-kelly-lab", "return-to-portfolio", "account-tabs",
         "account-holdings", "symbol-detail-panel",
         "standard-backtest-workspace", "research-chat-layer",
     ):
         assert f'id="{element_id}"' in html
+    for removed_id in ("quote-status", "account-sync-status", "last-refresh"):
+        assert f'id="{removed_id}"' not in html
+    assert "renderAccountSyncStatus" not in js
+    assert "quoteRefreshText" not in js
+    assert "quoteStatusText" not in js
+    assert ".source-status-group" in css
     assert "今日结论" not in html
     assert 'id="trade-actions"' not in html
     for token in (
@@ -620,6 +625,10 @@ def test_dashboard_command_center_css_keeps_accessible_responsive_states() -> No
     assert "@media (prefers-reduced-motion: reduce)" in css
     assert "transition-duration: 0.01ms !important;" in css
     mobile = css.split("@media (max-width: 760px) {", 1)[1]
+    source_row_css = css.split(".source-status-row {", 1)[1].split("}", 1)[0]
+    assert "grid-template-columns: minmax(70px, max-content) minmax(0, 1fr);" in source_row_css
+    assert ".source-status-row {\n    grid-template-columns: 1fr;\n  }" not in mobile
+    assert ".source-status-row span {\n    text-align: left;\n  }" not in mobile
     assert "min-height: 44px;" in mobile
     assert 'grid-template-areas: "brand" "source" "assets";' in mobile
     assert ".account-tab-list" in mobile
@@ -4226,7 +4235,7 @@ console.log(display.unrealized_pnl_pct);
     assert output.strip() == "20.00%"
 
 
-def test_dashboard_renders_one_compact_us_session_price_and_header_time() -> None:
+def test_dashboard_renders_one_compact_us_session_price() -> None:
     output = run_dashboard_js(r'''
 const sessions = {
   overnight: "夜盘",
@@ -4254,10 +4263,6 @@ const fallback = renderQuotePrice({market:"US", asset_class:"option"}, {
 if(!fallback.includes("盘中") || !fallback.includes("上一有效价"))throw new Error(fallback);
 const hk = renderQuotePrice({market:"HK", asset_class:"stock"}, {last_price:"510"});
 if(hk!=="510")throw new Error("non-US changed: "+hk);
-if(quoteRefreshText({fetched_at:"2026-07-15T15:03:13+08:00",stale:false})!=="刷新于 2026-07-15 15:03:13 CST")throw new Error("bad header time");
-if(quoteRefreshText({last_success_at:"2026-07-15T14:59:00+08:00",stale:true})!=="上次成功 2026-07-15 14:59:00 CST")throw new Error("bad stale time");
-if(quoteStatusText({status:"ok",us_session_status:"closed",fallback_count:0,missing_count:0})!=="美股休市")throw new Error("bad closed status");
-if(quoteStatusText({status:"partial",us_session_status:"active",fallback_count:2,missing_count:0})!=="部分标的当前时段无报价")throw new Error("bad fallback status");
 console.log("ok");
 ''')
     assert "ok" in output
@@ -4519,7 +4524,13 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert "持仓实时看板" in html
     assert 'id="refresh-quotes"' not in html
     assert "刷新账户与行情" not in html + js
-    assert 'id="account-sync-status"' in html
+    assert 'id="source-status-list"' in html
+    for removed_id in ("quote-status", "account-sync-status", "last-refresh"):
+        assert f'id="{removed_id}"' not in html
+    assert "renderAccountSyncStatus" not in js
+    assert "quoteRefreshText" not in js
+    assert "quoteStatusText" not in js
+    assert ".source-status-group" in css
     assert "accountSyncReloadNeeded" not in js
     assert "renderBacktestPriceSyncStatus" not in js
     assert "全部市场" in html
@@ -4684,7 +4695,6 @@ def test_dashboard_static_assets_include_local_shell() -> None:
     assert ".broker-summary-cards" in css
     assert ".broker-summary-card" in css
     assert ".broker-summary-empty" in css
-    assert ".source-header-row" in css
     assert ".source-status-list" in css
     assert ".source-status-row" in css
     assert ".cash-detail-panel" not in css

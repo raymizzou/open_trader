@@ -165,12 +165,6 @@ select:focus-visible {
   font-weight: 600;
 }
 
-.last-refresh {
-  color: var(--muted);
-  min-width: 132px;
-  text-align: right;
-}
-
 .header-filter-block {
   display: grid;
   gap: 8px;
@@ -291,26 +285,12 @@ select:focus-visible {
   overflow-wrap: anywhere;
 }
 
-.source-header-row {
-  align-items: center;
-  display: flex;
-  gap: 8px;
-  justify-content: space-between;
-  min-width: 0;
+.source-status-group {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  margin: 2px 2px 0;
 }
-
-.account-sync-status {
-  align-items: center;
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-  text-align: right;
-}
-
-.account-sync-status strong,
-.account-sync-status span { overflow-wrap: anywhere; }
-.account-sync-status strong { font-size: 13px; }
-.account-sync-status span { color: var(--muted); font-size: 12px; }
 
 .source-status-list {
   display: grid;
@@ -5451,22 +5431,11 @@ table {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .source-header-row,
   .current-view-breakdown {
     align-items: stretch;
     display: grid;
     grid-template-columns: 1fr;
   }
-
-  .source-status-row {
-    grid-template-columns: 1fr;
-  }
-
-  .source-status-row span {
-    text-align: left;
-  }
-
-  .account-sync-status { text-align: left; }
 
   .topbar {
     align-items: stretch;
@@ -5477,11 +5446,6 @@ table {
     align-items: stretch;
     display: grid;
     grid-template-columns: 1fr;
-  }
-
-  .last-refresh {
-    min-width: 0;
-    text-align: left;
   }
 
   .summary-grid {

@@ -3870,8 +3870,6 @@ def _select_account_tab(page: Any, broker: str) -> Any:
 
 
 def _check_session_prices(page: Any) -> None:
-    header = page.locator("#last-refresh").inner_text().strip()
-    assert "CST" in header, "Header 获取时间缺少 CST"
     price_cells = page.locator(
         '.account-holding-row:visible:has('
         '.account-holding-market:has-text("US")) .account-holding-price'
@@ -3893,6 +3891,64 @@ def _check_session_prices(page: Any) -> None:
             )
 
 
+def _source_time_text(broker: str, source: Mapping[str, object]) -> str:
+    raw = source.get("data_as_of")
+    if broker in {"futu", "tiger"} and (
+        not isinstance(raw, str) or not raw.strip()
+    ):
+        raw = source.get("last_success_at")
+    raw = raw if isinstance(raw, str) else ""
+    pattern = (
+        r"(?:T|\s|^)(\d{2}:\d{2})(?::\d{2})?"
+        if broker in {"futu", "tiger"}
+        else r"\b\d{4}-(\d{2}-\d{2})\b"
+    )
+    match = re.search(pattern, raw)
+    return match.group(1) if match else ""
+
+
+def _expected_source_copy(broker: str, source: Mapping[str, object]) -> str:
+    status = str(source.get("status") or "unknown").lower()
+    live = broker in {"futu", "tiger"}
+    time = _source_time_text(broker, source)
+    if status == "ok":
+        return (
+            f"同步正常{f' · {time}' if time else ''}"
+            if live
+            else (f"数据截至 · {time}" if time else "同步正常")
+        )
+    if status == "failed":
+        return (
+            f"同步失败 · {'上次' if live else '数据截至'} {time}"
+            if time
+            else "同步失败"
+        )
+    if status == "stale":
+        return f"数据已过期{f' · 截至 {time}' if time else ''}"
+    return "同步状态未知 · 数据未验证"
+
+
+def _check_source_status_panel(page: Any, payload: Mapping[str, object]) -> None:
+    panel = page.locator("#source-status-list")
+    assert panel.count() == 1, "缺少券商数据来源面板"
+    panel_text = re.sub(r"\s+", " ", panel.inner_text()).strip()
+    assert "实时账户" in panel_text and "券商结单" in panel_text, "券商来源未分组"
+    for removed in ("控制器心跳", "控制器", "刷新于", "部分标的当前时段无报价"):
+        assert removed not in panel_text, f"来源面板仍显示冗余信息：{removed}"
+    account_sync = payload.get("account_sync")
+    account_sync = account_sync if isinstance(account_sync, Mapping) else {}
+    brokers = account_sync.get("brokers")
+    brokers = brokers if isinstance(brokers, Mapping) else {}
+    for broker in ACCOUNT_BROKERS:
+        row = page.locator(f'#source-status-list [data-broker="{broker}"]')
+        assert row.count() == 1, f"缺少 {broker} 券商来源行"
+        source = brokers.get(broker)
+        source = source if isinstance(source, Mapping) else {}
+        assert _expected_source_copy(broker, source) in re.sub(
+            r"\s+", " ", row.inner_text()
+        ), f"{broker} 券商来源时间或状态不正确"
+
+
 def _check_visual_contract(page: Any) -> None:
     names = list(WARM_LEDGER_TOKENS)
     actual = page.evaluate(
@@ -3912,7 +3968,6 @@ def _check_visual_contract(page: Any) -> None:
             "backgroundColor": "rgb(36, 33, 29)",
             "borderTopColor": "rgb(36, 33, 29)",
         },
-        "#last-refresh": {"color": "rgb(116, 110, 100)"},
         ".research-chat-context .status-ok": {
             "backgroundColor": "rgb(231, 244, 236)",
             "color": "rgb(32, 29, 24)",
@@ -3943,8 +3998,7 @@ def _check_visual_contract(page: Any) -> None:
 
     assert page.locator("#refresh-quotes").count() == 0, "页面仍包含账户刷新按钮"
     assert page.locator("text=刷新账户与行情").count() == 0, "页面仍包含旧账户刷新文案"
-    status = page.locator("#account-sync-status")
-    assert status.count() == 1 and "同步" in status.inner_text(), "缺少只读账户同步状态"
+    assert page.locator("#source-status-list").count() == 1, "缺少券商数据来源面板"
 
 
 def _check_open_report_layout(
@@ -4179,6 +4233,7 @@ def _browser_check(
                         }"""
                     ), "Dashboard 未启动文件轮询"
                     _check_visual_contract(page)
+                    _check_source_status_panel(page, payload)
                     page.screenshot(
                         path=str(
                             ACCEPTANCE_SCREENSHOT_DIR / f"{name}-portfolio.png"
