@@ -753,7 +753,10 @@ def _project_source(source: Mapping[str, object], now: datetime) -> dict[str, st
 
 
 def _effective_quote_status(quotes: Mapping[str, object], now: datetime) -> str:
-    if quotes.get("status") != "ok":
+    status = quotes.get("status")
+    if status == "partial" and quotes.get("missing_count") == 0:
+        status = "ok"
+    if status != "ok":
         return "failed" if quotes.get("status") == "failed" else "unknown"
     last_success = _parse_aware_datetime(quotes.get("last_success_at"))
     if quotes.get("stale") is True or last_success is None:

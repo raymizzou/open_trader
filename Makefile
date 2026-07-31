@@ -5,6 +5,7 @@ REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir
 
 DASHBOARD_URL ?= http://127.0.0.1:8766
 DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/dashboard/launchd.out.log
+SKIP_POLYMARKET_LIVE ?= 0
 test:
 	.venv/bin/python -m pytest -q
 
@@ -12,6 +13,9 @@ acceptance:
 	cd "$(REPOSITORY_ROOT)" && \
 		PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src" \
 		"$(WORKTREE_ROOT)/.venv/bin/python" -m pytest "$(WORKTREE_ROOT)/tests" -q
+ifeq ($(SKIP_POLYMARKET_LIVE),1)
+	@echo "SKIPPED: Polymarket live acceptance by operator override"
+else
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
 	PYTHONPATH=src .venv/bin/python -m open_trader.prediction_arbitrage_acceptance \
@@ -20,6 +24,7 @@ acceptance:
 		--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json" || status=$$?; \
 	if [ $$status -eq 2 ]; then echo BLOCKED; exit 2; fi; \
 	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
+endif
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
 	PYTHONPATH=src .venv/bin/python -m open_trader trend-drawdown-preflight \
