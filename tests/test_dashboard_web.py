@@ -2358,7 +2358,8 @@ def test_prediction_market_layout_a_uses_binary_health_and_four_truthful_metrics
     output = run_dashboard_js(r'''
 const healthy = {
   status:"healthy",
-  health:{status:"healthy",degraded_reasons:[]},
+  health:{status:"healthy",degraded_reasons:[],heartbeat_age_seconds:"0.2"},
+  relation_discovery:{websocket:{status:"connected",last_message_age_seconds:0.2}},
   heartbeat_at:"2026-07-28T08:18:42Z",
   readiness:{status:"ready",balance:"50.00",geoblock:"allowed",relayer:"ready"},
   masked_wallet:"0x1234…5678",
@@ -2376,9 +2377,20 @@ const unavailable = {
   readiness:{status:"ready"},
   breaker:{open:false},
 };
+const connectedButBooksStale = {
+  status:"degraded",
+  stale:true,
+  health:{status:"degraded",degraded_reasons:["books_stale"],heartbeat_age_seconds:"0.4"},
+  relation_discovery:{websocket:{status:"connected",last_message_age_seconds:0.4}},
+  failure_reason:"books_stale",
+  readiness:{status:"ready"},
+  breaker:{open:false},
+};
 console.log(JSON.stringify({
   healthyHeader:predictionPageHeader(healthy),
   unavailableHeader:predictionPageHeader(unavailable),
+  connectedButStaleHeader:predictionPageHeader(connectedButBooksStale),
+  connectedButStaleAlert:predictionExecutionAlert(connectedButBooksStale),
   healthyReadiness:predictionReadinessStrip(healthy),
   unavailableReadiness:predictionReadinessStrip(unavailable),
   healthyMetrics:predictionMetricStrip(healthy),
@@ -2390,6 +2402,10 @@ console.log(JSON.stringify({
     assert "Watcher 正常" in rendered["healthyHeader"]
     assert "Watcher 不可用" in rendered["unavailableHeader"]
     assert "盘口心跳已过期" in rendered["unavailableHeader"]
+    assert "Watcher 正常" in rendered["connectedButStaleHeader"]
+    assert "可参与盘口已过期" not in rendered["connectedButStaleHeader"]
+    assert "当前盘口暂不可交易" in rendered["connectedButStaleAlert"]
+    assert "Polymarket 数据连接异常" not in rendered["connectedButStaleAlert"]
     assert rendered["healthyReadiness"].count('class="pm-readiness-item"') == 4
     assert "首单验证" not in rendered["healthyReadiness"]
     assert "可以交易" in rendered["healthyReadiness"]

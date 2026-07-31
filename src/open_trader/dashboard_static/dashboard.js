@@ -2049,6 +2049,16 @@ function predictionHealthIsNormal(payload) {
     && String(payload?.health?.status || "").trim().toLowerCase() === "healthy";
 }
 
+function predictionWatcherIsConnected(payload) {
+  const websocket = payload?.relation_discovery?.websocket;
+  const status = String(websocket?.status || "").trim().toLowerCase();
+  const age = Number(websocket?.last_message_age_seconds ?? payload?.health?.heartbeat_age_seconds);
+  if (!Number.isFinite(age) || age > 30) return false;
+  if (status) return status === "connected";
+  const reasons = Array.isArray(payload?.health?.degraded_reasons) ? payload.health.degraded_reasons : [];
+  return !reasons.some((reason) => ["heartbeat_missing", "heartbeat_stale", "stream_disconnected"].includes(String(reason)));
+}
+
 function predictionFailureReason(payload) {
   const reasons = payload?.health?.degraded_reasons;
   return payload?.failure_reason
@@ -2126,7 +2136,7 @@ function predictionFeeStatusLabel(value) {
 }
 
 function predictionStatusLabel(payload) {
-  return predictionHealthIsNormal(payload)
+  return predictionWatcherIsConnected(payload)
     ? ["Watcher 正常", "ok"]
     : ["Watcher 不可用", "danger"];
 }
@@ -2238,7 +2248,7 @@ function predictionOpportunities(payload) {
 
 function predictionPageHeader(payload) {
   const [health, tone] = predictionStatusLabel(payload);
-  const failure = predictionHealthIsNormal(payload)
+  const failure = predictionWatcherIsConnected(payload)
     ? ""
     : `<div class="pm-failure-reason">原因：${escapeHtml(predictionFailureReasonLabel(payload))}</div>`;
   return `<header class="pm-page-head"><div><h1>预测市场套利</h1><p>先看监控范围和实盘状态，再决定是否参与当前机会。</p></div><div class="pm-updated"><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>最后心跳：${escapeHtml(predictionValue(payload?.heartbeat_at || payload?.heartbeat, "-"))} · Polymarket${failure}</div></header>`;
@@ -2326,7 +2336,12 @@ function predictionExecutionAlert(payload) {
   if (execution && status === "holding_to_resolution") {
     return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交，待结算</strong><p>这是两个独立 condition 的阈值关系组合；不会 merge，结算前允许继续持有其他已确认组合。</p></div><span class="pm-pill action">待结算</span></section>`;
   }
-  if (payload?.stale) return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>Polymarket 数据连接异常</strong><p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+  if (payload?.stale) {
+    if (predictionWatcherIsConnected(payload)) {
+      return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>当前盘口暂不可交易</strong><p>盘口数据已过期，当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+    }
+    return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>Polymarket 数据连接异常</strong><p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+  }
   return "";
 }
 
