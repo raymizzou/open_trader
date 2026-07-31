@@ -1373,7 +1373,13 @@ Expected: old single log panel, “内存” label, and incomplete signal histor
 
 - [ ] **Step 5: Implement the smallest live funnel UI**
 
-Render two compact ordered stage grids in the existing left panel. Use the persisted last-completed activity numbers while `scanning`. Add concise status rows for scan duration/next run, Codex queue, and WebSocket age. Keep rejection counts folded under `<details>`.
+Replace the existing four relation summary cards with one full-width compact
+card above the unchanged scan/candidate split. Merge catalog/activity health,
+Codex queue, and WebSocket age into small header chips. Render the daily
+catalog as one four-stage row and the minute activity scan as one eight-stage
+row; do not add state-simulation controls or a second summary. Use persisted
+last-completed activity numbers while `scanning`, and keep rejection counts
+folded under `<details>`.
 
 Remove token IDs from threshold candidate leg rows:
 
