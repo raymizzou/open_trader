@@ -54,6 +54,9 @@ _PRIVATE_FIELD_PARTS = (
     "websocket",
     "order_payload",
 )
+_PUBLIC_RELATION_TOKEN_FIELDS = frozenset(
+    {"token_id", "yes_token_id", "no_token_id"}
+)
 
 
 def _utc_now() -> str:
@@ -96,13 +99,30 @@ def _decimal_string(value: Any) -> str:
     return format(value, "f")
 
 
-def _safe_value(value: Any, *, key: str | None = None) -> Any:
+def _safe_value(
+    value: Any,
+    *,
+    key: str | None = None,
+    allow_public_token_ids: bool = False,
+) -> Any:
     """Return JSON-safe data while dropping credential/tick-shaped fields."""
 
     if key is not None:
         normalized = _normalise_field_name(key)
-        sensitive_name = normalized in {"token", "auth", "authorization", "bearer"}
-        if sensitive_name or any(part in normalized for part in _PRIVATE_FIELD_PARTS):
+        token_name = (
+            normalized == "token"
+            or normalized.endswith("_token")
+            or normalized.endswith("_token_id")
+            or normalized.endswith("_token_ids")
+            or normalized in {"token_id", "token_ids"}
+        )
+        sensitive_name = normalized in {"auth", "authorization", "bearer"}
+        public_token = normalized in _PUBLIC_RELATION_TOKEN_FIELDS
+        if (
+            (token_name and not (allow_public_token_ids and public_token))
+            or sensitive_name
+            or any(part in normalized for part in _PRIVATE_FIELD_PARTS)
+        ):
             return _DROPPED
     from decimal import Decimal
 
@@ -114,14 +134,18 @@ def _safe_value(value: Any, *, key: str | None = None) -> Any:
         cleaned: dict[str, Any] = {}
         for raw_key, raw_value in value.items():
             child_key = str(raw_key)
-            child = _safe_value(raw_value, key=child_key)
+            child = _safe_value(
+                raw_value,
+                key=child_key,
+                allow_public_token_ids=allow_public_token_ids,
+            )
             if child is not _DROPPED:
                 cleaned[child_key] = child
         return cleaned
     if isinstance(value, (list, tuple)):
         cleaned_list = []
         for item in value:
-            child = _safe_value(item)
+            child = _safe_value(item, allow_public_token_ids=allow_public_token_ids)
             if child is not _DROPPED:
                 cleaned_list.append(child)
         return cleaned_list
@@ -149,6 +173,32 @@ def _normalise_field_name(key: str) -> str:
 
 def _dump_payload(payload: Mapping[str, object]) -> str:
     cleaned = _safe_value(payload)
+    if cleaned is _DROPPED or not isinstance(cleaned, dict):
+        raise TypeError("payload must be a mapping")
+    return json.dumps(
+        cleaned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _dump_relation_payload(payload: Mapping[str, object]) -> str:
+    cleaned = _safe_value(payload, allow_public_token_ids=True)
+    if cleaned is _DROPPED or not isinstance(cleaned, dict):
+        raise TypeError("payload must be a mapping")
+    return json.dumps(
+        cleaned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _dump_execution_payload(payload: Mapping[str, object]) -> str:
+    """Keep public outcome IDs needed to reconcile durable executions."""
+
+    cleaned = _safe_value(payload, allow_public_token_ids=True)
     if cleaned is _DROPPED or not isinstance(cleaned, dict):
         raise TypeError("payload must be a mapping")
     return json.dumps(
@@ -292,6 +342,23 @@ class PredictionArbitrageStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS relation_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                payload TEXT NOT NULL,
+                full_scanned_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS relation_scan_runs (
+                scan_id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL CHECK (scope IN ('full', 'event', 'activity')),
+                event_id TEXT,
+                status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+                payload TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_signal_per_market
             ON signals(market_id) WHERE ended_at IS NULL;
 
@@ -311,8 +378,12 @@ class PredictionArbitrageStore:
             ON llm_usage(created_at);
             """
         )
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version == 0:
             connection.execute("PRAGMA user_version=1")
+            version = 1
+        if version < 2:
+            connection.execute("PRAGMA user_version=2")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -351,6 +422,126 @@ class PredictionArbitrageStore:
             },
         )
 
+    @staticmethod
+    def _signal_result(row: sqlite3.Row) -> dict[str, object]:
+        return _row_payload(
+            row,
+            fields={
+                "signal_id": str(row["signal_id"]),
+                "market_id": str(row["market_id"]),
+                "started_at": str(row["started_at"]),
+                "ended_at": row["ended_at"],
+                "updated_at": str(row["updated_at"]),
+            },
+        )
+
+    @staticmethod
+    def _canonical_signal_payload(payload: dict[str, object]) -> dict[str, object]:
+        for field in ("started_at", "first_positive_at", "ended_at"):
+            if field in payload and payload[field] is not None:
+                payload[field] = _canonical_timestamp(payload[field])
+        return payload
+
+    def save_relation_state(
+        self, payload: Mapping[str, object], *, full_scanned_at: str
+    ) -> None:
+        encoded = _dump_relation_payload(payload)
+        scanned = _canonical_timestamp(full_scanned_at)
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO relation_state(singleton, payload, full_scanned_at, updated_at)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    payload=excluded.payload,
+                    full_scanned_at=excluded.full_scanned_at,
+                    updated_at=excluded.updated_at
+                """,
+                (encoded, scanned, now),
+            )
+
+    def load_relation_state(self) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM relation_state WHERE singleton=1"
+            ).fetchone()
+        return None if row is None else _load_payload(str(row["payload"]))
+
+    def record_relation_scan(
+        self,
+        *,
+        scope: Literal["full", "event", "activity"],
+        status: Literal["completed", "failed"],
+        started_at: str,
+        completed_at: str,
+        payload: Mapping[str, object],
+        event_id: str | None = None,
+    ) -> str:
+        if scope not in {"full", "event", "activity"}:
+            raise ValueError("unsupported relation scan scope")
+        if status not in {"completed", "failed"}:
+            raise ValueError("unsupported relation scan status")
+        started = _canonical_timestamp(started_at)
+        completed = _canonical_timestamp(completed_at)
+        encoded = _dump_payload(payload)
+        scan_id = _new_id()
+        with self._transaction() as connection:
+            cutoff = _canonical_timestamp(
+                _parse_timestamp(_utc_now()) - timedelta(days=7)
+            )
+            connection.execute(
+                """
+                DELETE FROM relation_scan_runs
+                WHERE scope='activity' AND completed_at < ?
+                """,
+                (cutoff,),
+            )
+            connection.execute(
+                """
+                INSERT INTO relation_scan_runs(
+                    scan_id, scope, event_id, status, payload, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (scan_id, scope, event_id, status, encoded, started, completed),
+            )
+        return scan_id
+
+    def relation_scan_history(
+        self, *, scope: str | None = None, limit: int = 20
+    ) -> list[dict[str, object]]:
+        if scope is not None and scope not in {"full", "event", "activity"}:
+            raise ValueError("unsupported relation scan scope")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        if limit == 0:
+            return []
+        query = "SELECT * FROM relation_scan_runs"
+        parameters: tuple[object, ...] = ()
+        if scope is not None:
+            query += " WHERE scope=?"
+            parameters = (scope,)
+        query += (
+            " ORDER BY completed_at DESC, scope ASC, scan_id DESC LIMIT ?"
+        )
+        parameters += (limit,)
+        with self._read_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            _row_payload(
+                row,
+                fields={
+                    "scan_id": str(row["scan_id"]),
+                    "scope": str(row["scope"]),
+                    "event_id": row["event_id"],
+                    "status": str(row["status"]),
+                    "started_at": str(row["started_at"]),
+                    "completed_at": str(row["completed_at"]),
+                },
+            )
+            for row in rows
+        ]
+
     def write_runtime(self, payload: Mapping[str, object]) -> None:
         now = _utc_now()
         encoded = _dump_payload(payload)
@@ -381,12 +572,14 @@ class PredictionArbitrageStore:
         return _utc_now()
 
     def upsert_signal(self, payload: Mapping[str, object]) -> str:
-        encoded = _dump_payload(payload)
-        clean = _load_payload(encoded)
+        clean = self._canonical_signal_payload(_load_payload(_dump_payload(payload)))
+        encoded = _dump_payload(clean)
         market_id = str(clean.get("market_id", "")).strip()
         if not market_id:
             raise ValueError("signal market_id is required")
         started_at = self._signal_time(clean)
+        clean.setdefault("started_at", started_at)
+        encoded = _dump_payload(clean)
         now = _utc_now()
         with self._transaction() as connection:
             row = connection.execute(
@@ -399,6 +592,9 @@ class PredictionArbitrageStore:
             ).fetchone()
             if row is not None:
                 previous = _load_payload(str(row["payload"]))
+                for immutable in ("started_at", "first_positive_at", "initial_profit"):
+                    if immutable in previous:
+                        clean[immutable] = previous[immutable]
                 previous.update(clean)
                 connection.execute(
                     "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
@@ -429,7 +625,50 @@ class PredictionArbitrageStore:
                 return str(row["signal_id"])
             return signal_id
 
-    def close_signal(self, market_id: str, *, ended_at: str, reason: str) -> None:
+    def signal(self, signal_id: str) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM signals WHERE signal_id=?", (signal_id,)
+            ).fetchone()
+        return None if row is None else self._signal_result(row)
+
+    def update_signal(
+        self, signal_id: str, changes: Mapping[str, object]
+    ) -> dict[str, object]:
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM signals WHERE signal_id=?", (signal_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(signal_id)
+            previous = _load_payload(str(row["payload"]))
+            clean = self._canonical_signal_payload(
+                _load_payload(_dump_payload(changes))
+            )
+            for immutable in ("started_at", "first_positive_at", "initial_profit"):
+                if immutable in previous:
+                    clean[immutable] = previous[immutable]
+            previous.update(clean)
+            encoded = _dump_payload(previous)
+            connection.execute(
+                "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
+                (encoded, now, signal_id),
+            )
+            refreshed = connection.execute(
+                "SELECT * FROM signals WHERE signal_id=?", (signal_id,)
+            ).fetchone()
+            assert refreshed is not None
+            return self._signal_result(refreshed)
+
+    def close_signal(
+        self,
+        market_id: str,
+        *,
+        ended_at: str,
+        reason: str,
+        updates: Mapping[str, object] | None = None,
+    ) -> None:
         ended = _canonical_timestamp(ended_at)
         now = _utc_now()
         with self._transaction() as connection:
@@ -440,6 +679,18 @@ class PredictionArbitrageStore:
             if row is None:
                 return
             payload = _load_payload(str(row["payload"]))
+            if updates is not None:
+                clean = self._canonical_signal_payload(
+                    _load_payload(_dump_payload(updates))
+                )
+                for immutable in (
+                    "started_at",
+                    "first_positive_at",
+                    "initial_profit",
+                ):
+                    if immutable in payload:
+                        clean[immutable] = payload[immutable]
+                payload.update(clean)
             payload["ended_at"] = ended
             payload["ended_reason"] = str(reason)
             connection.execute(
@@ -599,7 +850,7 @@ class PredictionArbitrageStore:
         return result
 
     def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str:
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         created = _parse_timestamp(_utc_now())
         requested_expiry = _parse_timestamp(expires_at)
         # The caller supplies the displayed deadline; cap accidental longer
@@ -672,7 +923,7 @@ class PredictionArbitrageStore:
         key = str(idempotency_key).strip()
         if not key:
             raise ValueError("recovery idempotency_key is required")
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         now = _parse_timestamp(_utc_now())
         with self._transaction() as connection:
             existing = connection.execute(
@@ -711,7 +962,7 @@ class PredictionArbitrageStore:
     def transition_execution(
         self, execution_id: str, *, state: str, evidence: Mapping[str, object]
     ) -> None:
-        encoded_evidence = _dump_payload(evidence)
+        encoded_evidence = _dump_execution_payload(evidence)
         evidence_value = _load_payload(encoded_evidence)
         now = _utc_now()
         with self._transaction() as connection:
@@ -740,7 +991,7 @@ class PredictionArbitrageStore:
             )
 
     def record_leg(self, execution_id: str, payload: Mapping[str, object]) -> None:
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         clean = _load_payload(encoded)
         label = str(
             clean.get(
@@ -762,7 +1013,7 @@ class PredictionArbitrageStore:
                 raise
 
     def open_incident(self, execution_id: str, payload: Mapping[str, object]) -> str:
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         incident_id = _new_id()
         now = _utc_now()
         with self._transaction() as connection:
@@ -776,7 +1027,7 @@ class PredictionArbitrageStore:
         return incident_id
 
     def acknowledge_incident(self, incident_id: str, payload: Mapping[str, object]) -> None:
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         now = _utc_now()
         with self._transaction() as connection:
             row = connection.execute(
@@ -792,7 +1043,7 @@ class PredictionArbitrageStore:
     def update_incident(self, incident_id: str, payload: Mapping[str, object]) -> None:
         """Append final incident facts without erasing its original evidence."""
 
-        encoded = _dump_payload(payload)
+        encoded = _dump_execution_payload(payload)
         now = _utc_now()
         with self._transaction() as connection:
             row = connection.execute(
@@ -804,7 +1055,7 @@ class PredictionArbitrageStore:
             previous.update(_load_payload(encoded))
             connection.execute(
                 "UPDATE incidents SET payload=?, updated_at=? WHERE incident_id=?",
-                (_dump_payload(previous), now, incident_id),
+                (_dump_execution_payload(previous), now, incident_id),
             )
 
     def active_execution(self) -> dict[str, object] | None:
