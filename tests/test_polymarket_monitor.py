@@ -1154,6 +1154,49 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
     asyncio.run(exercise())
 
 
+def test_activity_scheduler_does_not_treat_its_own_due_time_as_lagging(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._clock = lambda: NOW
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    starts = 0
+
+    async def blocked_activity(client: object) -> None:
+        del client
+        nonlocal starts
+        starts += 1
+        entered.set()
+        await release.wait()
+
+    monitor._refresh_relation_activity = blocked_activity  # type: ignore[method-assign]
+    monitor._activity_next_scan_at = NOW
+
+    async def exercise() -> None:
+        client = FakePublicClient()
+        await monitor._tick_relation_activity(client)
+        await entered.wait()
+        await monitor._tick_relation_activity(client)
+
+        assert starts == 1
+        assert monitor._activity_catchup_requested is False
+        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] != "lagging"
+
+        release.set()
+        task = monitor._activity_scan_task
+        assert task is not None
+        await task
+        assert starts == 1
+
+    asyncio.run(exercise())
+
+
 def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
     tmp_path: Path,
 ) -> None:
