@@ -2494,6 +2494,146 @@ console.log(JSON.stringify({
     assert "最多按 $2.00" in rendered["modal"]
 
 
+def test_prediction_state_projects_relation_funnel_without_secrets() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return []
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {"status": "ready", "geoblock": "allowed", "relayer": "ready"},
+                "relation_discovery": {
+                    "catalog": {
+                        "status": "healthy",
+                        "events_seen": 16058,
+                        "events_eligible": 15980,
+                        "markets_seen": 28000,
+                        "markets_normalized": 27800,
+                        "threshold_markets": 412,
+                        "relations_discovered": 4879,
+                        "relation_count": 4879,
+                        "unique_tokens": 1989,
+                        "completed_at": "2026-07-31T12:00:00Z",
+                        "duration_ms": 32495,
+                        "rejection_counts": {"event_ineligible": 78, "market_unparseable": 200},
+                        "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                        "raw_rules": {"secret": "do-not-show"},
+                        "prompt": "do-not-show",
+                        "token_id": "do-not-show",
+                        "raw_error": "do-not-show",
+                    },
+                    "activity": {
+                        "status": "healthy",
+                        "relations_considered": 4879,
+                        "tokens_expected": 1989,
+                        "tokens_probed": 1989,
+                        "relations_with_books": 3200,
+                        "relations_with_minimum_depth": 2900,
+                        "relations_within_5pct": 341,
+                        "codex_pending": 12,
+                        "codex_approved": 301,
+                        "codex_rejected": 28,
+                        "subscribed_relations": 313,
+                        "subscribed_tokens": 374,
+                        "positive_candidates": 2,
+                        "order_ready": 1,
+                        "notifications_sent": 1,
+                        "duration_ms": 1290,
+                        "next_scan_at": "2026-07-31T12:01:00Z",
+                        "rejection_counts": {"book_unavailable": 1679, "outside_5pct": 2559},
+                    },
+                    "websocket": {"status": "connected", "subscribed_tokens": 374, "last_message_age_seconds": 0.184},
+                    "codex_queue": {"pending": 12, "inflight": 1, "oldest_wait_seconds": 45},
+                    "scan_logs": [{"scope": "activity", "status": "completed"}],
+                },
+            }
+
+    state = _prediction_state_payload(
+        store=FakeStore(), monitor=FakeMonitor(), execution=None, csrf_token="csrf"
+    )
+    funnel = state["relation_discovery"]
+    assert funnel["catalog"]["events_seen"] == 16058
+    assert funnel["catalog"]["completed_at"] == "2026-07-31T12:00:00Z"
+    assert funnel["catalog"]["rejection_counts"]["event_ineligible"] == 78
+    assert funnel["activity"]["duration_ms"] == 1290
+    assert funnel["activity"]["next_scan_at"] == "2026-07-31T12:01:00Z"
+    serialized = repr(state)
+    for secret in ("1234567890abcdef1234567890abcdef12345678", "do-not-show"):
+        assert secret not in serialized
+
+
+def test_prediction_relation_funnel_renders_two_layers_and_health_chips() -> None:
+    output = run_dashboard_js(r'''
+const payload = {relation_discovery:{
+  catalog:{status:"healthy",events_seen:16058,events_eligible:15980,markets_seen:28000,markets_normalized:27800,threshold_markets:412,relations_discovered:4879,unique_tokens:1989,completed_at:"2026-07-31T12:00:00Z",duration_ms:32495,rejection_counts:{event_ineligible:78,market_unparseable:200}},
+  activity:{status:"healthy",relations_considered:4879,tokens_expected:1989,tokens_probed:1989,relations_with_books:3200,relations_with_minimum_depth:2900,relations_within_5pct:341,codex_pending:12,codex_approved:301,codex_rejected:28,subscribed_relations:313,subscribed_tokens:374,positive_candidates:2,order_ready:1,notifications_sent:1,duration_ms:1290,next_scan_at:"2026-07-31T12:01:00Z",rejection_counts:{book_unavailable:1679,minimum_depth:300,cost_limit:0,outside_5pct:2559,codex_rejected:28,codex_unavailable:0,rules_changed:0,readiness_blocked:1}},
+  websocket:{status:"connected",subscribed_tokens:374,last_message_age_seconds:0.184},
+  codex_queue:{pending:12,inflight:1,oldest_wait_seconds:45},
+  scan_logs:[{scope:"activity",status:"completed"}],
+  codex_usage_24h:{calls:10,successes:9,failures:1,cache_hits:200},
+}};
+const html = predictionRelationDiscoveryPanel(payload);
+const funnel = predictionRelationFunnel(payload);
+for (const text of ["第一层 · 关系目录","第二层 · 成交候选","16,058","15,980","4,879","341","374","正收益 2","可下单 1","飞书 1","1.29 秒","WebSocket 正常","盘口缺失 1,679"]) {
+  if (!html.includes(text) && !funnel.includes(text)) throw new Error(`missing ${text}`);
+}
+if (html.includes("内存") || funnel.includes("内存")) throw new Error("stale in-memory label");
+console.log(JSON.stringify({html, funnel}));
+''')
+    rendered = json.loads(output)
+    assert "Codex queue" in rendered["html"] or "Codex queue" in rendered["funnel"]
+
+
+def test_prediction_relation_funnel_handles_scanning_empty_and_history_states() -> None:
+    output = run_dashboard_js(r'''
+const base = {relation_discovery:{
+  catalog:{status:"healthy",events_seen:2,events_eligible:2,markets_seen:4,markets_normalized:4,threshold_markets:2,relations_discovered:1,unique_tokens:2,duration_ms:250},
+  activity:{status:"healthy",relations_considered:1,relations_with_books:1,relations_with_minimum_depth:1,relations_within_5pct:1,positive_candidates:1,order_ready:0,duration_ms:250},
+  websocket:{status:"connected",subscribed_tokens:2,last_message_age_seconds:0.25},codex_queue:{pending:0,inflight:0},scan_logs:[]
+}};
+const scanning = JSON.parse(JSON.stringify(base));
+scanning.relation_discovery.activity = {status:"scanning",relations_considered:1,positive_candidates:0,order_ready:0,last_completed:{relations_considered:7,positive_candidates:3,order_ready:1}};
+const noRelations = JSON.parse(JSON.stringify(base));
+noRelations.relation_discovery.catalog.relations_discovered = 0;
+const noPositive = JSON.parse(JSON.stringify(base));
+noPositive.relation_discovery.activity.positive_candidates = 0;
+const noReady = JSON.parse(JSON.stringify(base));
+noReady.relation_discovery.activity.positive_candidates = 2;
+noReady.relation_discovery.activity.order_ready = 0;
+noReady.opportunities = [{market_type:"threshold_hedge", actionable:false, eligibility_reason:"book_stale"}];
+const history = {histories:{signals:[{started_at:"2026-07-31T00:00:00Z",ended_at:"2026-07-31T00:00:00.250Z",observed_duration_ms:250,initial_profit:"0.10",peak_profit:"0.20",final_profit:"0.00",ended_reason:"data_unavailable",notification_state:"sent"},{observed_duration_ms:250,initial_profit:"0.10",peak_profit:"0.20",final_profit:"-0.01",ended_reason:"data_unavailable",notification_state:"failed"},{observed_duration_ms:250,initial_profit:"0.10",peak_profit:"0.20",final_profit:"-0.01",ended_reason:"data_unavailable",notification_state:"not_sent"}]}};
+console.log(JSON.stringify({scanning:predictionRelationFunnel(scanning),noRelations:predictionRelationFunnel(noRelations),noPositive:predictionRelationFunnel(noPositive),noReady:predictionRelationFunnel(noReady),history:predictionHistoryContent(history,"signals")}));
+''')
+    rendered = json.loads(output)
+    assert "扫描中" in rendered["scanning"]
+    assert "本轮未发现可验证关系" in rendered["noRelations"]
+    assert "拒绝" in rendered["noPositive"]
+    assert "盘口过期" in rendered["noReady"]
+    for text in ("250 ms", "初始利润", "峰值利润", "最终利润", "data_unavailable", "飞书已发", "发送失败", "未发送"):
+        assert text in rendered["history"]
+
+
+def test_prediction_relation_funnel_css_is_responsive_without_fixed_width_overflow() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".pm-relation-funnel" in css
+    assert "minmax(0, 1fr)" in css
+    assert "@media (max-width: 720px)" in css
+
+
 def test_prediction_market_threshold_action_fails_closed_on_contradictory_payloads() -> None:
     output = run_dashboard_js(r'''
 const opportunity = {
@@ -2870,6 +3010,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
 
     class FakeMonitor:
         kwargs: dict[str, object] = {}
+        observer: object | None = None
 
         def __init__(self, **_: object) -> None:
             self.__class__.kwargs = dict(_)
@@ -2880,9 +3021,17 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def stop(self) -> None:
             order.append("monitor.stop")
 
+        def set_ready_observer(self, observer: object) -> None:
+            self.__class__.observer = observer
+
     class FakeExecution:
+        kwargs: dict[str, object] = {}
+
         def __init__(self, **_: object) -> None:
-            pass
+            self.__class__.kwargs = dict(_)
+
+        def notify_ready_opportunity(self, opportunity_id: str, signal_id: str) -> dict[str, object]:
+            return {"state": "ignored", "opportunity_id": opportunity_id, "signal_id": signal_id}
 
         def reconcile_startup(self) -> dict[str, object]:
             order.append("execution.reconcile")
@@ -2919,6 +3068,8 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert FakeMonitor.kwargs["relation_discovery"] is dashboard_web.discover_threshold_relations
     assert FakeMonitor.kwargs["relation_validator"].__class__.__name__ == "CodexRelationValidator"
     assert "DEEPSEEK_API_KEY" not in repr(FakeMonitor.kwargs)
+    assert FakeExecution.kwargs["dashboard_url"] == "http://127.0.0.1:0/"
+    assert callable(FakeMonitor.observer)
 
 
 def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
@@ -12521,3 +12672,32 @@ def test_dashboard_server_serves_static_routes_when_files_exist(
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_prediction_history_projects_observed_signal_fields() -> None:
+    from open_trader.dashboard_web import _prediction_history_aliases
+
+    projected = _prediction_history_aliases(
+        "signals",
+        {
+            "signal_id": "s-1",
+            "first_positive_at": "2026-07-31T00:00:00.000000Z",
+            "last_positive_at": "2026-07-31T00:00:00.275000Z",
+            "observed_duration_ms": 275,
+            "initial_profit": "0.10",
+            "peak_profit": "0.20",
+            "final_profit": "-0.01",
+            "ended_reason": "profit_non_positive",
+            "notification_state": "not_sent",
+            "book_timestamp_a": "2026-07-31T00:00:00.250000Z",
+            "book_timestamp_b": "2026-07-31T00:00:00.250000Z",
+            "book_received_at_a": "2026-07-31T00:00:00.251000Z",
+            "book_received_at_b": "2026-07-31T00:00:00.251000Z",
+        },
+    )
+    assert projected["observed_duration_ms"] == 275
+    assert projected["initial_profit"] == "0.10"
+    assert projected["peak_profit"] == "0.20"
+    assert projected["final_profit"] == "-0.01"
+    assert projected["ended_reason"] == "profit_non_positive"
+    assert projected["notification_state"] == "not_sent"

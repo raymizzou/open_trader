@@ -2509,7 +2509,7 @@ function predictionThresholdCandidateHtml(value, payload, expandedRelationKeys =
   const open = relationKey && expandedRelationKeys.has(relationKey);
   const statusClass = llm.includes("APPROVE") ? "action" : "watch";
   const legRows = legs.length
-    ? legs.map((leg) => `<article class="pm-order-leg"><span>${escapeHtml(predictionValue(leg.label))} · BUY ${escapeHtml(predictionValue(leg.outcome))} · FOK · ${escapeHtml(predictionConditionLabel(leg.condition_id))}</span><strong>${escapeHtml(predictionValue(leg.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · token ${escapeHtml(predictionConditionLabel(leg.token_id))}</small></article>`).join("")
+    ? legs.map((leg) => `<article class="pm-order-leg"><span>${escapeHtml(predictionValue(leg.label))} · BUY ${escapeHtml(predictionValue(leg.outcome))} · FOK · ${escapeHtml(predictionConditionLabel(leg.condition_id))}</span><strong>${escapeHtml(predictionValue(leg.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))}</small></article>`).join("")
     : `<div class="pm-empty compact">两条 BUY 腿数据未返回</div>`;
   const action = actionable
     ? `<div class="pm-opportunity-action"><p>两笔订单非原子、不同 condition，不会 merge；确认时重新读取规则、盘口、费用和账户。</p><button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(relationKey)}">查看并确认两腿订单</button></div>`
@@ -2526,12 +2526,100 @@ function predictionThresholdCandidateHtml(value, payload, expandedRelationKeys =
   return `<details class="pm-threshold-candidate pm-opportunity ${actionable ? "" : "disabled"}" data-relation-key="${escapeHtml(relationKey)}"${open ? " open" : ""}><summary><div class="pm-threshold-summary-title"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))} + ${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div><span class="pm-pill ${statusClass}">${escapeHtml(llm.replace("Codex ", ""))}</span><div><span>24h 成交量</span><strong>${escapeHtml(predictionVolume(opportunity.volume_24h, "-"))}</strong></div><div><span>成本 / 最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))} / ${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>理论利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</strong></div><div class="pm-threshold-yield"><span>简单年化</span><strong>${escapeHtml(annualized)}</strong><small>查看详情</small></div></summary><div class="pm-threshold-detail"><section><h3>当前年化计算</h3><div class="pm-threshold-formula"><div><span>含费最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>理论最低利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</strong></div><div><span>预计资金占用</span><strong>${escapeHtml(remainingLabel)}</strong></div><div><span>简单收益率</span><strong>${escapeHtml(predictionMoney(opportunity.profit ?? opportunity.minimum_profit))} / ${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))} = ${escapeHtml(simpleReturn)}</strong></div><div><span>简单年化</span><strong>${escapeHtml(simpleReturn)} × 365 / ${escapeHtml(remainingLabel)} = ${escapeHtml(annualizedDetail)}</strong></div></div><p class="pm-threshold-caveat">按预计结算时间做非复利年化；结算延迟会降低实际年化。两腿成交前，利润尚未锁定。</p>${predictionThresholdDistributionHtml(payload)}</section><section><h3>合约与赔付证明</h3><div class="pm-threshold-questions"><div><span>市场 A</span><strong>${escapeHtml(predictionValue(opportunity.question_a, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))}</small></div><div><span>市场 B</span><strong>${escapeHtml(predictionValue(opportunity.question_b, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div></div><div class="pm-order-legs">${legRows}</div></section><section><h3>LLM 与确定性校验</h3><div class="pm-threshold-llm"><span class="pm-pill ${statusClass}">${escapeHtml(llm)}</span>${predictionLlmReasonHtml(opportunity)}${proof ? `<small>证明：${escapeHtml(proof)}</small>` : ""}<small>规则关系复核：${opportunity.llm_status === "approved" ? "通过" : "未通过"}</small>${blockedReason ? `<small>当前不可确认：${escapeHtml(blockedReason)}</small>` : ""}</div></section>${action}</div></details>`;
 }
 
+function predictionFunnelStatus(value) {
+  const status = String(value || "unavailable").toLowerCase();
+  if (status === "healthy" || status === "connected") return "正常";
+  if (status === "scanning") return "扫描中";
+  if (status === "lagging") return "追赶中";
+  if (status === "degraded") return "降级";
+  if (status === "stale") return "已过期";
+  return "不可用";
+}
+
+function predictionFunnelDuration(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds)) return "-";
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  return `${(milliseconds / 1000).toFixed(2)} 秒`;
+}
+
+function predictionFunnelStage(label, value, note = "", tone = "") {
+  const display = predictionNumber(value);
+  return `<article class="pm-funnel-stage ${tone}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong>${note ? `<small>${escapeHtml(note)}</small>` : ""}</article>`;
+}
+
+function predictionFunnelRejections(counts) {
+  const values = counts && typeof counts === "object" ? counts : {};
+  const labels = {
+    book_unavailable: "盘口缺失",
+    minimum_depth: "最小深度",
+    cost_limit: "成本上限",
+    outside_5pct: "距盈亏平衡",
+    codex_rejected: "Codex 拒绝",
+    codex_unavailable: "Codex 不可用",
+    rules_changed: "规则变化",
+    readiness_blocked: "准入阻断",
+    event_ineligible: "事件不合格",
+    market_unparseable: "市场不可解析",
+  };
+  const rows = Object.entries(values)
+    .filter(([, value]) => Number(value) > 0)
+    .map(([key, value]) => `${labels[key] || key.replaceAll("_", " ")} ${predictionNumber(value)}`);
+  return rows.length ? rows.join(" · ") : "暂无淘汰";
+}
+
+function predictionFunnelReasons(activity, payload) {
+  const reasons = Array.isArray(activity?.rejection_reasons) ? activity.rejection_reasons : [];
+  const fromActivity = reasons.map((item) => {
+    const reason = item && typeof item === "object" ? item.eligibility_reason || item.reason : item;
+    return predictionReasonLabel(reason);
+  }).filter(Boolean);
+  if (fromActivity.length) return [...new Set(fromActivity)];
+  const opportunities = predictionOpportunities(payload)
+    .filter((item) => String(item?.market_type || "") === "threshold_hedge")
+    .map((item) => predictionReasonLabel(item.eligibility_reason || item.reason))
+    .filter(Boolean);
+  return [...new Set(opportunities)];
+}
+
+function predictionRelationFunnel(payload) {
+  const discovery = payload?.relation_discovery && typeof payload.relation_discovery === "object" ? payload.relation_discovery : {};
+  const catalog = discovery.catalog && typeof discovery.catalog === "object" ? discovery.catalog : {};
+  const rawActivity = discovery.activity && typeof discovery.activity === "object" ? discovery.activity : {};
+  const scanning = ["scanning", "lagging"].includes(String(rawActivity.status || "").toLowerCase());
+  const completed = rawActivity.last_completed && typeof rawActivity.last_completed === "object" ? rawActivity.last_completed : {};
+  const activity = scanning ? {...rawActivity, ...completed} : rawActivity;
+  const websocket = discovery.websocket && typeof discovery.websocket === "object" ? discovery.websocket : {};
+  const queue = discovery.codex_queue && typeof discovery.codex_queue === "object" ? discovery.codex_queue : {};
+  const usage = discovery.codex_usage_24h && typeof discovery.codex_usage_24h === "object" ? discovery.codex_usage_24h : {};
+  const logs = Array.isArray(discovery.scan_logs) ? discovery.scan_logs : [];
+  const relationCount = catalog.relations_discovered ?? catalog.relation_count ?? 0;
+  const positive = activity.positive_candidates ?? 0;
+  const ready = activity.order_ready ?? 0;
+  const websocketStatus = String(websocket.status || "").toLowerCase() === "connected" ? "WebSocket 正常" : `WebSocket ${predictionFunnelStatus(websocket.status)}`;
+  const logRows = logs.length
+    ? logs.map((item) => `<li>${escapeHtml(typeof item === "object" ? Object.entries(item).map(([key, value]) => `${key}=${value}`).join(" · ") : String(item))}</li>`).join("")
+    : "<li>暂无扫描日志</li>";
+  const empty = Number(relationCount) === 0
+    ? `<div class="pm-funnel-empty"><strong>本轮未发现可验证关系</strong><p>关系目录完成后，下一轮成交筛选会自动恢复。</p></div>`
+    : positive > 0 && Number(ready) === 0
+      ? `<div class="pm-funnel-empty pm-funnel-warning"><strong>正收益候选尚未满足下单准入</strong><p>${escapeHtml(predictionFunnelReasons(activity, payload).join(" · ") || "仍在等待实时校验")}</p></div>`
+      : positive === 0
+        ? `<div class="pm-funnel-empty"><strong>本轮没有正收益候选</strong><p>完整漏斗和淘汰原因仍保留，下一分钟会重新考虑全部关系。</p></div>`
+        : "";
+  return `<section class="pm-panel pm-relation-funnel" aria-label="实时两层漏斗"><header class="pm-funnel-header"><div><h2>实时两层漏斗</h2><p>关系目录每日更新；成交候选每分钟重新筛选。</p></div><div class="pm-funnel-chips"><span class="pm-funnel-chip">关系目录 ${escapeHtml(predictionFunnelStatus(catalog.status))}</span><span class="pm-funnel-chip">成交筛选 ${escapeHtml(predictionFunnelStatus(rawActivity.status))}</span><span class="pm-funnel-chip">${escapeHtml(websocketStatus)} · ${escapeHtml(predictionValue(websocket.last_message_age_seconds, "-"))}s</span><span class="pm-funnel-chip">Codex queue · ${escapeHtml(predictionNumber(queue.pending, "0"))} 待审</span></div></header><div class="pm-funnel-lane"><div class="pm-funnel-lane-title"><strong>第一层 · 关系目录</strong><small>${escapeHtml(predictionFunnelStatus(catalog.status))} · ${escapeHtml(predictionFunnelDuration(catalog.duration_ms))}</small></div><div class="pm-funnel-grid pm-funnel-grid-catalog">${predictionFunnelStage("扫描事件", catalog.events_seen, `合格 ${predictionNumber(catalog.events_eligible)}`)}${predictionFunnelStage("阈值市场", catalog.threshold_markets)}${predictionFunnelStage("程序关系", relationCount)}${predictionFunnelStage("持久化目录", relationCount, `唯一 Token ${predictionNumber(catalog.unique_tokens)}`, "good")}</div></div><div class="pm-funnel-lane"><div class="pm-funnel-lane-title"><strong>第二层 · 成交候选</strong><small>${escapeHtml(predictionFunnelStatus(rawActivity.status))} · ${escapeHtml(predictionFunnelDuration(activity.duration_ms))}</small></div><div class="pm-funnel-grid pm-funnel-grid-activity">${predictionFunnelStage("全部关系", activity.relations_considered)}${predictionFunnelStage("盘口可用", activity.relations_with_books, `淘汰 ${predictionNumber(activity.rejection_counts?.book_unavailable, "0")}`)}${predictionFunnelStage("最小深度", activity.relations_with_minimum_depth, `淘汰 ${predictionNumber(activity.rejection_counts?.minimum_depth, "0")}`)}${predictionFunnelStage("5%边界内", activity.relations_within_5pct, `淘汰 ${predictionNumber(activity.rejection_counts?.outside_5pct, "0")}`, "drop")}${predictionFunnelStage("Codex", activity.codex_approved, `${predictionNumber(activity.codex_pending, "0")} 待审 · ${predictionNumber(activity.codex_rejected, "0")} 拒绝`)}${predictionFunnelStage("WebSocket池", activity.subscribed_tokens, `${predictionNumber(activity.subscribed_relations, "0")} 关系`, "live")}${predictionFunnelStage("正收益", positive, `正收益 ${predictionNumber(positive)}`, positive > 0 ? "good" : "")}${predictionFunnelStage("飞书已发", activity.notifications_sent, `飞书 ${predictionNumber(activity.notifications_sent, "0")} · 可下单 ${predictionNumber(ready, "0")}`, "good")}</div></div><div class="pm-funnel-meta"><span>${escapeHtml(websocketStatus)}</span><span>本轮耗时 ${escapeHtml(predictionFunnelDuration(activity.duration_ms))}</span><details class="pm-funnel-rejections"><summary>拒绝原因</summary><p>${escapeHtml(predictionFunnelRejections({...catalog.rejection_counts, ...activity.rejection_counts}))}</p></details><details class="pm-scan-logs"><summary>扫描日志（${logs.length} 条）</summary><ul>${logRows}</ul></details><span>Codex 24h：${escapeHtml(predictionNumber(usage.calls, "0"))} calls · ${escapeHtml(predictionNumber(usage.cache_hits, "0"))} cache hits</span></div>${empty}</section>`;
+}
+
 function predictionRelationDiscoveryPanel(payload) {
   const discovery = payload?.relation_discovery && typeof payload.relation_discovery === "object" ? payload.relation_discovery : {};
+  const catalog = discovery.catalog && typeof discovery.catalog === "object" ? discovery.catalog : {};
+  const activity = discovery.activity && typeof discovery.activity === "object" ? discovery.activity : {};
   const usage = discovery.codex_usage_24h && typeof discovery.codex_usage_24h === "object" ? discovery.codex_usage_24h : {};
   const logs = Array.isArray(discovery.scan_logs) ? discovery.scan_logs : [];
   const logRows = logs.length ? logs.map((item) => `<li>${escapeHtml(typeof item === "object" ? Object.entries(item).map(([key, value]) => `${key}=${value}`).join(" · ") : String(item))}</li>`).join("") : "<li>暂无扫描日志</li>";
-  return `<section class="pm-panel pm-relation-discovery"><header class="pm-panel-heading"><div><h2>关联合约扫描</h2></div><span class="pm-pill">${escapeHtml(predictionValue(discovery.status, "不可用"))}</span></header><div class="pm-relation-summary"><span>Codex 24h：${escapeHtml(predictionValue(usage.calls, "0"))} calls · ${escapeHtml(predictionValue(usage.successes, "0"))} 成功 · ${escapeHtml(predictionValue(usage.failures, "0"))} 失败 · ${escapeHtml(predictionValue(usage.cache_hits, "0"))} cache hits</span><span>tokens：${escapeHtml(predictionValue(usage.input_tokens, "0"))} input · ${escapeHtml(predictionValue(usage.output_tokens, "0"))} output</span></div><details class="pm-scan-logs"><summary>扫描日志（${logs.length} 条，内存）</summary><ul>${logRows}</ul></details></section>`;
+  const duration = predictionFunnelDuration(catalog.duration_ms);
+  const next = predictionValue(activity.next_scan_at, "按计划");
+  return `<section class="pm-panel pm-relation-discovery"><header class="pm-panel-heading"><div><h2>关联合约扫描</h2><p>关系目录持久化，成交筛选每分钟刷新。</p></div><span class="pm-pill">${escapeHtml(predictionFunnelStatus(catalog.status))}</span></header><div class="pm-relation-summary pm-relation-summary-grid"><span>最近全量扫描<strong>${escapeHtml(predictionValue(catalog.completed_at, "未完成"))}</strong></span><span>扫描耗时<strong>${escapeHtml(duration)}</strong></span><span>下次计划<strong>${escapeHtml(next)}</strong></span><span>Codex 24h<strong>${escapeHtml(predictionNumber(usage.calls, "0"))} calls · ${escapeHtml(predictionNumber(usage.cache_hits, "0"))} cache hits</strong></span></div><details class="pm-scan-logs"><summary>扫描日志（${logs.length} 条）</summary><ul>${logRows}</ul></details></section>`;
 }
 
 function predictionOpportunityPanel(payload) {
@@ -2571,7 +2659,17 @@ function predictionHistoryContent(payload, kind) {
     .filter((row) => kind !== "executions" || row.phase !== "startup_unknown_state");
   if (!displayRows.length) return `<div class="pm-empty compact"><strong>${kind === "signals" ? "还没有历史信号" : kind === "executions" ? "还没有真实交易" : "没有交易事故"}</strong><p>${kind === "signals" ? "后台达到正式信号门槛后会保留出现时间、成交量和利润。" : kind === "executions" ? "第一笔真实机会完成后，这里会记录两腿订单、合并交易和已实现利润。" : "单腿成交、自动处置失败和合并失败会永久保留在这里。"}</p></div>`;
   if (kind === "signals") {
-    return `<table class="pm-table"><thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>峰值净边际</th><th>可执行</th><th>峰值利润</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="出现时间">${escapeHtml(predictionValue(row.occurred_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="持续">${escapeHtml(predictionValue(row.duration))}</td><td data-label="峰值净边际">${escapeHtml(row.peak_edge === undefined || row.peak_edge === null ? "-" : `$${predictionValue(row.peak_edge)}`)}</td><td data-label="可执行">${escapeHtml(predictionValue(row.quantity))} 组</td><td data-label="峰值利润" class="pm-positive"><strong>${escapeHtml(predictionMoney(row.profit))}</strong></td></tr>`).join("")}</tbody></table>`;
+    const notificationLabel = (value) => {
+      const stateValue = String(value || "").toLowerCase();
+      if (stateValue === "sent") return "飞书已发";
+      if (stateValue === "failed") return "发送失败";
+      return "未发送";
+    };
+    const durationLabel = (row) => {
+      const observed = Number(row.observed_duration_ms);
+      return Number.isFinite(observed) ? `${Math.round(observed)} ms` : predictionValue(row.duration);
+    };
+    return `<table class="pm-table"><thead><tr><th>出现时间</th><th>市场</th><th>持续</th><th>初始利润</th><th>峰值利润</th><th>最终利润</th><th>窗口结束</th><th>通知</th></tr></thead><tbody>${displayRows.map((row) => `<tr><td data-label="出现时间">${escapeHtml(predictionValue(row.occurred_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="持续">${escapeHtml(durationLabel(row))}</td><td data-label="初始利润">${escapeHtml(predictionSignedMoney(row.initial_profit))}</td><td data-label="峰值利润" class="pm-positive"><strong>${escapeHtml(predictionSignedMoney(row.peak_profit ?? row.profit))}</strong></td><td data-label="最终利润">${escapeHtml(predictionSignedMoney(row.final_profit))}</td><td data-label="窗口结束">${escapeHtml(predictionValue(row.ended_reason, "进行中"))}</td><td data-label="通知">${escapeHtml(notificationLabel(row.notification_state))}</td></tr>`).join("")}</tbody></table>`;
   }
   if (kind === "executions") {
     return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; const holding = row.state === "holding_to_resolution"; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${holding ? "待结算（不 merge）" : escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${holding ? "待结算" : escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
@@ -2588,6 +2686,12 @@ function predictionHistoryDisplay(kind, value) {
       occurred_at: row.occurred_at ?? row.started_at ?? row.created_at,
       event_title: row.event_title ?? row.question ?? row.title,
       duration: row.duration ?? "-",
+      observed_duration_ms: row.observed_duration_ms,
+      initial_profit: row.initial_profit,
+      peak_profit: row.peak_profit,
+      final_profit: row.final_profit,
+      ended_reason: row.ended_reason,
+      notification_state: row.notification_state ?? row.notification_status,
       peak_edge: row.peak_edge ?? row.peak_net_edge ?? row.net_edge,
       quantity: row.quantity ?? row.peak_quantity,
       profit: row.profit ?? row.peak_estimated_profit ?? row.estimated_profit ?? row.minimum_profit,
@@ -2634,13 +2738,10 @@ function predictionYesNoWorkspace(payload, expandedEventKeys) {
 function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
   const opportunities = predictionOpportunities(payload)
     .filter((item) => String(item.market_type || "") === "threshold_hedge");
-  const approved = opportunities.filter((item) => String(item.llm_status || "") === "approved").length;
-  const actionable = opportunities.filter((item) => predictionThresholdIsActionable(item, payload)).length;
-  const usage = payload?.relation_discovery?.codex_usage_24h || {};
   const candidates = opportunities.length
     ? opportunities.map((item) => predictionThresholdCandidateHtml(item, payload, expandedRelationKeys)).join("")
     : `<div class="pm-empty"><strong>当前没有正收益候选</strong><p>关联合约扫描仍在运行；出现候选后会在这里展示校验状态和年化计算。</p></div>`;
-  return `<section class="pm-metrics" aria-label="LLM 对冲扫描摘要"><article class="pm-metric primary"><span>本轮关系候选</span><strong>${opportunities.length}</strong><small>尚未等于套利机会</small></article><article class="pm-metric"><span>Codex 通过</span><strong>${approved}</strong><small>拒绝原因仍保留</small></article><article class="pm-metric"><span>当前可确认</span><strong>${actionable}</strong><small>成交前利润尚未锁定</small></article><article class="pm-metric"><span>Codex 24h 调用</span><strong>${escapeHtml(predictionValue(usage.calls, "0"))}</strong><small>${escapeHtml(predictionValue(usage.cache_hits, "0"))} cache hits · ${escapeHtml(predictionValue(usage.failures, "0"))} 失败</small></article></section><aside class="pm-policy"><strong>所有正收益候选都会展示</strong><p>Codex 结论和程序复核全部通过后才出现人工确认入口；两腿属于不同 condition，不会 merge。</p></aside><div class="pm-llm-layout"><aside>${predictionRelationDiscoveryPanel(payload)}</aside><section class="pm-panel"><header class="pm-panel-heading"><div><h2>候选标的</h2><p>点击年化查看当前计算、历史参考、校验链和 LLM 理由；默认全部折叠。</p></div><span class="pm-pill">显示 ${opportunities.length}</span></header><div class="pm-threshold-candidates">${candidates}</div></section></div>`;
+  return `${predictionRelationFunnel(payload)}<aside class="pm-policy"><strong>所有正收益候选都会展示</strong><p>Codex 结论和程序复核全部通过后才出现人工确认入口；两腿属于不同 condition，不会 merge。</p></aside><div class="pm-llm-layout"><aside>${predictionRelationDiscoveryPanel(payload)}</aside><section class="pm-panel"><header class="pm-panel-heading"><div><h2>候选标的</h2><p>点击年化查看当前计算、历史参考、校验链和 LLM 理由；默认全部折叠。</p></div><span class="pm-pill">显示 ${opportunities.length}</span></header><div class="pm-threshold-candidates">${candidates}</div></section></div>`;
 }
 
 function renderPredictionMarket() {

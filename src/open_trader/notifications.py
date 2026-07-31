@@ -304,6 +304,111 @@ def render_feishu_order_review(
     return "\n".join(lines).strip() + "\n"
 
 
+def render_prediction_opportunity_notification(
+    opportunity: Mapping[str, object],
+    signal: Mapping[str, object],
+    *,
+    dashboard_url: str,
+) -> tuple[str, str]:
+    """Render facts from an order-ready observation without execution claims."""
+
+    def text(name: str, default: str = "") -> str:
+        value = opportunity.get(name, default)
+        return str(value) if value is not None else default
+
+    def decimal(value: object, default: str = "0") -> Decimal:
+        try:
+            return value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal(default)
+
+    def money(value: object, *, signed: bool = False) -> str:
+        amount = decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        prefix = "+" if signed and amount >= 0 else ""
+        return f"{prefix}${amount:.2f}"
+
+    def timestamp(value: object) -> str:
+        if isinstance(value, datetime):
+            moment = value
+        else:
+            raw = str(value).strip()
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            try:
+                moment = datetime.fromisoformat(raw)
+            except ValueError:
+                return str(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=SHANGHAI)
+        local = moment.astimezone(SHANGHAI)
+        offset = local.strftime("%z")
+        return f"{local:%Y-%m-%d %H:%M:%S.%f}"[:-3] + f" {offset[:3]}:{offset[3:]}"
+
+    def leg_payload(name: str, index: int) -> Mapping[str, object]:
+        value = opportunity.get(name)
+        if isinstance(value, Mapping):
+            return value
+        legs = opportunity.get("buy_legs")
+        if isinstance(legs, (list, tuple)) and len(legs) > index and isinstance(legs[index], Mapping):
+            return legs[index]
+        return {}
+
+    def leg_line(name: str, index: int) -> str:
+        leg = leg_payload(name, index)
+        question = str(leg.get("question", leg.get("label", "")))
+        outcome = str(leg.get("outcome", ""))
+        quantity = str(leg.get("quantity", ""))
+        price = money(leg.get("max_price"))
+        cost = money(leg.get("max_cost"))
+        return f"买入「{question}」{outcome}：{quantity} 份 × {price} = {cost}"
+
+    minimum_profit = decimal(opportunity.get("minimum_profit"))
+    edge = decimal(opportunity.get("net_edge")) * Decimal("100")
+    edge_text = f"{edge.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}%"
+    first_positive = signal.get("first_positive_at", opportunity.get("order_ready_at"))
+    ready_at = opportunity.get("order_ready_at", first_positive)
+    delay = max(Decimal("0"), decimal_timestamp(ready_at) - decimal_timestamp(first_positive))
+    delay_text = f"{delay.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP):.1f} 秒"
+    age = decimal(opportunity.get("confirmed_age_seconds")) * Decimal("1000")
+    verified = opportunity.get("rules_verified_at") not in (None, "")
+    event_slug = text("event_slug").strip()
+    event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else "https://polymarket.com/"
+    title = f"【仅观察·未下单】Polymarket 正收益机会｜{money(minimum_profit, signed=True)}"
+    message = "\n".join(
+        (
+            f"事件：{text('event_title', text('question'))}",
+            leg_line("leg_a", 0),
+            leg_line("leg_b", 1),
+            f"拟下单金额：{money(opportunity.get('planned_amount', opportunity.get('total_max_cost')))}",
+            f"预计费用：{money(opportunity.get('maximum_fee'))}",
+            f"最大总成本：{money(opportunity.get('total_max_cost'))}",
+            f"最低兑付：{money(opportunity.get('minimum_payout'))}",
+            f"保底净利润：{money(minimum_profit, signed=True)}（+{edge_text}）",
+            f"发现时间：{timestamp(first_positive)}",
+            f"信号→发送：{delay_text}",
+            f"盘口年龄：{age.quantize(Decimal('1'), rounding=ROUND_HALF_UP):.0f} 毫秒",
+            f"关系复核：{'通过' if verified else '未通过'}",
+            "机会状态：观察中",
+            f"机会编号：{signal.get('signal_id', '')}",
+            event_url,
+            f"Dashboard：{dashboard_url}",
+        )
+    )
+    return title, message
+
+
+def decimal_timestamp(value: object) -> Decimal:
+    if isinstance(value, datetime):
+        return Decimal(str(value.timestamp()))
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return Decimal(str(datetime.fromisoformat(raw).timestamp()))
+    except (ValueError, InvalidOperation):
+        return Decimal("0")
+
+
 def _conclusion_line(ready_rows: list[dict[str, str]]) -> str:
     if ready_rows:
         return f"今日结论：有 {len(ready_rows)} 条可采取行动，需人工确认后执行。"

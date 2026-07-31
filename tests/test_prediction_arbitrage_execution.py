@@ -4,6 +4,7 @@ import inspect
 import sqlite3
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -130,15 +131,24 @@ class ThresholdMonitor(FakeMonitor):
         self.rules_hash_a = "hash-a"
         self.rules_hash_b = "hash-b"
         self.cache_key = "cache-key"
+        self.rules_verified = True
+        self.codex_status = "approved"
+        self.book_age_seconds = Decimal("1")
+        self.remediation_safe = True
 
     def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
         if opportunity_id != "threshold-opp-1":
             return None
         intent = self.threshold_intent
+        now = datetime.now(UTC)
+        confirmed_at = now - timedelta(seconds=float(self.book_age_seconds))
+        rules_verified_at = now if self.rules_verified else None
         return {
             "opportunity_id": opportunity_id,
             "intent_type": "threshold_hedge",
             "event_id": intent.event_id,
+            "event_title": "Fed cuts",
+            "event_slug": "fed-cuts-2026",
             "market_id": intent.relation_id,
             "market_type": "threshold_hedge",
             "relation_id": intent.relation_id,
@@ -150,12 +160,41 @@ class ThresholdMonitor(FakeMonitor):
             "rules_hash_a": self.rules_hash_a,
             "rules_hash_b": self.rules_hash_b,
             "cache_key": self.cache_key,
-            "actionable": True,
-            "eligibility_reason": "actionable",
-            "confirmed_at": datetime.now(UTC),
-            "confirmed_age_seconds": Decimal("1"),
+            "relation_validation": {"status": self.codex_status},
+            "llm_status": self.codex_status,
+            "rules_verified_at": rules_verified_at,
+            "rules_fingerprint": self.cache_key,
+            "actionable": self.codex_status == "approved" and self.remediation_safe,
+            "eligibility_reason": "actionable" if self.codex_status == "approved" and self.remediation_safe else "not_ready",
+            "confirmed_at": confirmed_at,
+            "confirmed_age_seconds": self.book_age_seconds,
+            "book_timestamp_a": confirmed_at,
+            "book_timestamp_b": confirmed_at,
+            "book_received_at_a": now,
+            "book_received_at_b": now,
             "intent": intent,
             "tick_size": Decimal("0.01"),
+            "leg_a": {
+                "question": "Will BTC be above 90k?",
+                "outcome": intent.leg_a.outcome,
+                "quantity": intent.leg_a.quantity,
+                "max_price": intent.leg_a.max_price,
+                "max_cost": intent.leg_a.max_cost,
+            },
+            "leg_b": {
+                "question": "Will BTC be above 100k?",
+                "outcome": intent.leg_b.outcome,
+                "quantity": intent.leg_b.quantity,
+                "max_price": intent.leg_b.max_price,
+                "max_cost": intent.leg_b.max_cost,
+            },
+            "planned_amount": intent.total_max_cost,
+            "maximum_fee": intent.maximum_fee,
+            "total_max_cost": intent.total_max_cost,
+            "minimum_payout": intent.minimum_payout,
+            "minimum_profit": intent.minimum_profit,
+            "estimated_profit": intent.minimum_profit,
+            "net_edge": intent.net_edge,
         }
 
 
@@ -174,23 +213,29 @@ class FakeTrading:
         self._post_started = threading.Event()
         self._release_post = threading.Event()
         self.relayer_fresh = True
+        self.account_fresh = True
+        self.balance = None
+        self.allowance = None
+        self.geoblock = True
 
     def account_snapshot(self) -> AccountSnapshot:
         self._account_reads += 1
         # Fixtures perform an explicit clean startup read before preview and
         # execution; expose the post-merge balance only on the later proof read.
-        balance = Decimal("22") if self._account_reads >= 4 else Decimal("20")
+        balance = self.balance if self.balance is not None else (Decimal("22") if self._account_reads >= 4 else Decimal("20"))
+        allowance = self.allowance if self.allowance is not None else Decimal("20")
+        checked_at = datetime.now(UTC) if self.account_fresh else datetime.now(UTC) - timedelta(seconds=61)
         return AccountSnapshot(
             wallet_address="0x" + "1" * 40,
             p_usd_balance=balance,
-            p_usd_allowance=Decimal("20"),
+            p_usd_allowance=allowance,
             open_order_ids=(),
             positions=(),
-            checked_at=datetime.now(UTC),
+            checked_at=checked_at,
         )
 
     def geoblock_allowed(self) -> bool:
-        return True
+        return self.geoblock
 
     def readiness_snapshot(self) -> dict[str, object]:
         return {
@@ -349,7 +394,7 @@ class ThresholdTrading(FakeTrading):
         self, intent: ThresholdHedgeIntent
     ) -> dict[str, object]:
         self.threshold_preflight_calls += 1
-        return {"result": "PASS", "intent": intent}
+        return getattr(self, "threshold_preflight_result", {"result": "PASS", "intent": intent})
 
     def account_snapshot(self) -> AccountSnapshot:
         base = super().account_snapshot()
@@ -622,15 +667,258 @@ def threshold_execution_fixture(tmp_path: Path):
     store = PredictionArbitrageStore(tmp_path / "data")
     trading = ThresholdTrading()
     monitor = ThresholdMonitor(_threshold_intent())
+    macos = ChannelNotifier("macos")
+    feishu = ChannelNotifier("feishu")
+    notifier = CompositeTestNotifier(macos, feishu)
     service = PredictionExecutionService(
         store=store,
         monitor=monitor,
         trading=trading,
-        notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
+        notifier=notifier,
         lock_path=tmp_path / "execution.lock",
     )
     assert service.reconcile_startup()["state"] == "ready"
+    service.test_notifiers = (macos, feishu)  # type: ignore[attr-defined]
     return service, trading, store, monitor
+
+
+def _notification_signal(store: PredictionArbitrageStore) -> str:
+    return store.upsert_signal(
+        {
+            "market_id": "relation-1",
+            "event_id": "event-threshold",
+            "question": "Fed cuts",
+            "started_at": datetime.now(UTC).isoformat(),
+            "first_positive_at": datetime.now(UTC).isoformat(),
+            "net_edge": Decimal("0.788"),
+            "estimated_profit": Decimal("7.88"),
+            "notification_state": "pending",
+            "notification_attempts": 0,
+        }
+    )
+
+
+def test_ready_notification_sends_only_after_read_only_proof(tmp_path: Path) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+
+    result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
+
+    assert result["state"] == "sent"
+    assert trading.threshold_preflight_calls == 1
+    assert trading.threshold_submit_calls == 0
+    assert trading.batch_calls == 0
+    assert store.active_execution() is None
+    assert store.signal(signal_id)["notification_state"] == "sent"  # type: ignore[index]
+    assert store.signal(signal_id)["order_ready_at"]  # type: ignore[index]
+    assert "notification_error_code" not in store.signal(signal_id)  # type: ignore[operator]
+    macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    assert macos.calls == 0
+    assert feishu.calls == 1
+
+
+def test_two_service_instances_reserve_one_notification_attempt(tmp_path: Path) -> None:
+    service, _, store, _ = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+    store2 = PredictionArbitrageStore(tmp_path / "data")
+    trading2 = ThresholdTrading()
+    monitor2 = ThresholdMonitor(_threshold_intent())
+    notifier2 = CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu"))
+    service2 = PredictionExecutionService(
+        store=store2,
+        monitor=monitor2,
+        trading=trading2,
+        notifier=notifier2,
+        lock_path=tmp_path / "execution-2.lock",
+    )
+    assert service2.reconcile_startup()["state"] == "ready"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda item: item.notify_ready_opportunity("threshold-opp-1", signal_id),
+                (service, service2),
+            )
+        )
+
+    assert [result["state"] for result in results].count("sent") == 1
+    assert sum(notifier.calls for notifier in notifier2._notifiers) <= 1
+    assert store.signal(signal_id)["notification_attempts"] == 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "breaker",
+        "active_execution",
+        "rules",
+        "codex",
+        "book_age",
+        "economics",
+        "account_freshness",
+        "balance",
+        "allowance",
+        "geoblock",
+        "relayer",
+        "emergency_unwind",
+        "preflight",
+    ),
+)
+def test_ready_notification_fails_closed_when_any_preflight_check_fails(
+    tmp_path: Path, failure: str
+) -> None:
+    service, trading, store, monitor = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+    if failure == "breaker":
+        service._breaker_open = True  # type: ignore[attr-defined]
+    elif failure == "active_execution":
+        preview = service.preview("threshold-opp-1")
+        store.consume_preview_and_create_execution(str(preview["id"]), "active")
+    elif failure == "rules":
+        monitor.rules_verified = False
+    elif failure == "codex":
+        monitor.codex_status = "pending"
+    elif failure == "book_age":
+        monitor.book_age_seconds = Decimal("11")
+    elif failure == "economics":
+        monitor.threshold_intent = replace(
+            monitor.threshold_intent, minimum_profit=Decimal("0"), net_edge=Decimal("0")
+        )
+    elif failure == "account_freshness":
+        trading.account_fresh = False
+    elif failure == "balance":
+        trading.balance = Decimal("1")
+    elif failure == "allowance":
+        trading.allowance = Decimal("1")
+    elif failure == "geoblock":
+        trading.geoblock = False
+    elif failure == "relayer":
+        trading.relayer_fresh = False
+    elif failure == "emergency_unwind":
+        monitor.remediation_safe = False
+    elif failure == "preflight":
+        trading.threshold_preflight_result = {"result": "FAIL"}
+
+    result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
+
+    assert result["state"] != "sent"
+    assert trading.threshold_submit_calls == 0
+    assert trading.batch_calls == 0
+    macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    assert macos.calls == 0
+    assert feishu.calls == 0
+
+
+def test_ready_notification_final_intent_race_fails_closed(tmp_path: Path) -> None:
+    service, trading, store, monitor = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+
+    class ChangingThresholdMonitor(ThresholdMonitor):
+        def __init__(self, original: ThresholdMonitor) -> None:
+            super().__init__(original.threshold_intent)
+            self.calls = 0
+
+        def refresh_once(self) -> dict[str, object]:
+            return {"opportunities": [self.opportunity("threshold-opp-1")]}
+
+        def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+            self.calls += 1
+            value = super().opportunity(opportunity_id)
+            if value is not None and self.calls == 2:
+                value["intent"] = replace(
+                    self.threshold_intent,
+                    total_max_cost=Decimal("2.13"),
+                    minimum_profit=Decimal("7.87"),
+                )
+                value["total_max_cost"] = Decimal("2.13")
+                value["minimum_profit"] = Decimal("7.87")
+            return value
+
+    changing = ChangingThresholdMonitor(monitor)
+    service._monitor = changing  # type: ignore[attr-defined]
+
+    result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
+
+    assert result == {"state": "failed", "reason": "opportunity_changed"}
+    assert trading.threshold_submit_calls == 0
+    assert trading.batch_calls == 0
+    macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    assert macos.calls == 0
+    assert feishu.calls == 0
+
+
+@pytest.mark.parametrize("final_change", ("rules", "codex", "remediation", "hash"))
+def test_ready_notification_rechecks_final_rule_and_codex_proof(
+    tmp_path: Path, final_change: str
+) -> None:
+    service, trading, store, monitor = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+
+    class FinalChangeMonitor(ThresholdMonitor):
+        def __init__(self, original: ThresholdMonitor) -> None:
+            super().__init__(original.threshold_intent)
+            self.calls = 0
+
+        def refresh_once(self) -> dict[str, object]:
+            return {"opportunities": [self.opportunity("threshold-opp-1")]}
+
+        def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+            self.calls += 1
+            value = super().opportunity(opportunity_id)
+            if value is None or self.calls != 2:
+                return value
+            if final_change == "rules":
+                value["rules_verified_at"] = None
+            elif final_change == "codex":
+                value["relation_validation"] = {"status": "pending"}
+                value["llm_status"] = "pending"
+            elif final_change == "remediation":
+                value["remediation_safe"] = False
+            else:
+                value["rules_hash_b"] = "changed-hash"
+            return value
+
+    service._monitor = FinalChangeMonitor(monitor)  # type: ignore[attr-defined]
+
+    result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
+
+    assert result == {"state": "failed", "reason": "opportunity_changed"}
+    assert trading.threshold_submit_calls == 0
+    macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    assert macos.calls == 0
+    assert feishu.calls == 0
+
+
+def test_ready_notification_retries_at_most_three_times_and_dedupes_episode(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    feishu.fail = True
+    signal_id = _notification_signal(store)
+
+    for _ in range(3):
+        result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
+        assert result["state"] == "failed"
+    for _ in range(2):
+        assert service.notify_ready_opportunity("threshold-opp-1", signal_id)["state"] == "ignored"
+    assert feishu.calls == 3
+    assert macos.calls == 0
+    assert store.signal(signal_id)["notification_attempts"] == 3  # type: ignore[index]
+    assert store.signal(signal_id)["notification_error_code"] == "delivery_failed"  # type: ignore[index]
+    assert "notification_error" not in store.signal(signal_id)  # type: ignore[operator]
+
+    store.close_signal(
+        "relation-1", ended_at=datetime.now(UTC).isoformat(), reason="data_unavailable"
+    )
+    assert service.notify_ready_opportunity("threshold-opp-1", signal_id)["state"] == "ignored"
+
+    next_signal_id = _notification_signal(store)
+    feishu.fail = False
+    assert service.notify_ready_opportunity("threshold-opp-1", next_signal_id)["state"] == "sent"
+    assert feishu.calls == 4
+    assert trading.threshold_submit_calls == 0
+    assert trading.batch_calls == 0
 
 
 def incident_fixture(tmp_path: Path, *, result: str, notifier: object | None = None):

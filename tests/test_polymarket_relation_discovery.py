@@ -4,17 +4,36 @@ import hashlib
 import json
 import subprocess
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from polymarket.models.gamma.event import Event, EventState
+from polymarket.models.gamma.market import (
+    FeeSchedule,
+    Market,
+    MarketOutcome,
+    MarketOutcomes,
+    MarketResolution,
+    MarketState,
+    MarketTrading,
+)
 
 from open_trader.polymarket_relation_discovery import (
     CODEX_PROMPT_VERSION,
     CodexRelationValidator,
+    RelationActivityAssessment,
+    ThresholdRelation,
+    ThresholdRelationDiscoveryResult,
+    assess_threshold_relation_activity,
     codex_relation_cache_key,
+    discover_threshold_relation_catalog,
     discover_threshold_relations,
+    threshold_relation_from_payload,
+    threshold_relation_payload,
 )
+from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
 
@@ -86,6 +105,104 @@ def event(
         "negRisk": neg_risk,
         "markets": list(markets),
     }
+
+
+def sdk_market(market_id: str, question: str, token_suffix: str) -> Market:
+    return Market.model_construct(
+        id=market_id,
+        condition_id=f"condition-{market_id}",
+        question=question,
+        description=RULES,
+        state=MarketState(
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            enable_order_book=True,
+            neg_risk=False,
+            end_date=datetime(2026, 12, 31, 17, tzinfo=UTC),
+        ),
+        outcomes=MarketOutcomes(
+            yes=MarketOutcome(label="Yes", token_id=f"yes-{token_suffix}"),
+            no=MarketOutcome(label="No", token_id=f"no-{token_suffix}"),
+        ),
+        trading=MarketTrading(
+            minimum_order_size=Decimal("5"),
+            minimum_tick_size=Decimal("0.001"),
+            fees_enabled=True,
+            fee_schedule=FeeSchedule(
+                exponent=1,
+                rate=Decimal("0.07"),
+                taker_only=True,
+                rebate_rate=Decimal("0.2"),
+            ),
+        ),
+        resolution=MarketResolution(source="Binance"),
+    )
+
+
+def test_official_sdk_event_matches_json_dump() -> None:
+    sdk_event = Event.model_construct(
+        id="event-sdk",
+        slug="btc-thresholds",
+        title="Bitcoin thresholds",
+        state=EventState(active=True, closed=False, ended=False),
+        markets=(
+            sdk_market("lower", "Will Bitcoin be above $90,000 on December 31?", "lower"),
+            sdk_market("higher", "Will Bitcoin be above $100,000 on December 31?", "higher"),
+        ),
+    )
+    sdk_relations = discover_threshold_relations([sdk_event])
+    json_relations = discover_threshold_relations(
+        [sdk_event.model_dump(by_alias=True, mode="json")]
+    )
+    assert sdk_relations == json_relations
+    assert len(sdk_relations) == 1
+    assert sdk_relations[0].market_a.end_date == "2026-12-31T17:00:00Z"
+    assert sdk_relations[0].event_slug == "btc-thresholds"
+
+
+def test_catalog_result_reports_each_first_funnel_stage_once() -> None:
+    result = discover_threshold_relation_catalog(
+        [
+            event(
+                market("ordinary", question="Will Bitcoin rise?"),
+                market(
+                    "lower",
+                    question="Will Bitcoin be above $90,000 on December 31?",
+                ),
+                market(
+                    "higher",
+                    question="Will Bitcoin be above $100,000 on December 31?",
+                ),
+            ),
+            event(
+                market("closed-market", question="Will Bitcoin rise?"),
+                active=False,
+            ),
+        ]
+    )
+    assert isinstance(result, ThresholdRelationDiscoveryResult)
+    assert result.events_seen == 2
+    assert result.events_eligible == 1
+    assert result.markets_seen == 4
+    assert result.markets_normalized == 3
+    assert result.threshold_markets == 2
+    assert len(result.relations) == 1
+    assert result.unique_tokens == 2
+    assert result.rejection_counts["event_ineligible"] == 1
+    assert result.rejection_counts["not_threshold"] == 1
+
+
+def test_relation_payload_round_trips_without_type_loss() -> None:
+    relation = discover_threshold_relations([
+        event(
+            market("lower", question="Will Bitcoin be above $90,000 on December 31?"),
+            market("higher", question="Will Bitcoin be above $100,000 on December 31?"),
+        )
+    ])[0]
+    assert threshold_relation_from_payload(
+        threshold_relation_payload(relation)
+    ) == relation
 
 
 def test_exact_above_template_builds_the_logical_relation_and_buy_legs() -> None:
@@ -304,6 +421,160 @@ def threshold_relation():
     )[0]
 
 
+def activity_relation() -> ThresholdRelation:
+    relation = threshold_relation()
+    return replace(
+        relation,
+        market_a=replace(
+            relation.market_a,
+            fees_enabled=False,
+            fee_rate=None,
+        ),
+        market_b=replace(
+            relation.market_b,
+            fees_enabled=False,
+            fee_rate=None,
+        ),
+    )
+
+
+def activity_books(
+    relation: ThresholdRelation,
+    *,
+    price_a: str = "0.50",
+    price_b: str = "0.50",
+    size_a: str = "20",
+    size_b: str = "20",
+) -> dict[str, ThresholdOrderBook]:
+    def book(token_id: str, price: str, size: str) -> ThresholdOrderBook:
+        return ThresholdOrderBook(
+            token_id=token_id,
+            asks=(BookLevel(price=Decimal(price), size=Decimal(size)),),
+            bids=(),
+            confirmed_at=datetime(2026, 7, 31, tzinfo=UTC),
+        )
+
+    return {
+        relation.buy_leg_a.token_id: book(
+            relation.buy_leg_a.token_id, price_a, size_a
+        ),
+        relation.buy_leg_b.token_id: book(
+            relation.buy_leg_b.token_id, price_b, size_b
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_reason"),
+    [
+        ({"missing": "both"}, "book_unavailable"),
+        ({"missing": "b"}, "book_unavailable"),
+        ({"size_a": "0.5"}, "minimum_depth"),
+        ({"price_a": "0.55", "price_b": "0.51"}, "outside_5pct"),
+        ({"price_a": "0.55", "price_b": "0.50"}, "eligible"),
+    ],
+)
+def test_activity_assessment_has_exact_reason(
+    changes: dict[str, str],
+    expected_reason: str,
+) -> None:
+    relation = activity_relation()
+    missing = changes.get("missing", "")
+    prices_and_sizes = {
+        key: value for key, value in changes.items() if key != "missing"
+    }
+    books = activity_books(relation, **prices_and_sizes)
+    if missing == "both":
+        books.clear()
+    elif missing == "b":
+        books.pop(relation.buy_leg_b.token_id)
+    assert assess_threshold_relation_activity(relation, books).reason == expected_reason
+
+
+def test_activity_assessment_does_not_consume_volume() -> None:
+    relation = replace(
+        activity_relation(),
+        event_volume_24h=Decimal("0"),
+        event_liquidity=Decimal("0"),
+    )
+    assessment = assess_threshold_relation_activity(
+        relation,
+        activity_books(relation, price_a="0.50", price_b="0.51"),
+    )
+    assert assessment.reason == "eligible"
+
+
+def test_activity_assessment_reports_unknown_fee_before_market_cost() -> None:
+    relation = activity_relation()
+    relation = replace(
+        relation,
+        market_a=replace(relation.market_a, fees_enabled=True, fee_rate=None),
+    )
+
+    assessment = assess_threshold_relation_activity(
+        relation,
+        activity_books(relation),
+    )
+
+    assert isinstance(assessment, RelationActivityAssessment)
+    assert assessment.reason == "fee_unknown"
+    assert assessment.intent is None
+
+
+def test_activity_assessment_reports_invalid_tick_before_depth() -> None:
+    relation = activity_relation()
+    relation = replace(
+        relation,
+        market_a=replace(relation.market_a, tick_size=Decimal("0.03")),
+    )
+    books = activity_books(relation, price_a="0.50")
+
+    assessment = assess_threshold_relation_activity(relation, books)
+
+    assert assessment.reason == "tick_invalid"
+    assert assessment.intent is None
+
+
+def test_activity_assessment_uses_the_smaller_common_executable_depth() -> None:
+    relation = activity_relation()
+    assessment = assess_threshold_relation_activity(
+        relation,
+        activity_books(relation, size_a="10", size_b="20"),
+    )
+
+    assert assessment.reason == "eligible"
+    assert assessment.intent is not None
+    assert assessment.intent.quantity == Decimal("10")
+
+
+def test_activity_assessment_reports_cost_limit_when_minimum_is_too_expensive() -> None:
+    relation = activity_relation()
+    relation = replace(
+        relation,
+        market_a=replace(relation.market_a, minimum_order_size=Decimal("20")),
+        market_b=replace(relation.market_b, minimum_order_size=Decimal("20")),
+    )
+
+    assessment = assess_threshold_relation_activity(
+        relation,
+        activity_books(relation, price_a="0.60", price_b="0.60"),
+    )
+
+    assert assessment.reason == "cost_limit"
+    assert assessment.intent is None
+
+
+def test_activity_assessment_accepts_exact_twenty_dollar_boundary() -> None:
+    assessment = assess_threshold_relation_activity(
+        activity_relation(),
+        activity_books(activity_relation(), price_a="0.50", price_b="0.50"),
+    )
+
+    assert assessment.reason == "eligible"
+    assert assessment.intent is not None
+    assert assessment.intent.total_max_cost == Decimal("20.00")
+
+
 def codex_market_result(
     *,
     condition_id: str,
@@ -423,7 +694,6 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
             "rules": RULES,
             "resolution_source": "Binance",
             "end_date": "2026-12-31T17:00:00Z",
-            "updated_at": "",
         },
         "market_b": {
             "condition_id": "condition-higher",
@@ -431,7 +701,6 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
             "rules": RULES,
             "resolution_source": "Binance",
             "end_date": "2026-12-31T17:00:00Z",
-            "updated_at": "",
         },
     }
     canonical = json.dumps(
@@ -447,6 +716,10 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         relation,
         market_a=replace(relation.market_a, fee_rate=Decimal("0.99")),
     )
+    updated_at_change = replace(
+        relation,
+        market_a=replace(relation.market_a, updated_at="2026-07-31T12:00:00Z"),
+    )
     rules_change = replace(
         relation,
         market_a=replace(relation.market_a, rules=relation.market_a.rules + " Extra."),
@@ -459,6 +732,14 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
     assert (
         codex_relation_cache_key(
             price_only_change,
+            model="gpt-test",
+            prompt_version=CODEX_PROMPT_VERSION,
+        )
+        == expected
+    )
+    assert (
+        codex_relation_cache_key(
+            updated_at_change,
             model="gpt-test",
             prompt_version=CODEX_PROMPT_VERSION,
         )
@@ -496,6 +777,44 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         )
         != expected
     )
+
+
+def test_cache_key_ignores_generic_updated_at_but_not_rules() -> None:
+    relation = threshold_relation()
+    touched = replace(
+        relation,
+        market_a=replace(relation.market_a, updated_at="2026-07-31T12:00:00Z"),
+    )
+    changed_rules = replace(
+        relation,
+        market_a=replace(relation.market_a, rules=relation.market_a.rules + " Changed."),
+    )
+    assert codex_relation_cache_key(relation, model="gpt-test") == (
+        codex_relation_cache_key(touched, model="gpt-test")
+    )
+    assert codex_relation_cache_key(relation, model="gpt-test") != (
+        codex_relation_cache_key(changed_rules, model="gpt-test")
+    )
+
+
+def test_cached_validation_never_invokes_runner(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    validator = CodexRelationValidator(
+        codex_store(tmp_path),
+        model="gpt-test",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=codex_jsonl(codex_result()),
+            stderr="",
+        ),
+    )
+    assert validator.validate(relation).status == "approved"
+    validator.runner = lambda *args, **kwargs: pytest.fail("runner called")
+    cached = validator.cached_validation(relation)
+    assert cached is not None
+    assert cached.status == "approved"
+    assert cached.cached is True
 
 
 def test_codex_approve_uses_isolated_structured_command_and_records_usage(

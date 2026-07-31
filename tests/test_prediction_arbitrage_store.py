@@ -70,6 +70,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -84,6 +85,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "incidents",
         "llm_cache",
         "llm_usage",
+        "relation_state",
+        "relation_scan_runs",
     }
 
 
@@ -110,6 +113,140 @@ def test_one_open_signal_per_market_and_close_creates_new_episode(tmp_path: Path
     assert len(db.signal_history("all")) == 2
     assert db.signal_history("all")[0]["signal_id"] == second_id
     assert db.signal_history("all")[1]["ended_at"] is not None
+
+
+def test_relation_state_and_scan_tables_survive_restart(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    db.save_relation_state(
+        {"relations": [{"relation_id": "r-1", "token_id": "public-token"}]},
+        full_scanned_at="2026-07-31T00:00:00Z",
+    )
+    db.record_relation_scan(
+        scope="full",
+        status="completed",
+        started_at="2026-07-31T00:00:00Z",
+        completed_at="2026-07-31T00:00:02Z",
+        payload={"relations_discovered": 1},
+    )
+    restarted = PredictionArbitrageStore(tmp_path / "data")
+    assert restarted.load_relation_state()["relations"][0]["relation_id"] == "r-1"
+    assert restarted.load_relation_state()["relations"][0]["token_id"] == "public-token"
+    assert restarted.relation_scan_history(limit=1)[0]["scope"] == "full"
+
+
+def test_activity_retention_does_not_delete_full_or_event_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 31, 12, tzinfo=UTC)
+    monkeypatch.setattr(
+        "open_trader.prediction_arbitrage_store._utc_now", lambda: iso(now)
+    )
+    db = store(tmp_path)
+    for scope in ("full", "event", "activity"):
+        db.record_relation_scan(
+            scope=scope,
+            status="completed",
+            event_id="e-1" if scope == "event" else None,
+            started_at=iso(now - timedelta(days=8)),
+            completed_at=iso(now - timedelta(days=8)),
+            payload={"scope": scope},
+        )
+    db.record_relation_scan(
+        scope="activity",
+        status="completed",
+        started_at=iso(now),
+        completed_at=iso(now),
+        payload={"scope": "new"},
+    )
+    assert [row["scope"] for row in db.relation_scan_history(limit=10)] == [
+        "activity", "event", "full"
+    ]
+
+
+def test_open_signal_keeps_first_observation_and_initial_profit(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    signal_id = db.upsert_signal({
+        **signal_payload("relation-1", "2026-07-31T00:00:00Z"),
+        "first_positive_at": "2026-07-31T00:00:00Z",
+        "initial_profit": Decimal("0.10"),
+        "peak_profit": Decimal("0.10"),
+    })
+    db.upsert_signal({
+        **signal_payload("relation-1", "2026-07-31T00:00:01Z"),
+        "first_positive_at": "2026-07-31T00:00:01Z",
+        "initial_profit": Decimal("0.05"),
+        "peak_profit": Decimal("0.20"),
+    })
+    row = db.signal(signal_id)
+    assert row["started_at"] == "2026-07-31T00:00:00.000000Z"
+    assert row["first_positive_at"] == "2026-07-31T00:00:00.000000Z"
+    assert row["initial_profit"] == "0.10"
+    assert row["peak_profit"] == "0.20"
+
+
+def test_close_signal_persists_final_episode_values(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    signal_id = db.upsert_signal(
+        signal_payload("relation-1", "2026-07-31T00:00:00Z")
+    )
+    db.close_signal(
+        "relation-1",
+        ended_at="2026-07-31T00:00:00.250Z",
+        reason="profit_non_positive",
+        updates={
+            "observed_duration_ms": 250,
+            "final_profit": Decimal("-0.01"),
+        },
+    )
+    assert db.signal(signal_id)["observed_duration_ms"] == 250
+
+
+def test_notification_reservation_is_atomic_across_store_instances(tmp_path: Path) -> None:
+    first = store(tmp_path)
+    signal_id = first.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    stores = [PredictionArbitrageStore(tmp_path / "data"), PredictionArbitrageStore(tmp_path / "data")]
+
+    def reserve(index: int) -> dict[str, object]:
+        return stores[index].reserve_notification_attempt(signal_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, (0, 1)))
+
+    assert [item["state"] for item in results].count("reserved") == 1
+    assert [item["state"] for item in results].count("in_flight") == 1
+    assert first.signal(signal_id)["notification_attempts"] == 1
+    assert first.signal(signal_id)["notification_state"] == "pending"
+
+
+def test_stale_notification_lease_is_reclaimed_after_restart(tmp_path: Path) -> None:
+    first = store(tmp_path)
+    signal_id = first.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    reserved = first.reserve_notification_attempt(signal_id, lease_seconds=0)
+    assert reserved["state"] == "reserved"
+
+    restarted = PredictionArbitrageStore(tmp_path / "data")
+    reclaimed = restarted.reserve_notification_attempt(signal_id, lease_seconds=30)
+
+    assert reclaimed["state"] == "reserved"
+    assert reclaimed["lease_id"] != reserved["lease_id"]
+    assert restarted.signal(signal_id)["notification_attempts"] == 2
+
+
+def test_notification_attempts_stop_at_three_and_close_blocks_reservation(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    signal_id = db.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    for _ in range(3):
+        reserved = db.reserve_notification_attempt(signal_id, lease_seconds=0)
+        assert reserved["state"] == "reserved"
+        assert db.complete_notification_attempt(
+            signal_id, str(reserved["lease_id"]), success=False
+        )["state"] == "failed"
+    assert db.reserve_notification_attempt(signal_id)["state"] == "exhausted"
+
+    db.close_signal("relation-1", ended_at=iso(datetime.now(UTC)), reason="stale")
+    assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
 
 
 def test_preview_expires_after_ten_seconds_and_is_single_use(tmp_path: Path) -> None:
@@ -437,7 +574,7 @@ def test_decimal_strings_are_stored_without_exponents(tmp_path: Path) -> None:
     assert "E" not in raw
 
 
-def test_public_pair_token_ids_persist_but_camel_case_order_payload_is_redacted(
+def test_generic_payload_redacts_public_pair_token_ids_and_camel_case_order_payload(
     tmp_path: Path,
 ) -> None:
     db = store(tmp_path)
@@ -451,6 +588,55 @@ def test_public_pair_token_ids_persist_but_camel_case_order_payload_is_redacted(
 
     restored = db.load_runtime()
     assert restored is not None
-    assert restored["yes_token_id"] == "yes-public-token-123"
-    assert restored["no_token_id"] == "no-public-token-456"
+    assert "yes_token_id" not in restored
+    assert "no_token_id" not in restored
     assert "orderPayload" not in restored
+
+
+def test_relation_state_alone_preserves_public_pair_token_ids(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    db.save_relation_state(
+        {
+            "relations": [
+                {
+                    "token_id": "single-public-token",
+                    "yes_token_id": "yes-public-token",
+                    "no_token_id": "no-public-token",
+                    "api_token": "credential-sentinel",
+                }
+            ]
+        },
+        full_scanned_at="2026-07-31T00:00:00Z",
+    )
+
+    restored = db.load_relation_state()
+    assert restored == {
+        "relations": [
+            {
+                "no_token_id": "no-public-token",
+                "token_id": "single-public-token",
+                "yes_token_id": "yes-public-token",
+            }
+        ]
+    }
+    db.record_relation_scan(
+        scope="activity",
+        status="completed",
+        started_at="2026-07-31T00:00:00Z",
+        completed_at="2026-07-31T00:00:01Z",
+        payload={"token_id": "scan-token", "safe": "kept"},
+    )
+    scan = db.relation_scan_history(limit=1)[0]
+    assert "token_id" not in scan
+    assert scan["safe"] == "kept"
+    signal_id = db.upsert_signal(
+        {
+            **signal_payload("relation-1", "2026-07-31T00:00:00Z"),
+            "token_id": "signal-token",
+            "yes_token_id": "signal-yes",
+            "no_token_id": "signal-no",
+        }
+    )
+    signal = db.signal(signal_id)
+    assert signal is not None
+    assert not {"token_id", "yes_token_id", "no_token_id"} & signal.keys()

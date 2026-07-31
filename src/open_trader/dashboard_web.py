@@ -29,7 +29,14 @@ from .dashboard import (
 from .dashboard_quotes import SHANGHAI_TZ, load_published_quotes
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
-from .polymarket_relation_discovery import CodexRelationValidator, discover_threshold_relations
+from .polymarket_relation_discovery import (
+    CodexRelationValidator,
+    discover_threshold_relation_catalog,
+)
+
+# Keep the old module attribute for downstream test fakes while production
+# wiring uses the catalog result contract above.
+discover_threshold_relations = discover_threshold_relation_catalog
 from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .daily_premarket import build_notifier
 from .notifications import NullNotifier
@@ -130,6 +137,37 @@ def _prediction_safe_value(value: object, *, key: str = "") -> object:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _prediction_relation_safe_value(value: object) -> object:
+    """Project relation discovery facts without raw rules, tokens, or errors."""
+
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for name, item in value.items():
+            lowered = str(name).casefold()
+            if (
+                lowered in {
+                    "prompt",
+                    "token_id",
+                    "yes_token_id",
+                    "no_token_id",
+                    "raw_error",
+                    "raw_rules",
+                    "wallet_address",
+                    "wallet",
+                }
+                or lowered.endswith("_token_id")
+                or lowered.startswith("raw_")
+            ):
+                continue
+            safe = _prediction_relation_safe_value(item)
+            if safe is not None:
+                result[str(name)] = safe
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_prediction_relation_safe_value(item) for item in value]
+    return _prediction_safe_value(value)
 
 
 def _prediction_mask_wallet(value: object) -> str:
@@ -336,6 +374,22 @@ def _prediction_history_aliases(kind: str, value: object) -> object:
             "occurred_at": occurred_at,
             "event_title": event_title,
             "duration": duration,
+            "observed_duration_ms": _prediction_first(
+                result, "observed_duration_ms"
+            ),
+            "first_positive_at": _prediction_first(result, "first_positive_at"),
+            "last_positive_at": _prediction_first(result, "last_positive_at"),
+            "initial_profit": _prediction_first(result, "initial_profit"),
+            "peak_profit": _prediction_first(result, "peak_profit"),
+            "final_profit": _prediction_first(result, "final_profit"),
+            "ended_reason": _prediction_first(result, "ended_reason"),
+            "notification_state": _prediction_first(
+                result, "notification_state", "notification_status"
+            ),
+            "book_timestamp_a": _prediction_first(result, "book_timestamp_a"),
+            "book_timestamp_b": _prediction_first(result, "book_timestamp_b"),
+            "book_received_at_a": _prediction_first(result, "book_received_at_a"),
+            "book_received_at_b": _prediction_first(result, "book_received_at_b"),
             "peak_edge": _prediction_first(result, "peak_edge", "peak_net_edge", "net_edge"),
             "quantity": _prediction_first(result, "quantity", "peak_quantity"),
             "profit": _prediction_first(
@@ -616,7 +670,7 @@ def _prediction_state_payload(
         "stale": stale,
         "events": event_rows,
         "opportunities": opportunity_rows,
-        "relation_discovery": _prediction_safe_value(
+        "relation_discovery": _prediction_relation_safe_value(
             safe_snapshot.get("relation_discovery", {})
         ),
         "event_count": event_count,
@@ -1368,7 +1422,7 @@ def serve_dashboard(
             prediction_monitor = PolymarketMonitor(
                 store=prediction_store,
                 trading=prediction_trading,
-                relation_discovery=discover_threshold_relations,
+                relation_discovery=discover_threshold_relation_catalog,
                 relation_validator=relation_validator,
             )
             prediction_execution = PredictionExecutionService(
@@ -1377,6 +1431,10 @@ def serve_dashboard(
                 trading=prediction_trading,
                 notifier=prediction_notifier or NullNotifier(),
                 lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
+                dashboard_url=f"http://127.0.0.1:{port}/",
+            )
+            prediction_monitor.set_ready_observer(
+                prediction_execution.notify_ready_opportunity
             )
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
