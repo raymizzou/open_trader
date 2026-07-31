@@ -15,6 +15,7 @@ from open_trader.account_sync_state import (
     BrokerAccountCandidate,
     accept_candidate,
     accepted_portfolio_rows,
+    dashboard_projection_from_state,
     effective_source_status,
     load_account_sync_state,
     load_latest_statement_candidate,
@@ -156,6 +157,51 @@ def test_load_rejects_unknown_versions_and_invalid_broker_payloads(tmp_path) -> 
     )
     assert load_account_sync_state(path) == load_account_sync_state(tmp_path / "missing.json")
 
+
+def test_legacy_state_keeps_accepted_sources_and_exposes_no_projection(
+    tmp_path: Path,
+) -> None:
+    legacy = accept_candidate(
+        load_account_sync_state(tmp_path / "missing.json"),
+        _candidate(),
+        attempted_at="2026-07-31T08:00:00+08:00",
+    )
+    legacy.pop("dashboard_projection", None)
+    path = tmp_path / "state.json"
+    write_json_atomic(path, legacy)
+
+    loaded = load_account_sync_state(path)
+
+    assert loaded["brokers"]["futu"] == legacy["brokers"]["futu"]
+    assert loaded["dashboard_projection"] == {}
+    assert dashboard_projection_from_state(loaded) is None
+
+
+def test_invalid_projection_is_dropped_without_discarding_accepted_sources(
+    tmp_path: Path,
+) -> None:
+    accepted = accept_candidate(
+        load_account_sync_state(tmp_path / "missing.json"),
+        _candidate(),
+        attempted_at="2026-07-31T08:00:00+08:00",
+    )
+    accepted["dashboard_projection"] = {
+        "generated_at": "2026-07-31T08:00:00+08:00",
+        "quote_as_of": "",
+        "summary": {},
+        "broker_summaries": [],
+        "broker_positions": [{"broker": "futu"}],
+        "cash_details": [],
+    }
+    path = tmp_path / "state.json"
+    write_json_atomic(path, accepted)
+
+    loaded = load_account_sync_state(path)
+
+    assert loaded["brokers"]["futu"]["positions"]
+    assert loaded["dashboard_projection"] == {}
+    assert dashboard_projection_from_state(loaded) is None
+
     accepted = accept_candidate(
         load_account_sync_state(tmp_path / "missing.json"),
         _candidate(),
@@ -289,6 +335,7 @@ def test_health_is_ok_only_with_current_controller_sources_quotes_and_generation
     state = {
         "version": 1,
         "generation": "2026-07-30T11:59:59+08:00",
+        "dashboard_projection": _valid_dashboard_projection(),
         "brokers": {
             broker: _source(
                 source_kind="live" if broker in LIVE_BROKERS else "statement",
@@ -330,6 +377,31 @@ def test_health_is_ok_only_with_current_controller_sources_quotes_and_generation
     abnormal = project_account_sync_health(state_without_generation, controller, quotes, now=now)
     assert abnormal["status"] == "abnormal"
     assert abnormal["reason"] == "portfolio_missing"
+
+
+def test_health_marks_generated_state_without_projection_abnormal() -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+    state = {
+        "version": 1,
+        "generation": "2026-07-30T11:59:59+08:00",
+        "brokers": {
+            broker: _source(
+                source_kind="live" if broker in LIVE_BROKERS else "statement",
+                last_success_at=(now - timedelta(seconds=1)).isoformat(),
+            )
+            for broker in REQUIRED_BROKERS
+        },
+    }
+
+    health = project_account_sync_health(
+        state,
+        _controller_status(now),
+        {"status": "ok", "last_success_at": now.isoformat(), "stale": False},
+        now=now,
+    )
+
+    assert health["status"] == "abnormal"
+    assert health["reason"] == "dashboard_projection_missing"
 
 
 def test_health_rejects_invalid_controller_status_and_keeps_unknown_display() -> None:
@@ -574,6 +646,37 @@ def _source(
         "cash": [],
         "fx_rates": [],
         "summary": {},
+    }
+
+
+def _valid_dashboard_projection() -> dict[str, object]:
+    return {
+        "generated_at": "2026-07-30T11:59:59+08:00",
+        "quote_as_of": "",
+        "summary": {
+            "holding_value_hkd": "0.00",
+            "cash_like_value_hkd": "0.00",
+            "portfolio_value_hkd": "0.00",
+            "holding_weight_hkd": "0.00%",
+            "cash_like_weight_hkd": "0.00%",
+            "holding_count": 0,
+            "broker_count": 4,
+        },
+        "broker_summaries": [
+            {
+                "broker": broker,
+                "label": broker,
+                "source_kind": "live" if broker in LIVE_BROKERS else "statement",
+                "detail_available": True,
+                "holding_value_hkd": "0.00",
+                "cash_like_value_hkd": "0.00",
+                "portfolio_value_hkd": "0.00",
+                "holding_count": 0,
+            }
+            for broker in REQUIRED_BROKERS
+        ],
+        "broker_positions": [],
+        "cash_details": [],
     }
 
 

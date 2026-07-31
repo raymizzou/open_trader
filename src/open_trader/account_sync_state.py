@@ -31,6 +31,30 @@ LIVE_BROKERS = ("futu", "tiger")
 ACCOUNT_STALE_SECONDS = 180
 QUOTE_STALE_SECONDS = 15
 CONTROLLER_STALE_SECONDS = 15
+DASHBOARD_SUMMARY_FIELDS = (
+    "holding_value_hkd",
+    "cash_like_value_hkd",
+    "portfolio_value_hkd",
+    "holding_weight_hkd",
+    "cash_like_weight_hkd",
+)
+DASHBOARD_POSITION_FIELDS = (
+    "broker", "account_alias", "market", "asset_class", "symbol", "name",
+    "currency", "quantity", "cost_price", "cost_value", "last_price",
+    "price_kind", "price_as_of", "market_value", "market_value_usd",
+    "market_value_hkd", "cost_value_hkd", "unrealized_pnl",
+    "unrealized_pnl_pct", "account_weight_hkd", "portfolio_weight_hkd",
+    "statement_id", "confidence", "notes",
+)
+DASHBOARD_CASH_FIELDS = (
+    "broker", "account_alias", "currency", "cash_balance",
+    "available_balance", "cash_balance_hkd", "available_balance_hkd",
+    "statement_id", "confidence", "notes",
+)
+PRICE_KINDS = {
+    "live", "overnight", "pre_market", "after_hours", "statement",
+    "account_snapshot",
+}
 
 
 @dataclass(frozen=True)
@@ -70,6 +94,7 @@ def empty_account_sync_state() -> dict[str, object]:
         "version": ACCOUNT_STATE_VERSION,
         "generation": "",
         "brokers": {broker: _empty_source(broker) for broker in REQUIRED_BROKERS},
+        "dashboard_projection": {},
     }
 
 
@@ -78,7 +103,18 @@ def load_account_sync_state(path: Path) -> dict[str, object]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return empty_account_sync_state()
-    return payload if _is_valid_state(payload) else empty_account_sync_state()
+    if not _is_valid_state(payload):
+        return empty_account_sync_state()
+    normalized = deepcopy(payload)
+    normalized["dashboard_projection"] = dashboard_projection_from_state(payload) or {}
+    return normalized
+
+
+def dashboard_projection_from_state(
+    state: Mapping[str, object],
+) -> dict[str, object] | None:
+    projection = state.get("dashboard_projection")
+    return deepcopy(projection) if _is_valid_dashboard_projection(projection) else None
 
 
 def load_latest_statement_candidate(
@@ -299,6 +335,8 @@ def project_account_sync_health(
             reason = f"quotes_{quote_status}"
         if not reason and not valid_state["generation"]:
             reason = "portfolio_missing"
+        if not reason and dashboard_projection_from_state(valid_state) is None:
+            reason = "dashboard_projection_missing"
     return {
         "status": "ok" if not reason else "abnormal",
         "label": "同步正常" if not reason else "同步异常",
@@ -582,6 +620,109 @@ def _apply_accepted_fx_rates(
             row["cost_value_hkd"] = money(Decimal(row["cost_value"]) * rate)
     if rows and all(row["market_value_hkd"] for row in rows):
         recalculate_portfolio_weights(rows)
+
+
+def _is_valid_dashboard_projection(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if _parse_aware_datetime(value.get("generated_at")) is None:
+        return False
+    quote_as_of = value.get("quote_as_of")
+    if not isinstance(quote_as_of, str):
+        return False
+    if quote_as_of and _parse_aware_datetime(quote_as_of) is None:
+        return False
+    summary = value.get("summary")
+    if not _is_valid_dashboard_summary(summary):
+        return False
+    summaries = value.get("broker_summaries")
+    if not isinstance(summaries, list) or len(summaries) != len(REQUIRED_BROKERS):
+        return False
+    if any(
+        not _is_valid_dashboard_broker_summary(item, broker)
+        for item, broker in zip(summaries, REQUIRED_BROKERS)
+    ):
+        return False
+    positions = value.get("broker_positions")
+    cash_details = value.get("cash_details")
+    return (
+        isinstance(positions, list)
+        and all(_is_valid_dashboard_position(row) for row in positions)
+        and isinstance(cash_details, list)
+        and all(_is_valid_dashboard_cash(row) for row in cash_details)
+    )
+
+
+def _is_valid_dashboard_summary(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if any(not _is_finite_decimal_text(value.get(field)) for field in DASHBOARD_SUMMARY_FIELDS[:3]):
+        return False
+    if any(not _is_percent_text(value.get(field)) for field in DASHBOARD_SUMMARY_FIELDS[3:]):
+        return False
+    return all(
+        isinstance(value.get(field), int) and not isinstance(value.get(field), bool)
+        for field in ("holding_count", "broker_count")
+    )
+
+
+def _is_valid_dashboard_broker_summary(value: object, broker: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("broker") != broker or not isinstance(value.get("label"), str):
+        return False
+    if value.get("source_kind") != _source_kind_for_broker(broker):
+        return False
+    if not isinstance(value.get("detail_available"), bool):
+        return False
+    if any(
+        not _is_finite_decimal_text(value.get(field))
+        for field in ("holding_value_hkd", "cash_like_value_hkd", "portfolio_value_hkd")
+    ):
+        return False
+    return isinstance(value.get("holding_count"), int) and not isinstance(value.get("holding_count"), bool)
+
+
+def _is_valid_dashboard_position(value: object) -> bool:
+    if not isinstance(value, dict) or any(
+        not isinstance(value.get(field), str) for field in DASHBOARD_POSITION_FIELDS
+    ):
+        return False
+    return (
+        value["broker"] in REQUIRED_BROKERS
+        and value["price_kind"] in PRICE_KINDS
+        and _is_finite_decimal_text(value["market_value_hkd"])
+        and _is_percent_text(value["account_weight_hkd"])
+        and _is_percent_text(value["portfolio_weight_hkd"])
+    )
+
+
+def _is_valid_dashboard_cash(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(value.get(field), str) for field in DASHBOARD_CASH_FIELDS
+    ) and value["broker"] in REQUIRED_BROKERS and _is_finite_decimal_text(
+        value["cash_balance_hkd"]
+    ) and (
+        not value["available_balance_hkd"]
+        or _is_finite_decimal_text(value["available_balance_hkd"])
+    )
+
+
+def _is_finite_decimal_text(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return Decimal(value).is_finite()
+    except InvalidOperation:
+        return False
+
+
+def _is_percent_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.endswith("%")
+        and _is_finite_decimal_text(value[:-1])
+    )
 
 
 def _is_valid_state(value: object) -> bool:
