@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- Final verification for the broker source panel passed the full Dashboard
+  gate (`3902 passed`, live status `PASS`) after the accepted SHA was deployed;
+  desktop and mobile source-panel screenshots were captured for operator review.
 - Stabilized Dashboard browser acceptance by checking broker source timestamps
   against each viewport's live page payload, avoiding false failures when the
   account-sync controller publishes a newer accepted time during the gate.
