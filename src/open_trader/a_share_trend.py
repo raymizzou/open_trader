@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -54,6 +55,8 @@ from .trend_industry_context import (
     _context_from_mapping,
 )
 from .trend_animals import (
+    SEARCH_ASSETS_BY_MARKET,
+    TREND_SYMBOL_MAPPING_SCHEMA,
     TrendAnimalsClient,
     TrendAnimalsError,
     TrendAnimalsLookupError,
@@ -1016,6 +1019,7 @@ class AccountPosition:
     quantity: Decimal
     avg_cost_price: Decimal | None
     market_value: Decimal = Decimal("0")
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1115,6 +1119,7 @@ class CandidateInput:
     kline_supplement: dict[str, bool] | None = None
     boiling: object = None
     champagne: object = None
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1150,6 +1155,7 @@ class BuyAction:
     planned_stop_risk_pct: Decimal
     normal_cost: Decimal
     decisive_constraint: str
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1207,6 +1213,7 @@ class HoldingDecision:
     lot_size: int | None = None
     overheat_signals: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1465,6 +1472,7 @@ def load_real_holding_input(
                 quantity=quantity,
                 avg_cost_price=avg_cost_price,
                 market_value=market_value,
+                futu_symbol=futu_symbol,
             )
         )
     return RealHoldingInput(
@@ -1631,6 +1639,14 @@ def enrich_real_holding_input(
             ) != to_futu_symbol(market, position.symbol):
                 real_snapshots[position.symbol] = None
                 continue
+            _remember_verified_symbol_row(
+                api,
+                market=market,
+                expected_futu_symbol=position.symbol,
+                expected_tm_id=tm_id,
+                row=row,
+                require_unmapped=True,
+            )
             real_snapshots[position.symbol] = _holding_snapshot(
                 row,
                 market=market,
@@ -1648,6 +1664,62 @@ def enrich_real_holding_input(
         real_rows,
         real_bars,
         len(real_only_ids),
+    )
+
+
+def _remember_verified_symbol_row(
+    api: object,
+    *,
+    market: str,
+    expected_futu_symbol: str,
+    expected_tm_id: int,
+    row: Mapping[str, object],
+    require_unmapped: bool = False,
+) -> bool:
+    recorder = getattr(api, "remember_symbol_row", None)
+    if not callable(recorder):
+        return False
+    normalized_market = market.strip().upper()
+    if normalized_market not in SEARCH_ASSETS_BY_MARKET:
+        return False
+    tm_id = row.get("tmId")
+    ticker_symbol = row.get("tickerSymbol")
+    asset = row.get("asset")
+    if (
+        not isinstance(tm_id, int)
+        or isinstance(tm_id, bool)
+        or tm_id != expected_tm_id
+        or not isinstance(ticker_symbol, str)
+        or not isinstance(asset, str)
+        or asset.strip() not in SEARCH_ASSETS_BY_MARKET[normalized_market]
+    ):
+        return False
+    try:
+        futu_symbol = to_futu_symbol(normalized_market, expected_futu_symbol)
+        trend_futu_symbol = from_trend_animals_symbol(
+            normalized_market, ticker_symbol
+        )
+    except ValueError:
+        return False
+    if futu_symbol != trend_futu_symbol:
+        return False
+    if require_unmapped:
+        lookup = getattr(api, "symbol_mapping", None)
+        if not callable(lookup) or lookup(
+            futu_symbol, market=normalized_market
+        ) is not None:
+            return False
+    recorder(
+        market=normalized_market,
+        expected_futu_symbol=futu_symbol,
+        row=row,
+    )
+    return True
+
+
+def _supports_symbol_mapping_contract(api: object) -> bool:
+    return callable(getattr(api, "remember_symbol_row", None)) and callable(
+        getattr(api, "symbol_mapping", None)
     )
 
 
@@ -1801,6 +1873,7 @@ def load_futu_simulate_trend_account(
                     row.get("cost_price", row.get("avg_cost_price"))
                 ),
                 market_value=market_value,
+                futu_symbol=code,
             )
         )
     return AccountSnapshot(
@@ -1928,6 +2001,7 @@ def evaluate_candidate(
     pools: Sequence[str] = (),
     market: str = "CN",
     industry_temperature: str | None = None,
+    futu_symbol: str | None = None,
 ) -> CandidateInput:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     daily_bars = tuple(bars or ())
@@ -1981,6 +2055,7 @@ def evaluate_candidate(
             if isinstance(row.get("stopwinFlagByPopChampagne"), bool)
             else None
         ),
+        futu_symbol=futu_symbol,
         **paid_expansion,
     )
 
@@ -2325,13 +2400,14 @@ def collect_industry_contexts(
     candidates: Sequence[CandidateInput],
     candidate_rows: Sequence[Mapping[str, object]],
     held_symbols: set[str],
+    holding_snapshots: Sequence[HoldingSnapshot | None] = (),
     expected_date: str,
     market: str,
     history_root: Path,
     strategy_version: str | None = None,
     cny_per_local_currency: Decimal | None = None,
 ) -> tuple[tuple[IndustryContext, ...], dict[str, object], dict[str, object]]:
-    """Collect breadth/state only for industries that pass existing hard gates."""
+    """Collect candidate context first, then append isolated holding context."""
     candidate_decision = build_candidate_list(
         candidates,
         held_symbols=held_symbols,
@@ -2363,6 +2439,27 @@ def collect_industry_contexts(
             and isinstance(industry_name, str)
         ):
             industry_names[industry_id] = industry_name.strip()
+    holding_industry_ids = sorted(
+        {
+            snapshot.industry_tm_id
+            for snapshot in holding_snapshots
+            if snapshot is not None and snapshot.industry_tm_id is not None
+        }
+    )
+    for snapshot in holding_snapshots:
+        if (
+            snapshot is not None
+            and snapshot.industry_tm_id is not None
+            and snapshot.industry
+            and snapshot.industry_tm_id not in industry_names
+        ):
+            industry_names[snapshot.industry_tm_id] = snapshot.industry
+    holding_only_ids = [
+        industry_id
+        for industry_id in holding_industry_ids
+        if industry_id not in eligible_industry_ids
+    ]
+    context_industry_ids = [*eligible_industry_ids, *holding_only_ids]
     component_ids_by_industry: dict[int, set[int]] = {}
     component_rows_by_industry: dict[int, list[Mapping[str, object]]] = {}
     component_rows_count = 0
@@ -2421,7 +2518,7 @@ def collect_industry_contexts(
             and row.get("trendTemperatureCurr") in HOT_TEMPERATURES
         ):
             warm_to_hot_ids[industry_id].add(tm_id)
-    contexts = tuple(
+    candidate_contexts = tuple(
         calculate_industry_context(
             industry_tm_id=industry_id,
             industry=industry_names.get(industry_id, ""),
@@ -2438,8 +2535,10 @@ def collect_industry_contexts(
         market=market,
         before_date=expected_date,
     )
-    contexts = attach_prior_context(contexts, prior)
-    context_map = {context.industry_tm_id: context for context in contexts}
+    candidate_contexts = attach_prior_context(candidate_contexts, prior)
+    context_map = {
+        context.industry_tm_id: context for context in candidate_contexts
+    }
     ordering = build_candidate_list(
         candidates,
         held_symbols=held_symbols,
@@ -2449,18 +2548,109 @@ def collect_industry_contexts(
         strategy_version=strategy_version,
         cny_per_local_currency=cny_per_local_currency,
     )
+
+    holding_errors: dict[str, str] = {}
+    for industry_id in holding_only_ids:
+        try:
+            rows = api.get_components(  # type: ignore[attr-defined]
+                tm_id=industry_id,
+                expected_date=expected_date,
+            )
+        except TrendAnimalsError as exc:
+            rows = []
+            holding_errors[str(industry_id)] = str(exc)
+        component_rows_count += len(rows)
+        component_rows_by_industry[industry_id] = list(rows)
+        component_ids_by_industry[industry_id] = {
+            _row_tm_id(row) for row in rows
+        }
+
+    holding_member_ids = sorted(
+        {
+            member_id
+            for industry_id in holding_only_ids
+            for member_id in component_ids_by_industry[industry_id]
+        }
+        - set(member_ids)
+    )
+    holding_member_rows: list[Mapping[str, object]] = []
+    if holding_member_ids:
+        try:
+            holding_member_rows = list(
+                api.get_snapshots(  # type: ignore[attr-defined]
+                    tm_ids=holding_member_ids,
+                    fields=INDUSTRY_MEMBER_FIELDS,
+                    expected_date=expected_date,
+                )
+            )
+        except TrendAnimalsError as exc:
+            holding_errors["members"] = str(exc)
+
+    holding_state_rows: list[Mapping[str, object]] = []
+    if holding_only_ids:
+        try:
+            holding_state_rows = list(
+                api.get_snapshots(  # type: ignore[attr-defined]
+                    tm_ids=holding_only_ids,
+                    fields=INDUSTRY_STATE_FIELDS,
+                    expected_date=expected_date,
+                )
+            )
+        except TrendAnimalsError as exc:
+            holding_errors["states"] = str(exc)
+    holding_state_by_id: dict[int, Mapping[str, object]] = {}
+    for row in holding_state_rows:
+        tm_id = _row_tm_id(row)
+        if tm_id in holding_state_by_id:
+            holding_errors[str(tm_id)] = "duplicate holding industry state"
+            continue
+        holding_state_by_id[tm_id] = row
+
+    all_member_rows = [*member_rows, *holding_member_rows]
+    holding_contexts = tuple(
+        calculate_industry_context(
+            industry_tm_id=industry_id,
+            industry=industry_names.get(industry_id, ""),
+            expected_date=expected_date,
+            component_tm_ids=sorted(component_ids_by_industry[industry_id]),
+            member_rows=all_member_rows,
+            industry_row=holding_state_by_id.get(industry_id),
+            warm_to_hot_count=len(warm_to_hot_ids[industry_id]),
+        )
+        for industry_id in holding_only_ids
+    )
+    holding_contexts = attach_prior_context(holding_contexts, prior)
+    contexts = tuple(
+        sorted(
+            (*candidate_contexts, *holding_contexts),
+            key=lambda item: (
+                item.strength is None or not item.strength.is_finite(),
+                (
+                    -item.strength
+                    if item.strength is not None and item.strength.is_finite()
+                    else Decimal("0")
+                ),
+                item.industry_tm_id,
+            ),
+        )
+    )
+    all_member_ids = sorted({*member_ids, *holding_member_ids})
+    all_state_rows = [*state_rows, *holding_state_rows]
     facts = {
         "eligible_industry_ids": tuple(eligible_industry_ids),
-        "component_requests": len(eligible_industry_ids),
+        "holding_industry_ids": tuple(holding_industry_ids),
+        "context_industry_ids": tuple(context_industry_ids),
+        "holding_errors": holding_errors,
+        "component_requests": len(context_industry_ids),
         "component_rows": component_rows_count,
         "component_rows_by_industry": component_rows_by_industry,
-        "member_ids": tuple(member_ids),
-        "member_rows": len(member_rows),
-        "member_response": list(member_rows),
+        "member_ids": tuple(all_member_ids),
+        "member_rows": len(all_member_rows),
+        "member_response": all_member_rows,
         "member_fields": INDUSTRY_MEMBER_FIELDS,
-        "state_ids": tuple(eligible_industry_ids),
-        "state_rows": len(state_rows),
-        "state_response": list(state_rows),
+        "state_ids": tuple(context_industry_ids),
+        "state_rows": len(all_state_rows),
+        "state_response": all_state_rows,
         "state_fields": INDUSTRY_STATE_FIELDS,
     }
     return contexts, dict(ordering.industry_context_status), facts
@@ -2563,6 +2753,7 @@ def _estimate_buy_actions_v1(
                 planned_stop_risk_pct=Decimal("0"),
                 normal_cost=Decimal("0"),
                 decisive_constraint="",
+                futu_symbol=item.futu_symbol,
             )
         )
         remaining_cash -= amount
@@ -2903,6 +3094,7 @@ def _plan_buy_actions(
                     and sized.decisive_constraint == "名义仓位上限"
                     else sized.decisive_constraint
                 ),
+                futu_symbol=item.futu_symbol,
             )
         )
         remaining_cash -= sized.cash_required
@@ -3320,6 +3512,7 @@ def _evaluate_holding_positions(
                 lot_size=lot_size,
                 overheat_signals=overheat_signals,
                 warnings=warnings,
+                futu_symbol=position.futu_symbol,
             )
         )
         new_state: dict[str, object] = {
@@ -3382,6 +3575,10 @@ def build_report(
     estimated_api_cost_complete: bool = True,
     real_holdings: RealHoldingInput | None = None,
 ) -> TrendReport:
+    symbol_mapping_required = (
+        (metadata or {}).get("symbol_mapping_schema")
+        == TREND_SYMBOL_MAPPING_SCHEMA
+    )
     resolved_process_version = process_version or str(
         (metadata or {}).get("process_version")
         or (strategy_snapshot or {}).get("process_version")
@@ -3643,6 +3840,52 @@ def build_report(
                     normal_cost_rate=normal_cost_rate,
                     kelly_state=kelly_state,
                 )
+    if symbol_mapping_required:
+        missing_mapping = {
+            (item.tm_id, item.symbol)
+            for item in candidate_decision.eligible
+            if not item.futu_symbol
+        }
+        buy_actions = [
+            action for action in buy_actions
+            if action.futu_symbol
+        ]
+        risk_skips = [
+            skip
+            for skip in risk_skips
+            if (skip.get("tm_id"), skip.get("symbol")) not in missing_mapping
+        ]
+        risk_skips.extend(
+            _risk_skip(
+                item,
+                weight=(
+                    cn_target_weights.get(item.temperature_curr)
+                    if market == "CN"
+                    else position_weight
+                ),
+                target_amount=None,
+                reason="symbol_mapping_unavailable",
+                decisive_constraint="趋势代码映射",
+            )
+            for item in candidate_decision.eligible
+            if (item.tm_id, item.symbol) in missing_mapping
+        )
+        if snapshot_version != "v1":
+            existing_risk = _nonnegative_risk_decimal(
+                risk_summary.get("existing_planned_risk")
+            )
+            risk_summary = _risk_summary(
+                net_value=account.net_value,
+                existing_planned_risk=existing_risk,
+                new_planned_risk=sum(
+                    (item.planned_stop_risk for item in buy_actions),
+                    Decimal("0"),
+                ),
+                normal_cost_rate=normal_cost_rate,
+                pause_reason=str(risk_summary.get("pause_reason") or ""),
+                kelly_state=kelly_state,
+            )
+
     industry_concentration = tuple(
         (
             industry,
@@ -4880,7 +5123,10 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "top10_candidates": top10_candidates,
         "formal_actions": formal_actions,
     }
-    if not legacy_v1:
+    if not legacy_v1 or (
+        report.metadata.get("symbol_mapping_schema")
+        == TREND_SYMBOL_MAPPING_SCHEMA
+    ):
         strategy_judgments["risk_skips"] = _json_value(report.risk_skips)
     if report.real_holdings_status == "available":
         strategy_judgments.update(
@@ -5552,12 +5798,19 @@ def _write_frozen_industry_context_history(
     )
     if not isinstance(generated_at, str) or not isinstance(strategy_version, str):
         raise ValueError("frozen report is missing industry history metadata")
+    artifact_stem = receipt.get("artifact_stem")
+    revision_match = (
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}-r([1-9]\d*)", artifact_stem)
+        if isinstance(artifact_stem, str)
+        else None
+    )
     return write_industry_context_history(
         history_root,
         market=market,
         generated_at=generated_at,
         strategy_version=strategy_version,
         contexts=contexts,
+        revision=int(revision_match.group(1)) if revision_match else 0,
     )
 
 
@@ -5950,11 +6203,23 @@ def _attempt_report(
             row = rows_by_tm_id.get(tm_id)
             if row is None:
                 continue
+            mapping_verified = False
             try:
                 symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+                futu_symbol = f"{exchange}.{symbol}"
                 daily_bars = quote.get_daily_kline(
-                    f"{exchange}.{symbol}", start=kline_start, end=run_date
+                    futu_symbol, start=kline_start, end=run_date
                 )
+                try:
+                    mapping_verified = _remember_verified_symbol_row(
+                        api,
+                        market="CN",
+                        expected_futu_symbol=futu_symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                    )
+                except TrendAnimalsError:
+                    mapping_verified = False
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
@@ -5969,6 +6234,7 @@ def _attempt_report(
                     industry_temperature=industry_temperatures.get(
                         _optional_int(row.get("industryTmId"))
                     ),
+                    futu_symbol=futu_symbol if mapping_verified else None,
                 )
             )
         for position in account.positions:
@@ -5993,6 +6259,14 @@ def _attempt_report(
                         "CN", str(row.get("tickerSymbol") or "")
                     ) != to_futu_symbol("CN", symbol):
                         continue
+                    _remember_verified_symbol_row(
+                        api,
+                        market="CN",
+                        expected_futu_symbol=symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                        require_unmapped=True,
+                    )
                     holding_snapshots[symbol] = _holding_snapshot(
                         row,
                         industry_temperature=industry_temperatures.get(
@@ -6028,6 +6302,14 @@ def _attempt_report(
                 candidates=candidates,
                 candidate_rows=candidate_pool_rows,
                 held_symbols={position.symbol for position in account.positions},
+                holding_snapshots=(
+                    *holding_snapshots.values(),
+                    *(
+                        real_holdings.holding_snapshots.values()
+                        if real_holdings.status == "available"
+                        else ()
+                    ),
+                ),
                 expected_date=run_date,
                 market="CN",
                 history_root=config.data_dir / "trend_industry_context",
@@ -6144,6 +6426,11 @@ def _attempt_report(
                 "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "paid_response_cache": cache_metadata,
+                **(
+                    {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
+                    if _supports_symbol_mapping_contract(api)
+                    else {}
+                ),
             },
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,

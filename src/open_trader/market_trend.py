@@ -31,6 +31,8 @@ from .a_share_trend import (
     _is_systemic_futu_error,
     _optional_int,
     _process_version,
+    _remember_verified_symbol_row,
+    _supports_symbol_mapping_contract,
     _uses_shared_entry_discipline,
     read_delivery_receipt,
     _redact_api_key,
@@ -69,6 +71,7 @@ from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .parsers.base import detect_asset_class
 from .trend_animals import (
+    TREND_SYMBOL_MAPPING_SCHEMA,
     TrendAnimalsClient,
     TrendAnimalsError,
     TrendAnimalsNoCurrentRowsError,
@@ -1062,6 +1065,7 @@ def _attempt_market_report(
             row = rows_by_id.get(tm_id)
             if row is None:
                 continue
+            mapping_verified = False
             try:
                 futu_symbol = from_trend_animals_symbol(
                     market, str(row.get("tickerSymbol", ""))
@@ -1069,6 +1073,16 @@ def _attempt_market_report(
                 bars = quote.get_daily_kline(
                     futu_symbol, start=start, end=as_of_date
                 )
+                try:
+                    mapping_verified = _remember_verified_symbol_row(
+                        api,
+                        market=market,
+                        expected_futu_symbol=futu_symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                    )
+                except TrendAnimalsError:
+                    mapping_verified = False
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
@@ -1084,6 +1098,7 @@ def _attempt_market_report(
                     industry_temperature=industry_temperatures.get(
                         _optional_int(row.get("industryTmId"))
                     ),
+                    futu_symbol=futu_symbol if mapping_verified else None,
                 )
             )
         holding_snapshots = {position.symbol: None for position in account.positions}
@@ -1109,6 +1124,14 @@ def _attempt_market_report(
                         market, str(row.get("tickerSymbol") or "")
                     ) != to_futu_symbol(market, symbol):
                         continue
+                    _remember_verified_symbol_row(
+                        api,
+                        market=market,
+                        expected_futu_symbol=symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                        require_unmapped=True,
+                    )
                     holding_snapshots[symbol] = _holding_snapshot(
                         row,
                         market=market,
@@ -1145,6 +1168,14 @@ def _attempt_market_report(
                 candidates=candidates,
                 candidate_rows=candidate_pool_rows,
                 held_symbols={position.symbol for position in account.positions},
+                holding_snapshots=(
+                    *holding_snapshots.values(),
+                    *(
+                        real_holdings.holding_snapshots.values()
+                        if real_holdings.status == "available"
+                        else ()
+                    ),
+                ),
                 expected_date=as_of_date,
                 market=market,
                 history_root=paths.root.parent / "trend_industry_context",
@@ -1283,6 +1314,11 @@ def _attempt_market_report(
                 "run_date": run_date,
                 "process_version": process_version,
                 "paid_response_cache": cache_metadata,
+                **(
+                    {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
+                    if _supports_symbol_mapping_contract(api)
+                    else {}
+                ),
                 **(
                     {"industry_data_reason": industry_data_reason}
                     if shared_entry_discipline

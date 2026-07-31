@@ -951,6 +951,12 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         def get_account_balance(self) -> dict[str, object]:
             return {"balance": "100"}
 
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
         def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
             if tm_id == 700001:
                 return [
@@ -1052,6 +1058,19 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     notifier = RecordingFeishu()
     from open_trader import market_trend
 
+    holding_context_snapshots: list[object] = []
+    original_collect = market_trend.collect_industry_contexts
+
+    def collect_with_holding_context(**kwargs: object) -> object:
+        holding_context_snapshots.extend(kwargs["holding_snapshots"])  # type: ignore[arg-type]
+        return original_collect(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        market_trend,
+        "collect_industry_contexts",
+        collect_with_holding_context,
+    )
+
     original_freeze = market_trend._freeze_receipt_report
     freeze_attempts = 0
 
@@ -1139,12 +1158,20 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     actions = payload["strategy_judgments"]["formal_actions"]
     assert actions[0]["action"] == "BUY"
     assert actions[0]["symbol"] == "02800"
+    assert actions[0]["futu_symbol"] == "HK.02800"
+    assert payload["metadata"]["symbol_mapping_schema"] == (
+        "open_trader.trend_symbol_mapping.v1"
+    )
     assert actions[0]["target_amount"] == "4000.00"
     assert actions[0]["estimated_shares"] == 400
     assert payload["account"]["fresh"] is True
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert any(
+        getattr(snapshot, "symbol", None) == "00700"
+        for snapshot in holding_context_snapshots
+    )
     assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
@@ -1215,6 +1242,7 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     cfg = config(tmp_path)
     unlock_live_drawdown(cfg.data_dir, market, version="v8")
     industry_calls: list[dict[str, object]] = []
+    mapping_calls: list[dict[str, object]] = []
 
     class Api:
         ignored_stale_components: tuple[object, ...] = ()
@@ -1294,6 +1322,9 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
                 "stopwinFlagByPopChampagne": False,
             }]
 
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            mapping_calls.append(dict(kwargs))
+
     class Quote:
         def __init__(self, **kwargs: object) -> None:
             pass
@@ -1343,6 +1374,10 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     assert judgments["top10_candidates"] == []
     assert len(industry_calls) == 1
     assert bool(payload["metadata"]["industry_data_reason"]) is industry_error
+    assert len(mapping_calls) == 1
+    assert mapping_calls[0]["market"] == market
+    assert mapping_calls[0]["expected_futu_symbol"] == f"{market}.{symbol}"
+    assert mapping_calls[0]["row"]["tickerSymbol"] == wire_symbol
 
 
 @pytest.mark.parametrize(

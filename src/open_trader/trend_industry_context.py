@@ -281,7 +281,11 @@ def attach_prior_context(
 
 
 _HISTORY_SCHEMA_VERSION = "open_trader.trend_industry_context.v1"
-_HISTORY_DATE_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})\.json$")
+_HISTORY_DATE_PATTERN = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})(?:-r([1-9]\d*))?\.json$"
+)
+
+
 def load_latest_prior_context(
     history_root: Path,
     *,
@@ -293,6 +297,7 @@ def load_latest_prior_context(
     directory = _history_directory(history_root, market_name, for_write=False)
     latest: dict[int, IndustryContext] = {}
     latest_dates: dict[int, str] = {}
+    revisions_by_date: dict[str, list[tuple[int, Path]]] = {}
     try:
         paths = sorted(directory.iterdir())
     except OSError:
@@ -307,10 +312,18 @@ def load_latest_prior_context(
                 continue
         except ValueError:
             continue
-        payload = _read_history_payload(path)
-        contexts = _contexts_from_history_payload(
-            payload, market=market_name, stored_date=stored_date
-        )
+        revision = int(match.group(2) or 0)
+        revisions_by_date.setdefault(stored_date, []).append((revision, path))
+    for stored_date, revisions in sorted(revisions_by_date.items()):
+        contexts: list[IndustryContext] | None = None
+        for _revision, path in sorted(revisions, reverse=True):
+            contexts = _contexts_from_history_payload(
+                _read_history_payload(path),
+                market=market_name,
+                stored_date=stored_date,
+            )
+            if contexts is not None:
+                break
         if contexts is None:
             continue
         for context in contexts:
@@ -331,10 +344,13 @@ def write_industry_context_history(
     generated_at: str,
     strategy_version: str,
     contexts: Sequence[IndustryContext],
+    revision: int = 0,
 ) -> Path:
     market_name = str(market).upper()
     if not _valid_history_metadata(generated_at, strategy_version):
         raise ValueError("industry context history metadata is invalid")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("industry context history revision is invalid")
     context_rows = list(contexts)
     if any(not isinstance(context, IndustryContext) for context in context_rows):
         raise ValueError("industry context history rows must be IndustryContext objects")
@@ -347,7 +363,8 @@ def write_industry_context_history(
     if any(_positive_int(value) is None for value in ids) or len(ids) != len(set(ids)):
         raise ValueError("industry context history contains duplicate or invalid IDs")
     directory = _history_directory(history_root, market_name, for_write=True)
-    path = directory / f"{as_of_date}.json"
+    revision_suffix = f"-r{revision}" if revision else ""
+    path = directory / f"{as_of_date}{revision_suffix}.json"
     payload = {
         "schema_version": _HISTORY_SCHEMA_VERSION,
         "market": market_name,

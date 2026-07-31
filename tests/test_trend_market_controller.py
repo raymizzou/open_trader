@@ -1890,10 +1890,14 @@ def test_controller_executes_partial_and_full_sells_before_buys(
 ) -> None:
     config = controller_config(tmp_path)
     report_path, report = write_report(config)
+    report["metadata"]["symbol_mapping_schema"] = (  # type: ignore[index]
+        "open_trader.trend_symbol_mapping.v1"
+    )
     report["strategy_judgments"]["formal_actions"] = [  # type: ignore[index]
         {
             "action": "BUY",
-            "symbol": "SH.600001",
+            "symbol": "000001",
+            "futu_symbol": "SH.600001",
             "target_weight": "0.04",
             "lot_size": 100,
             "estimated_shares": 200,
@@ -1903,14 +1907,23 @@ def test_controller_executes_partial_and_full_sells_before_buys(
         {
             "action": "BUY",
             "symbol": "600003",
+            "futu_symbol": "SH.600003",
             "target_weight": "0.04",
             "lot_size": 100,
             "estimated_shares": 200,
             "target_amount": "2000",
             "atr": "0.5",
         },
-        partial_sell_action("600001"),
-        {"action": "SELL_ALL", "symbol": "600002", "reason": "danger_signal"},
+        {
+            **partial_sell_action("000001"),
+            "futu_symbol": "SH.600001",
+        },
+        {
+            "action": "SELL_ALL",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "reason": "danger_signal",
+        },
     ]
     report_path.write_text(json.dumps(report), encoding="utf-8")
 
@@ -1954,8 +1967,11 @@ def test_controller_executes_partial_and_full_sells_before_buys(
         def close(self) -> None:
             pass
 
+    quoted_symbols: list[list[str]] = []
+
     class Quote:
         def get_snapshots(self, symbols: object) -> dict[str, object]:
+            quoted_symbols.append(list(symbols))  # type: ignore[arg-type]
             return {
                 str(symbol): SimpleNamespace(last_price=Decimal("10"))
                 for symbol in symbols  # type: ignore[union-attr]
@@ -1981,6 +1997,7 @@ def test_controller_executes_partial_and_full_sells_before_buys(
         "SH.600001", "SH.600002"
     }
     assert orders.requests[-1]["futu_code"] == "SH.600003"
+    assert quoted_symbols == [["SH.600003"]]
 
 
 def write_report_delivery_receipt(

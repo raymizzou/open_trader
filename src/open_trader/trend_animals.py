@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -24,6 +25,8 @@ SEARCH_ASSETS_BY_MARKET = {
     "HK": frozenset({"港股", "香港ETF"}),
     "US": frozenset({"美股", "美国ETF"}),
 }
+TREND_SYMBOL_MAPPING_SCHEMA = "open_trader.trend_symbol_mapping.v1"
+TREND_SYMBOL_DISCOVERY_RULE_VERSION = "trend_symbol_discovery.v1"
 Transport = Callable[[str, float], dict[str, object]]
 
 
@@ -37,6 +40,15 @@ class TrendAnimalsLookupError(TrendAnimalsError):
 
 class TrendAnimalsNoCurrentRowsError(TrendAnimalsError):
     pass
+
+
+@dataclass(frozen=True)
+class TrendSymbolMapping:
+    market: str
+    futu_symbol: str
+    trend_animals_symbol: str
+    trend_animals_tm_id: int
+    asset: str
 
 
 def _default_transport(url: str, timeout: float) -> dict[str, object]:
@@ -85,6 +97,16 @@ class TrendAnimalsClient:
         self.timeout_seconds = float(timeout_seconds)
         self._paid_cache_events: list[dict[str, str]] = []
         self._ignored_stale_components: list[dict[str, str]] = []
+        self._symbol_mappings_loaded = False
+        self._symbol_mappings_by_futu: dict[
+            tuple[str, str], TrendSymbolMapping
+        ] = {}
+        self._symbol_mappings_by_trend: dict[
+            tuple[str, str], TrendSymbolMapping
+        ] = {}
+        self._symbol_mappings_by_tm_id: dict[
+            tuple[str, int], TrendSymbolMapping
+        ] = {}
 
     @property
     def paid_cache_events(self) -> tuple[dict[str, str], ...]:
@@ -106,6 +128,85 @@ class TrendAnimalsClient:
             raise TrendAnimalsError("getAccountBalance returned no unique summary")
         return rows[0]
 
+    def symbol_mapping(
+        self, symbol: str, *, market: str
+    ) -> TrendSymbolMapping | None:
+        normalized_market = self._normalize_market(market)
+        try:
+            futu_symbol = to_futu_symbol(normalized_market, symbol)
+        except (AttributeError, ValueError):
+            raise ValueError("symbol must be a valid Futu symbol") from None
+        self._ensure_symbol_mappings_loaded()
+        return self._symbol_mappings_by_futu.get(
+            (normalized_market, futu_symbol)
+        )
+
+    def symbol_mapping_from_trend(
+        self, symbol: str, *, market: str
+    ) -> TrendSymbolMapping | None:
+        normalized_market = self._normalize_market(market)
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol must be a nonempty Trend Animals symbol")
+        self._ensure_symbol_mappings_loaded()
+        return self._symbol_mappings_by_trend.get(
+            (normalized_market, symbol.strip())
+        )
+
+    def symbol_mapping_from_tm_id(
+        self, tm_id: int, *, market: str
+    ) -> TrendSymbolMapping | None:
+        normalized_market = self._normalize_market(market)
+        if not self._valid_tm_id(tm_id):
+            raise ValueError("tm_id must be a positive integer")
+        self._ensure_symbol_mappings_loaded()
+        return self._symbol_mappings_by_tm_id.get((normalized_market, tm_id))
+
+    def remember_symbol_row(
+        self,
+        *,
+        market: str,
+        expected_futu_symbol: str,
+        row: Mapping[str, object],
+    ) -> TrendSymbolMapping:
+        normalized_market = self._normalize_market(market)
+        if not isinstance(row, Mapping):
+            raise TypeError("row must be a mapping")
+        try:
+            futu_symbol = to_futu_symbol(
+                normalized_market, expected_futu_symbol
+            )
+        except (AttributeError, ValueError):
+            raise ValueError("expected_futu_symbol must be a valid Futu symbol") from None
+        payload = {
+            "asset": row.get("asset"),
+            "futu_symbol": futu_symbol,
+            "market": normalized_market,
+            "schema_version": TREND_SYMBOL_MAPPING_SCHEMA,
+            "trend_animals_symbol": row.get("tickerSymbol"),
+            "trend_animals_tm_id": row.get("tmId"),
+        }
+        mapping = self._mapping_from_payload(
+            payload, directory_market=normalized_market
+        )
+        if self._contains_secret(payload):
+            raise TrendAnimalsError("symbol mapping contains unsafe data")
+        self._ensure_symbol_mappings_loaded()
+        self._check_symbol_mapping_conflicts(mapping)
+        existing = self._symbol_mappings_by_futu.get(
+            (mapping.market, mapping.futu_symbol)
+        )
+        if existing == mapping:
+            return existing
+        path = (
+            self.cache_dir
+            / "symbol_mappings"
+            / mapping.market
+            / f"{mapping.futu_symbol}.json"
+        )
+        self._write_cache(path, payload)
+        self._index_symbol_mapping(mapping)
+        return mapping
+
     def search_exact_symbol(
         self,
         symbol: str,
@@ -122,12 +223,20 @@ class TrendAnimalsClient:
             expected_day = None
         if expected_day is None or expected_day.isoformat() != expected_date:
             raise ValueError("expected_date must be an ISO date")
-        target = to_futu_symbol(market, symbol)
-        normalized_market = market.strip().upper()
+        normalized_market = self._normalize_market(market)
+        target = to_futu_symbol(normalized_market, symbol)
         normalized = target.split(".", 1)[1]
-        query = to_trend_animals_symbol(market, target)
+        query = (
+            normalized
+            if normalized_market == "CN"
+            else to_trend_animals_symbol(normalized_market, target)
+        )
         if self._api_key in normalized:
             raise ValueError("symbol conflicts with credentials")
+        mapping = self.symbol_mapping(target, market=normalized_market)
+        if mapping is not None:
+            return mapping.trend_animals_tm_id
+
         cache_path = self.cache_dir / "symbols" / f"{normalized}.json"
         cached = self._read_cache(cache_path)
         if cached is not None:
@@ -140,28 +249,44 @@ class TrendAnimalsClient:
             return cached["tmId"]
 
         miss_payload = {
-            "market": normalized_market,
-            "date": expected_date,
-            "symbol": normalized,
+            "discovery_query": query,
+            "discovery_rule_version": TREND_SYMBOL_DISCOVERY_RULE_VERSION,
             "error": "no_unique_exact_match",
+            "futu_symbol": target,
+            "market": normalized_market,
         }
         miss_path = (
             self.cache_dir
             / "symbol_misses"
             / normalized_market
-            / expected_date
-            / f"{normalized}.json"
+            / f"{target}.json"
         )
         cached_miss = self._read_cache(miss_path)
         if cached_miss is not None:
-            if cached_miss != miss_payload:
+            if (
+                not isinstance(cached_miss, dict)
+                or set(cached_miss) != set(miss_payload)
+                or cached_miss.get("discovery_query") != query
+                or cached_miss.get("error") != "no_unique_exact_match"
+                or cached_miss.get("futu_symbol") != target
+                or cached_miss.get("market") != normalized_market
+                or not isinstance(
+                    cached_miss.get("discovery_rule_version"), str
+                )
+            ):
                 raise TrendAnimalsError("symbol miss cache has an invalid shape")
-            raise TrendAnimalsLookupError(
-                f"searchTicker found no unique exact match for {normalized}"
-            )
+            if (
+                cached_miss["discovery_rule_version"]
+                == TREND_SYMBOL_DISCOVERY_RULE_VERSION
+            ):
+                raise TrendAnimalsLookupError(
+                    f"searchTicker found no unique exact match for {normalized}"
+                )
 
         rows = self._get("searchTicker", {"keyword": query})
-        matches: set[int] = set()
+        matches: dict[
+            tuple[int, str, str], dict[str, object]
+        ] = {}
         allowed_assets = SEARCH_ASSETS_BY_MARKET[normalized_market]
         for row in rows:
             ticker_symbol = row.get("tickerSymbol")
@@ -169,24 +294,32 @@ class TrendAnimalsClient:
             if not isinstance(ticker_symbol, str) or not self._valid_tm_id(tm_id):
                 raise TrendAnimalsError("searchTicker returned an invalid row")
             asset = row.get("asset")
-            if asset is not None and (
-                not isinstance(asset, str) or asset.strip() not in allowed_assets
-            ):
+            if asset is None:
+                continue
+            if not isinstance(asset, str):
+                raise TrendAnimalsError("searchTicker returned an invalid row")
+            asset = asset.strip()
+            if asset not in allowed_assets:
                 continue
             try:
-                candidate = from_trend_animals_symbol(market, ticker_symbol)
+                candidate = from_trend_animals_symbol(
+                    normalized_market, ticker_symbol
+                )
             except ValueError:
                 continue
-            if candidate == target:
-                matches.add(tm_id)
+            if self._same_security(normalized_market, candidate, target):
+                matches[(tm_id, ticker_symbol, asset)] = row
         if len(matches) != 1:
             self._write_cache(miss_path, miss_payload)
             raise TrendAnimalsLookupError(
                 f"searchTicker found no unique exact match for {normalized}"
             )
-        tm_id = next(iter(matches))
-        self._write_cache(cache_path, {"symbol": normalized, "tmId": tm_id})
-        return tm_id
+        row = next(iter(matches.values()))
+        return self.remember_symbol_row(
+            market=normalized_market,
+            expected_futu_symbol=target,
+            row=row,
+        ).trend_animals_tm_id
 
     def get_components(
         self, *, tm_id: int, expected_date: str
@@ -390,6 +523,138 @@ class TrendAnimalsClient:
             return None
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise TrendAnimalsError("cache is unreadable or malformed") from None
+
+    def _ensure_symbol_mappings_loaded(self) -> None:
+        if self._symbol_mappings_loaded:
+            return
+        by_futu: dict[tuple[str, str], TrendSymbolMapping] = {}
+        by_trend: dict[tuple[str, str], TrendSymbolMapping] = {}
+        by_tm_id: dict[tuple[str, int], TrendSymbolMapping] = {}
+        for market in sorted(SEARCH_ASSETS_BY_MARKET):
+            directory = self.cache_dir / "symbol_mappings" / market
+            for path in sorted(directory.glob("*.json")):
+                payload = self._read_cache(path)
+                try:
+                    mapping = self._mapping_from_payload(
+                        payload, directory_market=market
+                    )
+                except TrendAnimalsError:
+                    raise
+                if path.stem != mapping.futu_symbol:
+                    raise TrendAnimalsError("symbol mapping cache has an invalid path")
+                self._check_symbol_mapping_conflicts(
+                    mapping,
+                    by_futu=by_futu,
+                    by_trend=by_trend,
+                    by_tm_id=by_tm_id,
+                )
+                by_futu[(mapping.market, mapping.futu_symbol)] = mapping
+                by_trend[(mapping.market, mapping.trend_animals_symbol)] = mapping
+                by_tm_id[(mapping.market, mapping.trend_animals_tm_id)] = mapping
+        self._symbol_mappings_by_futu = by_futu
+        self._symbol_mappings_by_trend = by_trend
+        self._symbol_mappings_by_tm_id = by_tm_id
+        self._symbol_mappings_loaded = True
+
+    def _mapping_from_payload(
+        self, payload: object, *, directory_market: str
+    ) -> TrendSymbolMapping:
+        required = {
+            "asset",
+            "futu_symbol",
+            "market",
+            "schema_version",
+            "trend_animals_symbol",
+            "trend_animals_tm_id",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise TrendAnimalsError("symbol mapping cache has an invalid shape")
+        market = payload.get("market")
+        futu_symbol = payload.get("futu_symbol")
+        trend_symbol = payload.get("trend_animals_symbol")
+        tm_id = payload.get("trend_animals_tm_id")
+        asset = payload.get("asset")
+        if (
+            payload.get("schema_version") != TREND_SYMBOL_MAPPING_SCHEMA
+            or market != directory_market
+            or market not in SEARCH_ASSETS_BY_MARKET
+            or not isinstance(futu_symbol, str)
+            or not futu_symbol
+            or not isinstance(trend_symbol, str)
+            or not trend_symbol.strip()
+            or trend_symbol != trend_symbol.strip()
+            or not self._valid_tm_id(tm_id)
+            or not isinstance(asset, str)
+            or asset not in SEARCH_ASSETS_BY_MARKET[market]
+        ):
+            raise TrendAnimalsError("symbol mapping cache has an invalid shape")
+        try:
+            canonical_futu = to_futu_symbol(market, futu_symbol)
+            trend_futu = from_trend_animals_symbol(market, trend_symbol)
+        except ValueError:
+            raise TrendAnimalsError("symbol mapping cache has an invalid shape") from None
+        if canonical_futu != futu_symbol or not self._same_security(
+            market, canonical_futu, trend_futu
+        ):
+            raise TrendAnimalsError("symbol mapping cache has an invalid shape")
+        return TrendSymbolMapping(
+            market=market,
+            futu_symbol=futu_symbol,
+            trend_animals_symbol=trend_symbol,
+            trend_animals_tm_id=tm_id,
+            asset=asset,
+        )
+
+    def _check_symbol_mapping_conflicts(
+        self,
+        mapping: TrendSymbolMapping,
+        *,
+        by_futu: dict[tuple[str, str], TrendSymbolMapping] | None = None,
+        by_trend: dict[tuple[str, str], TrendSymbolMapping] | None = None,
+        by_tm_id: dict[tuple[str, int], TrendSymbolMapping] | None = None,
+    ) -> None:
+        indexes = (
+            (
+                by_futu if by_futu is not None else self._symbol_mappings_by_futu,
+                (mapping.market, mapping.futu_symbol),
+            ),
+            (
+                by_trend if by_trend is not None else self._symbol_mappings_by_trend,
+                (mapping.market, mapping.trend_animals_symbol),
+            ),
+            (
+                by_tm_id if by_tm_id is not None else self._symbol_mappings_by_tm_id,
+                (mapping.market, mapping.trend_animals_tm_id),
+            ),
+        )
+        if any(index.get(key) not in (None, mapping) for index, key in indexes):
+            raise TrendAnimalsError("symbol mapping conflict")
+
+    def _index_symbol_mapping(self, mapping: TrendSymbolMapping) -> None:
+        self._symbol_mappings_by_futu[
+            (mapping.market, mapping.futu_symbol)
+        ] = mapping
+        self._symbol_mappings_by_trend[
+            (mapping.market, mapping.trend_animals_symbol)
+        ] = mapping
+        self._symbol_mappings_by_tm_id[
+            (mapping.market, mapping.trend_animals_tm_id)
+        ] = mapping
+
+    @staticmethod
+    def _normalize_market(market: object) -> str:
+        if not isinstance(market, str):
+            raise TypeError("market must be a string")
+        normalized = market.strip().upper()
+        if normalized not in SEARCH_ASSETS_BY_MARKET:
+            raise ValueError(f"unsupported market: {market}")
+        return normalized
+
+    @staticmethod
+    def _same_security(market: str, left: str, right: str) -> bool:
+        if market == "CN":
+            return left.split(".", 1)[1] == right.split(".", 1)[1]
+        return left == right
 
     def _write_cache(self, path: Path, payload: object) -> None:
         temp_path: Path | None = None

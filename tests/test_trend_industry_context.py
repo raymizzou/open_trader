@@ -521,3 +521,42 @@ def test_history_write_is_idempotent_for_same_context_and_rejects_conflicts(
             strategy_version="v8",
             contexts=(replace(context, right_count=999),),
         )
+
+
+def test_history_loader_uses_latest_same_date_report_revision(
+    tmp_path: Path,
+) -> None:
+    base_only = _valid_context(
+        industry_tm_id=700001,
+        as_of_date="2026-07-24",
+    )
+    revised_only = _valid_context(
+        industry_tm_id=700002,
+        as_of_date="2026-07-24",
+        right_share="0.321",
+    )
+    base_path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-24T18:00:00+08:00",
+        strategy_version="v8",
+        contexts=(base_only,),
+    )
+    revision_path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-24T19:00:00+08:00",
+        strategy_version="v8",
+        contexts=(revised_only,),
+        revision=1,
+    )
+
+    assert base_path.name == "2026-07-24.json"
+    assert revision_path.name == "2026-07-24-r1.json"
+    loaded = load_latest_prior_context(
+        tmp_path,
+        market="CN",
+        before_date="2026-07-25",
+    )
+    assert set(loaded) == {700002}
+    assert loaded[700002].right_share == Decimal("0.321")

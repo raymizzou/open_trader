@@ -17,6 +17,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
   broker statements and showing each broker's own accepted data time. Removed
   the redundant global quote, heartbeat, controller, and refresh labels while
   preserving file-backed status, quote polling, and per-broker failure states.
+- Persisted provider-verified 富途代码、趋势动物代码和 `tmId` as one immutable
+  mapping, with one exact discovery attempt and a permanent rule-versioned miss
+  instead of retries. Initialized the already verified `SH.515450` mapping;
+  new simulated actions now freeze and execute the exact mapped 富途 code while
+  legacy reports retain their existing conversion path.
+- Expanded each frozen CN/HK/US industry context from eligible candidates to
+  the union of candidates and current holdings, sorted by descending trend
+  strength with invalid rows last. Holding-only lookup failures remain local to
+  their row and display as `趋势代码映射异常`; same-day report revisions now keep
+  matching immutable `-rN` industry-history snapshots.
 - Made Dashboard browser acceptance compare volatile controller-owned prices
   with the page's current state instead of a pre-navigation snapshot. Live
   quote fetch and valid-price checks remain strict, so normal price movement no

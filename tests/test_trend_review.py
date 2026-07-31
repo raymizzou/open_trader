@@ -836,6 +836,79 @@ def report_with_actions(actions: list[dict[str, object]]) -> dict[str, object]:
     return report
 
 
+@pytest.mark.parametrize(
+    ("market", "symbol", "futu_symbol", "now"),
+    [
+        ("CN", "000001", "SH.000001", "2026-07-20T09:31:00+08:00"),
+        ("HK", "3033.HK", "HK.03033", "2026-07-20T09:31:00+08:00"),
+        ("US", "BRK_B", "US.BRK.B", "2026-07-20T09:31:00-04:00"),
+    ],
+)
+def test_new_symbol_mapping_report_executes_frozen_futu_code(
+    tmp_path: Path,
+    market: str,
+    symbol: str,
+    futu_symbol: str,
+    now: str,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "target_weight": "0.04",
+            "lot_size": 1,
+            "estimated_shares": 4,
+            "atr": "0.5",
+        }
+    ])
+    report["metadata"] = {
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1"
+    }
+    client = FakeTrendSimClient()
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market=market,
+        execution_date="2026-07-20",
+        now=now,
+        quote_prices={futu_symbol: Decimal("10")},
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["futu_code"] == futu_symbol
+    action_key = trend_review.trend_action_key(
+        market, "2026-07-20", futu_symbol, "buy"
+    )
+    action_root = (
+        tmp_path
+        / f"trend_review/ledgers/{market}/actions/2026-07-20"
+        / action_key
+    )
+    event = json.loads(next(action_root.glob("*.json")).read_text(encoding="utf-8"))
+    assert event["futu_code"] == futu_symbol
+
+
+def test_new_symbol_mapping_report_rejects_action_without_frozen_code() -> None:
+    report = cn_buy_report()
+    report["metadata"] = {
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1"
+    }
+
+    with pytest.raises(ValueError, match="frozen Futu symbol"):
+        trend_review._preflight_open_actions(report, "CN")
+
+
+def test_legacy_report_without_mapping_marker_keeps_symbol_conversion() -> None:
+    action = cn_buy_report()["strategy_judgments"]["formal_actions"][0]
+
+    assert trend_review._preflight_open_actions(cn_buy_report(), "CN")[0] == [
+        action
+    ]
+
+
 def partial_sell_report(
     *,
     symbol: object = "600001",

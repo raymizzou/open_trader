@@ -56,6 +56,7 @@ from open_trader.trend_animals import (
 from open_trader.trend_kelly import TrendKellyRound
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_industry_context import IndustryContext
+from open_trader.trend_industry_context import _context_to_mapping
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -227,6 +228,39 @@ def test_futu_simulation_account_ignores_explicit_zero_quantity_rows() -> None:
     )
 
     assert account.positions == ()
+
+
+def test_futu_simulation_account_preserves_exact_position_code() -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "50",
+                "positions": [
+                    {
+                        "code": "SH.000001",
+                        "stock_name": "上证测试",
+                        "qty": "100",
+                        "market_val": "50",
+                    }
+                ],
+            }
+
+        def close(self) -> None:
+            pass
+
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-17",
+        account_factory=lambda **_kwargs: Client(),
+    )
+
+    assert account.positions[0].symbol == "000001"
+    assert account.positions[0].futu_symbol == "SH.000001"
 
 
 def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
@@ -409,6 +443,103 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
         estimated_api_cost=Decimal("1.20"),
         actual_api_cost=Decimal("1.00"),
     )
+
+
+def test_new_mapping_report_freezes_actions_and_skips_unmapped_candidate() -> None:
+    schema = "open_trader.trend_symbol_mapping.v1"
+    mapped = replace(candidate("000001"), futu_symbol="SH.000001")
+    mapped_report = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(mapped,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"symbol_mapping_schema": schema},
+    )
+    mapped_payload = trend_module._report_payload(mapped_report)
+
+    assert mapped_payload["metadata"]["symbol_mapping_schema"] == schema
+    assert mapped_payload["strategy_judgments"]["formal_actions"][0][
+        "futu_symbol"
+    ] == "SH.000001"
+
+    unmapped_report = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(candidate("600001"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"symbol_mapping_schema": schema},
+    )
+    unmapped_payload = trend_module._report_payload(unmapped_report)
+
+    assert [item["symbol"] for item in unmapped_payload["strategy_judgments"][
+        "top10_candidates"
+    ]] == ["600001"]
+    assert unmapped_payload["strategy_judgments"]["formal_actions"] == []
+    assert unmapped_payload["strategy_judgments"]["risk_skips"][0][
+        "reason"
+    ] == "symbol_mapping_unavailable"
+
+
+def test_new_mapping_report_freezes_simulated_sell_but_not_real_advice() -> None:
+    schema = "open_trader.trend_symbol_mapping.v1"
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=(
+            AccountPosition(
+                "000001",
+                "模拟持仓",
+                "stock",
+                Decimal("100"),
+                Decimal("10"),
+                Decimal("1000"),
+                "SH.000001",
+            ),
+        ),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(
+            AccountPosition(
+                "515450",
+                "红利50",
+                "etf",
+                Decimal("100"),
+                Decimal("1.4"),
+                Decimal("146"),
+                "SH.515450",
+            ),
+        ),
+        holding_snapshots={"515450": holding("515450", danger=True)},
+        bars_by_symbol={"515450": bars()},
+        prior_state=None,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=(),
+        holding_snapshots={"000001": holding("000001", danger=True)},
+        bars_by_symbol={"000001": bars()},
+        metadata={"symbol_mapping_schema": schema},
+        real_holdings=real,
+    )
+    payload = trend_module._report_payload(built)
+    actions = payload["strategy_judgments"]["formal_actions"]
+
+    assert [(item["symbol"], item["futu_symbol"]) for item in actions] == [
+        ("000001", "SH.000001")
+    ]
+    assert all(item["symbol"] != "515450" for item in actions)
 
 
 def unlock_live_drawdown(
@@ -5101,6 +5232,31 @@ def test_frozen_revisions_choose_first_free_pair(tmp_path: Path) -> None:
     assert write_frozen_report(base, tmp_path, revision=True)[0].name == "2026-07-14-r2.md"
 
 
+def test_frozen_revision_writes_matching_industry_history_revision(
+    tmp_path: Path,
+) -> None:
+    context = _industry_context(700001)
+    receipt = {
+        "artifact_stem": "2026-07-14-r2",
+        "report_json": json.dumps(
+            {
+                "generated_at": "2026-07-14T19:00:00+08:00",
+                "strategy_snapshot": {"strategy_version": "v10"},
+                "industry_contexts": [_context_to_mapping(context)],
+            }
+        ),
+    }
+
+    path = trend_module._write_frozen_industry_context_history(
+        receipt=receipt,
+        history_root=tmp_path,
+        market="CN",
+    )
+
+    assert path is not None
+    assert path.name == "2026-07-14-r2.json"
+
+
 @pytest.mark.parametrize("failed_suffix", [".md", ".json"])
 def test_new_frozen_pair_rolls_back_any_failed_final_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_suffix: str
@@ -5845,6 +6001,31 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["rebuild_inputs"]["candidates"]
 
 
+def test_report_runner_includes_simulated_holding_only_industry(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    api = ReadyApi([], industry_ids={600009: 339103})
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **_kwargs: api,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert {item["industry_tm_id"] for item in payload["industry_contexts"]} == {
+        339103,
+        700001,
+    }
+    assert payload["strategy_judgments"]["holding_decisions"][0][
+        "industry"
+    ] == "电力"
+
+
 def test_cn_entry_gate_keeps_early_temperature_when_industry_state_changes(
     tmp_path: Path,
 ) -> None:
@@ -6006,6 +6187,117 @@ def test_collect_industry_contexts_marks_stale_only_components_invalid(
     assert "snapshot_coverage_below_90pct" in contexts[0].invalid_reasons
     assert status["ordering_mode"] == "legacy_invalid_current"
     assert facts["component_rows"] == 0
+
+
+def test_collect_industry_contexts_appends_holding_industries_in_strength_order(
+    tmp_path: Path,
+) -> None:
+    candidate_industry_id = 700001
+    invalid_industry_id = 800004
+
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            if tm_id == invalid_industry_id:
+                raise TrendAnimalsError("holding industry unavailable")
+            return [{"tmId": tm_id + 1, "asOfDate": expected_date}]
+
+        def get_snapshots(
+            self,
+            *,
+            tm_ids: list[int],
+            fields: tuple[str, ...],
+            expected_date: str,
+        ) -> list[dict[str, object]]:
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in tm_ids
+                ]
+            strengths = {
+                candidate_industry_id: "95",
+                339103: "92.4",
+                621693: "98.7",
+            }
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    **(
+                        {"trendStrengthLocalCurr": strengths[tm_id]}
+                        if tm_id in strengths
+                        else {}
+                    ),
+                }
+                for tm_id in tm_ids
+            ]
+
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(
+            candidate(
+                "600001",
+                industry="候选行业",
+                industry_tm_id=candidate_industry_id,
+            ),
+        ),
+        candidate_rows=[
+            {
+                "tmId": 600001,
+                "industryTmId": candidate_industry_id,
+                "industryName": "候选行业",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+            }
+        ],
+        held_symbols=set(),
+        holding_snapshots=(
+            holding("600010", industry="银行", industry_tm_id=339103),
+            holding("600011", industry="电力", industry_tm_id=621693),
+            holding("600012", industry="银行", industry_tm_id=339103),
+            holding("600013", industry="无行业", industry_tm_id=None),
+            holding(
+                "600014",
+                industry="异常行业",
+                industry_tm_id=invalid_industry_id,
+            ),
+        ),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert facts["eligible_industry_ids"] == (candidate_industry_id,)
+    assert facts["holding_industry_ids"] == (
+        339103,
+        621693,
+        invalid_industry_id,
+    )
+    assert facts["context_industry_ids"] == (
+        candidate_industry_id,
+        339103,
+        621693,
+        invalid_industry_id,
+    )
+    assert [item.industry_tm_id for item in contexts] == [
+        621693,
+        candidate_industry_id,
+        339103,
+        invalid_industry_id,
+    ]
+    assert contexts[-1].strength is None
+    assert contexts[-1].valid is False
+    assert facts["holding_errors"] == {
+        str(invalid_industry_id): "holding industry unavailable"
+    }
+    assert status["ordering_mode"] == "context_current_only"
 
 
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
@@ -7316,6 +7608,93 @@ def test_report_runner_excludes_only_candidate_with_failed_kline(tmp_path: Path)
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
     assert payload["excluded"]["000001"] == ["atr_unavailable"]
     assert [item["symbol"] for item in payload["strategy_judgments"]["top10_candidates"]] == ["000002"]
+
+
+@pytest.mark.parametrize(
+    ("failed_klines", "expected_symbols"),
+    [
+        ({"SH.000001", "SH.000002"}, []),
+        ({"SH.000001"}, ["SH.000002"]),
+    ],
+)
+def test_report_runner_records_candidate_mapping_only_after_verified_futu_kline(
+    tmp_path: Path,
+    failed_klines: set[str],
+    expected_symbols: list[str],
+) -> None:
+    mapping_calls: list[dict[str, object]] = []
+
+    class MappingApi(ReadyApi):
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            mapping_calls.append(dict(kwargs))
+
+    run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: MappingApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote(
+            [], failed_klines=failed_klines
+        ),
+        notifier=RecordingFeishu(),
+    )
+
+    assert [call["expected_futu_symbol"] for call in mapping_calls] == expected_symbols
+    assert all(call["market"] == "CN" for call in mapping_calls)
+    assert [call["row"]["tickerSymbol"] for call in mapping_calls] == [
+        symbol.replace("SH.", "") + ".SH" for symbol in expected_symbols
+    ]
+
+
+@pytest.mark.parametrize(
+    ("market", "expected_tm_id", "row", "expected_calls"),
+    [
+        (
+            "CN",
+            308052,
+            {"tmId": 308052, "tickerSymbol": "600036.SH", "asset": "A股"},
+            1,
+        ),
+        (
+            "CN",
+            999999,
+            {"tmId": 308052, "tickerSymbol": "600036.SH", "asset": "A股"},
+            0,
+        ),
+        (
+            "CN",
+            308052,
+            {"tmId": 308052, "tickerSymbol": "600036.US", "asset": "A股"},
+            0,
+        ),
+        (
+            "CN",
+            308052,
+            {"tmId": 308052, "tickerSymbol": "600036.SH", "asset": "美股"},
+            0,
+        ),
+    ],
+)
+def test_legacy_mapping_upgrade_requires_matching_snapshot_identity(
+    market: str,
+    expected_tm_id: int,
+    row: dict[str, object],
+    expected_calls: int,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Api:
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            calls.append(dict(kwargs))
+
+    trend_module._remember_verified_symbol_row(
+        Api(),
+        market=market,
+        expected_futu_symbol="SH.600036",
+        expected_tm_id=expected_tm_id,
+        row=row,
+    )
+
+    assert len(calls) == expected_calls
 
 
 @pytest.mark.parametrize("with_prior", [False, True])
