@@ -42,7 +42,6 @@ CONTROLLER_DOM_FIELDS = {
     "cost_price": "data-cost-price",
     "last_price": "data-last-price",
     "price_kind": "data-price-kind",
-    "price_as_of": "data-price-as-of",
     "market_value_usd": "data-market-value-usd",
     "market_value_hkd": "data-market-value-hkd",
     "account_weight_hkd": "data-account-weight-hkd",
