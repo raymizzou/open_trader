@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-01
+
+- Dashboard 账户持仓、趋势纪律与审计折叠区现在会在报价轮询刷新、账户视图重绘和券商标签切换后保留用户选择的展开/收起状态；切换报告身份时不复用旧状态。验证 375px 账户视图 Playwright 回归 1 个通过。
+
 ## 2026-07-31
 
 - 将预测市场顶部 Watcher 状态改为只反映 Polymarket WebSocket/心跳连接；盘口过期仍保持失败关闭并明确提示“当前盘口暂不可交易”。验证 Dashboard Web 测试 286 个通过。
