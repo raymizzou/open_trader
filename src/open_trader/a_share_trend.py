@@ -55,6 +55,7 @@ from .trend_industry_context import (
 )
 from .trend_animals import (
     SEARCH_ASSETS_BY_MARKET,
+    TREND_SYMBOL_MAPPING_SCHEMA,
     TrendAnimalsClient,
     TrendAnimalsError,
     TrendAnimalsLookupError,
@@ -1017,6 +1018,7 @@ class AccountPosition:
     quantity: Decimal
     avg_cost_price: Decimal | None
     market_value: Decimal = Decimal("0")
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1118,7 @@ class CandidateInput:
     kline_supplement: dict[str, bool] | None = None
     boiling: object = None
     champagne: object = None
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1151,6 +1154,7 @@ class BuyAction:
     planned_stop_risk_pct: Decimal
     normal_cost: Decimal
     decisive_constraint: str
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1212,7 @@ class HoldingDecision:
     lot_size: int | None = None
     overheat_signals: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    futu_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1466,6 +1471,7 @@ def load_real_holding_input(
                 quantity=quantity,
                 avg_cost_price=avg_cost_price,
                 market_value=market_value,
+                futu_symbol=futu_symbol,
             )
         )
     return RealHoldingInput(
@@ -1710,6 +1716,12 @@ def _remember_verified_symbol_row(
     return True
 
 
+def _supports_symbol_mapping_contract(api: object) -> bool:
+    return callable(getattr(api, "remember_symbol_row", None)) and callable(
+        getattr(api, "symbol_mapping", None)
+    )
+
+
 def load_eastmoney_account(
     path: Path,
     *,
@@ -1860,6 +1872,7 @@ def load_futu_simulate_trend_account(
                     row.get("cost_price", row.get("avg_cost_price"))
                 ),
                 market_value=market_value,
+                futu_symbol=code,
             )
         )
     return AccountSnapshot(
@@ -1987,6 +2000,7 @@ def evaluate_candidate(
     pools: Sequence[str] = (),
     market: str = "CN",
     industry_temperature: str | None = None,
+    futu_symbol: str | None = None,
 ) -> CandidateInput:
     symbol, exchange = _symbol_parts(row.get("tickerSymbol"), market=market)
     daily_bars = tuple(bars or ())
@@ -2040,6 +2054,7 @@ def evaluate_candidate(
             if isinstance(row.get("stopwinFlagByPopChampagne"), bool)
             else None
         ),
+        futu_symbol=futu_symbol,
         **paid_expansion,
     )
 
@@ -2622,6 +2637,7 @@ def _estimate_buy_actions_v1(
                 planned_stop_risk_pct=Decimal("0"),
                 normal_cost=Decimal("0"),
                 decisive_constraint="",
+                futu_symbol=item.futu_symbol,
             )
         )
         remaining_cash -= amount
@@ -2962,6 +2978,7 @@ def _plan_buy_actions(
                     and sized.decisive_constraint == "名义仓位上限"
                     else sized.decisive_constraint
                 ),
+                futu_symbol=item.futu_symbol,
             )
         )
         remaining_cash -= sized.cash_required
@@ -3379,6 +3396,7 @@ def _evaluate_holding_positions(
                 lot_size=lot_size,
                 overheat_signals=overheat_signals,
                 warnings=warnings,
+                futu_symbol=position.futu_symbol,
             )
         )
         new_state: dict[str, object] = {
@@ -3441,6 +3459,10 @@ def build_report(
     estimated_api_cost_complete: bool = True,
     real_holdings: RealHoldingInput | None = None,
 ) -> TrendReport:
+    symbol_mapping_required = (
+        (metadata or {}).get("symbol_mapping_schema")
+        == TREND_SYMBOL_MAPPING_SCHEMA
+    )
     resolved_process_version = process_version or str(
         (metadata or {}).get("process_version")
         or (strategy_snapshot or {}).get("process_version")
@@ -3702,6 +3724,52 @@ def build_report(
                     normal_cost_rate=normal_cost_rate,
                     kelly_state=kelly_state,
                 )
+    if symbol_mapping_required:
+        missing_mapping = {
+            (item.tm_id, item.symbol)
+            for item in candidate_decision.eligible
+            if not item.futu_symbol
+        }
+        buy_actions = [
+            action for action in buy_actions
+            if action.futu_symbol
+        ]
+        risk_skips = [
+            skip
+            for skip in risk_skips
+            if (skip.get("tm_id"), skip.get("symbol")) not in missing_mapping
+        ]
+        risk_skips.extend(
+            _risk_skip(
+                item,
+                weight=(
+                    cn_target_weights.get(item.temperature_curr)
+                    if market == "CN"
+                    else position_weight
+                ),
+                target_amount=None,
+                reason="symbol_mapping_unavailable",
+                decisive_constraint="趋势代码映射",
+            )
+            for item in candidate_decision.eligible
+            if (item.tm_id, item.symbol) in missing_mapping
+        )
+        if snapshot_version != "v1":
+            existing_risk = _nonnegative_risk_decimal(
+                risk_summary.get("existing_planned_risk")
+            )
+            risk_summary = _risk_summary(
+                net_value=account.net_value,
+                existing_planned_risk=existing_risk,
+                new_planned_risk=sum(
+                    (item.planned_stop_risk for item in buy_actions),
+                    Decimal("0"),
+                ),
+                normal_cost_rate=normal_cost_rate,
+                pause_reason=str(risk_summary.get("pause_reason") or ""),
+                kelly_state=kelly_state,
+            )
+
     industry_concentration = tuple(
         (
             industry,
@@ -4939,7 +5007,10 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "top10_candidates": top10_candidates,
         "formal_actions": formal_actions,
     }
-    if not legacy_v1:
+    if not legacy_v1 or (
+        report.metadata.get("symbol_mapping_schema")
+        == TREND_SYMBOL_MAPPING_SCHEMA
+    ):
         strategy_judgments["risk_skips"] = _json_value(report.risk_skips)
     if report.real_holdings_status == "available":
         strategy_judgments.update(
@@ -6009,19 +6080,23 @@ def _attempt_report(
             row = rows_by_tm_id.get(tm_id)
             if row is None:
                 continue
+            mapping_verified = False
             try:
                 symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
                 futu_symbol = f"{exchange}.{symbol}"
                 daily_bars = quote.get_daily_kline(
                     futu_symbol, start=kline_start, end=run_date
                 )
-                _remember_verified_symbol_row(
-                    api,
-                    market="CN",
-                    expected_futu_symbol=futu_symbol,
-                    expected_tm_id=tm_id,
-                    row=row,
-                )
+                try:
+                    mapping_verified = _remember_verified_symbol_row(
+                        api,
+                        market="CN",
+                        expected_futu_symbol=futu_symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                    )
+                except TrendAnimalsError:
+                    mapping_verified = False
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
@@ -6036,6 +6111,7 @@ def _attempt_report(
                     industry_temperature=industry_temperatures.get(
                         _optional_int(row.get("industryTmId"))
                     ),
+                    futu_symbol=futu_symbol if mapping_verified else None,
                 )
             )
         for position in account.positions:
@@ -6219,6 +6295,11 @@ def _attempt_report(
                 "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "paid_response_cache": cache_metadata,
+                **(
+                    {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
+                    if _supports_symbol_mapping_contract(api)
+                    else {}
+                ),
             },
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,

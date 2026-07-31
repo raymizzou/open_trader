@@ -74,6 +74,7 @@ from .trend_review import (
     overheat_trim_progress,
     _preflight_open_actions,
     record_trend_review_missed_buys,
+    trend_action_futu_symbol,
 )
 
 
@@ -899,13 +900,13 @@ def _execute_locked_report(
         now=now,
     )
     sell_symbols = {
-        to_futu_symbol(market, str(action.get("symbol") or ""))
+        trend_action_futu_symbol(locked_report, action, market)
         for action in actions
         if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
     eligible_buys = sum(
         action.get("action") == "BUY"
-        and to_futu_symbol(market, str(action.get("symbol") or ""))
+        and trend_action_futu_symbol(locked_report, action, market)
         not in sell_symbols
         for action in actions
     )
@@ -919,12 +920,12 @@ def _execute_locked_report(
         }
     symbols = sorted(
         {
-            to_futu_symbol(market, str(action["symbol"]))
+            trend_action_futu_symbol(locked_report, action, market)
             for action in actions
             if (
                 allow_new_buys
                 and action["action"] == "BUY"
-                and to_futu_symbol(market, str(action["symbol"]))
+                and trend_action_futu_symbol(locked_report, action, market)
                 not in sell_symbols
             )
         }
@@ -2358,7 +2359,7 @@ def _execution_completed(
         return True
 
     sell_symbols = {
-        to_futu_symbol(cycle.market, str(action.get("symbol") or ""))
+        trend_action_futu_symbol(report, action, cycle.market)
         for action in actions
         if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
@@ -2367,7 +2368,8 @@ def _execution_completed(
         symbol = str(action.get("symbol") or "").strip()
         if (
             action_name == "BUY"
-            and to_futu_symbol(cycle.market, symbol) in sell_symbols
+            and trend_action_futu_symbol(report, action, cycle.market)
+            in sell_symbols
         ):
             continue
         events, resolutions = load_trend_action_audit(
@@ -2375,6 +2377,7 @@ def _execution_completed(
             market=cycle.market,
             execution_date=cycle.execution_date,
             symbol=symbol,
+            futu_symbol=trend_action_futu_symbol(report, action, cycle.market),
             side="buy" if action_name == "BUY" else "sell",
             progress=progress,
         )

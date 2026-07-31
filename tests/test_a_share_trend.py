@@ -229,6 +229,39 @@ def test_futu_simulation_account_ignores_explicit_zero_quantity_rows() -> None:
     assert account.positions == ()
 
 
+def test_futu_simulation_account_preserves_exact_position_code() -> None:
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100",
+                "cash": "50",
+                "positions": [
+                    {
+                        "code": "SH.000001",
+                        "stock_name": "上证测试",
+                        "qty": "100",
+                        "market_val": "50",
+                    }
+                ],
+            }
+
+        def close(self) -> None:
+            pass
+
+    account = load_futu_simulate_trend_account(
+        host="127.0.0.1",
+        port=11111,
+        simulate_acc_id=101,
+        market="CN",
+        expected_date="2026-07-17",
+        account_factory=lambda **_kwargs: Client(),
+    )
+
+    assert account.positions[0].symbol == "000001"
+    assert account.positions[0].futu_symbol == "SH.000001"
+
+
 def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
     from open_trader.a_share_trend import UNIFIED_TREND_FIELDS
 
@@ -409,6 +442,103 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
         estimated_api_cost=Decimal("1.20"),
         actual_api_cost=Decimal("1.00"),
     )
+
+
+def test_new_mapping_report_freezes_actions_and_skips_unmapped_candidate() -> None:
+    schema = "open_trader.trend_symbol_mapping.v1"
+    mapped = replace(candidate("000001"), futu_symbol="SH.000001")
+    mapped_report = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(mapped,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"symbol_mapping_schema": schema},
+    )
+    mapped_payload = trend_module._report_payload(mapped_report)
+
+    assert mapped_payload["metadata"]["symbol_mapping_schema"] == schema
+    assert mapped_payload["strategy_judgments"]["formal_actions"][0][
+        "futu_symbol"
+    ] == "SH.000001"
+
+    unmapped_report = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(candidate("600001"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"symbol_mapping_schema": schema},
+    )
+    unmapped_payload = trend_module._report_payload(unmapped_report)
+
+    assert [item["symbol"] for item in unmapped_payload["strategy_judgments"][
+        "top10_candidates"
+    ]] == ["600001"]
+    assert unmapped_payload["strategy_judgments"]["formal_actions"] == []
+    assert unmapped_payload["strategy_judgments"]["risk_skips"][0][
+        "reason"
+    ] == "symbol_mapping_unavailable"
+
+
+def test_new_mapping_report_freezes_simulated_sell_but_not_real_advice() -> None:
+    schema = "open_trader.trend_symbol_mapping.v1"
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=(
+            AccountPosition(
+                "000001",
+                "模拟持仓",
+                "stock",
+                Decimal("100"),
+                Decimal("10"),
+                Decimal("1000"),
+                "SH.000001",
+            ),
+        ),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(
+            AccountPosition(
+                "515450",
+                "红利50",
+                "etf",
+                Decimal("100"),
+                Decimal("1.4"),
+                Decimal("146"),
+                "SH.515450",
+            ),
+        ),
+        holding_snapshots={"515450": holding("515450", danger=True)},
+        bars_by_symbol={"515450": bars()},
+        prior_state=None,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=(),
+        holding_snapshots={"000001": holding("000001", danger=True)},
+        bars_by_symbol={"000001": bars()},
+        metadata={"symbol_mapping_schema": schema},
+        real_holdings=real,
+    )
+    payload = trend_module._report_payload(built)
+    actions = payload["strategy_judgments"]["formal_actions"]
+
+    assert [(item["symbol"], item["futu_symbol"]) for item in actions] == [
+        ("000001", "SH.000001")
+    ]
+    assert all(item["symbol"] != "515450" for item in actions)
 
 
 def unlock_live_drawdown(

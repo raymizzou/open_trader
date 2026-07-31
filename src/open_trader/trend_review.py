@@ -196,6 +196,33 @@ def _market(value: object) -> str:
     return market
 
 
+def trend_action_futu_symbol(
+    report: Mapping[str, object],
+    action: Mapping[str, object],
+    market: str,
+) -> str:
+    from .futu_symbols import to_futu_symbol
+    from .trend_animals import TREND_SYMBOL_MAPPING_SCHEMA
+
+    metadata = report.get("metadata")
+    marker = (
+        metadata.get("symbol_mapping_schema")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if marker is None:
+        return to_futu_symbol(market, str(action.get("symbol") or ""))
+    if marker != TREND_SYMBOL_MAPPING_SCHEMA:
+        raise ValueError("trend report symbol mapping schema is unsupported")
+    frozen = action.get("futu_symbol")
+    if not isinstance(frozen, str) or not frozen.strip():
+        raise ValueError("trend action frozen Futu symbol is unavailable")
+    canonical = to_futu_symbol(market, frozen)
+    if frozen != canonical:
+        raise ValueError("trend action frozen Futu symbol is invalid")
+    return frozen
+
+
 def _fact_path(
     data_dir: Path, stream: str, market: str, trading_date: str
 ) -> Path:
@@ -1274,11 +1301,9 @@ def record_trend_review_missed_buys(
         and current.time().replace(tzinfo=None) <= window_end
     ):
         return 0
-    from .futu_symbols import to_futu_symbol
-
     report_sha = _report_hash(report)
     sell_symbols = {
-        to_futu_symbol(market, str(action.get("symbol") or ""))
+        trend_action_futu_symbol(report, action, market)
         for action in actions
         if action.get("action") in {"SELL_ALL", "SELL_PARTIAL"}
     }
@@ -1287,10 +1312,10 @@ def record_trend_review_missed_buys(
         symbol = str(action.get("symbol") or "").strip()
         if (
             action.get("action") != "BUY"
-            or to_futu_symbol(market, symbol) in sell_symbols
+            or trend_action_futu_symbol(report, action, market) in sell_symbols
         ):
             continue
-        futu_code = to_futu_symbol(market, symbol)
+        futu_code = trend_action_futu_symbol(report, action, market)
         action_key = trend_action_key(
             market, execution_date, futu_code, "buy"
         )
@@ -2037,6 +2062,7 @@ def load_trend_action_audit(
     execution_date: str,
     symbol: str,
     side: str,
+    futu_symbol: str | None = None,
     progress: Callable[[], None] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     market = _market(market)
@@ -2047,7 +2073,11 @@ def load_trend_action_audit(
         raise ValueError("trend action identity is invalid")
     from .futu_symbols import to_futu_symbol
 
-    futu_code = to_futu_symbol(market, symbol)
+    futu_code = to_futu_symbol(
+        market, futu_symbol if futu_symbol is not None else symbol
+    )
+    if futu_symbol is not None and futu_code != futu_symbol:
+        raise ValueError("trend action frozen Futu symbol is invalid")
     action_key = trend_action_key(
         market, execution_date, futu_code, side
     )
@@ -3025,8 +3055,6 @@ def _preflight_open_actions(
     if not strategy_version:
         raise ValueError("trend report strategy version is unavailable")
 
-    from .futu_symbols import to_futu_symbol
-
     validated: list[Mapping[str, object]] = []
     sell_actions_by_symbol: set[str] = set()
     for action in actions:
@@ -3036,7 +3064,7 @@ def _preflight_open_actions(
         symbol = str(action.get("symbol") or "").strip()
         if action_name not in {"BUY", "SELL_ALL", "SELL_PARTIAL"} or not symbol:
             raise ValueError("trend review action is invalid")
-        futu_code = to_futu_symbol(market, symbol)
+        futu_code = trend_action_futu_symbol(report, action, market)
         if action_name in {"SELL_ALL", "SELL_PARTIAL"}:
             if futu_code in sell_actions_by_symbol:
                 raise ValueError("trend review has conflicting sell actions")
@@ -3160,14 +3188,12 @@ def execute_trend_review_open(
     nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
     if nav <= 0:
         raise TrendReviewAccountStateError("simulate net value must be positive")
-    from .futu_symbols import to_futu_symbol
-
     report_sha = _report_hash(report)
     submitted = 0
     artifacts: list[str] = []
     blocked_status: str | None = None
     sell_symbols = {
-        to_futu_symbol(market, str(action.get("symbol") or ""))
+        trend_action_futu_symbol(report, action, market)
         for action in actions
         if (
             isinstance(action, Mapping)
@@ -3196,7 +3222,7 @@ def execute_trend_review_open(
         symbol = str(action.get("symbol") or "").strip()
         if action_name not in {"BUY", "SELL_ALL", "SELL_PARTIAL"}:
             continue
-        futu_code = to_futu_symbol(market, symbol)
+        futu_code = trend_action_futu_symbol(report, action, market)
         side = "buy" if action_name == "BUY" else "sell"
         action_key = trend_action_key(market, execution_date, futu_code, side)
         action_evidence = {
@@ -5659,6 +5685,12 @@ def rebuild_trend_report_from_evidence(
             quantity=Decimal(str(item["quantity"])),
             avg_cost_price=decimal_or_none(item.get("avg_cost_price")),
             market_value=Decimal(str(item.get("market_value", "0"))),
+            futu_symbol=(
+                str(item["futu_symbol"])
+                if isinstance(item.get("futu_symbol"), str)
+                and item.get("futu_symbol")
+                else None
+            ),
         )
         for item in positions_raw
         if isinstance(item, Mapping)
@@ -5794,6 +5826,12 @@ def rebuild_trend_report_from_evidence(
                             ),
                             market_value=Decimal(
                                 str(raw_position.get("market_value", "0"))
+                            ),
+                            futu_symbol=(
+                                str(raw_position["futu_symbol"])
+                                if isinstance(raw_position.get("futu_symbol"), str)
+                                and raw_position.get("futu_symbol")
+                                else None
                             ),
                         )
                     )

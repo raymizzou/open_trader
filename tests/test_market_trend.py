@@ -951,6 +951,12 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         def get_account_balance(self) -> dict[str, object]:
             return {"balance": "100"}
 
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
         def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
             if tm_id == 700001:
                 return [
@@ -1139,6 +1145,10 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     actions = payload["strategy_judgments"]["formal_actions"]
     assert actions[0]["action"] == "BUY"
     assert actions[0]["symbol"] == "02800"
+    assert actions[0]["futu_symbol"] == "HK.02800"
+    assert payload["metadata"]["symbol_mapping_schema"] == (
+        "open_trader.trend_symbol_mapping.v1"
+    )
     assert actions[0]["target_amount"] == "4000.00"
     assert actions[0]["estimated_shares"] == 400
     assert payload["account"]["fresh"] is True
