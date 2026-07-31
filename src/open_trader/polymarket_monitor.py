@@ -1603,11 +1603,7 @@ class PolymarketMonitor:
             )
             self._activity_scan_due_at = completed
             subscribed_ids = set(self._active_relation_ids) & set(self._relation_ids_subscribed())
-            subscribed_tokens = {
-                token
-                for relation_id in subscribed_ids
-                for token in self._relation_subscription_tokens(relation_id)
-            }
+            subscribed_tokens = set(self._market_by_token) | set(self._relation_by_token)
             statuses = [
                 self._codex_statuses.get(relation_id, "pending")
                 for relation_id in self._active_relation_ids
@@ -2213,11 +2209,7 @@ class PolymarketMonitor:
         )
         self._activity["subscribed_relations"] = len(self._relation_ids_subscribed())
         self._activity["subscribed_tokens"] = len(
-            {
-                token
-                for relation_id in self._relation_ids_subscribed()
-                for token in self._relation_subscription_tokens(relation_id)
-            }
+            set(self._market_by_token) | set(self._relation_by_token)
         )
 
     def _merge_relation_rows(

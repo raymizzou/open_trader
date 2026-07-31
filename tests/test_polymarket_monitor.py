@@ -1319,9 +1319,12 @@ def test_rejected_relations_leave_pending_subscriptions_intact(tmp_path: Path) -
     )
     client = FakePublicClient()
     asyncio.run(monitor._run_full_relation_scan(client))
+    monitor._market_by_token["top20-token"] = "top20-market"
     asyncio.run(monitor._refresh_relation_activity(client))
     relation_ids = set(monitor._active_relation_ids)
     assert len(relation_ids) == 2
+    snapshot = monitor.snapshot()["relation_discovery"]
+    assert snapshot["activity"]["subscribed_tokens"] == snapshot["websocket"]["subscribed_tokens"]
 
     async def reject_one() -> None:
         await monitor._poll_relation_validation(client)
