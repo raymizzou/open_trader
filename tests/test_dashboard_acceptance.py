@@ -3300,6 +3300,7 @@ class TabbedAccountPage:
         self.reports = source["trend_reports"]  # type: ignore[assignment]
         self.reviews = source["trend_reviews"]  # type: ignore[assignment]
         self.controllers = source.get("trend_controllers", trend_controllers())  # type: ignore[assignment]
+        self.broker_positions = source.get("broker_positions", [])
         self.section_texts = dict(ACCOUNT_SECTION_TEXTS)
         self.entry_texts = {
             broker: (
@@ -3407,7 +3408,9 @@ class TabbedAccountPage:
 
     def evaluate(
         self, expression: str, argument: object | None = None,
-    ) -> bool | list[int] | dict[str, object] | Mapping[str, object] | int | None:
+    ) -> bool | list[int] | list[dict[str, object]] | dict[str, object] | Mapping[str, object] | int | None:
+        if expression == "() => state.dashboard?.broker_positions ?? []":
+            return self.broker_positions
         if expression == "broker => state.dashboard?.trend_controllers?.[broker] ?? null":
             return self.controllers.get(str(argument))
         if "openResearchChat" in expression:
@@ -4614,6 +4617,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def evaluate(
             self, expression: str, argument: object | None = None
         ) -> object:
+            if expression == "() => state.dashboard?.broker_positions ?? []":
+                return super().evaluate(expression, argument)
             if "clearInterval(state.quoteIntervalId)" in expression:
                 polling_freezes.append(self.name)
                 return True
@@ -4892,15 +4897,25 @@ def test_validate_dashboard_payload_requires_controller_owned_position_fields() 
     assert any("控制器持仓第 1 行缺少字段" in error for error in errors)
 
 
-def test_check_controller_owned_rows_matches_dom_projection() -> None:
-    position = _controller_position()
-    dom_values = dict(position)
+def test_check_controller_owned_rows_uses_current_page_projection() -> None:
+    stale_position = _controller_position("DRAM")
+    stale_position["last_price"] = "53.38"
+    page_position = dict(stale_position)
+    page_position["last_price"] = "53.40"
+    dom_values = dict(page_position)
+
+    class Page:
+        def evaluate(self, expression: str) -> list[dict[str, str]]:
+            assert expression == (
+                "() => state.dashboard?.broker_positions ?? []"
+            )
+            return [page_position]
 
     class Row:
         def get_attribute(self, name: str) -> str:
             return {
                 "data-broker": "tiger",
-                "data-symbol": "QQQ",
+                "data-symbol": "DRAM",
                 **{
                     attribute: dom_values[field]
                     for field, attribute in dashboard_acceptance.CONTROLLER_DOM_FIELDS.items()
@@ -4920,12 +4935,12 @@ def test_check_controller_owned_rows_matches_dom_projection() -> None:
             return Rows()
 
     dashboard_acceptance._check_controller_owned_rows(
-        Section(), [position], "tiger"
+        Page(), Section(), "tiger"
     )
-    position["market_value_hkd"] = "7801"
-    with pytest.raises(AssertionError, match="market_value_hkd"):
+    dom_values["last_price"] = stale_position["last_price"]
+    with pytest.raises(AssertionError, match="last_price"):
         dashboard_acceptance._check_controller_owned_rows(
-            Section(), [position], "tiger"
+            Page(), Section(), "tiger"
         )
 
 

@@ -2935,7 +2935,11 @@ def _check_trend_holding_tabs(
     )
 
 
-def _check_controller_owned_rows(section: Any, positions: list[Any], broker: str) -> None:
+def _check_controller_owned_rows(page: Any, section: Any, broker: str) -> None:
+    positions = page.evaluate(
+        "() => state.dashboard?.broker_positions ?? []"
+    )
+    assert isinstance(positions, list), "页面持仓状态无效"
     expected = [
         row for row in positions
         if isinstance(row, Mapping)
@@ -3037,7 +3041,7 @@ def _check_account_holdings(
             )
         else:
             assert empty.count() == 0, f"{broker} 有持仓账户错误显示空状态"
-        _check_controller_owned_rows(section, positions, broker)
+        _check_controller_owned_rows(page, section, broker)
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"

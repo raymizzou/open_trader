@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- Made Dashboard browser acceptance compare volatile controller-owned prices
+  with the page's current state instead of a pre-navigation snapshot. Live
+  quote fetch and valid-price checks remain strict, so normal price movement no
+  longer causes a false DOM mismatch.
 - Moved account-table financial fields into the account-sync controller's
   published Dashboard projection. The browser now only renders controller
   values, so missing FX or quotes cannot blank HKD market values and weights;
