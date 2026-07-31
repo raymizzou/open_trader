@@ -1391,6 +1391,10 @@ def serve_dashboard(
     eastmoney_password: str = "",
     prediction_notifier: object | None = None,
 ) -> None:
+    print(
+        f"dashboard_runtime: {json.dumps(_dashboard_runtime_metadata())}",
+        flush=True,
+    )
     trend_simulate_position_service = TrendSimulatePositionService(
         host=config.futu_host,
         port=config.futu_port,
@@ -1478,10 +1482,6 @@ def serve_dashboard(
     )
     _, actual_port = server.server_address
     try:
-        print(
-            f"dashboard_runtime: {json.dumps(_dashboard_runtime_metadata())}",
-            flush=True,
-        )
         print(f"dashboard_url: http://{host}:{actual_port}", flush=True)
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")

@@ -12079,6 +12079,7 @@ def test_serve_dashboard_configures_simulate_accounts_once(
 
         def prewarm(self) -> None:
             prewarmed.append(True)
+            print("simulate prewarm output")
 
     class FakeServer:
         server_address = ("127.0.0.1", 8765)
@@ -12115,6 +12116,7 @@ def test_serve_dashboard_configures_simulate_accounts_once(
         ["git", "-C", str(Path.cwd()), "rev-parse", "HEAD"], text=True
     ).strip()
     output = capsys.readouterr().out
+    assert output.splitlines()[0].startswith("dashboard_runtime: ")
     assert f'"pid": {os.getpid()}' in output
     assert f'"git_sha": "{sha}"' in output
     assert len(created) == 1
