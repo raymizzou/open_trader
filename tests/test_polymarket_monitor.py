@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -124,22 +125,25 @@ def threshold_market(
     )
 
 
-def threshold_event() -> SimpleNamespace:
+def threshold_event(
+    *, event_id: str = "threshold-event", token_prefix: str = ""
+) -> SimpleNamespace:
+    prefix = token_prefix or ""
     return event(
-        "threshold-event",
+        event_id,
         volume="250",
         markets=(
             threshold_market(
                 "threshold-low",
                 question="Will Bitcoin be above $90,000 on December 31?",
-                yes="yes-low",
-                no="no-low",
+                yes=f"{prefix}yes-low",
+                no=f"{prefix}no-low",
             ),
             threshold_market(
                 "threshold-high",
                 question="Will Bitcoin be above $100,000 on December 31?",
-                yes="yes-high",
-                no="no-high",
+                yes=f"{prefix}yes-high",
+                no=f"{prefix}no-high",
             ),
         ),
     )
@@ -204,6 +208,7 @@ class FakePublicClient:
     page_mode = False
     fail_list_events = False
     fail_get_event = False
+    fail_get_order_books = False
 
     def __init__(self) -> None:
         self.stream = self.streams.pop(0) if self.streams else FakeStream()
@@ -218,6 +223,8 @@ class FakePublicClient:
 
     async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
         self.book_calls.append(list(token_ids))
+        if self.fail_get_order_books:
+            raise ConnectionError("sentinel book failure")
         # Deliberately reverse the response to prove token-id matching.
         return tuple(self.books[token_id] for token_id in reversed(token_ids))
 
@@ -301,9 +308,15 @@ class FakeRelationValidator:
     def __init__(self, status: str = "approved") -> None:
         self.status = status
         self.calls = 0
+        self.relation_ids: list[str] = []
+        self.cached: dict[str, RelationValidation] = {}
+        self.block: threading.Event | None = None
 
     def validate(self, relation) -> RelationValidation:
         self.calls += 1
+        self.relation_ids.append(relation.relation_id)
+        if self.block is not None:
+            self.block.wait(timeout=5)
         approved = self.status == "approved"
         rejected = self.status == "llm_rejected"
         reason = (
@@ -311,7 +324,7 @@ class FakeRelationValidator:
             if rejected
             else (("CODEX_FAILED",) if not approved else ())
         )
-        return RelationValidation(
+        result = RelationValidation(
             status=self.status,  # type: ignore[arg-type]
             decision="APPROVE" if approved else ("REJECT" if rejected else None),
             relation=relation.relation if approved else ("NONE" if rejected else None),
@@ -349,6 +362,15 @@ class FakeRelationValidator:
                 }
             },
         )
+        if result.status in {"approved", "llm_rejected"}:
+            self.cached[relation.relation_id] = result
+        return result
+
+    def cached_validation(self, relation) -> RelationValidation | None:
+        value = self.cached.get(relation.relation_id)
+        if value is None:
+            return None
+        return replace(value, cached=True)
 
 
 def setup_public(event_rows: list[object]) -> None:
@@ -370,6 +392,7 @@ def setup_public(event_rows: list[object]) -> None:
     FakePublicClient.page_mode = False
     FakePublicClient.fail_list_events = False
     FakePublicClient.fail_get_event = False
+    FakePublicClient.fail_get_order_books = False
     PagePaginator.first_page_calls = 0
     PagePaginator.iter_calls = 0
 
@@ -619,16 +642,441 @@ def test_refresh_reads_only_official_first_page(tmp_path: Path) -> None:
 
 
 def setup_threshold_books(
-    *, low_ask: str = "0.40", high_no_ask: str = "0.48", size: str = "20"
+    *,
+    low_ask: str = "0.40",
+    high_no_ask: str = "0.48",
+    size: str = "20",
+    token_prefix: str = "",
 ) -> None:
+    prefix = token_prefix or ""
     FakePublicClient.books.update(
         {
-            "yes-low": threshold_book("yes-low", ask=low_ask, bid="0.39", size=size),
-            "no-low": threshold_book("no-low", ask="0.60", bid="0.59", size=size),
-            "yes-high": threshold_book("yes-high", ask="0.60", bid="0.59", size=size),
-            "no-high": threshold_book("no-high", ask=high_no_ask, bid="0.47", size=size),
+            f"{prefix}yes-low": threshold_book(f"{prefix}yes-low", ask=low_ask, bid="0.39", size=size),
+            f"{prefix}no-low": threshold_book(f"{prefix}no-low", ask="0.60", bid="0.59", size=size),
+            f"{prefix}yes-high": threshold_book(f"{prefix}yes-high", ask="0.60", bid="0.59", size=size),
+            f"{prefix}no-high": threshold_book(f"{prefix}no-high", ask=high_no_ask, bid="0.47", size=size),
         }
     )
+
+
+def test_activity_scan_reconsiders_complete_catalog_each_minute(tmp_path: Path) -> None:
+    first = threshold_event(event_id="threshold-a", token_prefix="a-")
+    second = threshold_event(event_id="threshold-b", token_prefix="b-")
+    setup_public([first, second])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="a-")
+    setup_threshold_books(low_ask="0.60", high_no_ask="0.60", token_prefix="b-")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+
+    asyncio.run(monitor._refresh_relation_activity(client))
+    first_activity = monitor.snapshot()["relation_discovery"]["activity"]
+    assert first_activity["relations_considered"] == 2
+    assert first_activity["relations_within_5pct"] == 1
+
+    FakePublicClient.books["b-yes-low"] = threshold_book(
+        "b-yes-low", ask="0.50", bid="0.49"
+    )
+    FakePublicClient.books["b-no-high"] = threshold_book(
+        "b-no-high", ask="0.52", bid="0.51"
+    )
+    asyncio.run(monitor._refresh_relation_activity(client))
+    second_activity = monitor.snapshot()["relation_discovery"]["activity"]
+    assert second_activity["relations_considered"] == 2
+    assert second_activity["relations_within_5pct"] == 2
+
+
+def test_zero_volume_display_metrics_do_not_block_activity_pool(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    relation_id, relation = next(iter(monitor._relations.items()))
+    monitor._relations[relation_id] = replace(
+        relation,
+        event_volume_24h=Decimal("0"),
+        event_liquidity=Decimal("0"),
+        market_a=replace(relation.market_a, volume_24h=Decimal("0"), liquidity=Decimal("0")),
+        market_b=replace(relation.market_b, volume_24h=Decimal("0"), liquidity=Decimal("0")),
+    )
+
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    assert relation_id in monitor._active_relation_ids
+
+
+def test_failed_activity_scan_keeps_last_completed_pool_and_counts(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    before = monitor.snapshot()["relation_discovery"]["activity"]
+    active_before = set(monitor._active_relation_ids)
+    FakePublicClient.fail_get_order_books = True
+
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    after = monitor.snapshot()["relation_discovery"]["activity"]
+    assert after["status"] == "degraded"
+    for key in ("relations_considered", "relations_within_5pct", "rejection_counts"):
+        assert after[key] == before[key]
+    assert set(monitor._active_relation_ids) == active_before
+    assert monitor._relation_by_token
+
+
+def test_affected_relations_price_refresh_is_targeted(tmp_path: Path) -> None:
+    setup_public(
+        [
+            threshold_event(event_id="threshold-a", token_prefix="a-"),
+            threshold_event(event_id="threshold-b", token_prefix="b-"),
+        ]
+    )
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="a-")
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="b-")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    FakePublicClient.book_calls.clear()
+    relation_a = next(
+        relation
+        for relation in monitor._relations.values()
+        if relation.event_id == "threshold-a"
+    )
+
+    asyncio.run(
+        monitor._process_stream_event(
+            client,
+            ns(
+                type="price_change",
+                payload=ns(asset_id=relation_a.buy_leg_a.token_id, price_changes=()),
+            ),
+        )
+    )
+
+    assert FakePublicClient.book_calls == [
+        sorted([relation_a.buy_leg_a.token_id, relation_a.buy_leg_b.token_id])
+    ]
+
+
+def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    now = [NOW]
+    monitor._clock = lambda: now[0]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    starts = 0
+
+    async def blocked_activity(client: object) -> None:
+        del client
+        nonlocal starts
+        starts += 1
+        entered.set()
+        await release.wait()
+
+    monitor._refresh_relation_activity = blocked_activity  # type: ignore[method-assign]
+    monitor._activity_next_scan_at = NOW
+
+    async def exercise() -> None:
+        client = FakePublicClient()
+        await monitor._tick_relation_activity(client)
+        await entered.wait()
+        now[0] = NOW + timedelta(seconds=61)
+        await monitor._tick_relation_activity(client)
+        await monitor._tick_relation_activity(client)
+        assert starts == 1
+        assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "lagging"
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert starts == 2
+        release.set()
+        task = monitor._activity_scan_task
+        if task is not None:
+            await task
+
+    asyncio.run(exercise())
+
+
+def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
+    tmp_path: Path,
+) -> None:
+    setup_public(
+        [
+            threshold_event(event_id="threshold-a", token_prefix="a-"),
+            threshold_event(event_id="threshold-b", token_prefix="b-"),
+        ]
+    )
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="a-")
+    setup_threshold_books(low_ask="0.49", high_no_ask="0.49", token_prefix="b-")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    expected = next(
+        relation_id
+        for relation_id, relation in monitor._relations.items()
+        if relation.event_id == "threshold-b"
+    )
+
+    async def exercise() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_relation_id == expected
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        await monitor._poll_relation_validation(client)
+        await asyncio.sleep(0.01)
+        assert len(validator.relation_ids) == 2
+        assert validator.relation_ids[0] == expected
+
+    asyncio.run(exercise())
+
+
+def test_transient_codex_failure_retries_once_at_the_retry_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "RELATION_VALIDATION_RETRY_SECONDS", 60)
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    now = [NOW]
+    validator = FakeRelationValidator("llm_unavailable")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+        clock=lambda: now[0],
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    async def tick() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        assert validator.calls == 1
+        now[0] = NOW + timedelta(seconds=59)
+        await monitor._poll_relation_validation(client)
+        assert validator.calls == 1
+        now[0] = NOW + timedelta(seconds=60)
+        await monitor._poll_relation_validation(client)
+        await asyncio.sleep(0.01)
+        assert validator.calls == 2
+
+    asyncio.run(tick())
+
+
+@pytest.mark.parametrize("terminal_status", ["approved", "llm_rejected"])
+def test_terminal_codex_cache_survives_pool_churn_and_restart(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    validator = FakeRelationValidator(terminal_status)
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    async def validate_once() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+
+    asyncio.run(validate_once())
+    assert validator.calls == 1
+    setup_threshold_books(low_ask="0.60", high_no_ask="0.60")
+    asyncio.run(monitor._refresh_relation_activity(client))
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    asyncio.run(monitor._refresh_relation_activity(client))
+    asyncio.run(monitor._poll_relation_validation(client))
+    assert validator.calls == 1
+
+    restarted = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    restarted._load_relation_catalog()
+    asyncio.run(restarted._refresh_relation_activity(client))
+    asyncio.run(restarted._poll_relation_validation(client))
+    assert validator.calls == 1
+
+
+def test_rejected_relations_leave_pending_subscriptions_intact(tmp_path: Path) -> None:
+    setup_public(
+        [
+            threshold_event(event_id="threshold-a", token_prefix="a-"),
+            threshold_event(event_id="threshold-b", token_prefix="b-"),
+        ]
+    )
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="a-")
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="b-")
+    validator = FakeRelationValidator("llm_rejected")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation_ids = set(monitor._active_relation_ids)
+    assert len(relation_ids) == 2
+
+    async def reject_one() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        rejected = monitor._relations[validator.relation_ids[0]]
+        rejected_tokens = set(monitor._relation_subscription_tokens(rejected.relation_id))
+        subscribed_tokens = set(monitor._relation_by_token)
+        assert subscribed_tokens
+        assert not rejected_tokens & subscribed_tokens
+        assert monitor.snapshot()["relation_discovery"]["codex_queue"]["rejected"] == 1
+
+    asyncio.run(reject_one())
+
+
+def test_activity_pool_has_no_top_n_relation_cap(tmp_path: Path) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+    relations = []
+    for index in range(301):
+        suffix = f"r{index:03d}"
+        market_a = replace(
+            base.market_a,
+            market_id=f"market-a-{suffix}",
+            condition_id=f"condition-a-{suffix}",
+            yes_token_id=f"yes-a-{suffix}",
+            no_token_id=f"no-a-{suffix}",
+        )
+        market_b = replace(
+            base.market_b,
+            market_id=f"market-b-{suffix}",
+            condition_id=f"condition-b-{suffix}",
+            yes_token_id=f"yes-b-{suffix}",
+            no_token_id=f"no-b-{suffix}",
+        )
+        relation = replace(
+            base,
+            relation_id=f"relation-{suffix}",
+            event_id=f"event-{suffix}",
+            market_a=market_a,
+            market_b=market_b,
+            buy_leg_a=replace(
+                base.buy_leg_a,
+                market_id=market_a.market_id,
+                condition_id=market_a.condition_id,
+                token_id=market_a.yes_token_id,
+            ),
+            buy_leg_b=replace(
+                base.buy_leg_b,
+                market_id=market_b.market_id,
+                condition_id=market_b.condition_id,
+                token_id=market_b.no_token_id,
+            ),
+        )
+        relations.append(relation)
+        for token in (relation.buy_leg_a.token_id, relation.buy_leg_b.token_id):
+            FakePublicClient.books[token] = threshold_book(token, ask="0.50", bid="0.49")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    monitor._set_relation_state(relations, ())
+
+    async def scan() -> None:
+        await monitor._refresh_relation_activity(FakePublicClient())
+
+    asyncio.run(scan())
+    assert len(monitor._active_relation_ids) == 301
+    assert len(monitor._relation_by_token) == 301 * 4
+    specs = FakePublicClient.subscribe_specs[-1]
+    assert isinstance(specs, list)
+    assert all(len(spec.token_ids) <= 250 for spec in specs)
+    assert len({token for spec in specs for token in spec.token_ids}) == 301 * 4
+
+
+def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    validator = FakeRelationValidator()
+    validator.block = threading.Event()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation = next(iter(monitor._relations.values()))
+
+    async def exercise() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await asyncio.sleep(0.01)
+        await asyncio.gather(
+            monitor._refresh_relation_activity(client),
+            monitor._process_stream_event(
+                client,
+                ns(
+                    type="price_change",
+                    payload=ns(asset_id=relation.buy_leg_a.token_id, price_changes=()),
+                ),
+            ),
+        )
+        validator.block.set()
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+
+    asyncio.run(exercise())
+    assert validator.calls == 1
+    assert FakePublicClient.book_calls
 
 
 def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relation(
