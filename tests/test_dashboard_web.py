@@ -3074,6 +3074,14 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert FakeMonitor.kwargs["relation_validator"].__class__.__name__ == "CodexRelationValidator"
     assert "DEEPSEEK_API_KEY" not in repr(FakeMonitor.kwargs)
     assert FakeExecution.kwargs["dashboard_url"] == "http://127.0.0.1:8766/"
+    from open_trader.notifications import render_prediction_opportunity_notification
+
+    _, notification = render_prediction_opportunity_notification(
+        {"event_title": "event"},
+        {"signal_id": "signal"},
+        dashboard_url=str(FakeExecution.kwargs["dashboard_url"]),
+    )
+    assert "Dashboard：http://127.0.0.1:8766/" in notification
     assert callable(FakeMonitor.observer)
 
 
@@ -12763,6 +12771,40 @@ def test_dashboard_healthz_reports_legacy_module_runtime(tmp_path: Path) -> None
     assert payload["git_sha"]
     assert payload["source_state"] in {"clean", "dirty"}
     assert payload["started_at"]
+
+
+def test_dashboard_healthz_reuses_startup_runtime_metadata(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    runtime = {
+        "pid": 1234,
+        "started_at": "2026-07-31T23:00:00+08:00",
+        "cwd": "/srv/open_trader",
+        "git_sha": "accepted-sha",
+        "source_state": "clean",
+    }
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata=runtime,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=5) as response:
+            payload = json.load(response)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert payload["pid"] == 1234
+    assert payload["started_at"] == "2026-07-31T23:00:00+08:00"
+    assert payload["cwd"] == "/srv/open_trader"
+    assert payload["git_sha"] == "accepted-sha"
+    assert payload["source_state"] == "clean"
 
 
 def test_prediction_history_projects_observed_signal_fields() -> None:

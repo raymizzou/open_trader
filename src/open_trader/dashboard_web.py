@@ -941,6 +941,7 @@ def create_dashboard_server(
     prediction_execution_service: object | None = None,
     prediction_session_token: str | None = None,
     prediction_csrf_token: str | None = None,
+    runtime_metadata: Mapping[str, object] | None = None,
 ) -> ThreadingHTTPServer:
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
     import_service = statement_import_service or StatementImportService(
@@ -951,6 +952,11 @@ def create_dashboard_server(
     portfolio_update_lock = threading.Lock()
     prediction_session = prediction_session_token or secrets.token_urlsafe(32)
     prediction_csrf = prediction_csrf_token or secrets.token_urlsafe(32)
+    health_runtime = dict(
+        runtime_metadata
+        if runtime_metadata is not None
+        else _dashboard_runtime_metadata()
+    )
 
     class DashboardRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -973,7 +979,7 @@ def create_dashboard_server(
                     {
                         "schema_version": "open_trader.legacy_dashboard.health.v1",
                         "module": "legacy_dashboard",
-                        **_dashboard_runtime_metadata(),
+                        **health_runtime,
                     }
                 )
                 return
@@ -1404,10 +1410,8 @@ def serve_dashboard(
     resolved_public_url = public_url.strip() or f"http://{host}:{port}/"
     if not resolved_public_url.endswith("/"):
         resolved_public_url += "/"
-    print(
-        f"dashboard_runtime: {json.dumps(_dashboard_runtime_metadata())}",
-        flush=True,
-    )
+    runtime_metadata = _dashboard_runtime_metadata()
+    print(f"dashboard_runtime: {json.dumps(runtime_metadata)}", flush=True)
     trend_simulate_position_service = TrendSimulatePositionService(
         host=config.futu_host,
         port=config.futu_port,
@@ -1492,11 +1496,11 @@ def serve_dashboard(
         prediction_store=prediction_store,
         prediction_monitor=prediction_monitor,
         prediction_execution_service=prediction_execution,
+        runtime_metadata=runtime_metadata,
     )
     _, actual_port = server.server_address
     try:
         print(f"dashboard_url: {resolved_public_url}", flush=True)
-        print(f"dashboard_listener: http://{host}:{actual_port}/", flush=True)
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")

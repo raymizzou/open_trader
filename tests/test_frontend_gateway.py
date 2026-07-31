@@ -198,6 +198,23 @@ def test_gateway_forwards_api_get_path_query_status_and_body(tmp_path: Path) -> 
     assert upstream.requests[0]["path"] == "/api/items?limit=2&kind=a"
 
 
+def test_gateway_rewrites_only_the_configured_public_origin(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    upstream = _Upstream()
+    request = urllib.request.Request(
+        "http://unused/api/state",
+        headers={"Origin": "http://127.0.0.1:9999"},
+    )
+    with _running(upstream), _gateway(
+        tmp_path / "static", upstream.server_address[1]
+    ) as base:
+        request.full_url = base + "/api/state"
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+
+    assert upstream.requests[0]["headers"]["Origin"] == "http://127.0.0.1:9999"
+
+
 def test_gateway_forwards_api_post_body_cookie_csrf_and_trusted_origin(
     tmp_path: Path,
 ) -> None:
