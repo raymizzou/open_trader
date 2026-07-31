@@ -4803,18 +4803,20 @@ function render(status){
   state.dashboard.account_sync.status=status==="ok"?"ok":"abnormal";
   state.dashboard.account_sync.label=status==="ok"?"同步正常":"同步异常";
   const group=accountHoldingGroups().find((item)=>item.broker==="tiger");
-  return {status:renderAccountSyncStatus(),card:renderBrokerSummaryCards(),sources:renderSourceStatusList(),section:renderAccountSection(group)};
+  return {
+    card: renderBrokerSummaryCards(),
+    sources: renderSourceStatusList(),
+    section: renderAccountSection(group),
+  };
 }
 console.log(JSON.stringify({ok:render("ok"),failed:render("failed"),stale:render("stale"),unknown:render("unknown")}));
 ''')
     rendered = json.loads(output)
 
-    assert "同步正常" in rendered["ok"]["status"]
-    assert "心跳 2026-07-30 12:10" in rendered["ok"]["status"]
     assert rendered["ok"]["section"].count("account-holding-row") == 14
+    assert "控制器" not in rendered["ok"]["sources"]
     assert "同步失败 · 数据截至 11:56" in rendered["failed"]["card"]
-    assert "同步异常" in rendered["failed"]["status"]
-    assert "同步失败 · 数据截至 11:56" in rendered["failed"]["sources"]
+    assert "同步失败 · 上次 11:56" in rendered["failed"]["sources"]
     assert "人工复核" in rendered["failed"]["section"]
     assert 'data-detail-mode="t_signal"' not in rendered["failed"]["section"]
     assert "数据已过期 · 数据截至 11:56" in rendered["stale"]["section"]
@@ -4822,6 +4824,42 @@ console.log(JSON.stringify({ok:render("ok"),failed:render("failed"),stale:render
     assert "status-failed" in rendered["failed"]["sources"]
     assert "status-stale" in rendered["stale"]["sources"]
     assert "status-muted" in rendered["unknown"]["sources"]
+
+
+def test_dashboard_groups_broker_sources_and_shows_each_source_time() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard={account_sync:{brokers:{
+  futu:{status:"ok",display:"同步正常",data_as_of:"2026-07-31T13:48:44+08:00"},
+  tiger:{status:"ok",display:"同步正常",data_as_of:"2026-07-31T13:49:01+08:00"},
+  phillips:{status:"ok",display:"同步正常",data_as_of:"2026-07-29"},
+  eastmoney:{status:"ok",display:"同步正常",data_as_of:"2026-07-30"},
+}}};
+const normal=renderSourceStatusList();
+state.dashboard.account_sync.brokers={
+  futu:{status:"failed",data_as_of:"2026-07-31T12:10:00+08:00"},
+  tiger:{status:"ok",data_as_of:"",last_success_at:"2026-07-31T13:47:00+08:00"},
+  phillips:{status:"stale",data_as_of:"2026-07-29"},
+  eastmoney:{status:"unknown",data_as_of:""},
+};
+console.log(JSON.stringify({normal,abnormal:renderSourceStatusList()}));
+''')
+    rendered = json.loads(output)
+    normal = rendered["normal"]
+    abnormal = rendered["abnormal"]
+
+    assert normal.index("实时账户") < normal.index("富途账户")
+    assert normal.index("老虎账户") < normal.index("券商结单")
+    assert normal.index("券商结单") < normal.index("辉立账户")
+    assert normal.index("辉立账户") < normal.index("东方财富账户")
+    assert "同步正常 · 13:48" in normal
+    assert "同步正常 · 13:49" in normal
+    assert "数据截至 · 07-29" in normal
+    assert "数据截至 · 07-30" in normal
+    assert "控制器" not in normal
+    assert "同步失败 · 上次 12:10" in abnormal
+    assert "同步正常 · 13:47" in abnormal
+    assert "数据已过期 · 截至 07-29" in abnormal
+    assert "同步状态未知 · 数据未验证" in abnormal
 
 
 def test_trading_decision_tab_css() -> None:

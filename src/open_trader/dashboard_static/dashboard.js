@@ -69,6 +69,10 @@ const ACCOUNT_STRATEGY_PROFILES = {
 };
 
 const ACCOUNT_BROKERS = Object.keys(ACCOUNT_STRATEGY_PROFILES);
+const ACCOUNT_SOURCE_GROUPS = [
+  {label: "实时账户", brokers: ["futu", "tiger"]},
+  {label: "券商结单", brokers: ["phillips", "eastmoney"]},
+];
 const TREND_ACCOUNT_BROKERS = ["tiger", "phillips", "eastmoney"];
 const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report"];
 
@@ -8380,6 +8384,36 @@ function brokerSyncStatus(broker) {
   };
 }
 
+function brokerSourceTime(broker, source) {
+  const live = ["futu", "tiger"].includes(broker);
+  const raw = String(firstPresent(
+    source?.data_as_of,
+    live ? source?.last_success_at : "",
+  ) || "");
+  if (live) {
+    const match = raw.match(/(?:T|\s|^)(\d{2}:\d{2})(?::\d{2})?/);
+    return match ? match[1] : "";
+  }
+  const match = raw.match(/\b\d{4}-(\d{2}-\d{2})\b/);
+  return match ? match[1] : "";
+}
+
+function brokerSourceStatus(broker) {
+  const sync = brokerSyncStatus(broker);
+  const source = state.dashboard?.account_sync?.brokers?.[broker] || {};
+  const live = ["futu", "tiger"].includes(broker);
+  const time = brokerSourceTime(broker, source);
+  const suffix = time ? ` · ${time}` : "";
+  const display = sync.status === "ok"
+    ? (live ? `同步正常${suffix}` : (time ? `数据截至${suffix}` : "同步正常"))
+    : sync.status === "failed"
+      ? `同步失败${time ? ` · ${live ? "上次 " : "数据截至 "}${time}` : ""}`
+      : sync.status === "stale"
+        ? `数据已过期${time ? ` · 截至 ${time}` : ""}`
+        : "同步状态未知 · 数据未验证";
+  return {...sync, display};
+}
+
 function renderAccountSyncStatus() {
   const sync = state.dashboard?.account_sync || {};
   const controller = sync.controller || {};
@@ -8434,22 +8468,18 @@ function renderSourceStatusListIntoHeader() {
 }
 
 function renderSourceStatusList() {
-  const controller = state.dashboard?.account_sync?.controller || {};
-  const controllerStatus = String(controller.status || "unknown").toLowerCase();
-  const controllerClass = sourceStatusClass(controllerStatus);
-  const controllerText = controller.heartbeat_at
-    ? `心跳 ${formatPlain(controller.heartbeat_at)}`
-    : "同步状态未知 · 数据未验证";
-  return [`<div class="source-status-row ${escapeHtml(controllerClass)}"><strong>控制器</strong><span>${escapeHtml(controllerText)}</span></div>`,
-    ...ACCOUNT_BROKERS.map((broker) => {
-    const sync = brokerSyncStatus(broker);
-    return `
-      <div class="source-status-row ${escapeHtml(sourceStatusClass(sync.status))}" data-broker="${escapeHtml(broker)}">
-        <strong>${escapeHtml(brokerDisplayName(broker))}账户</strong>
-        <span>${escapeHtml(sync.display)}</span>
-      </div>
-    `;
-  })].join("");
+  return ACCOUNT_SOURCE_GROUPS.map((group) => `
+    <div class="source-status-group">${escapeHtml(group.label)}</div>
+    ${group.brokers.map((broker) => {
+      const sync = brokerSourceStatus(broker);
+      return `
+        <div class="source-status-row ${escapeHtml(sourceStatusClass(sync.status))}" data-broker="${escapeHtml(broker)}">
+          <strong>${escapeHtml(brokerDisplayName(broker))}账户</strong>
+          <span>${escapeHtml(sync.display)}</span>
+        </div>
+      `;
+    }).join("")}
+  `).join("");
 }
 
 function sourceStatuses() {
