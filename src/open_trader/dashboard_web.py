@@ -29,7 +29,14 @@ from .dashboard import (
 from .dashboard_quotes import SHANGHAI_TZ, load_published_quotes
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
-from .polymarket_relation_discovery import CodexRelationValidator, discover_threshold_relations
+from .polymarket_relation_discovery import (
+    CodexRelationValidator,
+    discover_threshold_relation_catalog,
+)
+
+# Keep the old module attribute for downstream test fakes while production
+# wiring uses the catalog result contract above.
+discover_threshold_relations = discover_threshold_relation_catalog
 from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .daily_premarket import build_notifier
 from .notifications import NullNotifier
@@ -1368,7 +1375,7 @@ def serve_dashboard(
             prediction_monitor = PolymarketMonitor(
                 store=prediction_store,
                 trading=prediction_trading,
-                relation_discovery=discover_threshold_relations,
+                relation_discovery=discover_threshold_relation_catalog,
                 relation_validator=relation_validator,
             )
             prediction_execution = PredictionExecutionService(

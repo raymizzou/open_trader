@@ -12,7 +12,9 @@ import pytest
 
 from open_trader.polymarket_relation_discovery import (
     RelationValidation,
+    discover_threshold_relation_catalog,
     discover_threshold_relations,
+    threshold_relation_payload,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
@@ -201,6 +203,7 @@ class FakePublicClient:
     get_event_calls: list[str] = []
     page_mode = False
     fail_list_events = False
+    fail_get_event = False
 
     def __init__(self) -> None:
         self.stream = self.streams.pop(0) if self.streams else FakeStream()
@@ -220,6 +223,8 @@ class FakePublicClient:
 
     async def get_event(self, *, id: str) -> object:
         self.get_event_calls.append(id)
+        if self.fail_get_event:
+            raise ConnectionError("sentinel event failure")
         return next(row for row in self.events if str(getattr(row, "id", "")) == id)
 
     def subscribe(self, spec: object) -> FakeStream:
@@ -364,6 +369,7 @@ def setup_public(event_rows: list[object]) -> None:
     FakePublicClient.get_event_calls = []
     FakePublicClient.page_mode = False
     FakePublicClient.fail_list_events = False
+    FakePublicClient.fail_get_event = False
     PagePaginator.first_page_calls = 0
     PagePaginator.iter_calls = 0
 
@@ -372,8 +378,9 @@ def make_monitor(
     tmp_path: Path,
     *,
     trading: FakeTrading | None = None,
-    relation_discovery=None,
+    relation_discovery=discover_threshold_relation_catalog,
     relation_validator=None,
+    clock=None,
 ):
     from open_trader.polymarket_monitor import PolymarketMonitor
 
@@ -381,10 +388,191 @@ def make_monitor(
         store=PredictionArbitrageStore(tmp_path / "data"),
         trading=trading or FakeTrading(),
         public_client_factory=FakePublicClient,
-        clock=lambda: NOW,
+        clock=clock or (lambda: NOW),
         relation_discovery=relation_discovery,
         relation_validator=relation_validator,
     )
+
+
+def test_restart_loads_fresh_relation_catalog_without_full_scan(tmp_path: Path) -> None:
+    relation = discover_threshold_relations([threshold_event()])[0]
+    setup_public([])
+    db = PredictionArbitrageStore(tmp_path / "data")
+    db.save_relation_state(
+        {"relations": [threshold_relation_payload(relation)]},
+        full_scanned_at=NOW.isoformat(),
+    )
+    monitor = make_monitor(tmp_path)
+    monitor._load_relation_catalog()
+    assert set(monitor._relations) == {relation.relation_id}
+    assert FakePublicClient.list_events_calls == []
+
+
+def test_restart_rehydrates_persisted_catalog_funnel_counts(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    expected = monitor.snapshot()["relation_discovery"]["catalog"]
+
+    setup_public([])
+    restarted = make_monitor(tmp_path)
+    restarted._load_relation_catalog()
+    catalog = restarted.snapshot()["relation_discovery"]["catalog"]
+    for key in (
+        "events_seen",
+        "events_eligible",
+        "markets_seen",
+        "markets_normalized",
+        "threshold_markets",
+        "unique_tokens",
+        "relation_count",
+        "rejection_counts",
+    ):
+        assert catalog[key] == expected[key]
+
+
+def test_restart_restores_event_scan_activity_due_state(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    assert asyncio.run(
+        monitor._refresh_relation_event(FakePublicClient(), "threshold-event")
+    )
+    completed_at = monitor.snapshot()["relation_discovery"]["catalog"][
+        "last_event_run"
+    ]["completed_at"]
+
+    restarted = make_monitor(tmp_path)
+    restarted._load_relation_catalog()
+    catalog = restarted.snapshot()["relation_discovery"]["catalog"]
+    assert catalog["activity_scan_due"] is True
+    assert catalog["activity_scan_due_at"] == completed_at
+
+
+def test_event_scan_without_full_anchor_stays_due_for_full_scan(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    assert not asyncio.run(
+        monitor._refresh_relation_event(FakePublicClient(), "threshold-event")
+    )
+    assert monitor._catalog_full_scanned_at is None
+    assert monitor._catalog_due(NOW) is True
+    assert monitor._store.load_relation_state() is None
+
+
+def test_full_scan_consumes_every_paginator_page_and_publishes_once(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        event(
+            f"ordinary-{index}",
+            markets=(market(f"market-{index}"),),
+        )
+        for index in range(21)
+    ] + [threshold_event()]
+    setup_public(rows)
+    FakePublicClient.page_mode = True
+    monitor = make_monitor(tmp_path)
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    state = monitor._store.load_relation_state()
+    assert state is not None
+    assert state["relations"]
+    assert PagePaginator.iter_calls == 1
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+
+
+def test_failed_full_scan_keeps_previous_catalog(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    before = set(monitor._relations)
+    FakePublicClient.fail_list_events = True
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    assert set(monitor._relations) == before
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "degraded"
+
+
+def test_full_scan_due_at_twenty_four_hours_without_blocking_universe(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    now = [NOW + timedelta(seconds=1)]
+    monitor = make_monitor(tmp_path, clock=lambda: now[0])
+    monitor._catalog_full_scanned_at = NOW
+    monitor._catalog_last_attempt_at = NOW
+
+    async def exercise() -> None:
+        client = FakePublicClient()
+        now[0] = NOW + timedelta(hours=23, minutes=59, seconds=59)
+        monitor._maybe_schedule_full_scan(client)
+        assert monitor._full_scan_task is None
+        now[0] = NOW + timedelta(hours=24)
+        monitor._maybe_schedule_full_scan(client)
+        first = monitor._full_scan_task
+        assert first is not None
+        monitor._maybe_schedule_full_scan(client)
+        assert monitor._full_scan_task is first
+        await monitor._refresh_universe_bounded(client)
+        await first
+
+    asyncio.run(exercise())
+    assert FakePublicClient.list_events_calls
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+
+
+def test_event_only_scan_replaces_one_event_and_preserves_full_timestamp(
+    tmp_path: Path,
+) -> None:
+    original = threshold_event()
+    ordinary = event("ordinary", markets=(market("ordinary-market"),))
+    setup_public([original, ordinary])
+    monitor = make_monitor(tmp_path)
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    full_scanned_at = monitor.snapshot()["relation_discovery"]["catalog"][
+        "full_scanned_at"
+    ]
+    previous_ids = set(monitor._relations)
+    replacement = event(
+        "threshold-event",
+        markets=(
+            threshold_market(
+                "threshold-low-new",
+                question="Will Bitcoin be above $91,000 on December 31?",
+                yes="yes-low-new",
+                no="no-low-new",
+            ),
+            threshold_market(
+                "threshold-high-new",
+                question="Will Bitcoin be above $101,000 on December 31?",
+                yes="yes-high-new",
+                no="no-high-new",
+            ),
+        ),
+    )
+    setup_public([replacement, ordinary])
+    assert asyncio.run(monitor._refresh_relation_event(FakePublicClient(), "threshold-event"))
+    assert FakePublicClient.get_event_calls == ["threshold-event"]
+    assert set(monitor._relations) != previous_ids
+    assert all(
+        relation.event_id == "threshold-event" or relation.event_id == "ordinary"
+        for relation in monitor._relations.values()
+    )
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["full_scanned_at"] == full_scanned_at
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["activity_scan_due_at"] is not None
+
+    before = set(monitor._relations)
+    full_before_failure = monitor.snapshot()["relation_discovery"]["catalog"][
+        "full_scanned_at"
+    ]
+    FakePublicClient.fail_get_event = True
+    assert not asyncio.run(
+        monitor._refresh_relation_event(FakePublicClient(), "threshold-event")
+    )
+    assert set(monitor._relations) == before
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["full_scanned_at"] == full_before_failure
 
 
 def test_refresh_uses_official_event_query_and_limits_valid_top_twenty(tmp_path: Path) -> None:
@@ -443,7 +631,7 @@ def setup_threshold_books(
     )
 
 
-def test_threshold_discovery_scans_relation_first_page_and_only_calls_codex_for_positive_relation(
+def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relation(
     tmp_path: Path,
 ) -> None:
     rows = [
@@ -470,13 +658,16 @@ def test_threshold_discovery_scans_relation_first_page_and_only_calls_codex_for_
         "ascending": False,
         "page_size": 20,
     }
+    assert len(FakePublicClient.list_events_calls) == 1
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     assert FakePublicClient.list_events_calls[1] == {
         "closed": False,
         "ended": False,
         "page_size": 100,
     }
-    assert PagePaginator.first_page_calls == 2
-    assert PagePaginator.iter_calls == 0
+    assert PagePaginator.first_page_calls == 1
+    assert PagePaginator.iter_calls == 1
+    monitor.refresh_once()
     assert len(monitor.snapshot()["events"]) == 20
     threshold_rows = [
         row
@@ -509,6 +700,7 @@ def test_nonpositive_threshold_economics_never_calls_codex(tmp_path: Path) -> No
         relation_validator=validator,
     )
 
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     monitor.refresh_once()
 
     assert validator.calls == 0
@@ -534,10 +726,11 @@ def test_new_market_refreshes_only_its_event_for_relation_discovery(
     )
     monitor = make_monitor(
         tmp_path,
-        relation_discovery=discover_threshold_relations,
+        relation_discovery=discover_threshold_relation_catalog,
         relation_validator=FakeRelationValidator(),
     )
     monitor.refresh_once()
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     list_calls_before = len(FakePublicClient.list_events_calls)
     FakePublicClient.events.append(threshold_event())
     setup_threshold_books()
@@ -573,6 +766,7 @@ def test_rejected_or_unavailable_threshold_positive_relation_remains_visible(
         relation_validator=FakeRelationValidator(validator_status),
     )
 
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     monitor.refresh_once()
 
     rows = [
@@ -605,6 +799,7 @@ def test_subcent_threshold_profit_is_visible_and_annualized_distribution_is_repo
         relation_validator=FakeRelationValidator(),
     )
 
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     monitor.refresh_once()
 
     row = next(
@@ -630,7 +825,7 @@ def test_relation_scan_logs_are_bounded_and_not_persisted(tmp_path: Path) -> Non
     for _ in range(11):
         monitor.refresh_once()
 
-    assert len(monitor.snapshot()["relation_discovery"]["scan_logs"]) == 20
+    assert len(monitor.snapshot()["relation_discovery"]["scan_logs"]) <= 20
     assert make_monitor(
         tmp_path,
         relation_discovery=discover_threshold_relations,

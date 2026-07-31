@@ -30,9 +30,11 @@ from .polymarket_relation_discovery import (
     ThresholdHedgeIntent,
     ThresholdOrderBook,
     ThresholdRelation,
+    ThresholdRelationDiscoveryResult,
     build_threshold_hedge_intent,
-    discover_threshold_relations,
     simple_annualized_yield,
+    threshold_relation_from_payload,
+    threshold_relation_payload,
 )
 
 
@@ -50,6 +52,7 @@ PUBLIC_BOOK_CONCURRENCY = 8
 STREAM_SUBSCRIPTION_CHUNK_SIZE = 250
 THRESHOLD_BOOK_BATCH_SIZE = 100
 RELATION_SCAN_LOG_LIMIT = 20
+RELATION_CATALOG_FRESHNESS_SECONDS = 24 * 60 * 60
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -275,6 +278,17 @@ class PolymarketMonitor:
         self._readiness: dict[str, object] | None = None
         self._universe_at: datetime | None = None
         self._relations_at: datetime | None = None
+        self._catalog_full_scanned_at: datetime | None = None
+        self._catalog_last_attempt_at: datetime | None = None
+        self._catalog_scan_started_at: datetime | None = None
+        self._catalog_scan_duration_seconds: float | None = None
+        self._catalog_status = "stale" if relation_discovery is not None else "unavailable"
+        self._catalog_counts: dict[str, object] = {}
+        self._catalog_last_full_run: dict[str, object] | None = None
+        self._catalog_last_event_run: dict[str, object] | None = None
+        self._activity_scan_due_at: datetime | None = None
+        self._full_scan_task: asyncio.Task[None] | None = None
+        self._catalog_loaded = False
         self._heartbeat_at: datetime | None = None
         self._stream_connected_at: datetime | None = None
         self._stream_disconnected_at: datetime | None = None
@@ -333,6 +347,7 @@ class PolymarketMonitor:
                 )
             ]
             relation_health = self._relation_health(now)
+            catalog = self._relation_catalog_snapshot(now)
             for opportunity in opportunities:
                 confirmed_at = opportunity.get("confirmed_at")
                 age = _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None)
@@ -345,11 +360,11 @@ class PolymarketMonitor:
                     opportunity["eligibility_reason"] = "monitor_degraded"
                 if (
                     opportunity.get("market_type") == "threshold_hedge"
-                    and relation_health["status"] != "healthy"
+                    and catalog["status"] != "healthy"
                 ):
                     opportunity["actionable"] = False
                     opportunity["eligibility_reason"] = (
-                        "relation_discovery_" + str(relation_health["status"])
+                        "relation_discovery_" + str(catalog["status"])
                     )
             return {
                 "status": health["status"],
@@ -362,6 +377,7 @@ class PolymarketMonitor:
                 "readiness": copy.deepcopy(self._readiness),
                 "relation_discovery": {
                     **relation_health,
+                    "catalog": catalog,
                     "scan_logs": copy.deepcopy(list(self._relation_scan_logs)),
                     "codex_usage_24h": self._llm_usage(),
                     "annualized_distribution": self._annualized_distributions(),
@@ -385,13 +401,14 @@ class PolymarketMonitor:
                 result["actionable"] = False
                 result["eligibility_reason"] = "monitor_degraded"
             relation_health = self._relation_health(now)
+            catalog = self._relation_catalog_snapshot(now)
             if (
                 result.get("market_type") == "threshold_hedge"
-                and relation_health["status"] != "healthy"
+                and catalog["status"] != "healthy"
             ):
                 result["actionable"] = False
                 result["eligibility_reason"] = (
-                    "relation_discovery_" + str(relation_health["status"])
+                    "relation_discovery_" + str(catalog["status"])
                 )
             return result
 
@@ -401,6 +418,8 @@ class PolymarketMonitor:
         return asyncio.run(self._refresh_once())
 
     async def _refresh_once(self) -> dict[str, object]:
+        if not self._catalog_loaded:
+            self._load_relation_catalog()
         client = self._client
         owned_client = client is None
         if client is None:
@@ -417,12 +436,16 @@ class PolymarketMonitor:
                 self._client = None
 
     async def run_forever(self) -> None:
+        if not self._catalog_loaded:
+            self._load_relation_catalog()
         client = self._public_client_factory()
         self._client = client
+        self._maybe_schedule_full_scan(client)
         next_refresh = 0.0
         next_readiness_refresh = 0.0
         try:
             while not self._stop_event.is_set():
+                self._maybe_schedule_full_scan(client)
                 current = time.monotonic()
                 if self._universe_at is None or current >= next_refresh:
                     try:
@@ -466,6 +489,14 @@ class PolymarketMonitor:
                     self._record_error(exc, "stream_event")
                 self._write_runtime()
         finally:
+            task = self._full_scan_task
+            self._full_scan_task = None
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             await self._close_stream()
             self._client = None
 
@@ -564,17 +595,6 @@ class PolymarketMonitor:
             event_row["markets"] = valid_markets
             event_row["market_count"] = len(valid_markets)
             event_row.pop("_raw_markets", None)
-        if self._relation_discovery is not None:
-            try:
-                await self._refresh_relation_universe(client)
-            except Exception as exc:
-                self._relations_failed = True
-                self._record_error(exc, "relations")
-                self._log_relation_scan(
-                    phase="failed",
-                    status="degraded",
-                    reason=type(exc).__name__,
-                )
         with self._lock:
             previous_opportunity_rows = copy.deepcopy(self._opportunities)
             previous_opportunities = set(previous_opportunity_rows)
@@ -605,7 +625,7 @@ class PolymarketMonitor:
         for opportunity in confirmed:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
-        if self._relation_discovery is not None and not self._relations_failed:
+        if self._relation_discovery is not None:
             for opportunity in await self._refresh_relation_opportunities(client):
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
         with self._lock:
@@ -622,43 +642,345 @@ class PolymarketMonitor:
         entry = {"at": self._now(), **fields}
         self._relation_scan_logs.append(entry)
 
-    async def _refresh_relation_universe(self, client: object) -> None:
-        list_events = getattr(client, "list_events", None)
-        if not callable(list_events):
-            raise RuntimeError("public client has no list_events")
-        self._log_relation_scan(phase="started", status="scanning")
-        raw = await _call(
-            list_events,
-            closed=False,
-            ended=False,
-            page_size=THRESHOLD_BOOK_BATCH_SIZE,
+    def _catalog_due(self, now: datetime) -> bool:
+        if self._relation_discovery is None:
+            return False
+        anchor = self._catalog_last_attempt_at or self._catalog_full_scanned_at
+        return anchor is None or _age(now, anchor) >= RELATION_CATALOG_FRESHNESS_SECONDS
+
+    def _maybe_schedule_full_scan(self, client: object) -> None:
+        task = self._full_scan_task
+        if task is not None and not task.done():
+            return
+        if not self._catalog_due(self._now()):
+            return
+        self._full_scan_task = asyncio.create_task(
+            self._run_full_relation_scan(client)
         )
-        # The SDK async iterator may issue a slow per-item follow-up request on
-        # the live Gamma endpoint.  A full iterator therefore regularly
-        # outlives the monitor's bounded refresh window before discovery can
-        # even start.  The first Gamma page still expands coverage fivefold
-        # over the ordinary Top-20 monitor and keeps the relation layer
-        # time-bounded; the next scheduled scan refreshes the active window.
-        events = await _collect_first_page(raw)
-        resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
-        if not callable(resolver):
-            raise RuntimeError("relation discovery is not callable")
-        discovered = await _call(resolver, events)
+
+    @staticmethod
+    def _discovery_result(
+        value: object,
+        events: Sequence[object],
+    ) -> ThresholdRelationDiscoveryResult:
+        if isinstance(value, ThresholdRelationDiscoveryResult):
+            return value
         relations = tuple(
-            item for item in _items(discovered) if isinstance(item, ThresholdRelation)
+            item for item in _items(value) if isinstance(item, ThresholdRelation)
         )
-        self._set_relation_state(relations, events)
-        self._log_relation_scan(
-            phase="completed",
-            status="healthy",
-            event_count=len(events),
-            relation_count=len(relations),
+        return ThresholdRelationDiscoveryResult(
+            relations=relations,
+            events_seen=len(events),
+            events_eligible=0,
+            markets_seen=0,
+            markets_normalized=0,
+            threshold_markets=0,
+            unique_tokens=len(
+                {
+                    token
+                    for relation in relations
+                    for token in (
+                        relation.buy_leg_a.token_id,
+                        relation.buy_leg_b.token_id,
+                    )
+                }
+            ),
+            rejection_counts={},
         )
+
+    @staticmethod
+    def _result_counts(
+        result: ThresholdRelationDiscoveryResult,
+    ) -> dict[str, object]:
+        return {
+            "events_seen": result.events_seen,
+            "events_eligible": result.events_eligible,
+            "markets_seen": result.markets_seen,
+            "markets_normalized": result.markets_normalized,
+            "threshold_markets": result.threshold_markets,
+            "unique_tokens": result.unique_tokens,
+            "relation_count": len(result.relations),
+            "rejection_counts": dict(result.rejection_counts),
+        }
+
+    def _stored_full_scanned_at(
+        self, state: Mapping[str, object] | None = None
+    ) -> datetime | None:
+        if isinstance(state, Mapping):
+            for key in ("full_scanned_at", "scanned_at"):
+                parsed = _timestamp_or_none(state.get(key))
+                if parsed is not None:
+                    return parsed
+        reader = getattr(self._store, "_read_connection", None)
+        if not callable(reader):
+            return None
+        try:
+            with reader() as connection:
+                row = connection.execute(
+                    "SELECT full_scanned_at FROM relation_state WHERE singleton=1"
+                ).fetchone()
+            return _timestamp_or_none(row["full_scanned_at"]) if row is not None else None
+        except Exception:
+            return None
+
+    def _load_relation_catalog(self) -> None:
+        self._catalog_loaded = True
+        if self._relation_discovery is None:
+            self._catalog_status = "unavailable"
+            return
+        try:
+            state = self._store.load_relation_state()
+            if not isinstance(state, Mapping):
+                self._catalog_status = "stale"
+                return
+            raw_relations = state.get("relations", ())
+            if not isinstance(raw_relations, (list, tuple)):
+                raise ValueError("invalid relation catalog")
+            relations = tuple(
+                threshold_relation_from_payload(item)
+                for item in raw_relations
+            )
+            scanned_at = self._stored_full_scanned_at(state)
+            self._set_relation_state(relations, (), scanned_at=scanned_at)
+            self._catalog_full_scanned_at = scanned_at
+            self._catalog_last_attempt_at = scanned_at
+            self._catalog_counts = {
+                "events_seen": 0,
+                "events_eligible": 0,
+                "markets_seen": 0,
+                "markets_normalized": 0,
+                "threshold_markets": 0,
+                "relation_count": len(relations),
+                "unique_tokens": len(
+                    {
+                        token
+                        for relation in relations
+                        for token in (
+                            relation.buy_leg_a.token_id,
+                            relation.buy_leg_b.token_id,
+                        )
+                    }
+                ),
+                "rejection_counts": {
+                    "event_ineligible": 0,
+                    "market_ineligible": 0,
+                    "market_unparseable": 0,
+                    "not_threshold": 0,
+                    "duplicate_condition": 0,
+                    "duplicate_token": 0,
+                },
+            }
+            history = getattr(self._store, "relation_scan_history", None)
+            if callable(history):
+                try:
+                    runs = history(limit=20)
+                except Exception:
+                    runs = ()
+                for run in runs:
+                    if not isinstance(run, Mapping):
+                        continue
+                    scope = str(run.get("scope", ""))
+                    if scope == "full" and self._catalog_last_full_run is None:
+                        self._catalog_last_full_run = dict(run)
+                        for key in (
+                            "events_seen",
+                            "events_eligible",
+                            "markets_seen",
+                            "markets_normalized",
+                            "threshold_markets",
+                            "unique_tokens",
+                            "relation_count",
+                            "rejection_counts",
+                        ):
+                            if key in run and key != "rejection_counts":
+                                self._catalog_counts[key] = copy.deepcopy(run[key])
+                        saved_rejections = run.get("rejection_counts")
+                        if isinstance(saved_rejections, Mapping):
+                            self._catalog_counts["rejection_counts"].update(
+                                saved_rejections
+                            )
+                        saved_items = run.get("rejection_counts_items")
+                        if isinstance(saved_items, list):
+                            self._catalog_counts["rejection_counts"].update(
+                                {
+                                    str(item[0]): int(item[1])
+                                    for item in saved_items
+                                    if isinstance(item, (list, tuple))
+                                    and len(item) == 2
+                                }
+                            )
+                        duration = _decimal(run.get("duration_seconds"))
+                        self._catalog_scan_duration_seconds = (
+                            float(duration) if duration is not None else None
+                        )
+                        self._catalog_last_attempt_at = (
+                            _timestamp_or_none(run.get("completed_at"))
+                            or _timestamp_or_none(run.get("started_at"))
+                            or self._catalog_last_attempt_at
+                        )
+                    elif scope == "event" and self._catalog_last_event_run is None:
+                        self._catalog_last_event_run = dict(run)
+                        if run.get("status") == "completed":
+                            self._activity_scan_due_at = _timestamp_or_none(
+                                run.get("completed_at")
+                            )
+            self._catalog_status = (
+                "degraded"
+                if isinstance(self._catalog_last_full_run, Mapping)
+                and self._catalog_last_full_run.get("status") == "failed"
+                else "stale"
+            )
+            self._relations_failed = False
+        except Exception as exc:
+            self._catalog_status = "degraded"
+            self._relations_failed = True
+            self._record_error(exc, "relations")
+
+    def _relation_catalog_snapshot(self, now: datetime) -> dict[str, object]:
+        status = self._catalog_status
+        if status not in {"scanning", "degraded", "unavailable"}:
+            status = (
+                "stale"
+                if self._catalog_full_scanned_at is None
+                or _age(now, self._catalog_full_scanned_at)
+                > RELATION_CATALOG_FRESHNESS_SECONDS
+                else "healthy"
+            )
+        return {
+            "status": status,
+            "scanned_at": self._catalog_full_scanned_at,
+            "full_scanned_at": self._catalog_full_scanned_at,
+            "age_seconds": _display_age(_age(now, self._catalog_full_scanned_at)),
+            "scan_started_at": self._catalog_scan_started_at,
+            "duration_seconds": self._catalog_scan_duration_seconds,
+            "last_full_run": copy.deepcopy(self._catalog_last_full_run),
+            "last_event_run": copy.deepcopy(self._catalog_last_event_run),
+            "activity_scan_due_at": self._activity_scan_due_at,
+            "activity_scan_due": self._activity_scan_due_at is not None,
+            **copy.deepcopy(self._catalog_counts),
+            "relation_count": len(self._relations),
+        }
+
+    async def _run_full_relation_scan(self, client: object) -> None:
+        started = self._now()
+        self._catalog_last_attempt_at = started
+        self._catalog_scan_started_at = started
+        self._catalog_status = "scanning"
+        self._catalog_last_full_run = {
+            "scope": "full",
+            "status": "scanning",
+            "started_at": started,
+            "completed_at": None,
+        }
+        self._log_relation_scan(phase="started", status="scanning", scope="full")
+        try:
+            list_events = getattr(client, "list_events", None)
+            if not callable(list_events):
+                raise RuntimeError("public client has no list_events")
+            raw = await _call(
+                list_events,
+                closed=False,
+                ended=False,
+                page_size=THRESHOLD_BOOK_BATCH_SIZE,
+            )
+            events = await _collect(raw)
+            resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
+            if not callable(resolver):
+                raise RuntimeError("relation discovery is not callable")
+            result = self._discovery_result(await _call(resolver, events), events)
+            relations = tuple(result.relations)
+            payload = {
+                "relations": [threshold_relation_payload(relation) for relation in relations]
+            }
+            completed = self._now()
+            self._store.save_relation_state(
+                payload,
+                full_scanned_at=completed.isoformat(),
+            )
+            self._set_relation_state(relations, events, scanned_at=completed)
+            self._catalog_full_scanned_at = completed
+            self._catalog_last_attempt_at = completed
+            self._catalog_counts = self._result_counts(result)
+            self._catalog_scan_duration_seconds = max(
+                0.0, (completed - started).total_seconds()
+            )
+            self._catalog_status = "healthy"
+            self._relations_failed = False
+            self._catalog_last_full_run = {
+                "scope": "full",
+                "status": "completed",
+                "started_at": started,
+                "completed_at": completed,
+                "duration_seconds": self._catalog_scan_duration_seconds,
+                **self._catalog_counts,
+            }
+            try:
+                self._store.record_relation_scan(
+                    scope="full",
+                    status="completed",
+                    started_at=started.isoformat(),
+                    completed_at=completed.isoformat(),
+                    payload={
+                        **self._catalog_counts,
+                        "duration_seconds": self._catalog_scan_duration_seconds,
+                        "rejection_counts_items": [
+                            [str(key), int(value)]
+                            for key, value in self._catalog_counts[
+                                "rejection_counts"
+                            ].items()
+                        ],
+                    },
+                )
+            except Exception as exc:
+                self._store_failed = True
+                self._record_error(exc, "store")
+            self._log_relation_scan(
+                phase="completed",
+                status="healthy",
+                scope="full",
+                event_count=len(events),
+                relation_count=len(relations),
+            )
+        except Exception as exc:
+            completed = self._now()
+            self._catalog_scan_duration_seconds = max(
+                0.0, (completed - started).total_seconds()
+            )
+            self._catalog_status = "degraded"
+            self._relations_failed = True
+            self._record_error(exc, "relations")
+            self._catalog_last_full_run = {
+                "scope": "full",
+                "status": "failed",
+                "started_at": started,
+                "completed_at": completed,
+                "duration_seconds": self._catalog_scan_duration_seconds,
+                "reason": type(exc).__name__,
+            }
+            try:
+                self._store.record_relation_scan(
+                    scope="full",
+                    status="failed",
+                    started_at=started.isoformat(),
+                    completed_at=completed.isoformat(),
+                    payload={"reason": type(exc).__name__},
+                )
+            except Exception as record_exc:
+                self._store_failed = True
+                self._record_error(record_exc, "store")
+            self._log_relation_scan(
+                phase="failed",
+                status="degraded",
+                scope="full",
+                reason=type(exc).__name__,
+            )
 
     def _set_relation_state(
         self,
         relations: Sequence[ThresholdRelation],
         events: Sequence[object],
+        *,
+        scanned_at: datetime | None = None,
     ) -> None:
         relation_map = {relation.relation_id: relation for relation in relations}
         token_map: dict[str, set[str]] = {}
@@ -680,6 +1002,9 @@ class PolymarketMonitor:
                 if relation.event_id == event_id:
                     volumes[relation.relation_id] = volume
         for relation in relations:
+            if relation.relation_id not in volumes:
+                volumes[relation.relation_id] = relation.event_volume_24h or Decimal("0")
+        for relation in relations:
             for token in (
                 relation.market_a.yes_token_id,
                 relation.market_a.no_token_id,
@@ -691,41 +1016,148 @@ class PolymarketMonitor:
             self._relations = relation_map
             self._relation_by_token = token_map
             self._relation_volumes = volumes
-            self._relations_at = self._now()
+            self._relations_at = scanned_at or self._now()
             self._relations_failed = False
 
-    async def _refresh_relation_event(self, client: object, event_id: str) -> None:
-        get_event = getattr(client, "get_event", None)
-        if not callable(get_event):
-            raise RuntimeError("public client has no get_event")
-        raw_event = await _call(get_event, id=event_id)
-        resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
-        if not callable(resolver):
-            raise RuntimeError("relation discovery is not callable")
-        discovered = await _call(resolver, (raw_event,))
-        refreshed = tuple(
-            item for item in _items(discovered) if isinstance(item, ThresholdRelation)
-        )
-        remaining = tuple(
-            relation
-            for relation in self._relations.values()
-            if relation.event_id != event_id
-        )
-        old_volumes = dict(self._relation_volumes)
-        self._set_relation_state(remaining + refreshed, (raw_event,))
-        for relation_id, volume in old_volumes.items():
-            if relation_id in self._relations and relation_id not in {
-                relation.relation_id for relation in refreshed
-            }:
-                self._relation_volumes[relation_id] = volume
-        self._relations_failed = False
-        self._log_relation_scan(
-            phase="event",
-            status="healthy",
-            event_id=event_id,
-            relation_count=len(refreshed),
-        )
-        await self._subscribe(client)
+    async def _refresh_relation_event(self, client: object, event_id: str) -> bool:
+        event_id = str(event_id).strip()
+        started = self._now()
+        self._catalog_last_event_run = {
+            "scope": "event",
+            "event_id": event_id,
+            "status": "scanning",
+            "started_at": started,
+            "completed_at": None,
+        }
+        try:
+            get_event = getattr(client, "get_event", None)
+            if not callable(get_event):
+                raise RuntimeError("public client has no get_event")
+            raw_event = await _call(get_event, id=event_id)
+            if _event_id(raw_event) != event_id:
+                raise RuntimeError("event response ID mismatch")
+            resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
+            if not callable(resolver):
+                raise RuntimeError("relation discovery is not callable")
+            result = self._discovery_result(
+                await _call(resolver, (raw_event,)),
+                (raw_event,),
+            )
+            refreshed = tuple(
+                relation for relation in result.relations if relation.event_id == event_id
+            )
+            remaining = tuple(
+                relation
+                for relation in self._relations.values()
+                if relation.event_id != event_id
+            )
+            old_volumes = dict(self._relation_volumes)
+            merged = remaining + refreshed
+            full_scanned_at = self._catalog_full_scanned_at or self._stored_full_scanned_at()
+            if full_scanned_at is None:
+                raise RuntimeError("full relation catalog anchor unavailable")
+            completed = self._now()
+            payload = {
+                "relations": [threshold_relation_payload(relation) for relation in merged]
+            }
+            self._store.save_relation_state(
+                payload,
+                full_scanned_at=full_scanned_at.isoformat(),
+            )
+            self._set_relation_state(
+                merged,
+                (raw_event,),
+                scanned_at=full_scanned_at,
+            )
+            for relation_id, volume in old_volumes.items():
+                if relation_id in self._relations and relation_id not in {
+                    relation.relation_id for relation in refreshed
+                }:
+                    self._relation_volumes[relation_id] = volume
+            self._relations_failed = False
+            self._activity_scan_due_at = completed
+            self._catalog_status = (
+                "healthy"
+                if _age(completed, full_scanned_at)
+                <= RELATION_CATALOG_FRESHNESS_SECONDS
+                else "stale"
+            )
+            self._catalog_last_event_run = {
+                "scope": "event",
+                "event_id": event_id,
+                "status": "completed",
+                "started_at": started,
+                "completed_at": completed,
+                "duration_seconds": max(0.0, (completed - started).total_seconds()),
+                **self._result_counts(result),
+            }
+            try:
+                self._store.record_relation_scan(
+                    scope="event",
+                    status="completed",
+                    started_at=started.isoformat(),
+                    completed_at=completed.isoformat(),
+                    payload={
+                        **self._result_counts(result),
+                        "duration_seconds": max(
+                            0.0, (completed - started).total_seconds()
+                        ),
+                        "rejection_counts_items": [
+                            [str(key), int(value)]
+                            for key, value in result.rejection_counts.items()
+                        ],
+                    },
+                    event_id=event_id,
+                )
+            except Exception as exc:
+                self._store_failed = True
+                self._record_error(exc, "store")
+            self._log_relation_scan(
+                phase="event",
+                status="healthy",
+                scope="event",
+                event_id=event_id,
+                relation_count=len(refreshed),
+            )
+        except Exception as exc:
+            completed = self._now()
+            self._catalog_status = "degraded"
+            self._relations_failed = True
+            self._record_error(exc, "relations")
+            self._catalog_last_event_run = {
+                "scope": "event",
+                "event_id": event_id,
+                "status": "failed",
+                "started_at": started,
+                "completed_at": completed,
+                "duration_seconds": max(0.0, (completed - started).total_seconds()),
+                "reason": type(exc).__name__,
+            }
+            try:
+                self._store.record_relation_scan(
+                    scope="event",
+                    status="failed",
+                    started_at=started.isoformat(),
+                    completed_at=completed.isoformat(),
+                    payload={"reason": type(exc).__name__},
+                    event_id=event_id,
+                )
+            except Exception as record_exc:
+                self._store_failed = True
+                self._record_error(record_exc, "store")
+            self._log_relation_scan(
+                phase="event",
+                status="degraded",
+                scope="event",
+                event_id=event_id,
+                reason=type(exc).__name__,
+            )
+            return False
+        try:
+            await self._subscribe(client)
+        except Exception as exc:
+            self._record_error(exc, "stream")
+        return True
 
     async def _refresh_relation_books(self, client: object) -> None:
         get_books = getattr(client, "get_order_books", None)
@@ -1281,17 +1713,17 @@ class PolymarketMonitor:
             if event_id is None:
                 event_id = _event_id(payload)
             if event_id is not None and self._relation_discovery is not None:
-                await self._refresh_relation_event(client, event_id)
-                relation_rows = await self._refresh_relation_opportunities(client)
-                with self._lock:
-                    self._opportunities = {
-                        key: value
-                        for key, value in self._opportunities.items()
-                        if value.get("market_type") != "threshold_hedge"
-                    }
-                    self._opportunities.update(
-                        {str(row["opportunity_id"]): row for row in relation_rows}
-                    )
+                if await self._refresh_relation_event(client, event_id):
+                    relation_rows = await self._refresh_relation_opportunities(client)
+                    with self._lock:
+                        self._opportunities = {
+                            key: value
+                            for key, value in self._opportunities.items()
+                            if value.get("market_type") != "threshold_hedge"
+                        }
+                        self._opportunities.update(
+                            {str(row["opportunity_id"]): row for row in relation_rows}
+                        )
             return
         tokens: list[str] = []
         token = _value(payload, "token_id", "asset_id", "assetId", default=None)
@@ -1439,11 +1871,11 @@ class PolymarketMonitor:
     def _relation_health(self, now: datetime) -> dict[str, object]:
         if self._relation_discovery is None or self._relation_validator is None:
             status = "unavailable"
-        elif self._relations_failed:
+        elif self._catalog_status == "degraded" or self._relations_failed:
             status = "degraded"
         elif self._relations_at is None:
             status = "stale"
-        elif _age(now, self._relations_at) > UNIVERSE_STALE_SECONDS:
+        elif _age(now, self._relations_at) > RELATION_CATALOG_FRESHNESS_SECONDS:
             status = "stale"
         else:
             status = "healthy"
