@@ -139,6 +139,37 @@ def _prediction_safe_value(value: object, *, key: str = "") -> object:
     return str(value)
 
 
+def _prediction_relation_safe_value(value: object) -> object:
+    """Project relation discovery facts without raw rules, tokens, or errors."""
+
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for name, item in value.items():
+            lowered = str(name).casefold()
+            if (
+                lowered in {
+                    "prompt",
+                    "token_id",
+                    "yes_token_id",
+                    "no_token_id",
+                    "raw_error",
+                    "raw_rules",
+                    "wallet_address",
+                    "wallet",
+                }
+                or lowered.endswith("_token_id")
+                or lowered.startswith("raw_")
+            ):
+                continue
+            safe = _prediction_relation_safe_value(item)
+            if safe is not None:
+                result[str(name)] = safe
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_prediction_relation_safe_value(item) for item in value]
+    return _prediction_safe_value(value)
+
+
 def _prediction_mask_wallet(value: object) -> str:
     wallet = str(value or "").strip()
     if len(wallet) < 10:
@@ -639,7 +670,7 @@ def _prediction_state_payload(
         "stale": stale,
         "events": event_rows,
         "opportunities": opportunity_rows,
-        "relation_discovery": _prediction_safe_value(
+        "relation_discovery": _prediction_relation_safe_value(
             safe_snapshot.get("relation_discovery", {})
         ),
         "event_count": event_count,
