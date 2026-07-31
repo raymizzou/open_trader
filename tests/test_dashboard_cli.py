@@ -24,6 +24,7 @@ def test_dashboard_parser_defaults() -> None:
     assert args.poll_seconds == 5.0
     assert args.futu_host == "127.0.0.1"
     assert args.futu_port == 11111
+    assert args.public_url == ""
 
 
 def test_dashboard_main_delegates_to_server(
@@ -38,11 +39,13 @@ def test_dashboard_main_delegates_to_server(
         host: str,
         port: int,
         eastmoney_password: str,
+        public_url: str,
     ) -> None:
         captured["config"] = config
         captured["host"] = host
         captured["port"] = port
         captured["eastmoney_password"] = eastmoney_password
+        captured["public_url"] = public_url
 
     monkeypatch.setattr(cli, "serve_dashboard", fake_serve_dashboard)
     (tmp_path / "dashboard.env").write_text(
@@ -76,6 +79,8 @@ def test_dashboard_main_delegates_to_server(
             "192.0.2.10",
             "--futu-port",
             "22222",
+            "--public-url",
+            "http://127.0.0.1:8766/",
         ]
     )
 
@@ -83,6 +88,7 @@ def test_dashboard_main_delegates_to_server(
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 9000
     assert captured["eastmoney_password"] == "local-secret"
+    assert captured["public_url"] == "http://127.0.0.1:8766/"
     config = captured["config"]
     assert isinstance(config, DashboardConfig)
     assert config.portfolio_path == tmp_path / "portfolio.csv"
@@ -119,3 +125,4 @@ def test_dashboard_help_includes_expected_options(
     assert "--poll-seconds" in output
     assert "--futu-host" in output
     assert "--futu-port" in output
+    assert "--public-url" in output

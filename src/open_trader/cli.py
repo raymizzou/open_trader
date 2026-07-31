@@ -51,6 +51,7 @@ from .decision_plan import load_decision_plans
 from .decision_plan_watch import run_decision_plan_watch
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
+from .frontend_gateway import FrontendGatewayConfig, serve_frontend_gateway
 from .kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
     FutuPaperOrderSyncError,
@@ -1188,6 +1189,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Backtest execution adapter",
     )
 
+    frontend_gateway_parser = subparsers.add_parser(
+        "frontend-gateway",
+        help="Serve the lightweight frontend gateway",
+    )
+    frontend_gateway_parser.add_argument("--host", default="127.0.0.1")
+    frontend_gateway_parser.add_argument("--port", type=positive_int, default=8766)
+    frontend_gateway_parser.add_argument(
+        "--upstream-host", default="127.0.0.1"
+    )
+    frontend_gateway_parser.add_argument(
+        "--upstream-port", type=positive_int, default=8767
+    )
+    frontend_gateway_parser.add_argument(
+        "--public-origin", default="http://127.0.0.1:8766"
+    )
+    frontend_gateway_parser.add_argument(
+        "--upstream-timeout", type=positive_float, default=30.0
+    )
+    frontend_gateway_parser.add_argument(
+        "--static-dir",
+        type=Path,
+        default=Path(__file__).with_name("dashboard_static"),
+    )
+
     dashboard_parser = subparsers.add_parser(
         "dashboard",
         help="Serve the realtime portfolio dashboard",
@@ -1213,6 +1238,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_parser.add_argument("--futu-host", default="127.0.0.1")
     dashboard_parser.add_argument("--futu-port", type=positive_int, default=11111)
+    dashboard_parser.add_argument(
+        "--public-url",
+        default="",
+        help="Public dashboard URL used in generated links",
+    )
     dashboard_parser.add_argument(
         "--prediction-config",
         type=Path,
@@ -2490,6 +2520,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"report: {result.report_path}")
         return 0
 
+    if args.command == "frontend-gateway":
+        serve_frontend_gateway(
+            config=FrontendGatewayConfig(
+                static_dir=args.static_dir,
+                upstream_host=args.upstream_host,
+                upstream_port=args.upstream_port,
+                public_origin=args.public_origin,
+                upstream_timeout_seconds=args.upstream_timeout,
+            ),
+            host=args.host,
+            port=args.port,
+        )
+        return 0
+
     if args.command == "dashboard":
         if args.prediction_config is not None:
             try:
@@ -2570,6 +2614,7 @@ def main(argv: list[str] | None = None) -> int:
             eastmoney_password=config_values.get(
                 "OPEN_TRADER_EASTMONEY_PDF_PASSWORD", ""
             ).strip(),
+            public_url=args.public_url,
             **(
                 {"prediction_notifier": prediction_notifier}
                 if args.prediction_config is not None

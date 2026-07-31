@@ -968,6 +968,15 @@ def create_dashboard_server(
                     "application/javascript; charset=utf-8",
                 )
                 return
+            if path == "/healthz":
+                self._send_json(
+                    {
+                        "schema_version": "open_trader.legacy_dashboard.health.v1",
+                        "module": "legacy_dashboard",
+                        **_dashboard_runtime_metadata(),
+                    }
+                )
+                return
             if path == "/api/dashboard":
                 try:
                     self._send_json(
@@ -1390,7 +1399,11 @@ def serve_dashboard(
     port: int,
     eastmoney_password: str = "",
     prediction_notifier: object | None = None,
+    public_url: str = "",
 ) -> None:
+    resolved_public_url = public_url.strip() or f"http://{host}:{port}/"
+    if not resolved_public_url.endswith("/"):
+        resolved_public_url += "/"
     print(
         f"dashboard_runtime: {json.dumps(_dashboard_runtime_metadata())}",
         flush=True,
@@ -1436,7 +1449,7 @@ def serve_dashboard(
                 trading=prediction_trading,
                 notifier=prediction_notifier or NullNotifier(),
                 lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
-                dashboard_url=f"http://127.0.0.1:{port}/",
+                dashboard_url=resolved_public_url,
             )
             prediction_monitor.set_ready_observer(
                 prediction_execution.notify_ready_opportunity
@@ -1482,7 +1495,8 @@ def serve_dashboard(
     )
     _, actual_port = server.server_address
     try:
-        print(f"dashboard_url: http://{host}:{actual_port}", flush=True)
+        print(f"dashboard_url: {resolved_public_url}", flush=True)
+        print(f"dashboard_listener: http://{host}:{actual_port}/", flush=True)
         print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")

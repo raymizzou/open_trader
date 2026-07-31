@@ -3059,7 +3059,12 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
 
-    dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+    dashboard_web.serve_dashboard(
+        config,
+        host="127.0.0.1",
+        port=0,
+        public_url="http://127.0.0.1:8766/",
+    )
     assert order.index("execution.reconcile") < order.index("monitor.start")
     assert order.index("monitor.start") < order.index("server.serve")
     assert order.index("monitor.stop") < order.index("server.close")
@@ -3068,7 +3073,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert FakeMonitor.kwargs["relation_discovery"] is dashboard_web.discover_threshold_relations
     assert FakeMonitor.kwargs["relation_validator"].__class__.__name__ == "CodexRelationValidator"
     assert "DEEPSEEK_API_KEY" not in repr(FakeMonitor.kwargs)
-    assert FakeExecution.kwargs["dashboard_url"] == "http://127.0.0.1:0/"
+    assert FakeExecution.kwargs["dashboard_url"] == "http://127.0.0.1:8766/"
     assert callable(FakeMonitor.observer)
 
 
@@ -12729,6 +12734,35 @@ def test_dashboard_server_serves_static_routes_when_files_exist(
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_dashboard_healthz_reports_legacy_module_runtime(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=5) as response:
+            payload = json.load(response)
+            assert response.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert payload["schema_version"] == "open_trader.legacy_dashboard.health.v1"
+    assert payload["module"] == "legacy_dashboard"
+    assert payload["pid"] == os.getpid()
+    assert payload["cwd"] == str(Path.cwd().resolve())
+    assert payload["git_sha"]
+    assert payload["source_state"] in {"clean", "dirty"}
+    assert payload["started_at"]
 
 
 def test_prediction_history_projects_observed_signal_fields() -> None:
