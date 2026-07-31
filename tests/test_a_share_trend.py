@@ -56,6 +56,7 @@ from open_trader.trend_animals import (
 from open_trader.trend_kelly import TrendKellyRound
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_industry_context import IndustryContext
+from open_trader.trend_industry_context import _context_to_mapping
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -5229,6 +5230,31 @@ def test_frozen_revisions_choose_first_free_pair(tmp_path: Path) -> None:
     base = report()
     assert write_frozen_report(base, tmp_path, revision=True)[0].name == "2026-07-14-r1.md"
     assert write_frozen_report(base, tmp_path, revision=True)[0].name == "2026-07-14-r2.md"
+
+
+def test_frozen_revision_writes_matching_industry_history_revision(
+    tmp_path: Path,
+) -> None:
+    context = _industry_context(700001)
+    receipt = {
+        "artifact_stem": "2026-07-14-r2",
+        "report_json": json.dumps(
+            {
+                "generated_at": "2026-07-14T19:00:00+08:00",
+                "strategy_snapshot": {"strategy_version": "v10"},
+                "industry_contexts": [_context_to_mapping(context)],
+            }
+        ),
+    }
+
+    path = trend_module._write_frozen_industry_context_history(
+        receipt=receipt,
+        history_root=tmp_path,
+        market="CN",
+    )
+
+    assert path is not None
+    assert path.name == "2026-07-14-r2.json"
 
 
 @pytest.mark.parametrize("failed_suffix", [".md", ".json"])

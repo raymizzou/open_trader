@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -5797,12 +5798,19 @@ def _write_frozen_industry_context_history(
     )
     if not isinstance(generated_at, str) or not isinstance(strategy_version, str):
         raise ValueError("frozen report is missing industry history metadata")
+    artifact_stem = receipt.get("artifact_stem")
+    revision_match = (
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}-r([1-9]\d*)", artifact_stem)
+        if isinstance(artifact_stem, str)
+        else None
+    )
     return write_industry_context_history(
         history_root,
         market=market,
         generated_at=generated_at,
         strategy_version=strategy_version,
         contexts=contexts,
+        revision=int(revision_match.group(1)) if revision_match else 0,
     )
 
 
