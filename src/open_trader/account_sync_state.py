@@ -338,6 +338,10 @@ def project_account_sync_health(
     reason = ""
     if controller["status"] != "ok":
         reason = f"controller_{controller['status']}"
+    elif _controller_loop_failed(controller_status, "account_loop"):
+        reason = "account_loop_failed"
+    elif _controller_loop_failed(controller_status, "quote_loop"):
+        reason = "quote_loop_failed"
     else:
         for broker in REQUIRED_BROKERS:
             status = projected_brokers[broker]["status"]
@@ -358,6 +362,15 @@ def project_account_sync_health(
         "controller": controller,
         "quotes": {"status": quote_status},
         "brokers": projected_brokers,
+    }
+
+
+def _controller_loop_failed(
+    controller_status: Mapping[str, object], loop: str
+) -> bool:
+    value = controller_status.get(loop)
+    return isinstance(value, dict) and value.get("status") in {
+        "failed", "publication_failed",
     }
 
 

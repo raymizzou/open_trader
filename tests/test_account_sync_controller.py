@@ -61,6 +61,11 @@ def test_sync_accounts_publishes_full_tiger_generation_before_state(
     published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     assert published["brokers"]["tiger"]["summary"]["position_count"] == 14
     assert len(published["brokers"]["tiger"]["positions"]) == 14
+    assert published["dashboard_projection"]["broker_positions"]
+    assert all(
+        row["portfolio_weight_hkd"]
+        for row in published["dashboard_projection"]["broker_positions"]
+    )
     symbols = _portfolio_symbols(portfolio_path)
     assert symbols >= all_14_symbols
     assert "OLD0" not in symbols
@@ -508,7 +513,11 @@ def _candidate(broker: str, count: int, prefix: str) -> BrokerAccountCandidate:
             for index in range(count)
         ),
         cash=(),
-        fx_rates=(),
+        fx_rates=(
+            ({"account_alias": f"{broker}_main", "currency": "USD", "rate_to_hkd": "7.8"},)
+            if source_kind == "live"
+            else ()
+        ),
         summary={"position_count": count, "cash_count": 0, "is_real_time": source_kind == "live"},
     )
 

@@ -20,6 +20,7 @@ from .account_sync_state import (
     load_account_sync_state,
     load_latest_statement_candidate,
     record_source_failure,
+    with_dashboard_projection,
     write_json_atomic,
     write_portfolio_atomic,
 )
@@ -146,6 +147,28 @@ class AccountSyncController:
                 }
             state = next_state
             results[broker] = {"status": "ok"}
+        try:
+            projected_state = with_dashboard_projection(
+                state,
+                load_published_quotes(
+                    self._quotes_path(), now=datetime.now(SHANGHAI_TZ)
+                ),
+                generated_at=attempted_at,
+            )
+            write_json_atomic(state_path, projected_state)
+            state = projected_state
+        except OSError:
+            return {
+                "status": "publication_failed",
+                "blocker": "dashboard_projection_publish_failed",
+                "brokers": results,
+            }
+        except Exception:
+            return {
+                "status": "failed",
+                "blocker": "dashboard_projection_failed",
+                "brokers": results,
+            }
         ok_count = sum(
             1 for result in results.values() if result["status"] == "ok"
         )
@@ -177,6 +200,22 @@ class AccountSyncController:
         except Exception as exc:
             payload = self._quote_failure_payload(str(exc))
         write_json_atomic(self._quotes_path(), payload)
+        if payload["status"] == "failed":
+            return payload
+        try:
+            state_path = self.config.data_dir / "latest" / "account_sync_state.json"
+            write_json_atomic(
+                state_path,
+                with_dashboard_projection(
+                    load_account_sync_state(state_path),
+                    payload,
+                    generated_at=self.now_text(),
+                ),
+            )
+        except OSError:
+            return {**payload, "status": "publication_failed", "blocker": "dashboard_projection_publish_failed"}
+        except Exception:
+            return {**payload, "status": "failed", "blocker": "dashboard_projection_failed"}
         return payload
 
     def write_heartbeat(self, *, blocker: str | None = None) -> None:

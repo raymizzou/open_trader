@@ -405,6 +405,34 @@ def test_health_marks_generated_state_without_projection_abnormal() -> None:
     assert health["reason"] == "dashboard_projection_missing"
 
 
+def test_health_marks_failed_projection_loop_abnormal() -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+    state = {
+        "version": 1,
+        "generation": "2026-07-30T11:59:59+08:00",
+        "dashboard_projection": _valid_dashboard_projection(),
+        "brokers": {
+            broker: _source(
+                source_kind="live" if broker in LIVE_BROKERS else "statement",
+                last_success_at=(now - timedelta(seconds=1)).isoformat(),
+            )
+            for broker in REQUIRED_BROKERS
+        },
+    }
+    controller = _controller_status(now)
+    controller["quote_loop"] = {"status": "failed", "blocker": "dashboard_projection_failed"}
+
+    health = project_account_sync_health(
+        state,
+        controller,
+        {"status": "ok", "last_success_at": now.isoformat(), "stale": False},
+        now=now,
+    )
+
+    assert health["status"] == "abnormal"
+    assert health["reason"] == "quote_loop_failed"
+
+
 def test_health_rejects_invalid_controller_status_and_keeps_unknown_display() -> None:
     now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone(timedelta(hours=8)))
     health = project_account_sync_health(
