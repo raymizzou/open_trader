@@ -31,6 +31,7 @@ from .a_share_trend import (
     _is_systemic_futu_error,
     _optional_int,
     _process_version,
+    _remember_verified_symbol_row,
     _uses_shared_entry_discipline,
     read_delivery_receipt,
     _redact_api_key,
@@ -1069,6 +1070,13 @@ def _attempt_market_report(
                 bars = quote.get_daily_kline(
                     futu_symbol, start=start, end=as_of_date
                 )
+                _remember_verified_symbol_row(
+                    api,
+                    market=market,
+                    expected_futu_symbol=futu_symbol,
+                    expected_tm_id=tm_id,
+                    row=row,
+                )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
                     raise
@@ -1109,6 +1117,14 @@ def _attempt_market_report(
                         market, str(row.get("tickerSymbol") or "")
                     ) != to_futu_symbol(market, symbol):
                         continue
+                    _remember_verified_symbol_row(
+                        api,
+                        market=market,
+                        expected_futu_symbol=symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                        require_unmapped=True,
+                    )
                     holding_snapshots[symbol] = _holding_snapshot(
                         row,
                         market=market,

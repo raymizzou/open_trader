@@ -7318,6 +7318,93 @@ def test_report_runner_excludes_only_candidate_with_failed_kline(tmp_path: Path)
     assert [item["symbol"] for item in payload["strategy_judgments"]["top10_candidates"]] == ["000002"]
 
 
+@pytest.mark.parametrize(
+    ("failed_klines", "expected_symbols"),
+    [
+        ({"SH.000001", "SH.000002"}, []),
+        ({"SH.000001"}, ["SH.000002"]),
+    ],
+)
+def test_report_runner_records_candidate_mapping_only_after_verified_futu_kline(
+    tmp_path: Path,
+    failed_klines: set[str],
+    expected_symbols: list[str],
+) -> None:
+    mapping_calls: list[dict[str, object]] = []
+
+    class MappingApi(ReadyApi):
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            mapping_calls.append(dict(kwargs))
+
+    run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: MappingApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote(
+            [], failed_klines=failed_klines
+        ),
+        notifier=RecordingFeishu(),
+    )
+
+    assert [call["expected_futu_symbol"] for call in mapping_calls] == expected_symbols
+    assert all(call["market"] == "CN" for call in mapping_calls)
+    assert [call["row"]["tickerSymbol"] for call in mapping_calls] == [
+        symbol.replace("SH.", "") + ".SH" for symbol in expected_symbols
+    ]
+
+
+@pytest.mark.parametrize(
+    ("market", "expected_tm_id", "row", "expected_calls"),
+    [
+        (
+            "CN",
+            308052,
+            {"tmId": 308052, "tickerSymbol": "600036.SH", "asset": "A股"},
+            1,
+        ),
+        (
+            "CN",
+            999999,
+            {"tmId": 308052, "tickerSymbol": "600036.SH", "asset": "A股"},
+            0,
+        ),
+        (
+            "CN",
+            308052,
+            {"tmId": 308052, "tickerSymbol": "600036.US", "asset": "A股"},
+            0,
+        ),
+        (
+            "CN",
+            308052,
+            {"tmId": 308052, "tickerSymbol": "600036.SH", "asset": "美股"},
+            0,
+        ),
+    ],
+)
+def test_legacy_mapping_upgrade_requires_matching_snapshot_identity(
+    market: str,
+    expected_tm_id: int,
+    row: dict[str, object],
+    expected_calls: int,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Api:
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            calls.append(dict(kwargs))
+
+    trend_module._remember_verified_symbol_row(
+        Api(),
+        market=market,
+        expected_futu_symbol="SH.600036",
+        expected_tm_id=expected_tm_id,
+        row=row,
+    )
+
+    assert len(calls) == expected_calls
+
+
 @pytest.mark.parametrize("with_prior", [False, True])
 def test_report_runner_degrades_holding_kline_without_blocking_report(
     tmp_path: Path, with_prior: bool

@@ -54,6 +54,7 @@ from .trend_industry_context import (
     _context_from_mapping,
 )
 from .trend_animals import (
+    SEARCH_ASSETS_BY_MARKET,
     TrendAnimalsClient,
     TrendAnimalsError,
     TrendAnimalsLookupError,
@@ -1631,6 +1632,14 @@ def enrich_real_holding_input(
             ) != to_futu_symbol(market, position.symbol):
                 real_snapshots[position.symbol] = None
                 continue
+            _remember_verified_symbol_row(
+                api,
+                market=market,
+                expected_futu_symbol=position.symbol,
+                expected_tm_id=tm_id,
+                row=row,
+                require_unmapped=True,
+            )
             real_snapshots[position.symbol] = _holding_snapshot(
                 row,
                 market=market,
@@ -1649,6 +1658,56 @@ def enrich_real_holding_input(
         real_bars,
         len(real_only_ids),
     )
+
+
+def _remember_verified_symbol_row(
+    api: object,
+    *,
+    market: str,
+    expected_futu_symbol: str,
+    expected_tm_id: int,
+    row: Mapping[str, object],
+    require_unmapped: bool = False,
+) -> bool:
+    recorder = getattr(api, "remember_symbol_row", None)
+    if not callable(recorder):
+        return False
+    normalized_market = market.strip().upper()
+    if normalized_market not in SEARCH_ASSETS_BY_MARKET:
+        return False
+    tm_id = row.get("tmId")
+    ticker_symbol = row.get("tickerSymbol")
+    asset = row.get("asset")
+    if (
+        not isinstance(tm_id, int)
+        or isinstance(tm_id, bool)
+        or tm_id != expected_tm_id
+        or not isinstance(ticker_symbol, str)
+        or not isinstance(asset, str)
+        or asset.strip() not in SEARCH_ASSETS_BY_MARKET[normalized_market]
+    ):
+        return False
+    try:
+        futu_symbol = to_futu_symbol(normalized_market, expected_futu_symbol)
+        trend_futu_symbol = from_trend_animals_symbol(
+            normalized_market, ticker_symbol
+        )
+    except ValueError:
+        return False
+    if futu_symbol != trend_futu_symbol:
+        return False
+    if require_unmapped:
+        lookup = getattr(api, "symbol_mapping", None)
+        if not callable(lookup) or lookup(
+            futu_symbol, market=normalized_market
+        ) is not None:
+            return False
+    recorder(
+        market=normalized_market,
+        expected_futu_symbol=futu_symbol,
+        row=row,
+    )
+    return True
 
 
 def load_eastmoney_account(
@@ -5952,8 +6011,16 @@ def _attempt_report(
                 continue
             try:
                 symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+                futu_symbol = f"{exchange}.{symbol}"
                 daily_bars = quote.get_daily_kline(
-                    f"{exchange}.{symbol}", start=kline_start, end=run_date
+                    futu_symbol, start=kline_start, end=run_date
+                )
+                _remember_verified_symbol_row(
+                    api,
+                    market="CN",
+                    expected_futu_symbol=futu_symbol,
+                    expected_tm_id=tm_id,
+                    row=row,
                 )
             except FutuQuoteError as exc:
                 if _is_systemic_futu_error(exc):
@@ -5993,6 +6060,14 @@ def _attempt_report(
                         "CN", str(row.get("tickerSymbol") or "")
                     ) != to_futu_symbol("CN", symbol):
                         continue
+                    _remember_verified_symbol_row(
+                        api,
+                        market="CN",
+                        expected_futu_symbol=symbol,
+                        expected_tm_id=tm_id,
+                        row=row,
+                        require_unmapped=True,
+                    )
                     holding_snapshots[symbol] = _holding_snapshot(
                         row,
                         industry_temperature=industry_temperatures.get(

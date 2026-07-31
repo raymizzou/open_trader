@@ -1215,6 +1215,7 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     cfg = config(tmp_path)
     unlock_live_drawdown(cfg.data_dir, market, version="v8")
     industry_calls: list[dict[str, object]] = []
+    mapping_calls: list[dict[str, object]] = []
 
     class Api:
         ignored_stale_components: tuple[object, ...] = ()
@@ -1294,6 +1295,9 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
                 "stopwinFlagByPopChampagne": False,
             }]
 
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            mapping_calls.append(dict(kwargs))
+
     class Quote:
         def __init__(self, **kwargs: object) -> None:
             pass
@@ -1343,6 +1347,10 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     assert judgments["top10_candidates"] == []
     assert len(industry_calls) == 1
     assert bool(payload["metadata"]["industry_data_reason"]) is industry_error
+    assert len(mapping_calls) == 1
+    assert mapping_calls[0]["market"] == market
+    assert mapping_calls[0]["expected_futu_symbol"] == f"{market}.{symbol}"
+    assert mapping_calls[0]["row"]["tickerSymbol"] == wire_symbol
 
 
 @pytest.mark.parametrize(
