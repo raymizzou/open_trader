@@ -6348,8 +6348,37 @@ def test_simulated_position_wait_has_bounded_timeout() -> None:
     assert calls == [(
         dashboard_acceptance.SIMULATE_POSITIONS_READY_EXPRESSION,
         {"broker": "tiger", "expected": 1},
-        10_000,
+        30_000,
     )]
+
+
+def test_dashboard_api_fetch_allows_slow_live_simulate_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int | None] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(_url: str, *, timeout: int | None = None) -> Response:
+        calls.append(timeout)
+        return Response()
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", fake_urlopen)
+
+    assert dashboard_acceptance._fetch_json_path(
+        "http://dashboard.test", "/api/trend-simulate-positions/tiger"
+    ) == {}
+    assert calls == [30]
 
 
 def test_acceptance_rejects_appended_stale_log_content(tmp_path: Path) -> None:

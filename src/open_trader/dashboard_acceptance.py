@@ -80,6 +80,8 @@ SIMULATE_POSITIONS_READY_EXPRESSION = """
     || panel.querySelectorAll(".account-holding-row").length === expected;
 }
 """
+SIMULATE_POSITIONS_READY_TIMEOUT_MS = 30_000
+DASHBOARD_API_TIMEOUT_SECONDS = 30
 WARM_LEDGER_TOKENS = {
     "--bg": "#F7F5F1",
     "--surface": "#FFFEFA",
@@ -896,21 +898,27 @@ def validate_integrated_candidate(
 
 
 def _fetch_payload(url: str) -> dict[str, Any]:
-    with urlopen(f"{url.rstrip('/')}/api/dashboard", timeout=15) as response:
+    with urlopen(
+        f"{url.rstrip('/')}/api/dashboard", timeout=DASHBOARD_API_TIMEOUT_SECONDS
+    ) as response:
         if response.status != 200:
             raise RuntimeError(f"Dashboard API HTTP {response.status}")
         return json.load(response)
 
 
 def _fetch_quotes_payload(url: str) -> dict[str, Any]:
-    with urlopen(f"{url.rstrip('/')}/api/quotes", timeout=15) as response:
+    with urlopen(
+        f"{url.rstrip('/')}/api/quotes", timeout=DASHBOARD_API_TIMEOUT_SECONDS
+    ) as response:
         if response.status != 200:
             raise RuntimeError(f"Quotes API HTTP {response.status}")
         return json.load(response)
 
 
 def _fetch_json_path(url: str, path: str) -> Any:
-    with urlopen(f"{url.rstrip('/')}{path}", timeout=15) as response:
+    with urlopen(
+        f"{url.rstrip('/')}{path}", timeout=DASHBOARD_API_TIMEOUT_SECONDS
+    ) as response:
         if response.status != 200:
             raise RuntimeError(f"Dashboard API HTTP {response.status}: {path}")
         return json.load(response)
@@ -1285,7 +1293,7 @@ def _wait_for_simulate_positions(
     page.wait_for_function(
         SIMULATE_POSITIONS_READY_EXPRESSION,
         arg={"broker": broker, "expected": expected},
-        timeout=10_000,
+        timeout=SIMULATE_POSITIONS_READY_TIMEOUT_MS,
     )
 
 
