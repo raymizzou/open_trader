@@ -947,12 +947,11 @@ def _trend_market_date(market: str, *, now: datetime | None = None) -> date:
 
 
 def _latest_valid_report_payload(
-    reports_dir: Path, report_date: str, *, market: str, broker: str
+    reports_dir: Path, *, market: str, broker: str
 ) -> tuple[Path, dict[str, Any], date, date, date, datetime] | None:
     matches: list[
         tuple[date, datetime, date, str, Path, dict[str, Any], date]
     ] = []
-    today = date.fromisoformat(report_date)
     for path in reports_dir.glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -966,11 +965,6 @@ def _latest_valid_report_payload(
         if chronology is None:
             continue
         execution_date, as_of_date, freshness_date, generated_at = chronology
-        if (
-            freshness_date > today
-            or generated_at.astimezone(SHANGHAI).date() > today
-        ):
-            continue
         matches.append(
             (
                 freshness_date,
@@ -1967,7 +1961,7 @@ def _load_broker_trend_report(
         "status_text": "暂时不可用",
     }
     selected = _latest_valid_report_payload(
-        reports_dir, report_date, market=market, broker=broker
+        reports_dir, market=market, broker=broker
     )
     if selected is None:
         return unavailable

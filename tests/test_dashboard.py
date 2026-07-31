@@ -3157,14 +3157,15 @@ def test_dashboard_trend_report_ranks_revisions_by_generated_instant(
     assert report["buy_actions"][0]["symbol"] == "LATER"
 
 
-def test_dashboard_trend_report_skips_future_candidate(tmp_path: Path) -> None:
-    config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
-    reports_dir.mkdir(parents=True)
+def _write_valid_us_trend_report(
+    reports_dir: Path,
+    *,
+    execution_date: str,
+    as_of_date: str,
+    generated_at: str,
+) -> None:
     payload = {
-        "as_of_date": "2026-07-15",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [],
@@ -3172,12 +3173,35 @@ def test_dashboard_trend_report_skips_future_candidate(tmp_path: Path) -> None:
         },
         "option_attention": [],
     }
-    for execution_date in ("2026-07-15", "2026-07-16"):
-        (reports_dir / f"{execution_date}.json").write_text(json.dumps({
-            **payload,
-            "execution_date": execution_date,
-            "generated_at": f"{execution_date}T18:00:00+08:00",
-        }), encoding="utf-8")
+    (reports_dir / f"{execution_date}.json").write_text(json.dumps({
+        **payload,
+        "execution_date": execution_date,
+        "as_of_date": as_of_date,
+        "generated_at": generated_at,
+        "metadata": {
+            "market": "US",
+            "broker": "tiger",
+            "run_date": execution_date,
+        },
+    }), encoding="utf-8")
+
+
+def test_dashboard_trend_report_selects_latest_valid_next_execution_day(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    for execution_date, as_of_date in (
+        ("2026-07-15", "2026-07-14"),
+        ("2026-07-16", "2026-07-15"),
+    ):
+        _write_valid_us_trend_report(
+            reports_dir,
+            execution_date=execution_date,
+            as_of_date=as_of_date,
+            generated_at=f"{execution_date}T07:30:00+08:00",
+        )
 
     report = dashboard_module._load_trend_reports(
         config.data_dir,
@@ -3186,8 +3210,36 @@ def test_dashboard_trend_report_skips_future_candidate(tmp_path: Path) -> None:
     )["tiger"]
 
     assert report["available"] is True
-    assert report["report_date"] == "2026-07-15"
-    assert report["data_status"] == "current"
+    assert report["artifact"] == "2026-07-16.json"
+    assert report["report_date"] == "2026-07-16"
+
+
+def test_dashboard_us_main_view_uses_latest_report_before_new_york_midnight(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir.mkdir(parents=True)
+    for execution_date, as_of_date, generated_at in (
+        ("2026-07-15", "2026-07-14", "2026-07-15T23:57:00+08:00"),
+        ("2026-07-16", "2026-07-15", "2026-07-16T07:30:00+08:00"),
+    ):
+        _write_valid_us_trend_report(
+            reports_dir,
+            execution_date=execution_date,
+            as_of_date=as_of_date,
+            generated_at=generated_at,
+        )
+
+    now = datetime(2026, 7, 16, 7, 30, tzinfo=dashboard_module.SHANGHAI)
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        now=now,
+    )["tiger"]
+
+    assert dashboard_module._trend_market_date("US", now=now) == date(2026, 7, 15)
+    assert report["artifact"] == "2026-07-16.json"
 
 
 @pytest.mark.parametrize("run_date", ["not-a-date", "2026-07-16"])
