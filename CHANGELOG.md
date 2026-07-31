@@ -10,7 +10,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   midnight. Invalid artifacts still fall through safely, and all older valid
   reports remain available from history. The final Dashboard gate now has an
   explicit, opt-in Polymarket-live waiver for unrelated venue outages; its
-  default remains strict.
+  default remains strict. Complete, current quote fallbacks now preserve
+  account-sync health; missing or stale quotes remain abnormal.
 - Merged the statement-upload and restored market-discipline fixes into `main`.
   A real Phillips upload now shows four securities including `03308`, dated
   2026-07-29, with HKD 628,326.07 total assets; final acceptance was skipped at

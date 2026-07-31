@@ -306,6 +306,17 @@ def test_health_is_ok_only_with_current_controller_sources_quotes_and_generation
     assert healthy["reason"] == ""
     assert healthy["brokers"]["futu"]["display"] == "同步正常"
 
+    complete_fallback_quotes = {
+        "status": "partial",
+        "last_success_at": now.isoformat(),
+        "stale": False,
+        "missing_count": 0,
+    }
+    healthy = project_account_sync_health(
+        state, controller, complete_fallback_quotes, now=now
+    )
+    assert healthy["status"] == "ok"
+
     stale_controller = _controller_status(now - timedelta(seconds=16))
     abnormal = project_account_sync_health(state, stale_controller, quotes, now=now)
     assert abnormal["status"] == "abnormal"
