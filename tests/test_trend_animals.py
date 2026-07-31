@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import open_trader.trend_animals as trend_animals
 
 from open_trader.trend_animals import (
     TrendAnimalsClient,
@@ -439,8 +440,8 @@ def test_search_exact_symbol_caches_tm_id_without_guessing(tmp_path: Path) -> No
         {
             "searchTicker": success(
                 [
-                    {"tmId": 7, "tickerSymbol": "600025.SH"},
-                    {"tmId": 8, "tickerSymbol": "600026.SH"},
+                    {"tmId": 7, "tickerSymbol": "600025.SH", "asset": "A股"},
+                    {"tmId": 8, "tickerSymbol": "600026.SH", "asset": "A股"},
                 ]
             )
         }
@@ -464,28 +465,27 @@ def test_search_exact_symbol_caches_tm_id_without_guessing(tmp_path: Path) -> No
     assert len(transport.calls) == 1
     assert transport.calls[0][1] == {
         "apiKey": ["secret-value"],
-        "keyword": ["600025.SH"],
+        "keyword": ["600025"],
     }
-    assert (tmp_path / "symbols" / "600025.json").read_text(encoding="utf-8")
+    assert (
+        tmp_path / "symbol_mappings" / "CN" / "SH.600025.json"
+    ).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
-    ("market", "symbol", "ticker_symbol", "keyword", "asset"),
+    ("market", "symbol", "keyword", "ticker_symbol", "asset"),
     [
-        ("HK", "HK.00027", "0027.HK", "0027.HK", "港股"),
+        ("CN", "SH.600036", "600036", "600036.SH", "A股"),
+        ("CN", "SH.515450", "515450", "515450", "ETF基金"),
         ("HK", "HK.03033", "3033.HK", "3033.HK", "香港ETF"),
-        ("CN", "SH.600036", "600036.SH", "600036.SH", "A股"),
-        ("CN", "SH.510300", "510300.SH", "510300.SH", "ETF基金"),
-        ("US", "US.ARWR", "ARWR.US", "ARWR", "美股"),
-        ("US", "US.QQQ", "QQQ.US", "QQQ", "美国ETF"),
         ("US", "US.BRK.B", "BRK_B", "BRK_B", "美股"),
     ],
 )
-def test_search_exact_symbol_uses_market_qualified_conversion(
+def test_search_exact_symbol_uses_one_exact_query_and_persists_returned_code(
     market: str,
     symbol: str,
-    ticker_symbol: str,
     keyword: str,
+    ticker_symbol: str,
     asset: str,
     tmp_path: Path,
 ) -> None:
@@ -500,13 +500,25 @@ def test_search_exact_symbol_uses_market_qualified_conversion(
         api_key="secret-value", cache_dir=tmp_path, transport=transport
     )
 
-    assert (
-        client.search_exact_symbol(
-            symbol, market=market, expected_date="2026-07-29"
-        )
-        == 7
+    assert client.search_exact_symbol(
+        symbol, market=market, expected_date="2026-07-29"
+    ) == 7
+    assert transport.calls == [
+        ("searchTicker", {"apiKey": ["secret-value"], "keyword": [keyword]})
+    ]
+    mapping = client.symbol_mapping(symbol, market=market)
+    assert mapping is not None
+    assert mapping.trend_animals_symbol == ticker_symbol
+    assert mapping.futu_symbol == symbol
+
+    cached_transport = FakeTransport({})
+    cached = TrendAnimalsClient(
+        api_key="different-secret", cache_dir=tmp_path, transport=cached_transport
     )
-    assert transport.calls[0][1]["keyword"] == [keyword]
+    assert cached.search_exact_symbol(
+        symbol, market=market, expected_date="2026-08-01"
+    ) == 7
+    assert cached_transport.calls == []
 
 
 def test_search_exact_symbol_ignores_same_code_crypto_asset(tmp_path: Path) -> None:
@@ -667,7 +679,7 @@ def test_exact_symbol_miss_has_distinct_error(tmp_path: Path) -> None:
         )
 
 
-def test_search_exact_symbol_reuses_miss_only_for_same_data_date(
+def test_failed_discovery_is_permanent_across_dates(
     tmp_path: Path,
 ) -> None:
     first_transport = FakeTransport({"searchTicker": success([])})
@@ -680,40 +692,92 @@ def test_search_exact_symbol_reuses_miss_only_for_same_data_date(
             "EUV", market="US", expected_date="2026-07-29"
         )
 
-    cached_transport = FakeTransport({})
-    cached_client = TrendAnimalsClient(
-        api_key="secret-value", cache_dir=tmp_path, transport=cached_transport
-    )
-    with pytest.raises(TrendAnimalsLookupError, match="no unique exact match"):
-        cached_client.search_exact_symbol(
-            "EUV", market="US", expected_date="2026-07-29"
-        )
-    assert cached_transport.calls == []
+    assert len(first_transport.calls) == 1
+    miss_path = tmp_path / "symbol_misses" / "US" / "US.EUV.json"
+    assert json.loads(miss_path.read_text(encoding="utf-8")) == {
+        "discovery_query": "EUV",
+        "discovery_rule_version": "trend_symbol_discovery.v1",
+        "error": "no_unique_exact_match",
+        "futu_symbol": "US.EUV",
+        "market": "US",
+    }
 
-    retry_transport = FakeTransport(
+    for expected_date in ("2026-07-29", "2026-07-30", "2026-08-01"):
+        cached_transport = FakeTransport({})
+        cached_client = TrendAnimalsClient(
+            api_key="secret-value", cache_dir=tmp_path, transport=cached_transport
+        )
+        with pytest.raises(TrendAnimalsLookupError, match="no unique exact match"):
+            cached_client.search_exact_symbol(
+                "EUV", market="US", expected_date=expected_date
+            )
+        assert cached_transport.calls == []
+
+
+def test_complete_mapping_wins_over_permanent_miss(tmp_path: Path) -> None:
+    miss_path = tmp_path / "symbol_misses" / "CN" / "SH.515450.json"
+    miss_path.parent.mkdir(parents=True)
+    miss_path.write_text(
+        json.dumps(
+            {
+                "discovery_query": "515450",
+                "discovery_rule_version": "trend_symbol_discovery.v1",
+                "error": "no_unique_exact_match",
+                "futu_symbol": "SH.515450",
+                "market": "CN",
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=FakeTransport({})
+    )
+    client.remember_symbol_row(
+        market="CN",
+        expected_futu_symbol="SH.515450",
+        row={"tmId": 328879, "tickerSymbol": "515450", "asset": "ETF基金"},
+    )
+
+    assert client.search_exact_symbol(
+        "SH.515450", market="CN", expected_date="2026-08-01"
+    ) == 328879
+
+
+def test_changed_discovery_rule_may_query_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = TrendAnimalsClient(
+        api_key="secret-value",
+        cache_dir=tmp_path,
+        transport=FakeTransport({"searchTicker": success([])}),
+    )
+    with pytest.raises(TrendAnimalsLookupError):
+        first.search_exact_symbol(
+            "SH.515450", market="CN", expected_date="2026-07-29"
+        )
+
+    monkeypatch.setattr(
+        trend_animals,
+        "TREND_SYMBOL_DISCOVERY_RULE_VERSION",
+        "trend_symbol_discovery.v2",
+    )
+    changed_transport = FakeTransport(
         {
             "searchTicker": success(
-                [
-                    {
-                        "tickerSymbol": "EUV.US",
-                        "tmId": 800001,
-                        "asset": "美国ETF",
-                    }
-                ]
+                [{"tmId": 328879, "tickerSymbol": "515450", "asset": "ETF基金"}]
             )
         }
     )
-    retry_client = TrendAnimalsClient(
-        api_key="secret-value", cache_dir=tmp_path, transport=retry_transport
+    changed = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=changed_transport
     )
 
-    assert (
-        retry_client.search_exact_symbol(
-            "EUV", market="US", expected_date="2026-07-30"
-        )
-        == 800001
-    )
-    assert len(retry_transport.calls) == 1
+    assert changed.search_exact_symbol(
+        "SH.515450", market="CN", expected_date="2026-07-30"
+    ) == 328879
+    assert changed_transport.calls == [
+        ("searchTicker", {"apiKey": ["secret-value"], "keyword": ["515450"]})
+    ]
 
 
 def test_search_exact_symbol_does_not_cache_transport_failure(
