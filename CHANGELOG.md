@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- Simplified the Dashboard account-source panel by grouping live accounts and
+  broker statements and showing each broker's own accepted data time. Removed
+  the redundant global quote, heartbeat, controller, and refresh labels while
+  preserving file-backed status, quote polling, and per-broker failure states.
 - Made Dashboard browser acceptance compare volatile controller-owned prices
   with the page's current state instead of a pre-navigation snapshot. Live
   quote fetch and valid-price checks remain strict, so normal price movement no
