@@ -4770,6 +4770,69 @@ function filterAccountRows(rows) {
     || String(display.market || "").toUpperCase() === state.marketFilter);
 }
 
+function accountDisclosureKey(root, details) {
+  const path = [];
+  let current = details;
+  while (current && current !== root) {
+    const parent = current.parentElement;
+    if (!parent) return "";
+    const index = Array.from(parent.children).indexOf(current);
+    const identity = current.tagName === "DETAILS"
+      ? [
+        current.className || "",
+        current.getAttribute("aria-label") || "",
+        current.getAttribute("data-discipline") || "",
+        current.getAttribute("data-health") || "",
+        current.getAttribute("data-risk-status") || "",
+      ].join("|")
+      : current.tagName || "";
+    path.unshift(`${identity}#${index}`);
+    current = parent;
+  }
+  return path.join("/");
+}
+
+function accountDisclosureScope(root, broker, view) {
+  const section = root?.querySelector?.(`#account-${broker}`);
+  if (!section || typeof section.querySelector !== "function") return null;
+  const panel = section.querySelector(`#account-${broker}-view-panel`);
+  if (TREND_ACCOUNT_BROKERS.includes(broker)
+      && panel?.getAttribute("aria-labelledby") !== `account-${broker}-view-${view}`) {
+    return null;
+  }
+  const report = panel?.querySelector?.(".cn-trend-report");
+  return [
+    broker,
+    view,
+    report?.dataset?.reportArtifact || "",
+    report?.dataset?.reportSha256 || "",
+    report?.dataset?.strategyVersion || "",
+  ].join("|");
+}
+
+function captureAccountDisclosureState(root, broker, view) {
+  const section = root?.querySelector?.(`#account-${broker}`);
+  const scope = accountDisclosureScope(root, broker, view);
+  if (!section || scope === null || typeof section.querySelectorAll !== "function") return null;
+  const states = new Map();
+  section.querySelectorAll("details").forEach((details) => {
+    const key = accountDisclosureKey(section, details);
+    if (key) states.set(key, details.open);
+  });
+  return {scope, states};
+}
+
+function restoreAccountDisclosureState(root, broker, view, snapshot) {
+  if (!snapshot) return;
+  const section = root?.querySelector?.(`#account-${broker}`);
+  if (!section || accountDisclosureScope(root, broker, view) !== snapshot.scope
+      || typeof section.querySelectorAll !== "function") return;
+  section.querySelectorAll("details").forEach((details) => {
+    const key = accountDisclosureKey(section, details);
+    if (snapshot.states.has(key)) details.open = snapshot.states.get(key);
+  });
+}
+
 function renderAccountViewPanelOnly(broker) {
   const container = elements["account-holdings"] || elements["holdings-body"];
   const panel = state.brokerFilter === broker && typeof container?.querySelector === "function"
@@ -4783,11 +4846,13 @@ function renderAccountViewPanelOnly(broker) {
   const visibleRows = view === "simulate"
     ? filterAccountRows(simulatedAccountRows(broker))
     : rows;
+  const disclosureSnapshot = captureAccountDisclosureState(container, broker, view);
   if (elements["visible-count"]) {
     elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   }
   panel.innerHTML = renderAccountViewPanel({...group, rows});
   panel.setAttribute("aria-labelledby", `account-${broker}-view-${view}`);
+  restoreAccountDisclosureState(container, broker, view, disclosureSnapshot);
   container.querySelectorAll?.(`#account-${broker} [data-account-view]`).forEach((tab) => {
     const selected = tab.dataset.accountView === view;
     tab.setAttribute("aria-selected", String(selected));
@@ -4826,10 +4891,25 @@ function renderAccountHoldings() {
   const visibleRows = active && state.accountViews[active.broker] === "simulate"
     ? filterAccountRows(simulated)
     : rows;
+  const disclosureSnapshot = active
+    ? captureAccountDisclosureState(
+      container,
+      active.broker,
+      state.accountViews[active.broker] || "real",
+    )
+    : null;
   elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   container.innerHTML = active
     ? renderAccountSection({...active, rows})
     : '<div class="empty-state">暂无券商账户</div>';
+  if (active) {
+    restoreAccountDisclosureState(
+      container,
+      active.broker,
+      state.accountViews[active.broker] || "real",
+      disclosureSnapshot,
+    );
+  }
   if (active?.broker === focusedBroker && focusedView) {
     container.querySelector(`[data-account-view="${focusedView}"]`)?.focus();
   }
