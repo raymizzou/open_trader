@@ -1400,6 +1400,10 @@ def serve_dashboard(
                 trading=prediction_trading,
                 notifier=prediction_notifier or NullNotifier(),
                 lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
+                dashboard_url=f"http://127.0.0.1:{port}/",
+            )
+            prediction_monitor.set_ready_observer(
+                prediction_execution.notify_ready_opportunity
             )
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked

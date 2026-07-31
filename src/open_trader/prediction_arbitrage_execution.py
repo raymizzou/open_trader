@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .daily_premarket import send_notification_with_results
-from .notifications import Notifier
+from .notifications import Notifier, render_prediction_opportunity_notification
 from .polymarket_trading import (
     LegResult,
     PairSubmission,
@@ -133,23 +133,55 @@ class PredictionExecutionService:
         trading: object,
         notifier: Notifier,
         lock_path: Path,
+        dashboard_url: str = "http://127.0.0.1:8766/",
     ) -> None:
         self._store = store
         self._monitor = monitor
         self._trading = trading
         self._notifier = notifier
         self._lock_path = Path(lock_path)
+        self._dashboard_url = str(dashboard_url)
         self._process_lock = _PROCESS_LOCK
         # A newly constructed process has not reconciled its dedicated wallet;
         # only a clean startup/reset path may clear this lock.
         self._breaker_open = True
         self._first_live_order_verified = False
         self._threads: dict[str, threading.Thread] = {}
+        self._notification_lock = threading.Lock()
         self._clock = time.monotonic
         self._sleep = time.sleep
 
     def preview(self, opportunity_id: str) -> dict[str, object]:
         """Freshly validate one server-issued opportunity and persist a preview."""
+
+        prepared = self._prepare_opportunity(str(opportunity_id))
+        if isinstance(prepared, dict):
+            return prepared
+        opportunity, intent, account = prepared
+
+        now = _utc_now()
+        expires_at = now + PREVIEW_TTL
+        payload = self._preview_payload(
+            opportunity, intent, account=account, expires_at=expires_at
+        )
+        preview_id = self._store.create_preview(
+            payload, expires_at=_timestamp(expires_at)
+        )
+        result = dict(payload)
+        result.update(
+            {
+                "id": preview_id,
+                "preview_id": preview_id,
+                "state": "previewed",
+                "expires_at": _timestamp(expires_at),
+            }
+        )
+        return result
+
+    def _prepare_opportunity(
+        self, opportunity_id: str
+    ) -> tuple[dict[str, object], ExecutionIntent, dict[str, object]] | dict[str, object]:
+        """Run the shared read-only admission checks used by preview and notify."""
 
         if self._breaker_is_open():
             return {"state": "locked", "reason": "circuit_breaker_open"}
@@ -175,25 +207,151 @@ class PredictionExecutionService:
         account, reason = self._volatile_checks(intent)
         if account is None:
             return {"state": "rejected", "reason": reason or "readiness_unavailable"}
+        return opportunity, intent, account
 
-        now = _utc_now()
-        expires_at = now + PREVIEW_TTL
-        payload = self._preview_payload(
-            opportunity, intent, account=account, expires_at=expires_at
+    def notify_ready_opportunity(
+        self, opportunity_id: str, signal_id: str
+    ) -> dict[str, object]:
+        """Deliver one observation-only alert after a fresh no-submit proof."""
+
+        signal = self._store.signal(str(signal_id))
+        if signal is None:
+            return {"state": "ignored", "reason": "signal_unavailable"}
+        if signal.get("ended_at") is not None:
+            return {"state": "ignored", "reason": "signal_closed"}
+        if signal.get("notification_state") == "sent":
+            return {"state": "ignored", "reason": "already_sent"}
+        if signal.get("notification_state") == "sending":
+            return {"state": "ignored", "reason": "notification_in_flight"}
+        attempts = _decimal(signal.get("notification_attempts")) or Decimal("0")
+        if attempts >= 3:
+            return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+
+        prepared = self._prepare_opportunity(str(opportunity_id))
+        if isinstance(prepared, dict):
+            return {"state": "failed", "reason": prepared.get("reason", "not_ready")}
+        opportunity, intent, _account = prepared
+        if not isinstance(intent, ThresholdHedgeIntent):
+            return {"state": "failed", "reason": "unsupported_intent"}
+        if opportunity.get("rules_verified_at") in (None, ""):
+            return {"state": "failed", "reason": "rules_unverified"}
+        if not self._codex_approved(opportunity):
+            return {"state": "failed", "reason": "codex_not_approved"}
+        if opportunity.get("remediation_safe") is False:
+            return {"state": "failed", "reason": "emergency_unwind_unavailable"}
+        if intent.minimum_profit <= 0 or intent.net_edge <= 0:
+            return {"state": "failed", "reason": "threshold_economics"}
+
+        preflight = getattr(self._trading, "no_submit_threshold_preflight", None)
+        if not callable(preflight):
+            return {"state": "failed", "reason": "threshold_preflight_unavailable"}
+        try:
+            preflight_result = _call(preflight, intent)
+        except Exception:
+            preflight_result = None
+        if not self._preflight_passed(preflight_result):
+            return {"state": "failed", "reason": "preflight_failed"}
+
+        final = self._fresh_opportunity(str(opportunity_id))
+        final_intent = self._intent_from_opportunity(final)
+        if final is None or not isinstance(final_intent, ThresholdHedgeIntent):
+            return {"state": "failed", "reason": "opportunity_changed"}
+        if self._intent_payload(final_intent) != self._intent_payload(intent):
+            return {"state": "failed", "reason": "opportunity_changed"}
+        final_reason = self._validate_opportunity(final, final_intent)
+        if final_reason is not None:
+            return {"state": "failed", "reason": final_reason}
+        final_age = _decimal(final.get("confirmed_age_seconds"))
+        if final_age is None or final_age > BOOK_FRESHNESS_SECONDS:
+            return {"state": "failed", "reason": "books_stale"}
+        if final_intent.minimum_profit <= 0 or final_intent.net_edge <= 0:
+            return {"state": "failed", "reason": "threshold_economics"}
+
+        with self._notification_lock:
+            current = self._store.signal(str(signal_id))
+            if current is None or current.get("ended_at") is not None:
+                return {"state": "ignored", "reason": "signal_closed"}
+            if current.get("notification_state") == "sent":
+                return {"state": "ignored", "reason": "already_sent"}
+            if current.get("notification_state") == "sending":
+                return {"state": "ignored", "reason": "notification_in_flight"}
+            current_attempts = _decimal(current.get("notification_attempts")) or Decimal("0")
+            if current_attempts >= 3:
+                return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+            reserved_attempts = int(current_attempts) + 1
+            try:
+                current = self._store.update_signal(
+                    str(signal_id),
+                    {
+                        "notification_attempts": reserved_attempts,
+                        "notification_state": "sending",
+                    },
+                )
+            except Exception:
+                return {"state": "failed", "reason": "notification_state_unavailable"}
+
+        final = dict(final)
+        final.setdefault("order_ready_at", _timestamp(_utc_now()))
+        title, message = render_prediction_opportunity_notification(
+            final, current, dashboard_url=self._dashboard_url
         )
-        preview_id = self._store.create_preview(
-            payload, expires_at=_timestamp(expires_at)
+        fallback_target: object | None = None
+        try:
+            attempts_result = send_notification_with_results(
+                self._notifier,
+                title,
+                message,
+                channels={"feishu", "feishu_app"},
+            )
+            if not attempts_result:
+                # Test doubles and custom notifiers may expose an explicit
+                # channel without being one of the built-in Feishu classes.
+                fallback_target = self._feishu_target()
+                if fallback_target is not None:
+                    attempts_result = send_notification_with_results(
+                        fallback_target, title, message, channels=None
+                    )
+        except Exception:
+            attempts_result = []
+            error_code = "delivery_failed"
+        else:
+            error_code = "delivery_failed"
+        feishu_success = any(
+            getattr(item, "channel", "") in {"feishu", "feishu_app"}
+            and getattr(item, "success", False)
+            for item in attempts_result
         )
-        result = dict(payload)
-        result.update(
-            {
-                "id": preview_id,
-                "preview_id": preview_id,
-                "state": "previewed",
-                "expires_at": _timestamp(expires_at),
-            }
+        if not feishu_success and fallback_target is not None:
+            feishu_success = any(getattr(item, "success", False) for item in attempts_result)
+        if feishu_success:
+            self._store.update_signal(
+                str(signal_id),
+                {
+                    "notification_state": "sent",
+                    "notification_sent_at": _timestamp(_utc_now()),
+                },
+            )
+            return {"state": "sent", "signal_id": str(signal_id)}
+        self._store.update_signal(
+            str(signal_id),
+            {"notification_state": "failed", "notification_error": error_code},
         )
-        return result
+        return {"state": "failed", "reason": "notification_failed"}
+
+    def _feishu_target(self) -> object | None:
+        targets = getattr(self._notifier, "_notifiers", None)
+        candidates = list(targets) if isinstance(targets, (list, tuple)) else [self._notifier]
+        for target in candidates:
+            if self._notification_channel(target) in {"feishu", "feishu_app"}:
+                return target
+        return None
+
+    @staticmethod
+    def _codex_approved(opportunity: Mapping[str, object]) -> bool:
+        validation = opportunity.get("relation_validation")
+        if isinstance(validation, Mapping):
+            return str(validation.get("status", "")).strip().lower() == "approved"
+        return str(opportunity.get("llm_status", "")).strip().lower() == "approved"
 
     def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         """Consume one preview and start exactly one daemon execution thread."""

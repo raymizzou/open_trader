@@ -20,6 +20,7 @@ from open_trader.notifications import (
     XiaoaiSSHNotifier,
     XiaoaiVoiceSuppressed,
     render_feishu_order_review,
+    render_prediction_opportunity_notification,
     render_xiaoai_voice_notification,
     xiaoai_voice_allowed,
 )
@@ -89,6 +90,71 @@ def test_feishu_webhook_notifier_sends_text_payload() -> None:
         "payload": {"msg_type": "text", "content": {"text": "Open Trader\n\nhello"}},
         "timeout": 3.0,
     }
+
+
+def test_prediction_notification_contains_ready_order_facts_only() -> None:
+    title, message = render_prediction_opportunity_notification(
+        {
+            "event_title": "2026 年美联储会降息多少次？",
+            "event_slug": "fed-cuts-2026",
+            "leg_a": {
+                "question": "至少降息 2 次",
+                "outcome": "YES",
+                "quantity": "10.00",
+                "max_price": "0.53",
+                "max_cost": "5.30",
+            },
+            "leg_b": {
+                "question": "至少降息 3 次",
+                "outcome": "NO",
+                "quantity": "10.00",
+                "max_price": "0.42",
+                "max_cost": "4.20",
+            },
+            "planned_amount": "9.50",
+            "maximum_fee": "0.12",
+            "total_max_cost": "9.62",
+            "minimum_payout": "10.00",
+            "minimum_profit": "0.38",
+            "net_edge": "0.0395",
+            "order_ready_at": "2026-07-31T10:46:54.896000+08:00",
+            "confirmed_age_seconds": "0.184",
+            "rules_verified_at": "2026-07-31T10:46:54.700000+08:00",
+        },
+        {
+            "signal_id": "pm-01",
+            "first_positive_at": "2026-07-31T10:46:53.696000+08:00",
+        },
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    assert title == "【仅观察·未下单】Polymarket 正收益机会｜+$0.38"
+    for text in (
+        "事件：2026 年美联储会降息多少次？",
+        "买入「至少降息 2 次」YES：10.00 份 × $0.53 = $5.30",
+        "买入「至少降息 3 次」NO：10.00 份 × $0.42 = $4.20",
+        "拟下单金额：$9.50",
+        "预计费用：$0.12",
+        "最大总成本：$9.62",
+        "最低兑付：$10.00",
+        "保底净利润：+$0.38（+3.95%）",
+        "发现时间：2026-07-31 10:46:53.696 +08:00",
+        "信号→发送：1.2 秒",
+        "盘口年龄：184 毫秒",
+        "关系复核：通过",
+        "机会状态：观察中",
+        "机会编号：pm-01",
+        "https://polymarket.com/event/fed-cuts-2026",
+        "Dashboard：http://127.0.0.1:8766/",
+    ):
+        assert text in message
+    for forbidden in (
+        "token_id",
+        "wallet",
+        "Codex 待确认",
+        "余额正常",
+        "自动下单关闭",
+    ):
+        assert forbidden not in message
 
 
 def test_feishu_webhook_notifier_raises_on_api_error() -> None:

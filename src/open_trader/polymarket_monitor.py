@@ -307,6 +307,7 @@ class PolymarketMonitor:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._relation_discovery = relation_discovery
         self._relation_validator = relation_validator
+        self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -370,6 +371,8 @@ class PolymarketMonitor:
         self._codex_validations: dict[str, object] = {}
         self._codex_statuses: dict[str, str] = {}
         self._codex_wait_started_at: dict[str, datetime] = {}
+        self._notification_task: asyncio.Task[object] | None = None
+        self._notification_signal_id: str | None = None
         self._full_scan_task: asyncio.Task[None] | None = None
         self._catalog_loaded = False
         self._heartbeat_at: datetime | None = None
@@ -388,6 +391,11 @@ class PolymarketMonitor:
         self._relation_scan_logs: deque[dict[str, object]] = deque(
             maxlen=RELATION_SCAN_LOG_LIMIT
         )
+
+    def set_ready_observer(
+        self, observer: Callable[[str, str], Mapping[str, object]]
+    ) -> None:
+        self._ready_observer = observer
 
     def start(self) -> None:
         with self._lock:
@@ -598,6 +606,7 @@ class PolymarketMonitor:
         next_readiness_refresh = 0.0
         try:
             while not self._stop_event.is_set():
+                self._reap_notification_task()
                 self._maintain_open_signals()
                 self._maybe_schedule_full_scan(client)
                 self._maybe_schedule_activity_scan(client)
@@ -646,7 +655,12 @@ class PolymarketMonitor:
                     self._record_error(exc, "stream_event")
                 self._write_runtime()
         finally:
-            for task_name in ("_full_scan_task", "_activity_scan_task", "_codex_task"):
+            for task_name in (
+                "_full_scan_task",
+                "_activity_scan_task",
+                "_codex_task",
+                "_notification_task",
+            ):
                 task = getattr(self, task_name)
                 setattr(self, task_name, None)
                 if task is not None and not task.done():
@@ -2029,6 +2043,10 @@ class PolymarketMonitor:
                     self._relation_books[relation.buy_leg_b.token_id].confirmed_at,
                 ),
             )
+            event_row = self._events.get(relation.event_id)
+            if event_row is not None:
+                row.setdefault("event_title", event_row.get("title", ""))
+                row.setdefault("event_slug", event_row.get("slug", ""))
             rows.append(row)
             self._upsert_signal(row)
         self._log_relation_scan(
@@ -2268,6 +2286,11 @@ class PolymarketMonitor:
             "buy_legs": [
                 {
                     "label": leg.label,
+                    "question": (
+                        relation.market_a.question
+                        if leg.label == "A"
+                        else relation.market_b.question
+                    ),
                     "market_id": leg.market_id,
                     "condition_id": leg.condition_id,
                     "outcome": leg.outcome,
@@ -2278,6 +2301,21 @@ class PolymarketMonitor:
                 }
                 for leg in legs
             ],
+            "leg_a": {
+                "question": relation.market_a.question,
+                "outcome": legs[0].outcome,
+                "quantity": legs[0].quantity,
+                "max_price": legs[0].max_price,
+                "max_cost": legs[0].max_cost,
+            },
+            "leg_b": {
+                "question": relation.market_b.question,
+                "outcome": legs[1].outcome,
+                "quantity": legs[1].quantity,
+                "max_price": legs[1].max_price,
+                "max_cost": legs[1].max_cost,
+            },
+            "planned_amount": selected.total_max_cost,
             "volume_24h": volume,
             "confirmed_at": confirmed_at,
             "confirmed_age_seconds": confirmed_age,
@@ -2302,6 +2340,7 @@ class PolymarketMonitor:
             "eligibility": "actionable" if actionable else "visible_positive",
             "eligibility_reason": eligibility_reason,
             "llm_status": getattr(validation, "status", "llm_unavailable"),
+            "relation_validation": {"status": getattr(validation, "status", "llm_unavailable")},
             "llm_decision": getattr(validation, "decision", None),
             "llm_relation": getattr(validation, "relation", None),
             "llm_summary": summary,
@@ -2781,11 +2820,65 @@ class PolymarketMonitor:
                     "book_received_at_b": opportunity.get("book_received_at_b"),
                 }
             )
+            self._schedule_ready_notification(signal_id, opportunity)
             return signal_id
         except Exception as exc:
             self._store_failed = True
             self._record_error(exc, "store")
             return None
+
+    def _schedule_ready_notification(
+        self, signal_id: str | None, opportunity: Mapping[str, object]
+    ) -> None:
+        observer = self._ready_observer
+        if observer is None or signal_id is None:
+            return
+        if opportunity.get("market_type") != "threshold_hedge":
+            return
+        if opportunity.get("actionable") is not True:
+            return
+        if opportunity.get("rules_verified_at") in (None, ""):
+            return
+        validation = opportunity.get("relation_validation")
+        codex_status = (
+            validation.get("status")
+            if isinstance(validation, Mapping)
+            else opportunity.get("llm_status")
+        )
+        if str(codex_status).strip().lower() != "approved":
+            return
+        self._reap_notification_task()
+        task = self._notification_task
+        if task is not None and not task.done():
+            return
+        signal = self._store.signal(str(signal_id))
+        if signal is None or signal.get("ended_at") is not None:
+            return
+        if signal.get("notification_state") in {"sent", "sending"}:
+            return
+        attempts = _decimal(signal.get("notification_attempts")) or Decimal("0")
+        if attempts >= 3:
+            return
+        self._notification_signal_id = str(signal_id)
+        self._notification_task = asyncio.create_task(
+            asyncio.to_thread(observer, str(opportunity.get("opportunity_id", "")), str(signal_id))
+        )
+
+    def _reap_notification_task(self) -> None:
+        task = self._notification_task
+        if task is None or not task.done():
+            return
+        self._notification_task = None
+        signal_id = self._notification_signal_id
+        self._notification_signal_id = None
+        try:
+            result = task.result()
+        except Exception:
+            return
+        if isinstance(result, Mapping) and result.get("state") == "sent":
+            self._activity["notifications_sent"] = int(
+                self._activity.get("notifications_sent", 0) or 0
+            ) + 1
 
     def _close_signal(
         self,

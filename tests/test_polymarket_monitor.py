@@ -839,6 +839,45 @@ def test_generic_open_signal_closes_on_stale_receive_timestamp(
     assert monitor._store.signal(signal_id)["ended_reason"] == "data_unavailable"
 
 
+def test_ready_observer_is_called_once_for_order_ready_episode(tmp_path: Path) -> None:
+    async def scenario() -> list[tuple[str, str]]:
+        setup_public([threshold_event()])
+        setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+        monitor = make_monitor(
+            tmp_path,
+            relation_discovery=discover_threshold_relations,
+            relation_validator=FakeRelationValidator(),
+        )
+        calls: list[tuple[str, str]] = []
+
+        def observer(opportunity_id: str, signal_id: str) -> dict[str, object]:
+            calls.append((opportunity_id, signal_id))
+            monitor._store.update_signal(
+                signal_id,
+                {"notification_state": "sent", "notification_attempts": 1},
+            )
+            return {"state": "sent"}
+
+        monitor.set_ready_observer(observer)
+        client = FakePublicClient()
+        await monitor._run_full_relation_scan(client)
+        await monitor._refresh_readiness()
+        await monitor._refresh_relation_activity(client)
+        await monitor._drain_relation_validation(client)
+        await monitor._refresh_relation_opportunities(client, set(monitor._active_relation_ids))
+        await asyncio.sleep(0.05)
+        monitor._reap_notification_task()
+        await monitor._refresh_relation_opportunities(client, set(monitor._active_relation_ids))
+        await asyncio.sleep(0.01)
+        monitor._reap_notification_task()
+        return calls
+
+    calls = asyncio.run(scenario())
+    assert len(calls) == 1
+    assert calls[0][0]
+    assert calls[0][1]
+
+
 def test_event_refetch_failure_closes_episode_as_data_unavailable(
     tmp_path: Path,
 ) -> None:

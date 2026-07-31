@@ -2861,6 +2861,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
 
     class FakeMonitor:
         kwargs: dict[str, object] = {}
+        observer: object | None = None
 
         def __init__(self, **_: object) -> None:
             self.__class__.kwargs = dict(_)
@@ -2871,9 +2872,17 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def stop(self) -> None:
             order.append("monitor.stop")
 
+        def set_ready_observer(self, observer: object) -> None:
+            self.__class__.observer = observer
+
     class FakeExecution:
+        kwargs: dict[str, object] = {}
+
         def __init__(self, **_: object) -> None:
-            pass
+            self.__class__.kwargs = dict(_)
+
+        def notify_ready_opportunity(self, opportunity_id: str, signal_id: str) -> dict[str, object]:
+            return {"state": "ignored", "opportunity_id": opportunity_id, "signal_id": signal_id}
 
         def reconcile_startup(self) -> dict[str, object]:
             order.append("execution.reconcile")
@@ -2910,6 +2919,8 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert FakeMonitor.kwargs["relation_discovery"] is dashboard_web.discover_threshold_relations
     assert FakeMonitor.kwargs["relation_validator"].__class__.__name__ == "CodexRelationValidator"
     assert "DEEPSEEK_API_KEY" not in repr(FakeMonitor.kwargs)
+    assert FakeExecution.kwargs["dashboard_url"] == "http://127.0.0.1:0/"
+    assert callable(FakeMonitor.observer)
 
 
 def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
