@@ -11292,6 +11292,56 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_symbol_mapping_conflict_in_existing_reason_cell() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendHoldingTable([{
+  symbol:"515450",name:"红利50",action:"MANUAL_REVIEW",
+  reason:"symbol_mapping_conflict",industry:"指数基金",
+}], {market:"CN"});
+if (!html.includes('data-label="当前判断">趋势代码映射异常</td>')) {
+  throw new Error(html);
+}
+if (html.includes("映射状态")) throw new Error("unexpected new column");
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_holding_industry_error_does_not_claim_candidate_fallback() -> None:
+    output = run_dashboard_js(r'''
+const contexts = [{
+  industry_tm_id:1,industry:"候选行业",strength:"95",valid:true,
+  temperature:"热",invalid_reasons:[],
+},{
+  industry_tm_id:2,industry:"持仓行业",strength:null,valid:false,
+  temperature:null,invalid_reasons:["holding_industry_unavailable"],
+}];
+const current = renderTrendIndustryContext({
+  industry_context_status:{
+    ordering_mode:"context_current_only",current_complete:true,
+  },
+  industry_contexts:contexts,
+});
+if (!current.includes("持仓行业") || !current.includes('class="trend-industry-context-row invalid"')) {
+  throw new Error(current);
+}
+if (current.includes("已回退旧排序")) throw new Error(current);
+
+const legacy = renderTrendIndustryContext({
+  industry_context_status:{
+    ordering_mode:"legacy_invalid_current",current_complete:false,
+    fallback_reason:"industry_context_invalid",
+  },
+  industry_contexts:contexts,
+});
+if (!legacy.includes("已回退旧排序")) throw new Error(legacy);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_uses_market_neutral_empty_discipline_state_without_current_rules() -> None:
     output = run_dashboard_js(r'''
 const report = (market) => ({

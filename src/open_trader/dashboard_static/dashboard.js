@@ -3026,6 +3026,7 @@ const TREND_REASON_LABELS = {
   danger_signal: "危险信号触发",
   left_trend_right_side: "右侧趋势已结束",
   holding_signal_unknown: "趋势信号不完整",
+  symbol_mapping_conflict: "趋势代码映射异常",
   holding_trend_excluded: "已排除趋势查询",
   holding_kline_unavailable: "持仓日线数据不可用",
   holding_lot_size_unavailable: "持仓整手信息不可用",
@@ -3994,6 +3995,9 @@ function trendIndustryContextFallback(status, contexts) {
       && status?.current_complete !== true) {
     return '<p class="trend-industry-context-fallback">当前行业上下文未提供，无法确认排序；未使用当前规则</p>';
   }
+  const mode = formatPlain(status?.ordering_mode);
+  const invalid = mode.startsWith("legacy") || status?.current_complete === false;
+  if (!invalid) return "";
   const reasons = [];
   if (status && hasValue(status.fallback_reason)) reasons.push(formatPlain(status.fallback_reason));
   if (status && status.validation_reasons && typeof status.validation_reasons === "object") {
@@ -4004,10 +4008,6 @@ function trendIndustryContextFallback(status, contexts) {
     (Array.isArray(context.invalid_reasons) ? context.invalid_reasons : ["行业上下文无效"])
       .filter(hasValue).forEach((reason) => reasons.push(formatPlain(reason)));
   });
-  const mode = formatPlain(status?.ordering_mode);
-  const invalid = mode.startsWith("legacy") || status?.current_complete === false
-    || (contexts || []).some((context) => context && context.valid === false);
-  if (!invalid && !reasons.length) return "";
   const reasonText = [...new Set(reasons)].join("、") || "当前行业上下文不完整";
   return `<p class="trend-industry-context-fallback">当前行业上下文无效，已回退旧排序：${escapeHtml(reasonText)}</p>`;
 }
