@@ -241,11 +241,18 @@ test('renders the exact approved warm-ledger contract', async ({ page }) => {
   });
   await expect(page.locator('body')).toHaveCSS('background-color', rgb.bg);
   await expect(page.locator('body')).toHaveCSS('color', rgb.text);
-  await expect(page.locator('#account-sync-status')).toContainText('同步正常');
+  const sourceStatusList = page.locator('#source-status-list');
+  await expect(sourceStatusList).toBeVisible();
+  await expect(sourceStatusList).toContainText('实时账户');
+  await expect(sourceStatusList).toContainText('券商结单');
+  for (const broker of ['futu', 'tiger', 'phillips', 'eastmoney']) {
+    await expect(sourceStatusList.locator(`[data-broker="${broker}"]`)).toHaveCount(1);
+  }
+  await expect(sourceStatusList).not.toContainText('控制器心跳');
+  await expect(sourceStatusList).not.toContainText('刷新于');
   await expect(page.locator('.current-view-card')).toHaveCSS('background-color', rgb.primary);
   await expectWarmSurface(page, '.header-brand-panel');
   await expectWarmSurface(page, '.holdings-panel');
-  await expect(page.locator('#last-refresh')).toHaveCSS('color', rgb.muted);
   await expect(page.locator('.research-chat-context .status-ok')).toHaveCSS('color', rgb.text);
 });
 
