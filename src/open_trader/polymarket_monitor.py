@@ -46,7 +46,6 @@ UNIVERSE_REFRESH_SECONDS = 5 * 60
 BOOK_FRESHNESS_SECONDS = 10
 READINESS_FRESHNESS_SECONDS = 60
 READINESS_REFRESH_SECONDS = 30
-HEARTBEAT_FRESHNESS_SECONDS = 30
 STREAM_DISCONNECT_SECONDS = 15
 UNIVERSE_STALE_SECONDS = 10 * 60
 RUNTIME_WRITE_SECONDS = 1
@@ -374,10 +373,12 @@ class PolymarketMonitor:
         self._notification_task: asyncio.Task[object] | None = None
         self._notification_signal_id: str | None = None
         self._full_scan_task: asyncio.Task[None] | None = None
+        self._full_scan_pending = False
         self._catalog_loaded = False
         self._heartbeat_at: datetime | None = None
         self._stream_connected_at: datetime | None = None
         self._stream_disconnected_at: datetime | None = None
+        self._subscription_dirty = False
         self._last_runtime_write: datetime | None = None
         self._store_failed = False
         self._universe_failed = False
@@ -444,9 +445,17 @@ class PolymarketMonitor:
                 age = _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None)
                 opportunity["confirmed_age_seconds"] = age
                 if age > BOOK_FRESHNESS_SECONDS:
+                    was_actionable = opportunity.get("actionable") is True
                     opportunity["actionable"] = False
-                    opportunity["eligibility_reason"] = "book_stale"
-                if health["status"] == "degraded":
+                    if was_actionable or opportunity.get("eligibility_reason") in {
+                        "actionable",
+                        "book_stale",
+                    }:
+                        opportunity["eligibility_reason"] = "book_stale"
+                if (
+                    health["status"] == "degraded"
+                    and opportunity.get("market_type") != "threshold_hedge"
+                ):
                     opportunity["actionable"] = False
                     opportunity["eligibility_reason"] = "monitor_degraded"
                 if (
@@ -548,9 +557,17 @@ class PolymarketMonitor:
             age = _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None)
             result["confirmed_age_seconds"] = age
             if age > BOOK_FRESHNESS_SECONDS:
+                was_actionable = result.get("actionable") is True
                 result["actionable"] = False
-                result["eligibility_reason"] = "book_stale"
-            if self._health(now)["status"] == "degraded":
+                if was_actionable or result.get("eligibility_reason") in {
+                    "actionable",
+                    "book_stale",
+                }:
+                    result["eligibility_reason"] = "book_stale"
+            if (
+                self._health(now)["status"] == "degraded"
+                and result.get("market_type") != "threshold_hedge"
+            ):
                 result["actionable"] = False
                 result["eligibility_reason"] = "monitor_degraded"
             relation_health = self._relation_health(now)
@@ -570,6 +587,59 @@ class PolymarketMonitor:
 
         return asyncio.run(self._refresh_once())
 
+    def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        """Refresh only one server-issued opportunity for preview validation."""
+
+        return asyncio.run(self._refresh_opportunity(str(opportunity_id)))
+
+    async def _refresh_opportunity(
+        self, opportunity_id: str
+    ) -> dict[str, object] | None:
+        client = self._public_client_factory()
+        try:
+            await self._refresh_readiness()
+            with self._lock:
+                current = copy.deepcopy(self._opportunities.get(opportunity_id))
+            if opportunity_id in self._relations or (
+                current is not None
+                and current.get("market_type") == "threshold_hedge"
+            ):
+                relation_id = str(
+                    current.get("relation_id", opportunity_id)
+                    if current is not None
+                    else opportunity_id
+                )
+                rows = await self._refresh_relation_opportunities(
+                    client, {relation_id}
+                )
+                self._merge_relation_rows(rows, {relation_id})
+                return self.opportunity(opportunity_id)
+            if current is None:
+                return None
+            market_id = str(current.get("market_id", ""))
+            market_row = await self._refresh_standard_market_metadata(
+                client, current
+            )
+            if market_row is None:
+                with self._lock:
+                    self._opportunities.pop(opportunity_id, None)
+                self._sync_event_rows()
+                return None
+            refreshed = await self._confirm_market(client, market_row)
+            with self._lock:
+                self._opportunities.pop(opportunity_id, None)
+                if refreshed is not None:
+                    self._opportunities[opportunity_id] = refreshed
+            self._sync_event_rows()
+            return self.opportunity(opportunity_id)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    await _call(close)
+                except Exception:
+                    pass
+
     async def _refresh_once(self) -> dict[str, object]:
         if not self._catalog_loaded:
             self._load_relation_catalog()
@@ -579,15 +649,36 @@ class PolymarketMonitor:
             client = self._public_client_factory()
             self._client = client
         try:
-            await self._refresh_universe_bounded(client)
+            await self._refresh_universe_bounded(
+                client, subscribe=self._relation_discovery is None
+            )
             if self._relation_discovery is not None:
+                if (
+                    (self._full_scan_task is None or self._full_scan_task.done())
+                    and (
+                        self._activity_scan_task is None
+                        or self._activity_scan_task.done()
+                    )
+                    and (
+                        self._activity_next_scan_at is None
+                        or self._now() >= self._activity_next_scan_at
+                        or self._activity["status"] in {"stale", "degraded"}
+                    )
+                ):
+                    await self._refresh_relation_activity(
+                        client, resubscribe=False
+                    )
                 if self._codex_task is None:
                     await self._drain_relation_validation(client)
+                rows: tuple[dict[str, object], ...] = ()
                 if self._active_relation_ids:
                     rows = await self._refresh_relation_opportunities(
                         client, set(self._active_relation_ids)
                     )
-                    self._merge_relation_rows(rows, set(self._active_relation_ids))
+                self._merge_relation_rows(
+                    rows, set(self._active_relation_ids), replace_all=True
+                )
+                await self._subscribe(client)
             return self.snapshot()
         except Exception as exc:
             self._record_error(exc, "universe")
@@ -596,20 +687,73 @@ class PolymarketMonitor:
             if owned_client and self._stop_event.is_set():
                 self._client = None
 
+    async def _refresh_standard_market_metadata(
+        self, client: object, current: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        get_event = getattr(client, "get_event", None)
+        if not callable(get_event):
+            return None
+        event_id = str(current.get("event_id", ""))
+        market_id = str(current.get("market_id", ""))
+        if not event_id or not market_id:
+            return None
+        raw_event = await _call(get_event, id=event_id)
+        event_row = self._normalize_event(raw_event)
+        if event_row is None or str(event_row.get("event_id", "")) != event_id:
+            return None
+        market_row: dict[str, object] | None = None
+        for raw_market in _items(event_row.pop("_raw_markets", ())):
+            candidate = self._normalize_market(event_row, raw_market)
+            if candidate is not None and str(candidate.get("market_id", "")) == market_id:
+                market_row = candidate
+                break
+        if market_row is None:
+            return None
+        with self._lock:
+            previous = self._markets.get(market_id, {})
+            for token in (
+                str(previous.get("yes_token_id", "")),
+                str(previous.get("no_token_id", "")),
+            ):
+                if self._market_by_token.get(token) == market_id:
+                    self._market_by_token.pop(token, None)
+            self._markets[market_id] = market_row
+            self._market_by_token[str(market_row["yes_token_id"])] = market_id
+            self._market_by_token[str(market_row["no_token_id"])] = market_id
+            existing_event = self._events.get(event_id)
+            if existing_event is not None:
+                markets = [
+                    market_row if str(item.get("market_id", "")) == market_id else item
+                    for item in existing_event.get("markets", [])
+                    if isinstance(item, Mapping)
+                ]
+                if not any(
+                    str(item.get("market_id", "")) == market_id
+                    for item in markets
+                ):
+                    markets.append(market_row)
+                existing_event.update(
+                    {
+                        "title": event_row["title"],
+                        "slug": event_row["slug"],
+                        "volume_24h": event_row["volume_24h"],
+                        "markets": markets,
+                        "market_count": len(markets),
+                    }
+                )
+        return market_row
+
     async def run_forever(self) -> None:
         if not self._catalog_loaded:
             self._load_relation_catalog()
         client = self._public_client_factory()
         self._client = client
-        self._maybe_schedule_full_scan(client)
         next_refresh = 0.0
         next_readiness_refresh = 0.0
         try:
             while not self._stop_event.is_set():
                 self._reap_notification_task()
                 self._maintain_open_signals()
-                self._maybe_schedule_full_scan(client)
-                self._maybe_schedule_activity_scan(client)
                 await self._poll_relation_validation(client)
                 current = time.monotonic()
                 if self._universe_at is None or current >= next_refresh:
@@ -622,6 +766,13 @@ class PolymarketMonitor:
                 if current >= next_readiness_refresh:
                     await self._refresh_readiness()
                     next_readiness_refresh = current + READINESS_REFRESH_SECONDS
+                if self._universe_at is not None:
+                    self._maybe_schedule_full_scan(client)
+                    self._maybe_schedule_activity_scan(client)
+                try:
+                    await self._refresh_subscription_if_dirty(client)
+                except Exception as exc:
+                    self._record_error(exc, "stream")
                 if self._stream_handle is None:
                     try:
                         await self._subscribe(client)
@@ -672,9 +823,11 @@ class PolymarketMonitor:
             await self._close_stream()
             self._client = None
 
-    async def _refresh_universe_bounded(self, client: object) -> None:
+    async def _refresh_universe_bounded(
+        self, client: object, *, subscribe: bool = True
+    ) -> None:
         await asyncio.wait_for(
-            self._refresh_universe(client),
+            self._refresh_universe(client, subscribe=subscribe),
             timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
         )
 
@@ -711,7 +864,6 @@ class PolymarketMonitor:
             )
         if not token_ids:
             return
-        await self._close_stream()
         subscribe = getattr(client, "subscribe", None)
         if not callable(subscribe):
             raise ConnectionError("public client has no market stream")
@@ -722,12 +874,34 @@ class PolymarketMonitor:
             )
             for index in range(0, len(token_ids), STREAM_SUBSCRIPTION_CHUNK_SIZE)
         ]
-        handle = await _call(subscribe, specs[0] if len(specs) == 1 else specs)
+        previous = self._stream_handle
+        self._subscription_dirty = False
+        try:
+            handle = await _call(
+                subscribe, specs[0] if len(specs) == 1 else specs
+            )
+        except Exception:
+            self._subscription_dirty = True
+            raise
         self._stream_handle = handle
         self._stream_connected_at = self._now()
         self._stream_disconnected_at = None
+        if previous is not None and previous is not handle:
+            close = getattr(previous, "close", None)
+            if callable(close):
+                try:
+                    await _call(close)
+                except Exception:
+                    pass
 
-    async def _refresh_universe(self, client: object) -> None:
+    async def _refresh_subscription_if_dirty(self, client: object) -> None:
+        if not self._subscription_dirty:
+            return
+        await self._subscribe(client)
+
+    async def _refresh_universe(
+        self, client: object, *, subscribe: bool = True
+    ) -> None:
         list_events = getattr(client, "list_events", None)
         if not callable(list_events):
             raise RuntimeError("public client has no list_events")
@@ -777,7 +951,6 @@ class PolymarketMonitor:
             self._diagnostics["malformed_events"] = malformed_events
             self._universe_at = self._now()
             self._universe_failed = False
-        await self._subscribe(client)
         await self._refresh_readiness()
         semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
 
@@ -798,24 +971,16 @@ class PolymarketMonitor:
         for opportunity in confirmed:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
-        if self._relation_discovery is not None:
-            if (
-                (self._full_scan_task is None or self._full_scan_task.done())
-                and
-                (self._activity_scan_task is None or self._activity_scan_task.done())
-                and (
-                    self._activity_next_scan_at is None
-                    or self._now() >= self._activity_next_scan_at
-                    or self._activity["status"] in {"stale", "degraded"}
-                )
-            ):
-                await self._refresh_relation_activity(client)
-            relation_rows = await self._refresh_relation_opportunities(
-                client, set(self._active_relation_ids)
-            )
-            for opportunity in relation_rows:
-                current_opportunities[str(opportunity["opportunity_id"])] = opportunity
+        if subscribe:
+            await self._subscribe(client)
         with self._lock:
+            current_opportunities.update(
+                {
+                    opportunity_id: copy.deepcopy(opportunity)
+                    for opportunity_id, opportunity in self._opportunities.items()
+                    if opportunity.get("market_type") == "threshold_hedge"
+                }
+            )
             self._opportunities = current_opportunities
             missing = previous_opportunities - set(current_opportunities)
         for opportunity_id in missing:
@@ -840,9 +1005,15 @@ class PolymarketMonitor:
         if task is not None and not task.done():
             return
         if not self._catalog_due(self._now()):
+            self._full_scan_pending = False
             return
+        activity_task = self._activity_scan_task
+        if activity_task is not None and not activity_task.done():
+            self._full_scan_pending = True
+            return
+        self._full_scan_pending = False
         self._full_scan_task = asyncio.create_task(
-            self._run_full_relation_scan(client)
+            self._run_with_owned_public_client(self._run_full_relation_scan)
         )
 
     def _maybe_schedule_activity_scan(self, client: object) -> None:
@@ -866,8 +1037,35 @@ class PolymarketMonitor:
             seconds=RELATION_ACTIVITY_REFRESH_SECONDS
         )
         self._activity_scan_task = asyncio.create_task(
-            self._run_activity_scan(client)
+            self._run_with_owned_public_client(self._run_activity_scan)
         )
+
+    async def _run_with_owned_public_client(
+        self, runner: Callable[[object], object]
+    ) -> None:
+        try:
+            client = self._public_client_factory()
+        except Exception as error:
+            class FailedPublicClient:
+                async def list_events(self, **kwargs: object) -> object:
+                    del kwargs
+                    raise error
+
+                async def get_order_books(self, **kwargs: object) -> object:
+                    del kwargs
+                    raise error
+
+            await _call(runner, FailedPublicClient())
+            return
+        try:
+            await _call(runner, client)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    await _call(close)
+                except Exception:
+                    pass
 
     @property
     def _activity_task(self) -> asyncio.Task[None] | None:
@@ -884,12 +1082,37 @@ class PolymarketMonitor:
 
     async def _run_activity_scan(self, client: object) -> None:
         try:
-            await self._refresh_relation_activity(client)
+            await self._refresh_relation_activity(client, resubscribe=False)
+            if self._activity.get("status") == "healthy":
+                relation_ids = set(self._active_relation_ids)
+                rows = await self._refresh_relation_opportunities(
+                    client, relation_ids
+                )
+                self._merge_relation_rows(
+                    rows, relation_ids, replace_all=True
+                )
+                self._activity["order_ready"] = sum(
+                    row.get("market_type") == "threshold_hedge"
+                    and row.get("actionable") is True
+                    for row in self._opportunities.values()
+                )
+                self._subscription_dirty = True
+        except Exception as exc:
+            self._activity = {**self._activity, "status": "degraded"}
+            self._relations_failed = True
+            self._record_error(exc, "relations")
         finally:
             catchup = self._activity_catchup_requested
             self._activity_catchup_requested = False
             self._activity_scan_task = None
-            if catchup and not self._stop_event.is_set():
+            full_scheduled = False
+            if self._full_scan_pending and not self._stop_event.is_set():
+                self._maybe_schedule_full_scan(client)
+                full_scheduled = (
+                    self._full_scan_task is not None
+                    and not self._full_scan_task.done()
+                )
+            if catchup and not full_scheduled and not self._stop_event.is_set():
                 self._activity_next_scan_at = self._now()
                 self._maybe_schedule_activity_scan(client)
 
@@ -1532,6 +1755,10 @@ class PolymarketMonitor:
             self._relation_book_timestamps = timestamps
             self._relation_book_received_at = received
         else:
+            for token in tokens:
+                self._relation_books.pop(token, None)
+                self._relation_book_timestamps.pop(token, None)
+                self._relation_book_received_at.pop(token, None)
             self._relation_books.update(books)
             self._relation_book_timestamps.update(timestamps)
             self._relation_book_received_at.update(received)
@@ -1542,7 +1769,9 @@ class PolymarketMonitor:
             return ()
         return relation.buy_leg_a.token_id, relation.buy_leg_b.token_id
 
-    async def _refresh_relation_activity(self, client: object) -> None:
+    async def _refresh_relation_activity(
+        self, client: object, *, resubscribe: bool = True
+    ) -> None:
         """Re-scan every persisted relation and atomically publish the live pool."""
 
         if self._relation_discovery is None:
@@ -1551,7 +1780,6 @@ class PolymarketMonitor:
         self._activity_scan_started_at = started
         previous = copy.deepcopy(self._activity)
         self._activity = {**previous, "status": "scanning"}
-        self._catalog_status = "scanning"
         relations = tuple(self._relations.values())
         try:
             await self._refresh_relation_books(client, set(self._relations))
@@ -1601,7 +1829,7 @@ class PolymarketMonitor:
                 self._relation_rule_failure_fingerprints.pop(relation_id, None)
             self._rebuild_relation_subscriptions()
             self._activity_scan_duration_seconds = duration
-            self._activity_next_scan_at = completed + timedelta(
+            self._activity_next_scan_at = started + timedelta(
                 seconds=RELATION_ACTIVITY_REFRESH_SECONDS
             )
             self._activity_scan_due_at = completed
@@ -1648,7 +1876,6 @@ class PolymarketMonitor:
                 "rejection_counts": rejection_counts,
             }
             self._activity = activity
-            self._catalog_status = "healthy"
             self._relations_failed = False
             try:
                 self._store.record_relation_scan(
@@ -1665,10 +1892,11 @@ class PolymarketMonitor:
             except Exception as exc:
                 self._store_failed = True
                 self._record_error(exc, "store")
-            try:
-                await self._subscribe(client)
-            except Exception as exc:
-                self._record_error(exc, "stream")
+            if resubscribe:
+                try:
+                    await self._subscribe(client)
+                except Exception as exc:
+                    self._record_error(exc, "stream")
             self._log_relation_scan(
                 phase="activity",
                 status="healthy",
@@ -1678,11 +1906,10 @@ class PolymarketMonitor:
             )
         except Exception as exc:
             self._activity = {**previous, "status": "degraded"}
-            self._catalog_status = "degraded"
             self._relations_failed = True
             self._record_error(exc, "relations")
             completed = self._now()
-            self._activity_next_scan_at = completed + timedelta(
+            self._activity_next_scan_at = started + timedelta(
                 seconds=RELATION_ACTIVITY_REFRESH_SECONDS
             )
             try:
@@ -2139,6 +2366,7 @@ class PolymarketMonitor:
             cache_reader = None
         now = self._now()
         candidates: list[tuple[Decimal, str, ThresholdRelation]] = []
+        restored_relation_ids: set[str] = set()
         for relation_id in sorted(self._active_relation_ids):
             relation = self._relations.get(relation_id)
             if relation is None:
@@ -2158,6 +2386,7 @@ class PolymarketMonitor:
                     self._codex_validations[relation_id] = cached
                     self._codex_statuses[relation_id] = str(cached.status)
                     self._codex_retry_at.pop(relation_id, None)
+                    restored_relation_ids.add(relation_id)
                     continue
             retry_at = self._codex_retry_at.get(relation_id)
             if retry_at is not None and now < retry_at:
@@ -2172,6 +2401,14 @@ class PolymarketMonitor:
                 continue
             candidates.append((candidate.net_edge, relation_id, relation))
             self._codex_wait_started_at.setdefault(relation_id, now)
+        if client is not None and restored_relation_ids:
+            try:
+                rows = await self._refresh_relation_opportunities(
+                    client, restored_relation_ids
+                )
+                self._merge_relation_rows(rows, restored_relation_ids)
+            except Exception as exc:
+                self._record_error(exc, "relations")
         if not candidates:
             self._rebuild_relation_subscriptions()
             self._update_activity_codex_counts()
@@ -2216,14 +2453,21 @@ class PolymarketMonitor:
         )
 
     def _merge_relation_rows(
-        self, rows: Sequence[Mapping[str, object]], relation_ids: set[str]
+        self,
+        rows: Sequence[Mapping[str, object]],
+        relation_ids: set[str],
+        *,
+        replace_all: bool = False,
     ) -> None:
         with self._lock:
             self._opportunities = {
                 key: value
                 for key, value in self._opportunities.items()
                 if value.get("market_type") != "threshold_hedge"
-                or str(value.get("relation_id", "")) not in relation_ids
+                or (
+                    not replace_all
+                    and str(value.get("relation_id", "")) not in relation_ids
+                )
             }
             self._opportunities.update(
                 {
@@ -2528,7 +2772,7 @@ class PolymarketMonitor:
         if yes_timestamp is None or no_timestamp is None:
             market_row["eligibility_reason"] = "book_timestamp_missing"
             return None
-        confirmed_at = max(yes_timestamp, no_timestamp)
+        confirmed_at = now
         books = ConfirmedBooks(
             yes_token_id=yes_token,
             no_token_id=no_token,
@@ -2537,7 +2781,7 @@ class PolymarketMonitor:
             confirmed_at=confirmed_at,
         )
         self._books[market_id] = books
-        age = _age(now, confirmed_at)
+        age = 0.0
         market_row["confirmed_at"] = confirmed_at
         market_row["confirmed_age_seconds"] = age
         market_row["gross_upper_bound"] = max(
@@ -2659,7 +2903,9 @@ class PolymarketMonitor:
                         client, set(self._active_relation_ids)
                     )
                     self._merge_relation_rows(
-                        relation_rows, set(self._active_relation_ids)
+                        relation_rows,
+                        set(self._active_relation_ids),
+                        replace_all=True,
                     )
             return
         tokens: list[str] = []
@@ -2871,6 +3117,8 @@ class PolymarketMonitor:
         self._notification_signal_id = None
         try:
             result = task.result()
+        except asyncio.CancelledError:
+            return
         except Exception:
             return
         if isinstance(result, Mapping) and result.get("state") == "sent":
@@ -3094,17 +3342,11 @@ class PolymarketMonitor:
             reasons.append("universe_stale")
         if self._universe_failed:
             reasons.append("universe_refresh_failed")
-        if self._heartbeat_at is not None and _age(now, self._heartbeat_at) > HEARTBEAT_FRESHNESS_SECONDS:
-            reasons.append("heartbeat_stale")
-        elif (
-            self._heartbeat_at is None
-            and self._stream_connected_at is not None
-            and _age(now, self._stream_connected_at) > STREAM_DISCONNECT_SECONDS
-        ):
-            reasons.append("heartbeat_missing")
         if self._stream_disconnected_at is not None and _age(now, self._stream_disconnected_at) > STREAM_DISCONNECT_SECONDS:
             reasons.append("stream_disconnected")
         for opportunity in self._opportunities.values():
+            if opportunity.get("market_type") == "threshold_hedge":
+                continue
             confirmed_at = opportunity.get("confirmed_at")
             if _age(now, confirmed_at if isinstance(confirmed_at, datetime) else None) > BOOK_FRESHNESS_SECONDS:
                 reasons.append("books_stale")

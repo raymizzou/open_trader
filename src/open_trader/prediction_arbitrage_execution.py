@@ -1321,15 +1321,19 @@ class PredictionExecutionService:
 
     def _fresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
         refreshed: object = None
-        for name in ("refresh_once", "refresh_opportunity", "recheck_opportunity", "refresh"):
+        refresh_attempted = False
+        for name in ("refresh_opportunity", "recheck_opportunity", "refresh_once", "refresh"):
             refresh = getattr(self._monitor, name, None)
             if not callable(refresh):
                 continue
+            refresh_attempted = True
             try:
                 refreshed = _call(refresh, opportunity_id) if name != "refresh_once" else _call(refresh)
             except Exception:
-                refreshed = None
+                return None
             break
+        if refresh_attempted and refreshed is None:
+            return None
         if refreshed is None:
             snapshot = getattr(self._monitor, "snapshot", None)
             if callable(snapshot):
@@ -2336,6 +2340,11 @@ class PredictionExecutionService:
                 {
                     "relation_id": intent.relation_id,
                     "relation": intent.relation,
+                    "question_a": str(opportunity.get("question_a", "")),
+                    "question_b": str(opportunity.get("question_b", "")),
+                    "llm_status": str(opportunity.get("llm_status", "")),
+                    "llm_decision": str(opportunity.get("llm_decision", "")),
+                    "llm_summary": str(opportunity.get("llm_summary", "")),
                     "rules_hash_a": opportunity.get("rules_hash_a", ""),
                     "rules_hash_b": opportunity.get("rules_hash_b", ""),
                     "cache_key": opportunity.get("cache_key", ""),

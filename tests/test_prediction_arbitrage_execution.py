@@ -162,6 +162,8 @@ class ThresholdMonitor(FakeMonitor):
             "cache_key": self.cache_key,
             "relation_validation": {"status": self.codex_status},
             "llm_status": self.codex_status,
+            "llm_decision": "APPROVE" if self.codex_status == "approved" else "REJECT",
+            "llm_summary": "The higher threshold implies the lower threshold.",
             "rules_verified_at": rules_verified_at,
             "rules_fingerprint": self.cache_key,
             "actionable": self.codex_status == "approved" and self.remediation_safe,
@@ -663,6 +665,85 @@ def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
     return service, trading, store, monitor
 
 
+def test_preview_refreshes_only_the_selected_opportunity(tmp_path: Path) -> None:
+    class TargetedMonitor(FakeMonitor):
+        def __init__(self) -> None:
+            super().__init__(_intent())
+            self.targeted_calls = 0
+            self.full_refresh_calls = 0
+
+        def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+            self.targeted_calls += 1
+            return self.opportunity(opportunity_id)
+
+        def refresh_once(self) -> dict[str, object]:
+            self.full_refresh_calls += 1
+            return super().refresh_once()
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = FakeTrading()
+    monitor = TargetedMonitor()
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=CompositeTestNotifier(
+            ChannelNotifier("macos"), ChannelNotifier("feishu")
+        ),
+        lock_path=tmp_path / "execution.lock",
+    )
+    assert service.reconcile_startup()["state"] == "ready"
+
+    preview = service.preview("opp-1")
+
+    assert preview["state"] == "previewed"
+    assert monitor.targeted_calls == 1
+    assert monitor.full_refresh_calls == 0
+
+
+@pytest.mark.parametrize("failure", ["none", "exception"])
+def test_preview_fails_closed_when_targeted_refresh_fails(
+    tmp_path: Path, failure: str,
+) -> None:
+    class FailingTargetedMonitor(FakeMonitor):
+        def __init__(self) -> None:
+            super().__init__(_intent())
+            self.snapshot_calls = 0
+
+        def refresh_opportunity(
+            self, opportunity_id: str,
+        ) -> dict[str, object] | None:
+            assert opportunity_id == "opp-1"
+            if failure == "exception":
+                raise ConnectionError("sentinel refresh failure")
+            return None
+
+        def snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return {"opportunities": [self.opportunity("opp-1")]}
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = FakeTrading()
+    monitor = FailingTargetedMonitor()
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=CompositeTestNotifier(
+            ChannelNotifier("macos"), ChannelNotifier("feishu")
+        ),
+        lock_path=tmp_path / "execution.lock",
+    )
+    assert service.reconcile_startup()["state"] == "ready"
+
+    result = service.preview("opp-1")
+
+    assert result == {"state": "rejected", "reason": "opportunity_unavailable"}
+    assert monitor.snapshot_calls == 0
+    assert trading.preflight_calls == 0
+    assert trading.batch_calls == 0
+
+
 def threshold_execution_fixture(tmp_path: Path):
     store = PredictionArbitrageStore(tmp_path / "data")
     trading = ThresholdTrading()
@@ -1090,6 +1171,20 @@ def test_preview_rechecks_without_signing_and_serializes_only_safe_intent(tmp_pa
     }
     assert "PairIntent" not in repr(preview)
     assert not {"prices", "quantity", "wallet", "limits"} & set(inspect.signature(service.preview).parameters)
+
+
+def test_threshold_preview_preserves_both_market_questions_for_confirmation(
+    tmp_path: Path,
+) -> None:
+    service, _, _, _ = threshold_execution_fixture(tmp_path)
+
+    preview = service.preview("threshold-opp-1")
+
+    assert preview["question_a"] == "Will BTC be above 90k?"
+    assert preview["question_b"] == "Will BTC be above 100k?"
+    assert preview["llm_status"] == "approved"
+    assert preview["llm_decision"] == "APPROVE"
+    assert preview["llm_summary"] == "The higher threshold implies the lower threshold."
 
 
 def test_preview_returns_busy_when_execution_is_active(tmp_path: Path) -> None:
