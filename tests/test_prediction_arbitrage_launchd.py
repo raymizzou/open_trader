@@ -60,6 +60,9 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     )
     payload = plistlib.loads(result.stdout.encode("utf-8"))
     assert payload["Label"] == "com.open-trader.dashboard"
+    assert payload["EnvironmentVariables"]["PATH"] == (
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    )
     args = payload["ProgramArguments"]
     assert payload["WorkingDirectory"] == str(ROOT)
     assert args[args.index("--portfolio") + 1] == str(
