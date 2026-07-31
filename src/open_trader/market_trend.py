@@ -1168,6 +1168,14 @@ def _attempt_market_report(
                 candidates=candidates,
                 candidate_rows=candidate_pool_rows,
                 held_symbols={position.symbol for position in account.positions},
+                holding_snapshots=(
+                    *holding_snapshots.values(),
+                    *(
+                        real_holdings.holding_snapshots.values()
+                        if real_holdings.status == "available"
+                        else ()
+                    ),
+                ),
                 expected_date=as_of_date,
                 market=market,
                 history_root=paths.root.parent / "trend_industry_context",

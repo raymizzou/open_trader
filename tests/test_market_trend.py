@@ -1058,6 +1058,19 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     notifier = RecordingFeishu()
     from open_trader import market_trend
 
+    holding_context_snapshots: list[object] = []
+    original_collect = market_trend.collect_industry_contexts
+
+    def collect_with_holding_context(**kwargs: object) -> object:
+        holding_context_snapshots.extend(kwargs["holding_snapshots"])  # type: ignore[arg-type]
+        return original_collect(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        market_trend,
+        "collect_industry_contexts",
+        collect_with_holding_context,
+    )
+
     original_freeze = market_trend._freeze_receipt_report
     freeze_attempts = 0
 
@@ -1155,6 +1168,10 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert any(
+        getattr(snapshot, "symbol", None) == "00700"
+        for snapshot in holding_context_snapshots
+    )
     assert payload["strategy_snapshot"]["strategy_version"] == "v4"
     assert payload["risk_summary"]["kelly_phase"] == "cold_start"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0

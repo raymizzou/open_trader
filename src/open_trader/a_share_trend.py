@@ -2399,13 +2399,14 @@ def collect_industry_contexts(
     candidates: Sequence[CandidateInput],
     candidate_rows: Sequence[Mapping[str, object]],
     held_symbols: set[str],
+    holding_snapshots: Sequence[HoldingSnapshot | None] = (),
     expected_date: str,
     market: str,
     history_root: Path,
     strategy_version: str | None = None,
     cny_per_local_currency: Decimal | None = None,
 ) -> tuple[tuple[IndustryContext, ...], dict[str, object], dict[str, object]]:
-    """Collect breadth/state only for industries that pass existing hard gates."""
+    """Collect candidate context first, then append isolated holding context."""
     candidate_decision = build_candidate_list(
         candidates,
         held_symbols=held_symbols,
@@ -2437,6 +2438,27 @@ def collect_industry_contexts(
             and isinstance(industry_name, str)
         ):
             industry_names[industry_id] = industry_name.strip()
+    holding_industry_ids = sorted(
+        {
+            snapshot.industry_tm_id
+            for snapshot in holding_snapshots
+            if snapshot is not None and snapshot.industry_tm_id is not None
+        }
+    )
+    for snapshot in holding_snapshots:
+        if (
+            snapshot is not None
+            and snapshot.industry_tm_id is not None
+            and snapshot.industry
+            and snapshot.industry_tm_id not in industry_names
+        ):
+            industry_names[snapshot.industry_tm_id] = snapshot.industry
+    holding_only_ids = [
+        industry_id
+        for industry_id in holding_industry_ids
+        if industry_id not in eligible_industry_ids
+    ]
+    context_industry_ids = [*eligible_industry_ids, *holding_only_ids]
     component_ids_by_industry: dict[int, set[int]] = {}
     component_rows_by_industry: dict[int, list[Mapping[str, object]]] = {}
     component_rows_count = 0
@@ -2495,7 +2517,7 @@ def collect_industry_contexts(
             and row.get("trendTemperatureCurr") in HOT_TEMPERATURES
         ):
             warm_to_hot_ids[industry_id].add(tm_id)
-    contexts = tuple(
+    candidate_contexts = tuple(
         calculate_industry_context(
             industry_tm_id=industry_id,
             industry=industry_names.get(industry_id, ""),
@@ -2512,8 +2534,10 @@ def collect_industry_contexts(
         market=market,
         before_date=expected_date,
     )
-    contexts = attach_prior_context(contexts, prior)
-    context_map = {context.industry_tm_id: context for context in contexts}
+    candidate_contexts = attach_prior_context(candidate_contexts, prior)
+    context_map = {
+        context.industry_tm_id: context for context in candidate_contexts
+    }
     ordering = build_candidate_list(
         candidates,
         held_symbols=held_symbols,
@@ -2523,18 +2547,109 @@ def collect_industry_contexts(
         strategy_version=strategy_version,
         cny_per_local_currency=cny_per_local_currency,
     )
+
+    holding_errors: dict[str, str] = {}
+    for industry_id in holding_only_ids:
+        try:
+            rows = api.get_components(  # type: ignore[attr-defined]
+                tm_id=industry_id,
+                expected_date=expected_date,
+            )
+        except TrendAnimalsError as exc:
+            rows = []
+            holding_errors[str(industry_id)] = str(exc)
+        component_rows_count += len(rows)
+        component_rows_by_industry[industry_id] = list(rows)
+        component_ids_by_industry[industry_id] = {
+            _row_tm_id(row) for row in rows
+        }
+
+    holding_member_ids = sorted(
+        {
+            member_id
+            for industry_id in holding_only_ids
+            for member_id in component_ids_by_industry[industry_id]
+        }
+        - set(member_ids)
+    )
+    holding_member_rows: list[Mapping[str, object]] = []
+    if holding_member_ids:
+        try:
+            holding_member_rows = list(
+                api.get_snapshots(  # type: ignore[attr-defined]
+                    tm_ids=holding_member_ids,
+                    fields=INDUSTRY_MEMBER_FIELDS,
+                    expected_date=expected_date,
+                )
+            )
+        except TrendAnimalsError as exc:
+            holding_errors["members"] = str(exc)
+
+    holding_state_rows: list[Mapping[str, object]] = []
+    if holding_only_ids:
+        try:
+            holding_state_rows = list(
+                api.get_snapshots(  # type: ignore[attr-defined]
+                    tm_ids=holding_only_ids,
+                    fields=INDUSTRY_STATE_FIELDS,
+                    expected_date=expected_date,
+                )
+            )
+        except TrendAnimalsError as exc:
+            holding_errors["states"] = str(exc)
+    holding_state_by_id: dict[int, Mapping[str, object]] = {}
+    for row in holding_state_rows:
+        tm_id = _row_tm_id(row)
+        if tm_id in holding_state_by_id:
+            holding_errors[str(tm_id)] = "duplicate holding industry state"
+            continue
+        holding_state_by_id[tm_id] = row
+
+    all_member_rows = [*member_rows, *holding_member_rows]
+    holding_contexts = tuple(
+        calculate_industry_context(
+            industry_tm_id=industry_id,
+            industry=industry_names.get(industry_id, ""),
+            expected_date=expected_date,
+            component_tm_ids=sorted(component_ids_by_industry[industry_id]),
+            member_rows=all_member_rows,
+            industry_row=holding_state_by_id.get(industry_id),
+            warm_to_hot_count=len(warm_to_hot_ids[industry_id]),
+        )
+        for industry_id in holding_only_ids
+    )
+    holding_contexts = attach_prior_context(holding_contexts, prior)
+    contexts = tuple(
+        sorted(
+            (*candidate_contexts, *holding_contexts),
+            key=lambda item: (
+                item.strength is None or not item.strength.is_finite(),
+                (
+                    -item.strength
+                    if item.strength is not None and item.strength.is_finite()
+                    else Decimal("0")
+                ),
+                item.industry_tm_id,
+            ),
+        )
+    )
+    all_member_ids = sorted({*member_ids, *holding_member_ids})
+    all_state_rows = [*state_rows, *holding_state_rows]
     facts = {
         "eligible_industry_ids": tuple(eligible_industry_ids),
-        "component_requests": len(eligible_industry_ids),
+        "holding_industry_ids": tuple(holding_industry_ids),
+        "context_industry_ids": tuple(context_industry_ids),
+        "holding_errors": holding_errors,
+        "component_requests": len(context_industry_ids),
         "component_rows": component_rows_count,
         "component_rows_by_industry": component_rows_by_industry,
-        "member_ids": tuple(member_ids),
-        "member_rows": len(member_rows),
-        "member_response": list(member_rows),
+        "member_ids": tuple(all_member_ids),
+        "member_rows": len(all_member_rows),
+        "member_response": all_member_rows,
         "member_fields": INDUSTRY_MEMBER_FIELDS,
-        "state_ids": tuple(eligible_industry_ids),
-        "state_rows": len(state_rows),
-        "state_response": list(state_rows),
+        "state_ids": tuple(context_industry_ids),
+        "state_rows": len(all_state_rows),
+        "state_response": all_state_rows,
         "state_fields": INDUSTRY_STATE_FIELDS,
     }
     return contexts, dict(ordering.industry_context_status), facts
@@ -6179,6 +6294,14 @@ def _attempt_report(
                 candidates=candidates,
                 candidate_rows=candidate_pool_rows,
                 held_symbols={position.symbol for position in account.positions},
+                holding_snapshots=(
+                    *holding_snapshots.values(),
+                    *(
+                        real_holdings.holding_snapshots.values()
+                        if real_holdings.status == "available"
+                        else ()
+                    ),
+                ),
                 expected_date=run_date,
                 market="CN",
                 history_root=config.data_dir / "trend_industry_context",

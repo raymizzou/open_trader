@@ -5975,6 +5975,31 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["rebuild_inputs"]["candidates"]
 
 
+def test_report_runner_includes_simulated_holding_only_industry(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    api = ReadyApi([], industry_ids={600009: 339103})
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **_kwargs: api,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions("SH.600009"),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert {item["industry_tm_id"] for item in payload["industry_contexts"]} == {
+        339103,
+        700001,
+    }
+    assert payload["strategy_judgments"]["holding_decisions"][0][
+        "industry"
+    ] == "电力"
+
+
 def test_cn_entry_gate_keeps_early_temperature_when_industry_state_changes(
     tmp_path: Path,
 ) -> None:
@@ -6136,6 +6161,117 @@ def test_collect_industry_contexts_marks_stale_only_components_invalid(
     assert "snapshot_coverage_below_90pct" in contexts[0].invalid_reasons
     assert status["ordering_mode"] == "legacy_invalid_current"
     assert facts["component_rows"] == 0
+
+
+def test_collect_industry_contexts_appends_holding_industries_in_strength_order(
+    tmp_path: Path,
+) -> None:
+    candidate_industry_id = 700001
+    invalid_industry_id = 800004
+
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            if tm_id == invalid_industry_id:
+                raise TrendAnimalsError("holding industry unavailable")
+            return [{"tmId": tm_id + 1, "asOfDate": expected_date}]
+
+        def get_snapshots(
+            self,
+            *,
+            tm_ids: list[int],
+            fields: tuple[str, ...],
+            expected_date: str,
+        ) -> list[dict[str, object]]:
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in tm_ids
+                ]
+            strengths = {
+                candidate_industry_id: "95",
+                339103: "92.4",
+                621693: "98.7",
+            }
+            return [
+                {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    **(
+                        {"trendStrengthLocalCurr": strengths[tm_id]}
+                        if tm_id in strengths
+                        else {}
+                    ),
+                }
+                for tm_id in tm_ids
+            ]
+
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(
+            candidate(
+                "600001",
+                industry="候选行业",
+                industry_tm_id=candidate_industry_id,
+            ),
+        ),
+        candidate_rows=[
+            {
+                "tmId": 600001,
+                "industryTmId": candidate_industry_id,
+                "industryName": "候选行业",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+            }
+        ],
+        held_symbols=set(),
+        holding_snapshots=(
+            holding("600010", industry="银行", industry_tm_id=339103),
+            holding("600011", industry="电力", industry_tm_id=621693),
+            holding("600012", industry="银行", industry_tm_id=339103),
+            holding("600013", industry="无行业", industry_tm_id=None),
+            holding(
+                "600014",
+                industry="异常行业",
+                industry_tm_id=invalid_industry_id,
+            ),
+        ),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert facts["eligible_industry_ids"] == (candidate_industry_id,)
+    assert facts["holding_industry_ids"] == (
+        339103,
+        621693,
+        invalid_industry_id,
+    )
+    assert facts["context_industry_ids"] == (
+        candidate_industry_id,
+        339103,
+        621693,
+        invalid_industry_id,
+    )
+    assert [item.industry_tm_id for item in contexts] == [
+        621693,
+        candidate_industry_id,
+        339103,
+        invalid_industry_id,
+    ]
+    assert contexts[-1].strength is None
+    assert contexts[-1].valid is False
+    assert facts["holding_errors"] == {
+        str(invalid_industry_id): "holding industry unavailable"
+    }
+    assert status["ordering_mode"] == "context_current_only"
 
 
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
