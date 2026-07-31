@@ -12807,6 +12807,13 @@ def test_dashboard_healthz_reuses_startup_runtime_metadata(tmp_path: Path) -> No
     assert payload["source_state"] == "clean"
 
 
+def test_dashboard_dual_runtime_requires_loopback_host() -> None:
+    from open_trader.dashboard_web import _require_loopback_host
+
+    with pytest.raises(ValueError, match="loopback"):
+        _require_loopback_host("0.0.0.0")
+
+
 def test_prediction_history_projects_observed_signal_fields() -> None:
     from open_trader.dashboard_web import _prediction_history_aliases
 

@@ -1373,6 +1373,17 @@ def _is_loopback_address(value: str) -> bool:
     return address.is_loopback
 
 
+def _require_loopback_host(value: str) -> None:
+    if value == "localhost":
+        return
+    try:
+        if _is_loopback_address(value):
+            return
+    except ValueError:
+        pass
+    raise ValueError("dashboard dual runtime requires a loopback host")
+
+
 def _dashboard_runtime_metadata() -> dict[str, object]:
     cwd = Path.cwd().resolve()
     try:
@@ -1407,6 +1418,8 @@ def serve_dashboard(
     prediction_notifier: object | None = None,
     public_url: str = "",
 ) -> None:
+    if public_url.strip():
+        _require_loopback_host(host)
     resolved_public_url = public_url.strip() or f"http://{host}:{port}/"
     if not resolved_public_url.endswith("/"):
         resolved_public_url += "/"
