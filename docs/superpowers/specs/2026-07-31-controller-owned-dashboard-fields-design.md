@@ -95,15 +95,18 @@ source 事实；`dashboard_projection` 保存控制器从这些事实和已发�
 
 金额、价格和数量使用十进制字符串；权重和盈亏率使用带 `%` 的百分比字符串。
 未知值使用空字符串，不能用 `0` 代替未知。已发布行不允许缺少上述键。
-`price_kind` 只使用 `live`、`pre_market`、`after_hours`、`statement` 和
-`account_snapshot`，由前端映射成现有中文标签。
+`price_kind` 只使用 `live`、`overnight`、`pre_market`、`after_hours`、
+`statement` 和 `account_snapshot`，由前端映射成现有中文标签。保留
+`overnight` 是为了不丢失现有美股夜盘价格语义。
 
 港元市值和两级权重是每个非现金持仓的必需计算字段，缺失会阻止投影发布。
 成本、成本港元值和盈亏是来源可选事实；结单未提供时保留空字符串，不阻止
 其他完整字段发布。非 USD 持仓的 `market_value_usd` 为空字符串。
 
 `broker_summaries` 和 `summary` 同样由控制器发布。Dashboard 不再从明细
-重复求和。`cash_details` 保留控制器计算后的港元值，前端不做汇率换算。
+重复求和。`summary` 保留当前 API 所需的 `holding_count`、`broker_count`、
+三项港元金额和持仓/现金两项权重；`cash_details` 保留控制器计算后的
+`cash_balance_hkd` 和 `available_balance_hkd`，前端不做汇率换算。
 
 ## 计算规则
 
