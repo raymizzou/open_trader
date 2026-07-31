@@ -6427,6 +6427,45 @@ window.fetch=async (input)=>{{
         )
         assert cash_details.get_attribute("data-history-stable") == "yes"
         assert cash_details.evaluate("node => node.open") is True
+
+        discipline = section.locator("details.trend-discipline-workspace")
+        assert discipline.count() == 1
+        assert discipline.evaluate("node => !node.open")
+        discipline.locator(":scope > summary").click()
+
+        category = discipline.locator("details.trend-discipline-category")
+        assert category.count() == 6
+        category.nth(0).locator(":scope > summary").click()
+
+        audit = section.locator(
+            ".cn-trend-report > details.trend-audit:not(.trend-review-disclosure)"
+        )
+        assert audit.count() == 1
+        audit.locator(":scope > summary").click()
+
+        page.evaluate("renderAccountHoldings()")
+        section = page.locator("#account-tiger")
+        assert section.locator("details.account-cash-details").evaluate("node => node.open")
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => node.open")
+        assert section.locator("details.trend-discipline-category").nth(0).evaluate("node => node.open")
+        assert section.locator(
+            ".cn-trend-report > details.trend-audit:not(.trend-review-disclosure)"
+        ).evaluate("node => node.open")
+
+        page.evaluate("renderAccountViewPanelOnly('tiger')")
+        section = page.locator("#account-tiger")
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => node.open")
+        assert section.locator("details.trend-discipline-category").nth(0).evaluate("node => node.open")
+
+        section.locator("details.trend-discipline-workspace > summary").click()
+        section.locator('[data-account-view="real"]').click()
+        section.locator('[data-account-view="report"]').click()
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => !node.open")
+        page.locator("#account-tab-futu").click()
+        page.locator("#account-tab-tiger").click()
+        section = page.locator("#account-tiger")
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => !node.open")
+
         page.locator("#account-tab-futu").click()
         assert page.locator("#account-futu .trend-report-entry").count() == 0
         assert page.locator("#account-futu .account-view-tabs").count() == 0
