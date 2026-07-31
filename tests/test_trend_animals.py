@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -312,6 +313,125 @@ def test_paid_cache_identity_separates_dates_endpoints_and_parameters(
     assert cached_client.get_snapshots(
         tm_ids=[1], fields=["tmId"], expected_date="2026-07-14"
     ) == snapshot
+
+
+def test_symbol_mapping_round_trips_all_provider_keys(tmp_path: Path) -> None:
+    client = TrendAnimalsClient(api_key="secret-value", cache_dir=tmp_path)
+
+    mapping = client.remember_symbol_row(
+        market="CN",
+        expected_futu_symbol="SH.515450",
+        row={
+            "tmId": 328879,
+            "tickerSymbol": "515450",
+            "asset": "ETF基金",
+        },
+    )
+
+    assert asdict(mapping) == {
+        "market": "CN",
+        "futu_symbol": "SH.515450",
+        "trend_animals_symbol": "515450",
+        "trend_animals_tm_id": 328879,
+        "asset": "ETF基金",
+    }
+    assert client.symbol_mapping("SH.515450", market="CN") == mapping
+    assert client.symbol_mapping_from_trend("515450", market="CN") == mapping
+    assert client.symbol_mapping_from_tm_id(328879, market="CN") == mapping
+    cache_path = tmp_path / "symbol_mappings" / "CN" / "SH.515450.json"
+    assert json.loads(cache_path.read_text(encoding="utf-8")) == {
+        "asset": "ETF基金",
+        "futu_symbol": "SH.515450",
+        "market": "CN",
+        "schema_version": "open_trader.trend_symbol_mapping.v1",
+        "trend_animals_symbol": "515450",
+        "trend_animals_tm_id": 328879,
+    }
+
+    loaded = TrendAnimalsClient(api_key="different-secret", cache_dir=tmp_path)
+    assert loaded.symbol_mapping("SH.515450", market="CN") == mapping
+    assert loaded.symbol_mapping_from_trend("515450", market="CN") == mapping
+    assert loaded.symbol_mapping_from_tm_id(328879, market="CN") == mapping
+
+
+@pytest.mark.parametrize(
+    ("expected_futu_symbol", "row"),
+    [
+        (
+            "SH.000001",
+            {"tmId": 328880, "tickerSymbol": "000001.SZ", "asset": "A股"},
+        ),
+        (
+            "SZ.000001",
+            {"tmId": 328880, "tickerSymbol": "000001.SH", "asset": "A股"},
+        ),
+        (
+            "SZ.000002",
+            {"tmId": 328879, "tickerSymbol": "000002.SZ", "asset": "A股"},
+        ),
+    ],
+)
+def test_symbol_mapping_conflict_preserves_original_cache(
+    expected_futu_symbol: str,
+    row: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    client = TrendAnimalsClient(api_key="secret-value", cache_dir=tmp_path)
+    client.remember_symbol_row(
+        market="CN",
+        expected_futu_symbol="SH.000001",
+        row={"tmId": 328879, "tickerSymbol": "000001.SH", "asset": "A股"},
+    )
+    original_path = tmp_path / "symbol_mappings" / "CN" / "SH.000001.json"
+    original_bytes = original_path.read_bytes()
+
+    with pytest.raises(TrendAnimalsError, match="conflict"):
+        client.remember_symbol_row(
+            market="CN",
+            expected_futu_symbol=expected_futu_symbol,
+            row=row,
+        )
+
+    assert original_path.read_bytes() == original_bytes
+    assert len(list((tmp_path / "symbol_mappings" / "CN").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"remove": "schema_version"},
+        {"remove": "market"},
+        {"remove": "futu_symbol"},
+        {"remove": "trend_animals_symbol"},
+        {"remove": "trend_animals_tm_id"},
+        {"remove": "asset"},
+        {"market": "US"},
+        {"asset": "美股"},
+    ],
+)
+def test_symbol_mapping_rejects_malformed_cache(
+    mutation: dict[str, str], tmp_path: Path
+) -> None:
+    payload: dict[str, object] = {
+        "asset": "ETF基金",
+        "futu_symbol": "SH.515450",
+        "market": "CN",
+        "schema_version": "open_trader.trend_symbol_mapping.v1",
+        "trend_animals_symbol": "515450",
+        "trend_animals_tm_id": 328879,
+    }
+    removed = mutation.get("remove")
+    if removed is not None:
+        payload.pop(removed)
+    else:
+        payload.update(mutation)
+    cache_path = tmp_path / "symbol_mappings" / "CN" / "SH.515450.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    client = TrendAnimalsClient(api_key="secret-value", cache_dir=tmp_path)
+    with pytest.raises(TrendAnimalsError, match="mapping cache"):
+        client.symbol_mapping("SH.515450", market="CN")
 
 
 def test_search_exact_symbol_caches_tm_id_without_guessing(tmp_path: Path) -> None:
