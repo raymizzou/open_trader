@@ -3255,9 +3255,10 @@ console.log(JSON.stringify([
 def test_dashboard_account_table_formats_values_but_not_symbol() -> None:
     output = run_dashboard_js(r'''
 console.log(renderAccountTable([{key:"futu:HK:02840:0",holding:{},display:{
-  market:"HK",symbol:"02840",name:"SPDR 金",total_quantity:"10000",
-  avg_cost_price:"2932.00",market_value_hkd:"31845000.00",
-  account_weight:"3.28%",portfolio_weight:"1.04%",unrealized_pnl_pct:"-1.26%"
+  market:"HK",symbol:"02840",name:"SPDR 金",quantity:"10000",
+  cost_price:"2932.00",last_price:"3184.50",price_kind:"live",market_value_usd:"",
+  market_value_hkd:"31845000.00",account_weight_hkd:"3.28%",
+  portfolio_weight_hkd:"1.04%",unrealized_pnl_pct:"-1.26%"
 }}]));
 ''')
     assert "10,000" in output
@@ -3283,15 +3284,15 @@ state.quotes = {};
 const statement = renderAccountHoldingRow({
   key: "eastmoney:CN:600900:0", broker: "eastmoney", holding: {},
   display: {
-    market: "CN", symbol: "600900", name: "长江电力", total_quantity: "2000",
-    avg_cost_price: "25.653", last_price: "27.99", market_value_hkd: "55980",
+    market: "CN", symbol: "600900", name: "长江电力", quantity: "2000",
+    cost_price: "25.653", last_price: "27.99", price_kind: "statement", market_value_hkd: "55980",
   },
 });
 const live = renderAccountHoldingRow({
   key: "futu:HK:02840:0", broker: "futu", holding: {},
   display: {
-    market: "HK", symbol: "02840", name: "SPDR金", total_quantity: "11",
-    avg_cost_price: "2932", last_price: "2907", market_value_hkd: "31977",
+    market: "HK", symbol: "02840", name: "SPDR金", quantity: "11",
+    cost_price: "2932", market_value_hkd: "31977",
   },
 });
 console.log(JSON.stringify({statement, live}));
@@ -3605,8 +3606,8 @@ console.log(JSON.stringify({profit:render("+1234.50"),loss:render("-1234.50"),ze
 def test_dashboard_signed_pnl_formats_signs_groups_and_only_actual_pnl() -> None:
     output = run_dashboard_js(r'''
 const account = renderAccountTable([{key:"futu:US:AAPL:0",holding:{},display:{
-  market:"US",symbol:"AAPL",name:"Apple",total_quantity:"1",avg_cost_price:"1",
-  market_value_hkd:"1",account_weight:"12.50%",portfolio_weight:"6.25%",unrealized_pnl_pct:"16.67%",
+  market:"US",symbol:"AAPL",name:"Apple",quantity:"1",cost_price:"1",
+  market_value_hkd:"1",account_weight_hkd:"12.50%",portfolio_weight_hkd:"6.25%",unrealized_pnl_pct:"16.67%",
 }}]);
 const backtest = renderBacktestComparisonMetrics({
   strategy:{total_return_pct:12.5,max_drawdown_pct:8.25,trades:[],win_rate_pct:60},
@@ -3849,7 +3850,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_dashboard_derives_account_groups_from_accepted_broker_positions() -> None:
+def test_dashboard_account_groups_render_controller_fields_without_quote_math() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
   summary: {portfolio_value_hkd: "3000", cash_like_value_hkd: "700"}, broker_summaries: [
@@ -3859,8 +3860,8 @@ state.dashboard = {
     {broker: "eastmoney", portfolio_value_hkd: "0", cash_like_value_hkd: "0"},
   ], account_sync:{brokers:{futu:{status:"ok",display:"同步正常"},tiger:{status:"ok",display:"同步正常"}}}, cash_rows: [],
   broker_positions: [
-    {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100"},
-    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500"},
+    {broker: "futu", account_alias: "futu_1", market: "US", symbol: "QQQ", quantity: "1", market_value_hkd: "700", cost_value: "600", unrealized_pnl: "100", account_weight_hkd: "70.00%", portfolio_weight_hkd: "23.33%"},
+    {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "QQQ", quantity: "2", market_value_hkd: "1600", cost_value: "1100", unrealized_pnl: "500", account_weight_hkd: "80.00%", portfolio_weight_hkd: "53.33%"},
     {broker: "tiger", account_alias: "tiger_1", market: "CASH", symbol: "USD", asset_class: "cash", quantity: "1", market_value_hkd: "400"},
     {broker: "tiger", account_alias: "tiger_1", market: "US", symbol: "MONEY", asset_class: "money_market_fund", quantity: "1", market_value_hkd: "100"},
   ],
@@ -3871,7 +3872,7 @@ state.dashboard = {
 };
 console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
   broker: group.broker, horizon: group.profile.horizon,
-  rows: group.rows.map((row) => ({key: row.key, quantity: row.display.total_quantity, accountWeight: row.display.account_weight})),
+  rows: group.rows.map((row) => ({key: row.key, quantity: row.display.quantity, accountWeight: row.display.account_weight_hkd})),
 }))));
 ''')
     groups = json.loads(output)
@@ -3880,7 +3881,56 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
     assert groups[1]["rows"] == [{"key": "tiger:US:QQQ:0", "quantity": "2", "accountWeight": "80.00%"}]
 
 
-def test_dashboard_preserves_orphan_accepted_position_fields_and_derives_hkd_value() -> None:
+def test_dashboard_account_group_keeps_controller_values_when_quotes_conflict() -> None:
+    output = run_dashboard_js(r'''
+state.dashboard = {
+  broker_summaries: [{broker:"tiger", portfolio_value_hkd:"99999"}],
+  broker_positions: [{
+    broker:"tiger", market:"US", symbol:"QQQ", quantity:"2", cost_price:"400",
+    last_price:"500", price_kind:"after_hours", price_as_of:"2026-07-31T19:52:00-04:00",
+    market_value_usd:"1000", market_value_hkd:"7800", unrealized_pnl:"200",
+    unrealized_pnl_pct:"25.00%", account_weight_hkd:"7.80%", portfolio_weight_hkd:"1.25%",
+  }],
+  holdings: [{market:"US", symbol:"QQQ", brokers:"tiger", strategy:"趋势"}],
+};
+state.quotes = {conflict:{market:"US", symbol:"QQQ", last_price:"999"}};
+const row = accountHoldingGroups().find((group) => group.broker === "tiger").rows[0];
+console.log(JSON.stringify({display:row.display, strategy:row.holding.strategy}));
+''')
+    row = json.loads(output)
+    assert row["display"]["market_value_hkd"] == "7800"
+    assert row["display"]["account_weight_hkd"] == "7.80%"
+    assert row["display"]["portfolio_weight_hkd"] == "1.25%"
+    assert row["display"]["last_price"] == "500"
+    assert row["strategy"] == "趋势"
+
+
+def test_dashboard_account_price_uses_controller_price_kind() -> None:
+    output = run_dashboard_js(r'''
+console.log(JSON.stringify({
+  statement: renderAccountHoldingPrice({market:"CN", last_price:"27.99", price_kind:"statement"}),
+  afterHours: renderAccountHoldingPrice({market:"US", last_price:"500", price_kind:"after_hours", price_as_of:"2026-07-31T19:52:00-04:00"}),
+}));
+''')
+    prices = json.loads(output)
+    assert "结单" in prices["statement"]
+    assert "盘后" in prices["afterHours"]
+    assert "19:52 ET" in prices["afterHours"]
+
+
+def test_dashboard_account_view_has_no_financial_calculation_helpers() -> None:
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    for name in (
+        "acceptedPositionForDisplay",
+        "quoteAdjustedTotal",
+        "accountDisplayRow",
+        "quoteForHolding",
+        "quoteAdjustedHolding",
+    ):
+        assert f"function {name}(" not in source
+
+
+def legacy_dashboard_preserves_orphan_accepted_position_fields_and_derives_hkd_value() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
   summary: {portfolio_value_hkd: "6240"},
@@ -3921,7 +3971,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_dashboard_account_rows_reprice_with_unmapped_assets_and_negative_cash() -> None:
+def legacy_dashboard_account_rows_reprice_with_unmapped_assets_and_negative_cash() -> None:
     output = run_dashboard_js(r'''
 state.dashboard = {
   summary: {portfolio_value_hkd: "5000", cash_like_value_hkd: "300"}, broker_summaries: [
@@ -3974,7 +4024,7 @@ console.log(JSON.stringify(accountHoldingGroups().slice(0, 2).map((group) => {
     ]
 
 
-def test_dashboard_account_rows_do_not_turn_unknown_values_into_zero() -> None:
+def legacy_dashboard_account_rows_do_not_turn_unknown_values_into_zero() -> None:
     output = run_dashboard_js(r'''
 const display = accountDisplayRow(
   {market: "US", symbol: "QQQ"},
@@ -4000,7 +4050,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_dashboard_matches_holding_to_backend_canonical_quote() -> None:
+def legacy_dashboard_matches_holding_to_backend_canonical_quote() -> None:
     output = run_dashboard_js(
         r'''
 state.quotes = {
@@ -4018,7 +4068,7 @@ console.log(JSON.stringify(quoteForHolding({ market: "CN", symbol: "600025" })))
     assert json.loads(output)["futu_symbol"] == "SH.600025"
 
 
-def test_dashboard_derives_live_holding_values_from_futu_quote() -> None:
+def legacy_dashboard_derives_live_holding_values_from_futu_quote() -> None:
     output = run_dashboard_js(
         r'''
 const holding = quoteAdjustedHolding({
@@ -4070,7 +4120,7 @@ console.log(JSON.stringify({
     ],
     ids=("long", "short"),
 )
-def test_dashboard_account_option_row_uses_selected_quote_with_standard_multiplier(
+def legacy_dashboard_account_option_row_uses_selected_quote_with_standard_multiplier(
     quantity: str, cost_value: str, last_price: str, expected: dict[str, str],
 ) -> None:
     scenario = json.dumps({
@@ -4106,7 +4156,7 @@ console.log(JSON.stringify({
     assert json.loads(output) == expected
 
 
-def test_dashboard_non_us_option_preserves_unit_multiplier() -> None:
+def legacy_dashboard_non_us_option_preserves_unit_multiplier() -> None:
     output = run_dashboard_js(r'''
 const holding = quoteAdjustedHolding({
   market: "HK", asset_class: "option", total_quantity: "2",
@@ -4131,7 +4181,7 @@ console.log(JSON.stringify({
     [("US", "stock"), ("HK", "option")],
     ids=("negative-stock", "negative-non-us-option"),
 )
-def test_dashboard_negative_non_us_option_or_stock_keeps_stale_values(
+def legacy_dashboard_negative_non_us_option_or_stock_keeps_stale_values(
     market: str, asset_class: str,
 ) -> None:
     scenario = json.dumps({"market": market, "asset_class": asset_class})
@@ -4161,7 +4211,7 @@ console.log(JSON.stringify({
     }
 
 
-def test_dashboard_account_detail_uses_own_percentage_when_quote_price_is_missing() -> None:
+def legacy_dashboard_account_detail_uses_own_percentage_when_quote_price_is_missing() -> None:
     output = run_dashboard_js(r'''
 state.quotes = {missing: {market: "US", symbol: "QQQ", last_price: ""}};
 const display = accountDisplayRow(
@@ -4229,7 +4279,7 @@ def test_dashboard_session_labels_use_distinct_semantic_colors() -> None:
         ) in css
 
 
-def test_dashboard_live_holdings_recalculate_values_and_weights() -> None:
+def legacy_dashboard_live_holdings_recalculate_values_and_weights() -> None:
     output = run_dashboard_js(
         r'''
 state.dashboard = {
@@ -10424,12 +10474,12 @@ state.dashboard = {
     phillips: {status: "ok", display: "同步正常"}, eastmoney: {status: "ok", display: "同步正常"},
   }},
   broker_positions: [
-    {broker: "futu", market: "US", symbol: "VIXY", quantity: "10", market_value: "1940.00", market_value_hkd: "15132.00"},
-    {broker: "futu", market: "US", symbol: "VIXY260821C22000", quantity: "1", market_value_hkd: "300.00"},
-    {broker: "futu", market: "HK", symbol: "HKOPT", quantity: "1", market_value_hkd: "200.00"},
-    {broker: "tiger", market: "US", symbol: "VIXY", quantity: "2", market_value_hkd: "22698.00"},
-    {broker: "tiger", market: "US", symbol: "BND", quantity: "2", market_value_hkd: "100.00"},
-    {broker: "phillips", market: "HK", symbol: "00700", quantity: "100", market_value_hkd: "15982.00"},
+        {broker: "futu", market: "US", symbol: "VIXY", quantity: "10", cost_price: "12.34", last_price: "194", price_kind: "live", market_value_usd: "1940.00", market_value_hkd: "15132.00", account_weight_hkd: "15.00%", portfolio_weight_hkd: "12.25%", unrealized_pnl_pct: "5.00%"},
+        {broker: "futu", market: "US", symbol: "VIXY260821C22000", quantity: "1", cost_price: "2.10", last_price: "168", price_kind: "live", market_value_usd: "168.00", market_value_hkd: "300.00", account_weight_hkd: "0.30%", portfolio_weight_hkd: "0.50%", unrealized_pnl_pct: "-20.00%"},
+        {broker: "futu", market: "HK", symbol: "HKOPT", quantity: "1", cost_price: "1.00", last_price: "200", price_kind: "live", market_value_hkd: "200.00", account_weight_hkd: "0.20%", portfolio_weight_hkd: "0.40%", unrealized_pnl_pct: "1.00%"},
+        {broker: "tiger", market: "US", symbol: "VIXY", quantity: "2", cost_price: "12.34", last_price: "194", price_kind: "live", market_value_usd: "2910.00", market_value_hkd: "22698.00", account_weight_hkd: "10.00%", portfolio_weight_hkd: "18.50%", unrealized_pnl_pct: "5.00%"},
+        {broker: "tiger", market: "US", symbol: "BND", quantity: "2", cost_price: "50.00", last_price: "50", price_kind: "live", market_value_usd: "100.00", market_value_hkd: "100.00", account_weight_hkd: "0.50%", portfolio_weight_hkd: "2.50%", unrealized_pnl_pct: "-1.00%"},
+        {broker: "phillips", market: "HK", symbol: "00700", quantity: "100", cost_price: "150.00", last_price: "159.82", price_kind: "statement", market_value_hkd: "15982.00", account_weight_hkd: "2.00%", portfolio_weight_hkd: "3.25%", unrealized_pnl_pct: "2.00%"},
   ],
 };
 state.marketFilter = "US";
@@ -10595,7 +10645,7 @@ state.dashboard.holdings.push({
   portfolio_weight_hkd: "1.50%",
   unrealized_pnl_pct: "0.00%",
 });
-state.dashboard.broker_positions.push({broker: "phillips", market: "JP", symbol: "7203", quantity: "1", market_value_hkd: "300.00"});
+    state.dashboard.broker_positions.push({broker: "phillips", market: "JP", symbol: "7203", name: "Toyota", quantity: "1", cost_price: "3000", last_price: "300", price_kind: "statement", market_value_hkd: "300.00", account_weight_hkd: "0.25%", portfolio_weight_hkd: "1.50%", unrealized_pnl_pct: "0.00%"});
 state.selectedHoldingKey = "";
 selectBroker("phillips");
 const renderedWithOther = elements["holdings-body"].innerHTML;

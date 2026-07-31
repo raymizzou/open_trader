@@ -4953,20 +4953,17 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
     ? '<span class="account-review-action">人工复核</span>'
     : `<button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
   const attribution = simulated ? renderSimulationAttribution(holding, row.broker) : "";
-  const quote = simulated && hasValue(display.last_price)
-    ? {last_price: display.last_price}
-    : quoteForHolding(display);
-  const cells = `<tr class="account-holding-row ${isSelected ? "active-row" : ""}">
+  const cells = `<tr class="account-holding-row ${isSelected ? "active-row" : ""}" data-broker="${escapeHtml(row.broker)}" data-symbol="${escapeHtml(String(display.symbol || "").toUpperCase())}">
     <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
     <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
     <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${attribution}</td>
-    <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.total_quantity))}</td>
-    <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.avg_cost_price))}</td>
-    <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderAccountHoldingPrice(row, quote)}</td>
-    <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(renderUsdMarketValue(display))}</td>
+    <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.quantity))}</td>
+    <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.cost_price))}</td>
+    <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderAccountHoldingPrice(display)}</td>
+    <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(hasValue(display.market_value_usd) ? formatMoney(display.market_value_usd, "USD") : "-")}</td>
     <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
-    <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight))}</td>
-    <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight))}</td>
+    <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight_hkd))}</td>
+    <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight_hkd))}</td>
     <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatSignedPnl(display.unrealized_pnl_pct))}</td>
   </tr>`;
   if (!isSelected) return cells;
@@ -8300,168 +8297,32 @@ function renderUsdMarketValue(holding) {
 }
 
 function getHoldings() {
-  const holdings = (state.dashboard && Array.isArray(state.dashboard.holdings))
+  return (state.dashboard && Array.isArray(state.dashboard.holdings))
     ? state.dashboard.holdings
     : [];
-  const adjusted = holdings.map((holding) => ({
-    ...quoteAdjustedHolding(holding, quoteForHolding(holding)),
-    snapshot_market_value_hkd: holding.market_value_hkd,
-  }));
-  const values = [...adjusted, ...getCashRows()].map(
-    (row) => numericValue(row.market_value_hkd),
-  );
-  if (values.some((value) => value === null)) {
-    return adjusted;
-  }
-  const total = values.reduce((sum, value) => sum + value, 0);
-  if (total <= 0) {
-    return adjusted;
-  }
-  return adjusted.map((holding) => ({
-    ...holding,
-    portfolio_weight_hkd: percentValue(
-      numericValue(holding.market_value_hkd),
-      total,
-    ),
-  }));
 }
 
 function accountHoldingGroups() {
-  const portfolioTotal = state.dashboard?.summary?.portfolio_value_hkd;
   const groups = Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
     const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
     const rows = (Array.isArray(state.dashboard?.broker_positions)
       ? state.dashboard.broker_positions : [])
       .filter((position) => brokerKey(position) === broker && isAccountHoldingPosition(position))
       .map((position, index) => {
-        const accepted = acceptedPositionForDisplay(position);
         const matching = getHoldings().find((holding) => (
           rowBrokers(holding).includes(broker)
-          && String(holding.market || "").toUpperCase() === String(accepted.market || "").toUpperCase()
-          && String(holding.symbol || "").toUpperCase() === String(accepted.symbol || "").toUpperCase()
+          && String(holding.market || "").toUpperCase() === String(position.market || "").toUpperCase()
+          && String(holding.symbol || "").toUpperCase() === String(position.symbol || "").toUpperCase()
         )) || {};
-        const holding = {
-          ...matching,
-          ...accepted,
-          brokers: broker,
-          total_quantity: accepted.total_quantity,
-          avg_cost_price: accepted.avg_cost_price,
-        };
+        const holding = {...matching, ...position, brokers: broker};
         return {
           key: accountHoldingKey(broker, holding, index), broker, holding,
-          acceptedPosition: accepted,
-          display: accountDisplayRow(holding, accepted, summary, portfolioTotal),
-          snapshot_market_value_hkd: accepted.market_value_hkd, index,
+          display: position, index,
         };
       });
     return {broker, profile, summary, rows};
   });
-  const livePortfolioTotal = quoteAdjustedTotal(
-    state.dashboard?.summary?.portfolio_value_hkd,
-    groups.flatMap((group) => group.rows),
-  );
-  groups.forEach((group) => {
-    const liveAccountTotal = quoteAdjustedTotal(group.summary.portfolio_value_hkd, group.rows);
-    group.rows.forEach((row) => {
-      const marketValue = numericValue(row.display.market_value_hkd);
-      if (!hasValue(row.acceptedPosition?.account_weight)
-          && !hasValue(row.acceptedPosition?.account_weight_hkd)) {
-        row.display.account_weight = percentValue(marketValue, liveAccountTotal);
-      }
-      if (!hasValue(row.acceptedPosition?.portfolio_weight)
-          && !hasValue(row.acceptedPosition?.portfolio_weight_hkd)) {
-        row.display.portfolio_weight = percentValue(marketValue, livePortfolioTotal);
-      }
-    });
-  });
   return groups;
-}
-
-function acceptedPositionForDisplay(position) {
-  const existingMarketValueHkd = firstPresent(
-    position.market_value_hkd,
-    position.market_value_in_hkd,
-    position.value_hkd,
-  );
-  const marketValue = numericValue(position.market_value);
-  const fxToHkd = numericValue(position.fx_to_hkd);
-  const marketValueHkd = hasValue(existingMarketValueHkd)
-    ? existingMarketValueHkd
-    : marketValue !== null && fxToHkd !== null && fxToHkd > 0
-      ? (marketValue * fxToHkd).toFixed(2)
-      : "";
-  return {
-    ...position,
-    market_value_hkd: marketValueHkd,
-    total_quantity: firstPresent(position.total_quantity, position.quantity),
-    avg_cost_price: firstPresent(position.avg_cost_price, position.cost_price),
-    last_price: firstPresent(position.last_price, position.price),
-    unrealized_pnl: firstPresent(position.unrealized_pnl, position.pnl),
-    unrealized_pnl_pct: firstPresent(position.unrealized_pnl_pct, position.pnl_pct),
-    account_weight: firstPresent(position.account_weight, position.account_weight_hkd),
-    portfolio_weight: firstPresent(position.portfolio_weight, position.portfolio_weight_hkd),
-  };
-}
-
-function quoteAdjustedTotal(snapshotTotal, rows) {
-  let total = numericValue(snapshotTotal);
-  if (total === null) return null;
-  for (const row of rows) {
-    const liveValue = numericValue(row.display.market_value_hkd);
-    const snapshotValue = numericValue(row.snapshot_market_value_hkd);
-    if (liveValue === null || snapshotValue === null) return null;
-    total += liveValue - snapshotValue;
-  }
-  return total;
-}
-
-function accountDisplayRow(holding, detail, summary, portfolioTotal) {
-  const quote = quoteForHolding(holding);
-  const hasQuotePrice = numericValue(quote && quote.last_price) > 0;
-  const quantity = firstPresent(detail?.quantity, detail?.total_quantity, holding.total_quantity);
-  const costPrice = firstPresent(detail?.cost_price, detail?.avg_cost_price, holding.avg_cost_price);
-  const acceptedPnlPercent = firstPresent(
-    detail?.unrealized_pnl_pct,
-    detail?.pnl_pct,
-  );
-  const acceptedAccountWeight = firstPresent(
-    detail?.account_weight,
-    detail?.account_weight_hkd,
-    holding.account_weight,
-    holding.account_weight_hkd,
-  );
-  const acceptedPortfolioWeight = firstPresent(
-    detail?.portfolio_weight,
-    detail?.portfolio_weight_hkd,
-    holding.portfolio_weight,
-    holding.portfolio_weight_hkd,
-  );
-  const display = quoteAdjustedHolding({
-    ...holding,
-    ...(detail || {}),
-    total_quantity: quantity,
-    avg_cost_price: costPrice,
-  }, quote);
-  const marketValue = numericValue(display.market_value_hkd);
-  return {
-    ...display,
-    total_quantity: formatPlain(quantity),
-    avg_cost_price: formatPlain(costPrice),
-    account_weight: firstPresent(
-      acceptedAccountWeight,
-      percentValue(marketValue, numericValue(summary.portfolio_value_hkd)),
-    ) || "-",
-    portfolio_weight: firstPresent(
-      acceptedPortfolioWeight,
-      percentValue(marketValue, numericValue(portfolioTotal)),
-    ) || "-",
-    unrealized_pnl_pct: detail && !hasQuotePrice
-      ? firstPresent(
-        acceptedPnlPercent,
-        percentValue(numericValue(display.unrealized_pnl), numericValue(display.cost_value)),
-      ) || "-"
-      : formatPlain(display.unrealized_pnl_pct),
-  };
 }
 
 function accountHoldingKey(broker, holding, index) {
@@ -8484,12 +8345,6 @@ function numericValue(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function percentValue(numerator, denominator) {
-  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
-    return "-";
-  }
-  return `${((numerator / denominator) * 100).toFixed(2)}%`;
-}
 
 function brokerSummaries() {
   return (state.dashboard && Array.isArray(state.dashboard.broker_summaries))
@@ -8702,42 +8557,6 @@ function brokerDisplayName(value) {
   return labels[key] || formatPlain(value);
 }
 
-function quoteForHolding(holding) {
-  const market = String(holding && holding.market || "").trim().toUpperCase();
-  const symbol = String(holding && holding.symbol || "").trim().toUpperCase();
-  return Object.values(state.quotes).find((quote) => (
-    String(quote && quote.market || "").trim().toUpperCase() === market
-    && String(quote && quote.symbol || "").trim().toUpperCase() === symbol
-  )) || null;
-}
-
-function quoteAdjustedHolding(holding, quote) {
-  const price = numericValue(quote && quote.last_price);
-  const quantity = numericValue(holding && holding.total_quantity);
-  const cost = numericValue(holding && holding.cost_value);
-  const fx = numericValue(holding && holding.fx_to_hkd);
-  const isStandardUsOption = String(holding.market || "").toUpperCase() === "US"
-    && String(holding.asset_class || "").toLowerCase() === "option";
-  if (price === null || price <= 0 || quantity === null
-      || (isStandardUsOption ? quantity === 0 : quantity <= 0) || cost === null
-      || (isStandardUsOption ? cost === 0 : cost <= 0) || fx === null || fx <= 0) {
-    return holding;
-  }
-  // ponytail: standard US contracts only; use a feed multiplier for adjusted contracts.
-  const multiplier = isStandardUsOption ? 100 : 1;
-  const marketValue = price * quantity * multiplier;
-  const costBasis = cost * multiplier;
-  const unrealizedPnl = marketValue - costBasis;
-  return {
-    ...holding,
-    last_price: String(price),
-    market_value: marketValue.toFixed(2),
-    market_value_hkd: (marketValue * fx).toFixed(2),
-    unrealized_pnl: unrealizedPnl.toFixed(2),
-    unrealized_pnl_pct: `${((unrealizedPnl / Math.abs(costBasis)) * 100).toFixed(2)}%`,
-  };
-}
-
 function quoteNotApplicable(holding) {
   const market = String(holding.market || "").toUpperCase();
   const assetClass = String(holding.asset_class || "").toLowerCase();
@@ -8773,18 +8592,16 @@ function renderQuotePrice(holding, quote) {
   return `<span class="session-quote"><span class="session-quote-label" data-session="${escapeHtml(sessionKey)}">${escapeHtml(session)}</span><strong class="session-quote-price">${escapeHtml(formatDisplayNumber(quote.last_price))}</strong>${detail ? `<span class="session-quote-time">· ${escapeHtml(detail)}</span>` : ""}</span>`;
 }
 
-function renderAccountHoldingPrice(row, quote) {
-  if (quote && hasValue(quote.last_price)) {
-    return renderQuotePrice(row.display, quote);
+function renderAccountHoldingPrice(display) {
+  if (!hasValue(display?.last_price)) return '<span class="missing-text">缺行情</span>';
+  const kind = String(display.price_kind || "");
+  const label = ({overnight: "夜盘", pre_market: "盘前", live: "盘中", after_hours: "盘后", statement: "结单", account_snapshot: "账户快照"})[kind] || "";
+  const isUs = String(display.market || "").toUpperCase() === "US";
+  if (!label || (!isUs && kind !== "statement" && kind !== "account_snapshot")) {
+    return escapeHtml(formatDisplayNumber(display.last_price));
   }
-  const sourceKind = brokerSummaries().find(
-    (summary) => brokerKey(summary) === row.broker,
-  )?.source_kind;
-  if (String(sourceKind || "").toLowerCase() === "statement"
-      && hasValue(row.display?.last_price)) {
-    return `<span class="session-quote statement-quote"><span class="session-quote-label">结单</span><strong class="session-quote-price">${escapeHtml(formatDisplayNumber(row.display.last_price))}</strong></span>`;
-  }
-  return renderQuotePrice(row.display, quote);
+  const detail = display.price_as_of ? `· ${escapeHtml(quoteTimeEt(display.price_as_of))}` : "";
+  return `<span class="session-quote ${kind === "statement" ? "statement-quote" : ""}"><span class="session-quote-label" data-session="${escapeHtml(kind)}">${escapeHtml(label)}</span><strong class="session-quote-price">${escapeHtml(formatDisplayNumber(display.last_price))}</strong>${detail ? `<span class="session-quote-time">${detail}</span>` : ""}</span>`;
 }
 
 function sessionQuoteLabel(value) {
