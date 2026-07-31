@@ -3949,6 +3949,12 @@ def _check_source_status_panel(page: Any, payload: Mapping[str, object]) -> None
         ), f"{broker} 券商来源时间或状态不正确"
 
 
+def _page_dashboard_payload(page: Any) -> Mapping[str, object]:
+    payload = page.evaluate("() => state.dashboard")
+    assert isinstance(payload, Mapping), "Dashboard 当前页面数据无效"
+    return payload
+
+
 def _check_visual_contract(page: Any) -> None:
     names = list(WARM_LEDGER_TOKENS)
     actual = page.evaluate(
@@ -4232,8 +4238,9 @@ def _browser_check(
                           return active;
                         }"""
                     ), "Dashboard 未启动文件轮询"
+                    page_payload = _page_dashboard_payload(page)
                     _check_visual_contract(page)
-                    _check_source_status_panel(page, payload)
+                    _check_source_status_panel(page, page_payload)
                     page.screenshot(
                         path=str(
                             ACCEPTANCE_SCREENSHOT_DIR / f"{name}-portfolio.png"

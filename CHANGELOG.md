@@ -5,6 +5,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- Stabilized Dashboard browser acceptance by checking broker source timestamps
+  against each viewport's live page payload, avoiding false failures when the
+  account-sync controller publishes a newer accepted time during the gate.
 - Simplified the Dashboard account-source panel by grouping live accounts and
   broker statements and showing each broker's own accepted data time. Removed
   the redundant global quote, heartbeat, controller, and refresh labels while

@@ -1263,6 +1263,25 @@ def test_acceptance_checks_grouped_broker_source_times() -> None:
     dashboard_acceptance._check_source_status_panel(Page(), payload)
 
 
+def test_acceptance_source_panel_uses_current_page_dashboard_payload() -> None:
+    initial = valid_payload()
+    current = copy.deepcopy(initial)
+    current_account_sync = current["account_sync"]
+    assert isinstance(current_account_sync, dict)
+    current_brokers = current_account_sync["brokers"]
+    assert isinstance(current_brokers, dict)
+    current_futu = current_brokers["futu"]
+    assert isinstance(current_futu, dict)
+    current_futu["data_as_of"] = "2026-07-31T13:49:44+08:00"
+
+    class DashboardPage:
+        def evaluate(self, expression: str) -> object:
+            assert expression == "() => state.dashboard"
+            return current
+
+    assert dashboard_acceptance._page_dashboard_payload(DashboardPage()) is current
+
+
 def trend_controllers() -> dict[str, dict[str, object]]:
     return {
         broker: {
@@ -4688,6 +4707,8 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ) -> object:
             if expression == "() => state.dashboard?.broker_positions ?? []":
                 return super().evaluate(expression, argument)
+            if expression == "() => state.dashboard":
+                return self.payload
             if "clearInterval(state.quoteIntervalId)" in expression:
                 polling_freezes.append(self.name)
                 return True
