@@ -1650,16 +1650,21 @@ def _sell_proceeds(
     return None
 
 
-def build_threshold_hedge_intent(
+@dataclass(frozen=True, slots=True)
+class RelationActivityAssessment:
+    reason: str
+    intent: ThresholdHedgeIntent | None
+
+
+def _threshold_candidate(
     relation: ThresholdRelation,
     books: Mapping[str, ThresholdOrderBook],
     *,
-    require_safe_unwind: bool = True,
-) -> ThresholdHedgeIntent | None:
-    """Return the largest equal-share positive hedge with safe current unwinds."""
-
-    if not isinstance(relation, ThresholdRelation):
-        return None
+    require_safe_unwind: bool,
+    require_positive_profit: bool = False,
+) -> tuple[ThresholdHedgeIntent | None, str]:
+    if not isinstance(relation, ThresholdRelation) or not isinstance(books, Mapping):
+        return None, "book_unavailable"
     book_a = _book(
         books,
         relation.buy_leg_a.token_id,
@@ -1671,28 +1676,48 @@ def build_threshold_hedge_intent(
         require_bids=require_safe_unwind,
     )
     if book_a is None or book_b is None:
-        return None
+        return None, "book_unavailable"
     rate_a = _fee_rate(relation.market_a)
     rate_b = _fee_rate(relation.market_b)
     if rate_a is None or rate_b is None:
-        return None
+        return None, "fee_unknown"
+    for tick_size in (relation.market_a.tick_size, relation.market_b.tick_size):
+        if (
+            not isinstance(tick_size, Decimal)
+            or not tick_size.is_finite()
+            or tick_size <= 0
+        ):
+            return None, "tick_invalid"
     segments_a = _book_segments(book_a.asks, relation.market_a.tick_size)
     segments_b = _book_segments(book_b.asks, relation.market_b.tick_size)
     if segments_a is None or segments_b is None:
-        return None
+        return None, "tick_invalid"
     candidates_a = _protected_buy_candidates(
         segments_a, relation.market_a.tick_size
     )
     candidates_b = _protected_buy_candidates(
         segments_b, relation.market_b.tick_size
     )
-    minimum = max(
+    minimum_sizes = (
         relation.market_a.minimum_order_size,
         relation.market_b.minimum_order_size,
     )
-    for quantity in sorted(candidates_a.keys() & candidates_b.keys(), reverse=True):
-        if quantity < minimum:
-            continue
+    if any(
+        not isinstance(size, Decimal) or not size.is_finite() or size <= 0
+        for size in minimum_sizes
+    ):
+        return None, "minimum_depth"
+    minimum = max(minimum_sizes)
+    common_quantities = sorted(
+        candidates_a.keys() & candidates_b.keys(), reverse=True
+    )
+    executable_quantities = [
+        quantity for quantity in common_quantities if quantity >= minimum
+    ]
+    if not executable_quantities:
+        return None, "minimum_depth"
+    capped_candidate = False
+    for quantity in executable_quantities:
         price_a = _worst_price(segments_a, quantity)
         price_b = _worst_price(segments_b, quantity)
         if price_a is None or price_b is None:
@@ -1704,7 +1729,10 @@ def build_threshold_hedge_intent(
         maximum_fee = fee_a + fee_b
         total_cost = cost_a + cost_b + maximum_fee
         profit = quantity - total_cost
-        if total_cost > MAX_NORMAL_COST or profit <= 0:
+        if total_cost > MAX_NORMAL_COST:
+            continue
+        capped_candidate = True
+        if require_positive_profit and profit <= 0:
             continue
         if require_safe_unwind:
             unwind_a = _sell_proceeds(
@@ -1750,20 +1778,60 @@ def build_threshold_hedge_intent(
             max_cost=cost_b,
             tick_size=relation.market_b.tick_size,
         )
-        return ThresholdHedgeIntent(
-            relation_id=relation.relation_id,
-            event_id=relation.event_id,
-            relation=relation.relation,
-            leg_a=leg_a,
-            leg_b=leg_b,
-            quantity=quantity,
-            maximum_fee=maximum_fee,
-            total_max_cost=total_cost,
-            minimum_payout=quantity,
-            minimum_profit=profit,
-            net_edge=profit / quantity,
+        return (
+            ThresholdHedgeIntent(
+                relation_id=relation.relation_id,
+                event_id=relation.event_id,
+                relation=relation.relation,
+                leg_a=leg_a,
+                leg_b=leg_b,
+                quantity=quantity,
+                maximum_fee=maximum_fee,
+                total_max_cost=total_cost,
+                minimum_payout=quantity,
+                minimum_profit=profit,
+                net_edge=profit / quantity,
+            ),
+            "eligible",
         )
-    return None
+    if capped_candidate:
+        return None, "outside_5pct"
+    return None, "cost_limit"
+
+
+def assess_threshold_relation_activity(
+    relation: ThresholdRelation,
+    books: Mapping[str, ThresholdOrderBook],
+    *,
+    minimum_net_edge: Decimal = Decimal("-0.05"),
+) -> RelationActivityAssessment:
+    candidate, reason = _threshold_candidate(
+        relation,
+        books,
+        require_safe_unwind=False,
+    )
+    if candidate is None:
+        return RelationActivityAssessment(reason=reason, intent=None)
+    if candidate.net_edge < minimum_net_edge:
+        return RelationActivityAssessment(reason="outside_5pct", intent=None)
+    return RelationActivityAssessment(reason="eligible", intent=candidate)
+
+
+def build_threshold_hedge_intent(
+    relation: ThresholdRelation,
+    books: Mapping[str, ThresholdOrderBook],
+    *,
+    require_safe_unwind: bool = True,
+) -> ThresholdHedgeIntent | None:
+    """Return the largest equal-share positive hedge with safe current unwinds."""
+
+    candidate, _ = _threshold_candidate(
+        relation,
+        books,
+        require_safe_unwind=require_safe_unwind,
+        require_positive_profit=True,
+    )
+    return candidate
 
 
 def simple_annualized_yield(
