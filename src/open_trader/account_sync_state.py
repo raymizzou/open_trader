@@ -21,6 +21,8 @@ from .portfolio import (
     PortfolioBuildError,
     build_portfolio_rows,
     money,
+    number,
+    pct,
     recalculate_portfolio_weights,
 )
 
@@ -54,6 +56,17 @@ DASHBOARD_CASH_FIELDS = (
 PRICE_KINDS = {
     "live", "overnight", "pre_market", "after_hours", "statement",
     "account_snapshot",
+}
+_BROKER_LABELS = {
+    "futu": "富途",
+    "tiger": "老虎",
+    "phillips": "辉立",
+    "eastmoney": "东方财富",
+}
+_STATEMENT_FX_TO_HKD = {
+    "HKD": Decimal("1"),
+    "USD": Decimal("7.8"),
+    "CNY": Decimal("1.08"),
 }
 
 
@@ -386,6 +399,281 @@ def accepted_portfolio_rows(state: Mapping[str, object]) -> list[dict[str, str]]
     )
     _apply_accepted_fx_rates(rows, source_rates)
     return rows
+
+
+def build_dashboard_projection(
+    state: Mapping[str, object],
+    quotes: Mapping[str, object],
+    *,
+    generated_at: str,
+) -> dict[str, object]:
+    if _parse_aware_datetime(generated_at) is None:
+        raise PortfolioBuildError("invalid dashboard projection generated_at")
+    accepted = state if _is_valid_state(state) else empty_account_sync_state()
+    brokers = accepted["brokers"]
+    assert isinstance(brokers, dict)
+    if any(brokers[broker]["status"] == "unknown" for broker in REQUIRED_BROKERS):
+        raise PortfolioBuildError("accepted source missing for dashboard projection")
+    quote_rows = _dashboard_quote_rows(quotes)
+    positions: list[dict[str, str]] = []
+    cash_details: list[dict[str, str]] = []
+    for broker in REQUIRED_BROKERS:
+        source = brokers[broker]
+        assert isinstance(source, dict)
+        source_rates = {
+            (account_alias, currency): rate
+            for rate in source["fx_rates"]
+            if (parsed := _rate_from_row(rate)) is not None
+            for account_alias, currency, rate in (parsed,)
+        }
+        for row in source["positions"]:
+            position = _position_from_row(row)
+            if position.quantity == 0:
+                continue
+            positions.append(
+                _dashboard_position_row(
+                    position,
+                    source,
+                    source_rates,
+                    quote_rows.get((position.market.value, position.symbol.upper())),
+                )
+            )
+        for row in source["cash"]:
+            cash = _cash_from_row(row)
+            cash_details.append(_dashboard_cash_row(cash, source, source_rates))
+    summaries = [
+        _dashboard_broker_summary(broker, positions, cash_details)
+        for broker in REQUIRED_BROKERS
+    ]
+    summary = _dashboard_summary(positions, cash_details, summaries)
+    _apply_dashboard_weights(positions, summaries, summary)
+    projection = {
+        "generated_at": generated_at,
+        "quote_as_of": str(quotes.get("last_success_at") or ""),
+        "summary": summary,
+        "broker_summaries": summaries,
+        "broker_positions": positions,
+        "cash_details": cash_details,
+    }
+    if not _is_valid_dashboard_projection(projection):
+        raise PortfolioBuildError("invalid dashboard projection")
+    return projection
+
+
+def with_dashboard_projection(
+    state: Mapping[str, object],
+    quotes: Mapping[str, object],
+    *,
+    generated_at: str,
+) -> dict[str, object]:
+    projected = deepcopy(state) if _is_valid_state(state) else empty_account_sync_state()
+    projected["dashboard_projection"] = build_dashboard_projection(
+        projected, quotes, generated_at=generated_at
+    )
+    return projected
+
+
+def _dashboard_quote_rows(
+    quotes: Mapping[str, object],
+) -> dict[tuple[str, str], Mapping[str, object]]:
+    raw_rows = quotes.get("quotes")
+    if not isinstance(raw_rows, dict):
+        return {}
+    return {
+        (str(row.get("market") or "").upper(), str(row.get("symbol") or "").upper()): row
+        for row in raw_rows.values()
+        if isinstance(row, dict)
+        and str(row.get("market") or "")
+        and str(row.get("symbol") or "")
+    }
+
+
+def _dashboard_position_row(
+    position: Position,
+    source: Mapping[str, object],
+    source_rates: Mapping[tuple[str, str], Decimal],
+    quote: Mapping[str, object] | None,
+) -> dict[str, str]:
+    market_value = position.market_value
+    last_price = position.last_price
+    price_kind = "statement" if source["source_kind"] == "statement" else "account_snapshot"
+    price_as_of = str(source["data_as_of"])
+    if source["source_kind"] == "live" and quote is not None:
+        quote_price = _optional_quote_decimal(quote.get("last_price"))
+        if quote.get("status") == "ok" and quote_price is not None and quote_price > 0:
+            last_price = quote_price
+            market_value = quote_price * position.quantity * _position_multiplier(position)
+            session = str(quote.get("price_session") or "")
+            price_kind = session if session in PRICE_KINDS else "live"
+            price_as_of = str(quote.get("price_time") or quote.get("fetched_at") or "")
+    if market_value is None:
+        raise PortfolioBuildError(f"market value missing for {position.symbol}")
+    fx_rate = _dashboard_fx_rate(position, source, source_rates)
+    cost_value = position.cost_value
+    unrealized_pnl = market_value - cost_value if cost_value is not None else None
+    return {
+        "broker": position.broker,
+        "account_alias": position.account_alias,
+        "market": position.market.value,
+        "asset_class": position.asset_class.value,
+        "symbol": position.symbol,
+        "name": position.name,
+        "currency": position.currency.upper(),
+        "quantity": number(position.quantity),
+        "cost_price": number(position.cost_price),
+        "cost_value": money(cost_value),
+        "last_price": number(last_price),
+        "price_kind": price_kind,
+        "price_as_of": price_as_of,
+        "market_value": money(market_value),
+        "market_value_usd": money(market_value) if position.currency.upper() == "USD" else "",
+        "market_value_hkd": money(market_value * fx_rate),
+        "cost_value_hkd": money(cost_value * fx_rate) if cost_value is not None else "",
+        "unrealized_pnl": money(unrealized_pnl),
+        "unrealized_pnl_pct": pct(
+            unrealized_pnl / abs(cost_value)
+            if unrealized_pnl is not None and cost_value not in {None, Decimal("0")}
+            else None
+        ),
+        "account_weight_hkd": "",
+        "portfolio_weight_hkd": "",
+        "statement_id": position.statement_id,
+        "confidence": position.confidence,
+        "notes": position.notes,
+    }
+
+
+def _dashboard_cash_row(
+    cash: CashBalance,
+    source: Mapping[str, object],
+    source_rates: Mapping[tuple[str, str], Decimal],
+) -> dict[str, str]:
+    fx_rate = _dashboard_fx_rate(cash, source, source_rates)
+    return {
+        "broker": cash.broker,
+        "account_alias": cash.account_alias,
+        "currency": cash.currency.upper(),
+        "cash_balance": number(cash.cash_balance),
+        "available_balance": number(cash.available_balance),
+        "cash_balance_hkd": money(cash.cash_balance * fx_rate),
+        "available_balance_hkd": money(cash.available_balance * fx_rate)
+        if cash.available_balance is not None
+        else "",
+        "statement_id": cash.statement_id,
+        "confidence": cash.confidence,
+        "notes": cash.notes,
+    }
+
+
+def _dashboard_fx_rate(
+    value: Position | CashBalance,
+    source: Mapping[str, object],
+    source_rates: Mapping[tuple[str, str], Decimal],
+) -> Decimal:
+    currency = value.currency.upper()
+    rate = source_rates.get((value.account_alias, currency))
+    if rate is not None:
+        return rate
+    if source["source_kind"] == "statement" and currency in _STATEMENT_FX_TO_HKD:
+        return _STATEMENT_FX_TO_HKD[currency]
+    raise PortfolioBuildError(f"live FX missing for {value.broker}.{value.account_alias}.{currency}")
+
+
+def _position_multiplier(position: Position) -> Decimal:
+    return (
+        Decimal("100")
+        if position.market == Market.US and position.asset_class == AssetClass.OPTION
+        else Decimal("1")
+    )
+
+
+def _optional_quote_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value or ""))
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _is_dashboard_cash_like(row: Mapping[str, str]) -> bool:
+    return row["market"] == Market.CASH.value or row["asset_class"] in {
+        AssetClass.CASH.value,
+        AssetClass.MONEY_MARKET_FUND.value,
+    }
+
+
+def _dashboard_broker_summary(
+    broker: str,
+    positions: Sequence[Mapping[str, str]],
+    cash_details: Sequence[Mapping[str, str]],
+) -> dict[str, object]:
+    broker_positions = [row for row in positions if row["broker"] == broker]
+    broker_cash = [row for row in cash_details if row["broker"] == broker]
+    holding_value = sum(
+        (Decimal(row["market_value_hkd"]) for row in broker_positions if not _is_dashboard_cash_like(row)),
+        Decimal("0"),
+    )
+    cash_like_value = sum(
+        (Decimal(row["market_value_hkd"]) for row in broker_positions if _is_dashboard_cash_like(row)),
+        Decimal("0"),
+    ) + sum((Decimal(row["cash_balance_hkd"]) for row in broker_cash), Decimal("0"))
+    portfolio_value = holding_value + cash_like_value
+    return {
+        "broker": broker,
+        "label": _BROKER_LABELS[broker],
+        "source_kind": _source_kind_for_broker(broker),
+        "detail_available": bool(broker_positions or broker_cash),
+        "holding_value_hkd": money(holding_value),
+        "cash_like_value_hkd": money(cash_like_value),
+        "portfolio_value_hkd": money(portfolio_value),
+        "holding_count": sum(1 for row in broker_positions if not _is_dashboard_cash_like(row)),
+    }
+
+
+def _dashboard_summary(
+    positions: Sequence[Mapping[str, str]],
+    cash_details: Sequence[Mapping[str, str]],
+    summaries: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    holding_value = sum(
+        (Decimal(row["market_value_hkd"]) for row in positions if not _is_dashboard_cash_like(row)),
+        Decimal("0"),
+    )
+    cash_like_value = sum(
+        (Decimal(row["market_value_hkd"]) for row in positions if _is_dashboard_cash_like(row)),
+        Decimal("0"),
+    ) + sum((Decimal(row["cash_balance_hkd"]) for row in cash_details), Decimal("0"))
+    portfolio_value = holding_value + cash_like_value
+    if portfolio_value <= 0:
+        raise PortfolioBuildError("portfolio HKD total must be positive")
+    return {
+        "holding_value_hkd": money(holding_value),
+        "cash_like_value_hkd": money(cash_like_value),
+        "portfolio_value_hkd": money(portfolio_value),
+        "holding_weight_hkd": pct(holding_value / portfolio_value),
+        "cash_like_weight_hkd": pct(cash_like_value / portfolio_value),
+        "holding_count": sum(1 for row in positions if not _is_dashboard_cash_like(row)),
+        "broker_count": sum(1 for row in summaries if row["detail_available"]),
+    }
+
+
+def _apply_dashboard_weights(
+    positions: list[dict[str, str]],
+    summaries: Sequence[Mapping[str, object]],
+    summary: Mapping[str, object],
+) -> None:
+    broker_totals = {
+        str(row["broker"]): Decimal(str(row["portfolio_value_hkd"]))
+        for row in summaries
+    }
+    portfolio_total = Decimal(str(summary["portfolio_value_hkd"]))
+    for row in positions:
+        market_value = Decimal(row["market_value_hkd"])
+        broker_total = broker_totals[row["broker"]]
+        if broker_total <= 0:
+            raise PortfolioBuildError(f"broker HKD total must be positive for {row['broker']}")
+        row["account_weight_hkd"] = pct(market_value / broker_total)
+        row["portfolio_weight_hkd"] = pct(market_value / portfolio_total)
 
 
 def write_portfolio_atomic(path: Path, rows: Sequence[Mapping[str, str]]) -> None:

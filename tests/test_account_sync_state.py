@@ -15,6 +15,7 @@ from open_trader.account_sync_state import (
     BrokerAccountCandidate,
     accept_candidate,
     accepted_portfolio_rows,
+    build_dashboard_projection,
     dashboard_projection_from_state,
     effective_source_status,
     load_account_sync_state,
@@ -453,6 +454,38 @@ def test_accepted_portfolio_uses_source_fx_and_rejects_duplicate_identities(tmp_
         accepted_portfolio_rows(duplicate_cash_state)
 
 
+def test_dashboard_projection_publishes_complete_live_and_statement_fields(
+    tmp_path: Path,
+) -> None:
+    projection = build_dashboard_projection(
+        _projection_state(tmp_path),
+        {
+            "status": "ok",
+            "last_success_at": "2026-07-31T08:30:05+08:00",
+            "stale": False,
+            "quotes": {},
+        },
+        generated_at="2026-07-31T08:30:05+08:00",
+    )
+
+    rows = {(row["broker"], row["symbol"]): row for row in projection["broker_positions"]}
+    tiger = rows[("tiger", "ADP")]
+    phillips = rows[("phillips", "00200")]
+    eastmoney = rows[("eastmoney", "000001")]
+
+    assert tiger["market_value_hkd"] == "22640.05"
+    assert tiger["price_kind"] == "account_snapshot"
+    assert phillips["market_value_hkd"] == "1973.16"
+    assert phillips["price_kind"] == "statement"
+    assert eastmoney["market_value_hkd"] == "1080.00"
+    assert all(row["account_weight_hkd"] for row in rows.values())
+    assert all(row["portfolio_weight_hkd"] for row in rows.values())
+    assert Decimal(projection["summary"]["portfolio_value_hkd"]) == sum(
+        Decimal(row["portfolio_value_hkd"])
+        for row in projection["broker_summaries"]
+    )
+
+
 def test_mixed_broker_portfolio_rows_keep_the_deterministic_fx_fallback(tmp_path) -> None:
     state = accept_candidate(
         load_account_sync_state(tmp_path / "missing.json"),
@@ -623,6 +656,112 @@ def _candidate() -> BrokerAccountCandidate:
         ),
         fx_rates=(
             {"account_alias": "main", "currency": "USD", "rate_to_hkd": "7.8123"},
+        ),
+        summary={"position_count": 1, "cash_count": 1},
+    )
+
+
+def _projection_state(tmp_path: Path) -> dict[str, object]:
+    state = load_account_sync_state(tmp_path / "missing.json")
+    candidates = (
+        _candidate(),
+        _projection_candidate(
+            broker="tiger",
+            market=Market.US,
+            symbol="ADP",
+            currency="USD",
+            quantity="11",
+            market_value="2902.57",
+            cost_value="3067.9",
+            fx_rate="7.8",
+        ),
+        _projection_candidate(
+            broker="phillips",
+            market=Market.HK,
+            symbol="00200",
+            currency="HKD",
+            quantity="522",
+            market_value="1973.16",
+            cost_value="1800",
+        ),
+        _projection_candidate(
+            broker="eastmoney",
+            market=Market.CN,
+            symbol="000001",
+            currency="CNY",
+            quantity="100",
+            market_value="1000",
+            cost_value="900",
+        ),
+    )
+    for candidate in candidates:
+        state = accept_candidate(
+            state,
+            candidate,
+            attempted_at="2026-07-31T08:00:00+08:00",
+        )
+    return state
+
+
+def _projection_candidate(
+    *,
+    broker: str,
+    market: Market,
+    symbol: str,
+    currency: str,
+    quantity: str,
+    market_value: str,
+    cost_value: str,
+    fx_rate: str = "",
+) -> BrokerAccountCandidate:
+    source_kind = "live" if broker in LIVE_BROKERS else "statement"
+    account_alias = f"{broker}_main"
+    statement_id = (
+        "2026-07-31-tiger-live"
+        if broker == "tiger"
+        else f"2026-07-31-{broker}"
+    )
+    return BrokerAccountCandidate(
+        broker=broker,
+        source_kind=source_kind,
+        data_as_of="2026-07-31T08:00:00+08:00",
+        period="2026-07",
+        positions=(
+            Position(
+                statement_id=statement_id,
+                broker=broker,
+                account_alias=account_alias,
+                market=market,
+                asset_class=AssetClass.STOCK,
+                symbol=symbol,
+                name=symbol,
+                currency=currency,
+                quantity=Decimal(quantity),
+                cost_price=Decimal(cost_value) / Decimal(quantity),
+                last_price=Decimal(market_value) / Decimal(quantity),
+                market_value=Decimal(market_value),
+                cost_value=Decimal(cost_value),
+                unrealized_pnl=Decimal(market_value) - Decimal(cost_value),
+                confidence="high",
+                notes="",
+            ),
+        ),
+        cash=(
+            CashBalance(
+                statement_id=statement_id,
+                broker=broker,
+                account_alias=account_alias,
+                currency=currency,
+                cash_balance=Decimal("100"),
+                available_balance=Decimal("100"),
+                confidence="high",
+                notes="",
+            ),
+        ),
+        fx_rates=(
+            ({"account_alias": account_alias, "currency": currency, "rate_to_hkd": fx_rate},)
+            if fx_rate
+            else ()
         ),
         summary={"position_count": 1, "cash_count": 1},
     )
