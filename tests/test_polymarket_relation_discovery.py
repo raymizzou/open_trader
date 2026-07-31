@@ -4,16 +4,31 @@ import hashlib
 import json
 import subprocess
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from polymarket.models.gamma.event import Event, EventState
+from polymarket.models.gamma.market import (
+    FeeSchedule,
+    Market,
+    MarketOutcome,
+    MarketOutcomes,
+    MarketResolution,
+    MarketState,
+    MarketTrading,
+)
 
 from open_trader.polymarket_relation_discovery import (
     CODEX_PROMPT_VERSION,
     CodexRelationValidator,
+    ThresholdRelationDiscoveryResult,
     codex_relation_cache_key,
+    discover_threshold_relation_catalog,
     discover_threshold_relations,
+    threshold_relation_from_payload,
+    threshold_relation_payload,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
@@ -86,6 +101,104 @@ def event(
         "negRisk": neg_risk,
         "markets": list(markets),
     }
+
+
+def sdk_market(market_id: str, question: str, token_suffix: str) -> Market:
+    return Market.model_construct(
+        id=market_id,
+        condition_id=f"condition-{market_id}",
+        question=question,
+        description=RULES,
+        state=MarketState(
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            enable_order_book=True,
+            neg_risk=False,
+            end_date=datetime(2026, 12, 31, 17, tzinfo=UTC),
+        ),
+        outcomes=MarketOutcomes(
+            yes=MarketOutcome(label="Yes", token_id=f"yes-{token_suffix}"),
+            no=MarketOutcome(label="No", token_id=f"no-{token_suffix}"),
+        ),
+        trading=MarketTrading(
+            minimum_order_size=Decimal("5"),
+            minimum_tick_size=Decimal("0.001"),
+            fees_enabled=True,
+            fee_schedule=FeeSchedule(
+                exponent=1,
+                rate=Decimal("0.07"),
+                taker_only=True,
+                rebate_rate=Decimal("0.2"),
+            ),
+        ),
+        resolution=MarketResolution(source="Binance"),
+    )
+
+
+def test_official_sdk_event_matches_json_dump() -> None:
+    sdk_event = Event.model_construct(
+        id="event-sdk",
+        slug="btc-thresholds",
+        title="Bitcoin thresholds",
+        state=EventState(active=True, closed=False, ended=False),
+        markets=(
+            sdk_market("lower", "Will Bitcoin be above $90,000 on December 31?", "lower"),
+            sdk_market("higher", "Will Bitcoin be above $100,000 on December 31?", "higher"),
+        ),
+    )
+    sdk_relations = discover_threshold_relations([sdk_event])
+    json_relations = discover_threshold_relations(
+        [sdk_event.model_dump(by_alias=True, mode="json")]
+    )
+    assert sdk_relations == json_relations
+    assert len(sdk_relations) == 1
+    assert sdk_relations[0].market_a.end_date == "2026-12-31T17:00:00Z"
+    assert sdk_relations[0].event_slug == "btc-thresholds"
+
+
+def test_catalog_result_reports_each_first_funnel_stage_once() -> None:
+    result = discover_threshold_relation_catalog(
+        [
+            event(
+                market("ordinary", question="Will Bitcoin rise?"),
+                market(
+                    "lower",
+                    question="Will Bitcoin be above $90,000 on December 31?",
+                ),
+                market(
+                    "higher",
+                    question="Will Bitcoin be above $100,000 on December 31?",
+                ),
+            ),
+            event(
+                market("closed-market", question="Will Bitcoin rise?"),
+                active=False,
+            ),
+        ]
+    )
+    assert isinstance(result, ThresholdRelationDiscoveryResult)
+    assert result.events_seen == 2
+    assert result.events_eligible == 1
+    assert result.markets_seen == 4
+    assert result.markets_normalized == 3
+    assert result.threshold_markets == 2
+    assert len(result.relations) == 1
+    assert result.unique_tokens == 2
+    assert result.rejection_counts["event_ineligible"] == 1
+    assert result.rejection_counts["not_threshold"] == 1
+
+
+def test_relation_payload_round_trips_without_type_loss() -> None:
+    relation = discover_threshold_relations([
+        event(
+            market("lower", question="Will Bitcoin be above $90,000 on December 31?"),
+            market("higher", question="Will Bitcoin be above $100,000 on December 31?"),
+        )
+    ])[0]
+    assert threshold_relation_from_payload(
+        threshold_relation_payload(relation)
+    ) == relation
 
 
 def test_exact_above_template_builds_the_logical_relation_and_buy_legs() -> None:
@@ -423,7 +536,6 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
             "rules": RULES,
             "resolution_source": "Binance",
             "end_date": "2026-12-31T17:00:00Z",
-            "updated_at": "",
         },
         "market_b": {
             "condition_id": "condition-higher",
@@ -431,7 +543,6 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
             "rules": RULES,
             "resolution_source": "Binance",
             "end_date": "2026-12-31T17:00:00Z",
-            "updated_at": "",
         },
     }
     canonical = json.dumps(
@@ -447,6 +558,10 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         relation,
         market_a=replace(relation.market_a, fee_rate=Decimal("0.99")),
     )
+    updated_at_change = replace(
+        relation,
+        market_a=replace(relation.market_a, updated_at="2026-07-31T12:00:00Z"),
+    )
     rules_change = replace(
         relation,
         market_a=replace(relation.market_a, rules=relation.market_a.rules + " Extra."),
@@ -459,6 +574,14 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
     assert (
         codex_relation_cache_key(
             price_only_change,
+            model="gpt-test",
+            prompt_version=CODEX_PROMPT_VERSION,
+        )
+        == expected
+    )
+    assert (
+        codex_relation_cache_key(
+            updated_at_change,
             model="gpt-test",
             prompt_version=CODEX_PROMPT_VERSION,
         )
@@ -496,6 +619,44 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         )
         != expected
     )
+
+
+def test_cache_key_ignores_generic_updated_at_but_not_rules() -> None:
+    relation = threshold_relation()
+    touched = replace(
+        relation,
+        market_a=replace(relation.market_a, updated_at="2026-07-31T12:00:00Z"),
+    )
+    changed_rules = replace(
+        relation,
+        market_a=replace(relation.market_a, rules=relation.market_a.rules + " Changed."),
+    )
+    assert codex_relation_cache_key(relation, model="gpt-test") == (
+        codex_relation_cache_key(touched, model="gpt-test")
+    )
+    assert codex_relation_cache_key(relation, model="gpt-test") != (
+        codex_relation_cache_key(changed_rules, model="gpt-test")
+    )
+
+
+def test_cached_validation_never_invokes_runner(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    validator = CodexRelationValidator(
+        codex_store(tmp_path),
+        model="gpt-test",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=codex_jsonl(codex_result()),
+            stderr="",
+        ),
+    )
+    assert validator.validate(relation).status == "approved"
+    validator.runner = lambda *args, **kwargs: pytest.fail("runner called")
+    cached = validator.cached_validation(relation)
+    assert cached is not None
+    assert cached.status == "approved"
+    assert cached.cached is True
 
 
 def test_codex_approve_uses_isolated_structured_command_and_records_usage(

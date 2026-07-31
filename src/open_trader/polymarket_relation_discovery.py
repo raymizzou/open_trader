@@ -205,6 +205,8 @@ class ThresholdMarket:
     fee_rate: Decimal | None
     minimum_order_size: Decimal
     tick_size: Decimal
+    volume_24h: Decimal | None = None
+    liquidity: Decimal | None = None
     updated_at: str = ""
 
 
@@ -228,6 +230,22 @@ class ThresholdRelation:
     buy_leg_b: ThresholdBuyLeg
     rules_hash_a: str
     rules_hash_b: str
+    event_title: str = ""
+    event_slug: str = ""
+    event_volume_24h: Decimal | None = None
+    event_liquidity: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdRelationDiscoveryResult:
+    relations: tuple[ThresholdRelation, ...]
+    events_seen: int
+    events_eligible: int
+    markets_seen: int
+    markets_normalized: int
+    threshold_markets: int
+    unique_tokens: int
+    rejection_counts: Mapping[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +284,14 @@ def _value(value: object, *names: str, default: object = None) -> object:
     return default
 
 
+def _json_model(value: object) -> object:
+    model_dump = getattr(value, "model_dump", None)
+    if not callable(model_dump):
+        return value
+    dumped = model_dump(by_alias=True, mode="json")
+    return dumped if isinstance(dumped, Mapping) else value
+
+
 def _nested(value: object, container: str, *names: str, default: object = None) -> object:
     direct = _value(value, *names, default=None)
     if direct is not None:
@@ -301,6 +327,11 @@ def _decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return parsed if parsed.is_finite() else None
+
+
+def _display_metric(value: object, *names: str) -> Decimal | None:
+    metric = _decimal(_nested(value, "metrics", *names, default=None))
+    return metric if metric is not None and metric >= 0 else None
 
 
 def _normalized(value: str) -> str:
@@ -414,7 +445,7 @@ def _eligible_event(value: object) -> bool:
 
 def _market(
     event_id: str, value: object
-) -> tuple[ThresholdMarket, str, str] | None:
+) -> tuple[tuple[ThresholdMarket, str, str] | None, str | None]:
     if (
         _nested(value, "state", "active", default=True) is False
         or _nested(value, "state", "closed", default=False) is True
@@ -436,17 +467,16 @@ def _market(
         is False
         or _nested(value, "state", "negRisk", "neg_risk", default=False) is True
     ):
-        return None
+        return None, "market_ineligible"
     market_id = _text(_value(value, "id", "market_id", "marketId", default=""))
     condition_id = _text(
         _value(value, "conditionId", "condition_id", default="")
     )
     question = _text(_value(value, "question", default=""))
     rules = _text(_value(value, "description", "rules", default=""))
-    parsed = _parse_question(question)
     tokens = _outcome_tokens(value)
-    if not market_id or not condition_id or not question or not rules or parsed is None or tokens is None:
-        return None
+    if not market_id or not condition_id or not question or not rules or tokens is None:
+        return None, "market_unparseable"
     source = _text(
         _nested(
             value,
@@ -461,7 +491,7 @@ def _market(
         _nested(value, "state", "endDate", "end_date", default="")
     )
     if not end_date:
-        return None
+        return None, "market_unparseable"
     minimum_order_size = _decimal(
         _nested(
             value,
@@ -488,7 +518,10 @@ def _market(
         or tick_size is None
         or tick_size <= 0
     ):
-        return None
+        return None, "market_unparseable"
+    parsed = _parse_question(question)
+    if parsed is None:
+        return None, "not_threshold"
     fees_enabled_value = _nested(
         value, "trading", "feesEnabled", "fees_enabled", default=None
     )
@@ -523,11 +556,22 @@ def _market(
         fee_rate=fee_rate,
         minimum_order_size=minimum_order_size,
         tick_size=tick_size,
+        volume_24h=_display_metric(
+            value,
+            "volume_24h",
+            "volume24h",
+            "volume_24hr",
+            "volume24hr",
+        ),
+        liquidity=_display_metric(value, "liquidity"),
         updated_at=_text(
             _value(value, "updatedAt", "updated_at", default="")
         ),
     )
-    return market, parsed.template, _normalize_rules(rules, parsed.threshold)
+    return (
+        (market, parsed.template, _normalize_rules(rules, parsed.threshold)),
+        None,
+    )
 
 
 def _hash(value: str) -> str:
@@ -549,7 +593,16 @@ def _relation_id(event_id: str, a: ThresholdMarket, b: ThresholdMarket) -> str:
     return f"threshold:{_hash(encoded)}"
 
 
-def _relation(event_id: str, a: ThresholdMarket, b: ThresholdMarket) -> ThresholdRelation:
+def _relation(
+    event_id: str,
+    a: ThresholdMarket,
+    b: ThresholdMarket,
+    *,
+    event_title: str,
+    event_slug: str,
+    event_volume_24h: Decimal | None,
+    event_liquidity: Decimal | None,
+) -> ThresholdRelation:
     if a.operator in {">", ">="}:
         relation: Relation = "B_IMPLIES_A"
         outcomes: tuple[Outcome, Outcome] = ("YES", "NO")
@@ -572,24 +625,61 @@ def _relation(event_id: str, a: ThresholdMarket, b: ThresholdMarket) -> Threshol
         ),
         rules_hash_a=_hash(_normalized(a.rules)),
         rules_hash_b=_hash(_normalized(b.rules)),
+        event_title=event_title,
+        event_slug=event_slug,
+        event_volume_24h=event_volume_24h,
+        event_liquidity=event_liquidity,
     )
 
 
-def discover_threshold_relations(
+def discover_threshold_relation_catalog(
     events: Sequence[object],
-) -> tuple[ThresholdRelation, ...]:
+) -> ThresholdRelationDiscoveryResult:
     relations: list[ThresholdRelation] = []
-    for event in events:
-        if not _eligible_event(event):
-            continue
+    events_seen = 0
+    events_eligible = 0
+    markets_seen = 0
+    markets_normalized = 0
+    threshold_markets = 0
+    rejection_counts = {
+        "event_ineligible": 0,
+        "market_ineligible": 0,
+        "market_unparseable": 0,
+        "not_threshold": 0,
+        "duplicate_condition": 0,
+        "duplicate_token": 0,
+    }
+    for raw_event in events:
+        events_seen += 1
+        event = _json_model(raw_event)
+        raw_markets = _items(_value(event, "markets", default=()))
+        markets_seen += len(raw_markets)
         event_id = _text(_value(event, "id", "event_id", "eventId", default=""))
-        if not event_id:
+        if not event_id or not _eligible_event(event):
+            rejection_counts["event_ineligible"] += 1
             continue
+        events_eligible += 1
+        event_title = _text(_value(event, "title", default=""))
+        event_slug = _text(_value(event, "slug", default=""))
+        event_volume_24h = _display_metric(
+            event,
+            "volume_24h",
+            "volume24h",
+            "volume_24hr",
+            "volume24hr",
+        )
+        event_liquidity = _display_metric(event, "liquidity")
         groups: dict[tuple[str, ...], list[ThresholdMarket]] = {}
-        for raw_market in _items(_value(event, "markets", default=())):
-            parsed = _market(event_id, raw_market)
+        for raw_market in raw_markets:
+            parsed, rejection = _market(event_id, raw_market)
             if parsed is None:
+                assert rejection is not None
+                if rejection == "not_threshold":
+                    markets_normalized += 1
+                rejection_counts[rejection] += 1
                 continue
+            markets_normalized += 1
+            threshold_markets += 1
             market, question_template, rules_template = parsed
             key = (
                 market.operator,
@@ -612,17 +702,27 @@ def discover_threshold_relations(
                 for higher in ordered[index + 1 :]:
                     if lower.threshold == higher.threshold:
                         continue
-                    if (
-                        lower.condition_id == higher.condition_id
-                        or {
-                            lower.yes_token_id,
-                            lower.no_token_id,
-                        }
-                        & {higher.yes_token_id, higher.no_token_id}
-                    ):
+                    if lower.condition_id == higher.condition_id:
+                        rejection_counts["duplicate_condition"] += 1
                         continue
-                    relations.append(_relation(event_id, lower, higher))
-    return tuple(
+                    if {
+                        lower.yes_token_id,
+                        lower.no_token_id,
+                    } & {higher.yes_token_id, higher.no_token_id}:
+                        rejection_counts["duplicate_token"] += 1
+                        continue
+                    relations.append(
+                        _relation(
+                            event_id,
+                            lower,
+                            higher,
+                            event_title=event_title,
+                            event_slug=event_slug,
+                            event_volume_24h=event_volume_24h,
+                            event_liquidity=event_liquidity,
+                        )
+                    )
+    ordered_relations = tuple(
         sorted(
             relations,
             key=lambda item: (
@@ -633,6 +733,364 @@ def discover_threshold_relations(
                 item.market_b.condition_id,
             ),
         )
+    )
+    return ThresholdRelationDiscoveryResult(
+        relations=ordered_relations,
+        events_seen=events_seen,
+        events_eligible=events_eligible,
+        markets_seen=markets_seen,
+        markets_normalized=markets_normalized,
+        threshold_markets=threshold_markets,
+        unique_tokens=len(
+            {
+                token
+                for relation in ordered_relations
+                for token in (
+                    relation.buy_leg_a.token_id,
+                    relation.buy_leg_b.token_id,
+                )
+            }
+        ),
+        rejection_counts=rejection_counts,
+    )
+
+
+def discover_threshold_relations(
+    events: Sequence[object],
+) -> tuple[ThresholdRelation, ...]:
+    return discover_threshold_relation_catalog(events).relations
+
+
+def _market_payload(market: ThresholdMarket) -> dict[str, object]:
+    return {
+        "event_id": market.event_id,
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "question": market.question,
+        "rules": market.rules,
+        "resolution_source": market.resolution_source,
+        "end_date": market.end_date,
+        "operator": market.operator,
+        "threshold": str(market.threshold),
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "group_item_threshold": market.group_item_threshold,
+        "fees_enabled": market.fees_enabled,
+        "fee_rate": str(market.fee_rate) if market.fee_rate is not None else None,
+        "minimum_order_size": str(market.minimum_order_size),
+        "tick_size": str(market.tick_size),
+        "volume_24h": (
+            str(market.volume_24h) if market.volume_24h is not None else None
+        ),
+        "liquidity": (
+            str(market.liquidity) if market.liquidity is not None else None
+        ),
+        "updated_at": market.updated_at,
+    }
+
+
+def _buy_leg_payload(leg: ThresholdBuyLeg) -> dict[str, str]:
+    return {
+        "label": leg.label,
+        "market_id": leg.market_id,
+        "condition_id": leg.condition_id,
+        "outcome": leg.outcome,
+        "token_id": leg.token_id,
+    }
+
+
+def threshold_relation_payload(
+    relation: ThresholdRelation,
+) -> dict[str, object]:
+    return {
+        "relation_id": relation.relation_id,
+        "event_id": relation.event_id,
+        "event_title": relation.event_title,
+        "event_slug": relation.event_slug,
+        "event_volume_24h": (
+            str(relation.event_volume_24h)
+            if relation.event_volume_24h is not None
+            else None
+        ),
+        "event_liquidity": (
+            str(relation.event_liquidity)
+            if relation.event_liquidity is not None
+            else None
+        ),
+        "market_a": _market_payload(relation.market_a),
+        "market_b": _market_payload(relation.market_b),
+        "relation": relation.relation,
+        "buy_leg_a": _buy_leg_payload(relation.buy_leg_a),
+        "buy_leg_b": _buy_leg_payload(relation.buy_leg_b),
+        "rules_hash_a": relation.rules_hash_a,
+        "rules_hash_b": relation.rules_hash_b,
+    }
+
+
+def _payload_keys(
+    payload: Mapping[str, object],
+    expected: set[str],
+) -> None:
+    if set(payload) != expected:
+        raise ValueError("invalid relation payload fields")
+
+
+def _payload_text(
+    payload: Mapping[str, object],
+    field: str,
+    *,
+    required: bool = False,
+) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or (required and not value):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _payload_decimal(
+    payload: Mapping[str, object],
+    field: str,
+    *,
+    nullable: bool = False,
+    nonnegative: bool = False,
+    positive: bool = False,
+) -> Decimal | None:
+    value = payload.get(field)
+    if nullable and value is None:
+        return None
+    parsed = _decimal(value)
+    if (
+        parsed is None
+        or (nonnegative and parsed < 0)
+        or (positive and parsed <= 0)
+    ):
+        raise ValueError(f"invalid {field}")
+    return parsed
+
+
+def _market_from_payload(value: object) -> ThresholdMarket:
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid market payload")
+    _payload_keys(
+        value,
+        {
+            "event_id",
+            "market_id",
+            "condition_id",
+            "question",
+            "rules",
+            "resolution_source",
+            "end_date",
+            "operator",
+            "threshold",
+            "yes_token_id",
+            "no_token_id",
+            "group_item_threshold",
+            "fees_enabled",
+            "fee_rate",
+            "minimum_order_size",
+            "tick_size",
+            "volume_24h",
+            "liquidity",
+            "updated_at",
+        },
+    )
+    operator = value.get("operator")
+    if operator not in {">", ">=", "<", "<="}:
+        raise ValueError("unsupported operator")
+    fees_enabled = value.get("fees_enabled")
+    if fees_enabled is not None and not isinstance(fees_enabled, bool):
+        raise ValueError("invalid fees_enabled")
+    yes_token_id = _payload_text(value, "yes_token_id", required=True)
+    no_token_id = _payload_text(value, "no_token_id", required=True)
+    if yes_token_id == no_token_id:
+        raise ValueError("duplicate tokens")
+    threshold = _payload_decimal(value, "threshold")
+    minimum_order_size = _payload_decimal(
+        value,
+        "minimum_order_size",
+        positive=True,
+    )
+    tick_size = _payload_decimal(value, "tick_size", positive=True)
+    assert threshold is not None
+    assert minimum_order_size is not None
+    assert tick_size is not None
+    return ThresholdMarket(
+        event_id=_payload_text(value, "event_id", required=True),
+        market_id=_payload_text(value, "market_id", required=True),
+        condition_id=_payload_text(value, "condition_id", required=True),
+        question=_payload_text(value, "question", required=True),
+        rules=_payload_text(value, "rules", required=True),
+        resolution_source=_payload_text(value, "resolution_source"),
+        end_date=_payload_text(value, "end_date", required=True),
+        operator=operator,
+        threshold=threshold,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        group_item_threshold=_payload_text(value, "group_item_threshold"),
+        fees_enabled=fees_enabled,
+        fee_rate=_payload_decimal(
+            value,
+            "fee_rate",
+            nullable=True,
+            nonnegative=True,
+        ),
+        minimum_order_size=minimum_order_size,
+        tick_size=tick_size,
+        volume_24h=_payload_decimal(
+            value,
+            "volume_24h",
+            nullable=True,
+            nonnegative=True,
+        ),
+        liquidity=_payload_decimal(
+            value,
+            "liquidity",
+            nullable=True,
+            nonnegative=True,
+        ),
+        updated_at=_payload_text(value, "updated_at"),
+    )
+
+
+def _buy_leg_from_payload(value: object) -> ThresholdBuyLeg:
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid buy leg payload")
+    _payload_keys(
+        value,
+        {"label", "market_id", "condition_id", "outcome", "token_id"},
+    )
+    label = value.get("label")
+    if label not in {"A", "B"}:
+        raise ValueError("unsupported label")
+    outcome = value.get("outcome")
+    if outcome not in {"YES", "NO"}:
+        raise ValueError("unsupported outcome")
+    return ThresholdBuyLeg(
+        label=label,
+        market_id=_payload_text(value, "market_id", required=True),
+        condition_id=_payload_text(value, "condition_id", required=True),
+        outcome=outcome,
+        token_id=_payload_text(value, "token_id", required=True),
+    )
+
+
+def threshold_relation_from_payload(
+    payload: Mapping[str, object],
+) -> ThresholdRelation:
+    if not isinstance(payload, Mapping):
+        raise ValueError("invalid relation payload")
+    _payload_keys(
+        payload,
+        {
+            "relation_id",
+            "event_id",
+            "event_title",
+            "event_slug",
+            "event_volume_24h",
+            "event_liquidity",
+            "market_a",
+            "market_b",
+            "relation",
+            "buy_leg_a",
+            "buy_leg_b",
+            "rules_hash_a",
+            "rules_hash_b",
+        },
+    )
+    event_id = _payload_text(payload, "event_id", required=True)
+    market_a = _market_from_payload(payload.get("market_a"))
+    market_b = _market_from_payload(payload.get("market_b"))
+    if (
+        market_a.event_id != event_id
+        or market_b.event_id != event_id
+        or market_a.condition_id == market_b.condition_id
+    ):
+        raise ValueError("invalid relation market IDs")
+    if len(
+        {
+            market_a.yes_token_id,
+            market_a.no_token_id,
+            market_b.yes_token_id,
+            market_b.no_token_id,
+        }
+    ) != 4:
+        raise ValueError("duplicate tokens")
+    relation = payload.get("relation")
+    if relation not in {"A_IMPLIES_B", "B_IMPLIES_A"}:
+        raise ValueError("unsupported relation")
+    buy_leg_a = _buy_leg_from_payload(payload.get("buy_leg_a"))
+    buy_leg_b = _buy_leg_from_payload(payload.get("buy_leg_b"))
+    expected_outcomes: tuple[Outcome, Outcome] = (
+        ("NO", "YES")
+        if relation == "A_IMPLIES_B"
+        else ("YES", "NO")
+    )
+    expected_legs = (
+        (
+            "A",
+            market_a.market_id,
+            market_a.condition_id,
+            expected_outcomes[0],
+            (
+                market_a.yes_token_id
+                if expected_outcomes[0] == "YES"
+                else market_a.no_token_id
+            ),
+        ),
+        (
+            "B",
+            market_b.market_id,
+            market_b.condition_id,
+            expected_outcomes[1],
+            (
+                market_b.yes_token_id
+                if expected_outcomes[1] == "YES"
+                else market_b.no_token_id
+            ),
+        ),
+    )
+    if (
+        (
+            buy_leg_a.label,
+            buy_leg_a.market_id,
+            buy_leg_a.condition_id,
+            buy_leg_a.outcome,
+            buy_leg_a.token_id,
+        ),
+        (
+            buy_leg_b.label,
+            buy_leg_b.market_id,
+            buy_leg_b.condition_id,
+            buy_leg_b.outcome,
+            buy_leg_b.token_id,
+        ),
+    ) != expected_legs:
+        raise ValueError("invalid relation buy legs")
+    return ThresholdRelation(
+        relation_id=_payload_text(payload, "relation_id", required=True),
+        event_id=event_id,
+        market_a=market_a,
+        market_b=market_b,
+        relation=relation,
+        buy_leg_a=buy_leg_a,
+        buy_leg_b=buy_leg_b,
+        rules_hash_a=_payload_text(payload, "rules_hash_a", required=True),
+        rules_hash_b=_payload_text(payload, "rules_hash_b", required=True),
+        event_title=_payload_text(payload, "event_title"),
+        event_slug=_payload_text(payload, "event_slug"),
+        event_volume_24h=_payload_decimal(
+            payload,
+            "event_volume_24h",
+            nullable=True,
+            nonnegative=True,
+        ),
+        event_liquidity=_payload_decimal(
+            payload,
+            "event_liquidity",
+            nullable=True,
+            nonnegative=True,
+        ),
     )
 
 
@@ -654,6 +1112,16 @@ def _codex_payload(relation: ThresholdRelation) -> dict[str, object]:
     }
 
 
+def _codex_cache_market_payload(market: ThresholdMarket) -> dict[str, str]:
+    return {
+        "condition_id": market.condition_id,
+        "question": market.question,
+        "rules": market.rules,
+        "resolution_source": market.resolution_source,
+        "end_date": market.end_date,
+    }
+
+
 def _canonical_json(value: Mapping[str, object]) -> str:
     return json.dumps(
         value,
@@ -669,7 +1137,12 @@ def codex_relation_cache_key(
     model: str,
     prompt_version: str = CODEX_PROMPT_VERSION,
 ) -> str:
-    payload = _canonical_json(_codex_payload(relation))
+    payload = _canonical_json(
+        {
+            "market_a": _codex_cache_market_payload(relation.market_a),
+            "market_b": _codex_cache_market_payload(relation.market_b),
+        }
+    )
     return _hash(f"{model}{prompt_version}{payload}")
 
 
@@ -979,30 +1452,45 @@ class CodexRelationValidator:
             cached=cached,
         )
 
-    def validate(self, relation: ThresholdRelation) -> RelationValidation:
+    def cached_validation(
+        self, relation: ThresholdRelation
+    ) -> RelationValidation | None:
         cache_key = codex_relation_cache_key(
             relation,
             model=self.model,
             prompt_version=self.prompt_version,
         )
         cached = self.store.load_llm_cache(cache_key)
-        if isinstance(cached, Mapping):
-            structured = cached.get("structured_result")
-            if (
-                cached.get("model") == self.model
-                and cached.get("prompt_version") == self.prompt_version
-                and _valid_structured_result(structured)
-            ):
-                assert isinstance(structured, Mapping)
-                validation = self._validated(
-                    relation,
-                    cache_key,
-                    structured,
-                    cached=True,
-                )
-                if validation.status in {"approved", "llm_rejected"}:
-                    self.store.record_llm_cache_hit()
-                    return validation
+        if not isinstance(cached, Mapping):
+            return None
+        structured = cached.get("structured_result")
+        if (
+            cached.get("model") != self.model
+            or cached.get("prompt_version") != self.prompt_version
+            or not _valid_structured_result(structured)
+        ):
+            return None
+        assert isinstance(structured, Mapping)
+        validation = self._validated(
+            relation,
+            cache_key,
+            structured,
+            cached=True,
+        )
+        if validation.status not in {"approved", "llm_rejected"}:
+            return None
+        self.store.record_llm_cache_hit()
+        return validation
+
+    def validate(self, relation: ThresholdRelation) -> RelationValidation:
+        cached = self.cached_validation(relation)
+        if cached is not None:
+            return cached
+        cache_key = codex_relation_cache_key(
+            relation,
+            model=self.model,
+            prompt_version=self.prompt_version,
+        )
 
         command = [
             "codex",
