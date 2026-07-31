@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- Moved account-table financial fields into the account-sync controller's
+  published Dashboard projection. The browser now only renders controller
+  values, so missing FX or quotes cannot blank HKD market values and weights;
+  API and DOM acceptance now compare the published fields end to end.
 - Merged the statement-upload and restored market-discipline fixes into `main`.
   A real Phillips upload now shows four securities including `03308`, dated
   2026-07-29, with HKD 628,326.07 total assets; final acceptance was skipped at
