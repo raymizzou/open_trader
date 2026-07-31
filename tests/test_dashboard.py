@@ -6717,6 +6717,101 @@ def test_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> N
     assert "compliance" not in review
 
 
+def test_dashboard_projects_decision_plan_backtests_to_visible_summary(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
+    current = dashboard_decision_plan("2026-07-13")
+    first = current["backtests"][0]
+    first["strategy"]["equity_curve"] = [str(index) for index in range(1_000)]
+    first["strategy"]["trades"] = [{"id": index} for index in range(1_000)]
+    first["market_benchmark"]["equity_curve"] = [
+        str(index) for index in range(1_000)
+    ]
+    first["market_benchmark"]["trades"] = [
+        {"id": index} for index in range(1_000)
+    ]
+    first["signals"] = [{"date": "2026-01-01"} for _ in range(1_000)]
+    publish_decision_plans(
+        data_dir=config.data_dir,
+        run_date="2026-07-13",
+        market="US",
+        records=[current],
+        update_latest=True,
+    )
+
+    projected = load_dashboard_state(config).to_dict()["holdings"][0][
+        "decision_plan"
+    ]["backtests"][0]
+
+    assert projected == {
+        "strategy_id": "trend_pullback/v1",
+        "range": "6M",
+        "gate": {"passed": True},
+        "strategy": {
+            "total_return_pct": "8",
+            "max_drawdown_pct": "6",
+            "sharpe_ratio": "1.1",
+            "calmar_ratio": None,
+        },
+        "market_benchmark": {
+            "symbol": "SPY",
+            "total_return_pct": "5",
+        },
+        "market_excess_return_pct": "3",
+    }
+
+
+def test_dashboard_caches_decision_plan_file_until_it_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    current = dashboard_decision_plan("2026-07-13")
+    publish_decision_plans(
+        data_dir=data_dir,
+        run_date="2026-07-13",
+        market="US",
+        records=[current],
+        update_latest=True,
+    )
+    real_load = dashboard_module.load_decision_plans
+    calls: list[Path] = []
+    latest_path = data_dir / "latest/US/decision_plans.json"
+
+    def counted_load(path: Path) -> list[dict[str, object]]:
+        calls.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(dashboard_module, "load_decision_plans", counted_load)
+    dashboard_module._load_decision_plans_cached.cache_clear()
+
+    first, _ = dashboard_module._latest_decision_plans_for_markets(
+        data_dir, {"US"}
+    )
+    second, _ = dashboard_module._latest_decision_plans_for_markets(
+        data_dir, {"US"}
+    )
+
+    assert calls.count(latest_path) == 1
+    assert first == second
+
+    updated = dashboard_decision_plan("2026-07-14")
+    publish_decision_plans(
+        data_dir=data_dir,
+        run_date="2026-07-14",
+        market="US",
+        records=[updated],
+        update_latest=True,
+    )
+    refreshed, _ = dashboard_module._latest_decision_plans_for_markets(
+        data_dir, {"US"}
+    )
+
+    assert calls.count(latest_path) == 2
+    assert next(iter(refreshed.values()))["run_date"] == "2026-07-14"
+
+
 def test_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())

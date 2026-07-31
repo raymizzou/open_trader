@@ -5,7 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
-- 修复 Polymarket 每分钟关系扫描把自身的启动时刻误判为落后、从而连续补跑的问题；扫描启动时会先推进下一到期时间，真正超过一分钟才补跑一次，避免长期占满 Dashboard CPU 和内存。验证 64 个 monitor 测试及 602 个预测市场与 Dashboard Web 测试通过。
+- 修复 Polymarket 每分钟关系扫描把自身的启动时刻误判为落后、从而连续补跑的问题；扫描启动时会先推进下一到期时间，真正超过一分钟才补跑一次。Dashboard 交易计划只投影页面使用的回测汇总，并按文件版本缓存 64 MB 源计划解析，不再每五秒解析和传输完整曲线、成交及信号明细，避免服务端与浏览器长期占满 CPU 和内存。验证 597 个 Dashboard、Web 与 monitor 测试通过。
 - 修复 Polymarket 官方 SDK 模型导致关系候选恒为 0；关系目录改为每日全量扫描并持久化。新增每分钟 5% 成交候选漏斗、Codex 前置缓存、定向 WebSocket、机会窗口历史，以及“已可下单但观察模式未提交”的飞书通知。Dashboard 实时展示两层漏斗、淘汰原因、扫描耗时、Codex 队列和 WebSocket 健康；最终验证 654 个预测市场与 Dashboard 测试通过。
 - Final verification for the broker source panel passed the full Dashboard
   gate (`3902 passed`, live status `PASS`) after the accepted SHA was deployed;
