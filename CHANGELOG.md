@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- 修复 Polymarket 官方 SDK 模型导致关系候选恒为 0；关系目录改为每日全量扫描并持久化。新增每分钟 5% 成交候选漏斗、Codex 前置缓存、定向 WebSocket、机会窗口历史，以及“已可下单但观察模式未提交”的飞书通知。Dashboard 实时展示两层漏斗、淘汰原因、扫描耗时、Codex 队列和 WebSocket 健康；最终验证 654 个预测市场与 Dashboard 测试通过。
 - Moved account-table financial fields into the account-sync controller's
   published Dashboard projection. The browser now only renders controller
   values, so missing FX or quotes cannot blank HKD market values and weights;
