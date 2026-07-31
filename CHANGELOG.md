@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- 将预测市场顶部 Watcher 状态改为只反映 Polymarket WebSocket/心跳连接；盘口过期仍保持失败关闭并明确提示“当前盘口暂不可交易”。验证 Dashboard Web 测试 286 个通过。
 - Added Homebrew CLI directories to the Dashboard launchd `PATH`, so the
   Polymarket relation validator can invoke Codex instead of failing before any
   model tokens are produced.
