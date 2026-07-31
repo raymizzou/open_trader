@@ -323,6 +323,7 @@ class PolymarketMonitor:
         self._relation_volumes: dict[str, Decimal] = {}
         self._relation_rule_verifications: dict[str, tuple[datetime, str]] = {}
         self._relation_rule_failures: set[str] = set()
+        self._relation_rule_failure_fingerprints: dict[str, str] = {}
         self._opportunities: dict[str, dict[str, object]] = {}
         self._books: dict[str, ConfirmedBooks] = {}
         self._readiness: dict[str, object] | None = None
@@ -858,6 +859,7 @@ class PolymarketMonitor:
     async def _tick_relation_activity(self, client: object) -> None:
         """Tick the single minute scanner; work itself remains a background task."""
 
+        self._maintain_open_signals()
         self._maybe_schedule_activity_scan(client)
         await asyncio.sleep(0)
 
@@ -1129,6 +1131,11 @@ class PolymarketMonitor:
                 full_scanned_at=completed.isoformat(),
             )
             self._set_relation_state(relations, events, scanned_at=completed)
+            self._invalidate_rule_cache()
+            # A completed catalog scan is a fresh episode boundary.  Even an
+            # unchanged relation gets one new chance after a prior mismatch.
+            self._relation_rule_failures.clear()
+            self._relation_rule_failure_fingerprints.clear()
             self._catalog_full_scanned_at = completed
             self._catalog_last_attempt_at = completed
             self._activity_scan_due_at = completed
@@ -1317,14 +1324,13 @@ class PolymarketMonitor:
                 (raw_event,),
                 scanned_at=full_scanned_at,
             )
+            self._invalidate_rule_cache()
             completed_verification = completed
-            self._relation_rule_verifications = {
-                key: value
-                for key, value in self._relation_rule_verifications.items()
-                if key in self._relations
-            }
             for refreshed_relation in refreshed:
                 self._relation_rule_failures.discard(refreshed_relation.relation_id)
+                self._relation_rule_failure_fingerprints.pop(
+                    refreshed_relation.relation_id, None
+                )
                 self._relation_rule_verifications[refreshed_relation.relation_id] = (
                     completed_verification,
                     _relation_fingerprint(refreshed_relation),
@@ -1573,6 +1579,9 @@ class PolymarketMonitor:
             completed = self._now()
             duration = max(0.0, (completed - started).total_seconds())
             self._active_relation_ids = relation_ids
+            for relation_id in relation_ids:
+                self._relation_rule_failures.discard(relation_id)
+                self._relation_rule_failure_fingerprints.pop(relation_id, None)
             self._rebuild_relation_subscriptions()
             self._activity_scan_duration_seconds = duration
             self._activity_next_scan_at = completed + timedelta(
@@ -1713,11 +1722,34 @@ class PolymarketMonitor:
         received_at = self._relation_book_received_at.get(token, book.confirmed_at)
         return max(_age(now, received_at), _age(now, book.confirmed_at)) > BOOK_FRESHNESS_SECONDS
 
+    def _invalidate_rule_cache(self) -> None:
+        current = {
+            relation_id: _relation_fingerprint(relation)
+            for relation_id, relation in self._relations.items()
+        }
+        self._relation_rule_verifications = {
+            relation_id: value
+            for relation_id, value in self._relation_rule_verifications.items()
+            if current.get(relation_id) == value[1]
+        }
+        self._relation_rule_failures = {
+            relation_id
+            for relation_id in self._relation_rule_failures
+            if current.get(relation_id)
+            == self._relation_rule_failure_fingerprints.get(relation_id)
+        }
+        self._relation_rule_failure_fingerprints = {
+            relation_id: fingerprint
+            for relation_id, fingerprint in self._relation_rule_failure_fingerprints.items()
+            if relation_id in self._relation_rule_failures
+        }
+
     def _persist_relation_metadata(self, relation: ThresholdRelation) -> None:
         """Publish fresher unchanged event metadata without a second fetch."""
 
         self._relations[relation.relation_id] = relation
         self._relation_rule_failures.discard(relation.relation_id)
+        self._relation_rule_failure_fingerprints.pop(relation.relation_id, None)
         full_scanned_at = self._catalog_full_scanned_at or self._stored_full_scanned_at()
         if full_scanned_at is None:
             return
@@ -1740,11 +1772,22 @@ class PolymarketMonitor:
     ) -> tuple[datetime, str] | None:
         """Fetch and rediscover the exact source event before first positivity."""
 
+        current_fingerprint = _relation_fingerprint(relation)
         verified = self._relation_rule_verifications.get(relation.relation_id)
-        if verified is not None:
+        if verified is not None and verified[1] == current_fingerprint:
             return verified
-        if relation.relation_id in self._relation_rule_failures:
+        if verified is not None:
+            self._relation_rule_verifications.pop(relation.relation_id, None)
+        failure_fingerprint = self._relation_rule_failure_fingerprints.get(
+            relation.relation_id
+        )
+        if (
+            relation.relation_id in self._relation_rule_failures
+            and failure_fingerprint == current_fingerprint
+        ):
             return None
+        self._relation_rule_failures.discard(relation.relation_id)
+        self._relation_rule_failure_fingerprints.pop(relation.relation_id, None)
         previous = self._open_signal(relation.relation_id)
         previous_fingerprint = previous.get("rules_fingerprint") if previous else None
         previous_verified_at = (
@@ -1752,17 +1795,30 @@ class PolymarketMonitor:
             if previous
             else None
         )
-        if isinstance(previous_fingerprint, str) and previous_fingerprint and previous_verified_at:
+        if (
+            isinstance(previous_fingerprint, str)
+            and previous_fingerprint == current_fingerprint
+            and previous_verified_at
+        ):
             verified = (previous_verified_at, previous_fingerprint)
             self._relation_rule_verifications[relation.relation_id] = verified
             return verified
         get_event = getattr(client, "get_event", None)
         resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
         if not callable(get_event) or not callable(resolver):
-            self._close_signal(relation.relation_id, "rules_changed")
+            self._close_signal(relation.relation_id, "data_unavailable")
             return None
         try:
             raw_event = await _call(get_event, id=relation.event_id)
+        except (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+            self._record_error(exc, "relations")
+            self._close_signal(relation.relation_id, "data_unavailable")
+            return None
+        except Exception as exc:
+            self._record_error(exc, "relations")
+            self._close_signal(relation.relation_id, "data_unavailable")
+            return None
+        try:
             result = self._discovery_result(
                 await _call(resolver, (raw_event,)),
                 (raw_event,),
@@ -1776,9 +1832,14 @@ class PolymarketMonitor:
                 ),
                 None,
             )
-            fingerprint = _relation_fingerprint(relation)
-            if refreshed is None or _relation_fingerprint(refreshed) != fingerprint:
+            if (
+                refreshed is None
+                or _relation_fingerprint(refreshed) != current_fingerprint
+            ):
                 self._relation_rule_failures.add(relation.relation_id)
+                self._relation_rule_failure_fingerprints[relation.relation_id] = (
+                    current_fingerprint
+                )
                 self._close_signal(relation.relation_id, "rules_changed")
                 with self._lock:
                     self._opportunities.pop(relation.relation_id, None)
@@ -1786,15 +1847,18 @@ class PolymarketMonitor:
             verified_at = self._now()
             self._relation_rule_verifications[relation.relation_id] = (
                 verified_at,
-                fingerprint,
+                current_fingerprint,
             )
             if refreshed != relation:
                 self._persist_relation_metadata(refreshed)
-            return verified_at, fingerprint
+            return verified_at, current_fingerprint
+        except (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+            self._record_error(exc, "relations")
+            self._close_signal(relation.relation_id, "data_unavailable")
+            return None
         except Exception as exc:
             self._record_error(exc, "relations")
-            self._relation_rule_failures.add(relation.relation_id)
-            self._close_signal(relation.relation_id, "rules_changed")
+            self._close_signal(relation.relation_id, "data_unavailable")
             return None
 
     async def _refresh_relation_opportunities(
@@ -2503,6 +2567,10 @@ class PolymarketMonitor:
             "eligibility_reason": "actionable",
             "confirmed_at": confirmed_at,
             "confirmed_age_seconds": age,
+            "book_timestamp_a": yes_timestamp,
+            "book_timestamp_b": no_timestamp,
+            "book_received_at_a": now,
+            "book_received_at_b": now,
             "profit": intent.minimum_profit,
             "estimated_profit": intent.minimum_profit,
             "net_edge": intent.net_edge,
@@ -2680,6 +2748,7 @@ class PolymarketMonitor:
                     "started_at": started_at,
                     "first_positive_at": first_positive_at,
                     "last_positive_at": now,
+                    "last_seen_at": now,
                     "observed_duration_ms": max(
                         0,
                         int(
@@ -2775,6 +2844,26 @@ class PolymarketMonitor:
             market_id = str(signal.get("market_id", ""))
             relation = self._relations.get(market_id)
             if relation is None:
+                if disconnected:
+                    self._close_signal(market_id, "data_unavailable")
+                    continue
+                received_keys = (
+                    "book_received_at_a",
+                    "book_received_at_b",
+                )
+                received_values = [
+                    _timestamp_or_none(signal.get(key)) for key in received_keys
+                ]
+                # Standard and generic episodes persist local receipt times.  A
+                # legacy row may not have them yet; let its next quote refresh
+                # backfill the fields rather than closing it on startup.
+                if any(value is not None for value in received_values):
+                    if any(value is None for value in received_values) or any(
+                        _age(now, value) > BOOK_FRESHNESS_SECONDS
+                        for value in received_values
+                        if value is not None
+                    ):
+                        self._close_signal(market_id, "data_unavailable")
                 continue
             if stale_catalog:
                 self._close_signal(market_id, "relation_discovery_stale")

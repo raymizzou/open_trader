@@ -85,3 +85,33 @@ because the existing `ThresholdOrderBook` type's `confirmed_at` field is the
 local receive time. Quote freshness intentionally uses local receive age so
 existing REST refresh semantics remain compatible; exchange timestamps are
 still persisted for audit and projection.
+
+## Review follow-up
+
+The review pass hardened the first-positive boundary without changing the
+signal schema or execution path:
+
+- Cached and persisted rule verification now compares the current semantic
+  relation fingerprint before it can be reused. A same-ID mutation after a
+  restart therefore refetches the exact event and closes the episode as
+  `rules_changed` when the source no longer matches.
+- Exact-event and rediscovery failures fail closed as `data_unavailable`;
+  only a successful semantic mismatch is `rules_changed`.
+- Full catalog, event, and fresh activity publication reset prior mismatch
+  guards so a later positive episode can retry. The one-second maintenance
+  path also handles generic/non-relation signals using their local quote
+  receive timestamps and stream-disconnect state.
+- Standard signal rows now persist local receive timestamps for the same
+  freshness check, and the activity tick invokes open-signal maintenance.
+
+Review regressions:
+
+```text
+8 passed, 54 deselected
+tests/test_polymarket_monitor.py: 62 passed
+tests/test_polymarket_monitor.py tests/test_prediction_arbitrage_store.py tests/test_dashboard_web.py: 368 passed in 40.08s
+compileall and git diff --check: PASS
+```
+
+The parent task still owns the final Dashboard acceptance and live deployment
+gates.

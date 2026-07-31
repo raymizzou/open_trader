@@ -768,6 +768,148 @@ def test_first_positive_refetches_exact_event_and_verifies_rules(
     assert row["rules_fingerprint"]
 
 
+def test_same_relation_id_mutation_after_restart_refetches_before_positive(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    monitor.refresh_once()
+    relation_id = next(iter(monitor._active_relation_ids))
+    original = monitor._relations[relation_id]
+    mutated = replace(
+        original,
+        market_a=replace(original.market_a, rules=original.market_a.rules + " Changed."),
+        rules_hash_a="mutated-rules-hash",
+    )
+    monitor._store.save_relation_state(
+        {"relations": [threshold_relation_payload(mutated)]},
+        full_scanned_at=NOW.isoformat(),
+    )
+
+    restarted = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    restarted._load_relation_catalog()
+    restarted._active_relation_ids = {relation_id}
+    FakePublicClient.get_event_calls.clear()
+    restarted.refresh_once()
+
+    assert FakePublicClient.get_event_calls == ["threshold-event"]
+    closed = next(
+        row
+        for row in restarted._store.signal_history("all")
+        if row.get("market_id") == relation_id
+    )
+    assert closed["ended_reason"] == "rules_changed"
+    assert restarted.opportunity(relation_id) is None
+
+
+def test_generic_open_signal_closes_on_stale_receive_timestamp(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    setup_public([])
+    monitor = make_monitor(tmp_path, clock=lambda: now[0])
+    signal_id = monitor._store.upsert_signal(
+        {
+            "market_id": "generic-market",
+            "event_id": "generic-event",
+            "question": "generic",
+            "started_at": NOW,
+            "first_positive_at": NOW,
+            "book_received_at_a": NOW,
+            "book_received_at_b": NOW,
+            "estimated_profit": Decimal("1"),
+        }
+    )
+
+    now[0] += timedelta(seconds=10, milliseconds=1)
+    monitor._maintain_open_signals()
+
+    assert monitor._store.signal(signal_id)["ended_reason"] == "data_unavailable"
+
+
+def test_event_refetch_failure_closes_episode_as_data_unavailable(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation_id = next(iter(monitor._active_relation_ids))
+    signal_id = monitor._store.upsert_signal(
+        {
+            "market_id": relation_id,
+            "event_id": "threshold-event",
+            "question": "threshold relation",
+            "started_at": NOW,
+            "estimated_profit": Decimal("1"),
+        }
+    )
+    FakePublicClient.fail_get_event = True
+
+    monitor.refresh_once()
+
+    assert monitor._store.signal(signal_id)["ended_reason"] == "data_unavailable"
+    assert monitor.opportunity(relation_id) is None
+
+
+def test_relation_rule_failure_guard_resets_on_fresh_activity_scan(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+    relation_id = next(iter(monitor._active_relation_ids))
+    signal_id = monitor._store.upsert_signal(
+        {
+            "market_id": relation_id,
+            "event_id": "threshold-event",
+            "question": "threshold relation",
+            "started_at": NOW,
+            "estimated_profit": Decimal("1"),
+        }
+    )
+    FakePublicClient.events[0].markets[0].description += " Cancellation is possible."
+    monitor.refresh_once()
+    assert monitor._store.signal(signal_id)["ended_reason"] == "rules_changed"
+
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    asyncio.run(monitor._refresh_relation_activity(client))
+    monitor.refresh_once()
+
+    open_rows = [
+        row
+        for row in monitor._store.signal_history("all")
+        if row.get("market_id") == relation_id and row.get("ended_at") is None
+    ]
+    assert len(open_rows) == 1
+
+
 def test_recovery_opens_new_signal_after_quote_age(tmp_path: Path) -> None:
     now = [NOW]
     setup_public([threshold_event()])
