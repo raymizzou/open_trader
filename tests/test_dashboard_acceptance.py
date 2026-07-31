@@ -4853,6 +4853,82 @@ def test_validate_dashboard_payload_accepts_real_contract() -> None:
     assert validate_dashboard_payload(valid_payload(), expected_cn=5) == []
 
 
+def _controller_position(symbol: str = "QQQ") -> dict[str, str]:
+    return {
+        field: "0"
+        for field in dashboard_acceptance.DASHBOARD_POSITION_FIELDS
+    } | {
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "market": "US",
+        "asset_class": "stock",
+        "symbol": symbol,
+        "name": "Test",
+        "currency": "USD",
+        "quantity": "2",
+        "cost_price": "400",
+        "cost_value": "800",
+        "last_price": "500",
+        "price_kind": "live",
+        "price_as_of": "2026-07-31T19:52:00-04:00",
+        "market_value": "1000",
+        "market_value_usd": "1000",
+        "market_value_hkd": "7800",
+        "cost_value_hkd": "6240",
+        "unrealized_pnl": "200",
+        "unrealized_pnl_pct": "25.00%",
+        "account_weight_hkd": "7.80%",
+        "portfolio_weight_hkd": "1.25%",
+    }
+
+
+def test_validate_dashboard_payload_requires_controller_owned_position_fields() -> None:
+    payload = valid_payload()
+    payload["broker_positions"] = [_controller_position()]
+    payload["broker_positions"][0].pop("portfolio_weight_hkd")  # type: ignore[index]
+
+    errors = validate_dashboard_payload(payload, expected_cn=5)
+
+    assert any("控制器持仓第 1 行缺少字段" in error for error in errors)
+
+
+def test_check_controller_owned_rows_matches_dom_projection() -> None:
+    position = _controller_position()
+    dom_values = dict(position)
+
+    class Row:
+        def get_attribute(self, name: str) -> str:
+            return {
+                "data-broker": "tiger",
+                "data-symbol": "QQQ",
+                **{
+                    attribute: dom_values[field]
+                    for field, attribute in dashboard_acceptance.CONTROLLER_DOM_FIELDS.items()
+                },
+            }[name]
+
+    class Rows:
+        def count(self) -> int:
+            return 1
+
+        def nth(self, _index: int) -> Row:
+            return Row()
+
+    class Section:
+        def locator(self, selector: str) -> Rows:
+            assert selector == ".account-holding-row:visible"
+            return Rows()
+
+    dashboard_acceptance._check_controller_owned_rows(
+        Section(), [position], "tiger"
+    )
+    position["market_value_hkd"] = "7801"
+    with pytest.raises(AssertionError, match="market_value_hkd"):
+        dashboard_acceptance._check_controller_owned_rows(
+            Section(), [position], "tiger"
+        )
+
+
 def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accepted_count() -> None:
     payload = valid_payload()
     payload["account_sync"] = {

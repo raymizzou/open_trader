@@ -13,6 +13,7 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+from .account_sync_state import DASHBOARD_POSITION_FIELDS
 from .dashboard import (
     SHANGHAI,
     _is_dashboard_holding,
@@ -36,6 +37,19 @@ from .strategy_drawdown import valid_strategy_parameter_audit_identity
 
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
 SESSION_KEYS = {"overnight", "pre_market", "regular", "after_hours"}
+CONTROLLER_DOM_FIELDS = {
+    "quantity": "data-quantity",
+    "cost_price": "data-cost-price",
+    "last_price": "data-last-price",
+    "price_kind": "data-price-kind",
+    "price_as_of": "data-price-as-of",
+    "market_value_usd": "data-market-value-usd",
+    "market_value_hkd": "data-market-value-hkd",
+    "account_weight_hkd": "data-account-weight-hkd",
+    "portfolio_weight_hkd": "data-portfolio-weight-hkd",
+    "unrealized_pnl": "data-unrealized-pnl",
+    "unrealized_pnl_pct": "data-unrealized-pnl-pct",
+}
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
@@ -316,7 +330,30 @@ def validate_dashboard_payload(
     if "tiger_" + "long_term_strategy" in payload:
         errors.append("Dashboard API 仍包含已退役策略")
     errors.extend(_account_sync_errors(payload))
+    errors.extend(_dashboard_position_field_errors(payload))
     errors.extend(_trend_execution_batch_errors(payload))
+    return errors
+
+
+def _dashboard_position_field_errors(payload: Mapping[str, Any]) -> list[str]:
+    positions = payload.get("broker_positions")
+    if positions is None:
+        return []
+    if not isinstance(positions, list):
+        return ["Dashboard 缺少控制器持仓字段"]
+    errors: list[str] = []
+    for index, row in enumerate(positions):
+        if not isinstance(row, Mapping):
+            errors.append(f"控制器持仓第 {index + 1} 行不是对象")
+            continue
+        missing = [
+            field for field in DASHBOARD_POSITION_FIELDS
+            if not isinstance(row.get(field), str)
+        ]
+        if missing:
+            errors.append(
+                f"控制器持仓第 {index + 1} 行缺少字段：{', '.join(missing)}"
+            )
     return errors
 
 
@@ -2899,6 +2936,34 @@ def _check_trend_holding_tabs(
     )
 
 
+def _check_controller_owned_rows(section: Any, positions: list[Any], broker: str) -> None:
+    expected = [
+        row for row in positions
+        if isinstance(row, Mapping)
+        and row.get("broker") == broker
+        and _is_accepted_dashboard_holding(row)
+    ]
+    if not expected or any(
+        not all(isinstance(row.get(field), str) for field in CONTROLLER_DOM_FIELDS)
+        for row in expected
+    ):
+        return
+    rows = section.locator(".account-holding-row:visible")
+    assert rows.count() == len(expected), f"{broker} 控制器持仓行数与 DOM 不一致"
+    for index, expected_row in enumerate(expected):
+        row = rows.nth(index)
+        assert row.get_attribute("data-broker") == broker, (
+            f"{broker} DOM 持仓券商字段不一致"
+        )
+        assert row.get_attribute("data-symbol") == str(expected_row.get("symbol", "")).upper(), (
+            f"{broker} DOM 持仓标的不一致"
+        )
+        for field, attribute in CONTROLLER_DOM_FIELDS.items():
+            assert row.get_attribute(attribute) == expected_row[field], (
+                f"{broker} {expected_row.get('symbol', '-')} DOM 字段 {field} 不一致"
+            )
+
+
 def _check_account_holdings(
     page: Any,
     payload: dict[str, Any],
@@ -2973,6 +3038,7 @@ def _check_account_holdings(
             )
         else:
             assert empty.count() == 0, f"{broker} 有持仓账户错误显示空状态"
+        _check_controller_owned_rows(section, positions, broker)
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"

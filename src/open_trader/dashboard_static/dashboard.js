@@ -4953,7 +4953,20 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
     ? '<span class="account-review-action">人工复核</span>'
     : `<button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
   const attribution = simulated ? renderSimulationAttribution(holding, row.broker) : "";
-  const cells = `<tr class="account-holding-row ${isSelected ? "active-row" : ""}" data-broker="${escapeHtml(row.broker)}" data-symbol="${escapeHtml(String(display.symbol || "").toUpperCase())}">
+  const controllerFields = [
+    ["quantity", display.quantity],
+    ["cost-price", display.cost_price],
+    ["last-price", display.last_price],
+    ["price-kind", display.price_kind],
+    ["price-as-of", display.price_as_of],
+    ["market-value-usd", display.market_value_usd],
+    ["market-value-hkd", display.market_value_hkd],
+    ["account-weight-hkd", display.account_weight_hkd],
+    ["portfolio-weight-hkd", display.portfolio_weight_hkd],
+    ["unrealized-pnl", display.unrealized_pnl],
+    ["unrealized-pnl-pct", display.unrealized_pnl_pct],
+  ].map(([name, value]) => ` data-${name}="${escapeHtml(value ?? "")}"`).join("");
+  const cells = `<tr class="account-holding-row ${isSelected ? "active-row" : ""}" data-broker="${escapeHtml(row.broker)}" data-symbol="${escapeHtml(String(display.symbol || "").toUpperCase())}"${controllerFields}>
     <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
     <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
     <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${attribution}</td>
