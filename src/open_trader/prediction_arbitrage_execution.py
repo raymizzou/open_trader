@@ -147,7 +147,6 @@ class PredictionExecutionService:
         self._breaker_open = True
         self._first_live_order_verified = False
         self._threads: dict[str, threading.Thread] = {}
-        self._notification_lock = threading.Lock()
         self._clock = time.monotonic
         self._sleep = time.sleep
 
@@ -221,8 +220,6 @@ class PredictionExecutionService:
             return {"state": "ignored", "reason": "signal_closed"}
         if signal.get("notification_state") == "sent":
             return {"state": "ignored", "reason": "already_sent"}
-        if signal.get("notification_state") == "sending":
-            return {"state": "ignored", "reason": "notification_in_flight"}
         attempts = _decimal(signal.get("notification_attempts")) or Decimal("0")
         if attempts >= 3:
             return {"state": "ignored", "reason": "notification_attempts_exhausted"}
@@ -266,37 +263,44 @@ class PredictionExecutionService:
             return {"state": "failed", "reason": "books_stale"}
         if final_intent.minimum_profit <= 0 or final_intent.net_edge <= 0:
             return {"state": "failed", "reason": "threshold_economics"}
+        if final.get("rules_verified_at") in (None, ""):
+            return {"state": "failed", "reason": "opportunity_changed"}
+        if not self._codex_approved(final):
+            return {"state": "failed", "reason": "opportunity_changed"}
+        if final.get("remediation_safe") is False:
+            return {"state": "failed", "reason": "opportunity_changed"}
+        for key in ("rules_hash_a", "rules_hash_b", "cache_key", "rules_fingerprint"):
+            if opportunity.get(key) != final.get(key):
+                return {"state": "failed", "reason": "opportunity_changed"}
 
-        with self._notification_lock:
-            current = self._store.signal(str(signal_id))
-            if current is None or current.get("ended_at") is not None:
-                return {"state": "ignored", "reason": "signal_closed"}
-            if current.get("notification_state") == "sent":
-                return {"state": "ignored", "reason": "already_sent"}
-            if current.get("notification_state") == "sending":
-                return {"state": "ignored", "reason": "notification_in_flight"}
-            current_attempts = _decimal(current.get("notification_attempts")) or Decimal("0")
-            if current_attempts >= 3:
-                return {"state": "ignored", "reason": "notification_attempts_exhausted"}
-            reserved_attempts = int(current_attempts) + 1
-            try:
-                current = self._store.update_signal(
-                    str(signal_id),
-                    {
-                        "notification_attempts": reserved_attempts,
-                        "notification_state": "sending",
-                    },
-                )
-            except Exception:
-                return {"state": "failed", "reason": "notification_state_unavailable"}
+        order_ready_at = _timestamp(_utc_now())
+        reservation = self._store.reserve_notification_attempt(
+            str(signal_id),
+            max_attempts=3,
+            lease_seconds=60.0,
+            order_ready_at=order_ready_at,
+        )
+        reservation_state = reservation.get("state")
+        if reservation_state in {"missing", "closed"}:
+            return {"state": "ignored", "reason": "signal_closed" if reservation_state == "closed" else "signal_unavailable"}
+        if reservation_state == "sent":
+            return {"state": "ignored", "reason": "already_sent"}
+        if reservation_state == "in_flight":
+            return {"state": "ignored", "reason": "notification_in_flight"}
+        if reservation_state == "exhausted":
+            return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+        lease_id = reservation.get("lease_id")
+        current = reservation.get("signal")
+        if not isinstance(lease_id, str) or not isinstance(current, Mapping):
+            return {"state": "failed", "reason": "notification_state_unavailable"}
 
         final = dict(final)
-        final.setdefault("order_ready_at", _timestamp(_utc_now()))
-        title, message = render_prediction_opportunity_notification(
-            final, current, dashboard_url=self._dashboard_url
-        )
+        final["order_ready_at"] = current.get("order_ready_at", order_ready_at)
         fallback_target: object | None = None
         try:
+            title, message = render_prediction_opportunity_notification(
+                final, current, dashboard_url=self._dashboard_url
+            )
             attempts_result = send_notification_with_results(
                 self._notifier,
                 title,
@@ -323,19 +327,16 @@ class PredictionExecutionService:
         )
         if not feishu_success and fallback_target is not None:
             feishu_success = any(getattr(item, "success", False) for item in attempts_result)
-        if feishu_success:
-            self._store.update_signal(
-                str(signal_id),
-                {
-                    "notification_state": "sent",
-                    "notification_sent_at": _timestamp(_utc_now()),
-                },
-            )
-            return {"state": "sent", "signal_id": str(signal_id)}
-        self._store.update_signal(
+        completion = self._store.complete_notification_attempt(
             str(signal_id),
-            {"notification_state": "failed", "notification_error": error_code},
+            lease_id,
+            success=feishu_success,
+            error_code=error_code,
         )
+        if completion.get("state") == "sent":
+            return {"state": "sent", "signal_id": str(signal_id)}
+        if completion.get("state") == "closed":
+            return {"state": "ignored", "reason": "signal_closed"}
         return {"state": "failed", "reason": "notification_failed"}
 
     def _feishu_target(self) -> object | None:

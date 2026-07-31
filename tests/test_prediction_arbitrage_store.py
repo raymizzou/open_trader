@@ -201,6 +201,54 @@ def test_close_signal_persists_final_episode_values(tmp_path: Path) -> None:
     assert db.signal(signal_id)["observed_duration_ms"] == 250
 
 
+def test_notification_reservation_is_atomic_across_store_instances(tmp_path: Path) -> None:
+    first = store(tmp_path)
+    signal_id = first.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    stores = [PredictionArbitrageStore(tmp_path / "data"), PredictionArbitrageStore(tmp_path / "data")]
+
+    def reserve(index: int) -> dict[str, object]:
+        return stores[index].reserve_notification_attempt(signal_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, (0, 1)))
+
+    assert [item["state"] for item in results].count("reserved") == 1
+    assert [item["state"] for item in results].count("in_flight") == 1
+    assert first.signal(signal_id)["notification_attempts"] == 1
+    assert first.signal(signal_id)["notification_state"] == "pending"
+
+
+def test_stale_notification_lease_is_reclaimed_after_restart(tmp_path: Path) -> None:
+    first = store(tmp_path)
+    signal_id = first.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    reserved = first.reserve_notification_attempt(signal_id, lease_seconds=0)
+    assert reserved["state"] == "reserved"
+
+    restarted = PredictionArbitrageStore(tmp_path / "data")
+    reclaimed = restarted.reserve_notification_attempt(signal_id, lease_seconds=30)
+
+    assert reclaimed["state"] == "reserved"
+    assert reclaimed["lease_id"] != reserved["lease_id"]
+    assert restarted.signal(signal_id)["notification_attempts"] == 2
+
+
+def test_notification_attempts_stop_at_three_and_close_blocks_reservation(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    signal_id = db.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    for _ in range(3):
+        reserved = db.reserve_notification_attempt(signal_id, lease_seconds=0)
+        assert reserved["state"] == "reserved"
+        assert db.complete_notification_attempt(
+            signal_id, str(reserved["lease_id"]), success=False
+        )["state"] == "failed"
+    assert db.reserve_notification_attempt(signal_id)["state"] == "exhausted"
+
+    db.close_signal("relation-1", ended_at=iso(datetime.now(UTC)), reason="stale")
+    assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
+
+
 def test_preview_expires_after_ten_seconds_and_is_single_use(tmp_path: Path) -> None:
     db = store(tmp_path)
     now = datetime.now(UTC)

@@ -661,6 +661,126 @@ class PredictionArbitrageStore:
             assert refreshed is not None
             return self._signal_result(refreshed)
 
+    def reserve_notification_attempt(
+        self,
+        signal_id: str,
+        *,
+        max_attempts: int = 3,
+        lease_seconds: float = 60.0,
+        order_ready_at: str | None = None,
+    ) -> dict[str, object]:
+        """Atomically reserve one open signal notification attempt."""
+
+        if isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        if isinstance(lease_seconds, bool) or lease_seconds < 0:
+            raise ValueError("lease_seconds must be non-negative")
+        now_text = _utc_now()
+        now = _parse_timestamp(now_text)
+        lease_expires = _canonical_timestamp(
+            now + timedelta(seconds=float(lease_seconds))
+        )
+        lease_id = _new_id()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM signals WHERE signal_id=?", (str(signal_id),)
+            ).fetchone()
+            if row is None:
+                return {"state": "missing", "signal_id": str(signal_id)}
+            payload = _load_payload(str(row["payload"]))
+            if row["ended_at"] is not None or payload.get("ended_at") is not None:
+                return {"state": "closed", "signal_id": str(signal_id)}
+            state = str(payload.get("notification_state", "pending"))
+            if state == "sent":
+                return {"state": "sent", "signal_id": str(signal_id)}
+            current_lease = payload.get("notification_lease_expires_at")
+            lease_active = False
+            if current_lease not in (None, ""):
+                try:
+                    lease_active = _parse_timestamp(current_lease) > now
+                except ValueError:
+                    lease_active = False
+            if lease_active:
+                return {"state": "in_flight", "signal_id": str(signal_id)}
+            try:
+                attempts = int(payload.get("notification_attempts", 0) or 0)
+            except (TypeError, ValueError):
+                attempts = 0
+            if attempts >= max_attempts:
+                return {
+                    "state": "exhausted",
+                    "signal_id": str(signal_id),
+                    "notification_attempts": attempts,
+                }
+            payload.update(
+                {
+                    "notification_state": "pending",
+                    "notification_attempts": attempts + 1,
+                    "notification_lease_id": lease_id,
+                    "notification_lease_expires_at": lease_expires,
+                }
+            )
+            if order_ready_at is not None:
+                payload["order_ready_at"] = _canonical_timestamp(order_ready_at)
+            connection.execute(
+                "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
+                (_dump_payload(payload), now_text, str(signal_id)),
+            )
+            return {
+                "state": "reserved",
+                "signal_id": str(signal_id),
+                "lease_id": lease_id,
+                "notification_attempts": attempts + 1,
+                "signal": {
+                    **payload,
+                    "signal_id": str(signal_id),
+                    "market_id": str(row["market_id"]),
+                    "started_at": str(row["started_at"]),
+                    "ended_at": row["ended_at"],
+                    "updated_at": now_text,
+                },
+            }
+
+    def complete_notification_attempt(
+        self,
+        signal_id: str,
+        lease_id: str,
+        *,
+        success: bool,
+        error_code: str = "delivery_failed",
+    ) -> dict[str, object]:
+        """Persist a reserved attempt's final pending/sent/failed state."""
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM signals WHERE signal_id=?", (str(signal_id),)
+            ).fetchone()
+            if row is None:
+                return {"state": "missing", "signal_id": str(signal_id)}
+            payload = _load_payload(str(row["payload"]))
+            if payload.get("notification_lease_id") != str(lease_id):
+                return {"state": "stale", "signal_id": str(signal_id)}
+            if row["ended_at"] is not None:
+                return {"state": "closed", "signal_id": str(signal_id)}
+            payload["notification_state"] = "sent" if success else "failed"
+            payload.pop("notification_lease_id", None)
+            payload.pop("notification_lease_expires_at", None)
+            if success:
+                payload["notification_sent_at"] = _utc_now()
+                payload.pop("notification_error_code", None)
+            else:
+                payload["notification_error_code"] = str(error_code)
+            updated_at = _utc_now()
+            connection.execute(
+                "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
+                (_dump_payload(payload), updated_at, str(signal_id)),
+            )
+            return {
+                "state": payload["notification_state"],
+                "signal_id": str(signal_id),
+                "notification_attempts": payload.get("notification_attempts", 0),
+            }
+
     def close_signal(
         self,
         market_id: str,

@@ -2854,7 +2854,10 @@ class PolymarketMonitor:
         signal = self._store.signal(str(signal_id))
         if signal is None or signal.get("ended_at") is not None:
             return
-        if signal.get("notification_state") in {"sent", "sending"}:
+        if signal.get("notification_state") == "sent":
+            return
+        lease_expires = _timestamp_or_none(signal.get("notification_lease_expires_at"))
+        if lease_expires is not None and lease_expires > self._now():
             return
         attempts = _decimal(signal.get("notification_attempts")) or Decimal("0")
         if attempts >= 3:

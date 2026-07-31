@@ -710,9 +710,40 @@ def test_ready_notification_sends_only_after_read_only_proof(tmp_path: Path) -> 
     assert trading.batch_calls == 0
     assert store.active_execution() is None
     assert store.signal(signal_id)["notification_state"] == "sent"  # type: ignore[index]
+    assert store.signal(signal_id)["order_ready_at"]  # type: ignore[index]
+    assert "notification_error_code" not in store.signal(signal_id)  # type: ignore[operator]
     macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
     assert macos.calls == 0
     assert feishu.calls == 1
+
+
+def test_two_service_instances_reserve_one_notification_attempt(tmp_path: Path) -> None:
+    service, _, store, _ = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+    store2 = PredictionArbitrageStore(tmp_path / "data")
+    trading2 = ThresholdTrading()
+    monitor2 = ThresholdMonitor(_threshold_intent())
+    notifier2 = CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu"))
+    service2 = PredictionExecutionService(
+        store=store2,
+        monitor=monitor2,
+        trading=trading2,
+        notifier=notifier2,
+        lock_path=tmp_path / "execution-2.lock",
+    )
+    assert service2.reconcile_startup()["state"] == "ready"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda item: item.notify_ready_opportunity("threshold-opp-1", signal_id),
+                (service, service2),
+            )
+        )
+
+    assert [result["state"] for result in results].count("sent") == 1
+    assert sum(notifier.calls for notifier in notifier2._notifiers) <= 1
+    assert store.signal(signal_id)["notification_attempts"] == 1  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -787,6 +818,9 @@ def test_ready_notification_final_intent_race_fails_closed(tmp_path: Path) -> No
             super().__init__(original.threshold_intent)
             self.calls = 0
 
+        def refresh_once(self) -> dict[str, object]:
+            return {"opportunities": [self.opportunity("threshold-opp-1")]}
+
         def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
             self.calls += 1
             value = super().opportunity(opportunity_id)
@@ -813,6 +847,48 @@ def test_ready_notification_final_intent_race_fails_closed(tmp_path: Path) -> No
     assert feishu.calls == 0
 
 
+@pytest.mark.parametrize("final_change", ("rules", "codex", "remediation", "hash"))
+def test_ready_notification_rechecks_final_rule_and_codex_proof(
+    tmp_path: Path, final_change: str
+) -> None:
+    service, trading, store, monitor = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+
+    class FinalChangeMonitor(ThresholdMonitor):
+        def __init__(self, original: ThresholdMonitor) -> None:
+            super().__init__(original.threshold_intent)
+            self.calls = 0
+
+        def refresh_once(self) -> dict[str, object]:
+            return {"opportunities": [self.opportunity("threshold-opp-1")]}
+
+        def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+            self.calls += 1
+            value = super().opportunity(opportunity_id)
+            if value is None or self.calls != 2:
+                return value
+            if final_change == "rules":
+                value["rules_verified_at"] = None
+            elif final_change == "codex":
+                value["relation_validation"] = {"status": "pending"}
+                value["llm_status"] = "pending"
+            elif final_change == "remediation":
+                value["remediation_safe"] = False
+            else:
+                value["rules_hash_b"] = "changed-hash"
+            return value
+
+    service._monitor = FinalChangeMonitor(monitor)  # type: ignore[attr-defined]
+
+    result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
+
+    assert result == {"state": "failed", "reason": "opportunity_changed"}
+    assert trading.threshold_submit_calls == 0
+    macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    assert macos.calls == 0
+    assert feishu.calls == 0
+
+
 def test_ready_notification_retries_at_most_three_times_and_dedupes_episode(
     tmp_path: Path,
 ) -> None:
@@ -829,6 +905,8 @@ def test_ready_notification_retries_at_most_three_times_and_dedupes_episode(
     assert feishu.calls == 3
     assert macos.calls == 0
     assert store.signal(signal_id)["notification_attempts"] == 3  # type: ignore[index]
+    assert store.signal(signal_id)["notification_error_code"] == "delivery_failed"  # type: ignore[index]
+    assert "notification_error" not in store.signal(signal_id)  # type: ignore[operator]
 
     store.close_signal(
         "relation-1", ended_at=datetime.now(UTC).isoformat(), reason="data_unavailable"
