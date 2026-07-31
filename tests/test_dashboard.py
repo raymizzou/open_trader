@@ -22,7 +22,10 @@ from open_trader.dashboard import (
     _futu_skill_signal_detail,
     load_dashboard_state,
 )
-from open_trader.account_sync_state import empty_account_sync_state
+from open_trader.account_sync_state import (
+    build_dashboard_projection,
+    empty_account_sync_state,
+)
 from open_trader.decision_facts import (
     KLINE_FIELDS,
     MISSING_VALUE,
@@ -138,10 +141,31 @@ def seed_accepted_account_sync(
     ]
     tiger["summary"] = {"position_count": tiger_position_count, "cash_count": 1}
     state["generation"] = accepted_at
+    state["dashboard_projection"] = build_dashboard_projection(
+        state,
+        {"status": "ok", "last_success_at": accepted_at, "stale": False, "quotes": {}},
+        generated_at=accepted_at,
+    )
     path = config.data_dir / "latest" / "account_sync_state.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state), encoding="utf-8")
     return state
+
+
+def test_dashboard_maps_controller_projection_without_recomputing_account_fields(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    accepted = seed_accepted_account_sync(config, tiger_position_count=1)
+
+    state = load_dashboard_state(config).to_dict()
+    projection = accepted["dashboard_projection"]
+    assert isinstance(projection, dict)
+
+    assert state["summary"] == projection["summary"]
+    assert state["broker_summaries"] == projection["broker_summaries"]
+    assert state["broker_positions"] == projection["broker_positions"]
+    assert state["cash_details"] == projection["cash_details"]
 
 
 def test_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:

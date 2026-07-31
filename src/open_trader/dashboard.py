@@ -31,6 +31,7 @@ from .a_share_trend import (
 from .backtest_prices import normalize_backtest_symbol
 from .account_sync_state import (
     accepted_portfolio_rows,
+    dashboard_projection_from_state,
     load_account_sync_state,
     project_account_sync_health,
 )
@@ -250,14 +251,27 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     account_state = load_account_sync_state(
         config.data_dir / "latest" / "account_sync_state.json"
     )
+    dashboard_projection = dashboard_projection_from_state(account_state)
+    legacy_portfolio_fallback = not account_state["generation"]
     portfolio_rows = (
         accepted_portfolio_rows(account_state)
         if account_state["generation"]
         else _read_csv_rows(config.portfolio_path)
     )
-    broker_positions, raw_cash_details = _accepted_broker_details(account_state)
+    raw_broker_positions, raw_cash_details = _accepted_broker_details(account_state)
+    broker_positions = (
+        [dict(row) for row in dashboard_projection["broker_positions"]]
+        if dashboard_projection is not None
+        else raw_broker_positions if legacy_portfolio_fallback else []
+    )
+    cash_details = (
+        [dict(row) for row in dashboard_projection["cash_details"]]
+        if dashboard_projection is not None
+        else [_cash_detail_row(row) for row in raw_cash_details]
+        if legacy_portfolio_fallback
+        else []
+    )
     detail_month = _accepted_statement_period(account_state)
-    cash_details = [_cash_detail_row(row) for row in raw_cash_details]
     now = datetime.now(SHANGHAI)
     quotes = _load_published_quotes(config.data_dir / "latest" / "quotes.json", now=now)
     account_sync = project_account_sync_health(
@@ -316,7 +330,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     kelly_lab, kelly_experiments_by_holding = _load_dashboard_kelly_lab(
         config.data_dir
     )
-    positions_by_holding = _group_by_market_symbol(broker_positions)
+    positions_by_holding = _group_by_market_symbol(raw_broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
     premarket_actions_by_holding = _latest_by_market_symbol(premarket_actions)
@@ -356,12 +370,20 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         config=config,
         broker_detail_month=detail_month,
         detail_available=bool(detail_month),
-        summary=_build_summary(portfolio_rows, holding_rows),
+        summary=(
+            dict(dashboard_projection["summary"])
+            if dashboard_projection is not None
+            else _build_summary(portfolio_rows, holding_rows)
+            if legacy_portfolio_fallback
+            else _empty_dashboard_summary()
+        ),
         holdings=holdings,
-        broker_summaries=_build_broker_summaries(
-            portfolio_rows,
-            broker_positions,
-            cash_details,
+        broker_summaries=(
+            [dict(row) for row in dashboard_projection["broker_summaries"]]
+            if dashboard_projection is not None
+            else _build_broker_summaries(portfolio_rows, broker_positions, cash_details)
+            if legacy_portfolio_fallback
+            else []
         ),
         source_statuses=_build_source_statuses(account_sync),
         cash_rows=cash_rows,
@@ -373,7 +395,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         trend_reports=_load_trend_reports(
             config.data_dir,
             config.reports_dir,
-            broker_positions=broker_positions,
+            broker_positions=raw_broker_positions,
             cash_details=raw_cash_details,
             current_candidate_pool_ids={
                 market: config.trend_candidate_pool_ids(market)
@@ -393,6 +415,18 @@ def _load_published_quotes(path: Path, *, now: datetime) -> dict[str, object]:
     from .dashboard_quotes import load_published_quotes
 
     return load_published_quotes(path, now=now)
+
+
+def _empty_dashboard_summary() -> dict[str, Any]:
+    return {
+        "holding_count": 0,
+        "portfolio_value_hkd": "",
+        "holding_value_hkd": "",
+        "cash_like_value_hkd": "",
+        "holding_weight_hkd": "",
+        "cash_like_weight_hkd": "",
+        "broker_count": 0,
+    }
 
 
 def _read_json_mapping(path: Path) -> dict[str, object]:
