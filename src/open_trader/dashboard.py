@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
@@ -3462,7 +3463,7 @@ def _latest_decision_plans_for_markets(
             errors[market] = "decision_plans.json 不存在"
             continue
         try:
-            plans = load_decision_plans(path)
+            plans = _load_decision_plans_file(path)
         except ValueError:
             errors[market] = "decision_plans.json 无效"
             continue
@@ -3475,11 +3476,35 @@ def _latest_decision_plans_for_markets(
     return indexed, errors
 
 
+def _load_decision_plans_file(path: Path) -> tuple[dict[str, Any], ...]:
+    stat = path.stat()
+    return _load_decision_plans_cached(
+        str(path.resolve()), stat.st_mtime_ns, stat.st_size
+    )
+
+
+@lru_cache(maxsize=8)
+def _load_decision_plans_cached(
+    path: str, mtime_ns: int, size: int,
+) -> tuple[dict[str, Any], ...]:
+    del mtime_ns, size
+    return tuple(load_decision_plans(Path(path)))
+
+
 def _project_decision_plan(
     data_dir: Path,
     plan: dict[str, object],
 ) -> dict[str, Any]:
-    projected = copy.deepcopy(plan)
+    projected = {
+        key: copy.deepcopy(value)
+        for key, value in plan.items()
+        if key != "backtests"
+    }
+    projected["backtests"] = [
+        _project_decision_plan_backtest(item)
+        for item in plan.get("backtests", [])
+        if isinstance(item, Mapping)
+    ]
     run_date = str(plan["run_date"])
     market = str(plan["market"])
     plan_id = str(plan["plan_id"])
@@ -3502,6 +3527,33 @@ def _project_decision_plan(
     return projected
 
 
+def _project_decision_plan_backtest(item: Mapping[str, object]) -> dict[str, object]:
+    strategy = item.get("strategy")
+    benchmark = item.get("market_benchmark")
+    gate = item.get("gate")
+    strategy = strategy if isinstance(strategy, Mapping) else {}
+    benchmark = benchmark if isinstance(benchmark, Mapping) else {}
+    gate = gate if isinstance(gate, Mapping) else {}
+    return {
+        "strategy_id": item.get("strategy_id"),
+        "range": item.get("range"),
+        "gate": {"passed": gate.get("passed")},
+        "strategy": {
+            key: strategy.get(key)
+            for key in (
+                "total_return_pct",
+                "max_drawdown_pct",
+                "sharpe_ratio",
+                "calmar_ratio",
+            )
+        },
+        "market_benchmark": {
+            key: benchmark.get(key) for key in ("symbol", "total_return_pct")
+        },
+        "market_excess_return_pct": item.get("market_excess_return_pct"),
+    }
+
+
 def _previous_decision_plan_review(
     data_dir: Path,
     current: dict[str, object],
@@ -3522,7 +3574,7 @@ def _previous_decision_plan_review(
             previous = next(
                 (
                     item
-                    for item in load_decision_plans(path)
+                    for item in _load_decision_plans_file(path)
                     if item["market"] == market and item["symbol"] == symbol
                 ),
                 None,

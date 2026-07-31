@@ -862,6 +862,9 @@ class PolymarketMonitor:
             and now < self._activity_next_scan_at
         ):
             return
+        self._activity_next_scan_at = now + timedelta(
+            seconds=RELATION_ACTIVITY_REFRESH_SECONDS
+        )
         self._activity_scan_task = asyncio.create_task(
             self._run_activity_scan(client)
         )

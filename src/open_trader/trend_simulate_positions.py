@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import threading
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -35,6 +37,7 @@ class TrendSimulatePositionService:
         reports_dir: Path,
         client_factory: Callable[..., Any] = FutuSimulateOrderExecutionClient,
         now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+        refresh_seconds: int = 30,
     ) -> None:
         self.host = host
         self.port = port
@@ -44,10 +47,51 @@ class TrendSimulatePositionService:
         self.reports_dir = reports_dir
         self.client_factory = client_factory
         self.now = now
+        self.refresh_seconds = refresh_seconds
+        self._cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        self._refreshing: set[str] = set()
+        self._cache_lock = threading.RLock()
 
     def load(self, broker: str) -> dict[str, Any]:
         if broker not in TREND_SIMULATE_BROKERS:
             raise ValueError(f"unsupported trend simulate broker: {broker}")
+        now = self.now()
+        with self._cache_lock:
+            cached = self._cache.get(broker)
+            if cached is not None:
+                cached_at, payload = cached
+                if (
+                    (now - cached_at).total_seconds() >= self.refresh_seconds
+                    and broker not in self._refreshing
+                ):
+                    self._refreshing.add(broker)
+                    threading.Thread(
+                        target=self._refresh_in_background,
+                        args=(broker,),
+                        name=f"trend-simulate-refresh-{broker}",
+                        daemon=True,
+                    ).start()
+                return copy.deepcopy(payload)
+        return self._refresh_and_store(broker)
+
+    def prewarm(self) -> None:
+        for broker in TREND_SIMULATE_BROKERS:
+            self._refresh_and_store(broker)
+
+    def _refresh_in_background(self, broker: str) -> None:
+        try:
+            self._refresh_and_store(broker)
+        finally:
+            with self._cache_lock:
+                self._refreshing.discard(broker)
+
+    def _refresh_and_store(self, broker: str) -> dict[str, Any]:
+        payload = self._load_uncached(broker)
+        with self._cache_lock:
+            self._cache[broker] = (self.now(), copy.deepcopy(payload))
+        return payload
+
+    def _load_uncached(self, broker: str) -> dict[str, Any]:
         market, currency = TREND_SIMULATE_BROKERS[broker]
         account_id = self.account_ids.get(broker, 0)
         if account_id <= 0:
