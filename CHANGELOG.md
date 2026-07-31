@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-07-31
 
+- Made each Dashboard trend-report main view select the newest valid artifact
+  immediately, including the next US execution-day report before New York
+  midnight. Invalid artifacts still fall through safely, and all older valid
+  reports remain available from history.
 - Merged the statement-upload and restored market-discipline fixes into `main`.
   A real Phillips upload now shows four securities including `03308`, dated
   2026-07-29, with HKD 628,326.07 total assets; final acceptance was skipped at
