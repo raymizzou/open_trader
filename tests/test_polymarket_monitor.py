@@ -690,6 +690,553 @@ def test_activity_scan_reconsiders_complete_catalog_each_minute(tmp_path: Path) 
     assert second_activity["relations_within_5pct"] == 2
 
 
+def test_activity_scan_keeps_one_minute_start_to_start_cadence(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    now = [NOW]
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+        clock=lambda: now[0],
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    original = monitor._refresh_relation_books
+
+    async def delayed_books(
+        selected_client: object, relation_ids: set[str] | None = None,
+    ) -> None:
+        await original(selected_client, relation_ids)
+        now[0] = NOW + timedelta(seconds=30)
+
+    monitor._refresh_relation_books = delayed_books  # type: ignore[method-assign]
+
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    assert monitor._activity_next_scan_at == NOW + timedelta(seconds=60)
+
+
+def test_universe_refresh_subscribes_once_when_relation_activity_is_due(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    FakePublicClient.subscribe_specs.clear()
+
+    monitor.refresh_once()
+
+    assert len(FakePublicClient.subscribe_specs) == 1
+
+
+def test_subscription_refresh_swaps_handles_without_disconnect_window(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class RecordingStream(FakeStream):
+        def __init__(self, label: str) -> None:
+            super().__init__()
+            self.label = label
+
+        async def close(self) -> None:
+            events.append(f"close:{self.label}")
+            await super().close()
+
+    class RotatingClient:
+        def __init__(self) -> None:
+            self.streams = [RecordingStream("old"), RecordingStream("new")]
+
+        def subscribe(self, spec: object) -> RecordingStream:
+            del spec
+            if not self.streams:
+                events.append("subscribe:failed")
+                raise ConnectionError("replacement failed")
+            stream = self.streams.pop(0)
+            events.append(f"subscribe:{stream.label}")
+            return stream
+
+    monitor = make_monitor(tmp_path)
+    monitor._market_by_token = {"token-1": "market-1"}
+    client = RotatingClient()
+
+    async def exercise() -> None:
+        await monitor._subscribe(client)
+        old = monitor._stream_handle
+        await monitor._subscribe(client)
+
+        assert events == ["subscribe:old", "subscribe:new", "close:old"]
+        assert old is not None and old.closed is True
+        assert monitor._stream_handle is not old
+        assert monitor._stream_handle.closed is False  # type: ignore[union-attr]
+        current = monitor._stream_handle
+        with pytest.raises(ConnectionError, match="replacement failed"):
+            await monitor._subscribe(client)
+        assert monitor._stream_handle is current
+        assert monitor._stream_handle.closed is False  # type: ignore[union-attr]
+
+    asyncio.run(exercise())
+
+
+def test_bounded_top_twenty_refresh_does_not_wait_for_relation_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_trader import polymarket_monitor
+
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+
+    async def slow_relation_activity(
+        client: object, *, resubscribe: bool = True,
+    ) -> None:
+        del client, resubscribe
+        await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(
+        monitor, "_refresh_relation_activity", slow_relation_activity
+    )
+    monkeypatch.setattr(
+        polymarket_monitor, "PUBLIC_REFRESH_TIMEOUT_SECONDS", 0.05
+    )
+
+    started = time.monotonic()
+    asyncio.run(monitor._refresh_universe_bounded(FakePublicClient()))
+
+    assert time.monotonic() - started < 0.1
+    assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+
+def test_background_monitor_prioritizes_top_twenty_before_bulk_scans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._catalog_loaded = True
+    calls: list[str] = []
+
+    async def refresh_universe(
+        client: object, *, subscribe: bool = True,
+    ) -> None:
+        del client, subscribe
+        calls.append("universe")
+        monitor._universe_at = NOW
+
+    def schedule_full(client: object) -> None:
+        del client
+        calls.append("full")
+
+    def schedule_activity(client: object) -> None:
+        del client
+        calls.append("activity")
+        monitor._stop_event.set()
+
+    monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh_universe)
+    monkeypatch.setattr(monitor, "_maybe_schedule_full_scan", schedule_full)
+    monkeypatch.setattr(
+        monitor, "_maybe_schedule_activity_scan", schedule_activity
+    )
+
+    asyncio.run(monitor.run_forever())
+
+    assert calls[:3] == ["universe", "full", "activity"]
+
+
+def test_background_monitor_refreshes_top_twenty_while_bulk_scan_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._catalog_loaded = True
+    calls: list[str] = []
+
+    async def refresh_universe(
+        client: object, *, subscribe: bool = True,
+    ) -> None:
+        del client, subscribe
+        calls.append("universe")
+        monitor._universe_at = NOW
+
+    def schedule_full(client: object) -> None:
+        del client
+        calls.append("full")
+
+    def schedule_activity(client: object) -> None:
+        del client
+        calls.append("activity")
+        monitor._stop_event.set()
+
+    async def exercise() -> None:
+        async def blocked_bulk_scan() -> None:
+            await asyncio.Event().wait()
+
+        monitor._activity_scan_task = asyncio.create_task(blocked_bulk_scan())
+        await monitor.run_forever()
+
+    monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh_universe)
+    monkeypatch.setattr(monitor, "_maybe_schedule_full_scan", schedule_full)
+    monkeypatch.setattr(
+        monitor, "_maybe_schedule_activity_scan", schedule_activity
+    )
+
+    asyncio.run(exercise())
+
+    assert calls[:3] == ["universe", "full", "activity"]
+
+
+def test_background_bulk_scan_uses_and_closes_a_separate_public_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    main_client = object()
+
+    class BulkClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    bulk_client = BulkClient()
+    monitor._public_client_factory = lambda: bulk_client
+    seen: list[object] = []
+
+    async def activity_scan(client: object) -> None:
+        seen.append(client)
+
+    monkeypatch.setattr(monitor, "_run_activity_scan", activity_scan)
+
+    async def exercise() -> None:
+        monitor._maybe_schedule_activity_scan(main_client)
+        assert monitor._activity_scan_task is not None
+        await monitor._activity_scan_task
+
+    asyncio.run(exercise())
+
+    assert seen == [bulk_client]
+    assert bulk_client.closed is True
+
+
+def test_bulk_client_factory_failure_is_recorded_by_the_activity_scan(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    monitor._activity = {**monitor._activity, "status": "healthy"}
+
+    def fail_factory() -> object:
+        raise ConnectionError("sentinel client construction failure")
+
+    monitor._public_client_factory = fail_factory
+
+    async def exercise() -> None:
+        monitor._maybe_schedule_activity_scan(object())
+        assert monitor._activity_scan_task is not None
+        await monitor._activity_scan_task
+
+    asyncio.run(exercise())
+
+    assert monitor._activity["status"] == "degraded"
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+
+def test_bulk_client_factory_failure_is_recorded_by_the_full_scan(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+
+    def fail_factory() -> object:
+        raise ConnectionError("sentinel client construction failure")
+
+    monitor._public_client_factory = fail_factory
+
+    async def exercise() -> None:
+        monitor._maybe_schedule_full_scan(object())
+        assert monitor._full_scan_task is not None
+        await monitor._full_scan_task
+
+    asyncio.run(exercise())
+
+    catalog = monitor.snapshot()["relation_discovery"]["catalog"]
+    assert catalog["status"] == "degraded"
+    assert catalog["last_full_run"]["status"] == "failed"
+    assert monitor.snapshot()["diagnostics"]["last_error"] == "relations:ConnectionError"
+
+
+def test_full_scan_waits_for_the_minute_relation_writer(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+
+    async def exercise() -> None:
+        async def blocked_activity() -> None:
+            await asyncio.Event().wait()
+
+        activity = asyncio.create_task(blocked_activity())
+        monitor._activity_scan_task = activity
+        monitor._maybe_schedule_full_scan(FakePublicClient())
+        assert monitor._full_scan_task is None
+        activity.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await activity
+
+    asyncio.run(exercise())
+
+
+def test_due_full_scan_runs_before_activity_catchup(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._activity = {**monitor._activity, "status": "healthy"}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_activity(
+        client: object, *, resubscribe: bool = True,
+    ) -> None:
+        del client, resubscribe
+        entered.set()
+        await release.wait()
+
+    monitor._refresh_relation_activity = blocked_activity  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        activity = asyncio.create_task(
+            monitor._run_activity_scan(FakePublicClient())
+        )
+        monitor._activity_scan_task = activity
+        await entered.wait()
+        monitor._activity_catchup_requested = True
+        monitor._maybe_schedule_full_scan(FakePublicClient())
+        assert monitor._full_scan_pending is True
+        assert monitor._full_scan_task is None
+        release.set()
+        await activity
+        assert monitor._full_scan_task is not None
+        assert monitor._activity_scan_task is None
+        await monitor._full_scan_task
+
+    asyncio.run(exercise())
+
+
+def test_targeted_relation_refresh_does_not_reuse_a_missing_leg(
+    tmp_path: Path,
+) -> None:
+    setup_public(
+        [
+            threshold_event(event_id="threshold-a", token_prefix="a-"),
+            threshold_event(event_id="threshold-b", token_prefix="b-"),
+        ]
+    )
+    setup_threshold_books(token_prefix="a-")
+    setup_threshold_books(token_prefix="b-")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+
+    async def bootstrap() -> str:
+        await monitor._run_full_relation_scan(client)
+        await monitor._refresh_readiness()
+        await monitor._refresh_relation_activity(client, resubscribe=False)
+        await monitor._drain_relation_validation(client)
+        relation_id = next(
+            relation_id
+            for relation_id in monitor._active_relation_ids
+            if monitor._relations[relation_id].event_id == "threshold-a"
+        )
+        rows = await monitor._refresh_relation_opportunities(client, {relation_id})
+        monitor._merge_relation_rows(rows, {relation_id})
+        return relation_id
+
+    relation_id = asyncio.run(bootstrap())
+    assert monitor.opportunity(relation_id) is not None
+
+    class PartialBookClient(FakePublicClient):
+        async def get_order_books(
+            self, *, token_ids: list[str],
+        ) -> tuple[object, ...]:
+            self.book_calls.append(list(token_ids))
+            return (self.books[token_ids[0]],)
+
+    rows = asyncio.run(
+        monitor._refresh_relation_opportunities(
+            PartialBookClient(), {relation_id}
+        )
+    )
+
+    assert rows == ()
+    required = set(monitor._relation_buy_tokens(relation_id))
+    assert required - set(monitor._relation_books)
+
+
+def test_minute_activity_scan_removes_relations_that_leave_the_live_pool(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+
+    async def bootstrap() -> str:
+        await monitor._run_full_relation_scan(client)
+        await monitor._refresh_readiness()
+        await monitor._refresh_relation_activity(client, resubscribe=False)
+        await monitor._drain_relation_validation(client)
+        relation_id = next(iter(monitor._active_relation_ids))
+        rows = await monitor._refresh_relation_opportunities(client, {relation_id})
+        monitor._merge_relation_rows(rows, {relation_id})
+        return relation_id
+
+    relation_id = asyncio.run(bootstrap())
+    assert monitor.opportunity(relation_id) is not None
+    FakePublicClient.books["yes-low"] = threshold_book(
+        "yes-low", ask="0.60", bid="0.59"
+    )
+    FakePublicClient.books["no-high"] = threshold_book(
+        "no-high", ask="0.60", bid="0.59"
+    )
+
+    asyncio.run(monitor._run_activity_scan(client))
+
+    assert relation_id not in monitor._active_relation_ids
+    assert monitor.opportunity(relation_id) is None
+
+
+def test_top_twenty_refresh_preserves_current_threshold_opportunity(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("ordinary", markets=(market("ordinary-market"),))])
+    monitor = make_monitor(tmp_path)
+    threshold = {
+        "opportunity_id": "threshold-relation",
+        "market_type": "threshold_hedge",
+        "confirmed_at": NOW,
+    }
+    monitor._opportunities["threshold-relation"] = threshold
+
+    asyncio.run(monitor._refresh_universe_bounded(FakePublicClient()))
+
+    assert monitor._opportunities["threshold-relation"] == threshold
+
+
+def test_background_activity_scan_republishes_fresh_relation_opportunity(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+        clock=lambda: now[0],
+    )
+
+    async def exercise() -> None:
+        client = FakePublicClient()
+        await monitor._run_full_relation_scan(client)
+        await monitor._refresh_readiness()
+        await monitor._refresh_relation_activity(client)
+        await monitor._drain_relation_validation(client)
+        relation_id = next(iter(monitor._active_relation_ids))
+        assert monitor.opportunity(relation_id) is not None
+        now[0] += timedelta(seconds=11)
+        assert monitor.opportunity(relation_id)["actionable"] is False  # type: ignore[index]
+
+        FakePublicClient.subscribe_specs.clear()
+        await monitor._run_activity_scan(client)
+
+        refreshed = monitor.opportunity(relation_id)
+        assert refreshed is not None
+        assert refreshed["actionable"] is True
+        assert refreshed["confirmed_age_seconds"] == 0
+        assert FakePublicClient.subscribe_specs == []
+        assert monitor._subscription_dirty is True
+
+        await monitor._refresh_subscription_if_dirty(client)
+
+        assert len(FakePublicClient.subscribe_specs) == 1
+        assert monitor._subscription_dirty is False
+
+    asyncio.run(exercise())
+
+
+def test_activity_scan_does_not_mark_daily_catalog_scanning(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = monitor._refresh_relation_books
+
+    async def blocked_refresh(client: object, relation_ids: set[str]) -> None:
+        entered.set()
+        await release.wait()
+        await original(client, relation_ids)
+
+    monitor._refresh_relation_books = blocked_refresh  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        task = asyncio.create_task(monitor._refresh_relation_activity(FakePublicClient()))
+        await entered.wait()
+        assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+        release.set()
+        await task
+
+    asyncio.run(exercise())
+
+
 def test_observed_milliseconds_preserve_first_positive_and_close_episode(
     tmp_path: Path,
 ) -> None:
@@ -876,6 +1423,26 @@ def test_ready_observer_is_called_once_for_order_ready_episode(tmp_path: Path) -
     assert len(calls) == 1
     assert calls[0][0]
     assert calls[0][1]
+
+
+def test_cancelled_notification_task_does_not_crash_monitor_shutdown(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        monitor = make_monitor(tmp_path)
+        task = asyncio.create_task(asyncio.sleep(60))
+        monitor._notification_task = task
+        monitor._notification_signal_id = "signal-1"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        monitor._reap_notification_task()
+
+        assert monitor._notification_task is None
+        assert monitor._notification_signal_id is None
+
+    asyncio.run(scenario())
 
 
 def test_event_refetch_failure_closes_episode_as_data_unavailable(
@@ -1123,8 +1690,10 @@ def test_activity_scheduler_marks_lagging_and_runs_one_catchup(
     release = asyncio.Event()
     starts = 0
 
-    async def blocked_activity(client: object) -> None:
-        del client
+    async def blocked_activity(
+        client: object, *, resubscribe: bool = True,
+    ) -> None:
+        del client, resubscribe
         nonlocal starts
         starts += 1
         entered.set()
@@ -1168,8 +1737,10 @@ def test_activity_scheduler_does_not_treat_its_own_due_time_as_lagging(
     release = asyncio.Event()
     starts = 0
 
-    async def blocked_activity(client: object) -> None:
-        del client
+    async def blocked_activity(
+        client: object, *, resubscribe: bool = True,
+    ) -> None:
+        del client, resubscribe
         nonlocal starts
         starts += 1
         entered.set()
@@ -1340,8 +1911,23 @@ def test_terminal_codex_cache_survives_pool_churn_and_restart(
         relation_validator=validator,
     )
     restarted._load_relation_catalog()
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
     asyncio.run(restarted._refresh_relation_activity(client))
-    asyncio.run(restarted._poll_relation_validation(client))
+
+    async def restore_cached_opportunity() -> None:
+        relation_ids = set(restarted._active_relation_ids)
+        rows = await restarted._refresh_relation_opportunities(client, relation_ids)
+        restarted._merge_relation_rows(rows, relation_ids)
+        relation_id = next(iter(relation_ids))
+        assert restarted.opportunity(relation_id)["llm_status"] == "llm_unavailable"  # type: ignore[index]
+
+        await restarted._poll_relation_validation(client)
+
+        restored = restarted.opportunity(relation_id)
+        assert restored is not None
+        assert restored["llm_status"] == terminal_status
+
+    asyncio.run(restore_cached_opportunity())
     assert validator.calls == 1
 
 
@@ -1738,6 +2324,36 @@ def test_large_token_universe_is_subscribed_in_websocket_safe_chunks(
     )
 
 
+def test_subscription_keeps_dirty_when_tokens_change_during_connect(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    monitor._market_by_token = {"top20-token": "market"}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    subscribed: list[object] = []
+
+    class DelayedClient:
+        async def subscribe(self, spec: object) -> FakeStream:
+            subscribed.append(spec)
+            entered.set()
+            await release.wait()
+            return FakeStream()
+
+    async def exercise() -> None:
+        task = asyncio.create_task(monitor._subscribe(DelayedClient()))
+        await entered.wait()
+        monitor._relation_by_token = {"new-relation-token": {"relation"}}
+        monitor._subscription_dirty = True
+        release.set()
+        await task
+
+    asyncio.run(exercise())
+
+    assert tuple(subscribed[0].token_ids) == ("top20-token",)
+    assert monitor._subscription_dirty is True
+
+
 def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path: Path) -> None:
     setup_public([event("e", markets=(market("m"),))])
     trading = FakeTrading()
@@ -1756,6 +2372,93 @@ def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path
     monitor.refresh_once()
     assert monitor.opportunity("e:m") is None
     assert monitor.snapshot()["health"]["actionable"] is False
+
+
+def test_successful_paired_book_read_uses_local_receipt_freshness(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    FakePublicClient.books["yes-1"].timestamp = NOW - timedelta(minutes=1)
+    FakePublicClient.books["no-1"].timestamp = NOW - timedelta(minutes=1)
+
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+
+    opportunity = monitor.opportunity("e:m")
+    assert opportunity is not None
+    assert opportunity["actionable"] is True
+    assert opportunity["confirmed_at"] == NOW
+    assert opportunity["book_timestamp_a"] == NOW - timedelta(minutes=1)
+
+
+def test_targeted_standard_refresh_rechecks_live_market_metadata(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    assert monitor.opportunity("e:m") is not None
+    FakePublicClient.get_event_calls.clear()
+    FakePublicClient.events = [
+        event("e", markets=(market("m", fees_enabled=True),))
+    ]
+
+    refreshed = monitor.refresh_opportunity("e:m")
+
+    assert refreshed is None
+    assert FakePublicClient.get_event_calls == ["e"]
+    assert monitor.opportunity("e:m") is None
+
+
+def test_stale_snapshot_preserves_stronger_threshold_blocker(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._catalog_loaded = True
+    monitor._catalog_status = "healthy"
+    monitor._catalog_full_scanned_at = NOW
+    monitor._opportunities["blocked"] = {
+        "opportunity_id": "blocked",
+        "market_type": "threshold_hedge",
+        "relation_id": "blocked",
+        "confirmed_at": NOW - timedelta(seconds=11),
+        "actionable": False,
+        "eligibility_reason": "remediation_unsafe",
+    }
+
+    row = monitor.snapshot()["opportunities"][0]
+
+    assert row["actionable"] is False
+    assert row["eligibility_reason"] == "remediation_unsafe"
+
+
+def test_threshold_opportunity_is_not_blocked_by_standard_universe_failure(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_readiness())
+    asyncio.run(monitor._refresh_relation_activity(client))
+    asyncio.run(monitor._drain_relation_validation(client))
+    relation_id = next(iter(monitor._active_relation_ids))
+    monitor._universe_at = NOW
+    monitor._universe_failed = True
+
+    opportunity = monitor.opportunity(relation_id)
+
+    assert opportunity is not None
+    assert opportunity["actionable"] is True
 
 
 def test_task2_account_and_merge_capability_readiness_is_actionable(tmp_path: Path) -> None:
@@ -1923,14 +2626,14 @@ def test_background_monitor_refreshes_readiness_before_it_becomes_stale(
     assert monitor.snapshot()["health"]["status"] == "healthy"
 
 
-def test_no_stream_message_for_over_fifteen_seconds_is_degraded(tmp_path: Path) -> None:
-    setup_public([event("e", markets=(market("m"),))])
+def test_connected_quiet_stream_does_not_degrade_monitor_health(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m", fees_enabled=True),))])
     now = [NOW]
     monitor = make_monitor(tmp_path)
     monitor._clock = lambda: now[0]
     monitor.refresh_once()
     now[0] = NOW + timedelta(seconds=16)
-    assert monitor.snapshot()["health"]["status"] == "degraded"
+    assert monitor.snapshot()["health"]["status"] == "healthy"
 
 
 def test_universe_failure_degrades_prior_snapshot(tmp_path: Path) -> None:

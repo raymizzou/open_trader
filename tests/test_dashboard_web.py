@@ -2419,6 +2419,55 @@ console.log(JSON.stringify({
     assert rendered["unavailableMetrics"].count("<strong>-</strong>") == 4
 
 
+def test_prediction_llm_trading_health_is_independent_from_top_twenty_refresh() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status:"degraded",
+  stale:true,
+  health:{status:"degraded",degraded_reasons:["books_stale","universe_refresh_failed"]},
+  readiness:{status:"ready",balance:"60.40",geoblock:"allowed",relayer:"ready"},
+  masked_wallet:"0x1234…5678",
+  policy_limits:{max_wallet_balance:"65.00",max_normal_cost:"20.00",
+    max_emergency_loss:"2.00",min_estimated_profit:"1.00"},
+  relation_discovery:{
+    status:"healthy",
+    catalog:{status:"healthy"},
+    activity:{status:"scanning"},
+    websocket:{status:"connected"},
+  },
+  breaker:{open:false},
+};
+const critical = (reason) => ({
+  ...payload,
+  health:{...payload.health,degraded_reasons:["books_stale",reason]},
+});
+console.log(JSON.stringify({
+  yesNo:predictionTradingAvailable(payload, "yes_no"),
+  llm:predictionTradingAvailable(payload, "llm_hedge"),
+  yesNoReadiness:predictionReadinessStrip(payload, "yes_no"),
+  llmReadiness:predictionReadinessStrip(payload, "llm_hedge"),
+  yesNoAlert:predictionExecutionAlert(payload, "yes_no"),
+  llmAlert:predictionExecutionAlert(payload, "llm_hedge"),
+  readinessStale:predictionTradingAvailable(critical("readiness_stale"), "llm_hedge"),
+  storeFailed:predictionTradingAvailable(critical("store_write_failed"), "llm_hedge"),
+  readinessAlert:predictionExecutionAlert(critical("readiness_stale"), "llm_hedge"),
+  storeAlert:predictionExecutionAlert(critical("store_write_failed"), "llm_hedge"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["yesNo"] is False
+    assert rendered["llm"] is True
+    assert "不可用" in rendered["yesNoReadiness"]
+    assert "可以交易" in rendered["llmReadiness"]
+    assert "当前盘口暂不可交易" in rendered["yesNoAlert"]
+    assert rendered["llmAlert"] == ""
+    assert rendered["readinessStale"] is False
+    assert rendered["storeFailed"] is False
+    assert "当前盘口暂不可交易" in rendered["readinessAlert"]
+    assert "当前盘口暂不可交易" in rendered["storeAlert"]
+
+
 def test_prediction_market_incomplete_opportunity_stays_visible_but_cannot_trade() -> None:
     output = run_dashboard_js(r'''
 const payload = {
@@ -2670,6 +2719,7 @@ const opportunity = {
 };
 const payload = {
   status:"healthy", health:{status:"healthy"}, breaker:{open:false},
+  relation_discovery:{status:"healthy",catalog:{status:"healthy"},websocket:{status:"connected",last_message_age_seconds:1}},
   readiness:{status:"ready",geoblock:"allowed",relayer:"ready",balance:"50"},
   wallet:{masked_address:"0x1234…5678"},
   policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"},
@@ -2703,6 +2753,9 @@ console.log(JSON.stringify({
   bookStaleReason:renderCandidate({
     ...opportunity,actionable:false,eligibility_reason:"book_stale",
   }).includes("盘口过期，等待更新"),
+  bookStalePreview:hasAction({
+    ...opportunity,actionable:false,eligibility_reason:"book_stale",
+  }),
   unavailableReason:renderCandidate({
     ...opportunity,actionable:false,llm_status:"llm_unavailable",llm_decision:null,
     llm_summary:"",llm_reason_codes:[],llm_evidence:[],llm_uncertainties:[],
@@ -2723,6 +2776,7 @@ console.log(JSON.stringify({
         "unequalQuantity": False,
         "wrongOutcomes": False,
         "bookStaleReason": True,
+        "bookStalePreview": True,
         "unavailableReason": True,
     }
 
