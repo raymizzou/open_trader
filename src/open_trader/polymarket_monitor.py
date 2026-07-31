@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
+import json
 import math
 import threading
 import time
@@ -246,6 +248,46 @@ def _event_id(value: object) -> str | None:
     return str(raw).strip() if isinstance(raw, (str, int)) and str(raw).strip() else None
 
 
+def _relation_fingerprint(relation: ThresholdRelation) -> str:
+    """Hash the immutable market facts that make a relation executable."""
+
+    def market(value: object) -> dict[str, object]:
+        return {
+            "event_id": _value(value, "event_id", default=""),
+            "market_id": _value(value, "market_id", default=""),
+            "condition_id": _value(value, "condition_id", default=""),
+            "question": _value(value, "question", default=""),
+            "rules": _value(value, "rules", default=""),
+            "resolution_source": _value(value, "resolution_source", default=""),
+            "end_date": _value(value, "end_date", default=""),
+            "operator": _value(value, "operator", default=""),
+            "threshold": str(_value(value, "threshold", default="")),
+            "yes_token_id": _value(value, "yes_token_id", default=""),
+            "no_token_id": _value(value, "no_token_id", default=""),
+        }
+
+    payload = {
+        "event_id": relation.event_id,
+        "market_a": market(relation.market_a),
+        "market_b": market(relation.market_b),
+        "relation": relation.relation,
+        "rules_hash_a": relation.rules_hash_a,
+        "rules_hash_b": relation.rules_hash_b,
+        "buy_leg_a": {
+            "condition_id": relation.buy_leg_a.condition_id,
+            "outcome": relation.buy_leg_a.outcome,
+            "token_id": relation.buy_leg_a.token_id,
+        },
+        "buy_leg_b": {
+            "condition_id": relation.buy_leg_b.condition_id,
+            "outcome": relation.buy_leg_b.outcome,
+            "token_id": relation.buy_leg_b.token_id,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class PolymarketMonitor:
     """One async public monitor with a serialized in-memory snapshot."""
 
@@ -276,7 +318,11 @@ class PolymarketMonitor:
         self._relations: dict[str, ThresholdRelation] = {}
         self._relation_by_token: dict[str, set[str]] = {}
         self._relation_books: dict[str, ThresholdOrderBook] = {}
+        self._relation_book_timestamps: dict[str, datetime | None] = {}
+        self._relation_book_received_at: dict[str, datetime] = {}
         self._relation_volumes: dict[str, Decimal] = {}
+        self._relation_rule_verifications: dict[str, tuple[datetime, str]] = {}
+        self._relation_rule_failures: set[str] = set()
         self._opportunities: dict[str, dict[str, object]] = {}
         self._books: dict[str, ConfirmedBooks] = {}
         self._readiness: dict[str, object] | None = None
@@ -551,6 +597,7 @@ class PolymarketMonitor:
         next_readiness_refresh = 0.0
         try:
             while not self._stop_event.is_set():
+                self._maintain_open_signals()
                 self._maybe_schedule_full_scan(client)
                 self._maybe_schedule_activity_scan(client)
                 await self._poll_relation_validation(client)
@@ -577,6 +624,7 @@ class PolymarketMonitor:
                         self._stream_next(self._stream_handle), timeout=1.0
                     )
                 except asyncio.TimeoutError:
+                    self._maintain_open_signals()
                     self._write_runtime()
                     continue
                 except (StopAsyncIteration, ConnectionError, OSError) as exc:
@@ -639,6 +687,7 @@ class PolymarketMonitor:
         # The handle is closed by the next event-loop pass.  We deliberately do
         # not retain stream messages in the store.
         self._stream_handle = None
+        self._maintain_open_signals()
 
     async def _subscribe(self, client: object) -> None:
         with self._lock:
@@ -1268,6 +1317,18 @@ class PolymarketMonitor:
                 (raw_event,),
                 scanned_at=full_scanned_at,
             )
+            completed_verification = completed
+            self._relation_rule_verifications = {
+                key: value
+                for key, value in self._relation_rule_verifications.items()
+                if key in self._relations
+            }
+            for refreshed_relation in refreshed:
+                self._relation_rule_failures.discard(refreshed_relation.relation_id)
+                self._relation_rule_verifications[refreshed_relation.relation_id] = (
+                    completed_verification,
+                    _relation_fingerprint(refreshed_relation),
+                )
             for relation_id, volume in old_volumes.items():
                 if relation_id in self._relations and relation_id not in {
                     relation.relation_id for relation in refreshed
@@ -1388,11 +1449,18 @@ class PolymarketMonitor:
         ]
         semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
 
-        async def fetch(chunk: list[str]) -> dict[str, ThresholdOrderBook]:
+        async def fetch(
+            chunk: list[str],
+        ) -> tuple[
+            dict[str, ThresholdOrderBook],
+            dict[str, datetime | None],
+            dict[str, datetime],
+        ]:
             async with semaphore:
                 raw_books = await _call(get_books, token_ids=chunk)
                 result: dict[str, ThresholdOrderBook] = {}
-                received_at = self._now()
+                timestamps: dict[str, datetime | None] = {}
+                received: dict[str, datetime] = {}
                 for raw_book in _items(raw_books):
                     token = _value(
                         raw_book,
@@ -1408,22 +1476,42 @@ class PolymarketMonitor:
                     bids = bid_levels or ()
                     if asks is None:
                         continue
+                    received_at = self._now()
+                    timestamps[token] = _timestamp_or_none(
+                        _value(
+                            raw_book,
+                            "timestamp",
+                            "timestamp_ms",
+                            "time",
+                            "updated_at",
+                            default=None,
+                        )
+                    )
+                    received[token] = received_at
                     result[token] = ThresholdOrderBook(
                         token_id=token,
                         asks=asks,
                         bids=bids,
                         confirmed_at=received_at,
                     )
-                return result
+                return result, timestamps, received
 
         fetched = await asyncio.gather(*(fetch(chunk) for chunk in chunks))
         books: dict[str, ThresholdOrderBook] = {}
-        for batch in fetched:
+        timestamps: dict[str, datetime | None] = {}
+        received: dict[str, datetime] = {}
+        for batch, batch_timestamps, batch_received in fetched:
             books.update(batch)
+            timestamps.update(batch_timestamps)
+            received.update(batch_received)
         if replace_all:
             self._relation_books = books
+            self._relation_book_timestamps = timestamps
+            self._relation_book_received_at = received
         else:
             self._relation_books.update(books)
+            self._relation_book_timestamps.update(timestamps)
+            self._relation_book_received_at.update(received)
 
     def _relation_buy_tokens(self, relation_id: str) -> tuple[str, ...]:
         relation = self._relations.get(str(relation_id))
@@ -1612,6 +1700,103 @@ class PolymarketMonitor:
             not in {"llm_rejected", "deterministic_rejected"}
         )
 
+    def _open_signal(self, market_id: str) -> dict[str, object] | None:
+        for row in self._store.signal_history("all"):
+            if row.get("market_id") == market_id and row.get("ended_at") is None:
+                return row
+        return None
+
+    def _relation_book_stale(self, token: str, now: datetime) -> bool:
+        book = self._relation_books.get(token)
+        if book is None:
+            return True
+        received_at = self._relation_book_received_at.get(token, book.confirmed_at)
+        return max(_age(now, received_at), _age(now, book.confirmed_at)) > BOOK_FRESHNESS_SECONDS
+
+    def _persist_relation_metadata(self, relation: ThresholdRelation) -> None:
+        """Publish fresher unchanged event metadata without a second fetch."""
+
+        self._relations[relation.relation_id] = relation
+        self._relation_rule_failures.discard(relation.relation_id)
+        full_scanned_at = self._catalog_full_scanned_at or self._stored_full_scanned_at()
+        if full_scanned_at is None:
+            return
+        try:
+            self._store.save_relation_state(
+                {
+                    "relations": [
+                        threshold_relation_payload(item)
+                        for item in self._relations.values()
+                    ]
+                },
+                full_scanned_at=full_scanned_at.isoformat(),
+            )
+        except Exception as exc:
+            self._store_failed = True
+            self._record_error(exc, "store")
+
+    async def _verify_relation_rules(
+        self, client: object, relation: ThresholdRelation
+    ) -> tuple[datetime, str] | None:
+        """Fetch and rediscover the exact source event before first positivity."""
+
+        verified = self._relation_rule_verifications.get(relation.relation_id)
+        if verified is not None:
+            return verified
+        if relation.relation_id in self._relation_rule_failures:
+            return None
+        previous = self._open_signal(relation.relation_id)
+        previous_fingerprint = previous.get("rules_fingerprint") if previous else None
+        previous_verified_at = (
+            _timestamp_or_none(previous.get("rules_verified_at"))
+            if previous
+            else None
+        )
+        if isinstance(previous_fingerprint, str) and previous_fingerprint and previous_verified_at:
+            verified = (previous_verified_at, previous_fingerprint)
+            self._relation_rule_verifications[relation.relation_id] = verified
+            return verified
+        get_event = getattr(client, "get_event", None)
+        resolver = getattr(self._relation_discovery, "discover", self._relation_discovery)
+        if not callable(get_event) or not callable(resolver):
+            self._close_signal(relation.relation_id, "rules_changed")
+            return None
+        try:
+            raw_event = await _call(get_event, id=relation.event_id)
+            result = self._discovery_result(
+                await _call(resolver, (raw_event,)),
+                (raw_event,),
+            )
+            refreshed = next(
+                (
+                    item
+                    for item in result.relations
+                    if item.market_a.market_id == relation.market_a.market_id
+                    and item.market_b.market_id == relation.market_b.market_id
+                ),
+                None,
+            )
+            fingerprint = _relation_fingerprint(relation)
+            if refreshed is None or _relation_fingerprint(refreshed) != fingerprint:
+                self._relation_rule_failures.add(relation.relation_id)
+                self._close_signal(relation.relation_id, "rules_changed")
+                with self._lock:
+                    self._opportunities.pop(relation.relation_id, None)
+                return None
+            verified_at = self._now()
+            self._relation_rule_verifications[relation.relation_id] = (
+                verified_at,
+                fingerprint,
+            )
+            if refreshed != relation:
+                self._persist_relation_metadata(refreshed)
+            return verified_at, fingerprint
+        except Exception as exc:
+            self._record_error(exc, "relations")
+            self._relation_rule_failures.add(relation.relation_id)
+            self._close_signal(relation.relation_id, "rules_changed")
+            return None
+
     async def _refresh_relation_opportunities(
         self, client: object, relation_ids: set[str] | None = None
     ) -> tuple[dict[str, object], ...]:
@@ -1630,14 +1815,47 @@ class PolymarketMonitor:
             relation = self._relations.get(relation_id)
             if relation is None:
                 continue
-            candidate = build_threshold_hedge_intent(
+            catalog_status = self._relation_catalog_snapshot(now)["status"]
+            if catalog_status in {"stale", "degraded", "unavailable"}:
+                self._close_signal(relation.relation_id, "relation_discovery_stale")
+                continue
+            assessment = assess_threshold_relation_activity(
                 relation,
                 self._relation_books,
-                require_safe_unwind=False,
+                minimum_net_edge=RELATION_ACTIVITY_MIN_EDGE,
             )
-            if candidate is None or candidate.minimum_profit <= 0:
-                self._close_signal(relation.relation_id, "nonpositive_profit")
+            candidate = assessment.intent
+            if candidate is None:
+                self._close_signal(
+                    relation.relation_id,
+                    "profit_non_positive"
+                    if assessment.reason == "outside_5pct"
+                    else "data_unavailable",
+                )
                 continue
+            required_tokens = (
+                relation.buy_leg_a.token_id,
+                relation.buy_leg_b.token_id,
+            )
+            if any(self._relation_book_stale(token, now) for token in required_tokens):
+                self._close_signal(
+                    relation.relation_id,
+                    "data_unavailable",
+                    updates={"final_profit": candidate.minimum_profit},
+                )
+                continue
+            if candidate.minimum_profit <= 0:
+                self._close_signal(
+                    relation.relation_id,
+                    "profit_non_positive",
+                    updates={"final_profit": candidate.minimum_profit},
+                )
+                continue
+            verification = await self._verify_relation_rules(client, relation)
+            if verification is None:
+                continue
+            relation = self._relations.get(relation_id, relation)
+            rules_verified_at, rules_fingerprint = verification
             validation = self._codex_validations.get(relation.relation_id)
             if validation is None:
                 validation = RelationValidation(
@@ -1730,6 +1948,22 @@ class PolymarketMonitor:
                 eligibility_reason=eligibility_reason,
                 reason_codes=reason_codes,
                 summary=summary,
+                rules_verified_at=rules_verified_at,
+                rules_fingerprint=rules_fingerprint,
+                book_timestamp_a=self._relation_book_timestamps.get(
+                    relation.buy_leg_a.token_id
+                ),
+                book_timestamp_b=self._relation_book_timestamps.get(
+                    relation.buy_leg_b.token_id
+                ),
+                book_received_at_a=self._relation_book_received_at.get(
+                    relation.buy_leg_a.token_id,
+                    self._relation_books[relation.buy_leg_a.token_id].confirmed_at,
+                ),
+                book_received_at_b=self._relation_book_received_at.get(
+                    relation.buy_leg_b.token_id,
+                    self._relation_books[relation.buy_leg_b.token_id].confirmed_at,
+                ),
             )
             rows.append(row)
             self._upsert_signal(row)
@@ -1940,6 +2174,12 @@ class PolymarketMonitor:
         eligibility_reason: str,
         reason_codes: tuple[object, ...],
         summary: str,
+        rules_verified_at: datetime,
+        rules_fingerprint: str,
+        book_timestamp_a: datetime | None,
+        book_timestamp_b: datetime | None,
+        book_received_at_a: datetime,
+        book_received_at_b: datetime,
     ) -> dict[str, object]:
         selected = intent or candidate
         legs = (selected.leg_a, selected.leg_b)
@@ -1977,6 +2217,12 @@ class PolymarketMonitor:
             "volume_24h": volume,
             "confirmed_at": confirmed_at,
             "confirmed_age_seconds": confirmed_age,
+            "rules_verified_at": rules_verified_at,
+            "rules_fingerprint": rules_fingerprint,
+            "book_timestamp_a": book_timestamp_a,
+            "book_timestamp_b": book_timestamp_b,
+            "book_received_at_a": book_received_at_a,
+            "book_received_at_b": book_received_at_b,
             "resolution_at": resolution_at,
             "remaining_days": remaining_days,
             "profit": candidate.minimum_profit,
@@ -2393,28 +2639,63 @@ class PolymarketMonitor:
                 default=None,
             )
 
-    def _upsert_signal(self, opportunity: Mapping[str, object]) -> None:
+    def _upsert_signal(self, opportunity: Mapping[str, object]) -> str | None:
         market_id = str(opportunity["market_id"])
+        now = self._now()
         peak_edge = opportunity.get("net_edge")
         peak_quantity = opportunity.get("quantity")
         peak_profit = opportunity.get("estimated_profit")
+        profit = opportunity.get("estimated_profit", opportunity.get("profit"))
+        previous = self._open_signal(market_id)
+        first_positive_at = (
+            previous.get("first_positive_at") if previous is not None else None
+        ) or now
+        initial_profit = (
+            previous.get("initial_profit") if previous is not None else None
+        )
+        if initial_profit is None:
+            initial_profit = profit
+        started_at = (
+            previous.get("started_at") if previous is not None else None
+        ) or first_positive_at
         try:
-            for row in self._store.signal_history("all"):
-                if row.get("market_id") == market_id and row.get("ended_at") is None:
-                    peak_edge = self._max_decimal(peak_edge, row.get("peak_net_edge", row.get("net_edge")))
-                    peak_quantity = self._max_decimal(peak_quantity, row.get("peak_quantity", row.get("quantity")))
-                    peak_profit = self._max_decimal(peak_profit, row.get("peak_estimated_profit", row.get("estimated_profit")))
-                    break
-            self._store.upsert_signal(
+            if previous is not None:
+                peak_edge = self._max_decimal(
+                    peak_edge, previous.get("peak_net_edge", previous.get("net_edge"))
+                )
+                peak_quantity = self._max_decimal(
+                    peak_quantity, previous.get("peak_quantity", previous.get("quantity"))
+                )
+                peak_profit = self._max_decimal(
+                    peak_profit,
+                    previous.get(
+                        "peak_estimated_profit", previous.get("peak_profit", previous.get("estimated_profit"))
+                    ),
+                )
+            signal_id = self._store.upsert_signal(
                 {
                     "event_id": opportunity["event_id"],
                     "market_id": market_id,
                     "question": opportunity["question"],
-                    "started_at": self._now(),
-                    "last_seen_at": self._now(),
+                    "started_at": started_at,
+                    "first_positive_at": first_positive_at,
+                    "last_positive_at": now,
+                    "observed_duration_ms": max(
+                        0,
+                        int(
+                            (
+                                now
+                                - (_timestamp_or_none(first_positive_at) or now)
+                            ).total_seconds()
+                            * 1000
+                        ),
+                    ),
                     "net_edge": opportunity.get("net_edge"),
                     "quantity": opportunity.get("quantity"),
                     "estimated_profit": opportunity.get("estimated_profit"),
+                    "profit": profit,
+                    "initial_profit": initial_profit,
+                    "peak_profit": peak_profit,
                     "peak_net_edge": peak_edge,
                     "peak_quantity": peak_quantity,
                     "peak_estimated_profit": peak_profit,
@@ -2423,18 +2704,86 @@ class PolymarketMonitor:
                     "annualized_yield": opportunity.get("annualized_yield"),
                     "llm_status": opportunity.get("llm_status"),
                     "llm_reason_codes": opportunity.get("llm_reason_codes"),
+                    "rules_verified_at": opportunity.get("rules_verified_at"),
+                    "rules_fingerprint": opportunity.get("rules_fingerprint"),
+                    "book_timestamp_a": opportunity.get("book_timestamp_a"),
+                    "book_timestamp_b": opportunity.get("book_timestamp_b"),
+                    "book_received_at_a": opportunity.get("book_received_at_a"),
+                    "book_received_at_b": opportunity.get("book_received_at_b"),
                 }
             )
+            return signal_id
+        except Exception as exc:
+            self._store_failed = True
+            self._record_error(exc, "store")
+            return None
+
+    def _close_signal(
+        self,
+        market_id: str,
+        reason: str,
+        *,
+        updates: Mapping[str, object] | None = None,
+    ) -> None:
+        try:
+            reason = {
+                "nonpositive_profit": "profit_non_positive",
+                "threshold_or_freshness": "data_unavailable",
+                "opportunity_closed": "data_unavailable",
+            }.get(reason, reason)
+            ended_at = self._now()
+            previous = self._open_signal(market_id)
+            final_updates = dict(updates or {})
+            if previous is not None:
+                first = _timestamp_or_none(
+                    previous.get("first_positive_at", previous.get("started_at"))
+                )
+                if first is not None:
+                    final_updates.setdefault(
+                        "observed_duration_ms",
+                        max(0, int((ended_at - first).total_seconds() * 1000)),
+                    )
+                if "final_profit" not in final_updates:
+                    final_updates["final_profit"] = previous.get(
+                        "profit", previous.get("estimated_profit")
+                    )
+                final_updates.setdefault("last_positive_at", previous.get("last_positive_at"))
+            self._store.close_signal(
+                market_id,
+                ended_at=ended_at,
+                reason=reason,
+                updates=final_updates,
+            )
+            self._relation_rule_verifications.pop(market_id, None)
         except Exception as exc:
             self._store_failed = True
             self._record_error(exc, "store")
 
-    def _close_signal(self, market_id: str, reason: str) -> None:
-        try:
-            self._store.close_signal(market_id, ended_at=self._now(), reason=reason)
-        except Exception as exc:
-            self._store_failed = True
-            self._record_error(exc, "store")
+    def _maintain_open_signals(self) -> None:
+        """Close relation episodes when the one-second freshness boundary passes."""
+
+        now = self._now()
+        stale_catalog = self._relation_catalog_snapshot(now)["status"] in {
+            "stale",
+            "degraded",
+            "unavailable",
+        }
+        disconnected = self._stream_disconnected_at is not None
+        for signal in self._store.signal_history("all"):
+            if signal.get("ended_at") is not None:
+                continue
+            market_id = str(signal.get("market_id", ""))
+            relation = self._relations.get(market_id)
+            if relation is None:
+                continue
+            if stale_catalog:
+                self._close_signal(market_id, "relation_discovery_stale")
+                continue
+            tokens = (relation.buy_leg_a.token_id, relation.buy_leg_b.token_id)
+            if disconnected or any(
+                self._relation_book_stale(token, now) for token in tokens
+            ):
+                self._close_signal(market_id, "data_unavailable")
 
     @staticmethod
     def _max_decimal(left: object, right: object) -> object:

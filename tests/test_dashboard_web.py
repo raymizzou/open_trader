@@ -12473,3 +12473,32 @@ def test_dashboard_server_serves_static_routes_when_files_exist(
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_prediction_history_projects_observed_signal_fields() -> None:
+    from open_trader.dashboard_web import _prediction_history_aliases
+
+    projected = _prediction_history_aliases(
+        "signals",
+        {
+            "signal_id": "s-1",
+            "first_positive_at": "2026-07-31T00:00:00.000000Z",
+            "last_positive_at": "2026-07-31T00:00:00.275000Z",
+            "observed_duration_ms": 275,
+            "initial_profit": "0.10",
+            "peak_profit": "0.20",
+            "final_profit": "-0.01",
+            "ended_reason": "profit_non_positive",
+            "notification_state": "not_sent",
+            "book_timestamp_a": "2026-07-31T00:00:00.250000Z",
+            "book_timestamp_b": "2026-07-31T00:00:00.250000Z",
+            "book_received_at_a": "2026-07-31T00:00:00.251000Z",
+            "book_received_at_b": "2026-07-31T00:00:00.251000Z",
+        },
+    )
+    assert projected["observed_duration_ms"] == 275
+    assert projected["initial_profit"] == "0.10"
+    assert projected["peak_profit"] == "0.20"
+    assert projected["final_profit"] == "-0.01"
+    assert projected["ended_reason"] == "profit_non_positive"
+    assert projected["notification_state"] == "not_sent"

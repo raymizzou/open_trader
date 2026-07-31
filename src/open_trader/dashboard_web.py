@@ -343,6 +343,22 @@ def _prediction_history_aliases(kind: str, value: object) -> object:
             "occurred_at": occurred_at,
             "event_title": event_title,
             "duration": duration,
+            "observed_duration_ms": _prediction_first(
+                result, "observed_duration_ms"
+            ),
+            "first_positive_at": _prediction_first(result, "first_positive_at"),
+            "last_positive_at": _prediction_first(result, "last_positive_at"),
+            "initial_profit": _prediction_first(result, "initial_profit"),
+            "peak_profit": _prediction_first(result, "peak_profit"),
+            "final_profit": _prediction_first(result, "final_profit"),
+            "ended_reason": _prediction_first(result, "ended_reason"),
+            "notification_state": _prediction_first(
+                result, "notification_state", "notification_status"
+            ),
+            "book_timestamp_a": _prediction_first(result, "book_timestamp_a"),
+            "book_timestamp_b": _prediction_first(result, "book_timestamp_b"),
+            "book_received_at_a": _prediction_first(result, "book_received_at_a"),
+            "book_received_at_b": _prediction_first(result, "book_received_at_b"),
             "peak_edge": _prediction_first(result, "peak_edge", "peak_net_edge", "net_edge"),
             "quantity": _prediction_first(result, "quantity", "peak_quantity"),
             "profit": _prediction_first(
