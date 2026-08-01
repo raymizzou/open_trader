@@ -2358,7 +2358,8 @@ def test_prediction_market_layout_a_uses_binary_health_and_four_truthful_metrics
     output = run_dashboard_js(r'''
 const healthy = {
   status:"healthy",
-  health:{status:"healthy",degraded_reasons:[]},
+  health:{status:"healthy",degraded_reasons:[],heartbeat_age_seconds:"0.2"},
+  relation_discovery:{websocket:{status:"connected",last_message_age_seconds:0.2}},
   heartbeat_at:"2026-07-28T08:18:42Z",
   readiness:{status:"ready",balance:"50.00",geoblock:"allowed",relayer:"ready"},
   masked_wallet:"0x1234…5678",
@@ -2376,9 +2377,20 @@ const unavailable = {
   readiness:{status:"ready"},
   breaker:{open:false},
 };
+const connectedButBooksStale = {
+  status:"degraded",
+  stale:true,
+  health:{status:"degraded",degraded_reasons:["books_stale"],heartbeat_age_seconds:"0.4"},
+  relation_discovery:{websocket:{status:"connected",last_message_age_seconds:0.4}},
+  failure_reason:"books_stale",
+  readiness:{status:"ready"},
+  breaker:{open:false},
+};
 console.log(JSON.stringify({
   healthyHeader:predictionPageHeader(healthy),
   unavailableHeader:predictionPageHeader(unavailable),
+  connectedButStaleHeader:predictionPageHeader(connectedButBooksStale),
+  connectedButStaleAlert:predictionExecutionAlert(connectedButBooksStale),
   healthyReadiness:predictionReadinessStrip(healthy),
   unavailableReadiness:predictionReadinessStrip(unavailable),
   healthyMetrics:predictionMetricStrip(healthy),
@@ -2390,6 +2402,10 @@ console.log(JSON.stringify({
     assert "Watcher 正常" in rendered["healthyHeader"]
     assert "Watcher 不可用" in rendered["unavailableHeader"]
     assert "盘口心跳已过期" in rendered["unavailableHeader"]
+    assert "Watcher 正常" in rendered["connectedButStaleHeader"]
+    assert "可参与盘口已过期" not in rendered["connectedButStaleHeader"]
+    assert "当前盘口暂不可交易" in rendered["connectedButStaleAlert"]
+    assert "Polymarket 数据连接异常" not in rendered["connectedButStaleAlert"]
     assert rendered["healthyReadiness"].count('class="pm-readiness-item"') == 4
     assert "首单验证" not in rendered["healthyReadiness"]
     assert "可以交易" in rendered["healthyReadiness"]
@@ -2401,6 +2417,55 @@ console.log(JSON.stringify({
     assert "WebSocket" not in rendered["healthyMetrics"]
     assert "过去 24 小时信号" in rendered["healthyMetrics"]
     assert rendered["unavailableMetrics"].count("<strong>-</strong>") == 4
+
+
+def test_prediction_llm_trading_health_is_independent_from_top_twenty_refresh() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status:"degraded",
+  stale:true,
+  health:{status:"degraded",degraded_reasons:["books_stale","universe_refresh_failed"]},
+  readiness:{status:"ready",balance:"60.40",geoblock:"allowed",relayer:"ready"},
+  masked_wallet:"0x1234…5678",
+  policy_limits:{max_wallet_balance:"65.00",max_normal_cost:"20.00",
+    max_emergency_loss:"2.00",min_estimated_profit:"1.00"},
+  relation_discovery:{
+    status:"healthy",
+    catalog:{status:"healthy"},
+    activity:{status:"scanning"},
+    websocket:{status:"connected"},
+  },
+  breaker:{open:false},
+};
+const critical = (reason) => ({
+  ...payload,
+  health:{...payload.health,degraded_reasons:["books_stale",reason]},
+});
+console.log(JSON.stringify({
+  yesNo:predictionTradingAvailable(payload, "yes_no"),
+  llm:predictionTradingAvailable(payload, "llm_hedge"),
+  yesNoReadiness:predictionReadinessStrip(payload, "yes_no"),
+  llmReadiness:predictionReadinessStrip(payload, "llm_hedge"),
+  yesNoAlert:predictionExecutionAlert(payload, "yes_no"),
+  llmAlert:predictionExecutionAlert(payload, "llm_hedge"),
+  readinessStale:predictionTradingAvailable(critical("readiness_stale"), "llm_hedge"),
+  storeFailed:predictionTradingAvailable(critical("store_write_failed"), "llm_hedge"),
+  readinessAlert:predictionExecutionAlert(critical("readiness_stale"), "llm_hedge"),
+  storeAlert:predictionExecutionAlert(critical("store_write_failed"), "llm_hedge"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["yesNo"] is False
+    assert rendered["llm"] is True
+    assert "不可用" in rendered["yesNoReadiness"]
+    assert "可以交易" in rendered["llmReadiness"]
+    assert "当前盘口暂不可交易" in rendered["yesNoAlert"]
+    assert rendered["llmAlert"] == ""
+    assert rendered["readinessStale"] is False
+    assert rendered["storeFailed"] is False
+    assert "当前盘口暂不可交易" in rendered["readinessAlert"]
+    assert "当前盘口暂不可交易" in rendered["storeAlert"]
 
 
 def test_prediction_market_incomplete_opportunity_stays_visible_but_cannot_trade() -> None:
@@ -2654,6 +2719,7 @@ const opportunity = {
 };
 const payload = {
   status:"healthy", health:{status:"healthy"}, breaker:{open:false},
+  relation_discovery:{status:"healthy",catalog:{status:"healthy"},websocket:{status:"connected",last_message_age_seconds:1}},
   readiness:{status:"ready",geoblock:"allowed",relayer:"ready",balance:"50"},
   wallet:{masked_address:"0x1234…5678"},
   policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"},
@@ -2687,6 +2753,9 @@ console.log(JSON.stringify({
   bookStaleReason:renderCandidate({
     ...opportunity,actionable:false,eligibility_reason:"book_stale",
   }).includes("盘口过期，等待更新"),
+  bookStalePreview:hasAction({
+    ...opportunity,actionable:false,eligibility_reason:"book_stale",
+  }),
   unavailableReason:renderCandidate({
     ...opportunity,actionable:false,llm_status:"llm_unavailable",llm_decision:null,
     llm_summary:"",llm_reason_codes:[],llm_evidence:[],llm_uncertainties:[],
@@ -2707,6 +2776,7 @@ console.log(JSON.stringify({
         "unequalQuantity": False,
         "wrongOutcomes": False,
         "bookStaleReason": True,
+        "bookStalePreview": True,
         "unavailableReason": True,
     }
 
@@ -6424,6 +6494,45 @@ window.fetch=async (input)=>{{
         )
         assert cash_details.get_attribute("data-history-stable") == "yes"
         assert cash_details.evaluate("node => node.open") is True
+
+        discipline = section.locator("details.trend-discipline-workspace")
+        assert discipline.count() == 1
+        assert discipline.evaluate("node => !node.open")
+        discipline.locator(":scope > summary").click()
+
+        category = discipline.locator("details.trend-discipline-category")
+        assert category.count() == 6
+        category.nth(0).locator(":scope > summary").click()
+
+        audit = section.locator(
+            ".cn-trend-report > details.trend-audit:not(.trend-review-disclosure)"
+        )
+        assert audit.count() == 1
+        audit.locator(":scope > summary").click()
+
+        page.evaluate("renderAccountHoldings()")
+        section = page.locator("#account-tiger")
+        assert section.locator("details.account-cash-details").evaluate("node => node.open")
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => node.open")
+        assert section.locator("details.trend-discipline-category").nth(0).evaluate("node => node.open")
+        assert section.locator(
+            ".cn-trend-report > details.trend-audit:not(.trend-review-disclosure)"
+        ).evaluate("node => node.open")
+
+        page.evaluate("renderAccountViewPanelOnly('tiger')")
+        section = page.locator("#account-tiger")
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => node.open")
+        assert section.locator("details.trend-discipline-category").nth(0).evaluate("node => node.open")
+
+        section.locator("details.trend-discipline-workspace > summary").click()
+        section.locator('[data-account-view="real"]').click()
+        section.locator('[data-account-view="report"]').click()
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => !node.open")
+        page.locator("#account-tab-futu").click()
+        page.locator("#account-tab-tiger").click()
+        section = page.locator("#account-tiger")
+        assert section.locator("details.trend-discipline-workspace").evaluate("node => !node.open")
+
         page.locator("#account-tab-futu").click()
         assert page.locator("#account-futu .trend-report-entry").count() == 0
         assert page.locator("#account-futu .account-view-tabs").count() == 0

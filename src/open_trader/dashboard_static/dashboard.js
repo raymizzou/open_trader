@@ -2049,6 +2049,14 @@ function predictionHealthIsNormal(payload) {
     && String(payload?.health?.status || "").trim().toLowerCase() === "healthy";
 }
 
+function predictionWatcherIsConnected(payload) {
+  const websocket = payload?.relation_discovery?.websocket;
+  const status = String(websocket?.status || "").trim().toLowerCase();
+  if (status) return status === "connected";
+  const reasons = Array.isArray(payload?.health?.degraded_reasons) ? payload.health.degraded_reasons : [];
+  return !reasons.some((reason) => ["heartbeat_missing", "heartbeat_stale", "stream_disconnected"].includes(String(reason)));
+}
+
 function predictionFailureReason(payload) {
   const reasons = payload?.health?.degraded_reasons;
   return payload?.failure_reason
@@ -2092,13 +2100,37 @@ function predictionPolicyIsComplete(policy) {
     .every((key) => predictionHasValue(policy?.[key]) && Number.isFinite(Number(policy[key])));
 }
 
-function predictionTradingAvailable(payload) {
+function predictionTradingAvailable(payload, strategy = "yes_no") {
+  strategy = strategy === "llm_hedge" ? "llm_hedge" : "yes_no";
   const readiness = payload?.readiness || {};
   const geoblock = String(readiness.geoblock || readiness.region || readiness.region_status || "").toLowerCase();
   const relayer = String(readiness.relayer || readiness.relayer_readiness || "").toLowerCase();
   const blockedReadiness = ["unavailable", "blocked", "fail", "failed", "error"]
     .includes(String(readiness.status || "").toLowerCase());
-  return predictionHealthIsNormal(payload)
+  const relation = payload?.relation_discovery || {};
+  const degradedReasons = Array.isArray(payload?.health?.degraded_reasons)
+    ? payload.health.degraded_reasons.map((reason) => String(reason || ""))
+    : [];
+  const topTwentyOnlyReasons = new Set([
+    "books_stale",
+    "universe_unavailable",
+    "universe_stale",
+    "universe_refresh_failed",
+  ]);
+  const hasCriticalDegradation = degradedReasons.some(
+    (reason) => !topTwentyOnlyReasons.has(reason)
+  );
+  const topTwentyOnlyDegradation = degradedReasons.length > 0
+    && degradedReasons.every((reason) => topTwentyOnlyReasons.has(reason));
+  const llmGlobalHealthSafe = !hasCriticalDegradation
+    && (predictionHealthIsNormal(payload) || topTwentyOnlyDegradation);
+  const strategyHealthy = strategy === "llm_hedge"
+    ? llmGlobalHealthSafe
+      && predictionWatcherIsConnected(payload)
+      && String(relation.status || "").toLowerCase() === "healthy"
+      && String(relation.catalog?.status || "").toLowerCase() === "healthy"
+    : predictionHealthIsNormal(payload);
+  return strategyHealthy
     && !blockedReadiness
     && ["allowed", "allow", "ok", "ready", "pass"].includes(geoblock)
     && ["allowed", "allow", "ok", "ready", "pass"].includes(relayer)
@@ -2126,7 +2158,7 @@ function predictionFeeStatusLabel(value) {
 }
 
 function predictionStatusLabel(payload) {
-  return predictionHealthIsNormal(payload)
+  return predictionWatcherIsConnected(payload)
     ? ["Watcher 正常", "ok"]
     : ["Watcher 不可用", "danger"];
 }
@@ -2238,7 +2270,7 @@ function predictionOpportunities(payload) {
 
 function predictionPageHeader(payload) {
   const [health, tone] = predictionStatusLabel(payload);
-  const failure = predictionHealthIsNormal(payload)
+  const failure = predictionWatcherIsConnected(payload)
     ? ""
     : `<div class="pm-failure-reason">原因：${escapeHtml(predictionFailureReasonLabel(payload))}</div>`;
   return `<header class="pm-page-head"><div><h1>预测市场套利</h1><p>先看监控范围和实盘状态，再决定是否参与当前机会。</p></div><div class="pm-updated"><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>最后心跳：${escapeHtml(predictionValue(payload?.heartbeat_at || payload?.heartbeat, "-"))} · Polymarket${failure}</div></header>`;
@@ -2256,14 +2288,14 @@ function predictionAnnualizedPercent(value, digits = 1) {
   return `${(Math.trunc(number * 100 * scale) / scale).toFixed(digits)}%`;
 }
 
-function predictionReadinessStrip(payload) {
+function predictionReadinessStrip(payload, strategy = "yes_no") {
   const readiness = payload?.readiness || {};
   const balance = readiness.p_usd_balance ?? readiness.balance ?? payload?.balances?.p_usd;
   const wallet = readiness.masked_address || payload?.wallet?.masked_address || payload?.masked_wallet || readiness.wallet_address;
   const geoblock = predictionGeoblockLabel(readiness.geoblock || readiness.region || readiness.region_status);
   const policy = payload?.policy_limits || {};
   const policyReady = predictionPolicyIsComplete(policy);
-  const available = predictionTradingAvailable(payload);
+  const available = predictionTradingAvailable(payload, strategy);
   const tradingNote = policyReady
     ? `单笔上限 ${predictionMoney(policy.max_normal_cost)} · 应急上限 ${predictionMoney(policy.max_emergency_loss)}`
     : "策略参数未返回";
@@ -2295,7 +2327,7 @@ function predictionExecutionProgress(execution) {
   }).join("")}</div>`;
 }
 
-function predictionExecutionAlert(payload) {
+function predictionExecutionAlert(payload, strategy = "yes_no") {
   const execution = payload?.current_execution;
   const incident = payload?.breaker?.incident;
   const status = String(execution?.status || execution?.state || payload?.status || "").toLowerCase();
@@ -2326,7 +2358,12 @@ function predictionExecutionAlert(payload) {
   if (execution && status === "holding_to_resolution") {
     return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交，待结算</strong><p>这是两个独立 condition 的阈值关系组合；不会 merge，结算前允许继续持有其他已确认组合。</p></div><span class="pm-pill action">待结算</span></section>`;
   }
-  if (payload?.stale) return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>Polymarket 数据连接异常</strong><p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+  if (payload?.stale && !(strategy === "llm_hedge" && predictionTradingAvailable(payload, strategy))) {
+    if (predictionWatcherIsConnected(payload)) {
+      return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>当前盘口暂不可交易</strong><p>盘口数据已过期，当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+    }
+    return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>Polymarket 数据连接异常</strong><p>当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+  }
   return "";
 }
 
@@ -2444,7 +2481,7 @@ function predictionThresholdDistributionHtml(payload) {
   }).join("")}</section>`;
 }
 
-function predictionThresholdIsActionable(opportunity, payload) {
+function predictionThresholdCanPreview(opportunity, payload) {
   const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];
   const quantity = Number(opportunity.quantity);
   const conditions = [String(opportunity.condition_id_a || ""), String(opportunity.condition_id_b || "")];
@@ -2462,7 +2499,7 @@ function predictionThresholdIsActionable(opportunity, payload) {
     && Number.isFinite(Number(value))
     && Number(value) > 0;
   return predictionOpportunityIsComplete(opportunity)
-    && opportunity.actionable === true
+    && (opportunity.actionable === true || String(opportunity.eligibility_reason || "") === "book_stale")
     && String(opportunity.llm_status || "").toLowerCase() === "approved"
     && String(opportunity.llm_decision || "").toUpperCase() === "APPROVE"
     && conditions[0] !== conditions[1]
@@ -2480,7 +2517,7 @@ function predictionThresholdIsActionable(opportunity, payload) {
     && positiveNumber(opportunity.annualized_yield)
     && positiveNumber(opportunity.remaining_days)
     && predictionHasValue(opportunity.resolution_at)
-    && predictionTradingAvailable(payload);
+    && predictionTradingAvailable(payload, "llm_hedge");
 }
 
 function predictionThresholdCandidateHtml(value, payload, expandedRelationKeys = new Set()) {
@@ -2489,7 +2526,8 @@ function predictionThresholdCandidateHtml(value, payload, expandedRelationKeys =
     opportunity.relation_id || opportunity.opportunity_id || opportunity.id,
     ""
   );
-  const actionable = predictionThresholdIsActionable(opportunity, payload);
+  const previewable = predictionThresholdCanPreview(opportunity, payload);
+  const actionable = opportunity.actionable === true && previewable;
   const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];
   const llm = predictionLlmDecisionLabel(opportunity);
   const profit = Number(opportunity.profit ?? opportunity.minimum_profit);
@@ -2511,8 +2549,8 @@ function predictionThresholdCandidateHtml(value, payload, expandedRelationKeys =
   const legRows = legs.length
     ? legs.map((leg) => `<article class="pm-order-leg"><span>${escapeHtml(predictionValue(leg.label))} · BUY ${escapeHtml(predictionValue(leg.outcome))} · FOK · ${escapeHtml(predictionConditionLabel(leg.condition_id))}</span><strong>${escapeHtml(predictionValue(leg.quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))}</small></article>`).join("")
     : `<div class="pm-empty compact">两条 BUY 腿数据未返回</div>`;
-  const action = actionable
-    ? `<div class="pm-opportunity-action"><p>两笔订单非原子、不同 condition，不会 merge；确认时重新读取规则、盘口、费用和账户。</p><button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(relationKey)}">查看并确认两腿订单</button></div>`
+  const action = previewable
+    ? `<div class="pm-opportunity-action"><p>${actionable ? "两笔订单非原子、不同 condition，不会 merge；确认时重新读取规则、盘口、费用和账户。" : "当前盘口已过期；点击后只刷新这两腿，仍为正收益才生成确认单。"}</p><button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(relationKey)}">${actionable ? "查看并确认两腿订单" : "刷新盘口并确认"}</button></div>`
     : "";
   const blockedReason = actionable
     ? ""
@@ -2523,7 +2561,7 @@ function predictionThresholdCandidateHtml(value, payload, expandedRelationKeys =
   const proof = opportunity.llm_proof && typeof opportunity.llm_proof === "object"
     ? Object.entries(opportunity.llm_proof).map(([key, item]) => `${key}: ${item}`).join(" · ")
     : "";
-  return `<details class="pm-threshold-candidate pm-opportunity ${actionable ? "" : "disabled"}" data-relation-key="${escapeHtml(relationKey)}"${open ? " open" : ""}><summary><div class="pm-threshold-summary-title"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))} + ${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div><span class="pm-pill ${statusClass}">${escapeHtml(llm.replace("Codex ", ""))}</span><div><span>24h 成交量</span><strong>${escapeHtml(predictionVolume(opportunity.volume_24h, "-"))}</strong></div><div><span>成本 / 最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))} / ${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>理论利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</strong></div><div class="pm-threshold-yield"><span>简单年化</span><strong>${escapeHtml(annualized)}</strong><small>查看详情</small></div></summary><div class="pm-threshold-detail"><section><h3>当前年化计算</h3><div class="pm-threshold-formula"><div><span>含费最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>理论最低利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</strong></div><div><span>预计资金占用</span><strong>${escapeHtml(remainingLabel)}</strong></div><div><span>简单收益率</span><strong>${escapeHtml(predictionMoney(opportunity.profit ?? opportunity.minimum_profit))} / ${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))} = ${escapeHtml(simpleReturn)}</strong></div><div><span>简单年化</span><strong>${escapeHtml(simpleReturn)} × 365 / ${escapeHtml(remainingLabel)} = ${escapeHtml(annualizedDetail)}</strong></div></div><p class="pm-threshold-caveat">按预计结算时间做非复利年化；结算延迟会降低实际年化。两腿成交前，利润尚未锁定。</p>${predictionThresholdDistributionHtml(payload)}</section><section><h3>合约与赔付证明</h3><div class="pm-threshold-questions"><div><span>市场 A</span><strong>${escapeHtml(predictionValue(opportunity.question_a, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))}</small></div><div><span>市场 B</span><strong>${escapeHtml(predictionValue(opportunity.question_b, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div></div><div class="pm-order-legs">${legRows}</div></section><section><h3>LLM 与确定性校验</h3><div class="pm-threshold-llm"><span class="pm-pill ${statusClass}">${escapeHtml(llm)}</span>${predictionLlmReasonHtml(opportunity)}${proof ? `<small>证明：${escapeHtml(proof)}</small>` : ""}<small>规则关系复核：${opportunity.llm_status === "approved" ? "通过" : "未通过"}</small>${blockedReason ? `<small>当前不可确认：${escapeHtml(blockedReason)}</small>` : ""}</div></section>${action}</div></details>`;
+  return `<details class="pm-threshold-candidate pm-opportunity ${previewable ? "" : "disabled"}" data-relation-key="${escapeHtml(relationKey)}"${open ? " open" : ""}><summary><div class="pm-threshold-summary-title"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))} + ${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div><span class="pm-pill ${statusClass}">${escapeHtml(llm.replace("Codex ", ""))}</span><div><span>24h 成交量</span><strong>${escapeHtml(predictionVolume(opportunity.volume_24h, "-"))}</strong></div><div><span>成本 / 最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))} / ${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>理论利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</strong></div><div class="pm-threshold-yield"><span>简单年化</span><strong>${escapeHtml(annualized)}</strong><small>查看详情</small></div></summary><div class="pm-threshold-detail"><section><h3>当前年化计算</h3><div class="pm-threshold-formula"><div><span>含费最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>理论最低利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit ?? opportunity.minimum_profit))}</strong></div><div><span>预计资金占用</span><strong>${escapeHtml(remainingLabel)}</strong></div><div><span>简单收益率</span><strong>${escapeHtml(predictionMoney(opportunity.profit ?? opportunity.minimum_profit))} / ${escapeHtml(predictionMoney(opportunity.max_cost ?? opportunity.total_max_cost))} = ${escapeHtml(simpleReturn)}</strong></div><div><span>简单年化</span><strong>${escapeHtml(simpleReturn)} × 365 / ${escapeHtml(remainingLabel)} = ${escapeHtml(annualizedDetail)}</strong></div></div><p class="pm-threshold-caveat">按预计结算时间做非复利年化；结算延迟会降低实际年化。两腿成交前，利润尚未锁定。</p>${predictionThresholdDistributionHtml(payload)}</section><section><h3>合约与赔付证明</h3><div class="pm-threshold-questions"><div><span>市场 A</span><strong>${escapeHtml(predictionValue(opportunity.question_a, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_a))}</small></div><div><span>市场 B</span><strong>${escapeHtml(predictionValue(opportunity.question_b, "数据未返回"))}</strong><small>${escapeHtml(predictionConditionLabel(opportunity.condition_id_b))}</small></div></div><div class="pm-order-legs">${legRows}</div></section><section><h3>LLM 与确定性校验</h3><div class="pm-threshold-llm"><span class="pm-pill ${statusClass}">${escapeHtml(llm)}</span>${predictionLlmReasonHtml(opportunity)}${proof ? `<small>证明：${escapeHtml(proof)}</small>` : ""}<small>规则关系复核：${opportunity.llm_status === "approved" ? "通过" : "未通过"}</small>${blockedReason ? `<small>当前不可确认：${escapeHtml(blockedReason)}</small>` : ""}</div></section>${action}</div></details>`;
 }
 
 function predictionFunnelStatus(value) {
@@ -2761,7 +2799,7 @@ function renderPredictionMarket() {
   const workspace = strategy === "llm_hedge"
     ? predictionLlmHedgeWorkspace(viewPayload, expandedRelationKeys)
     : predictionYesNoWorkspace(viewPayload, expandedEventKeys);
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload)}${predictionExecutionAlert(viewPayload)}${workspace}`;
+  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload, strategy)}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
 }
 
 function startPredictionPolling() {
@@ -4755,6 +4793,69 @@ function filterAccountRows(rows) {
     || String(display.market || "").toUpperCase() === state.marketFilter);
 }
 
+function accountDisclosureKey(root, details) {
+  const path = [];
+  let current = details;
+  while (current && current !== root) {
+    const parent = current.parentElement;
+    if (!parent) return "";
+    const index = Array.from(parent.children).indexOf(current);
+    const identity = current.tagName === "DETAILS"
+      ? [
+        current.className || "",
+        current.getAttribute("aria-label") || "",
+        current.getAttribute("data-discipline") || "",
+        current.getAttribute("data-health") || "",
+        current.getAttribute("data-risk-status") || "",
+      ].join("|")
+      : current.tagName || "";
+    path.unshift(`${identity}#${index}`);
+    current = parent;
+  }
+  return path.join("/");
+}
+
+function accountDisclosureScope(root, broker, view) {
+  const section = root?.querySelector?.(`#account-${broker}`);
+  if (!section || typeof section.querySelector !== "function") return null;
+  const panel = section.querySelector(`#account-${broker}-view-panel`);
+  if (TREND_ACCOUNT_BROKERS.includes(broker)
+      && panel?.getAttribute("aria-labelledby") !== `account-${broker}-view-${view}`) {
+    return null;
+  }
+  const report = panel?.querySelector?.(".cn-trend-report");
+  return [
+    broker,
+    view,
+    report?.dataset?.reportArtifact || "",
+    report?.dataset?.reportSha256 || "",
+    report?.dataset?.strategyVersion || "",
+  ].join("|");
+}
+
+function captureAccountDisclosureState(root, broker, view) {
+  const section = root?.querySelector?.(`#account-${broker}`);
+  const scope = accountDisclosureScope(root, broker, view);
+  if (!section || scope === null || typeof section.querySelectorAll !== "function") return null;
+  const states = new Map();
+  section.querySelectorAll("details").forEach((details) => {
+    const key = accountDisclosureKey(section, details);
+    if (key) states.set(key, details.open);
+  });
+  return {scope, states};
+}
+
+function restoreAccountDisclosureState(root, broker, view, snapshot) {
+  if (!snapshot) return;
+  const section = root?.querySelector?.(`#account-${broker}`);
+  if (!section || accountDisclosureScope(root, broker, view) !== snapshot.scope
+      || typeof section.querySelectorAll !== "function") return;
+  section.querySelectorAll("details").forEach((details) => {
+    const key = accountDisclosureKey(section, details);
+    if (snapshot.states.has(key)) details.open = snapshot.states.get(key);
+  });
+}
+
 function renderAccountViewPanelOnly(broker) {
   const container = elements["account-holdings"] || elements["holdings-body"];
   const panel = state.brokerFilter === broker && typeof container?.querySelector === "function"
@@ -4768,11 +4869,13 @@ function renderAccountViewPanelOnly(broker) {
   const visibleRows = view === "simulate"
     ? filterAccountRows(simulatedAccountRows(broker))
     : rows;
+  const disclosureSnapshot = captureAccountDisclosureState(container, broker, view);
   if (elements["visible-count"]) {
     elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   }
   panel.innerHTML = renderAccountViewPanel({...group, rows});
   panel.setAttribute("aria-labelledby", `account-${broker}-view-${view}`);
+  restoreAccountDisclosureState(container, broker, view, disclosureSnapshot);
   container.querySelectorAll?.(`#account-${broker} [data-account-view]`).forEach((tab) => {
     const selected = tab.dataset.accountView === view;
     tab.setAttribute("aria-selected", String(selected));
@@ -4811,10 +4914,25 @@ function renderAccountHoldings() {
   const visibleRows = active && state.accountViews[active.broker] === "simulate"
     ? filterAccountRows(simulated)
     : rows;
+  const disclosureSnapshot = active
+    ? captureAccountDisclosureState(
+      container,
+      active.broker,
+      state.accountViews[active.broker] || "real",
+    )
+    : null;
   elements["visible-count"].textContent = `${formatDisplayNumber(visibleRows.length)} 条`;
   container.innerHTML = active
     ? renderAccountSection({...active, rows})
     : '<div class="empty-state">暂无券商账户</div>';
+  if (active) {
+    restoreAccountDisclosureState(
+      container,
+      active.broker,
+      state.accountViews[active.broker] || "real",
+      disclosureSnapshot,
+    );
+  }
   if (active?.broker === focusedBroker && focusedView) {
     container.querySelector(`[data-account-view="${focusedView}"]`)?.focus();
   }
