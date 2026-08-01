@@ -31,6 +31,7 @@ from .prediction_arbitrage import (
     MAX_NORMAL_COST,
     MAX_WALLET_BALANCE,
     MIN_ESTIMATED_PROFIT,
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
     PROTECTED_BUY_SHARE_PRECISION,
     PairIntent,
     ThresholdHedgeIntent,
@@ -2346,6 +2347,11 @@ class PredictionExecutionService:
                 return "order_amount_mismatch"
             if intent.total_max_cost > MAX_NORMAL_COST or intent.minimum_profit <= 0 or intent.net_edge <= 0:
                 return "threshold_economics"
+            annualized = _decimal(opportunity.get("annualized_yield"))
+            if annualized is None:
+                return "annualized_yield_unavailable"
+            if annualized < MIN_THRESHOLD_ANNUALIZED_YIELD:
+                return "annualized_yield_below_minimum"
             return None
         tick_size = self._tick_size(opportunity)
         if tick_size is None:

@@ -22,6 +22,7 @@ from polymarket.streams import MarketSpec
 from .prediction_arbitrage import (
     BookLevel,
     ConfirmedBooks,
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
     MarketFacts,
     build_pair_intent,
     monitored_event_sort_key,
@@ -2201,7 +2202,18 @@ class PolymarketMonitor:
                 if token in self._relation_books
             )
             confirmed_age = _age(now, confirmed_at)
-            end_date = _timestamp_or_none(relation.market_b.end_date)
+            end_a = _timestamp_or_none(relation.market_a.end_date)
+            end_b = _timestamp_or_none(relation.market_b.end_date)
+            end_date = (
+                end_a
+                if end_a is not None
+                and end_b is not None
+                and end_a == end_b
+                else None
+            )
+            resolution_at = (
+                relation.market_a.end_date if end_date is not None else None
+            )
             remaining_days = (
                 Decimal(str((end_date - now).total_seconds()))
                 / Decimal("86400")
@@ -2247,6 +2259,10 @@ class PolymarketMonitor:
                 or safe_intent.total_max_cost > allowance
             ):
                 eligibility_reason = "insufficient_funds"
+            elif status == "approved" and annualized is None:
+                eligibility_reason = "annualized_yield_unavailable"
+            elif status == "approved" and annualized < MIN_THRESHOLD_ANNUALIZED_YIELD:
+                eligibility_reason = "annualized_yield_below_minimum"
             actionable = status == "approved" and eligibility_reason == "actionable"
             intent = safe_intent
             row = self._relation_row(
@@ -2257,7 +2273,7 @@ class PolymarketMonitor:
                 volume=self._relation_volumes.get(relation.relation_id, Decimal("0")),
                 confirmed_at=confirmed_at,
                 confirmed_age=confirmed_age,
-                resolution_at=relation.market_b.end_date,
+                resolution_at=resolution_at,
                 remaining_days=remaining_days,
                 annualized=annualized,
                 actionable=actionable,
@@ -2502,7 +2518,7 @@ class PolymarketMonitor:
         volume: Decimal,
         confirmed_at: datetime,
         confirmed_age: float,
-        resolution_at: str,
+        resolution_at: str | None,
         remaining_days: Decimal | None,
         annualized: Decimal | None,
         actionable: bool,
@@ -3172,6 +3188,10 @@ class PolymarketMonitor:
                     "volume_24h": opportunity.get("volume_24h"),
                     "market_type": opportunity.get("market_type", "standard_binary"),
                     "annualized_yield": opportunity.get("annualized_yield"),
+                    "resolution_at": opportunity.get("resolution_at"),
+                    "remaining_days": opportunity.get("remaining_days"),
+                    "maximum_fee": opportunity.get("maximum_fee"),
+                    "eligibility_reason": opportunity.get("eligibility_reason"),
                     "llm_status": opportunity.get("llm_status"),
                     "llm_reason_codes": opportunity.get("llm_reason_codes"),
                     "rules_verified_at": opportunity.get("rules_verified_at"),

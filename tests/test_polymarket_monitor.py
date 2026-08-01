@@ -18,6 +18,7 @@ from open_trader.polymarket_relation_discovery import (
     threshold_relation_payload,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.polymarket_monitor import _relation_fingerprint
 
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
@@ -2333,10 +2334,92 @@ def test_subcent_threshold_profit_is_visible_and_annualized_distribution_is_repo
         if row.get("market_type") == "threshold_hedge"
     )
     assert row["estimated_profit"] == Decimal("0.0020010000000000")
+    assert row["actionable"] is False
+    assert row["eligibility_reason"] == "annualized_yield_below_minimum"
     distribution = monitor.snapshot()["relation_discovery"]["annualized_distribution"]
     assert distribution["current"]["count"] == 1
     assert distribution["7d"]["count"] == 1
     assert distribution["30d"]["count"] == 1
+
+
+def test_threshold_annualized_gate_requires_shared_end_and_keeps_low_yield_visible(
+    tmp_path: Path,
+) -> None:
+    source = threshold_event()
+    setup_public([source])
+    setup_threshold_books()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    calls: list[tuple[str, str]] = []
+
+    def observer(opportunity_id: str, signal_id: str) -> dict[str, object]:
+        calls.append((opportunity_id, signal_id))
+        return {"state": "sent"}
+
+    monitor.set_ready_observer(observer)
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    monitor._catalog_loaded = True
+    relation_id, relation = next(iter(monitor._relations.items()))
+    monitor._relations[relation_id] = replace(
+        relation,
+        market_b=replace(relation.market_b, end_date="2027-09-01T00:00:00Z"),
+    )
+    monitor._relation_rule_verifications[relation_id] = (
+        NOW,
+        _relation_fingerprint(monitor._relations[relation_id]),
+    )
+    monitor.refresh_once()
+
+    row = next(
+        item
+        for item in monitor.snapshot()["opportunities"]
+        if item.get("market_type") == "threshold_hedge"
+    )
+    assert row["resolution_at"] is None
+    assert row["annualized_yield"] is None
+    assert row["actionable"] is False
+    assert row["eligibility_reason"] == "annualized_yield_unavailable"
+    history = monitor._store.signal_history("all")
+    assert history[0]["annualized_yield"] == row["annualized_yield"]
+    assert calls == []
+
+
+def test_threshold_annualized_gate_fails_closed_when_end_date_is_invalid(
+    tmp_path: Path,
+) -> None:
+    source = threshold_event()
+    setup_public([source])
+    setup_threshold_books()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    monitor._catalog_loaded = True
+    relation_id, relation = next(iter(monitor._relations.items()))
+    monitor._relations[relation_id] = replace(
+        relation,
+        market_a=replace(relation.market_a, end_date="not-a-date"),
+    )
+    monitor._relation_rule_verifications[relation_id] = (
+        NOW,
+        _relation_fingerprint(monitor._relations[relation_id]),
+    )
+    monitor.refresh_once()
+
+    row = next(
+        item
+        for item in monitor.snapshot()["opportunities"]
+        if item.get("market_type") == "threshold_hedge"
+    )
+    assert row["annualized_yield"] is None
+    assert row["actionable"] is False
+    assert row["eligibility_reason"] == "annualized_yield_unavailable"
 
 
 def test_relation_scan_logs_are_bounded_and_not_persisted(tmp_path: Path) -> None:
