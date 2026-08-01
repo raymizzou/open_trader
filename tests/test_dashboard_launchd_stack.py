@@ -3,13 +3,18 @@ from __future__ import annotations
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_dashboard_launchd.sh"
+SINGLE_LABEL = "com.open-trader.dashboard"
 GATEWAY_LABEL = "com.open-trader.frontend-gateway"
 LEGACY_LABEL = "com.open-trader.legacy-dashboard"
+SINGLE_TEMPLATE = ROOT / f"ops/launchd/{SINGLE_LABEL}.plist.template"
 GATEWAY_TEMPLATE = ROOT / f"ops/launchd/{GATEWAY_LABEL}.plist.template"
 LEGACY_TEMPLATE = ROOT / f"ops/launchd/{LEGACY_LABEL}.plist.template"
 
@@ -20,6 +25,123 @@ def _dry_run_sections(stdout: str) -> dict[str, dict[str, object]]:
         label, xml = section.split(" =====\n", 1)
         sections[label] = plistlib.loads(xml.encode("utf-8"))
     return sections
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_installer(
+    tmp_path: Path,
+    *,
+    mode: str = "stack",
+    **env_overrides: str,
+) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    calls_path = tmp_path / "fake-calls"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    launchctl = bin_dir / "launchctl"
+    _write_executable(
+        launchctl,
+        """#!/bin/bash
+echo "launchctl $*" >> "$FAKE_CALLS"
+if [[ "$1" == "print" ]]; then
+  case "$2" in
+    *com.open-trader.dashboard) echo "pid = 4101" ;;
+    *com.open-trader.frontend-gateway) echo "pid = 4102" ;;
+    *com.open-trader.legacy-dashboard) echo "pid = 4103" ;;
+  esac
+fi
+exit 0
+""",
+    )
+    lsof = bin_dir / "lsof"
+    _write_executable(
+        lsof,
+        """#!/bin/bash
+echo "lsof $*" >> "$FAKE_CALLS"
+case "$*" in
+  *tiTCP:8766*) [[ -n "${FAKE_8766_PID:-4101}" ]] && echo "${FAKE_8766_PID:-4101}" ;;
+  *tiTCP:8767*) [[ -n "${FAKE_8767_PID:-}" ]] && echo "$FAKE_8767_PID" ;;
+esac
+""",
+    )
+    curl = bin_dir / "curl"
+    _write_executable(
+        curl,
+        """#!/bin/bash
+echo "curl $*" >> "$FAKE_CALLS"
+url="${@: -1}"
+if [[ "${FAKE_FAIL_GATEWAY:-0}" == "1" && "$url" == "http://127.0.0.1:8766/healthz" ]]; then
+  exit 22
+fi
+case "$url" in
+  http://127.0.0.1:8767/healthz)
+    printf '%s\\n' '{"module":"legacy_dashboard"}' ;;
+  http://127.0.0.1:8766/healthz)
+    printf '%s\\n' '{"module":"frontend_gateway","upstream_status":"ok"}' ;;
+esac
+exit 0
+""",
+    )
+
+    common_args = [
+        str(INSTALLER),
+        "--repo-root",
+        str(ROOT),
+        "--runtime-root",
+        str(runtime),
+        "--launch-agents-dir",
+        str(agents),
+        "--python",
+        sys.executable,
+        "--wait-seconds",
+        "1",
+    ]
+    single_dry_run = subprocess.run(
+        [str(INSTALLER), "--mode", "single", "--dry-run", *common_args[1:]],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (agents / f"{SINGLE_LABEL}.plist").write_text(
+        single_dry_run.stdout, encoding="utf-8"
+    )
+    if mode == "single":
+        stack_dry_run = subprocess.run(
+            [str(INSTALLER), "--dry-run", *common_args[1:]],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for label, payload in _dry_run_sections(stack_dry_run.stdout).items():
+            (agents / f"{label}.plist").write_bytes(plistlib.dumps(payload))
+
+    env = {
+        **os.environ,
+        "FAKE_CALLS": str(calls_path),
+        "LAUNCHCTL_BIN": str(launchctl),
+        "LSOF_BIN": str(lsof),
+        "CURL_BIN": str(curl),
+        **env_overrides,
+    }
+    result = subprocess.run(
+        [str(INSTALLER), "--mode", mode, *common_args[1:]],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    calls = calls_path.read_text(encoding="utf-8").splitlines()
+    return result, calls, agents
 
 
 def test_stack_templates_define_separate_loopback_jobs() -> None:
@@ -93,3 +215,69 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     assert sections[GATEWAY_LABEL]["WorkingDirectory"] == str(ROOT)
     assert str(runtime / "data") in sections[LEGACY_LABEL]["ProgramArguments"]
     assert not list(agents.iterdir())
+
+
+def test_stack_cutover_verifies_legacy_before_stopping_single_and_starting_gateway(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(tmp_path)
+    domain = f"gui/{os.getuid()}"
+    legacy_ready = next(
+        i
+        for i, call in enumerate(calls)
+        if call.endswith("http://127.0.0.1:8767/healthz")
+    )
+    single_stop = calls.index(f"launchctl bootout {domain}/{SINGLE_LABEL}")
+    gateway_start = calls.index(
+        f"launchctl bootstrap {domain} "
+        f"{agents / f'{GATEWAY_LABEL}.plist'}"
+    )
+    gateway_ready = next(
+        i
+        for i, call in enumerate(calls)
+        if call.endswith("http://127.0.0.1:8766/healthz")
+    )
+    assert result.returncode == 0
+    assert legacy_ready < single_stop < gateway_start < gateway_ready
+
+
+def test_gateway_failure_stops_stack_restores_single_and_verifies_public_url(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(tmp_path, FAKE_FAIL_GATEWAY="1")
+    domain = f"gui/{os.getuid()}"
+    changes = [
+        call
+        for call in calls
+        if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+    ]
+    assert result.returncode == 1
+    assert changes[-5:] == [
+        f"launchctl bootout {domain}/{GATEWAY_LABEL}",
+        f"launchctl bootout {domain}/{LEGACY_LABEL}",
+        f"launchctl bootout {domain}/{SINGLE_LABEL}",
+        f"launchctl bootstrap {domain} {agents / f'{SINGLE_LABEL}.plist'}",
+        f"launchctl kickstart -k {domain}/{SINGLE_LABEL}",
+    ]
+    assert calls[-1].endswith("http://127.0.0.1:8766/")
+    assert "restored single-process dashboard" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("env_name", "port", "pid"),
+    [("FAKE_8766_PID", 8766, "9999"), ("FAKE_8767_PID", 8767, "9998")],
+)
+def test_unknown_listener_aborts_before_mutation_or_http_probe(
+    tmp_path: Path,
+    env_name: str,
+    port: int,
+    pid: str,
+) -> None:
+    result, calls, _ = _run_installer(tmp_path, **{env_name: pid})
+    assert result.returncode == 1
+    assert f"port {port} is occupied by an unknown process (pid {pid})" in result.stderr
+    assert not any(
+        any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+        for call in calls
+    )
+    assert not any(call.startswith("curl ") for call in calls)
