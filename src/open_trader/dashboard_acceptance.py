@@ -4478,7 +4478,12 @@ def _log_errors(
             errors.append(f"日志状态读取失败：{type(exc).__name__}: {exc}")
         if record.get("git_sha") != expected_sha:
             errors.append(f"日志中的 {name} Git SHA 不匹配")
-        if Path(str(record.get("cwd") or "")).resolve() != expected_cwd.resolve():
+        record_cwd = record.get("cwd")
+        if (
+            not isinstance(record_cwd, str)
+            or not record_cwd.strip()
+            or Path(record_cwd).resolve() != expected_cwd.resolve()
+        ):
             errors.append(f"日志中的 {name} 工作目录不匹配")
         if record.get("source_state") != "clean":
             errors.append(f"日志中的 {name} 源码状态不是 clean")

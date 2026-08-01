@@ -6712,6 +6712,46 @@ def test_acceptance_reads_gateway_runtime_prefix(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("cwd_present", "cwd"),
+    [(False, None), (True, None), (True, ""), (True, False), (True, 0), (True, 123)],
+)
+def test_acceptance_rejects_runtime_log_with_invalid_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cwd_present: bool,
+    cwd: object,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "source_state": "clean",
+        "started_at": "2026-08-01T12:00:01+08:00",
+    }
+    if cwd_present:
+        runtime["cwd"] = cwd
+    log = tmp_path / "gateway.log"
+    log.write_text(
+        f"frontend_gateway_runtime: {json.dumps(runtime)}\n",
+        encoding="utf-8",
+    )
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        name="Frontend Gateway",
+        prefix="frontend_gateway_runtime: ",
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat(
+            "2026-08-01T12:00:00+08:00"
+        ),
+    )
+
+    assert any("工作目录" in error for error in errors)
+
+
+@pytest.mark.parametrize(
     ("record_pid", "expected_pid"),
     [(123.0, 123), (True, 1)],
 )
