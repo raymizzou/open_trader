@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,14 @@ def _run_installer(
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
+    repo = tmp_path / "repo"
+    (repo / "ops/launchd").mkdir(parents=True)
+    (repo / "config").mkdir()
+    for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
+        shutil.copy2(template, repo / "ops/launchd" / template.name)
+    (repo / "config/prediction_arbitrage.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     calls_path = tmp_path / "fake-calls"
@@ -99,7 +108,7 @@ exit 0
     common_args = [
         str(INSTALLER),
         "--repo-root",
-        str(ROOT),
+        str(repo),
         "--runtime-root",
         str(runtime),
         "--launch-agents-dir",
