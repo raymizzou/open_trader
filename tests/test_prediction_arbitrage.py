@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -15,6 +16,8 @@ from open_trader.prediction_arbitrage import (
     build_pair_intent,
     estimated_unwind_loss,
     monitored_event_sort_key,
+    _book_segments,
+    _protected_buy_candidates,
 )
 from open_trader.polymarket_relation_discovery import (
     ThresholdBuyLeg,
@@ -134,6 +137,25 @@ def test_supported_tick_sizes_use_pinned_protected_buy_precision(
 
     assert intent is not None
     assert -intent.quantity.as_tuple().exponent <= PROTECTED_BUY_SHARE_PRECISION[tick_size]
+
+
+def test_protected_buy_candidate_scan_stays_fast_for_deep_books() -> None:
+    asks = tuple(
+        BookLevel(Decimal(cents).scaleb(-2), Decimal("1"))
+        for cents in range(1, 101)
+    )
+    segments = _book_segments(asks, Decimal("0.01"))
+    assert segments is not None
+
+    started = time.process_time()
+    for _ in range(5):
+        candidates = _protected_buy_candidates(segments, Decimal("0.01"))
+    elapsed = time.process_time() - started
+
+    assert len(candidates) == 1010
+    assert candidates[Decimal("1.0000")] == Decimal("0.01")
+    assert candidates[Decimal("44.4445")] == Decimal("20.00")
+    assert elapsed < 0.25
 
 
 def test_unsupported_tick_size_is_rejected() -> None:

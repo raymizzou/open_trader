@@ -2048,6 +2048,8 @@ function predictionReasonLabel(value) {
     no_threshold_candidate: "已订阅 · 净利润未达到策略门槛",
     monitor_degraded: "数据连接异常，暂不可参与",
     opportunity_unavailable: "机会已变化或已失效",
+    annualized_yield_below_minimum: "年化低于 15% 入场门槛",
+    annualized_yield_unavailable: "年化无法计算，禁止入场",
   };
   return labels[raw] || raw.replaceAll("_", " ");
 }
@@ -2786,21 +2788,45 @@ function predictionHistoryContent(payload, kind) {
     const title = (row) => {
       const english = predictionValue(row.event_title, "-");
       const chinese = String(row.event_title_zh || row.title_zh || "").trim();
-      return chinese
-        ? `<span class="pm-title-zh">${escapeHtml(chinese)}</span><span class="pm-title-en">${escapeHtml(english)}</span>`
-        : `<span class="pm-title-en">${escapeHtml(english)}</span>`;
+      const secondary = chinese || "中文翻译生成中";
+      return `<span class="pm-title-en">${escapeHtml(english)}</span><span class="pm-title-zh">${escapeHtml(secondary)}</span>`;
     };
     const liveProfit = (row) => closed(row) ? "—" : predictionSignedMoney(row.live_profit ?? row.estimated_profit, "—");
+    const threshold = (row) => String(row.market_type || "") === "threshold_hedge";
+    const capitalUsage = (row) => {
+      if (!threshold(row)) return `<strong>${escapeHtml(durationLabel(row))}</strong>`;
+      const remaining = Number(row.remaining_days);
+      const remainingText = Number.isFinite(remaining) && remaining > 0
+        ? `${Number.isInteger(remaining) ? remaining : remaining.toFixed(1)} 天`
+        : "不可计算";
+      const resolution = predictionHktTimestamp(row.resolution_at, "结算时间未返回");
+      return `<strong>${escapeHtml(remainingText)}</strong><small>结算 ${escapeHtml(resolution)}</small>`;
+    };
+    const netReturn = (row) => {
+      if (!threshold(row)) {
+        return `<strong>${escapeHtml(predictionSignedMoney(row.initial_profit))}</strong><small>实时 ${escapeHtml(liveProfit(row))}</small>`;
+      }
+      const profit = predictionSignedMoney(row.minimum_profit ?? row.profit ?? row.estimated_profit);
+      const annualized = predictionAnnualizedPercent(row.annualized_yield, 2);
+      const cost = predictionMoney(row.total_max_cost ?? row.max_cost);
+      const fee = predictionHasValue(row.maximum_fee) ? ` ${predictionMoney(row.maximum_fee)}` : "";
+      return `<strong class="pm-positive">${escapeHtml(profit)}</strong><small>年化 ${escapeHtml(annualized)}</small><small>最多占用 ${escapeHtml(cost)} · 含模型手续费${escapeHtml(fee)}</small>`;
+    };
     const operation = (row) => {
       const currentState = state.predictionMarket.payload || payload;
       const healthy = !String(state.predictionMarket.signalError || "").trim()
         && predictionTradingAvailable(currentState);
       const actionable = row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy;
-      return actionable
-        ? `<button class="pm-button primary pm-signal-action" type="button" data-action="participate" data-opportunity-id="${escapeHtml(String(row.opportunity_id))}">重新检查</button>`
-        : "";
+      const button = `<button class="pm-button primary pm-signal-action" type="button" data-action="participate" data-opportunity-id="${escapeHtml(String(row.opportunity_id))}">重新检查</button>`;
+      if (threshold(row)) {
+        return actionable
+          ? button
+          : `<span class="pm-observe">仅观察</span><small>${escapeHtml(predictionReasonLabel(row.eligibility_reason || (row.actionable_now ? "opportunity_unavailable" : "annualized_yield_unavailable")))}</small>`;
+      }
+      const notice = notificationLabel(row.notification_state);
+      return `${escapeHtml(notice)}${actionable ? button : ""}`;
     };
-    return `<table class="pm-table pm-signal-table"><thead><tr><th>出现时间（HKT）</th><th>标的</th><th>持续</th><th>触发时利润</th><th>实时利润</th><th>通知</th><th>操作</th></tr></thead><tbody>${displayRows.map((row) => `<tr class="${row.actionable_now === true && !closed(row) ? "pm-signal-live" : ""}"><td data-label="出现时间（HKT）">${escapeHtml(predictionHktTimestamp(row.occurred_at))}<small class="pm-relative-age">${escapeHtml(predictionRelativeAge(row.occurred_at))}</small></td><td data-label="标的" class="pm-title-cell">${title(row)}</td><td data-label="持续">${escapeHtml(durationLabel(row))}</td><td data-label="触发时利润">${escapeHtml(predictionSignedMoney(row.initial_profit))}</td><td data-label="实时利润" class="pm-positive"><strong>${escapeHtml(liveProfit(row))}</strong></td><td data-label="通知">${escapeHtml(notificationLabel(row.notification_state))}</td><td data-label="操作" class="pm-signal-operation">${operation(row)}</td></tr>`).join("")}</tbody></table>`;
+    return `<table class="pm-table pm-signal-table"><thead><tr><th>出现时间（HKT）</th><th>标的</th><th>资金占用</th><th>净回报</th><th>操作</th></tr></thead><tbody>${displayRows.map((row) => `<tr class="${row.actionable_now === true && !closed(row) ? "pm-signal-live" : ""}"><td data-label="出现时间（HKT）">${escapeHtml(predictionHktTimestamp(row.occurred_at))}<small class="pm-relative-age">${escapeHtml(predictionRelativeAge(row.occurred_at))}</small></td><td data-label="标的" class="pm-title-cell">${title(row)}</td><td data-label="资金占用">${capitalUsage(row)}</td><td data-label="净回报">${netReturn(row)}</td><td data-label="操作" class="pm-signal-operation">${operation(row)}</td></tr>`).join("")}</tbody></table>`;
   }
   if (kind === "executions") {
     return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; const holding = row.state === "holding_to_resolution"; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${holding ? "待结算（不 merge）" : escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${holding ? "待结算" : escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;

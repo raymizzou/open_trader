@@ -2767,7 +2767,7 @@ console.log(JSON.stringify({scanning:predictionRelationFunnel(scanning),noRelati
     assert "本轮未发现可验证关系" in rendered["noRelations"]
     assert "拒绝" in rendered["noPositive"]
     assert "盘口过期" in rendered["noReady"]
-    for text in ("250 ms", "触发时利润", "实时利润", "飞书已发", "发送失败", "未发送"):
+    for text in ("250 ms", "资金占用", "净回报", "飞书已发", "发送失败", "未发送"):
         assert text in rendered["history"]
 
 
@@ -5255,7 +5255,7 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "pm-controller" not in html
     assert "原型场景控制器" not in html
     assert "底部场景" not in html
-    for label in ("实盘就绪状态", "当前监控范围", "套利信号", "交易与合并", "事故", "出现时间（HKT）", "触发时利润", "实时利润", "重新检查", "Watcher 数据时间", "信号刷新时间"):
+    for label in ("实盘就绪状态", "当前监控范围", "套利信号", "交易与合并", "事故", "出现时间（HKT）", "资金占用", "净回报", "重新检查", "Watcher 数据时间", "信号刷新时间"):
         assert label in js
     assert "data-prediction-history-panel" in js
     assert "signalPollId" in js
@@ -5286,9 +5286,13 @@ def test_prediction_market_static_contract_is_present() -> None:
 
 
 def test_prediction_yes_no_signal_renderer_has_approved_columns_and_fail_closed_actions() -> None:
+    english_pair = "Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?"
+    chinese_pair = "比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？"
     output = run_dashboard_js(r'''
 state.predictionMarket.signalLastSuccessAt = "2026-08-01T02:00:00Z";
 state.predictionMarket.signalError = "";
+const englishPair = "Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?";
+const chinesePair = "比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？";
 const payload = {
   status: "healthy",
   health: {status: "healthy", degraded_reasons: []},
@@ -5297,10 +5301,13 @@ const payload = {
   breaker: {open: false},
   events: [],
   opportunities: [],
-  histories: {signals: [
-    {occurred_at: "2026-08-01T01:59:00Z", event_title: "English market", event_title_zh: "中文标的", duration: "12s", initial_profit: "0.30", live_profit: "0.38", actionable_now: true, opportunity_id: "opp-1", notification_state: "sent"},
-    {occurred_at: "2026-08-01T01:58:00Z", event_title: "Closed market", ended_at: "2026-08-01T01:58:12Z", initial_profit: "0.20", live_profit: "0.22", actionable_now: true, opportunity_id: "opp-2", notification_state: "failed"},
-  ]},
+  histories: {signals: [{
+    occurred_at: "2026-08-01T01:59:00Z", event_title: englishPair, event_title_zh: chinesePair,
+    market_type: "threshold_hedge", duration: "12s", initial_profit: "0.30", minimum_profit: "0.81",
+    total_max_cost: "152.60", maximum_fee: "0.12", remaining_days: "152.6", resolution_at: "2026-12-31T00:00:00Z",
+    annualized_yield: "0.0053", eligibility_reason: "annualized_yield_below_minimum", actionable_now: false,
+    opportunity_id: "threshold-1", notification_state: "sent",
+  }]},
 };
 state.predictionMarket.payload = payload;
 const open = predictionYesNoWorkspace(payload, new Set());
@@ -5308,25 +5315,35 @@ state.predictionMarket.signalError = "history 503";
 const failed = predictionYesNoWorkspace(payload, new Set());
 state.predictionMarket.signalError = "";
 state.predictionMarket.payload = {...payload, stale: true};
-const stale = predictionYesNoWorkspace(payload, new Set());
+    const stale = predictionYesNoWorkspace(payload, new Set());
 console.log(JSON.stringify({open, failed, stale}));
 ''')
     rendered = json.loads(output)
     for html in (rendered["open"], rendered["failed"]):
-        for label in ("套利信号", "出现时间（HKT）", "标的", "持续", "触发时利润", "实时利润", "通知", "操作"):
+        for label in ("套利信号", "出现时间（HKT）", "标的", "资金占用", "净回报", "操作"):
             assert label in html
         for obsolete in ("当前机会", "历史记录", "信号历史", "峰值利润", "最终利润", "窗口结束", "预计", "未下单，当前可能已失效"):
             assert obsolete not in html
-    assert "中文标的" in rendered["open"]
-    assert rendered["open"].index("中文标的") < rendered["open"].index("English market")
-    assert 'data-action="participate"' in rendered["open"]
+    assert rendered["open"].index(english_pair) < rendered["open"].index(chinese_pair)
+    assert "152.6 天" in rendered["open"]
+    assert "年化 0.53%" in rendered["open"]
+    assert "含模型手续费" in rendered["open"]
+    assert "仅观察" in rendered["open"]
+    assert "年化低于 15% 入场门槛" in rendered["open"]
     assert 'data-action="participate"' not in rendered["failed"]
     assert 'data-action="participate"' not in rendered["stale"]
-    assert 'data-label="实时利润"' in rendered["open"]
-    assert "—" in rendered["failed"]
-    assert "+$0.38" in rendered["open"]
-    assert "+$0.22" not in rendered["open"]
+    assert 'data-label="净回报"' in rendered["open"]
     assert "仅监控" not in rendered["open"] + rendered["failed"]
+
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    signal_title_rules = css[css.index(".pm-title-cell"):css.index(".pm-relative-age")]
+    assert ".pm-title-en" in signal_title_rules
+    assert ".pm-title-zh" in signal_title_rules
+    assert "font-weight: 800" in signal_title_rules
+    assert "color: var(--muted)" in signal_title_rules
+    assert "font-size: 12px" in signal_title_rules
+    for forbidden in ("text-overflow: ellipsis", "line-clamp", "-webkit-line-clamp"):
+        assert forbidden not in signal_title_rules
 
 
 def test_prediction_signal_poll_stop_preserves_inflight_request_guard() -> None:
@@ -13164,6 +13181,20 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
             "initial_profit": "0.31",
             "notification_state": "pending",
         },
+        {
+            "signal_id": "threshold-open",
+            "opportunity_id": "threshold-opp",
+            "market_id": "threshold-market",
+            "market_type": "threshold_hedge",
+            "question": (
+                "Will Bitcoin be above $90,000 on December 31? / "
+                "Will Bitcoin be above $100,000 on December 31?"
+            ),
+            "started_at": "2026-08-01T09:59:00Z",
+            "ended_at": None,
+            "initial_profit": "1.00",
+            "notification_state": "pending",
+        },
     ]
     current = {
         "opportunity_id": "opp-1",
@@ -13188,6 +13219,38 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
         "confirmed_at": "2026-08-01T10:00:59Z",
         "confirmed_age_seconds": "1",
     }
+    threshold_pair = (
+        "Will Bitcoin be above $90,000 on December 31? / "
+        "Will Bitcoin be above $100,000 on December 31?"
+    )
+    threshold_current = {
+        "opportunity_id": "threshold-opp",
+        "relation_id": "threshold-opp",
+        "event_id": "threshold-event",
+        "market_id": "threshold-market",
+        "market_type": "threshold_hedge",
+        "question": threshold_pair,
+        "question_a": "Will Bitcoin be above $90,000 on December 31?",
+        "question_b": "Will Bitcoin be above $100,000 on December 31?",
+        "relation": "A_IMPLIES_B",
+        "condition_id_a": "condition-a",
+        "condition_id_b": "condition-b",
+        "token_id_a": "token-a",
+        "token_id_b": "token-b",
+        "quantity": "20",
+        "maximum_fee": "0.01",
+        "total_max_cost": "19.00",
+        "minimum_payout": "20.00",
+        "minimum_profit": "1.00",
+        "estimated_profit": "1.00",
+        "annualized_yield": "0.20",
+        "remaining_days": "47",
+        "resolution_at": "2026-12-31T00:00:00Z",
+        "confirmed_at": "2026-08-01T10:00:59Z",
+        "confirmed_age_seconds": "1",
+        "eligibility_reason": "actionable",
+        "actionable": True,
+    }
 
     class FakeStore:
         def histories(self, kind: str) -> list[dict[str, object]]:
@@ -13209,6 +13272,13 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
         def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
             if cache_key == prediction_title_cache_key(title):
                 return {"title_zh": "这件事会发生吗？"}
+            if cache_key == prediction_title_cache_key(threshold_pair):
+                return {
+                    "title_zh": (
+                        "比特币在 12 月 31 日是否高于 9 万美元？ / "
+                        "比特币在 12 月 31 日是否高于 10 万美元？"
+                    )
+                }
             return None
 
         def record_llm_cache_hit(self) -> None:
@@ -13222,12 +13292,13 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
             self.calls += 1
             live = dict(current)
             live["estimated_profit"] = self.profit
+            threshold_live = dict(threshold_current)
             return {
                 "status": "healthy",
                 "health": {"status": "healthy", "degraded_reasons": []},
                 "readiness": {"status": "ready", "geoblock": "allowed", "relayer": "ready"},
                 "events": [],
-                "opportunities": [live],
+                "opportunities": [live, threshold_live],
             }
 
     class FakeExecution:
@@ -13244,7 +13315,7 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     )
     items = payload["items"]
     assert [item["signal_id"] for item in items] == [
-        "open-older", "compat-open", "closed-newer"
+        "open-older", "compat-open", "threshold-open", "closed-newer"
     ]
     assert items[0]["actionable_now"] is True
     assert items[0]["live_profit"] == "0.44"
@@ -13252,8 +13323,18 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     assert items[0]["event_title"] == title
     assert items[0]["event_title_zh"] == "这件事会发生吗？"
     assert items[1]["actionable_now"] is True
-    assert items[2]["actionable_now"] is False
-    assert items[2]["live_profit"] is None
+    threshold_item = items[2]
+    assert threshold_item["actionable_now"] is True
+    assert threshold_item["live_profit"] == "1.00"
+    assert threshold_item["event_title"] == threshold_pair
+    assert threshold_item["event_title_zh"] == (
+        "比特币在 12 月 31 日是否高于 9 万美元？ / "
+        "比特币在 12 月 31 日是否高于 10 万美元？"
+    )
+    assert threshold_item["annualized_yield"] == "0.20"
+    assert threshold_item["remaining_days"] == "47"
+    assert items[3]["actionable_now"] is False
+    assert items[3]["live_profit"] is None
     assert monitor.calls == 1
 
     monitor.profit = "0.51"

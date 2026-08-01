@@ -22,6 +22,7 @@ from polymarket.streams import MarketSpec
 from .prediction_arbitrage import (
     BookLevel,
     ConfirmedBooks,
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
     MarketFacts,
     build_pair_intent,
     monitored_event_sort_key,
@@ -167,11 +168,16 @@ def _timestamp_or_none(value: object) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
-        number = float(value)
-        if not number == number or number in (float("inf"), float("-inf")):
+        try:
+            number = float(value)
+            if not number == number or number in (float("inf"), float("-inf")):
+                return None
+            # CLOB timestamps are epoch milliseconds; small values are seconds.
+            parsed = datetime.fromtimestamp(
+                number / (1000 if number > 10_000_000_000 else 1), UTC
+            )
+        except (OverflowError, OSError, ValueError):
             return None
-        # CLOB timestamps are epoch milliseconds; small values are seconds.
-        parsed = datetime.fromtimestamp(number / (1000 if number > 10_000_000_000 else 1), UTC)
     elif isinstance(value, str):
         text = value.strip()
         if text.endswith("Z"):
@@ -2301,7 +2307,18 @@ class PolymarketMonitor:
                 if token in self._relation_books
             )
             confirmed_age = _age(now, confirmed_at)
-            end_date = _timestamp_or_none(relation.market_b.end_date)
+            end_a = _timestamp_or_none(relation.market_a.end_date)
+            end_b = _timestamp_or_none(relation.market_b.end_date)
+            end_date = (
+                end_a
+                if end_a is not None
+                and end_b is not None
+                and end_a == end_b
+                else None
+            )
+            resolution_at = (
+                relation.market_a.end_date if end_date is not None else None
+            )
             remaining_days = (
                 Decimal(str((end_date - now).total_seconds()))
                 / Decimal("86400")
@@ -2347,6 +2364,10 @@ class PolymarketMonitor:
                 or safe_intent.total_max_cost > allowance
             ):
                 eligibility_reason = "insufficient_funds"
+            elif status == "approved" and annualized is None:
+                eligibility_reason = "annualized_yield_unavailable"
+            elif status == "approved" and annualized < MIN_THRESHOLD_ANNUALIZED_YIELD:
+                eligibility_reason = "annualized_yield_below_minimum"
             actionable = status == "approved" and eligibility_reason == "actionable"
             intent = safe_intent
             row = self._relation_row(
@@ -2357,7 +2378,7 @@ class PolymarketMonitor:
                 volume=self._relation_volumes.get(relation.relation_id, Decimal("0")),
                 confirmed_at=confirmed_at,
                 confirmed_age=confirmed_age,
-                resolution_at=relation.market_b.end_date,
+                resolution_at=resolution_at,
                 remaining_days=remaining_days,
                 annualized=annualized,
                 actionable=actionable,
@@ -2592,8 +2613,8 @@ class PolymarketMonitor:
             )
         self._sync_event_rows()
 
-    @staticmethod
     def _relation_row(
+        self,
         relation: ThresholdRelation,
         candidate: ThresholdHedgeIntent,
         intent: ThresholdHedgeIntent | None,
@@ -2602,7 +2623,7 @@ class PolymarketMonitor:
         volume: Decimal,
         confirmed_at: datetime,
         confirmed_age: float,
-        resolution_at: str,
+        resolution_at: str | None,
         remaining_days: Decimal | None,
         annualized: Decimal | None,
         actionable: bool,
@@ -2620,13 +2641,14 @@ class PolymarketMonitor:
         legs = (selected.leg_a, selected.leg_b)
         structured = getattr(validation, "structured_result", None)
         proof = structured.get("proof") if isinstance(structured, Mapping) else None
-        return {
+        question = f"{relation.market_a.question} / {relation.market_b.question}"
+        row = {
             "opportunity_id": relation.relation_id,
             "relation_id": relation.relation_id,
             "event_id": relation.event_id,
             "market_id": relation.relation_id,
             "market_type": "threshold_hedge",
-            "question": f"{relation.market_a.question} / {relation.market_b.question}",
+            "question": question,
             "question_a": relation.market_a.question,
             "question_b": relation.market_b.question,
             "condition_id_a": relation.market_a.condition_id,
@@ -2707,6 +2729,12 @@ class PolymarketMonitor:
             "cache_key": getattr(validation, "cache_key", ""),
             "intent": intent,
         }
+        translated = self._cached_title_zh(row["question"])
+        if translated:
+            row["title_zh"] = translated
+            row["event_title_zh"] = translated
+        self._enqueue_title_translations([{"title": row["question"]}])
+        return row
 
     def _normalize_event(self, value: object) -> dict[str, object] | None:
         event_id = _value(value, "id", "event_id", "eventId", default=None)
@@ -3148,6 +3176,15 @@ class PolymarketMonitor:
                     event["title_zh"] = translated
                     event["event_title_zh"] = translated
             for opportunity in self._opportunities.values():
+                if opportunity.get("market_type") == "threshold_hedge":
+                    translated = self._cached_title_zh(opportunity.get("question"))
+                    if translated:
+                        opportunity["event_title_zh"] = translated
+                        opportunity["title_zh"] = translated
+                    else:
+                        opportunity.pop("event_title_zh", None)
+                        opportunity.pop("title_zh", None)
+                    continue
                 event = self._events.get(str(opportunity.get("event_id", "")))
                 if event is None:
                     continue
@@ -3272,6 +3309,10 @@ class PolymarketMonitor:
                     "volume_24h": opportunity.get("volume_24h"),
                     "market_type": opportunity.get("market_type", "standard_binary"),
                     "annualized_yield": opportunity.get("annualized_yield"),
+                    "resolution_at": opportunity.get("resolution_at"),
+                    "remaining_days": opportunity.get("remaining_days"),
+                    "maximum_fee": opportunity.get("maximum_fee"),
+                    "eligibility_reason": opportunity.get("eligibility_reason"),
                     "llm_status": opportunity.get("llm_status"),
                     "llm_reason_codes": opportunity.get("llm_reason_codes"),
                     "rules_verified_at": opportunity.get("rules_verified_at"),

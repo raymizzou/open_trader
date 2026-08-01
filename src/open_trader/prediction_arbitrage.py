@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Literal, Mapping
 
 
@@ -13,6 +13,7 @@ MIN_ESTIMATED_PROFIT = Decimal("1.00")
 MAX_NORMAL_COST = Decimal("20.00")
 MAX_WALLET_BALANCE = Decimal("65.00")
 MAX_EMERGENCY_LOSS = Decimal("2.00")
+MIN_THRESHOLD_ANNUALIZED_YIELD = Decimal("0.15")
 COLLATERAL_SPEND_QUANTUM = Decimal("0.01")
 PROTECTED_BUY_SHARE_PRECISION = {
     Decimal("0.1"): 3,
@@ -300,22 +301,54 @@ def _book_segments(
 def _protected_buy_candidates(
     segments: list[tuple[Decimal, Decimal, Decimal]], tick_size: Decimal
 ) -> dict[Decimal, Decimal]:
+    precision = PROTECTED_BUY_SHARE_PRECISION.get(
+        tick_size,
+        max(5, -tick_size.as_tuple().exponent + 1),
+    )
+    scale = 10**precision
+    spend_numerator, spend_denominator = COLLATERAL_SPEND_QUANTUM.as_integer_ratio()
+    prepared: list[tuple[int, int, int, int]] = []
+    for price, previous_depth, total_depth in segments:
+        price_numerator, price_denominator = price.as_integer_ratio()
+        prepared.append(
+            (
+                scale * price_denominator * spend_numerator,
+                price_numerator * spend_denominator,
+                int(
+                    (previous_depth * scale).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                )
+                + 1,
+                int(
+                    (total_depth * scale).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                ),
+            )
+        )
     candidates: dict[Decimal, Decimal] = {}
     for cents in range(1, 2001):
-        spend = COLLATERAL_SPEND_QUANTUM * cents
-        for price, previous_depth, total_depth in segments:
-            quantity = protected_buy_quantity(
-                spend=spend,
-                price=price,
-                tick_size=tick_size,
+        low = 0
+        high = len(prepared)
+        while low < high:
+            middle = (low + high) // 2
+            multiplier, denominator, _, maximum_units = prepared[middle]
+            quantity_units = (cents * multiplier + denominator - 1) // denominator
+            if quantity_units <= maximum_units:
+                high = middle
+            else:
+                low = middle + 1
+        if low == len(prepared):
+            continue
+        multiplier, denominator, minimum_units, maximum_units = prepared[low]
+        quantity_units = (cents * multiplier + denominator - 1) // denominator
+        if minimum_units <= quantity_units <= maximum_units:
+            quantity = Decimal(quantity_units).scaleb(-precision)
+            candidates.setdefault(
+                quantity,
+                COLLATERAL_SPEND_QUANTUM * cents,
             )
-            if quantity is None:
-                break
-            if previous_depth < quantity <= total_depth:
-                old_spend = candidates.get(quantity)
-                if old_spend is None or spend < old_spend:
-                    candidates[quantity] = spend
-                break
     return candidates
 
 

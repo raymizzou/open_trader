@@ -136,6 +136,7 @@ class ThresholdMonitor(FakeMonitor):
         self.codex_status = "approved"
         self.book_age_seconds = Decimal("1")
         self.remediation_safe = True
+        self.annualized_yield: object = Decimal("0.20")
 
     def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
         if opportunity_id != "threshold-opp-1":
@@ -198,6 +199,7 @@ class ThresholdMonitor(FakeMonitor):
             "minimum_profit": intent.minimum_profit,
             "estimated_profit": intent.minimum_profit,
             "net_edge": intent.net_edge,
+            "annualized_yield": self.annualized_yield,
         }
 
 
@@ -1027,6 +1029,7 @@ def test_two_service_instances_reserve_one_notification_attempt(tmp_path: Path) 
         "relayer",
         "emergency_unwind",
         "preflight",
+        "annualized",
     ),
 )
 def test_ready_notification_fails_closed_when_any_preflight_check_fails(
@@ -1063,6 +1066,8 @@ def test_ready_notification_fails_closed_when_any_preflight_check_fails(
         monitor.remediation_safe = False
     elif failure == "preflight":
         trading.threshold_preflight_result = {"result": "FAIL"}
+    elif failure == "annualized":
+        monitor.annualized_yield = Decimal("0.149999")
 
     result = service.notify_ready_opportunity("threshold-opp-1", signal_id)
 
@@ -1369,6 +1374,32 @@ def test_threshold_preview_preserves_both_market_questions_for_confirmation(
     assert preview["llm_status"] == "approved"
     assert preview["llm_decision"] == "APPROVE"
     assert preview["llm_summary"] == "The higher threshold implies the lower threshold."
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_state", "expected_reason"),
+    [
+        (None, "rejected", "annualized_yield_unavailable"),
+        ("NaN", "rejected", "annualized_yield_unavailable"),
+        ("Infinity", "rejected", "annualized_yield_unavailable"),
+        (Decimal("0.149999"), "rejected", "annualized_yield_below_minimum"),
+        (Decimal("0.15"), "previewed", None),
+    ],
+)
+def test_threshold_preview_enforces_annualized_floor(
+    tmp_path: Path,
+    value: object,
+    expected_state: str,
+    expected_reason: str | None,
+) -> None:
+    service, _, _, monitor = threshold_execution_fixture(tmp_path)
+    monitor.annualized_yield = value
+
+    result = service.preview("threshold-opp-1")
+
+    assert result["state"] == expected_state
+    if expected_reason is not None:
+        assert result["reason"] == expected_reason
 
 
 def test_preview_returns_busy_when_execution_is_active(tmp_path: Path) -> None:
