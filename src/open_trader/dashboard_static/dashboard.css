@@ -5651,6 +5651,7 @@ table {
 .pm-event summary { align-items: center; display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto auto; list-style: none; min-height: 56px; padding: 10px 12px; }
 .pm-event summary::-webkit-details-marker { display: none; }
 .pm-event-title { font-weight: 750; line-height: 1.35; min-width: 0; }
+.pm-event-title .pm-title-en:first-child { color: inherit; font-size: inherit; margin-top: 0; }
 .pm-event-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
 .pm-volume { font-weight: 800; text-align: right; }
 .pm-volume span { color: var(--muted); display: block; font-size: 10px; font-weight: 600; }

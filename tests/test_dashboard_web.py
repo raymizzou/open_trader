@@ -5175,6 +5175,9 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "data-prediction-history-panel" in js
     assert "signalPollId" in js
     assert "signalRequestInFlight" in js
+    assert "signalPollEpoch" in js
+    assert "predictionTradingAvailable(currentState)" in js
+    assert "row.live_profit ?? row.estimated_profit ?? row.profit" not in js
     for copy in ("免手续费", "可能只成交一腿", "24h 成交量"):
         assert copy in js
     for fabricated in (
@@ -5204,6 +5207,9 @@ state.predictionMarket.signalError = "";
 const payload = {
   status: "healthy",
   health: {status: "healthy", degraded_reasons: []},
+  readiness: {status: "ready", geoblock: "allowed", relayer: "ready", balance: "50.00", wallet_address: "0xwallet"},
+  policy_limits: {max_wallet_balance: "65", max_normal_cost: "20", max_emergency_loss: "2", min_estimated_profit: "1"},
+  breaker: {open: false},
   events: [],
   opportunities: [],
   histories: {signals: [
@@ -5211,10 +5217,14 @@ const payload = {
     {occurred_at: "2026-08-01T01:58:00Z", event_title: "Closed market", ended_at: "2026-08-01T01:58:12Z", initial_profit: "0.20", live_profit: "0.22", actionable_now: true, opportunity_id: "opp-2", notification_state: "failed"},
   ]},
 };
+state.predictionMarket.payload = payload;
 const open = predictionYesNoWorkspace(payload, new Set());
 state.predictionMarket.signalError = "history 503";
 const failed = predictionYesNoWorkspace(payload, new Set());
-console.log(JSON.stringify({open, failed}));
+state.predictionMarket.signalError = "";
+state.predictionMarket.payload = {...payload, stale: true};
+const stale = predictionYesNoWorkspace(payload, new Set());
+console.log(JSON.stringify({open, failed, stale}));
 ''')
     rendered = json.loads(output)
     for html in (rendered["open"], rendered["failed"]):
@@ -5226,9 +5236,21 @@ console.log(JSON.stringify({open, failed}));
     assert rendered["open"].index("中文标的") < rendered["open"].index("English market")
     assert 'data-action="participate"' in rendered["open"]
     assert 'data-action="participate"' not in rendered["failed"]
+    assert 'data-action="participate"' not in rendered["stale"]
     assert 'data-label="实时利润"' in rendered["open"]
     assert "—" in rendered["failed"]
+    assert "+$0.38" in rendered["open"]
+    assert "+$0.22" not in rendered["open"]
     assert "仅监控" not in rendered["open"] + rendered["failed"]
+
+
+def test_prediction_signal_poll_stop_preserves_inflight_request_guard() -> None:
+    output = run_dashboard_js(r'''
+state.predictionMarket.signalRequestInFlight = true;
+stopPredictionSignalPolling();
+console.log(JSON.stringify({inFlight: state.predictionMarket.signalRequestInFlight, epoch: state.predictionMarket.signalPollEpoch}));
+''')
+    assert json.loads(output) == {"inFlight": True, "epoch": 1}
 
 
 def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:

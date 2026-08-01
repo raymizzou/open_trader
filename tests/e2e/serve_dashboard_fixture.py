@@ -51,7 +51,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "actionable": scenario in {"ready", "confirmation", "executing", "success", "success-incomplete", "incomplete"},
     }
     events = [
-        {"event_id": "event-ceasefire", "title": "以色列与伊朗停火是否持续至 8 月 31 日？", "volume_24h": "9700000", "markets": "1 个普通二元市场", "profit": "1.20", "actionable": opportunity["actionable"], "details": [["停火持续至 8 月 31 日？", "普通二元 · 免手续费 · 已订阅"], ["当前执行条件", "20 组 · 最多 $18.80 · 可参与"]], "opportunities": [opportunity]},
+        {"event_id": "event-ceasefire", "title": "Will the Israel-Iran ceasefire continue through August 31, 2026?", "title_zh": "以色列与伊朗停火是否持续至 8 月 31 日？", "volume_24h": "9700000", "markets": "1 个普通二元市场", "profit": "1.20", "actionable": opportunity["actionable"], "details": [["停火持续至 8 月 31 日？", "普通二元 · 免手续费 · 已订阅"], ["当前执行条件", "20 组 · 最多 $18.80 · 可参与"]], "opportunities": [opportunity]},
         {"event_id": "event-btc", "title": "比特币会在 8 月突破 $150,000？", "volume_24h": "12800000", "markets": "2 个市场", "profit": "4.60", "actionable": False, "opportunities": [{"title": "主要二元市场", "volume_24h": "12800000", "actionable": False, "reason": "已订阅 · 收费市场不可参与"}]},
         {"event_id": "event-fed", "title": "2026 年 9 月美联储是否降息？", "volume_24h": "15400000", "markets": "8 个市场", "profit": "3.80", "actionable": False, "opportunities": [{"title": "多结果事件市场", "volume_24h": "15400000", "actionable": False, "reason": "已订阅 · Negative Risk 暂不可参与"}]},
         {"event_id": "event-eth", "title": "以太坊会在 9 月前突破 $6,000？", "volume_24h": "7100000", "markets": "2 个市场", "profit": "2.10", "actionable": False, "opportunities": [{"title": "主要二元市场", "volume_24h": "7100000", "actionable": False, "reason": "已订阅 · 净利润未达到策略门槛"}]},
@@ -169,6 +169,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         payload["opportunities"] = [opportunity, approved_threshold, rejected_threshold]
         payload["relation_discovery"] = {
             "status": "healthy",
+            "catalog": {"status": "healthy"},
             "scan_logs": [
                 {"phase": "full_scan", "events": 428, "candidates": 14},
                 {"phase": "books", "positive": 2, "actionable": 1},

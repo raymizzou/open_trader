@@ -56,6 +56,7 @@ const state = {
     signalRequestInFlight: false,
     signalLastSuccessAt: "",
     signalError: "",
+    signalPollEpoch: 0,
     csrfToken: "",
     activeExecutionId: "",
   },
@@ -2091,6 +2092,8 @@ function predictionHealthIsNormal(payload) {
 }
 
 function predictionWatcherIsConnected(payload) {
+  const overall = String(payload?.status || payload?.health?.status || "").trim().toLowerCase();
+  if (["unavailable", "unknown", "mystery", "error", "failed"].includes(overall)) return false;
   const websocket = payload?.relation_discovery?.websocket;
   const status = String(websocket?.status || "").trim().toLowerCase();
   if (status) return status === "connected";
@@ -2463,6 +2466,10 @@ function predictionEventRows(payload, expandedEventKeys = new Set()) {
     const incomplete = claimedActionable && !completeActionable;
     const actionable = completeActionable && predictionTradingAvailable(payload);
     const title = event.title || event.event_title || opportunity.event_title || opportunity.title || "数据未返回";
+    const titleZh = String(event.title_zh || event.event_title_zh || "").trim();
+    const titleMarkup = titleZh
+      ? `<span class="pm-title-zh">${escapeHtml(titleZh)}</span><span class="pm-title-en">${escapeHtml(title)}</span>`
+      : `<span class="pm-title-en">${escapeHtml(title)}</span>`;
     const volume = event.volume_24h ?? opportunity.volume_24h;
     const rawDetails = Array.isArray(event.details) ? event.details : nested.length ? nested.map((item) => [item.title || item.market_title || "市场", item.actionable ? "可参与" : predictionReasonLabel(item.reason || item.eligibility_reason || item.status)]) : [[event.market_title || "市场", event.actionable ? "可参与" : predictionReasonLabel(event.reason || event.eligibility_reason || event.status)]];
     const unavailableLabel = incomplete ? "数据不完整" : "暂不可参与";
@@ -2483,7 +2490,7 @@ function predictionEventRows(payload, expandedEventKeys = new Set()) {
     const stateMarkup = displayStatus
       ? `<div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(displayStatus)}</div>`
       : "";
-    return `<details class="pm-event" data-event-key="${escapeHtml(eventKey)}"${expandedEventKeys.has(eventKey) ? " open" : ""}><summary><div><div class="pm-event-title">${escapeHtml(title)}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div>${stateMarkup}</summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
+    return `<details class="pm-event" data-event-key="${escapeHtml(eventKey)}"${expandedEventKeys.has(eventKey) ? " open" : ""}><summary><div><div class="pm-event-title">${titleMarkup}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div>${stateMarkup}</summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
   }).join("");
 }
 
@@ -2763,9 +2770,11 @@ function predictionHistoryContent(payload, kind) {
         ? `<span class="pm-title-zh">${escapeHtml(chinese)}</span><span class="pm-title-en">${escapeHtml(english)}</span>`
         : `<span class="pm-title-en">${escapeHtml(english)}</span>`;
     };
-    const liveProfit = (row) => closed(row) ? "—" : predictionSignedMoney(row.live_profit ?? row.estimated_profit ?? row.profit, "—");
+    const liveProfit = (row) => closed(row) ? "—" : predictionSignedMoney(row.live_profit ?? row.estimated_profit, "—");
     const operation = (row) => {
-      const healthy = !String(state.predictionMarket.signalError || "").trim();
+      const currentState = state.predictionMarket.payload || payload;
+      const healthy = !String(state.predictionMarket.signalError || "").trim()
+        && predictionTradingAvailable(currentState);
       const actionable = row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy;
       return actionable
         ? `<button class="pm-button primary pm-signal-action" type="button" data-action="participate" data-opportunity-id="${escapeHtml(String(row.opportunity_id))}">重新检查</button>`
@@ -2907,11 +2916,11 @@ function startPredictionSignalPolling() {
 }
 
 function stopPredictionSignalPolling() {
+  state.predictionMarket.signalPollEpoch += 1;
   if (state.predictionMarket.signalPollId !== null) {
     window.clearInterval(state.predictionMarket.signalPollId);
     state.predictionMarket.signalPollId = null;
   }
-  state.predictionMarket.signalRequestInFlight = false;
 }
 
 function predictionRequestUrl(path) {
@@ -2951,6 +2960,7 @@ async function fetchPredictionState() {
 async function loadPredictionHistory(kind, options = {}) {
   const panelOnly = options.panelOnly === true;
   if (panelOnly && state.predictionMarket.signalRequestInFlight) return;
+  const requestEpoch = panelOnly ? state.predictionMarket.signalPollEpoch : null;
   if (panelOnly) state.predictionMarket.signalRequestInFlight = true;
   try {
     const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/history?kind=${encodeURIComponent(kind)}&limit=100`), {cache: "no-store", credentials: "same-origin"});
@@ -2973,7 +2983,7 @@ async function loadPredictionHistory(kind, options = {}) {
   } finally {
     if (panelOnly) state.predictionMarket.signalRequestInFlight = false;
   }
-  if (panelOnly) {
+  if (panelOnly && requestEpoch === state.predictionMarket.signalPollEpoch) {
     renderPredictionSignalPanel();
   } else if (kind === state.predictionMarket.historyKind) {
     const panel = elements["prediction-market-root"]?.querySelector("[data-prediction-history-panel]");
