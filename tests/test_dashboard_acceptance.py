@@ -166,7 +166,12 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert '"$(WORKTREE_ROOT)/tests" -q' in makefile
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert (
-        'DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/dashboard/launchd.out.log'
+        'DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log'
+        in makefile
+    )
+    assert 'LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767' in makefile
+    assert (
+        'LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log'
         in makefile
     )
     assert "test:\n\t.venv/bin/python -m pytest -q" in makefile
@@ -346,31 +351,53 @@ def _run_acceptance_main_with_reports(
     tmp_path: Path,
     report_dirs: list[Path],
     *,
+    legacy_pid: int = 456,
     browser_log_text: str = "",
     log_is_directory: bool = False,
     log_read_error: OSError | None = None,
     controller_errors: list[str] | None = None,
+    public_calls: list[str] | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     payloads = iter({"reports_dir": str(path)} for path in report_dirs)
     quote_payloads = iter((valid_quotes_payload(),))
     browser_reports: list[Path | None] = []
-    log_path = tmp_path / "dashboard.log"
+    started_at = datetime.fromisoformat("2026-08-01T12:00:00+08:00")
+    gateway_log = tmp_path / "gateway.log"
+    legacy_log = tmp_path / "legacy.log"
+    gateway_log.write_text(
+        "frontend_gateway_runtime: "
+        + json.dumps({
+            "pid": 123,
+            "git_sha": "accepted-sha",
+            "cwd": str(worktree.resolve()),
+            "source_state": "clean",
+            "started_at": "2026-08-01T12:00:01+08:00",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
     if log_is_directory:
-        log_path.mkdir()
+        legacy_log.mkdir()
     else:
-        log_path.write_text(
-            'dashboard_runtime: {"pid": 123, "git_sha": "accepted-sha", '
-            '"cwd": "' + str(worktree.resolve()) + '", "source_state": "clean", '
-            '"started_at": "2026-07-18T12:00:01+08:00"}\n',
+        legacy_log.write_text(
+            "dashboard_runtime: "
+            + json.dumps({
+                "pid": legacy_pid,
+                "git_sha": "accepted-sha",
+                "cwd": str(worktree.resolve()),
+                "source_state": "clean",
+                "started_at": "2026-08-01T12:00:01+08:00",
+            })
+            + "\n",
             encoding="utf-8",
         )
     if log_read_error is not None:
         original_read_text = Path.read_text
 
         def read_text(path: Path, *args: object, **kwargs: object) -> str:
-            if path == log_path:
+            if path == legacy_log:
                 raise log_read_error
             return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -383,9 +410,28 @@ def _run_acceptance_main_with_reports(
         "_latest_phillips_expectation",
         lambda data_dir: (Decimal("1"), "2026-07"),
     )
-    monkeypatch.setattr(
-        dashboard_acceptance, "_listener", lambda url: (123, worktree.resolve())
-    )
+    listeners = {
+        "http://127.0.0.1:8766": (123, worktree.resolve()),
+        "http://127.0.0.1:8767": (legacy_pid, worktree.resolve()),
+    }
+    health = {
+        "http://127.0.0.1:8766": {
+            **_runtime_health(
+                worktree.resolve(),
+                module="frontend_gateway",
+                schema="open_trader.frontend_gateway.health.v1",
+                pid=123,
+            ),
+            "upstream_status": "ok",
+        },
+        "http://127.0.0.1:8767": _runtime_health(
+            worktree.resolve(),
+            module="legacy_dashboard",
+            schema="open_trader.legacy_dashboard.health.v1",
+            pid=legacy_pid,
+        ),
+    }
+    monkeypatch.setattr(dashboard_acceptance, "_listener", lambda url: listeners[url])
     monkeypatch.setattr(
         dashboard_acceptance.subprocess,
         "check_output",
@@ -394,7 +440,7 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(
         dashboard_acceptance,
         "_process_started_at",
-        lambda *_args: datetime.fromisoformat("2026-07-18T12:00:00+08:00"),
+        lambda *_args: started_at,
     )
     monkeypatch.setattr(
         dashboard_acceptance, "_source_changes", lambda *_args: []
@@ -404,12 +450,25 @@ def _run_acceptance_main_with_reports(
         "_expected_cn_holdings",
         lambda *_args: 2,
     )
-    monkeypatch.setattr(
-        dashboard_acceptance, "_fetch_payload", lambda url: next(payloads)
-    )
-    monkeypatch.setattr(
-        dashboard_acceptance, "_fetch_quotes_payload", lambda url: next(quote_payloads)
-    )
+    def record_public(url: str) -> None:
+        if public_calls is not None:
+            public_calls.append(url)
+
+    def fetch_payload(url: str) -> dict[str, object]:
+        record_public(url)
+        return next(payloads)
+
+    def fetch_quotes(url: str) -> dict[str, object]:
+        record_public(url)
+        return next(quote_payloads)
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_payload", fetch_payload)
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_quotes_payload", fetch_quotes)
+    def health_payload(url: str, path: str) -> dict[str, object]:
+        assert path == "/healthz"
+        return health[url]
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", health_payload)
     monkeypatch.setattr(
         dashboard_acceptance.time,
         "sleep",
@@ -455,16 +514,18 @@ def _run_acceptance_main_with_reports(
         history_expectations: object = None,
     ) -> tuple[list[str], None]:
         del simulate_payloads, history_expectations
+        record_public(url)
         browser_reports.append(reports_dir)
         if browser_log_text:
-            with log_path.open("a", encoding="utf-8") as handle:
+            with legacy_log.open("a", encoding="utf-8") as handle:
                 handle.write(browser_log_text)
         return [], None
 
     monkeypatch.setattr(dashboard_acceptance, "_browser_check", browser_check)
     status = dashboard_acceptance.main([
         "--expected-root", str(worktree),
-        "--log", str(log_path),
+        "--log", str(gateway_log),
+        "--legacy-log", str(legacy_log),
     ])
     result = json.loads(capsys.readouterr().out)
     return status, result, browser_reports
@@ -485,6 +546,146 @@ def test_acceptance_main_passes_external_api_reports_dir_to_browser_check(
     assert status == 0
     assert result["status"] == "PASS"
     assert browser_reports == [external.resolve()]
+
+
+def test_acceptance_main_reports_distinct_dual_runtime_pids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch, capsys, tmp_path, [reports, reports]
+    )
+
+    assert status == 0
+    assert result["pid"] == 123
+    assert result["gateway_pid"] == 123
+    assert result["legacy_pid"] == 456
+
+
+def test_acceptance_rejects_missing_legacy_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_listener",
+        lambda _url: (_ for _ in ()).throw(
+            RuntimeError("端口 8767 没有唯一监听进程")
+        ),
+    )
+
+    pid, cwd, started_at, errors = dashboard_acceptance._runtime_evidence(
+        "Legacy Dashboard",
+        url="http://127.0.0.1:8767",
+        expected_schema="open_trader.legacy_dashboard.health.v1",
+        expected_module="legacy_dashboard",
+        expected_root=tmp_path,
+        expected_sha="accepted-sha",
+    )
+
+    assert pid is None
+    assert cwd == tmp_path.resolve()
+    assert started_at is None
+    assert any("Legacy Dashboard" in error and "唯一监听" in error for error in errors)
+
+
+def test_acceptance_rejects_listener_cwd_and_running_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrong = tmp_path / "wrong"
+    wrong.mkdir()
+    monkeypatch.setattr(
+        dashboard_acceptance, "_listener", lambda _url: (456, wrong.resolve())
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_process_started_at",
+        lambda _pid: datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_source_changes", lambda _cwd: [])
+    monkeypatch.setattr(
+        dashboard_acceptance.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: "old-sha\n",
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_fetch_json_path",
+        lambda *_args: _runtime_health(
+            tmp_path,
+            module="legacy_dashboard",
+            schema="open_trader.legacy_dashboard.health.v1",
+            pid=456,
+        ),
+    )
+
+    _, _, _, errors = dashboard_acceptance._runtime_evidence(
+        "Legacy Dashboard",
+        url="http://127.0.0.1:8767",
+        expected_schema="open_trader.legacy_dashboard.health.v1",
+        expected_module="legacy_dashboard",
+        expected_root=tmp_path,
+        expected_sha="accepted-sha",
+    )
+
+    assert any("工作目录" in error for error in errors)
+    assert any("运行 Git SHA" in error for error in errors)
+
+
+def test_make_acceptance_wires_gateway_and_legacy_runtime_logs() -> None:
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
+
+    assert "logs/frontend_gateway/launchd.out.log" in makefile
+    assert "LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767" in makefile
+    assert "logs/legacy_dashboard/launchd.out.log" in makefile
+    assert '--legacy-url "$(LEGACY_DASHBOARD_URL)"' in makefile
+    assert '--legacy-log "$(LEGACY_DASHBOARD_LOG)"' in makefile
+
+
+def test_acceptance_main_rejects_same_gateway_and_legacy_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        legacy_pid=123,
+    )
+
+    assert status == 1
+    assert result["status"] == "FAIL"
+    assert any("不同 PID" in error for error in result["errors"])
+
+
+def test_acceptance_business_and_browser_checks_stay_on_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    calls: list[str] = []
+
+    status, _, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        public_calls=calls,
+    )
+
+    assert status == 0
+    assert calls
+    assert set(calls) == {"http://127.0.0.1:8766"}
 
 
 def test_acceptance_main_fails_when_reports_dir_changes_during_refresh(

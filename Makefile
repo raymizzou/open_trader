@@ -4,7 +4,9 @@ WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
 
 DASHBOARD_URL ?= http://127.0.0.1:8766
-DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/dashboard/launchd.out.log
+DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log
+LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767
+LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log
 SKIP_POLYMARKET_LIVE ?= 0
 test:
 	.venv/bin/python -m pytest -q
@@ -36,4 +38,6 @@ endif
 		PYTHONPATH=src .venv/bin/python -m open_trader.dashboard_acceptance \
 		--url "$(DASHBOARD_URL)" \
 		--log "$(DASHBOARD_LOG)" \
+		--legacy-url "$(LEGACY_DASHBOARD_URL)" \
+		--legacy-log "$(LEGACY_DASHBOARD_LOG)" \
 		--expected-root "$(CURDIR)"
