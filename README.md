@@ -414,12 +414,16 @@ Browser → Frontend Gateway → Legacy Dashboard
 `http://127.0.0.1:8766/` is the only user and review URL. The Legacy listener
 on `8767` owns the existing backend behavior and must remain loopback-only.
 
-Install or refresh both processes with one command:
+On the first install, create the preserved single-process rollback plist before
+cutting over to the stack. After that bootstrap, stack refreshes use one command:
 
 ```bash
 scripts/install_dashboard_launchd.sh --dry-run
+scripts/install_dashboard_launchd.sh --mode single
 scripts/install_dashboard_launchd.sh
 ```
+
+For an existing stack, run the dry-run and stack-install commands only.
 
 Check both jobs, listeners, health identities, the forwarded quotes API, and
 fresh startup logs:
@@ -702,7 +706,7 @@ scripts/install_daily_premarket_launchd.sh \
   --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --trend-only --market all
 
-scripts/install_dashboard_launchd.sh
+scripts/install_dashboard_launchd.sh --mode stack
 ```
 
 For each CN/HK/US status document, verify the PID is live, `working_directory`

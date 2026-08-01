@@ -37,8 +37,10 @@ will state:
 
 - `8766` is the only user and review URL;
 - `8767` is an internal Legacy Dashboard endpoint and must not be exposed;
-- `scripts/install_dashboard_launchd.sh` installs or refreshes the two-process
-  stack;
+- a first install runs `scripts/install_dashboard_launchd.sh --mode single` to
+  create the preserved rollback plist, then
+  `scripts/install_dashboard_launchd.sh` installs the two-process stack; later
+  stack refreshes can use that default command directly;
 - `scripts/install_dashboard_launchd.sh --mode single` restores the preserved
   single-process layout; and
 - the exact commands for checking launchd jobs, listeners, health, and fresh
@@ -66,10 +68,10 @@ handoff sequence:
 
 ### Changelog
 
-The dated `CHANGELOG.md` entry will describe completion of the production
-Gateway cutover and explicitly state that it changes no page, strategy, report,
-execution, or worker behavior. The entry is committed before the candidate SHA
-is accepted or considered for merge.
+The dated `CHANGELOG.md` entry will describe the production Gateway cutover
+documentation and acceptance preparation, and explicitly state that this phase
+changes no page, strategy, report, execution, or worker behavior. The entry is
+committed before the candidate SHA is accepted or considered for merge.
 
 ## Verification and Deployment
 
@@ -80,8 +82,8 @@ Verification runs in this order:
 
 1. focused Frontend Gateway, launchd stack, and dual-runtime acceptance tests;
 2. the complete pytest suite;
-3. candidate stack deployment through
-   `scripts/install_dashboard_launchd.sh`;
+3. candidate stack deployment through the existing installer, running
+   `--mode single` first when the preserved rollback plist is absent;
 4. direct checks for independent `8766` and `8767` listeners, correct module
    identities from both health endpoints, Gateway `upstream_status=ok`, and one
    successful `/api/*` request through `8766`;

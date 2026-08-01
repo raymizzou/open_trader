@@ -70,12 +70,16 @@ Browser → Frontend Gateway → Legacy Dashboard
 `http://127.0.0.1:8766/` is the only user and review URL. The Legacy listener
 on `8767` owns the existing backend behavior and must remain loopback-only.
 
-Install or refresh both processes with one command:
+On the first install, create the preserved single-process rollback plist before
+cutting over to the stack. After that bootstrap, stack refreshes use one command:
 
 ```bash
 scripts/install_dashboard_launchd.sh --dry-run
+scripts/install_dashboard_launchd.sh --mode single
 scripts/install_dashboard_launchd.sh
 ```
+
+For an existing stack, run the dry-run and stack-install commands only.
 
 Check both jobs, listeners, health identities, the forwarded quotes API, and
 fresh startup logs:
@@ -140,10 +144,11 @@ schema, and uninstall instructions unchanged.
 
 - [ ] **Step 4: Add the dated operator-facing changelog entry**
 
-Add this bullet at the top of the existing `2026-08-01` section:
+Add this pre-gate documentation and acceptance-preparation bullet at the top of
+the existing `2026-08-01` section:
 
 ```markdown
-- 完成 Frontend Gateway Phase 0 生产交付：README 与运维手册现在明确稳定的 `8766` 用户入口、内部 `8767` Legacy Dashboard、单命令双进程 stack 安装、双运行时诊断及 `--mode single` 回滚，并要求最终 PASS 后重新部署完全相同的 accepted SHA。本阶段没有页面、策略、报告、执行或 worker 行为变化。
+- 补齐 Frontend Gateway Phase 0 生产交付文档与验收准备：README 与运维手册现在明确稳定的 `8766` 用户入口、内部 `8767` Legacy Dashboard、首次安装先生成保留回滚 plist 后再执行双进程 stack 安装、双运行时诊断及 `--mode single` 回滚，并要求最终 PASS 后重新部署完全相同的 accepted SHA。本阶段没有页面、策略、报告、执行或 worker 行为变化。
 ```
 
 - [ ] **Step 5: Check documentation consistency**
@@ -252,7 +257,8 @@ verification failure requires a new committed candidate and a complete rerun.
 ### Task 3: Deploy And Directly Verify The Candidate Stack
 
 **Files:**
-- Execute: `scripts/install_dashboard_launchd.sh`
+- Execute: `scripts/install_dashboard_launchd.sh --mode single` once when the
+  preserved rollback plist is absent, then `--mode stack` for the candidate;
 - Execute: `scripts/install_account_sync_launchd.sh`
 - Execute: `scripts/install_daily_premarket_launchd.sh`
 - Inspect: `logs/frontend_gateway/launchd.out.log`
@@ -267,6 +273,11 @@ verification failure requires a new committed candidate and a complete rerun.
 - [ ] **Step 1: Deploy every process used by final acceptance**
 
 ```bash
+scripts/install_dashboard_launchd.sh --mode single \
+  --repo-root "$PWD" \
+  --runtime-root /Users/ray/projects/open_trader \
+  --python /Users/ray/projects/open_trader/.venv/bin/python
+
 scripts/install_dashboard_launchd.sh --mode stack \
   --repo-root "$PWD" \
   --runtime-root /Users/ray/projects/open_trader \
@@ -343,7 +354,7 @@ or mismatched process identity must be fixed before the final gate.
 
 **Files:**
 - Execute: `Makefile:14-49`
-- Execute: `scripts/install_dashboard_launchd.sh`
+- Execute: `scripts/install_dashboard_launchd.sh --mode stack`
 - Inspect: `logs/frontend_gateway/launchd.out.log`
 - Inspect: `logs/legacy_dashboard/launchd.out.log`
 - External write: GitHub Issue #17 only
@@ -458,7 +469,9 @@ open. Do not merge or push.
 
 ## Plan Self-Review
 
-- README stable URL, internal port, single install command, dual-process diagnostics, and executable rollback map to Task 1 Step 2.
+- README stable URL, internal port, first-install rollback-plist bootstrap,
+  stack refresh command, dual-process diagnostics, and executable rollback map
+  to Task 1 Step 2.
 - The dated changelog and explicit no-behavior-change boundary map to Task 1 Step 4 and precede candidate freezing.
 - Focused and complete pytest evidence maps to Task 2 Steps 2-3.
 - Candidate deployment plus two jobs, listeners, health identities, and one forwarded API map to Task 3 Steps 1-2.

@@ -35,7 +35,13 @@
 scripts/install_dashboard_launchd.sh --dry-run
 ```
 
-正式安装会先验证当前 `8766` 和 Legacy `8767`，确认 Legacy health 通过后才停止
+首次安装必须先生成保留的单进程回滚 plist；已有该 plist 的 stack 刷新可跳过此步：
+
+```bash
+scripts/install_dashboard_launchd.sh --mode single
+```
+
+随后正式 stack 安装会先验证当前 `8766` 和 Legacy `8767`，确认 Legacy health 通过后才停止
 旧的 `8766` job，再启动 Gateway。任何未知 listener 或 Gateway readiness 失败都会
 拒绝切换或自动恢复旧单进程，并验证 `http://127.0.0.1:8766/` HTTP 200：
 
