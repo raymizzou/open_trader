@@ -196,7 +196,8 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('keeps loading, unavailable, and unknown states fail-closed', async ({ page }) => {
     await openPrediction(page, 'loading');
     await expect(page.locator('.pm-event')).toHaveCount(0);
-    await expect(page.locator('[data-prediction-history-panel] .pm-empty')).toBeVisible();
+    await expect(page.locator('[data-prediction-history-panel] tbody tr')).toHaveCount(3);
+    await expect(page.locator('[data-prediction-history-panel] [data-action="participate"]')).toHaveCount(0);
     await expect(page.locator('.pm-readiness')).toContainText('不可用');
 
     await openPrediction(page, 'unavailable');
