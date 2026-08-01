@@ -779,6 +779,122 @@ def _notification_signal(store: PredictionArbitrageStore) -> str:
     )
 
 
+def _standard_notification_signal(
+    store: PredictionArbitrageStore, *, market_id: str = "market-1"
+) -> str:
+    now = datetime.now(UTC).isoformat()
+    return store.upsert_signal(
+        {
+            "opportunity_id": f"event-standard:{market_id}",
+            "market_id": market_id,
+            "event_id": "event-standard",
+            "event_title": "Will it happen?",
+            "question": "Will it happen?",
+            "market_type": "standard_binary",
+            "started_at": now,
+            "first_positive_at": now,
+            "yes_max_price": Decimal("0.40"),
+            "no_max_price": Decimal("0.40"),
+            "quantity": Decimal("10"),
+            "total_max_cost": Decimal("8.00"),
+            "estimated_profit": Decimal("2.00"),
+            "profit": Decimal("2.00"),
+            "notification_state": "pending",
+            "notification_attempts": 0,
+        }
+    )
+
+
+def standard_notification_fixture(tmp_path: Path):
+    service, trading, store, monitor = execution_fixture(tmp_path)
+    macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    return service, trading, store, monitor, macos, feishu
+
+
+def test_notify_ready_opportunity_standard_sends_feishu_observation_without_preflight(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _monitor, macos, feishu = standard_notification_fixture(tmp_path)
+    signal_id = _standard_notification_signal(store)
+    service._prepare_opportunity = lambda *_args: pytest.fail(  # type: ignore[method-assign]
+        "standard observation must not prepare an order"
+    )
+
+    result = service.notify_ready_opportunity("opp-1", signal_id)
+
+    assert result == {"state": "sent", "signal_id": signal_id}
+    assert feishu.calls == 1
+    assert macos.calls == 0
+    assert trading.preflight_calls == 0
+    assert trading.batch_calls == 0
+    assert store.active_execution() is None
+    assert store.signal(signal_id)["notification_state"] == "sent"  # type: ignore[index]
+
+
+def test_notify_ready_opportunity_standard_suppresses_same_market_within_cooldown(
+    tmp_path: Path,
+) -> None:
+    service, _trading, store, _monitor, _macos, feishu = standard_notification_fixture(tmp_path)
+    first_signal = _standard_notification_signal(store)
+    assert service.notify_ready_opportunity("opp-1", first_signal)["state"] == "sent"
+    store.close_signal(
+        "market-1", ended_at=datetime.now(UTC).isoformat(), reason="data_unavailable"
+    )
+    second_signal = _standard_notification_signal(store)
+
+    result = service.notify_ready_opportunity("opp-1", second_signal)
+
+    assert result == {"state": "ignored", "reason": "market_cooldown"}
+    assert feishu.calls == 1
+    current = store.signal(second_signal)
+    assert current["notification_state"] == "suppressed"  # type: ignore[index]
+    assert current["notification_suppressed_reason"] == "market_cooldown"  # type: ignore[index]
+
+
+def test_notify_ready_opportunity_standard_cooldown_ignores_failed_delivery(
+    tmp_path: Path,
+) -> None:
+    service, _trading, store, _monitor, _macos, feishu = standard_notification_fixture(tmp_path)
+    feishu.fail = True
+    first_signal = _standard_notification_signal(store)
+    assert service.notify_ready_opportunity("opp-1", first_signal)["state"] == "failed"
+    store.close_signal(
+        "market-1", ended_at=datetime.now(UTC).isoformat(), reason="data_unavailable"
+    )
+    feishu.fail = False
+    second_signal = _standard_notification_signal(store)
+
+    result = service.notify_ready_opportunity("opp-1", second_signal)
+
+    assert result == {"state": "sent", "signal_id": second_signal}
+    assert feishu.calls == 2
+
+
+def test_notify_ready_opportunity_standard_retries_three_times_and_stops_when_closed(
+    tmp_path: Path,
+) -> None:
+    service, _trading, store, _monitor, _macos, feishu = standard_notification_fixture(tmp_path)
+    feishu.fail = True
+    signal_id = _standard_notification_signal(store)
+
+    for _ in range(3):
+        assert service.notify_ready_opportunity("opp-1", signal_id)["state"] == "failed"
+    assert service.notify_ready_opportunity("opp-1", signal_id) == {
+        "state": "ignored",
+        "reason": "notification_attempts_exhausted",
+    }
+    assert feishu.calls == 3
+    assert store.signal(signal_id)["notification_attempts"] == 3  # type: ignore[index]
+
+    store.close_signal(
+        "market-1", ended_at=datetime.now(UTC).isoformat(), reason="data_unavailable"
+    )
+    assert service.notify_ready_opportunity("opp-1", signal_id) == {
+        "state": "ignored",
+        "reason": "signal_closed",
+    }
+
+
 def test_ready_notification_sends_only_after_read_only_proof(tmp_path: Path) -> None:
     service, trading, store, _ = threshold_execution_fixture(tmp_path)
     signal_id = _notification_signal(store)

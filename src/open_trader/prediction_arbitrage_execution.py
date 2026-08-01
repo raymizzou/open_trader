@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .daily_premarket import send_notification_with_results
-from .notifications import Notifier, render_prediction_opportunity_notification
+from .notifications import (
+    Notifier,
+    render_prediction_opportunity_notification,
+    render_yes_no_signal_notification,
+)
 from .polymarket_trading import (
     LegResult,
     PairSubmission,
@@ -216,6 +220,8 @@ class PredictionExecutionService:
         signal = self._store.signal(str(signal_id))
         if signal is None:
             return {"state": "ignored", "reason": "signal_unavailable"}
+        if signal.get("market_type") == "standard_binary":
+            return self._notify_yes_no_signal(str(signal_id), signal)
         if signal.get("ended_at") is not None:
             return {"state": "ignored", "reason": "signal_closed"}
         if signal.get("notification_state") == "sent":
@@ -296,11 +302,101 @@ class PredictionExecutionService:
 
         final = dict(final)
         final["order_ready_at"] = current.get("order_ready_at", order_ready_at)
-        fallback_target: object | None = None
         try:
             title, message = render_prediction_opportunity_notification(
                 final, current, dashboard_url=self._dashboard_url
             )
+            feishu_success = self._deliver_feishu_notification(title, message)
+        except Exception:
+            feishu_success = False
+        completion = self._store.complete_notification_attempt(
+            str(signal_id),
+            lease_id,
+            success=feishu_success,
+            error_code="delivery_failed",
+        )
+        if completion.get("state") == "sent":
+            return {"state": "sent", "signal_id": str(signal_id)}
+        if completion.get("state") == "closed":
+            return {"state": "ignored", "reason": "signal_closed"}
+        return {"state": "failed", "reason": "notification_failed"}
+
+    def _notify_yes_no_signal(
+        self, signal_id: str, signal: Mapping[str, object]
+    ) -> dict[str, object]:
+        if signal.get("ended_at") is not None:
+            return {"state": "ignored", "reason": "signal_closed"}
+        notification_state = str(signal.get("notification_state", "pending"))
+        if notification_state == "sent":
+            return {"state": "ignored", "reason": "already_sent"}
+        if notification_state == "suppressed":
+            return {
+                "state": "ignored",
+                "reason": str(
+                    signal.get("notification_suppressed_reason", "suppressed")
+                ),
+            }
+        attempts = _decimal(signal.get("notification_attempts")) or Decimal("0")
+        if attempts >= 3:
+            return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+
+        market_id = str(signal.get("market_id", "")).strip()
+        if self._store.notification_sent_since(
+            market_id, _utc_now() - timedelta(minutes=30)
+        ):
+            self._store.update_signal(
+                signal_id,
+                {
+                    "notification_state": "suppressed",
+                    "notification_suppressed_reason": "market_cooldown",
+                },
+            )
+            return {"state": "ignored", "reason": "market_cooldown"}
+
+        reservation = self._store.reserve_notification_attempt(
+            signal_id, max_attempts=3, lease_seconds=60.0
+        )
+        reservation_state = reservation.get("state")
+        if reservation_state in {"missing", "closed"}:
+            return {
+                "state": "ignored",
+                "reason": (
+                    "signal_closed"
+                    if reservation_state == "closed"
+                    else "signal_unavailable"
+                ),
+            }
+        if reservation_state == "sent":
+            return {"state": "ignored", "reason": "already_sent"}
+        if reservation_state == "in_flight":
+            return {"state": "ignored", "reason": "notification_in_flight"}
+        if reservation_state == "exhausted":
+            return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+        lease_id = reservation.get("lease_id")
+        current = reservation.get("signal")
+        if not isinstance(lease_id, str) or not isinstance(current, Mapping):
+            return {"state": "failed", "reason": "notification_state_unavailable"}
+
+        try:
+            title, message = render_yes_no_signal_notification(current)
+            feishu_success = self._deliver_feishu_notification(title, message)
+        except Exception:
+            feishu_success = False
+        completion = self._store.complete_notification_attempt(
+            signal_id,
+            lease_id,
+            success=feishu_success,
+            error_code="delivery_failed",
+        )
+        if completion.get("state") == "sent":
+            return {"state": "sent", "signal_id": signal_id}
+        if completion.get("state") == "closed":
+            return {"state": "ignored", "reason": "signal_closed"}
+        return {"state": "failed", "reason": "notification_failed"}
+
+    def _deliver_feishu_notification(self, title: str, message: str) -> bool:
+        fallback_target: object | None = None
+        try:
             attempts_result = send_notification_with_results(
                 self._notifier,
                 title,
@@ -317,27 +413,16 @@ class PredictionExecutionService:
                     )
         except Exception:
             attempts_result = []
-            error_code = "delivery_failed"
-        else:
-            error_code = "delivery_failed"
         feishu_success = any(
             getattr(item, "channel", "") in {"feishu", "feishu_app"}
             and getattr(item, "success", False)
             for item in attempts_result
         )
         if not feishu_success and fallback_target is not None:
-            feishu_success = any(getattr(item, "success", False) for item in attempts_result)
-        completion = self._store.complete_notification_attempt(
-            str(signal_id),
-            lease_id,
-            success=feishu_success,
-            error_code=error_code,
-        )
-        if completion.get("state") == "sent":
-            return {"state": "sent", "signal_id": str(signal_id)}
-        if completion.get("state") == "closed":
-            return {"state": "ignored", "reason": "signal_closed"}
-        return {"state": "failed", "reason": "notification_failed"}
+            feishu_success = any(
+                getattr(item, "success", False) for item in attempts_result
+            )
+        return feishu_success
 
     def _feishu_target(self) -> object | None:
         targets = getattr(self._notifier, "_notifiers", None)

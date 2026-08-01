@@ -1467,6 +1467,46 @@ def test_ready_observer_is_called_once_for_order_ready_episode(tmp_path: Path) -
     assert calls[0][1]
 
 
+def test_schedule_ready_notification_calls_standard_without_rule_or_codex(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> list[tuple[str, str]]:
+        monitor = make_monitor(tmp_path)
+        calls: list[tuple[str, str]] = []
+
+        def observer(opportunity_id: str, signal_id: str) -> dict[str, object]:
+            calls.append((opportunity_id, signal_id))
+            return {"state": "sent"}
+
+        monitor.set_ready_observer(observer)
+        signal_id = monitor._store.upsert_signal(
+            {
+                "opportunity_id": "event-standard:market-1",
+                "market_id": "market-1",
+                "event_id": "event-standard",
+                "question": "Will it happen?",
+                "market_type": "standard_binary",
+                "started_at": NOW,
+                "first_positive_at": NOW,
+                "estimated_profit": Decimal("0.38"),
+            }
+        )
+        monitor._schedule_ready_notification(
+            signal_id,
+            {
+                "opportunity_id": "event-standard:market-1",
+                "market_id": "market-1",
+                "market_type": "standard_binary",
+                "actionable": True,
+            },
+        )
+        await asyncio.sleep(0.01)
+        monitor._reap_notification_task()
+        return calls
+
+    assert asyncio.run(scenario())
+
+
 def test_cancelled_notification_task_does_not_crash_monitor_shutdown(
     tmp_path: Path,
 ) -> None:

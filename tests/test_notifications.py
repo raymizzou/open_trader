@@ -21,6 +21,7 @@ from open_trader.notifications import (
     XiaoaiVoiceSuppressed,
     render_feishu_order_review,
     render_prediction_opportunity_notification,
+    render_yes_no_signal_notification,
     render_xiaoai_voice_notification,
     xiaoai_voice_allowed,
 )
@@ -153,6 +154,53 @@ def test_prediction_notification_contains_ready_order_facts_only() -> None:
         "Codex 待确认",
         "余额正常",
         "自动下单关闭",
+    ):
+        assert forbidden not in message
+
+
+@pytest.mark.parametrize(
+    ("event_title_zh", "expected_title_lines"),
+    (
+        ("美伊停火会持续吗？", ["美伊停火会持续吗？", "Will the Israel-Iran ceasefire continue?"]),
+        (None, ["Will the Israel-Iran ceasefire continue?"]),
+    ),
+)
+def test_yes_no_signal_notification_is_link_free_and_observation_only(
+    event_title_zh: str | None, expected_title_lines: list[str]
+) -> None:
+    signal = {
+        "event_title": "Will the Israel-Iran ceasefire continue?",
+        "event_title_zh": event_title_zh,
+        "yes_max_price": "0.31",
+        "no_max_price": "0.31",
+        "quantity": "10",
+        "total_max_cost": "6.20",
+        "estimated_profit": "0.38",
+        "first_positive_at": "2026-08-01T01:23:45.678000Z",
+    }
+
+    title, message = render_yes_no_signal_notification(signal)
+
+    assert title == "【YES/NO 套利信号】+$0.38"
+    assert message.splitlines() == [
+        *expected_title_lines,
+        "YES 价格：$0.31",
+        "NO 价格：$0.31",
+        "数量：10",
+        "最大成本：$6.20",
+        "当前利润：+$0.38",
+        "发现时间（HKT）：2026-08-01 09:23:45.678 HKT",
+    ]
+    for forbidden in (
+        "http",
+        "Dashboard",
+        "Polymarket",
+        "wallet",
+        "signal_id",
+        "opportunity_id",
+        "规则",
+        "下单",
+        "未下单，当前可能已失效",
     ):
         assert forbidden not in message
 

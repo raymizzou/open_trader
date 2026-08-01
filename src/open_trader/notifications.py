@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+HONG_KONG = ZoneInfo("Asia/Hong_Kong")
 
 
 class NotificationError(RuntimeError):
@@ -392,6 +393,63 @@ def render_prediction_opportunity_notification(
             f"机会编号：{signal.get('signal_id', '')}",
             event_url,
             f"Dashboard：{dashboard_url}",
+        )
+    )
+    return title, message
+
+
+def render_yes_no_signal_notification(
+    signal: Mapping[str, object],
+) -> tuple[str, str]:
+    """Render a link-free observation alert from the persisted signal facts."""
+
+    def decimal(value: object) -> Decimal:
+        try:
+            return value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0")
+
+    def money(value: object, *, signed: bool = False) -> str:
+        amount = decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        prefix = "+" if signed and amount >= 0 else ""
+        return f"{prefix}${amount:.2f}"
+
+    def quantity(value: object) -> str:
+        amount = decimal(value)
+        rendered = format(amount, "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return rendered or "0"
+
+    raw_time = signal.get("first_positive_at", signal.get("started_at", ""))
+    if isinstance(raw_time, datetime):
+        moment = raw_time
+    else:
+        text = str(raw_time).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            moment = datetime.now(HONG_KONG)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=HONG_KONG)
+    discovered = moment.astimezone(HONG_KONG).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    english_title = str(signal.get("event_title", signal.get("question", ""))).strip()
+    chinese_title = str(signal.get("event_title_zh", "") or "").strip()
+    title_lines = [line for line in (chinese_title, english_title) if line]
+    profit = signal.get("estimated_profit", signal.get("profit"))
+    title = f"【YES/NO 套利信号】{money(profit, signed=True)}"
+    message = "\n".join(
+        (
+            *title_lines,
+            f"YES 价格：{money(signal.get('yes_max_price'))}",
+            f"NO 价格：{money(signal.get('no_max_price'))}",
+            f"数量：{quantity(signal.get('quantity'))}",
+            f"最大成本：{money(signal.get('total_max_cost'))}",
+            f"当前利润：{money(profit, signed=True)}",
+            f"发现时间（HKT）：{discovered} HKT",
         )
     )
     return title, message

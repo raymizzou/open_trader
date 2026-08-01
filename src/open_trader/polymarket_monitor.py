@@ -3080,20 +3080,22 @@ class PolymarketMonitor:
         observer = self._ready_observer
         if observer is None or signal_id is None:
             return
-        if opportunity.get("market_type") != "threshold_hedge":
+        market_type = opportunity.get("market_type")
+        if market_type not in {"standard_binary", "threshold_hedge"}:
             return
         if opportunity.get("actionable") is not True:
             return
-        if opportunity.get("rules_verified_at") in (None, ""):
-            return
-        validation = opportunity.get("relation_validation")
-        codex_status = (
-            validation.get("status")
-            if isinstance(validation, Mapping)
-            else opportunity.get("llm_status")
-        )
-        if str(codex_status).strip().lower() != "approved":
-            return
+        if market_type == "threshold_hedge":
+            if opportunity.get("rules_verified_at") in (None, ""):
+                return
+            validation = opportunity.get("relation_validation")
+            codex_status = (
+                validation.get("status")
+                if isinstance(validation, Mapping)
+                else opportunity.get("llm_status")
+            )
+            if str(codex_status).strip().lower() != "approved":
+                return
         self._reap_notification_task()
         task = self._notification_task
         if task is not None and not task.done():
@@ -3101,7 +3103,7 @@ class PolymarketMonitor:
         signal = self._store.signal(str(signal_id))
         if signal is None or signal.get("ended_at") is not None:
             return
-        if signal.get("notification_state") == "sent":
+        if signal.get("notification_state") in {"sent", "suppressed"}:
             return
         lease_expires = _timestamp_or_none(signal.get("notification_lease_expires_at"))
         if lease_expires is not None and lease_expires > self._now():
