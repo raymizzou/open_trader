@@ -6473,6 +6473,62 @@ def test_collect_industry_contexts_keeps_holding_state_failure_local(
     )
 
 
+def test_frozen_2026_07_31_paid_scope_ledger() -> None:
+    frozen = {
+        "CN": {
+            "candidate": {621715: 34, 621743: 68},
+            "holding_only": {339103: 42, 328115: 51, 621693: 102},
+        },
+        "HK": {
+            "candidate": {},
+            "holding_only": {
+                621783: 37,
+                621784: 75,
+                621772: 83,
+                621781: 129,
+                621766: 151,
+                621779: 63,
+                621768: 113,
+                669417: 0,
+            },
+        },
+        "US": {
+            "candidate": {332177: 247, 332182: 862},
+            "holding_only": {
+                332176: 1260,
+                692047: 2,
+                332179: 171,
+                692034: 3,
+                332181: 655,
+                692011: 3,
+                332174: 670,
+            },
+        },
+    }
+    old_component_calls = sum(
+        len(scope["candidate"]) + len(scope["holding_only"])
+        for scope in frozen.values()
+    )
+    new_component_calls = sum(
+        len(scope["candidate"]) for scope in frozen.values()
+    )
+    old_member_ids = sum(
+        sum(scope["candidate"].values()) + sum(scope["holding_only"].values())
+        for scope in frozen.values()
+    )
+    new_member_ids = sum(
+        sum(scope["candidate"].values()) for scope in frozen.values()
+    )
+
+    assert (old_component_calls, new_component_calls) == (22, 4)
+    assert (old_member_ids, new_member_ids) == (4821, 1211)
+    assert old_component_calls - new_component_calls == 18
+    assert old_member_ids - new_member_ids == 3610
+    assert Decimal(old_member_ids - new_member_ids) * Decimal("0.003") == Decimal(
+        "10.830"
+    )
+
+
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
     tmp_path: Path,
 ) -> None:
