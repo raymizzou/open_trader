@@ -19,7 +19,7 @@ This change applies only to opportunities with
 It does not:
 
 - change `simple_annualized_yield()` or create a second yield calculation;
-- change acquisition-cost, fee, payout, or capital-duration inputs;
+- change acquisition-cost, fee, or payout inputs;
 - add a Treasury-rate feed, settlement buffer, or early-exit model;
 - change standard same-condition YES/NO arbitrage;
 - add Negative Risk execution, Kalshi, or another venue;
@@ -38,6 +38,17 @@ simple_annualized_yield =
 ```
 
 The value remains a decimal ratio: `0.15` means `15%`.
+
+For a two-leg threshold hedge, `resolution_at` is the later valid end time of
+the two contracts. This is the conservative time when the complete hedge can
+be treated as released. If either end time is missing or invalid, annualized
+yield is unavailable and admission fails closed.
+
+`minimum_profit` already equals minimum payout minus both protected buy costs
+and the modeled maximum trading fees. It must be labelled as a theoretical
+minimum profit, not profit after every possible real-world cost: funding,
+withdrawal, FX, unexpected settlement delay, and an optional early exit are
+not modeled.
 
 The calculation returns unavailable when the resolution time is not in the
 future or maximum cost is not positive. An unavailable annualized yield must
@@ -100,15 +111,45 @@ falls below `15%` before either step, admission fails with
 
 ## Dashboard Behavior
 
-The existing LLM candidate view continues to display theoretical profit,
-remaining days, and simple annualized yield.
+Use the approved compact B layout inside the existing `套利信号` panel. Do not
+add another panel or interaction. The signal table uses these columns:
+
+1. `出现时间（HKT）`;
+2. `标的`;
+3. `资金占用`;
+4. `净回报`;
+5. `操作`.
+
+For a threshold hedge:
+
+- `标的` shows the complete English `question_a / question_b` as the primary,
+  stronger line, followed by its complete Chinese translation in smaller,
+  muted text;
+- neither language may use ellipsis, line clamping, or another truncation;
+  both wrap naturally on desktop and mobile;
+- reuse the existing asynchronous cached title translator for the exact
+  displayed pair; translation must not block signal discovery or replace the
+  English source;
+- while translation is pending or unavailable, retain the English and keep a
+  small second-line status instead of fabricating or silently truncating a
+  Chinese title;
+- `资金占用` shows remaining days and the later contract end date;
+- `净回报` groups theoretical minimum profit, simple annualized yield, and
+  total maximum cost, with wording that the modeled maximum fee is included;
+- `操作` shows `仅观察` plus the short blocking reason when the opportunity is
+  not actionable, and retains the existing recheck action only when currently
+  admissible.
+
+Standard same-condition YES/NO rows keep their existing execution semantics;
+this visual consolidation must not change their eligibility or order flow.
 
 Below-floor candidates remain visible with the reason
 `年化低于 15% 入场门槛`. An unavailable value displays the existing
 unavailable state and the reason `年化无法计算，禁止入场`.
 
-The history and distribution models remain unchanged. No new panel, table,
-column, or interaction is required.
+The history and distribution models remain unchanged. Existing stored
+threshold fields and the existing translation cache are projected into the
+approved layout; no second annualization or translation service is added.
 
 ## Notification Behavior
 
@@ -146,7 +187,14 @@ Focused automated coverage must prove:
 7. preview and notification admission reject an inconsistent or newly
    below-floor opportunity;
 8. standard binary arbitrage behavior is unchanged;
-9. the Dashboard shows the server-owned rejection reason.
+9. the Dashboard shows the server-owned rejection reason;
+10. capital duration uses the later contract end time and fails closed when
+    either time is invalid;
+11. every threshold target preserves the complete English pair above the
+    complete cached Chinese translation without truncation on desktop or
+    mobile;
+12. profit wording states the modeled-fee boundary and does not claim every
+    external cost is deducted.
 
 Implementation verification follows the repository gates: focused tests and
 direct workflow checks during development, then `make acceptance` once as the
