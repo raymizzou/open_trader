@@ -813,6 +813,58 @@ def standard_notification_fixture(tmp_path: Path):
     return service, trading, store, monitor, macos, feishu
 
 
+def test_notify_monitor_failure_uses_feishu_only_and_operator_copy(
+    tmp_path: Path,
+) -> None:
+    service, _trading, _store, _monitor, macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+
+    result = service.notify_monitor_failure(
+        {
+            "attempts": 5,
+            "error_type": "TransportError",
+            "last_success_at": "2026-08-01T12:00:00+00:00",
+        }
+    )
+
+    assert result == {"state": "sent"}
+    assert macos.calls == 0
+    assert feishu.calls == 1
+    title, message = feishu.messages[-1]
+    assert title == "预测市场监控需要人工干预"
+    assert "连续 5 次刷新失败" in message
+    assert "自动重试已停止" in message
+    assert "TransportError" in message
+    assert "2026-08-01T12:00:00+00:00" in message
+    assert "Dashboard：http://127.0.0.1:8766/" in message
+    assert "重启承载预测监控的 Dashboard 服务" in message
+    assert "Polymarket 连接" in message
+
+
+def test_notify_monitor_failure_sanitizes_error_and_reports_delivery_failure(
+    tmp_path: Path,
+) -> None:
+    service, _trading, _store, _monitor, _macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+    feishu.fail = True
+
+    result = service.notify_monitor_failure(
+        {
+            "attempts": 5,
+            "error_type": "TransportError: secret-token",
+            "last_success_at": None,
+        }
+    )
+
+    assert result == {"state": "failed", "reason": "notification_failed"}
+    assert feishu.calls == 1
+    assert "unknown_error" in feishu.messages[-1][1]
+    assert "secret-token" not in feishu.messages[-1][1]
+    assert "从未成功" in feishu.messages[-1][1]
+
+
 def test_notify_ready_opportunity_standard_sends_feishu_observation_without_preflight(
     tmp_path: Path,
 ) -> None:

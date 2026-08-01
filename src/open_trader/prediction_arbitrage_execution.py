@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import inspect
+import re
 import sqlite3
 import threading
 import time
@@ -400,6 +401,31 @@ class PredictionExecutionService:
             return {"state": "sent", "signal_id": signal_id}
         if completion.get("state") == "closed":
             return {"state": "ignored", "reason": "signal_closed"}
+        return {"state": "failed", "reason": "notification_failed"}
+
+    def notify_monitor_failure(
+        self, failure: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Alert operators once when universe refresh retries are exhausted."""
+
+        raw_error_type = str(failure.get("error_type") or "")
+        error_type = (
+            raw_error_type
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", raw_error_type)
+            else "unknown_error"
+        )
+        last_success_at = failure.get("last_success_at")
+        message = "\n".join(
+            (
+                "监控市场连续 5 次刷新失败，自动重试已停止。",
+                f"最后错误：{error_type}",
+                f"上次成功刷新：{last_success_at or '从未成功'}",
+                f"Dashboard：{self._dashboard_url}",
+                "请重启承载预测监控的 Dashboard 服务，并检查 Polymarket 连接。",
+            )
+        )
+        if self._deliver_feishu_notification("预测市场监控需要人工干预", message):
+            return {"state": "sent"}
         return {"state": "failed", "reason": "notification_failed"}
 
     def _deliver_feishu_notification(self, title: str, message: str) -> bool:
