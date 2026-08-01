@@ -85,6 +85,10 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
             "SELECT * FROM signals WHERE ended_at IS NULL "
             "ORDER BY started_at DESC, signal_id DESC"
         ).fetchall()
+        history_query_plan = connection.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM signals ORDER BY started_at DESC, signal_id DESC"
+        ).fetchall()
         query_plan = connection.execute(
             "EXPLAIN QUERY PLAN "
             "SELECT payload FROM signals WHERE market_id=? ORDER BY started_at DESC",
@@ -103,8 +107,10 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "relation_scan_runs",
     }
     assert "signals_market_started_at" in indexes
+    assert "signals_started_at" in indexes
     assert "signals_open_started_at" in indexes
     assert any("signals_market_started_at" in row[3] for row in query_plan)
+    assert any("signals_started_at" in row[3] for row in history_query_plan)
     assert any("signals_open_started_at" in row[3] for row in open_query_plan)
 
 

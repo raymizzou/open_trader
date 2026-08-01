@@ -365,6 +365,9 @@ class PredictionArbitrageStore:
             CREATE INDEX IF NOT EXISTS signals_market_started_at
             ON signals(market_id, started_at DESC);
 
+            CREATE INDEX IF NOT EXISTS signals_started_at
+            ON signals(started_at DESC, signal_id DESC);
+
             CREATE INDEX IF NOT EXISTS signals_open_started_at
             ON signals(started_at DESC, signal_id DESC) WHERE ended_at IS NULL;
 
