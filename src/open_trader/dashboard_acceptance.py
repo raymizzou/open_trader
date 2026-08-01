@@ -4393,7 +4393,13 @@ def _runtime_health_errors(
         errors.append(f"{name} health schema 不匹配")
     if payload.get("module") != expected_module:
         errors.append(f"{name} health 模块身份不匹配")
-    if payload.get("pid") != pid:
+    health_pid = payload.get("pid")
+    if (
+        not isinstance(health_pid, int)
+        or isinstance(health_pid, bool)
+        or health_pid <= 0
+        or health_pid != pid
+    ):
         errors.append(f"{name} health PID 不匹配")
     cwd = payload.get("cwd")
     if (
@@ -4449,7 +4455,15 @@ def _log_errors(
         if isinstance(record, Mapping):
             records.append((index, record))
     errors: list[str] = []
-    matching = [item for item in records if item[1].get("pid") == pid]
+    matching = [
+        item for item in records
+        if (
+            isinstance(item[1].get("pid"), int)
+            and not isinstance(item[1].get("pid"), bool)
+            and item[1].get("pid") > 0
+            and item[1].get("pid") == pid
+        )
+    ]
     if not matching:
         errors.append(f"日志没有候选 {name} PID：{pid}")
         fresh_text = text

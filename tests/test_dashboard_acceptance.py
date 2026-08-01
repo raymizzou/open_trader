@@ -6607,6 +6607,40 @@ def test_acceptance_accepts_matching_gateway_health(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("payload_pid", "expected_pid"),
+    [(123.0, 123), (True, 1)],
+)
+def test_acceptance_rejects_gateway_health_wrong_pid_type(
+    tmp_path: Path, payload_pid: object, expected_pid: int,
+) -> None:
+    payload = {
+        **_runtime_health(
+            tmp_path,
+            module="frontend_gateway",
+            schema="open_trader.frontend_gateway.health.v1",
+            pid=payload_pid,  # type: ignore[arg-type]
+        ),
+        "upstream_status": "ok",
+    }
+
+    errors = dashboard_acceptance._runtime_health_errors(
+        payload,
+        name="Frontend Gateway",
+        expected_schema="open_trader.frontend_gateway.health.v1",
+        expected_module="frontend_gateway",
+        pid=expected_pid,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat(
+            "2026-08-01T12:00:00+08:00"
+        ),
+        expected_upstream_status="ok",
+    )
+
+    assert any("PID" in error for error in errors)
+
+
+@pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("schema_version", "wrong.v1", "schema"),
@@ -6675,6 +6709,41 @@ def test_acceptance_reads_gateway_runtime_prefix(tmp_path: Path) -> None:
             "2026-08-01T12:00:00+08:00"
         ),
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("record_pid", "expected_pid"),
+    [(123.0, 123), (True, 1)],
+)
+def test_acceptance_rejects_gateway_runtime_wrong_pid_type(
+    tmp_path: Path, record_pid: object, expected_pid: int,
+) -> None:
+    runtime = {
+        "pid": record_pid,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-08-01T12:00:01+08:00",
+    }
+    log = tmp_path / "gateway.log"
+    log.write_text(
+        f"frontend_gateway_runtime: {json.dumps(runtime)}\n",
+        encoding="utf-8",
+    )
+
+    errors = dashboard_acceptance._log_errors(
+        log,
+        name="Frontend Gateway",
+        prefix="frontend_gateway_runtime: ",
+        pid=expected_pid,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat(
+            "2026-08-01T12:00:00+08:00"
+        ),
+    )
+
+    assert any("没有候选" in error for error in errors)
 
 
 @pytest.mark.parametrize(
