@@ -696,8 +696,9 @@ worktree, confirm its SHA and clean state, restart all controllers with the
 shared config, then restart the Dashboard stack from that exact worktree:
 
 ```bash
-cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec
-export ACCEPTED_SHA=replace-with-full-accepted-sha
+REPO_ROOT="$PWD"
+ACCEPTED_SHA="$(git rev-parse HEAD)"
+export REPO_ROOT ACCEPTED_SHA
 test "$(git rev-parse HEAD)" = "$ACCEPTED_SHA"
 test -z "$(git status --short)"
 
@@ -706,7 +707,10 @@ scripts/install_daily_premarket_launchd.sh \
   --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --trend-only --market all
 
-scripts/install_dashboard_launchd.sh --mode stack
+scripts/install_dashboard_launchd.sh --mode stack \
+  --repo-root "$REPO_ROOT" \
+  --runtime-root /Users/ray/projects/open_trader \
+  --python /Users/ray/projects/open_trader/.venv/bin/python
 ```
 
 For each CN/HK/US status document, verify the PID is live, `working_directory`
@@ -725,7 +729,7 @@ from pathlib import Path
 import time
 
 accepted_sha = os.environ["ACCEPTED_SHA"]
-worktree = "/Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec"
+worktree = os.environ["REPO_ROOT"]
 root = Path("/Users/ray/projects/open_trader/data/trend_controller")
 
 def read(market):
@@ -746,7 +750,7 @@ for market, previous in before.items():
 PY
 
 pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p
-tail -n 80 /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
+tail -n 80 "$REPO_ROOT"/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
 tail -n 80 logs/frontend_gateway/launchd.out.log
 tail -n 80 logs/legacy_dashboard/launchd.out.log
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
