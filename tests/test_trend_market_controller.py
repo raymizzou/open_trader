@@ -753,6 +753,21 @@ def test_protection_blocker_notifies_feishu_once_per_market_day(
     assert feishu.attempt_count == 1
 
 
+def test_protection_blocker_accepts_only_clean_holiday() -> None:
+    clean = SimpleNamespace(
+        status="holiday", exception_count=0, unknown_quote_count=0
+    )
+    unknown = SimpleNamespace(
+        status="holiday", exception_count=0, unknown_quote_count=1
+    )
+
+    assert controller._protection_blocker(clean) is None
+    assert controller._protection_blocker(unknown) == (
+        "protection pass abnormal: status=holiday, exceptions=0, "
+        "unknown_quotes=1"
+    )
+
+
 def _record_controller_notification_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, str, set[str]]]:
