@@ -2550,42 +2550,6 @@ def collect_industry_contexts(
     )
 
     holding_errors: dict[str, str] = {}
-    for industry_id in holding_only_ids:
-        try:
-            rows = api.get_components(  # type: ignore[attr-defined]
-                tm_id=industry_id,
-                expected_date=expected_date,
-            )
-        except TrendAnimalsError as exc:
-            rows = []
-            holding_errors[str(industry_id)] = str(exc)
-        component_rows_count += len(rows)
-        component_rows_by_industry[industry_id] = list(rows)
-        component_ids_by_industry[industry_id] = {
-            _row_tm_id(row) for row in rows
-        }
-
-    holding_member_ids = sorted(
-        {
-            member_id
-            for industry_id in holding_only_ids
-            for member_id in component_ids_by_industry[industry_id]
-        }
-        - set(member_ids)
-    )
-    holding_member_rows: list[Mapping[str, object]] = []
-    if holding_member_ids:
-        try:
-            holding_member_rows = list(
-                api.get_snapshots(  # type: ignore[attr-defined]
-                    tm_ids=holding_member_ids,
-                    fields=INDUSTRY_MEMBER_FIELDS,
-                    expected_date=expected_date,
-                )
-            )
-        except TrendAnimalsError as exc:
-            holding_errors["members"] = str(exc)
-
     holding_state_rows: list[Mapping[str, object]] = []
     if holding_only_ids:
         try:
@@ -2606,16 +2570,16 @@ def collect_industry_contexts(
             continue
         holding_state_by_id[tm_id] = row
 
-    all_member_rows = [*member_rows, *holding_member_rows]
     holding_contexts = tuple(
         calculate_industry_context(
             industry_tm_id=industry_id,
             industry=industry_names.get(industry_id, ""),
             expected_date=expected_date,
-            component_tm_ids=sorted(component_ids_by_industry[industry_id]),
-            member_rows=all_member_rows,
+            component_tm_ids=(),
+            member_rows=(),
             industry_row=holding_state_by_id.get(industry_id),
             warm_to_hot_count=len(warm_to_hot_ids[industry_id]),
+            member_breadth_collected=False,
         )
         for industry_id in holding_only_ids
     )
@@ -2634,19 +2598,18 @@ def collect_industry_contexts(
             ),
         )
     )
-    all_member_ids = sorted({*member_ids, *holding_member_ids})
     all_state_rows = [*state_rows, *holding_state_rows]
     facts = {
         "eligible_industry_ids": tuple(eligible_industry_ids),
         "holding_industry_ids": tuple(holding_industry_ids),
         "context_industry_ids": tuple(context_industry_ids),
         "holding_errors": holding_errors,
-        "component_requests": len(context_industry_ids),
+        "component_requests": len(eligible_industry_ids),
         "component_rows": component_rows_count,
         "component_rows_by_industry": component_rows_by_industry,
-        "member_ids": tuple(all_member_ids),
-        "member_rows": len(all_member_rows),
-        "member_response": all_member_rows,
+        "member_ids": tuple(member_ids),
+        "member_rows": len(member_rows),
+        "member_response": member_rows,
         "member_fields": INDUSTRY_MEMBER_FIELDS,
         "state_ids": tuple(context_industry_ids),
         "state_rows": len(all_state_rows),

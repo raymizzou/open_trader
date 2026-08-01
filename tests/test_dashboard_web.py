@@ -7056,6 +7056,35 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_holding_state_only_context_preserves_rendered_fields_and_status() -> None:
+    output = run_dashboard_js(r'''
+const before = {
+  industry_tm_id:339103, industry:"银行", component_count:42,
+  snapshot_count:42, tradable_count:42, valid_count:42, right_count:29,
+  snapshot_coverage:"1", right_state_coverage:"1", right_share:"0.690476",
+  member_breadth_collected:true, warm_to_hot_count:0,
+  temperature:"热", temperature_direction:"unchanged", strength:"92.4",
+  aggregate_right_count_ratio:"0.691", aggregate_right_market_cap_ratio:"0.74",
+  prior_aggregate_right_count_ratio:"0.680",
+  prior_aggregate_right_market_cap_ratio:"0.72",
+  valid:true, invalid_reasons:[],
+};
+const after = {...before, component_count:0, snapshot_count:0,
+  tradable_count:0, valid_count:0, right_count:0,
+  snapshot_coverage:"0", right_state_coverage:"0", right_share:null,
+  member_breadth_collected:false};
+const status = {ordering_mode:"context_current_only", current_complete:true,
+  history_complete:false};
+const beforeHtml = renderTrendIndustryContext({industry_context_status:status,
+  industry_contexts:[before]});
+const afterHtml = renderTrendIndustryContext({industry_context_status:status,
+  industry_contexts:[after]});
+if (beforeHtml !== afterHtml) throw new Error(`${beforeHtml}\n---\n${afterHtml}`);
+console.log("ok");
+''')
+    assert "ok" in output
+
+
 def test_dashboard_renders_frozen_risk_summary_and_candidate_detail_rows() -> None:
     output = run_dashboard_js(r'''
 const html = renderTrendReportWorkspace({

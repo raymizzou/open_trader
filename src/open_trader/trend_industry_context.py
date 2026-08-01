@@ -32,6 +32,7 @@ class IndustryContext:
     strength: Decimal | None
     valid: bool
     invalid_reasons: tuple[str, ...]
+    member_breadth_collected: bool = True
     aggregate_right_count_ratio: Decimal | None = None
     aggregate_right_market_cap_ratio: Decimal | None = None
     prior_as_of_date: str | None = None
@@ -52,6 +53,7 @@ def calculate_industry_context(
     member_rows: Sequence[Mapping[str, object]],
     industry_row: Mapping[str, object] | None,
     warm_to_hot_count: int,
+    member_breadth_collected: bool = True,
 ) -> IndustryContext:
     normalized_warm_to_hot_count = _nonnegative_int(warm_to_hot_count)
     component_ids = {
@@ -133,10 +135,11 @@ def calculate_industry_context(
         )
 
     invalid_reasons: list[str] = []
-    if snapshot_coverage < Decimal("0.9"):
-        invalid_reasons.append("snapshot_coverage_below_90pct")
-    if right_state_coverage < Decimal("0.9"):
-        invalid_reasons.append("right_state_coverage_below_90pct")
+    if member_breadth_collected:
+        if snapshot_coverage < Decimal("0.9"):
+            invalid_reasons.append("snapshot_coverage_below_90pct")
+        if right_state_coverage < Decimal("0.9"):
+            invalid_reasons.append("right_state_coverage_below_90pct")
     if normalized_warm_to_hot_count is None:
         invalid_reasons.append("warm_to_hot_count_invalid")
     if temperature is None:
@@ -161,6 +164,7 @@ def calculate_industry_context(
         strength=strength,
         valid=not invalid_reasons,
         invalid_reasons=tuple(invalid_reasons),
+        member_breadth_collected=member_breadth_collected,
         aggregate_right_count_ratio=aggregate_right_count_ratio,
         aggregate_right_market_cap_ratio=aggregate_right_market_cap_ratio,
     )
@@ -252,12 +256,7 @@ def attach_prior_context(
             "prior_aggregate_right_count_ratio": prior.aggregate_right_count_ratio,
             "prior_aggregate_right_market_cap_ratio": prior.aggregate_right_market_cap_ratio,
         }
-        if (
-            prior.right_share is not None
-            and context.right_share is not None
-            and prior.temperature in temperature_order
-            and context.temperature in temperature_order
-        ):
+        if prior.temperature in temperature_order and context.temperature in temperature_order:
             current_temperature = temperature_order[context.temperature]
             prior_temperature = temperature_order[prior.temperature]
             direction = (
@@ -269,8 +268,11 @@ def attach_prior_context(
             )
             changes.update(
                 prior_temperature=prior.temperature,
-                prior_right_share=prior.right_share,
                 temperature_direction=direction,
+            )
+        if prior.right_share is not None and context.right_share is not None:
+            changes.update(
+                prior_right_share=prior.right_share,
                 right_share_change_pp=(context.right_share - prior.right_share)
                 * Decimal("100"),
             )
@@ -383,13 +385,16 @@ def write_industry_context_history(
             existing = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise ValueError("conflicting same-date industry context history") from None
-        if (
+        same_history_identity = (
             isinstance(existing, Mapping)
             and existing.get("schema_version") == _HISTORY_SCHEMA_VERSION
             and existing.get("market") == market_name
             and existing.get("as_of_date") == as_of_date
-            and existing.get("industries") == payload["industries"]
-        ):
+        )
+        existing_industries = (
+            existing.get("industries") if isinstance(existing, Mapping) else None
+        )
+        if same_history_identity and existing_industries == payload["industries"]:
             return path
         aggregate_fields = {
             "aggregate_right_count_ratio",
@@ -397,15 +402,33 @@ def write_industry_context_history(
             "prior_aggregate_right_count_ratio",
             "prior_aggregate_right_market_cap_ratio",
         }
-        existing_industries = (
-            existing.get("industries") if isinstance(existing, Mapping) else None
+        flag_legacy_rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key != "member_breadth_collected"
+            }
+            for row in payload["industries"]
+        ]
+        if same_history_identity and existing_industries == flag_legacy_rows:
+            return path
+        missing_member_flag = (
+            isinstance(existing_industries, list)
+            and all(
+                isinstance(row, Mapping)
+                and "member_breadth_collected" not in row
+                for row in existing_industries
+            )
+        )
+        legacy_optional_fields = aggregate_fields | (
+            {"member_breadth_collected"} if missing_member_flag else set()
         )
         legacy_rows = (
             [
                 {
                     key: value
                     for key, value in row.items()
-                    if key not in aggregate_fields
+                    if key not in legacy_optional_fields
                 }
                 for row in payload["industries"]
             ]
@@ -418,11 +441,7 @@ def write_industry_context_history(
             else None
         )
         if not (
-            isinstance(existing, Mapping)
-            and existing.get("schema_version") == _HISTORY_SCHEMA_VERSION
-            and existing.get("market") == market_name
-            and existing.get("as_of_date") == as_of_date
-            and existing_industries == legacy_rows
+            same_history_identity and existing_industries == legacy_rows
         ):
             raise ValueError("conflicting same-date industry context history")
     temp_path: Path | None = None
@@ -533,11 +552,11 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         "prior_aggregate_right_count_ratio",
         "prior_aggregate_right_market_cap_ratio",
     }
-    if any(
-        field.name not in row
-        for field in fields(IndustryContext)
-        if field.name not in aggregate_fields
-    ):
+    optional_fields = aggregate_fields | {"member_breadth_collected"}
+    if any(field.name not in row for field in fields(IndustryContext) if field.name not in optional_fields):
+        return None
+    member_breadth_collected = row.get("member_breadth_collected", True)
+    if type(member_breadth_collected) is not bool:
         return None
     industry_tm_id = _positive_int(row.get("industry_tm_id"))
     if industry_tm_id is None or not isinstance(row.get("industry"), str):
@@ -612,6 +631,7 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         strength=strength,
         valid=row["valid"],
         invalid_reasons=tuple(reasons),
+        member_breadth_collected=member_breadth_collected,
         aggregate_right_count_ratio=aggregate_decimals[
             "aggregate_right_count_ratio"
         ],
@@ -635,30 +655,43 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
 def _context_is_valid_for_history(context: IndustryContext) -> bool:
     if not context.valid or context.invalid_reasons:
         return False
-    if context.component_count < 10:
-        return False
-    if not (
-        0 <= context.snapshot_count <= context.component_count
-        and context.snapshot_coverage >= Decimal("0.9")
-        and context.snapshot_coverage
-        == Decimal(context.snapshot_count) / Decimal(context.component_count)
-    ):
-        return False
-    if not (
-        0 <= context.tradable_count <= context.snapshot_count
-        and 0 <= context.valid_count <= context.tradable_count
-        and context.valid_count >= 10
-        and context.right_state_coverage >= Decimal("0.9")
-        and context.right_state_coverage
-        == Decimal(context.valid_count) / Decimal(context.tradable_count)
-    ):
-        return False
-    if not (
-        0 <= context.right_count <= context.valid_count
-        and context.right_share is not None
-        and 0 <= context.right_share <= 1
-        and context.right_share
-        == Decimal(context.right_count) / Decimal(context.valid_count)
+    if context.member_breadth_collected:
+        if context.component_count < 10:
+            return False
+        if not (
+            0 <= context.snapshot_count <= context.component_count
+            and context.snapshot_coverage >= Decimal("0.9")
+            and context.snapshot_coverage
+            == Decimal(context.snapshot_count) / Decimal(context.component_count)
+        ):
+            return False
+        if not (
+            0 <= context.tradable_count <= context.snapshot_count
+            and 0 <= context.valid_count <= context.tradable_count
+            and context.valid_count >= 10
+            and context.right_state_coverage >= Decimal("0.9")
+            and context.right_state_coverage
+            == Decimal(context.valid_count) / Decimal(context.tradable_count)
+        ):
+            return False
+        if not (
+            0 <= context.right_count <= context.valid_count
+            and context.right_share is not None
+            and 0 <= context.right_share <= 1
+            and context.right_share
+            == Decimal(context.right_count) / Decimal(context.valid_count)
+        ):
+            return False
+    elif not (
+        context.component_count
+        == context.snapshot_count
+        == context.tradable_count
+        == context.valid_count
+        == context.right_count
+        == 0
+        and context.snapshot_coverage == Decimal("0")
+        and context.right_state_coverage == Decimal("0")
+        and context.right_share is None
     ):
         return False
     return (

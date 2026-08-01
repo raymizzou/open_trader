@@ -1571,6 +1571,7 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
         "prior_aggregate_right_count_ratio",
         "prior_aggregate_right_market_cap_ratio",
     }
+    optional_context_keys = aggregate_ratio_keys | {"member_breadth_collected"}
 
     def valid_decimal(value: object, *, minimum: Decimal, maximum: Decimal) -> bool:
         if isinstance(value, bool):
@@ -1586,7 +1587,12 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
         if (
             not isinstance(context, dict)
             or not context_keys <= set(context)
-            or set(context) - context_keys - aggregate_ratio_keys
+            or set(context) - context_keys - optional_context_keys
+        ):
+            return False
+        if (
+            "member_breadth_collected" in context
+            and type(context["member_breadth_collected"]) is not bool
         ):
             return False
         industry_id = context["industry_tm_id"]

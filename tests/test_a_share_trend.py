@@ -6199,8 +6199,6 @@ def test_collect_industry_contexts_appends_holding_industries_in_strength_order(
         def get_components(
             self, *, tm_id: int, expected_date: str
         ) -> list[dict[str, object]]:
-            if tm_id == invalid_industry_id:
-                raise TrendAnimalsError("holding industry unavailable")
             return [{"tmId": tm_id + 1, "asOfDate": expected_date}]
 
         def get_snapshots(
@@ -6294,10 +6292,241 @@ def test_collect_industry_contexts_appends_holding_industries_in_strength_order(
     ]
     assert contexts[-1].strength is None
     assert contexts[-1].valid is False
-    assert facts["holding_errors"] == {
-        str(invalid_industry_id): "holding industry unavailable"
-    }
+    assert facts["holding_errors"] == {}
     assert status["ordering_mode"] == "context_current_only"
+
+
+def test_collect_industry_contexts_skips_holding_only_member_breadth(
+    tmp_path: Path,
+) -> None:
+    component_calls: list[int] = []
+    member_snapshot_calls: list[list[int]] = []
+    state_snapshot_calls: list[list[int]] = []
+
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            component_calls.append(tm_id)
+            assert tm_id == 700001
+            return [
+                {"tmId": member_id, "asOfDate": expected_date}
+                for member_id in range(1, 13)
+            ]
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                member_snapshot_calls.append(list(tm_ids))
+                return [
+                    {
+                        "tmId": member_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for member_id in tm_ids
+                ]
+            assert fields == trend_module.INDUSTRY_STATE_FIELDS
+            state_snapshot_calls.append(list(tm_ids))
+            strengths = {700001: "95", 339103: "92.4", 621693: "98.7"}
+            return [
+                {
+                    "tmId": industry_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": strengths[industry_id],
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
+                }
+                for industry_id in tm_ids
+            ]
+
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(
+            candidate("600001", industry="候选行业", industry_tm_id=700001),
+        ),
+        candidate_rows=[
+            {
+                "tmId": 600001,
+                "industryTmId": 700001,
+                "industryName": "候选行业",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+            }
+        ],
+        held_symbols=set(),
+        holding_snapshots=(
+            holding("600010", industry="银行", industry_tm_id=339103),
+            holding("600011", industry="电力", industry_tm_id=621693),
+        ),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert component_calls == [700001]
+    assert member_snapshot_calls == [list(range(1, 13))]
+    assert state_snapshot_calls == [[700001], [339103, 621693]]
+    assert facts["component_requests"] == 1
+    assert facts["member_ids"] == tuple(range(1, 13))
+    assert facts["member_rows"] == 12
+
+    holding_contexts = {
+        item.industry_tm_id: item
+        for item in contexts
+        if item.industry_tm_id in {339103, 621693}
+    }
+    assert all(
+        item.member_breadth_collected is False
+        and item.component_count == 0
+        and item.right_share is None
+        for item in holding_contexts.values()
+    )
+    assert [item.industry_tm_id for item in contexts] == [621693, 700001, 339103]
+    assert status["ordering_mode"] == "context_current_only"
+
+
+def test_collect_industry_contexts_keeps_holding_state_failure_local(
+    tmp_path: Path,
+) -> None:
+    component_calls: list[int] = []
+    member_snapshot_calls: list[list[int]] = []
+    state_snapshot_calls: list[list[int]] = []
+
+    class Api:
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            component_calls.append(tm_id)
+            assert tm_id == 700001
+            return [
+                {"tmId": member_id, "asOfDate": expected_date}
+                for member_id in range(1, 13)
+            ]
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                member_snapshot_calls.append(list(tm_ids))
+                return [
+                    {
+                        "tmId": member_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for member_id in tm_ids
+                ]
+            assert fields == trend_module.INDUSTRY_STATE_FIELDS
+            state_snapshot_calls.append(list(tm_ids))
+            if tm_ids == [339103, 621693]:
+                raise TrendAnimalsError("holding state unavailable")
+            return [
+                {
+                    "tmId": 700001,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "95",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
+                }
+            ]
+
+    contexts, _status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(
+            candidate("600001", industry="候选行业", industry_tm_id=700001),
+        ),
+        candidate_rows=[
+            {
+                "tmId": 600001,
+                "industryTmId": 700001,
+                "industryName": "候选行业",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+            }
+        ],
+        held_symbols=set(),
+        holding_snapshots=(
+            holding("600010", industry="银行", industry_tm_id=339103),
+            holding("600011", industry="电力", industry_tm_id=621693),
+        ),
+        expected_date="2026-07-14",
+        market="CN",
+        history_root=tmp_path / "trend_industry_context",
+    )
+
+    assert component_calls == [700001]
+    assert member_snapshot_calls == [list(range(1, 13))]
+    assert state_snapshot_calls == [[700001], [339103, 621693]]
+    assert facts["holding_errors"] == {"states": "holding state unavailable"}
+    assert all(
+        context.member_breadth_collected is False
+        and context.component_count == 0
+        and context.right_share is None
+        for context in contexts
+        if context.industry_tm_id in {339103, 621693}
+    )
+
+
+def test_frozen_2026_07_31_paid_scope_ledger() -> None:
+    frozen = {
+        "CN": {
+            "candidate": {621715: 34, 621743: 68},
+            "holding_only": {339103: 42, 328115: 51, 621693: 102},
+        },
+        "HK": {
+            "candidate": {},
+            "holding_only": {
+                621783: 37,
+                621784: 75,
+                621772: 83,
+                621781: 129,
+                621766: 151,
+                621779: 63,
+                621768: 113,
+                669417: 0,
+            },
+        },
+        "US": {
+            "candidate": {332177: 247, 332182: 862},
+            "holding_only": {
+                332176: 1260,
+                692047: 2,
+                332179: 171,
+                692034: 3,
+                332181: 655,
+                692011: 3,
+                332174: 670,
+            },
+        },
+    }
+    old_component_calls = sum(
+        len(scope["candidate"]) + len(scope["holding_only"])
+        for scope in frozen.values()
+    )
+    new_component_calls = sum(
+        len(scope["candidate"]) for scope in frozen.values()
+    )
+    old_member_ids = sum(
+        sum(scope["candidate"].values()) + sum(scope["holding_only"].values())
+        for scope in frozen.values()
+    )
+    new_member_ids = sum(
+        sum(scope["candidate"].values()) for scope in frozen.values()
+    )
+
+    assert (old_component_calls, new_component_calls) == (22, 4)
+    assert (old_member_ids, new_member_ids) == (4821, 1211)
+    assert old_component_calls - new_component_calls == 18
+    assert old_member_ids - new_member_ids == 3610
+    assert Decimal(old_member_ids - new_member_ids) * Decimal("0.003") == Decimal(
+        "10.830"
+    )
 
 
 def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(

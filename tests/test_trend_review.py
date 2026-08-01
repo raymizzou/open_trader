@@ -629,6 +629,7 @@ def test_rebuild_preserves_frozen_industry_context_ordering_facts(tmp_path: Path
         strength=Decimal("90"),
         valid=True,
         invalid_reasons=(),
+        member_breadth_collected=False,
         prior_as_of_date="2026-07-15",
         prior_temperature="温",
         prior_right_share=Decimal("0.4"),

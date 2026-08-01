@@ -201,6 +201,76 @@ def test_complete_small_industry_context_is_valid() -> None:
     assert context.invalid_reasons == ()
 
 
+def test_state_only_context_is_valid_without_member_coverage() -> None:
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="工业",
+        expected_date="2026-07-24",
+        component_tm_ids=(),
+        member_rows=(),
+        industry_row={
+            "tmId": 700001,
+            "asOfDate": "2026-07-24",
+            "trendTemperatureCurr": "热",
+            "trendStrengthLocalCurr": "90",
+            "TrendRightSideCountRatio": "0.191",
+            "TrendRightSideMktCapRatio": "0.650",
+        },
+        warm_to_hot_count=0,
+        member_breadth_collected=False,
+    )
+
+    assert context.member_breadth_collected is False
+    assert context.valid is True
+    assert context.invalid_reasons == ()
+    assert context.component_count == context.valid_count == 0
+    assert context.right_share is None
+    assert context.aggregate_right_count_ratio == Decimal("0.191")
+
+
+def test_state_only_history_keeps_display_transitions_without_local_breadth(
+    tmp_path: Path,
+) -> None:
+    prior = replace(
+        _valid_context(as_of_date="2026-07-23", temperature="温"),
+        component_count=0,
+        snapshot_count=0,
+        tradable_count=0,
+        valid_count=0,
+        right_count=0,
+        snapshot_coverage=Decimal("0"),
+        right_state_coverage=Decimal("0"),
+        right_share=None,
+        member_breadth_collected=False,
+        aggregate_right_count_ratio=Decimal("0.150"),
+        aggregate_right_market_cap_ratio=Decimal("0.600"),
+    )
+    write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(prior,),
+    )
+    loaded = load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    )
+    current = replace(
+        prior,
+        as_of_date="2026-07-24",
+        temperature="热",
+        aggregate_right_count_ratio=Decimal("0.191"),
+        aggregate_right_market_cap_ratio=Decimal("0.650"),
+    )
+
+    [attached] = attach_prior_context((current,), loaded)
+
+    assert attached.temperature_direction == "rising"
+    assert attached.prior_aggregate_right_count_ratio == Decimal("0.150")
+    assert attached.prior_right_share is None
+    assert attached.right_share_change_pp is None
+
+
 @pytest.mark.parametrize("warm_to_hot_count", [True, -1, "3"])
 def test_calculation_rejects_invalid_warm_to_hot_count(
     warm_to_hot_count: object,
@@ -402,6 +472,57 @@ def test_history_loader_accepts_legacy_rows_without_aggregate_fields(
 
     assert loaded[700001].aggregate_right_count_ratio is None
     assert loaded[700001].aggregate_right_market_cap_ratio is None
+
+
+def test_history_loader_defaults_missing_member_breadth_flag_to_true(
+    tmp_path: Path,
+) -> None:
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(_valid_context(as_of_date="2026-07-23"),),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "member_breadth_collected" in payload["industries"][0]
+    payload["industries"][0]["member_breadth_collected"] = True
+    payload["industries"][0].pop("member_breadth_collected")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    )
+
+    assert loaded[700001].member_breadth_collected is True
+
+
+def test_history_writer_does_not_rewrite_when_only_breadth_flag_is_missing(
+    tmp_path: Path,
+) -> None:
+    context = _valid_context(as_of_date="2026-07-23")
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(context,),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "member_breadth_collected" in payload["industries"][0]
+    payload["industries"][0]["member_breadth_collected"] = True
+    payload["industries"][0].pop("member_breadth_collected")
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    legacy_bytes = path.read_bytes()
+
+    assert write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T19:00:00+08:00",
+        strategy_version="v10",
+        contexts=(context,),
+    ) == path
+    assert path.read_bytes() == legacy_bytes
 
 
 def test_history_writer_enriches_legacy_rows_with_optional_aggregate_fields(

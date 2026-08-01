@@ -5608,6 +5608,9 @@ def rebuild_trend_report_from_evidence(
             integer_fields = {
                 field: int(value) for field, value in raw_integer_fields.items()
             }
+            member_breadth_collected = raw.get("member_breadth_collected", True)
+            if type(member_breadth_collected) is not bool:
+                raise ValueError
             context = IndustryContext(
                 **integer_fields,
                 industry=str(raw["industry"]),
@@ -5623,6 +5626,7 @@ def rebuild_trend_report_from_evidence(
                 strength=decimal_or_none(raw.get("strength")),
                 valid=raw["valid"] is True,
                 invalid_reasons=tuple(str(item) for item in raw["invalid_reasons"]),
+                member_breadth_collected=member_breadth_collected,
                 prior_as_of_date=(
                     None
                     if raw.get("prior_as_of_date") is None
