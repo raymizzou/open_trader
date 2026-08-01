@@ -44,6 +44,8 @@ from .polymarket_relation_discovery import (
 
 TOP_EVENT_LIMIT = 20
 UNIVERSE_REFRESH_SECONDS = 5 * 60
+UNIVERSE_RETRY_SECONDS = 5
+UNIVERSE_MAX_ATTEMPTS = 5
 BOOK_FRESHNESS_SECONDS = 10
 READINESS_FRESHNESS_SECONDS = 60
 READINESS_REFRESH_SECONDS = 30
@@ -306,10 +308,14 @@ class PolymarketMonitor:
         self._trading = trading
         self._public_client_factory = public_client_factory
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._monotonic = time.monotonic
         self._relation_discovery = relation_discovery
         self._relation_validator = relation_validator
         self._title_translator = title_translator
         self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
+        self._failure_observer: Callable[
+            [Mapping[str, object]], Mapping[str, object] | object
+        ] | None = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -390,12 +396,17 @@ class PolymarketMonitor:
         self._last_runtime_write: datetime | None = None
         self._store_failed = False
         self._universe_failed = False
+        self._universe_refresh_attempts = 0
+        self._universe_retry_exhausted = False
+        self._universe_failure_notification_scheduled = False
+        self._universe_failure_notification_task: asyncio.Task[object] | None = None
         self._relations_failed = False
         self._stream_message_at: datetime | None = None
         self._diagnostics: dict[str, object] = {
             "malformed_events": 0,
             "malformed_markets": 0,
             "last_error": None,
+            "universe_notification_error": None,
         }
         self._relation_scan_logs: deque[dict[str, object]] = deque(
             maxlen=RELATION_SCAN_LOG_LIMIT
@@ -405,6 +416,12 @@ class PolymarketMonitor:
         self, observer: Callable[[str, str], Mapping[str, object]]
     ) -> None:
         self._ready_observer = observer
+
+    def set_failure_observer(
+        self,
+        observer: Callable[[Mapping[str, object]], Mapping[str, object] | object],
+    ) -> None:
+        self._failure_observer = observer
 
     def start(self) -> None:
         with self._lock:
@@ -762,16 +779,17 @@ class PolymarketMonitor:
         try:
             while not self._stop_event.is_set():
                 self._reap_notification_task()
+                self._reap_universe_failure_notification_task()
                 self._maintain_open_signals()
                 await self._poll_relation_validation(client)
                 current = time.monotonic()
-                if self._universe_at is None or current >= next_refresh:
-                    try:
-                        await self._refresh_universe_bounded(client)
-                        next_readiness_refresh = current + READINESS_REFRESH_SECONDS
-                    except Exception as exc:
-                        self._record_error(exc, "universe")
-                    next_refresh = current + UNIVERSE_REFRESH_SECONDS
+                next_refresh, universe_refreshed = await self._refresh_universe_if_due(
+                    client,
+                    current=current,
+                    next_refresh=next_refresh,
+                )
+                if universe_refreshed:
+                    next_readiness_refresh = time.monotonic() + READINESS_REFRESH_SECONDS
                 if current >= next_readiness_refresh:
                     await self._refresh_readiness()
                     next_readiness_refresh = current + READINESS_REFRESH_SECONDS
@@ -820,6 +838,7 @@ class PolymarketMonitor:
                 "_activity_scan_task",
                 "_codex_task",
                 "_notification_task",
+                "_universe_failure_notification_task",
                 "_title_translation_task",
             ):
                 task = getattr(self, task_name)
@@ -840,6 +859,67 @@ class PolymarketMonitor:
             self._refresh_universe(client, subscribe=subscribe),
             timeout=PUBLIC_REFRESH_TIMEOUT_SECONDS,
         )
+
+    async def _refresh_universe_if_due(
+        self,
+        client: object,
+        *,
+        current: float,
+        next_refresh: float,
+    ) -> tuple[float, bool]:
+        if self._universe_retry_exhausted or current < next_refresh:
+            return next_refresh, False
+        try:
+            await self._refresh_universe_bounded(client)
+        except Exception as exc:
+            self._record_error(exc, "universe")
+            self._universe_refresh_attempts = min(
+                self._universe_refresh_attempts + 1,
+                UNIVERSE_MAX_ATTEMPTS,
+            )
+            if self._universe_refresh_attempts >= UNIVERSE_MAX_ATTEMPTS:
+                self._universe_retry_exhausted = True
+                self._schedule_universe_failure_notification(exc)
+            return self._monotonic() + UNIVERSE_RETRY_SECONDS, False
+        self._universe_failed = False
+        self._universe_refresh_attempts = 0
+        self._universe_retry_exhausted = False
+        return self._monotonic() + UNIVERSE_REFRESH_SECONDS, True
+
+    def _schedule_universe_failure_notification(self, exc: BaseException) -> None:
+        observer = self._failure_observer
+        if observer is None or self._universe_failure_notification_scheduled:
+            return
+        self._universe_failure_notification_scheduled = True
+        payload = {
+            "attempts": UNIVERSE_MAX_ATTEMPTS,
+            "error_type": type(exc).__name__,
+            "last_success_at": (
+                self._universe_at.isoformat() if self._universe_at is not None else None
+            ),
+        }
+        self._universe_failure_notification_task = asyncio.create_task(
+            asyncio.to_thread(observer, payload)
+        )
+
+    def _reap_universe_failure_notification_task(self) -> None:
+        task = self._universe_failure_notification_task
+        if task is None or not task.done():
+            return
+        self._universe_failure_notification_task = None
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self._diagnostics["universe_notification_error"] = type(exc).__name__
+            return
+        if isinstance(result, Mapping) and result.get("state") != "sent":
+            reason = str(result.get("reason") or "notification_failed")
+            self._diagnostics["universe_notification_error"] = "".join(
+                character if character.isalnum() or character in "_-" else "_"
+                for character in reason
+            )[:80]
 
     async def _stream_next(self, handle: object) -> object:
         iterator = getattr(handle, "__anext__", None)
@@ -3463,7 +3543,9 @@ class PolymarketMonitor:
             reasons.append("universe_unavailable")
         elif _age(now, self._universe_at) > UNIVERSE_STALE_SECONDS:
             reasons.append("universe_stale")
-        if self._universe_failed:
+        if self._universe_retry_exhausted:
+            reasons.append("universe_retry_exhausted")
+        elif self._universe_failed:
             reasons.append("universe_refresh_failed")
         if self._stream_disconnected_at is not None and _age(now, self._stream_disconnected_at) > STREAM_DISCONNECT_SECONDS:
             reasons.append("stream_disconnected")
@@ -3477,7 +3559,12 @@ class PolymarketMonitor:
         readiness_at = self._readiness.get("checked_at") if self._readiness else None
         if not isinstance(readiness_at, datetime) or _age(now, readiness_at) > READINESS_FRESHNESS_SECONDS:
             reasons.append("readiness_stale")
-        status = "loading" if self._universe_at is None else ("degraded" if reasons else "healthy")
+        status = (
+            "loading"
+            if self._universe_at is None and not self._universe_failed
+            and not self._universe_retry_exhausted
+            else ("degraded" if reasons else "healthy")
+        )
         return {
             "status": status,
             "degraded": status == "degraded",
@@ -3487,6 +3574,8 @@ class PolymarketMonitor:
             "heartbeat_age_seconds": _display_age(_age(now, self._heartbeat_at)),
             "universe_age_seconds": _display_age(_age(now, self._universe_at)),
             "readiness_age_seconds": _display_age(_age(now, readiness_at if isinstance(readiness_at, datetime) else None)),
+            "universe_refresh_attempts": self._universe_refresh_attempts,
+            "universe_retry_exhausted": self._universe_retry_exhausted,
         }
 
     def _now(self) -> datetime:

@@ -2950,3 +2950,141 @@ def test_title_translation_worker_is_fifo_and_does_not_block_english_snapshot(
         assert monitor._title_translation_task is None
 
     asyncio.run(scenario())
+
+
+def test_universe_retry_attempts_schedule_and_latch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    refresh_calls = 0
+
+    class TransportError(RuntimeError):
+        pass
+
+    async def fail_refresh(_client: object) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        raise TransportError("temporary failure")
+
+    monitor._refresh_universe_bounded = fail_refresh  # type: ignore[method-assign]
+    completion_times = iter((0.0, 5.0, 10.0, 15.0, 20.0))
+    last_completion = [0.0]
+
+    def monotonic() -> float:
+        try:
+            last_completion[0] = next(completion_times)
+        except StopIteration:
+            pass
+        return last_completion[0]
+
+    monkeypatch.setattr(monitor, "_monotonic", monotonic)
+
+    async def scenario() -> tuple[list[float], dict[str, object]]:
+        next_refresh = 0.0
+        due_times: list[float] = []
+        for current in (0.0, 5.0, 10.0, 15.0, 20.0, 25.0):
+            next_refresh, _succeeded = await monitor._refresh_universe_if_due(
+                object(), current=current, next_refresh=next_refresh
+            )
+            due_times.append(next_refresh)
+        return due_times, monitor.snapshot()["health"]
+
+    due_times, health = asyncio.run(scenario())
+
+    assert refresh_calls == 5
+    assert due_times[:4] == [5.0, 10.0, 15.0, 20.0]
+    assert health["universe_refresh_attempts"] == 5
+    assert health["universe_retry_exhausted"] is True
+    assert "universe_retry_exhausted" in health["degraded_reasons"]
+    assert "universe_refresh_failed" not in health["degraded_reasons"]
+
+
+def test_universe_retry_success_resets_attempts_and_restores_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    calls = 0
+
+    async def refresh(_client: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 4:
+            raise ConnectionError("temporary failure")
+        monitor._universe_at = NOW
+        monitor._universe_failed = False
+
+    monitor._refresh_universe_bounded = refresh  # type: ignore[method-assign]
+    completion_times = iter((0.0, 5.0, 10.0, 15.0))
+    last_completion = [0.0]
+
+    def monotonic() -> float:
+        try:
+            last_completion[0] = next(completion_times)
+        except StopIteration:
+            pass
+        return last_completion[0]
+
+    monkeypatch.setattr(monitor, "_monotonic", monotonic)
+
+    async def scenario() -> tuple[float, bool, dict[str, object]]:
+        next_refresh = 0.0
+        for current in (0.0, 5.0, 10.0):
+            next_refresh, _succeeded = await monitor._refresh_universe_if_due(
+                object(), current=current, next_refresh=next_refresh
+            )
+        next_refresh, succeeded = await monitor._refresh_universe_if_due(
+            object(), current=15.0, next_refresh=next_refresh
+        )
+        return next_refresh, succeeded, monitor.snapshot()["health"]
+
+    next_refresh, succeeded, health = asyncio.run(scenario())
+
+    assert calls == 4
+    from open_trader.polymarket_monitor import UNIVERSE_REFRESH_SECONDS
+
+    assert next_refresh == 15.0 + UNIVERSE_REFRESH_SECONDS
+    assert succeeded is True
+    assert health["universe_refresh_attempts"] == 0
+    assert health["universe_retry_exhausted"] is False
+    assert "universe_refresh_failed" not in health["degraded_reasons"]
+    assert "universe_retry_exhausted" not in health["degraded_reasons"]
+
+
+def test_universe_failure_observer_is_scheduled_once_on_attempt_five(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor = make_monitor(tmp_path, relation_discovery=None, relation_validator=None)
+    calls: list[dict[str, object]] = []
+
+    class TransportError(RuntimeError):
+        pass
+
+    async def fail_refresh(_client: object) -> None:
+        raise TransportError("temporary failure")
+
+    monitor._refresh_universe_bounded = fail_refresh  # type: ignore[method-assign]
+    monitor.set_failure_observer(
+        lambda payload: calls.append(dict(payload)) or {"state": "sent"}
+    )
+    completion_times = iter((0.0, 5.0, 10.0, 15.0, 20.0))
+    monkeypatch.setattr(monitor, "_monotonic", lambda: next(completion_times))
+
+    async def scenario() -> None:
+        next_refresh = 0.0
+        for current in (0.0, 5.0, 10.0, 15.0, 20.0, 25.0):
+            next_refresh, _succeeded = await monitor._refresh_universe_if_due(
+                object(), current=current, next_refresh=next_refresh
+            )
+        await asyncio.sleep(0.01)
+        monitor._reap_universe_failure_notification_task()
+
+    asyncio.run(scenario())
+
+    assert calls == [
+        {
+            "attempts": 5,
+            "error_type": "TransportError",
+            "last_success_at": None,
+        }
+    ]
+    assert monitor._universe_failure_notification_task is None
