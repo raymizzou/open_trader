@@ -191,7 +191,9 @@ kill "$GATEWAY_PID" "$LEGACY_PID"
 4. #15 安装器会自动停止本次新 job、恢复保留的单进程 plist，并重新验证 `8766`；
    如果恢复也失败，安装器返回非零并保留诊断日志，不报告切换成功。
 
-不要在 #14 阶段手动把 Legacy 直接切到正在使用的生产 `8766`。需要正式切换时，等待 #15 提供带 readiness 检查和回滚路径的 stack 安装器。
+不要在 #14 的手工验证阶段把 Legacy 直接切到正在使用的生产 `8766`。正式切换只通过
+`scripts/install_dashboard_launchd.sh` 执行，让 listener 所有权、readiness 和自动回滚
+保持在同一个状态机内。
 
 ## 目标端口参考
 
