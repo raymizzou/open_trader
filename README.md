@@ -498,38 +498,6 @@ writes `user_llm_conclusion.json` into the research bundle and updates that
 bundle's `dashboard_view.json`. This workflow is read-only for trading: it does
 not place orders and does not modify trade action files.
 
-Verify the deployment:
-
-```bash
-curl -sS http://127.0.0.1:8766/ | head
-curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
-ps aux | rg 'open_trader dashboard'
-```
-
-For a structured API check, run:
-
-```bash
-.venv/bin/python - <<'PY'
-import json
-from urllib.request import urlopen
-
-with urlopen("http://127.0.0.1:8766/api/dashboard", timeout=10) as response:
-    payload = json.load(response)
-
-print("holding_count", payload.get("summary", {}).get("holding_count"))
-print("detail_available", payload.get("detail_available"))
-print(
-    "has_soxx_decision_facts",
-    any(
-        holding.get("market") == "US"
-        and holding.get("symbol") == "SOXX"
-        and bool(holding.get("decision_facts"))
-        for holding in payload.get("holdings", [])
-    ),
-)
-PY
-```
-
 ## Daily Automation
 
 ### Deploy Daily Premarket Jobs
