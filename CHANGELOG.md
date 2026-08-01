@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-01
 
+- 修复 Dashboard 与账户同步 launchd 重装在旧 job 异步移除完成前立即 bootstrap、短暂输出 `Bootstrap failed: 5` 的启动竞态；账户同步也不再对已经由 RunAtLoad 启动的新进程重复 `kickstart -k`。安装器现在确认 label 已消失后只启动一次，同时保留真实 launchctl 错误。
 - 趋势报告不再为仅持仓行业付费展开全体成分；候选行业的精确宽度、当日排序、动作、风险及 Dashboard 行业字段/状态保持不变，仅持仓行业继续展示供应商聚合比例。若该行业日后首次重新成为候选，可能暂时使用仅当前数据排序。使用 2026-07-31 三市场冻结账本验证减少 18 次成分调用和 3,610 个成员快照，成员字段费用减少 10.830 Trend Animals 余额单位。
 - 补齐 Frontend Gateway Phase 0 的 README、运维手册与验收准备；已验证文档一致性和 git diff --check，最终 acceptance 与 exact-SHA 重部署待执行。本阶段没有页面、策略、报告、执行或 worker 行为变化。
 - 修复 Dashboard stack 在 `RunAtLoad` bootstrap 后重复 `kickstart -k`、可能留下孤儿 listener 并触发 launchd 重启循环的问题；安装和回滚现在只执行一次受管启动。
