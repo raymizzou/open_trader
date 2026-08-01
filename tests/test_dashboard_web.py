@@ -12995,6 +12995,8 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     current = {
         "opportunity_id": "opp-1",
         "market_id": "market-1",
+        "event_id": "event-1",
+        "condition_id": "condition-1",
         "market_type": "standard_binary",
         "question": title,
         "actionable": True,
@@ -13007,6 +13009,11 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
         "no_max_cost": "5.50",
         "total_max_cost": "9.50",
         "estimated_profit": "0.44",
+        "minimum_profit": "0.44",
+        "net_edge": "0.044",
+        "tick_size": "0.01",
+        "confirmed_at": "2026-08-01T10:00:59Z",
+        "confirmed_age_seconds": "1",
     }
 
     class FakeStore:
@@ -13036,14 +13043,16 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
 
     class FakeMonitor:
         profit = "0.44"
+        calls = 0
 
         def snapshot(self) -> dict[str, object]:
+            self.calls += 1
             live = dict(current)
             live["estimated_profit"] = self.profit
             return {
                 "status": "healthy",
                 "health": {"status": "healthy", "degraded_reasons": []},
-                "readiness": {},
+                "readiness": {"status": "ready", "geoblock": "allowed", "relayer": "ready"},
                 "events": [],
                 "opportunities": [live],
             }
@@ -13072,6 +13081,7 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     assert items[1]["actionable_now"] is True
     assert items[2]["actionable_now"] is False
     assert items[2]["live_profit"] is None
+    assert monitor.calls == 1
 
     monitor.profit = "0.51"
     refreshed = _prediction_history_payload(
@@ -13095,6 +13105,16 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
         {"status": "error"},
         {"missing_opportunity": True},
         {"incomplete_opportunity": True},
+        {"missing_field": "event_id"},
+        {"missing_field": "condition_id"},
+        {"missing_field": "tick_size"},
+        {"missing_field": "minimum_profit"},
+        {"missing_field": "net_edge"},
+        {"missing_field": "confirmed_at"},
+        {"missing_field": "confirmed_age_seconds"},
+        {"readiness_status": "unavailable"},
+        {"geoblock": "blocked"},
+        {"relayer": "blocked"},
         {"active_execution": True},
         {"breaker_open": True},
     ],
@@ -13116,6 +13136,8 @@ def test_prediction_history_fails_closed_for_unusable_live_truth(
     opportunity = {
         "opportunity_id": "opp-1",
         "market_id": "market-1",
+        "event_id": "event-1",
+        "condition_id": "condition-1",
         "market_type": "standard_binary",
         "question": "Will the event happen?",
         "actionable": True,
@@ -13128,11 +13150,19 @@ def test_prediction_history_fails_closed_for_unusable_live_truth(
         "no_max_cost": "5.50",
         "total_max_cost": "9.50",
         "estimated_profit": "0.44",
+        "minimum_profit": "0.44",
+        "net_edge": "0.044",
+        "tick_size": "0.01",
+        "confirmed_at": "2026-08-01T10:00:59Z",
+        "confirmed_age_seconds": "1",
     }
     if state_overrides.get("missing_opportunity"):
         opportunity = None
     elif state_overrides.get("incomplete_opportunity"):
         opportunity = {"opportunity_id": "opp-1", "market_id": "market-1", "actionable": True}
+    elif state_overrides.get("missing_field"):
+        opportunity = dict(opportunity)
+        opportunity.pop(str(state_overrides["missing_field"]), None)
 
     class FakeStore:
         def histories(self, kind: str) -> list[dict[str, object]]:
@@ -13157,7 +13187,11 @@ def test_prediction_history_fails_closed_for_unusable_live_truth(
                 "status": state_overrides.get("status", "healthy"),
                 "stale": state_overrides.get("stale", False),
                 "health": {"status": state_overrides.get("status", "healthy"), "degraded_reasons": []},
-                "readiness": {},
+                "readiness": {
+                    "status": state_overrides.get("readiness_status", "ready"),
+                    "geoblock": state_overrides.get("geoblock", "allowed"),
+                    "relayer": state_overrides.get("relayer", "ready"),
+                },
                 "events": [],
                 "opportunities": [] if opportunity is None else [opportunity],
             }

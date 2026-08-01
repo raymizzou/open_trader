@@ -778,11 +778,29 @@ def _prediction_history_payload(
         current_execution = state.get("current_execution") if isinstance(state, Mapping) else None
         breaker = state.get("breaker") if isinstance(state, Mapping) else None
         breaker_closed = isinstance(breaker, Mapping) and breaker.get("open") is False
+        readiness = state.get("readiness") if isinstance(state, Mapping) else None
+        accepted_readiness = {True, "ready", "allowed", "pass", "confirmed"}
+        readiness_status = str(readiness.get("status", "")).casefold() if isinstance(readiness, Mapping) else ""
+        geoblock = readiness.get("geoblock") if isinstance(readiness, Mapping) else None
+        relayer = (
+            readiness.get("relayer")
+            if isinstance(readiness, Mapping)
+            else None
+        )
+        if relayer is None and isinstance(readiness, Mapping):
+            relayer = readiness.get("relayer_readiness")
+        readiness_usable = (
+            isinstance(readiness, Mapping)
+            and readiness_status not in {"unavailable", "blocked", "fail", "failed"}
+            and geoblock in accepted_readiness
+            and relayer in accepted_readiness
+        )
         state_usable = (
             not state_stale
             and state_status not in {"degraded", "unavailable", "error"}
             and not current_execution
             and breaker_closed
+            and readiness_usable
         )
 
         def _present(value: Mapping[str, object], *names: str) -> bool:
@@ -791,7 +809,10 @@ def _prediction_history_payload(
         def _complete(value: Mapping[str, object]) -> bool:
             required = (
                 ("opportunity_id", "id"),
+                ("market_type",),
+                ("event_id",),
                 ("market_id",),
+                ("condition_id",),
                 ("yes_token_id",),
                 ("no_token_id",),
                 ("quantity",),
@@ -800,7 +821,11 @@ def _prediction_history_payload(
                 ("yes_max_cost",),
                 ("no_max_cost",),
                 ("total_max_cost", "max_cost"),
-                ("estimated_profit", "profit"),
+                ("minimum_profit",),
+                ("net_edge",),
+                ("tick_size",),
+                ("confirmed_at",),
+                ("confirmed_age_seconds",),
             )
             return all(_present(value, *names) for names in required)
 
@@ -819,6 +844,19 @@ def _prediction_history_payload(
                 current = opportunity_by_id.get(str(opportunity_id))
             if current is None and market_id not in (None, ""):
                 current = opportunity_by_market.get(str(market_id))
+            if isinstance(current, Mapping):
+                row_market_type = str(projected.get("market_type") or "standard_binary")
+                current_market_type = str(current.get("market_type") or "")
+                same_market = (
+                    market_id in (None, "")
+                    or str(current.get("market_id") or "") == str(market_id)
+                )
+                if (
+                    row_market_type != "standard_binary"
+                    or current_market_type != "standard_binary"
+                    or not same_market
+                ):
+                    current = None
             is_open = not projected.get("ended_at")
             complete = isinstance(current, Mapping) and _complete(current)
             current_usable = bool(is_open and state_usable and complete)

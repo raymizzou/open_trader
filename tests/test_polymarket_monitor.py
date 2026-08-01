@@ -2449,6 +2449,8 @@ def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path
     assert opportunity["actionable"] is True
     assert opportunity["market_type"] == "standard_binary"
     assert opportunity["fee_status"] == "fee_free"
+    assert opportunity["tick_size"] == Decimal("0.01")
+    assert opportunity["minimum_profit"] == opportunity["estimated_profit"]
     assert opportunity["confirmed_age_seconds"] <= 10
     assert trading.submit_calls == trading.remediation_calls == trading.merge_calls == 0
 
