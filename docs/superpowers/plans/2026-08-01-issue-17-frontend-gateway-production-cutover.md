@@ -148,7 +148,7 @@ Add this pre-gate documentation and acceptance-preparation bullet at the top of
 the existing `2026-08-01` section:
 
 ```markdown
-- 补齐 Frontend Gateway Phase 0 生产交付文档与验收准备：README 与运维手册现在明确稳定的 `8766` 用户入口、内部 `8767` Legacy Dashboard、首次安装先生成保留回滚 plist 后再执行双进程 stack 安装、双运行时诊断及 `--mode single` 回滚，并要求最终 PASS 后重新部署完全相同的 accepted SHA。本阶段没有页面、策略、报告、执行或 worker 行为变化。
+- 补齐 Frontend Gateway Phase 0 生产交付文档与验收准备：README 与运维手册现在明确稳定的 `8766` 用户入口、内部 `8767` Legacy Dashboard、首次安装先生成保留回滚 plist 后再执行双进程 stack 安装、双运行时诊断及 `--mode single` 回滚，并要求最终 PASS 后重新部署完全相同的 accepted SHA。本阶段没有页面、策略、报告、执行或 worker 行为变化。已验证 README/运维手册一致性检查与 `git diff --check`；最终 Dashboard acceptance 仍待执行。
 ```
 
 - [ ] **Step 5: Check documentation consistency**
