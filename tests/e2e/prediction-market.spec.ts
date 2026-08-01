@@ -125,6 +125,10 @@ test.describe('YES/NO arbitrage signal workspace', () => {
 
   test('failed signal refresh freezes the clock and suppresses operations', async ({ page }) => {
     await openPrediction(page);
+    const signalClock = page.locator('[data-prediction-history-panel] .pm-clock > span');
+    await expect(signalClock).toHaveText(/信号刷新时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} HKT/);
+    const successfulClockText = await signalClock.innerText();
+    await page.evaluate(() => (window as Window & { stopPredictionSignalPolling: () => void }).stopPredictionSignalPolling());
     await page.route('**/api/prediction-arbitrage/history?kind=signals**', async (route) => {
       await route.abort();
     });
@@ -132,6 +136,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       window as Window & { loadPredictionHistory: (kind: string, options?: { panelOnly?: boolean }) => Promise<void> }
     ).loadPredictionHistory('signals', { panelOnly: true }));
     await expect(page.locator('.pm-clock-danger')).toBeVisible();
+    await expect(signalClock).toHaveText(successfulClockText);
     await expect(page.locator('[data-prediction-history-panel] [data-action="participate"]')).toHaveCount(0);
     await expect(page.locator('[data-prediction-history-panel] tbody tr')).not.toHaveCount(0);
   });
