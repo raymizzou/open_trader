@@ -2029,7 +2029,7 @@ def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path:
         assert state["events"][0]["event_id"] == "a"
         assert state["events"][1]["event_id"] == "b"
         assert read_json(f"{base}/api/prediction-arbitrage/history?kind=signals&limit=1")["items"] == [
-            {"kind": "signals", "id": "one"}
+            {"kind": "signals", "id": "one", "signal_id": "one", "actionable_now": False, "live_profit": None}
         ]
         assert read_error_json(f"{base}/api/prediction-arbitrage/history?kind=unknown")[0] == 400
 
@@ -2182,6 +2182,8 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
         "peak_edge": "0.060",
         "quantity": "20",
         "profit": "1.20",
+        "actionable_now": False,
+        "live_profit": None,
     }
     execution_item = _prediction_history_payload(store, kind="executions", limit=10, offset=0)["items"][0]
     assert execution_item["status"] == "complete"
@@ -12950,3 +12952,226 @@ def test_prediction_history_projects_observed_signal_fields() -> None:
     assert projected["final_profit"] == "-0.01"
     assert projected["ended_reason"] == "profit_non_positive"
     assert projected["notification_state"] == "not_sent"
+
+
+def test_prediction_history_projects_live_yes_no_actionability_and_cached_title() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+    from open_trader.prediction_title_translation import prediction_title_cache_key
+
+    title = "Will the event happen?"
+    rows = [
+        {
+            "signal_id": "closed-newer",
+            "opportunity_id": "opp-1",
+            "market_id": "market-1",
+            "question": title,
+            "started_at": "2026-08-01T10:02:00Z",
+            "ended_at": "2026-08-01T10:02:01Z",
+            "observed_duration_ms": 1000,
+            "initial_profit": "0.30",
+            "notification_state": "sent",
+        },
+        {
+            "signal_id": "open-older",
+            "opportunity_id": "opp-1",
+            "market_id": "market-1",
+            "question": title,
+            "started_at": "2026-08-01T10:01:00Z",
+            "ended_at": None,
+            "observed_duration_ms": 2000,
+            "initial_profit": "0.38",
+            "notification_state": "pending",
+        },
+        {
+            "signal_id": "compat-open",
+            "market_id": "market-1",
+            "question": title,
+            "started_at": "2026-08-01T10:00:00Z",
+            "ended_at": None,
+            "initial_profit": "0.31",
+            "notification_state": "pending",
+        },
+    ]
+    current = {
+        "opportunity_id": "opp-1",
+        "market_id": "market-1",
+        "market_type": "standard_binary",
+        "question": title,
+        "actionable": True,
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "quantity": "10",
+        "yes_max_price": "0.40",
+        "no_max_price": "0.55",
+        "yes_max_cost": "4.00",
+        "no_max_cost": "5.50",
+        "total_max_cost": "9.50",
+        "estimated_profit": "0.44",
+    }
+
+    class FakeStore:
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "signals"
+            return rows
+
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return rows
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+        def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
+            if cache_key == prediction_title_cache_key(title):
+                return {"title_zh": "这件事会发生吗？"}
+            return None
+
+        def record_llm_cache_hit(self) -> None:
+            return None
+
+    class FakeMonitor:
+        profit = "0.44"
+
+        def snapshot(self) -> dict[str, object]:
+            live = dict(current)
+            live["estimated_profit"] = self.profit
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {},
+                "events": [],
+                "opportunities": [live],
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+
+    monitor = FakeMonitor()
+    payload = _prediction_history_payload(
+        FakeStore(),
+        kind="signals",
+        limit=10,
+        offset=0,
+        monitor=monitor,
+        execution=FakeExecution(),
+    )
+    items = payload["items"]
+    assert [item["signal_id"] for item in items] == [
+        "open-older", "compat-open", "closed-newer"
+    ]
+    assert items[0]["actionable_now"] is True
+    assert items[0]["live_profit"] == "0.44"
+    assert items[0]["initial_profit"] == "0.38"
+    assert items[0]["event_title"] == title
+    assert items[0]["event_title_zh"] == "这件事会发生吗？"
+    assert items[1]["actionable_now"] is True
+    assert items[2]["actionable_now"] is False
+    assert items[2]["live_profit"] is None
+
+    monitor.profit = "0.51"
+    refreshed = _prediction_history_payload(
+        FakeStore(),
+        kind="signals",
+        limit=10,
+        offset=0,
+        monitor=monitor,
+        execution=FakeExecution(),
+    )["items"][0]
+    assert refreshed["live_profit"] == "0.51"
+    assert refreshed["initial_profit"] == "0.38"
+
+
+@pytest.mark.parametrize(
+    "state_overrides",
+    [
+        {"stale": True},
+        {"status": "degraded"},
+        {"status": "unavailable"},
+        {"status": "error"},
+        {"missing_opportunity": True},
+        {"incomplete_opportunity": True},
+        {"active_execution": True},
+        {"breaker_open": True},
+    ],
+)
+def test_prediction_history_fails_closed_for_unusable_live_truth(
+    state_overrides: dict[str, object],
+) -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+
+    row = {
+        "signal_id": "s-1",
+        "opportunity_id": "opp-1",
+        "market_id": "market-1",
+        "question": "Will the event happen?",
+        "started_at": "2026-08-01T10:01:00Z",
+        "ended_at": None,
+        "initial_profit": "0.38",
+    }
+    opportunity = {
+        "opportunity_id": "opp-1",
+        "market_id": "market-1",
+        "market_type": "standard_binary",
+        "question": "Will the event happen?",
+        "actionable": True,
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "quantity": "10",
+        "yes_max_price": "0.40",
+        "no_max_price": "0.55",
+        "yes_max_cost": "4.00",
+        "no_max_cost": "5.50",
+        "total_max_cost": "9.50",
+        "estimated_profit": "0.44",
+    }
+    if state_overrides.get("missing_opportunity"):
+        opportunity = None
+    elif state_overrides.get("incomplete_opportunity"):
+        opportunity = {"opportunity_id": "opp-1", "market_id": "market-1", "actionable": True}
+
+    class FakeStore:
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "signals"
+            return [row]
+
+        def active_execution(self) -> dict[str, object] | None:
+            return {"execution_id": "exec-1"} if state_overrides.get("active_execution") else None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return [row]
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": state_overrides.get("status", "healthy"),
+                "stale": state_overrides.get("stale", False),
+                "health": {"status": state_overrides.get("status", "healthy"), "degraded_reasons": []},
+                "readiness": {},
+                "events": [],
+                "opportunities": [] if opportunity is None else [opportunity],
+            }
+
+    class FakeExecution:
+        _breaker_open = bool(state_overrides.get("breaker_open", False))
+
+    item = _prediction_history_payload(
+        FakeStore(),
+        kind="signals",
+        limit=10,
+        offset=0,
+        monitor=FakeMonitor(),
+        execution=FakeExecution(),
+    )["items"][0]
+    assert item["actionable_now"] is False
+    assert item["live_profit"] is None

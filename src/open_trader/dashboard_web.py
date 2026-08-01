@@ -376,6 +376,15 @@ def _prediction_duration(start: object, end: object) -> str | None:
     return f"{remainder}s"
 
 
+def _prediction_history_epoch(value: object) -> float:
+    if not isinstance(value, str):
+        return float("-inf")
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return float("-inf")
+
+
 def _prediction_history_aliases(kind: str, value: object) -> object:
     """Normalize durable store rows without changing their audit fields."""
 
@@ -409,6 +418,9 @@ def _prediction_history_aliases(kind: str, value: object) -> object:
             "peak_profit": _prediction_first(result, "peak_profit"),
             "final_profit": _prediction_first(result, "final_profit"),
             "ended_reason": _prediction_first(result, "ended_reason"),
+            "signal_id": _prediction_first(result, "signal_id", "id"),
+            "opportunity_id": _prediction_first(result, "opportunity_id"),
+            "market_id": _prediction_first(result, "market_id"),
             "notification_state": _prediction_first(
                 result, "notification_state", "notification_status"
             ),
@@ -725,6 +737,8 @@ def _prediction_history_payload(
     kind: str,
     limit: int,
     offset: int,
+    monitor: object | None = None,
+    execution: object | None = None,
 ) -> dict[str, object]:
     if kind not in PREDICTION_HISTORY_KINDS:
         raise ValueError("kind must be signals, executions, or incidents")
@@ -735,6 +749,93 @@ def _prediction_history_payload(
         )
         for row in rows
     ]
+    if kind == "signals":
+        try:
+            state = _prediction_state_payload(
+                store=store,
+                monitor=monitor,
+                execution=execution,
+                csrf_token="",
+            )
+        except Exception:
+            state = {}
+        opportunities = state.get("opportunities") if isinstance(state, Mapping) else None
+        opportunity_by_id: dict[str, Mapping[str, object]] = {}
+        opportunity_by_market: dict[str, Mapping[str, object]] = {}
+        if isinstance(opportunities, (list, tuple)):
+            for value in opportunities:
+                if not isinstance(value, Mapping):
+                    continue
+                opportunity_id = _prediction_first(value, "opportunity_id", "id")
+                market_id = _prediction_first(value, "market_id")
+                if opportunity_id not in (None, ""):
+                    opportunity_by_id.setdefault(str(opportunity_id), value)
+                if market_id not in (None, ""):
+                    opportunity_by_market.setdefault(str(market_id), value)
+
+        state_status = str(state.get("status") or "unavailable") if isinstance(state, Mapping) else "unavailable"
+        state_stale = bool(state.get("stale")) if isinstance(state, Mapping) else True
+        current_execution = state.get("current_execution") if isinstance(state, Mapping) else None
+        breaker = state.get("breaker") if isinstance(state, Mapping) else None
+        breaker_closed = isinstance(breaker, Mapping) and breaker.get("open") is False
+        state_usable = (
+            not state_stale
+            and state_status not in {"degraded", "unavailable", "error"}
+            and not current_execution
+            and breaker_closed
+        )
+
+        def _present(value: Mapping[str, object], *names: str) -> bool:
+            return _prediction_first(value, *names) not in (None, "")
+
+        def _complete(value: Mapping[str, object]) -> bool:
+            required = (
+                ("opportunity_id", "id"),
+                ("market_id",),
+                ("yes_token_id",),
+                ("no_token_id",),
+                ("quantity",),
+                ("yes_max_price", "yes_price"),
+                ("no_max_price", "no_price"),
+                ("yes_max_cost",),
+                ("no_max_cost",),
+                ("total_max_cost", "max_cost"),
+                ("estimated_profit", "profit"),
+            )
+            return all(_present(value, *names) for names in required)
+
+        projected_rows: list[object] = []
+        for row in safe_rows:
+            if not isinstance(row, Mapping):
+                projected_rows.append(row)
+                continue
+            projected = dict(row)
+            projected.setdefault("actionable_now", False)
+            projected.setdefault("live_profit", None)
+            opportunity_id = _prediction_first(projected, "opportunity_id")
+            market_id = _prediction_first(projected, "market_id")
+            current = None
+            if opportunity_id not in (None, ""):
+                current = opportunity_by_id.get(str(opportunity_id))
+            if current is None and market_id not in (None, ""):
+                current = opportunity_by_market.get(str(market_id))
+            is_open = not projected.get("ended_at")
+            complete = isinstance(current, Mapping) and _complete(current)
+            current_usable = bool(is_open and state_usable and complete)
+            if current_usable and isinstance(current, Mapping):
+                live_profit = _prediction_first(current, "estimated_profit", "profit")
+                if live_profit is not None:
+                    projected["live_profit"] = live_profit
+                projected["actionable_now"] = current.get("actionable") is True
+            projected_rows.append(projected)
+        safe_rows = sorted(
+            projected_rows,
+            key=lambda value: (
+                not (isinstance(value, Mapping) and value.get("actionable_now") is True),
+                -_prediction_history_epoch(value.get("started_at") if isinstance(value, Mapping) else None),
+                str(value.get("signal_id") if isinstance(value, Mapping) else ""),
+            ),
+        )
     items = safe_rows[offset : offset + limit]
     return {
         "kind": kind,
@@ -1041,6 +1142,8 @@ def create_dashboard_server(
                             kind=kind,
                             limit=limit,
                             offset=offset,
+                            monitor=prediction_monitor,
+                            execution=prediction_execution_service,
                         )
                     )
                 except Exception as exc:
