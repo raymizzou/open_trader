@@ -273,10 +273,12 @@ verification failure requires a new committed candidate and a complete rerun.
 - [ ] **Step 1: Deploy every process used by final acceptance**
 
 ```bash
-scripts/install_dashboard_launchd.sh --mode single \
-  --repo-root "$PWD" \
-  --runtime-root /Users/ray/projects/open_trader \
-  --python /Users/ray/projects/open_trader/.venv/bin/python
+if [[ ! -f "$HOME/Library/LaunchAgents/com.open-trader.dashboard.plist" ]]; then
+  scripts/install_dashboard_launchd.sh --mode single \
+    --repo-root "$PWD" \
+    --runtime-root /Users/ray/projects/open_trader \
+    --python /Users/ray/projects/open_trader/.venv/bin/python
+fi
 
 scripts/install_dashboard_launchd.sh --mode stack \
   --repo-root "$PWD" \
