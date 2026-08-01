@@ -404,6 +404,57 @@ def test_history_loader_accepts_legacy_rows_without_aggregate_fields(
     assert loaded[700001].aggregate_right_market_cap_ratio is None
 
 
+def test_history_loader_defaults_missing_member_breadth_flag_to_true(
+    tmp_path: Path,
+) -> None:
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(_valid_context(as_of_date="2026-07-23"),),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "member_breadth_collected" in payload["industries"][0]
+    payload["industries"][0]["member_breadth_collected"] = True
+    payload["industries"][0].pop("member_breadth_collected")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_latest_prior_context(
+        tmp_path, market="CN", before_date="2026-07-24"
+    )
+
+    assert loaded[700001].member_breadth_collected is True
+
+
+def test_history_writer_does_not_rewrite_when_only_breadth_flag_is_missing(
+    tmp_path: Path,
+) -> None:
+    context = _valid_context(as_of_date="2026-07-23")
+    path = write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T18:00:00+08:00",
+        strategy_version="v10",
+        contexts=(context,),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "member_breadth_collected" in payload["industries"][0]
+    payload["industries"][0]["member_breadth_collected"] = True
+    payload["industries"][0].pop("member_breadth_collected")
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    legacy_bytes = path.read_bytes()
+
+    assert write_industry_context_history(
+        tmp_path,
+        market="CN",
+        generated_at="2026-07-23T19:00:00+08:00",
+        strategy_version="v10",
+        contexts=(context,),
+    ) == path
+    assert path.read_bytes() == legacy_bytes
+
+
 def test_history_writer_enriches_legacy_rows_with_optional_aggregate_fields(
     tmp_path: Path,
 ) -> None:

@@ -32,6 +32,7 @@ class IndustryContext:
     strength: Decimal | None
     valid: bool
     invalid_reasons: tuple[str, ...]
+    member_breadth_collected: bool = True
     aggregate_right_count_ratio: Decimal | None = None
     aggregate_right_market_cap_ratio: Decimal | None = None
     prior_as_of_date: str | None = None
@@ -383,13 +384,16 @@ def write_industry_context_history(
             existing = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise ValueError("conflicting same-date industry context history") from None
-        if (
+        same_history_identity = (
             isinstance(existing, Mapping)
             and existing.get("schema_version") == _HISTORY_SCHEMA_VERSION
             and existing.get("market") == market_name
             and existing.get("as_of_date") == as_of_date
-            and existing.get("industries") == payload["industries"]
-        ):
+        )
+        existing_industries = (
+            existing.get("industries") if isinstance(existing, Mapping) else None
+        )
+        if same_history_identity and existing_industries == payload["industries"]:
             return path
         aggregate_fields = {
             "aggregate_right_count_ratio",
@@ -397,15 +401,33 @@ def write_industry_context_history(
             "prior_aggregate_right_count_ratio",
             "prior_aggregate_right_market_cap_ratio",
         }
-        existing_industries = (
-            existing.get("industries") if isinstance(existing, Mapping) else None
+        flag_legacy_rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key != "member_breadth_collected"
+            }
+            for row in payload["industries"]
+        ]
+        if same_history_identity and existing_industries == flag_legacy_rows:
+            return path
+        missing_member_flag = (
+            isinstance(existing_industries, list)
+            and all(
+                isinstance(row, Mapping)
+                and "member_breadth_collected" not in row
+                for row in existing_industries
+            )
+        )
+        legacy_optional_fields = aggregate_fields | (
+            {"member_breadth_collected"} if missing_member_flag else set()
         )
         legacy_rows = (
             [
                 {
                     key: value
                     for key, value in row.items()
-                    if key not in aggregate_fields
+                    if key not in legacy_optional_fields
                 }
                 for row in payload["industries"]
             ]
@@ -418,11 +440,7 @@ def write_industry_context_history(
             else None
         )
         if not (
-            isinstance(existing, Mapping)
-            and existing.get("schema_version") == _HISTORY_SCHEMA_VERSION
-            and existing.get("market") == market_name
-            and existing.get("as_of_date") == as_of_date
-            and existing_industries == legacy_rows
+            same_history_identity and existing_industries == legacy_rows
         ):
             raise ValueError("conflicting same-date industry context history")
     temp_path: Path | None = None
@@ -533,11 +551,11 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         "prior_aggregate_right_count_ratio",
         "prior_aggregate_right_market_cap_ratio",
     }
-    if any(
-        field.name not in row
-        for field in fields(IndustryContext)
-        if field.name not in aggregate_fields
-    ):
+    optional_fields = aggregate_fields | {"member_breadth_collected"}
+    if any(field.name not in row for field in fields(IndustryContext) if field.name not in optional_fields):
+        return None
+    member_breadth_collected = row.get("member_breadth_collected", True)
+    if type(member_breadth_collected) is not bool:
         return None
     industry_tm_id = _positive_int(row.get("industry_tm_id"))
     if industry_tm_id is None or not isinstance(row.get("industry"), str):
@@ -612,6 +630,7 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
         strength=strength,
         valid=row["valid"],
         invalid_reasons=tuple(reasons),
+        member_breadth_collected=member_breadth_collected,
         aggregate_right_count_ratio=aggregate_decimals[
             "aggregate_right_count_ratio"
         ],

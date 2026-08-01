@@ -1947,6 +1947,7 @@ def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(
             "strength": "100",
             "valid": True,
             "invalid_reasons": [],
+            "member_breadth_collected": False,
             "aggregate_right_count_ratio": "0.191",
             "aggregate_right_market_cap_ratio": "0.650",
             "prior_as_of_date": "2026-07-14",
@@ -1971,6 +1972,7 @@ def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(
     assert projected["industry_contexts"][0][
         "aggregate_right_market_cap_ratio"
     ] == "0.650"
+    assert projected["industry_contexts"][0]["member_breadth_collected"] is False
 
 
 @pytest.mark.parametrize(
