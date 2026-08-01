@@ -68,17 +68,8 @@ Keychain only; they are never written to config, SQLite, logs, or browser state)
 ```
 
 The preflight signs an in-memory probe but never submits it or places a canary
-order. After it passes, install the persistent macOS Dashboard stack. The
-default command cuts over to Gateway `8766` plus Legacy Dashboard `8767`; use
-`--mode single` to roll back while preserving all three job configurations:
-
-```bash
-scripts/install_dashboard_launchd.sh --dry-run
-scripts/install_dashboard_launchd.sh
-.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
-scripts/install_dashboard_launchd.sh --mode single
-scripts/uninstall_dashboard_launchd.sh
-```
+order. After it passes, use the [local Dashboard stack](#deploy-the-local-dashboard-stack)
+for persistent installation, rollback, and uninstall.
 
 Open `http://127.0.0.1:8766/` and choose `预测市场`. Clicking `参与` creates one
 short-lived preview. After your confirmation Open Trader sends exactly one batch
@@ -411,23 +402,50 @@ These standard-strategy results are research-only. Custom strategy editing and
 automatic execution are explicitly out of scope; the dashboard does not place
 orders.
 
-### Deploy Local Frontend Dashboard
+### Deploy the Local Dashboard Stack
 
-```bash
-.venv/bin/python -m open_trader dashboard \
-  --portfolio data/latest/portfolio.csv \
-  --data-dir data \
-  --reports-dir reports \
-  --poll-seconds 5 \
-  --host 127.0.0.1 \
-  --port 8766
+The persistent macOS Dashboard runs as one launchd-managed stack:
+
+```text
+Browser → Frontend Gateway → Legacy Dashboard
+          127.0.0.1:8766     127.0.0.1:8767
 ```
 
-The dashboard serves locally at `http://127.0.0.1:8765` by default; the example
-above pins it to `http://127.0.0.1:8766` so the local deployment URL stays
-stable. It reads
-`data/latest/portfolio.csv`, broker detail artifacts under
-`data/broker_positions/`, and the latest trade actions and reports when present.
+`http://127.0.0.1:8766/` is the only user and review URL. The Legacy listener
+on `8767` owns the existing backend behavior and must remain loopback-only.
+
+Install or refresh both processes with one command:
+
+```bash
+scripts/install_dashboard_launchd.sh --dry-run
+scripts/install_dashboard_launchd.sh
+```
+
+Check both jobs, listeners, health identities, the forwarded quotes API, and
+fresh startup logs:
+
+```bash
+launchctl print gui/$(id -u)/com.open-trader.frontend-gateway
+launchctl print gui/$(id -u)/com.open-trader.legacy-dashboard
+lsof -nP -iTCP:8766 -sTCP:LISTEN
+lsof -nP -iTCP:8767 -sTCP:LISTEN
+curl -fsS http://127.0.0.1:8766/healthz
+curl -fsS http://127.0.0.1:8767/healthz
+curl -fsS -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8766/api/quotes
+tail -n 20 logs/frontend_gateway/launchd.out.log
+tail -n 20 logs/legacy_dashboard/launchd.out.log
+```
+
+Restore the preserved single-process layout without deleting the stack plists:
+
+```bash
+scripts/install_dashboard_launchd.sh --mode single
+```
+
+See [Frontend Gateway 双进程部署参考](docs/operations/frontend-gateway-deployment-reference.md)
+for cutover order, automatic failure recovery, temporary-port smoke checks,
+exact-SHA acceptance, and complete uninstall instructions.
 
 To generate intraday 做T signals for existing HK or US holdings:
 
@@ -480,16 +498,6 @@ writes `user_llm_conclusion.json` into the research bundle and updates that
 bundle's `dashboard_view.json`. This workflow is read-only for trading: it does
 not place orders and does not modify trade action files.
 
-To keep the local frontend running after the terminal closes, start it in a
-detached `screen` session:
-
-```bash
-screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
-
-screen -dmS open_trader_dashboard_8766 zsh -lc \
-  'cd /Users/ray/projects/open_trader && export PYTHONPATH=src && exec .venv/bin/python -m open_trader dashboard --portfolio data/latest/portfolio.csv --data-dir data --reports-dir reports --poll-seconds 5 --host 127.0.0.1 --port 8766'
-```
-
 Verify the deployment:
 
 ```bash
@@ -520,12 +528,6 @@ print(
     ),
 )
 PY
-```
-
-Stop the detached dashboard when needed:
-
-```bash
-screen -S open_trader_dashboard_8766 -X quit
 ```
 
 ## Daily Automation
@@ -719,7 +721,7 @@ an old watcher directly while a controller may still be alive.
 After the final acceptance result is `PASS`, redeploy the exact accepted SHA;
 do not treat the acceptance process itself as the deployment. From the accepted
 worktree, confirm its SHA and clean state, restart all controllers with the
-shared config, then restart the Dashboard from that exact worktree:
+shared config, then restart the Dashboard stack from that exact worktree:
 
 ```bash
 cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec
@@ -732,9 +734,7 @@ scripts/install_daily_premarket_launchd.sh \
   --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --trend-only --market all
 
-screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
-screen -dmS open_trader_dashboard_8766 zsh -lc \
-  'cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec && exec env PYTHONPATH=src .venv/bin/python -u -m open_trader dashboard --portfolio /Users/ray/projects/open_trader/data/latest/portfolio.csv --data-dir /Users/ray/projects/open_trader/data --reports-dir /Users/ray/projects/open_trader/reports --config /Users/ray/projects/open_trader/config/daily_premarket.env --poll-seconds 5 --host 127.0.0.1 --port 8766 >> /tmp/open_trader_dashboard_8766.log 2>&1'
+scripts/install_dashboard_launchd.sh
 ```
 
 For each CN/HK/US status document, verify the PID is live, `working_directory`
@@ -775,7 +775,8 @@ PY
 
 pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p
 tail -n 80 /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
-tail -n 80 /tmp/open_trader_dashboard_8766.log
+tail -n 80 logs/frontend_gateway/launchd.out.log
+tail -n 80 logs/legacy_dashboard/launchd.out.log
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
 curl -sS http://127.0.0.1:8766/api/dashboard | \
   .venv/bin/python -m json.tool >/dev/null

@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-01
 
+- 完成 Frontend Gateway Phase 0 生产交付：README 与运维手册现在明确稳定的 `8766` 用户入口、内部 `8767` Legacy Dashboard、单命令双进程 stack 安装、双运行时诊断及 `--mode single` 回滚，并要求最终 PASS 后重新部署完全相同的 accepted SHA。本阶段没有页面、策略、报告、执行或 worker 行为变化。
 - 修复 Dashboard stack 在 `RunAtLoad` bootstrap 后重复 `kickstart -k`、可能留下孤儿 listener 并触发 launchd 重启循环的问题；安装和回滚现在只执行一次受管启动。
 - 稳定预测市场 loading 状态的浏览器验收：信号组件恢复历史后仍明确验证无下单按钮，不再把局部刷新前的瞬时空态当作交易安全条件。
 - 将预测市场 `当前机会` 替换为每秒局部刷新的 `套利信号` 组件；新增 HKT Watcher/信号新鲜度时钟与中英标的标题缓存；Feishu 改为无链接、仅观察的通知，并按市场成功送达设置 30 分钟冷却；人工下单仍保持 `重新检查` → `确认下单` 边界，LLM 对冲套利行为不变。
