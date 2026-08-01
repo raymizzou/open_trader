@@ -42,6 +42,8 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     result = subprocess.run(
         [
             str(INSTALLER),
+            "--mode",
+            "single",
             "--dry-run",
             "--repo-root",
             str(ROOT),
@@ -138,6 +140,8 @@ exit 0
     subprocess.run(
         [
             str(INSTALLER),
+            "--mode",
+            "single",
             "--repo-root",
             str(repo),
             "--runtime-root",

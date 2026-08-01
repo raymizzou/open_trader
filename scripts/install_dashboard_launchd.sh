@@ -2,20 +2,23 @@
 set -euo pipefail
 
 DRY_RUN=0
+MODE="stack"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-/bin/launchctl}"
+PLUTIL_BIN="${PLUTIL_BIN:-/usr/bin/plutil}"
 WAIT_SECONDS="${DASHBOARD_LAUNCHD_WAIT_SECONDS:-30}"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--mode stack|single] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
@@ -25,12 +28,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+[[ "$MODE" == "stack" || "$MODE" == "single" ]] || { usage; exit 2; }
+
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
 RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd)"
-TEMPLATE="$REPO_ROOT/ops/launchd/com.open-trader.dashboard.plist.template"
-LABEL="com.open-trader.dashboard"
-PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
+SINGLE_LABEL="com.open-trader.dashboard"
+GATEWAY_LABEL="com.open-trader.frontend-gateway"
+LEGACY_LABEL="com.open-trader.legacy-dashboard"
+SINGLE_TEMPLATE="$REPO_ROOT/ops/launchd/$SINGLE_LABEL.plist.template"
+GATEWAY_TEMPLATE="$REPO_ROOT/ops/launchd/$GATEWAY_LABEL.plist.template"
+LEGACY_TEMPLATE="$REPO_ROOT/ops/launchd/$LEGACY_LABEL.plist.template"
+SINGLE_PLIST="$LAUNCH_AGENTS_DIR/$SINGLE_LABEL.plist"
+GATEWAY_PLIST="$LAUNCH_AGENTS_DIR/$GATEWAY_LABEL.plist"
+LEGACY_PLIST="$LAUNCH_AGENTS_DIR/$LEGACY_LABEL.plist"
 DATA_DIR="$RUNTIME_ROOT/data"
 REPORTS_DIR="$RUNTIME_ROOT/reports"
 PORTFOLIO="$DATA_DIR/latest/portfolio.csv"
@@ -39,14 +50,19 @@ PREDICTION_CONFIG="$REPO_ROOT/config/prediction_arbitrage.json"
 OUT_LOG="$REPO_ROOT/logs/dashboard/launchd.out.log"
 ERR_LOG="$REPO_ROOT/logs/dashboard/launchd.err.log"
 
-[[ -f "$TEMPLATE" ]] || { echo "missing launchd template: $TEMPLATE" >&2; exit 1; }
+if [[ "$MODE" == "single" ]]; then
+  [[ -f "$SINGLE_TEMPLATE" ]] || { echo "missing launchd template: $SINGLE_TEMPLATE" >&2; exit 1; }
+else
+  [[ -f "$GATEWAY_TEMPLATE" ]] || { echo "missing launchd template: $GATEWAY_TEMPLATE" >&2; exit 1; }
+  [[ -f "$LEGACY_TEMPLATE" ]] || { echo "missing launchd template: $LEGACY_TEMPLATE" >&2; exit 1; }
+fi
 
 sed_escape() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
 
-render_plist() {
-  local repo python data reports portfolio daily_config prediction
+render_template() {
+  local template="$1" repo python data reports portfolio daily_config prediction
   repo="$(sed_escape "$REPO_ROOT")"
   python="$(sed_escape "$PYTHON_BIN")"
   data="$(sed_escape "$DATA_DIR")"
@@ -62,14 +78,14 @@ render_plist() {
     -e "s|OPEN_TRADER_DAILY_CONFIG|$daily_config|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$prediction|g" \
     -e "s|OPEN_TRADER_REPO|$repo|g" \
-    "$TEMPLATE"
+    "$template"
 }
 
 lint_plist() {
   local rendered="$1" temp
   temp="$(mktemp "${TMPDIR:-/tmp}/open-trader-dashboard.XXXXXX.plist")"
   printf '%s\n' "$rendered" > "$temp"
-  plutil -lint "$temp" >/dev/null
+  "$PLUTIL_BIN" -lint "$temp" >/dev/null
   rm -f "$temp"
 }
 
@@ -115,23 +131,40 @@ bootstrap_agent() {
   done
 }
 
-rendered="$(render_plist)"
-lint_plist "$rendered"
-
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  printf '%s\n' "$rendered"
+  if [[ "$MODE" == "stack" ]]; then
+    gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
+    legacy_rendered="$(render_template "$LEGACY_TEMPLATE")"
+    lint_plist "$gateway_rendered"
+    lint_plist "$legacy_rendered"
+    printf '===== %s =====\n%s\n' "$GATEWAY_LABEL" "$gateway_rendered"
+    printf '===== %s =====\n%s\n' "$LEGACY_LABEL" "$legacy_rendered"
+  else
+    single_rendered="$(render_template "$SINGLE_TEMPLATE")"
+    lint_plist "$single_rendered"
+    printf '%s\n' "$single_rendered"
+  fi
   exit 0
 fi
 
+[[ "$MODE" == "single" ]] || {
+  echo "stack mode is not available until the cutover helpers are installed" >&2
+  exit 1
+}
+
+rendered="$(render_template "$SINGLE_TEMPLATE")"
+lint_plist "$rendered"
+
 ensure_port_safe
 mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/dashboard" "$DATA_DIR" "$REPORTS_DIR"
-printf '%s\n' "$rendered" > "$PLIST_PATH"
+printf '%s\n' "$rendered" > "$SINGLE_PLIST"
 
-"$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
+"$LAUNCHCTL_BIN" bootout "gui/$UID/$SINGLE_LABEL" 2>/dev/null || true
 : > "$OUT_LOG"
 : > "$ERR_LOG"
+PLIST_PATH="$SINGLE_PLIST"
 bootstrap_agent
-"$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LABEL"
+"$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$SINGLE_LABEL"
 wait_ready
-echo "installed launchd agent: $LABEL"
+echo "installed launchd agent: $SINGLE_LABEL"
 echo "review URL: http://127.0.0.1:8766/"
