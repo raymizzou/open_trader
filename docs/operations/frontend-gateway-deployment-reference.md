@@ -1,10 +1,11 @@
 # Frontend Gateway 双进程部署参考
 
-本文件对应 GitHub Issue [#14](https://github.com/raymizzou/open_trader/issues/14)，用于验证第一阶段的前后端分离链路。
+本文件对应 GitHub Issue [#14](https://github.com/raymizzou/open_trader/issues/14) 和
+[#15](https://github.com/raymizzou/open_trader/issues/15)，用于验证和运维本地双进程链路。
 
 ## 当前范围
 
-当前版本只建立进程边界，不做生产端口切换：
+当前版本的默认 launchd 安装会执行可回滚的生产端口切换：
 
 ```text
 浏览器 → Frontend Gateway → Legacy Dashboard
@@ -14,10 +15,53 @@
 - Gateway 只提供静态资源、`/healthz` 和 `/api/*` 转发。
 - Legacy Dashboard 继续拥有现有数据组装、研究、预测、执行和 worker。
 - Gateway 不启动任何 worker，也不导入业务适配器。
-- 现有 `scripts/install_dashboard_launchd.sh` 仍管理旧的单进程 Dashboard；它还不是双进程 stack 安装器。
-- launchd 的双进程安装、自动回滚和生产切换属于后续 [#15](https://github.com/raymizzou/open_trader/issues/15)。
+- `scripts/install_dashboard_launchd.sh` 默认管理 Gateway + Legacy stack；旧的
+  `com.open-trader.dashboard` plist 会保留为回滚资产。
+- `scripts/install_dashboard_launchd.sh --mode single` 会停止两个新 job、恢复旧
+  `8766` 单进程并验证 health；它不会删除新 plist。
+- `scripts/uninstall_dashboard_launchd.sh` 才是完整卸载，会幂等移除三个已知 job；
+  卸载不会启动回滚服务。
 
 当前部署绑定 loopback，云端公开访问还需要后续的进程监管和入口层设计；不要直接把 `8767` 暴露到公网。
+
+## launchd 安装、回滚和卸载
+
+先检查两份新配置，不会调用 `launchctl`、`lsof`、`curl`，也不会写入
+`~/Library/LaunchAgents`：
+
+```bash
+scripts/install_dashboard_launchd.sh --dry-run
+```
+
+正式安装会先验证当前 `8766` 和 Legacy `8767`，确认 Legacy health 通过后才停止
+旧的 `8766` job，再启动 Gateway。任何未知 listener 或 Gateway readiness 失败都会
+拒绝切换或自动恢复旧单进程，并验证 `http://127.0.0.1:8766/` HTTP 200：
+
+```bash
+scripts/install_dashboard_launchd.sh
+```
+
+明确回滚并保留全部三份 plist：
+
+```bash
+scripts/install_dashboard_launchd.sh --mode single
+```
+
+完整卸载三个固定 label（重复运行安全）：
+
+```bash
+scripts/uninstall_dashboard_launchd.sh
+```
+
+运行时检查：
+
+```bash
+launchctl list | rg 'com\.open-trader\.(dashboard|frontend-gateway|legacy-dashboard)'
+lsof -nP -iTCP:8766 -sTCP:LISTEN
+lsof -nP -iTCP:8767 -sTCP:LISTEN
+tail -n 100 logs/frontend_gateway/launchd.out.log
+tail -n 100 logs/legacy_dashboard/launchd.out.log
+```
 
 ## 安全的本地验证（不占用生产 8766）
 
@@ -144,9 +188,12 @@ kill "$GATEWAY_PID" "$LEGACY_PID"
 1. 检查 Legacy `healthz` 和 `LEGACY_PORT` 监听状态。
 2. 检查两个 runtime 记录的 `cwd` 和 `git_sha` 是否一致。
 3. 停止本次 Gateway/Legacy 进程。
-4. 当前 #14 没有自动回滚生产服务；原有 `8766` 单进程服务未被本次验证停止。
+4. #15 安装器会自动停止本次新 job、恢复保留的单进程 plist，并重新验证 `8766`；
+   如果恢复也失败，安装器返回非零并保留诊断日志，不报告切换成功。
 
-不要在 #14 阶段手动把 Legacy 直接切到正在使用的生产 `8766`。需要正式切换时，等待 #15 提供带 readiness 检查和回滚路径的 stack 安装器。
+不要在 #14 的手工验证阶段把 Legacy 直接切到正在使用的生产 `8766`。正式切换只通过
+`scripts/install_dashboard_launchd.sh` 执行，让 listener 所有权、readiness 和自动回滚
+保持在同一个状态机内。
 
 ## 目标端口参考
 
@@ -158,4 +205,5 @@ Legacy Dashboard   127.0.0.1:8767
 公开浏览器地址     http://127.0.0.1:8766/
 ```
 
-在 #15 完成前，上述目标端口只作为接口契约；本文件的可执行验证默认使用 `18766/18767`，避免中断现有 Dashboard。
+手工不占用生产端口的双进程验证仍可使用上文的 `18766/18767`；正式安装器使用目标
+`8766/8767` 并提供自动回滚。

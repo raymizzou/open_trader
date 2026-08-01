@@ -4,6 +4,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -42,6 +43,8 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     result = subprocess.run(
         [
             str(INSTALLER),
+            "--mode",
+            "single",
             "--dry-run",
             "--repo-root",
             str(ROOT),
@@ -50,7 +53,7 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
             "--launch-agents-dir",
             str(agents),
             "--python",
-            str(ROOT / ".venv" / "bin" / "python"),
+            sys.executable,
         ],
         cwd=ROOT,
         env={**os.environ, "HOME": str(tmp_path)},
@@ -81,9 +84,11 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     assert "8766" in result.stdout
 
 
-def test_uninstaller_only_targets_the_dashboard_label() -> None:
+def test_uninstaller_targets_only_dashboard_stack_labels() -> None:
     source = UNINSTALLER.read_text(encoding="utf-8")
     assert "com.open-trader.dashboard" in source
+    assert "com.open-trader.frontend-gateway" in source
+    assert "com.open-trader.legacy-dashboard" in source
     assert "rm -rf" not in source
     assert "com.open-trader.premarket" not in source
 
@@ -130,14 +135,25 @@ exit 0
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
-    for name in ("curl", "lsof"):
-        executable = bin_dir / name
-        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        executable.chmod(0o755)
+    lsof = bin_dir / "lsof"
+    lsof.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    lsof.chmod(0o755)
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *healthz*) printf '%s\\n' '{\"module\":\"legacy_dashboard\"}' ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
 
     subprocess.run(
         [
             str(INSTALLER),
+            "--mode",
+            "single",
             "--repo-root",
             str(repo),
             "--runtime-root",
@@ -145,7 +161,7 @@ exit 0
             "--launch-agents-dir",
             str(agents),
             "--python",
-            str(ROOT / ".venv" / "bin" / "python"),
+            sys.executable,
             "--wait-seconds",
             "1",
         ],

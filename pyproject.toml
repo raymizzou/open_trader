@@ -23,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-open-trader = "open_trader.cli:main"
+open-trader = "open_trader.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

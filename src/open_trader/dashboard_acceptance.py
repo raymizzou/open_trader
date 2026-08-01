@@ -1937,6 +1937,56 @@ def _source_changes(cwd: Path) -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
+def _runtime_evidence(
+    name: str,
+    *,
+    url: str,
+    expected_schema: str,
+    expected_module: str,
+    expected_root: Path,
+    expected_sha: str,
+    expected_upstream_status: str | None = None,
+) -> tuple[int | None, Path, datetime | None, list[str]]:
+    expected_cwd = expected_root.resolve()
+    try:
+        pid, cwd = _listener(url)
+        process_started_at = _process_started_at(pid)
+        errors: list[str] = []
+        if cwd != expected_cwd:
+            errors.append(f"{name} 运行目录不匹配（运行工作目录）：{cwd}")
+        running_sha = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
+        ).strip()
+        if running_sha != expected_sha:
+            errors.append(
+                f"{name} 运行 Git SHA 不匹配："
+                f"{running_sha[:7]} != {expected_sha[:7]}"
+            )
+        source_changes = _source_changes(cwd)
+        if source_changes:
+            errors.append(f"{name} 源码未提交：{'；'.join(source_changes)}")
+        health = _fetch_json_path(url, "/healthz")
+        errors.extend(_runtime_health_errors(
+            health,
+            name=name,
+            expected_schema=expected_schema,
+            expected_module=expected_module,
+            pid=pid,
+            expected_sha=expected_sha,
+            expected_cwd=expected_cwd,
+            process_started_at=process_started_at,
+            expected_upstream_status=expected_upstream_status,
+        ))
+        return pid, cwd, process_started_at, errors
+    except Exception as exc:
+        return (
+            None,
+            expected_cwd,
+            None,
+            [f"{name} 运行检查失败：{type(exc).__name__}: {exc}"],
+        )
+
+
 def _is_actionable_console_error(message: str) -> bool:
     # Chrome can emit an unattributed favicon 404 without exposing a response.
     # HTTP failures for actual page resources and APIs are checked separately.
@@ -4324,6 +4374,60 @@ def _browser_check(
     return errors, None
 
 
+def _runtime_health_errors(
+    payload: object,
+    *,
+    name: str,
+    expected_schema: str,
+    expected_module: str,
+    pid: int,
+    expected_sha: str,
+    expected_cwd: Path,
+    process_started_at: datetime,
+    expected_upstream_status: str | None = None,
+) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return [f"{name} health 不是对象"]
+    errors: list[str] = []
+    if payload.get("schema_version") != expected_schema:
+        errors.append(f"{name} health schema 不匹配")
+    if payload.get("module") != expected_module:
+        errors.append(f"{name} health 模块身份不匹配")
+    health_pid = payload.get("pid")
+    if (
+        not isinstance(health_pid, int)
+        or isinstance(health_pid, bool)
+        or health_pid <= 0
+        or health_pid != pid
+    ):
+        errors.append(f"{name} health PID 不匹配")
+    cwd = payload.get("cwd")
+    if (
+        not isinstance(cwd, str)
+        or not cwd.strip()
+        or Path(cwd).resolve() != expected_cwd.resolve()
+    ):
+        errors.append(f"{name} health 工作目录不匹配")
+    if payload.get("git_sha") != expected_sha:
+        errors.append(f"{name} health Git SHA 不匹配")
+    if payload.get("source_state") != "clean":
+        errors.append(f"{name} health 源码状态不是 clean")
+    if (
+        expected_upstream_status is not None
+        and payload.get("upstream_status") != expected_upstream_status
+    ):
+        errors.append(f"{name} health upstream 状态不匹配")
+    try:
+        started_at = datetime.fromisoformat(str(payload.get("started_at") or ""))
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError("timezone-aware timestamp required")
+        if started_at < process_started_at:
+            errors.append(f"{name} health 启动时间早于候选进程")
+    except (TypeError, ValueError):
+        errors.append(f"{name} health 启动时间无效")
+    return errors
+
+
 def _log_errors(
     path: Path,
     *,
@@ -4331,6 +4435,8 @@ def _log_errors(
     expected_sha: str,
     expected_cwd: Path,
     process_started_at: datetime,
+    name: str = "Dashboard",
+    prefix: str = "dashboard_runtime: ",
 ) -> list[str]:
     try:
         if not path.exists():
@@ -4338,7 +4444,6 @@ def _log_errors(
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return [f"日志读取失败：{type(exc).__name__}: {exc}"]
-    prefix = "dashboard_runtime: "
     records: list[tuple[int, Mapping[str, Any]]] = []
     for index, line in enumerate(text.splitlines()):
         if not line.startswith(prefix):
@@ -4350,25 +4455,38 @@ def _log_errors(
         if isinstance(record, Mapping):
             records.append((index, record))
     errors: list[str] = []
-    matching = [item for item in records if item[1].get("pid") == pid]
+    matching = [
+        item for item in records
+        if (
+            isinstance(item[1].get("pid"), int)
+            and not isinstance(item[1].get("pid"), bool)
+            and item[1].get("pid") > 0
+            and item[1].get("pid") == pid
+        )
+    ]
     if not matching:
-        errors.append(f"日志没有候选 Dashboard PID：{pid}")
+        errors.append(f"日志没有候选 {name} PID：{pid}")
         fresh_text = text
     else:
         index, record = matching[-1]
         if index != 0:
-            errors.append("Dashboard 日志不是候选进程的新日志文件")
+            errors.append(f"{name} 日志不是候选进程的新日志文件")
         try:
             if path.stat().st_mtime < process_started_at.timestamp():
-                errors.append("Dashboard 日志修改时间早于候选进程")
+                errors.append(f"{name} 日志修改时间早于候选进程")
         except OSError as exc:
             errors.append(f"日志状态读取失败：{type(exc).__name__}: {exc}")
         if record.get("git_sha") != expected_sha:
-            errors.append("日志中的 Dashboard Git SHA 不匹配")
-        if Path(str(record.get("cwd") or "")).resolve() != expected_cwd.resolve():
-            errors.append("日志中的 Dashboard 工作目录不匹配")
+            errors.append(f"日志中的 {name} Git SHA 不匹配")
+        record_cwd = record.get("cwd")
+        if (
+            not isinstance(record_cwd, str)
+            or not record_cwd.strip()
+            or Path(record_cwd).resolve() != expected_cwd.resolve()
+        ):
+            errors.append(f"日志中的 {name} 工作目录不匹配")
         if record.get("source_state") != "clean":
-            errors.append("日志中的 Dashboard 源码状态不是 clean")
+            errors.append(f"日志中的 {name} 源码状态不是 clean")
         try:
             recorded_start = datetime.fromisoformat(
                 str(record.get("started_at") or "")
@@ -4376,9 +4494,9 @@ def _log_errors(
             if recorded_start.tzinfo is None or recorded_start.utcoffset() is None:
                 raise ValueError("timezone-aware timestamp required")
             if recorded_start < process_started_at:
-                errors.append("日志中的 Dashboard 启动时间早于候选进程")
+                errors.append(f"日志中的 {name} 启动时间早于候选进程")
         except (TypeError, ValueError):
-            errors.append("日志中的 Dashboard 启动时间无效")
+            errors.append(f"日志中的 {name} 启动时间无效")
         fresh_text = "\n".join(text.splitlines()[index:])
     markers = ("Traceback (most recent call last)", "看板数据加载失败")
     errors.extend(
@@ -4545,13 +4663,23 @@ def _trend_controller_errors(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
+    parser.add_argument("--legacy-url", default="http://127.0.0.1:8767")
     parser.add_argument("--expected-rows", type=int)
     parser.add_argument(
         "--expected-eastmoney-cny", type=Decimal
     )
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--expected-sha")
-    parser.add_argument("--log", type=Path, default=Path("/tmp/open_trader_dashboard_8766.log"))
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=Path("logs/frontend_gateway/launchd.out.log"),
+    )
+    parser.add_argument(
+        "--legacy-log",
+        type=Path,
+        default=Path("logs/legacy_dashboard/launchd.out.log"),
+    )
     return parser
 
 
@@ -4560,9 +4688,12 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[str] = []
     expected_cn = 0
     expected_sha = ""
-    pid: int | None = None
-    cwd = args.expected_root.resolve()
-    process_started_at: datetime | None = None
+    gateway_pid: int | None = None
+    gateway_cwd = args.expected_root.resolve()
+    gateway_started_at: datetime | None = None
+    legacy_pid: int | None = None
+    legacy_cwd = args.expected_root.resolve()
+    legacy_started_at: datetime | None = None
     browser_payload: dict[str, Any] = {}
     reports_dir: Path | None = None
     simulate_payloads: dict[str, dict[str, Any]] = {}
@@ -4571,31 +4702,55 @@ def main(argv: list[str] | None = None) -> int:
     external_blocker: str | None = None
     project_data_dir: Path | None = None
     try:
+        expected_sha = args.expected_sha or subprocess.check_output(
+            ["git", "-C", str(args.expected_root), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        (
+            gateway_pid,
+            gateway_cwd,
+            gateway_started_at,
+            gateway_errors,
+        ) = _runtime_evidence(
+            "Frontend Gateway",
+            url=args.url,
+            expected_schema="open_trader.frontend_gateway.health.v1",
+            expected_module="frontend_gateway",
+            expected_root=args.expected_root,
+            expected_sha=expected_sha,
+            expected_upstream_status="ok",
+        )
+        (
+            legacy_pid,
+            legacy_cwd,
+            legacy_started_at,
+            legacy_errors,
+        ) = _runtime_evidence(
+            "Legacy Dashboard",
+            url=args.legacy_url,
+            expected_schema="open_trader.legacy_dashboard.health.v1",
+            expected_module="legacy_dashboard",
+            expected_root=args.expected_root,
+            expected_sha=expected_sha,
+        )
+        errors.extend(gateway_errors)
+        errors.extend(legacy_errors)
+        if (
+            gateway_pid is not None
+            and legacy_pid is not None
+            and gateway_pid == legacy_pid
+        ):
+            errors.append("Frontend Gateway 与 Legacy Dashboard 必须使用不同 PID")
         project_data_dir = _project_data_dir(args.expected_root)
         expected_cn = _expected_cn_holdings(args.expected_root)
         phillips_total, phillips_period = _latest_phillips_expectation(
             project_data_dir
         )
-        pid, cwd = _listener(args.url)
-        if cwd != args.expected_root.resolve():
-            errors.append(f"运行目录不匹配：{cwd}")
-        running_sha = subprocess.check_output(
-            ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
-        ).strip()
-        expected_sha = args.expected_sha or subprocess.check_output(
-            ["git", "-C", str(args.expected_root), "rev-parse", "HEAD"], text=True
-        ).strip()
-        if running_sha != expected_sha:
-            errors.append(f"运行 Git SHA 不匹配：{running_sha[:7]} != {expected_sha[:7]}")
         errors.extend(_account_sync_controller_errors(
             args.expected_root, expected_root=args.expected_root, expected_sha=expected_sha,
         ))
-        process_started_at = _process_started_at(pid)
-        source_changes = _source_changes(cwd)
-        if source_changes:
-            errors.append(f"Dashboard 源码未提交：{'；'.join(source_changes)}")
         first = _fetch_payload(args.url)
-        first_reports_dir = _effective_reports_dir(first, process_cwd=cwd)
+        first_reports_dir = _effective_reports_dir(first, process_cwd=legacy_cwd)
         errors.extend(validate_dashboard_payload(
             first, expected_cn=expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
@@ -4637,7 +4792,7 @@ def main(argv: list[str] | None = None) -> int:
         errors.extend(validate_quotes_payload(quotes))
         second = _fetch_payload(args.url)
         browser_payload = second
-        reports_dir = _effective_reports_dir(second, process_cwd=cwd)
+        reports_dir = _effective_reports_dir(second, process_cwd=legacy_cwd)
         if first_reports_dir != reports_dir:
             errors.append("账户刷新前后的 Dashboard reports_dir 不一致")
         errors.extend(validate_dashboard_payload(
@@ -4666,7 +4821,6 @@ def main(argv: list[str] | None = None) -> int:
             errors.append("实盘刷新改写了冻结建议、Kelly 或模拟统计")
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
-        pid = None
     browser_errors, blocker = _browser_check(
         args.url,
         expected_cn,
@@ -4676,13 +4830,25 @@ def main(argv: list[str] | None = None) -> int:
         history_expectations,
     )
     errors.extend(browser_errors)
-    if pid is not None and process_started_at is not None:
+    if gateway_pid is not None and gateway_started_at is not None:
         errors.extend(_log_errors(
             args.log,
-            pid=pid,
+            name="Frontend Gateway",
+            prefix="frontend_gateway_runtime: ",
+            pid=gateway_pid,
             expected_sha=expected_sha,
-            expected_cwd=cwd,
-            process_started_at=process_started_at,
+            expected_cwd=gateway_cwd,
+            process_started_at=gateway_started_at,
+        ))
+    if legacy_pid is not None and legacy_started_at is not None:
+        errors.extend(_log_errors(
+            args.legacy_log,
+            name="Legacy Dashboard",
+            prefix="dashboard_runtime: ",
+            pid=legacy_pid,
+            expected_sha=expected_sha,
+            expected_cwd=legacy_cwd,
+            process_started_at=legacy_started_at,
         ))
     status = classify_result(
         errors, browser_blocker=blocker, external_blocker=external_blocker
@@ -4690,7 +4856,9 @@ def main(argv: list[str] | None = None) -> int:
     blockers = [item for item in (external_blocker, blocker) if item]
     result = {
         "status": status,
-        "pid": pid,
+        "pid": gateway_pid,
+        "gateway_pid": gateway_pid,
+        "legacy_pid": legacy_pid,
         "errors": errors,
         "blocker": "；".join(blockers) or None,
     }

@@ -6,8 +6,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-01
 
 - 将预测市场 `当前机会` 替换为每秒局部刷新的 `套利信号` 组件；新增 HKT Watcher/信号新鲜度时钟与中英标的标题缓存；Feishu 改为无链接、仅观察的通知，并按市场成功送达设置 30 分钟冷却；人工下单仍保持 `重新检查` → `确认下单` 边界，LLM 对冲套利行为不变。
+- Dashboard launchd 安装器现在默认把已验证的 Legacy Dashboard `8767` 与轻量 Frontend Gateway `8766` 作为一个双进程 stack 切换；切换失败会自动恢复保留的单进程 job，`--mode single` 可明确回滚，完整卸载会幂等移除三个已知 job。未知端口 listener 会在任何状态修改前阻止安装。
+- Dashboard acceptance 现在分别验证 Frontend Gateway `8766` 与 Legacy Dashboard `8767` 的独立 PID、模块身份、工作目录、Git SHA、源码状态、启动时间和新鲜 runtime 日志；账户、报价、API 与浏览器流程仍只通过稳定的 `8766` 入口执行，单进程 rollback 模式不再满足最终 PASS 条件。
 - 修复非交易日上午的趋势保护轮询把正常 `holiday` 结果误判为异常、导致 CN 控制器阻塞的问题；仅零异常且零未知报价的 holiday 结果不再阻断，其他保护异常继续失败关闭。
-- 新增轻量 `frontend-gateway` 进程：前端静态资源、健康检查与 `/api/*` 请求统一经网关访问，现有 Dashboard 作为仅监听 loopback 的 Legacy Backend 保持业务兼容；补充双进程部署参考与回滚步骤。本次仅合入渐进迁移边界，当前生产 launchd 仍保持单进程，待后续部署 issue 再切换。
+- 新增轻量 `frontend-gateway` 进程：前端静态资源、健康检查与 `/api/*` 请求统一经网关访问，现有 Dashboard 作为仅监听 loopback 的 Legacy Backend 保持业务兼容；Gateway 启动入口会在加载单体 CLI 前分流，不再连带导入交易、研究、预测 adapter 或 worker。补充双进程部署参考与回滚步骤。本次仅合入渐进迁移边界，当前生产 launchd 仍保持单进程，待后续部署 issue 再切换。
 - Dashboard 验收与交付不再强制截图；仅在用户显式要求时提供，缺少截图不再影响 `PASS`、完成或部署判定。
 - 修复 YES/NO 与 LLM 对冲套利页面被错误锁定：普通 Top 20 刷新与每分钟关系扫描不再争抢 30 秒预算或重复关闭 WebSocket，静默但已连接的 Watcher 不再误报不可用；两类策略分别判断健康状态，分钟扫描会立即发布新机会并恢复已缓存的 Codex 结论。人工预览只定向复核所选机会；Codex 已批准但盘口过期的正收益候选可主动刷新两腿，刷新后仍满足条件才生成确认单，并在弹窗保留双市场、利润与 Codex 理由。最终下单仍需用户在确认弹窗中明确提交。
 - Dashboard 账户持仓、趋势纪律与审计折叠区现在会在报价轮询刷新、账户视图重绘和券商标签切换后保留用户选择的展开/收起状态；切换报告身份时不复用旧状态。验证 375px 账户视图 Playwright 回归 1 个通过。

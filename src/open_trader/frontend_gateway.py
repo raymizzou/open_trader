@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -275,6 +276,34 @@ def serve_frontend_gateway(
         server.serve_forever()
     finally:
         server.server_close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="open-trader frontend-gateway")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--upstream-host", default="127.0.0.1")
+    parser.add_argument("--upstream-port", type=int, default=8767)
+    parser.add_argument("--public-origin", default="http://127.0.0.1:8766")
+    parser.add_argument("--upstream-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--static-dir",
+        type=Path,
+        default=Path(__file__).with_name("dashboard_static"),
+    )
+    args = parser.parse_args(argv)
+    serve_frontend_gateway(
+        config=FrontendGatewayConfig(
+            static_dir=args.static_dir,
+            upstream_host=args.upstream_host,
+            upstream_port=args.upstream_port,
+            public_origin=args.public_origin,
+            upstream_timeout_seconds=args.upstream_timeout,
+        ),
+        host=args.host,
+        port=args.port,
+    )
+    return 0
 
 
 def _is_api_path(path: str) -> bool:
