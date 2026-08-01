@@ -2513,8 +2513,8 @@ class PolymarketMonitor:
             )
         self._sync_event_rows()
 
-    @staticmethod
     def _relation_row(
+        self,
         relation: ThresholdRelation,
         candidate: ThresholdHedgeIntent,
         intent: ThresholdHedgeIntent | None,
@@ -2541,13 +2541,14 @@ class PolymarketMonitor:
         legs = (selected.leg_a, selected.leg_b)
         structured = getattr(validation, "structured_result", None)
         proof = structured.get("proof") if isinstance(structured, Mapping) else None
-        return {
+        question = f"{relation.market_a.question} / {relation.market_b.question}"
+        row = {
             "opportunity_id": relation.relation_id,
             "relation_id": relation.relation_id,
             "event_id": relation.event_id,
             "market_id": relation.relation_id,
             "market_type": "threshold_hedge",
-            "question": f"{relation.market_a.question} / {relation.market_b.question}",
+            "question": question,
             "question_a": relation.market_a.question,
             "question_b": relation.market_b.question,
             "condition_id_a": relation.market_a.condition_id,
@@ -2628,6 +2629,12 @@ class PolymarketMonitor:
             "cache_key": getattr(validation, "cache_key", ""),
             "intent": intent,
         }
+        translated = self._cached_title_zh(row["question"])
+        if translated:
+            row["title_zh"] = translated
+            row["event_title_zh"] = translated
+        self._enqueue_title_translations([{"title": row["question"]}])
+        return row
 
     def _normalize_event(self, value: object) -> dict[str, object] | None:
         event_id = _value(value, "id", "event_id", "eventId", default=None)
@@ -3069,6 +3076,15 @@ class PolymarketMonitor:
                     event["title_zh"] = translated
                     event["event_title_zh"] = translated
             for opportunity in self._opportunities.values():
+                if opportunity.get("market_type") == "threshold_hedge":
+                    translated = self._cached_title_zh(opportunity.get("question"))
+                    if translated:
+                        opportunity["event_title_zh"] = translated
+                        opportunity["title_zh"] = translated
+                    else:
+                        opportunity.pop("event_title_zh", None)
+                        opportunity.pop("title_zh", None)
+                    continue
                 event = self._events.get(str(opportunity.get("event_id", "")))
                 if event is None:
                     continue

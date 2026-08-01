@@ -14,7 +14,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(page.locator('.pm-layout > .pm-panel').first()).toContainText('当前监控范围');
     await expect(page.locator('[data-prediction-history-panel]')).toContainText('套利信号');
     await expect(page.locator('[data-prediction-history-panel] .pm-table th')).toHaveText([
-      '出现时间（HKT）', '标的', '持续', '触发时利润', '实时利润', '通知', '操作',
+      '出现时间（HKT）', '标的', '资金占用', '净回报', '操作',
     ]);
     await expect(page.locator('body')).not.toContainText('当前机会');
     await expect(page.locator('body')).not.toContainText('仅监控');
@@ -22,6 +22,9 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(page.locator('[data-prediction-history-panel]')).toContainText('信号刷新时间');
     await expect(page.locator('.pm-title-zh').first()).toContainText('以色列与伊朗停火');
     await expect(page.locator('.pm-title-en').first()).toContainText('Will the Israel-Iran ceasefire');
+    const targetRow = page.locator('[data-prediction-history-panel] tbody tr').filter({ hasText: 'Will Bitcoin be above $90,000 on December 31, 2026?' });
+    await expect(targetRow).toContainText('Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?');
+    await expect(targetRow).toContainText('比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？');
   });
 
   test('preserves the production LLM hedge math and rejection evidence', async ({ page }) => {
@@ -118,8 +121,8 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('closed signals remove the operation button and show a dash for live profit', async ({ page }) => {
     await openPrediction(page, 'signal-closed');
     const firstRow = page.locator('[data-prediction-history-panel] tbody tr').first();
-    await expect(firstRow.locator('[data-label="操作"]')).toHaveText('');
-    await expect(firstRow.locator('[data-label="实时利润"]')).toContainText('—');
+    await expect(firstRow.locator('[data-label="操作"]')).toContainText('飞书已发');
+    await expect(firstRow.locator('[data-label="净回报"]')).toContainText('—');
     await expect(firstRow.locator('[data-action="participate"]')).toHaveCount(0);
   });
 
@@ -164,6 +167,9 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
       await page.setViewportSize(viewport);
       await openPrediction(page);
+      const targetRow = page.locator('[data-prediction-history-panel] tbody tr').filter({ hasText: 'Will Bitcoin be above $90,000 on December 31, 2026?' });
+      await expect(targetRow).toContainText('Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?');
+      await expect(targetRow).toContainText('比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       for (const height of await page.locator('#prediction-market-workspace').evaluate((root) => Array.from(root.querySelectorAll('button')).filter((element) => element.getClientRects().length).map((element) => element.getBoundingClientRect().height))) {
         expect(height).toBeGreaterThanOrEqual(44);
@@ -196,7 +202,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('keeps loading, unavailable, and unknown states fail-closed', async ({ page }) => {
     await openPrediction(page, 'loading');
     await expect(page.locator('.pm-event')).toHaveCount(0);
-    await expect(page.locator('[data-prediction-history-panel] tbody tr')).toHaveCount(3);
+    await expect(page.locator('[data-prediction-history-panel] tbody tr')).toHaveCount(4);
     await expect(page.locator('[data-prediction-history-panel] [data-action="participate"]')).toHaveCount(0);
     await expect(page.locator('.pm-readiness')).toContainText('不可用');
 
@@ -230,6 +236,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       '以色列与伊朗停火是否持续至 2026 年 8 月 31 日？',
       '2026 年 9 月美联储是否降息？',
       '以太坊会在 9 月前突破 $6,000？',
+      '比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？',
     ]);
     await expect(page.locator('.pm-event-title')).toContainText([
       '以色列与伊朗停火是否持续至 8 月 31 日？Will the Israel-Iran ceasefire continue through August 31, 2026?',

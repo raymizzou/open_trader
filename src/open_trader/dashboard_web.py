@@ -812,26 +812,55 @@ def _prediction_history_payload(
             return _prediction_first(value, *names) not in (None, "")
 
         def _complete(value: Mapping[str, object]) -> bool:
-            required = (
-                ("opportunity_id", "id"),
-                ("market_type",),
-                ("event_id",),
-                ("market_id",),
-                ("condition_id",),
-                ("yes_token_id",),
-                ("no_token_id",),
-                ("quantity",),
-                ("yes_max_price", "yes_price"),
-                ("no_max_price", "no_price"),
-                ("yes_max_cost",),
-                ("no_max_cost",),
-                ("total_max_cost", "max_cost"),
-                ("minimum_profit",),
-                ("net_edge",),
-                ("tick_size",),
-                ("confirmed_at",),
-                ("confirmed_age_seconds",),
-            )
+            market_type = str(value.get("market_type") or "standard_binary")
+            if market_type == "threshold_hedge":
+                required = (
+                    ("opportunity_id", "relation_id", "id"),
+                    ("market_type",),
+                    ("event_id",),
+                    ("market_id", "relation_id"),
+                    ("question",),
+                    ("question_a",),
+                    ("question_b",),
+                    ("relation",),
+                    ("condition_id_a",),
+                    ("condition_id_b",),
+                    ("token_id_a",),
+                    ("token_id_b",),
+                    ("quantity",),
+                    ("total_max_cost", "max_cost"),
+                    ("maximum_fee",),
+                    ("minimum_profit", "profit"),
+                    ("minimum_payout",),
+                    ("annualized_yield",),
+                    ("remaining_days",),
+                    ("resolution_at",),
+                    ("confirmed_at",),
+                    ("confirmed_age_seconds",),
+                )
+            elif market_type == "standard_binary":
+                required = (
+                    ("opportunity_id", "id"),
+                    ("market_type",),
+                    ("event_id",),
+                    ("market_id",),
+                    ("condition_id",),
+                    ("yes_token_id",),
+                    ("no_token_id",),
+                    ("quantity",),
+                    ("yes_max_price", "yes_price"),
+                    ("no_max_price", "no_price"),
+                    ("yes_max_cost",),
+                    ("no_max_cost",),
+                    ("total_max_cost", "max_cost"),
+                    ("minimum_profit",),
+                    ("net_edge",),
+                    ("tick_size",),
+                    ("confirmed_at",),
+                    ("confirmed_age_seconds",),
+                )
+            else:
+                return False
             return all(_present(value, *names) for names in required)
 
         projected_rows: list[object] = []
@@ -856,11 +885,7 @@ def _prediction_history_payload(
                     market_id not in (None, "")
                     and str(current.get("market_id") or "") == str(market_id)
                 )
-                if (
-                    row_market_type != "standard_binary"
-                    or current_market_type != "standard_binary"
-                    or not same_market
-                ):
+                if row_market_type != current_market_type or not same_market:
                     current = None
             is_open = not projected.get("ended_at")
             complete = isinstance(current, Mapping) and _complete(current)
@@ -870,6 +895,17 @@ def _prediction_history_payload(
                 if live_profit is not None:
                     projected["live_profit"] = live_profit
                 projected["actionable_now"] = current.get("actionable") is True
+                if str(current.get("market_type") or "") == "threshold_hedge":
+                    for name in (
+                        "annualized_yield",
+                        "remaining_days",
+                        "resolution_at",
+                        "total_max_cost",
+                        "maximum_fee",
+                        "eligibility_reason",
+                    ):
+                        if current.get(name) not in (None, ""):
+                            projected[name] = current[name]
             projected_rows.append(projected)
         safe_rows = sorted(
             projected_rows,

@@ -3010,29 +3010,41 @@ def test_title_translation_worker_is_fifo_and_does_not_block_english_snapshot(
     setup_public([
         event("e-2", markets=(market("m-2"),)),
         event("e-1", markets=(market("m-1"),)),
+        threshold_event(),
     ])
+    setup_threshold_books()
     translator = BlockingTranslator()
 
     async def scenario() -> None:
         monitor = make_monitor(
             tmp_path,
-            relation_discovery=None,
+            relation_discovery=discover_threshold_relations,
+            relation_validator=FakeRelationValidator(),
             title_translator=translator,
         )
         task = asyncio.create_task(monitor.run_forever())
         assert await asyncio.to_thread(translator.started.wait, 1.0)
         english = monitor.snapshot()
-        assert [row["title"] for row in english["events"]] == ["Event e-1", "Event e-2"]
+        assert [row["title"] for row in english["events"]] == [
+            "Event e-1", "Event e-2", "Event threshold-event"
+        ]
         assert all("title_zh" not in row for row in english["events"])
         translator.release.set()
+        pair = (
+            "Will Bitcoin be above $90,000 on December 31? / "
+            "Will Bitcoin be above $100,000 on December 31?"
+        )
         for _ in range(100):
             await asyncio.sleep(0.01)
-            if all("title_zh" in row for row in monitor.snapshot()["events"]):
+            if pair in translator.calls and all(
+                "title_zh" in row for row in monitor.snapshot()["events"]
+            ):
                 break
         translated = monitor.snapshot()
         assert all("title_zh" in row for row in translated["events"])
         assert translator.max_active == 1
-        assert translator.calls == ["Event e-1", "Event e-2"]
+        assert pair in translator.calls
+        assert translator.calls.index(pair) > translator.calls.index("Event threshold-event")
         monitor.stop()
         await asyncio.wait_for(task, timeout=1.0)
         assert monitor._title_translation_task is None
