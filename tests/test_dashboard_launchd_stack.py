@@ -11,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_dashboard_launchd.sh"
+UNINSTALLER = ROOT / "scripts" / "uninstall_dashboard_launchd.sh"
 SINGLE_LABEL = "com.open-trader.dashboard"
 GATEWAY_LABEL = "com.open-trader.frontend-gateway"
 LEGACY_LABEL = "com.open-trader.legacy-dashboard"
@@ -85,7 +86,11 @@ case "$url" in
   http://127.0.0.1:8767/healthz)
     printf '%s\\n' '{"module":"legacy_dashboard"}' ;;
   http://127.0.0.1:8766/healthz)
-    printf '%s\\n' '{"module":"frontend_gateway","upstream_status":"ok"}' ;;
+    if [[ "${FAKE_SINGLE_HEALTH:-0}" == "1" ]]; then
+      printf '%s\\n' '{"module":"legacy_dashboard"}'
+    else
+      printf '%s\\n' '{"module":"frontend_gateway","upstream_status":"ok"}'
+    fi ;;
 esac
 exit 0
 """,
@@ -281,3 +286,107 @@ def test_unknown_listener_aborts_before_mutation_or_http_probe(
         for call in calls
     )
     assert not any(call.startswith("curl ") for call in calls)
+
+
+def test_single_mode_stops_stack_starts_single_and_keeps_all_plists(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        mode="single",
+        FAKE_8766_PID="4102",
+        FAKE_8767_PID="4103",
+        FAKE_SINGLE_HEALTH="1",
+    )
+    domain = f"gui/{os.getuid()}"
+    changes = [
+        call
+        for call in calls
+        if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+    ]
+    single_health = next(
+        i
+        for i, call in enumerate(calls)
+        if call.endswith("http://127.0.0.1:8766/healthz")
+    )
+    public_ready = next(
+        i
+        for i, call in enumerate(calls)
+        if call.endswith("http://127.0.0.1:8766/")
+    )
+    assert result.returncode == 0
+    assert changes[-5:] == [
+        f"launchctl bootout {domain}/{GATEWAY_LABEL}",
+        f"launchctl bootout {domain}/{LEGACY_LABEL}",
+        f"launchctl bootout {domain}/{SINGLE_LABEL}",
+        f"launchctl bootstrap {domain} {agents / f'{SINGLE_LABEL}.plist'}",
+        f"launchctl kickstart -k {domain}/{SINGLE_LABEL}",
+    ]
+    assert single_health < public_ready
+    assert {path.name for path in agents.glob("*.plist")} == {
+        f"{SINGLE_LABEL}.plist",
+        f"{GATEWAY_LABEL}.plist",
+        f"{LEGACY_LABEL}.plist",
+    }
+
+
+def _run_uninstaller(
+    tmp_path: Path,
+    loaded_labels: set[str],
+    *,
+    seed: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir(exist_ok=True)
+    if seed:
+        for label in (SINGLE_LABEL, GATEWAY_LABEL, LEGACY_LABEL):
+            (agents / f"{label}.plist").write_bytes(
+                plistlib.dumps({"Label": label})
+            )
+    calls = tmp_path / "uninstall-calls"
+    launchctl = tmp_path / "uninstall-launchctl"
+    loaded_case = "|".join(f"*{label}*" for label in sorted(loaded_labels))
+    _write_executable(
+        launchctl,
+        f"""#!/bin/bash
+echo "launchctl $*" >> "{calls}"
+if [[ "$1" == "print" ]]; then
+  case "$2" in
+    {loaded_case}) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+exit 0
+""",
+    )
+    return subprocess.run(
+        [
+            str(UNINSTALLER),
+            "--repo-root",
+            str(ROOT),
+            "--launch-agents-dir",
+            str(agents),
+        ],
+        cwd=ROOT,
+        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl)},
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_uninstaller_idempotently_removes_all_three_known_jobs(tmp_path: Path) -> None:
+    first = _run_uninstaller(tmp_path, loaded_labels=set())
+    second = _run_uninstaller(tmp_path, loaded_labels=set(), seed=False)
+    assert first.returncode == second.returncode == 0
+    assert not list((tmp_path / "LaunchAgents").glob("*.plist"))
+    for label in (SINGLE_LABEL, GATEWAY_LABEL, LEGACY_LABEL):
+        assert label in first.stdout
+        assert label in second.stdout
+
+
+def test_uninstaller_preserves_plist_when_job_remains_loaded(tmp_path: Path) -> None:
+    result = _run_uninstaller(tmp_path, loaded_labels={GATEWAY_LABEL})
+    plist = tmp_path / "LaunchAgents" / f"{GATEWAY_LABEL}.plist"
+    assert result.returncode == 1
+    assert plist.exists()
+    assert f"still loaded: {GATEWAY_LABEL}" in result.stderr

@@ -68,11 +68,15 @@ Keychain only; they are never written to config, SQLite, logs, or browser state)
 ```
 
 The preflight signs an in-memory probe but never submits it or places a canary
-order. After it passes, install the persistent macOS service:
+order. After it passes, install the persistent macOS Dashboard stack. The
+default command cuts over to Gateway `8766` plus Legacy Dashboard `8767`; use
+`--mode single` to roll back while preserving all three job configurations:
 
 ```bash
+scripts/install_dashboard_launchd.sh --dry-run
 scripts/install_dashboard_launchd.sh
 .venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
+scripts/install_dashboard_launchd.sh --mode single
 scripts/uninstall_dashboard_launchd.sh
 ```
 

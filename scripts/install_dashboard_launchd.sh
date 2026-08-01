@@ -206,6 +206,7 @@ install_single() {
   : > "$OUT_LOG"
   : > "$ERR_LOG"
   start_agent "$SINGLE_LABEL" "$SINGLE_PLIST"
+  wait_health "http://127.0.0.1:8766/healthz" "legacy_dashboard" ""
   wait_http "http://127.0.0.1:8766/"
   echo "installed launchd agent: $SINGLE_LABEL"
   echo "review URL: http://127.0.0.1:8766/"

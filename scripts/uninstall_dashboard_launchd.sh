@@ -13,17 +13,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-LABEL="com.open-trader.dashboard"
-PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
-
-"$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
-if "$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" >/dev/null 2>&1; then
-  echo "launchd job is still loaded: $LABEL; preserving $PLIST_PATH" >&2
-  exit 1
-fi
-if [[ -f "$PLIST_PATH" ]]; then
-  rm "$PLIST_PATH"
-  echo "removed launchd agent: $PLIST_PATH"
-else
-  echo "launchd agent not installed: $PLIST_PATH"
-fi
+status=0
+for label in \
+  com.open-trader.frontend-gateway \
+  com.open-trader.legacy-dashboard \
+  com.open-trader.dashboard
+do
+  plist="$LAUNCH_AGENTS_DIR/$label.plist"
+  "$LAUNCHCTL_BIN" bootout "gui/$UID/$label" 2>/dev/null || true
+  if "$LAUNCHCTL_BIN" print "gui/$UID/$label" >/dev/null 2>&1; then
+    echo "launchd job is still loaded: $label; preserving $plist" >&2
+    status=1
+  elif [[ -f "$plist" ]]; then
+    rm "$plist"
+    echo "removed launchd agent: $plist"
+  else
+    echo "launchd agent not installed: $plist"
+  fi
+done
+exit "$status"
