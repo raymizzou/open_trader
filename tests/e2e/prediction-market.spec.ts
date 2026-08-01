@@ -22,6 +22,9 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(page.locator('[data-prediction-history-panel]')).toContainText('信号刷新时间');
     await expect(page.locator('.pm-title-zh').first()).toContainText('以色列与伊朗停火');
     await expect(page.locator('.pm-title-en').first()).toContainText('Will the Israel-Iran ceasefire');
+    const eventTitle = page.locator('.pm-event-title').first();
+    await expect(eventTitle.locator('.pm-title-zh')).toHaveCSS('font-weight', '800');
+    await expect(eventTitle.locator('.pm-title-en')).toHaveCSS('font-size', '12px');
     const targetRow = page.locator('[data-prediction-history-panel] tbody tr').filter({ hasText: 'Will Bitcoin be above $90,000 on December 31, 2026?' });
     await expect(targetRow).toContainText('Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?');
     await expect(targetRow).toContainText('比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？');
