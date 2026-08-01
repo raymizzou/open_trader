@@ -34,6 +34,25 @@ from tests.test_dashboard import (
 )
 
 
+def test_acceptance_gate_runs_prediction_playwright() -> None:
+    makefile = (Path(__file__).resolve().parents[1] / "Makefile").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'OPEN_TRADER_PYTHON="$(WORKTREE_ROOT)/.venv/bin/python"' in makefile
+    normalized = " ".join(re.sub(r"\\\s*\n", " ", makefile).split())
+    assert (
+        "npm exec playwright test tests/e2e/prediction-market.spec.ts "
+        "--project=chromium"
+    ) in normalized
+
+    acceptance = makefile.split("\nacceptance:\n", 1)[1]
+    playwright_index = acceptance.index("npm exec playwright test")
+    live_index = acceptance.index("prediction_arbitrage_acceptance")
+    assert playwright_index < live_index
+    assert playwright_index < acceptance.index("ifeq ($(SKIP_POLYMARKET_LIVE),1)")
+
+
 def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
     return {
         "schema_version": "open_trader.trend_controller.status.v1",

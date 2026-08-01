@@ -13,6 +13,12 @@ acceptance:
 	cd "$(REPOSITORY_ROOT)" && \
 		PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src" \
 		"$(WORKTREE_ROOT)/.venv/bin/python" -m pytest "$(WORKTREE_ROOT)/tests" -q
+	@status=0; \
+	cd "$(WORKTREE_ROOT)" && \
+	OPEN_TRADER_PYTHON="$(WORKTREE_ROOT)/.venv/bin/python" \
+		npm exec playwright test tests/e2e/prediction-market.spec.ts \
+		--project=chromium || status=$$?; \
+	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
 ifeq ($(SKIP_POLYMARKET_LIVE),1)
 	@echo "SKIPPED: Polymarket live acceptance by operator override"
 else
