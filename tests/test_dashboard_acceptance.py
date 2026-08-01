@@ -6365,6 +6365,117 @@ def test_acceptance_rejects_dirty_dashboard_source(
     }
 
 
+def _runtime_health(
+    tmp_path: Path, *, module: str, schema: str, pid: int,
+) -> dict[str, object]:
+    return {
+        "schema_version": schema,
+        "module": module,
+        "pid": pid,
+        "started_at": "2026-08-01T12:00:01+08:00",
+        "cwd": str(tmp_path),
+        "git_sha": "accepted-sha",
+        "source_state": "clean",
+    }
+
+
+def test_acceptance_accepts_matching_gateway_health(tmp_path: Path) -> None:
+    payload = {
+        **_runtime_health(
+            tmp_path,
+            module="frontend_gateway",
+            schema="open_trader.frontend_gateway.health.v1",
+            pid=123,
+        ),
+        "upstream_status": "ok",
+    }
+
+    assert dashboard_acceptance._runtime_health_errors(
+        payload,
+        name="Frontend Gateway",
+        expected_schema="open_trader.frontend_gateway.health.v1",
+        expected_module="frontend_gateway",
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat(
+            "2026-08-01T12:00:00+08:00"
+        ),
+        expected_upstream_status="ok",
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("schema_version", "wrong.v1", "schema"),
+        ("module", "legacy_dashboard", "模块"),
+        ("pid", 999, "PID"),
+        ("cwd", "/wrong/worktree", "工作目录"),
+        ("git_sha", "old-sha", "Git SHA"),
+        ("source_state", "dirty", "源码状态"),
+        ("started_at", "2026-08-01T11:59:59+08:00", "启动时间"),
+        ("upstream_status", "unavailable", "upstream"),
+    ],
+)
+def test_acceptance_rejects_gateway_health_mismatch(
+    tmp_path: Path, field: str, value: object, message: str,
+) -> None:
+    payload = {
+        **_runtime_health(
+            tmp_path,
+            module="frontend_gateway",
+            schema="open_trader.frontend_gateway.health.v1",
+            pid=123,
+        ),
+        "upstream_status": "ok",
+        field: value,
+    }
+
+    errors = dashboard_acceptance._runtime_health_errors(
+        payload,
+        name="Frontend Gateway",
+        expected_schema="open_trader.frontend_gateway.health.v1",
+        expected_module="frontend_gateway",
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat(
+            "2026-08-01T12:00:00+08:00"
+        ),
+        expected_upstream_status="ok",
+    )
+
+    assert any(message in error for error in errors)
+
+
+def test_acceptance_reads_gateway_runtime_prefix(tmp_path: Path) -> None:
+    runtime = {
+        "pid": 123,
+        "git_sha": "accepted-sha",
+        "cwd": str(tmp_path),
+        "source_state": "clean",
+        "started_at": "2026-08-01T12:00:01+08:00",
+    }
+    log = tmp_path / "gateway.log"
+    log.write_text(
+        f"frontend_gateway_runtime: {json.dumps(runtime)}\n",
+        encoding="utf-8",
+    )
+
+    assert dashboard_acceptance._log_errors(
+        log,
+        name="Frontend Gateway",
+        prefix="frontend_gateway_runtime: ",
+        pid=123,
+        expected_sha="accepted-sha",
+        expected_cwd=tmp_path,
+        process_started_at=datetime.fromisoformat(
+            "2026-08-01T12:00:00+08:00"
+        ),
+    ) == []
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [

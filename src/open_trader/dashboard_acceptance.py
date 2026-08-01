@@ -4324,6 +4324,54 @@ def _browser_check(
     return errors, None
 
 
+def _runtime_health_errors(
+    payload: object,
+    *,
+    name: str,
+    expected_schema: str,
+    expected_module: str,
+    pid: int,
+    expected_sha: str,
+    expected_cwd: Path,
+    process_started_at: datetime,
+    expected_upstream_status: str | None = None,
+) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return [f"{name} health 不是对象"]
+    errors: list[str] = []
+    if payload.get("schema_version") != expected_schema:
+        errors.append(f"{name} health schema 不匹配")
+    if payload.get("module") != expected_module:
+        errors.append(f"{name} health 模块身份不匹配")
+    if payload.get("pid") != pid:
+        errors.append(f"{name} health PID 不匹配")
+    cwd = payload.get("cwd")
+    if (
+        not isinstance(cwd, str)
+        or not cwd.strip()
+        or Path(cwd).resolve() != expected_cwd.resolve()
+    ):
+        errors.append(f"{name} health 工作目录不匹配")
+    if payload.get("git_sha") != expected_sha:
+        errors.append(f"{name} health Git SHA 不匹配")
+    if payload.get("source_state") != "clean":
+        errors.append(f"{name} health 源码状态不是 clean")
+    if (
+        expected_upstream_status is not None
+        and payload.get("upstream_status") != expected_upstream_status
+    ):
+        errors.append(f"{name} health upstream 状态不匹配")
+    try:
+        started_at = datetime.fromisoformat(str(payload.get("started_at") or ""))
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError("timezone-aware timestamp required")
+        if started_at < process_started_at:
+            errors.append(f"{name} health 启动时间早于候选进程")
+    except (TypeError, ValueError):
+        errors.append(f"{name} health 启动时间无效")
+    return errors
+
+
 def _log_errors(
     path: Path,
     *,
@@ -4331,6 +4379,8 @@ def _log_errors(
     expected_sha: str,
     expected_cwd: Path,
     process_started_at: datetime,
+    name: str = "Dashboard",
+    prefix: str = "dashboard_runtime: ",
 ) -> list[str]:
     try:
         if not path.exists():
@@ -4338,7 +4388,6 @@ def _log_errors(
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return [f"日志读取失败：{type(exc).__name__}: {exc}"]
-    prefix = "dashboard_runtime: "
     records: list[tuple[int, Mapping[str, Any]]] = []
     for index, line in enumerate(text.splitlines()):
         if not line.startswith(prefix):
@@ -4352,23 +4401,23 @@ def _log_errors(
     errors: list[str] = []
     matching = [item for item in records if item[1].get("pid") == pid]
     if not matching:
-        errors.append(f"日志没有候选 Dashboard PID：{pid}")
+        errors.append(f"日志没有候选 {name} PID：{pid}")
         fresh_text = text
     else:
         index, record = matching[-1]
         if index != 0:
-            errors.append("Dashboard 日志不是候选进程的新日志文件")
+            errors.append(f"{name} 日志不是候选进程的新日志文件")
         try:
             if path.stat().st_mtime < process_started_at.timestamp():
-                errors.append("Dashboard 日志修改时间早于候选进程")
+                errors.append(f"{name} 日志修改时间早于候选进程")
         except OSError as exc:
             errors.append(f"日志状态读取失败：{type(exc).__name__}: {exc}")
         if record.get("git_sha") != expected_sha:
-            errors.append("日志中的 Dashboard Git SHA 不匹配")
+            errors.append(f"日志中的 {name} Git SHA 不匹配")
         if Path(str(record.get("cwd") or "")).resolve() != expected_cwd.resolve():
-            errors.append("日志中的 Dashboard 工作目录不匹配")
+            errors.append(f"日志中的 {name} 工作目录不匹配")
         if record.get("source_state") != "clean":
-            errors.append("日志中的 Dashboard 源码状态不是 clean")
+            errors.append(f"日志中的 {name} 源码状态不是 clean")
         try:
             recorded_start = datetime.fromisoformat(
                 str(record.get("started_at") or "")
@@ -4376,9 +4425,9 @@ def _log_errors(
             if recorded_start.tzinfo is None or recorded_start.utcoffset() is None:
                 raise ValueError("timezone-aware timestamp required")
             if recorded_start < process_started_at:
-                errors.append("日志中的 Dashboard 启动时间早于候选进程")
+                errors.append(f"日志中的 {name} 启动时间早于候选进程")
         except (TypeError, ValueError):
-            errors.append("日志中的 Dashboard 启动时间无效")
+            errors.append(f"日志中的 {name} 启动时间无效")
         fresh_text = "\n".join(text.splitlines()[index:])
     markers = ("Traceback (most recent call last)", "看板数据加载失败")
     errors.extend(
