@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Approved product design; implementation plan ready for confirmation
+**Status:** Approved product design; acceptance matrix ready for review
 
 **Target:** Existing Open Trader prediction-market Dashboard
 
@@ -90,7 +90,7 @@ While the YES/NO workspace is visible, a separate one-second timer requests
 only:
 
 ```text
-/api/prediction-arbitrage/history?kind=signals&limit=...
+/api/prediction-arbitrage/history?kind=signals&limit=100
 ```
 
 The successful response updates only the `套利信号` component DOM. It must not
@@ -259,29 +259,58 @@ Out of scope:
 - Execution or incident behavior after confirmation remains governed by the
   existing execution boundary and circuit breaker.
 
-## 11. Acceptance Scenarios
+## 11. Acceptance Gate
 
-The implementation is ready only when the final Dashboard acceptance gate also
-passes these behaviors:
+### 11.1 Final result
 
-1. `当前机会` is absent and Variant A layout is present in the original style.
-2. `套利信号`, `交易与合并`, and `事故` tabs retain their selected state.
-3. A new signal does not switch away from another selected tab.
-4. An open signal shows HKT time, bilingual title when cached, immutable
-   `触发时利润`, changing `实时利润`, and one `重新检查` button.
-5. The signal component updates at one-second cadence without replacing the
-   monitoring-scope DOM or resetting an expanded monitoring row.
-6. Closing the signal changes `实时利润` to `—` and removes its button.
-7. A failed signal request freezes/redens its refresh time and removes buttons.
-8. `重新检查` can open a complete fresh preview; an expired signal is rejected
-   without submission.
-9. `确认下单` remains the only action that can create an execution.
-10. The first signal sends the specified link-free Feishu message; another
-    episode for the same `market_id` within 30 minutes is persisted but not
-    sent.
-11. Failed Feishu delivery retries no more than three times and never after the
-    signal closes.
-12. English titles render before translation and later gain cached Chinese
-    without delaying signal availability.
-13. The existing LLM hedge surface and notifications remain unchanged.
-14. Desktop and 375px layouts preserve readable titles and usable controls.
+`make acceptance` is the sole final review-readiness result. It must aggregate:
+
+1. the complete Python test suite
+2. the deterministic Prediction Playwright suite
+3. the real read-only Polymarket acceptance and no-submit readiness checks
+4. the trend drawdown preflight
+5. the live Dashboard API, process, log, desktop, and mobile checks
+
+Run it with live Polymarket acceptance enabled; the operator override
+`SKIP_POLYMARKET_LIVE=1` cannot produce an accepted build for this change.
+
+- `PASS`: every deterministic and live check passes, then the exact accepted
+  SHA is redeployed and its new PID, cwd, SHA, fresh logs, and HTTP 200 are
+  proven.
+- `FAIL`: any code, API, UI, notification, regression, process, or log
+  assertion fails.
+- `BLOCKED`: only a required browser, Polymarket route, credential, or other
+  external environment is unavailable. A deterministic assertion failure is
+  never `BLOCKED`.
+
+The gate sends no real Feishu test message, places no order, and requires no
+screenshot. Feishu delivery is proven with a deterministic notifier double;
+there is no live Feishu delivery assertion.
+
+### 11.2 Required criteria
+
+| ID | Given / action | Required observation | Required evidence |
+| --- | --- | --- | --- |
+| AC-01 | Open the YES/NO workspace. | `当前机会`, generic `历史记录`, and `信号历史` are absent. The original-style two-column layout shows `当前监控范围` left and the selected `套利信号` / `交易与合并` / `事故` panel right. | Prediction Playwright at 1440px and 375px. |
+| AC-02 | Select `交易与合并` or `事故`, then deliver a new signal response and a five-second state response. | The selected tab does not change. A new signal never switches the user back to `套利信号`. | Prediction Playwright. |
+| AC-03 | Keep one monitoring event expanded while two one-second signal responses arrive. | Requests do not overlap. Only the signal panel DOM is replaced; readiness, metrics, monitoring scope, and the expanded event retain object identity and state. No browser request targets Polymarket. | Prediction Playwright request log and DOM identity assertions. |
+| AC-04 | Provide a watcher heartbeat and a successful signal response, then fail the next signal request. | `Watcher 数据时间` and `信号刷新时间` show HKT and relative age. On failure the last signal timestamp remains visible in danger styling and every signal action disappears until recovery. | Python formatter/projection tests and Prediction Playwright. |
+| AC-05 | Open one signal at calculated profit `$0.38`, then update its watcher profit to `$0.44`, then close it. | `触发时利润` remains `+$0.38`; `实时利润` becomes `+$0.44`; after close it becomes `—`. No signal row displays `峰值利润` or `最终利润`. | Store/API pytest plus Prediction Playwright. |
+| AC-06 | Project open, closed, stale, degraded, missing-opportunity, active-execution, and open-breaker states. | `重新检查` exists only for an open, matched, complete, currently actionable signal with healthy watcher/readiness, no active execution, and a closed breaker. Every other operation cell is empty, not a disabled button. | History-projection pytest and Prediction Playwright. |
+| AC-07 | Click `重新检查` for one accepted and one expired signal. | Each click calls only the existing preview endpoint. Expired preview creates no modal and no execution. Accepted preview opens the current confirmation modal; only `确认下单` creates exactly one execution request. | Prediction Playwright request counts and execution-service pytest. |
+| AC-08 | Deliver a standard signal through a deterministic Feishu notifier. | Title is `【YES/NO 套利信号】+<profit>`. Body contains only optional cached Chinese title, English title, YES price, NO price, quantity, maximum cost, current profit, and discovered HKT time. It contains no link, button, wallet, internal ID, rule trace, or stale disclaimer. | Notification renderer/service pytest. No real message is sent. |
+| AC-09 | Create repeated episodes for the same and different markets; simulate successful and failed delivery. | A successful send starts a per-`market_id` rolling 30-minute cooldown; failed delivery does not. Every episode persists. Failure reserves at most three attempts while open and never retries after close. | Store, monitor, and execution-service pytest. |
+| AC-10 | Block or fail title translation while a signal appears, then make a cached translation available. | English title, persistence, Feishu scheduling, actionability, preview, and execution never wait for translation. One FIFO worker runs Codex `gpt-5.6-luna` with reasoning `high` and priority service tier. A later refresh adds Chinese above English. | Translator/monitor pytest and Prediction Playwright. No live Codex call is required. |
+| AC-11 | Render monitoring rows and signal rows with and without cached Chinese. | Only the market title is bilingual. English remains visible. Neutral `仅监控` and `预计` copy are absent; meaningful degraded or exception status remains visible. | Renderer pytest and Prediction Playwright. |
+| AC-12 | Run existing LLM-hedge notification, candidate, preview, and execution tests. | Existing LLM-hedge behavior and copy remain unchanged. | Existing pytest and Prediction Playwright regression cases. |
+| AC-13 | Exercise desktop 1440px and mobile 375px, including the preview modal. | No horizontal overflow; titles remain readable; visible buttons are at least 44px high; Escape closes the modal and restores focus. | Prediction Playwright. |
+| AC-14 | Run real wallet status, `preflight --no-submit`, prediction state/history reads, and live Dashboard checks from the candidate worktree. | Commands expose current truth, submit no order, return schema-valid local data, and fail closed when external readiness is unavailable. | `prediction_arbitrage_acceptance`, direct command output, and Dashboard acceptance. |
+| AC-15 | Complete all checks, record the accepted SHA, and reinstall the same worktree without source or data edits. | `make acceptance` reports `PASS`; the redeployed Dashboard has a new PID, exact accepted cwd/SHA, fresh `dashboard_runtime` logs without traceback, and HTTP 200 at the review URL. | Final gate output, `launchctl`, `lsof`, Git SHA, fresh logs, and curl. |
+
+### 11.3 Evidence rule
+
+Each criterion must have the evidence named in the matrix. Passing a lower
+level does not substitute for a higher one: unit tests do not replace browser
+behavior, fixture browser checks do not replace live read-only readiness, and
+HTTP 200 does not replace exact-SHA process and log proof. If any required
+evidence is missing, the result is not `PASS`.
