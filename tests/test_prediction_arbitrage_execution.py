@@ -15,6 +15,7 @@ import pytest
 from open_trader.prediction_arbitrage import PairIntent, ThresholdHedgeIntent, ThresholdHedgeLeg
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_title_translation import prediction_title_cache_key
 from open_trader.polymarket_trading import (
     AccountSnapshot,
     LegResult,
@@ -617,9 +618,10 @@ class ChannelNotifier:
         self.channel = channel
         self.fail = fail
         self.calls = 0
+        self.messages: list[tuple[str, str]] = []
 
     def notify(self, title: str, message: str) -> None:
-        del title, message
+        self.messages.append((title, message))
         self.calls += 1
         if self.fail:
             raise RuntimeError("delivery failed")
@@ -829,6 +831,20 @@ def test_notify_ready_opportunity_standard_sends_feishu_observation_without_pref
     assert trading.batch_calls == 0
     assert store.active_execution() is None
     assert store.signal(signal_id)["notification_state"] == "sent"  # type: ignore[index]
+
+
+def test_standard_notification_uses_only_cached_title_translation(
+    tmp_path: Path,
+) -> None:
+    service, _trading, store, _monitor, _macos, feishu = standard_notification_fixture(tmp_path)
+    store.save_llm_cache(
+        prediction_title_cache_key("Will it happen?"),
+        {"title_zh": "会发生吗？"},
+    )
+    signal_id = _standard_notification_signal(store)
+
+    assert service.notify_ready_opportunity("opp-1", signal_id)["state"] == "sent"
+    assert "会发生吗？" in feishu.messages[-1][1]
 
 
 def test_notify_ready_opportunity_standard_suppresses_same_market_within_cooldown(

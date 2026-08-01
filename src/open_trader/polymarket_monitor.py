@@ -27,6 +27,7 @@ from .prediction_arbitrage import (
     monitored_event_sort_key,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_title_translation import cached_prediction_title_zh
 from .polymarket_relation_discovery import (
     RelationValidation,
     ThresholdHedgeIntent,
@@ -299,6 +300,7 @@ class PolymarketMonitor:
         clock: Callable[[], datetime] | None = None,
         relation_discovery: Callable[[Sequence[object]], object] | object | None = None,
         relation_validator: object | None = None,
+        title_translator: object | None = None,
     ) -> None:
         self._store = store
         self._trading = trading
@@ -306,6 +308,7 @@ class PolymarketMonitor:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._relation_discovery = relation_discovery
         self._relation_validator = relation_validator
+        self._title_translator = title_translator
         self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -372,6 +375,11 @@ class PolymarketMonitor:
         self._codex_wait_started_at: dict[str, datetime] = {}
         self._notification_task: asyncio.Task[object] | None = None
         self._notification_signal_id: str | None = None
+        self._title_translation_queue: asyncio.Queue[str] | None = None
+        self._title_translation_task: asyncio.Task[None] | None = None
+        self._title_translation_pending: set[str] = set()
+        self._translated_titles: dict[str, str] = {}
+        self._title_cache_checked: set[str] = set()
         self._full_scan_task: asyncio.Task[None] | None = None
         self._full_scan_pending = False
         self._catalog_loaded = False
@@ -744,6 +752,7 @@ class PolymarketMonitor:
         return market_row
 
     async def run_forever(self) -> None:
+        self._ensure_title_translation_worker()
         if not self._catalog_loaded:
             self._load_relation_catalog()
         client = self._public_client_factory()
@@ -811,6 +820,7 @@ class PolymarketMonitor:
                 "_activity_scan_task",
                 "_codex_task",
                 "_notification_task",
+                "_title_translation_task",
             ):
                 task = getattr(self, task_name)
                 setattr(self, task_name, None)
@@ -951,6 +961,8 @@ class PolymarketMonitor:
             self._diagnostics["malformed_events"] = malformed_events
             self._universe_at = self._now()
             self._universe_failed = False
+        self._apply_cached_title_projections()
+        self._enqueue_title_translations(normalized)
         await self._refresh_readiness()
         semaphore = asyncio.Semaphore(PUBLIC_BOOK_CONCURRENCY)
 
@@ -2272,6 +2284,8 @@ class PolymarketMonitor:
             event_row = self._events.get(relation.event_id)
             if event_row is not None:
                 row.setdefault("event_title", event_row.get("title", ""))
+                if event_row.get("title_zh"):
+                    row.setdefault("event_title_zh", event_row.get("title_zh"))
                 row.setdefault("event_slug", event_row.get("slug", ""))
             rows.append(row)
             self._upsert_signal(row)
@@ -2837,6 +2851,7 @@ class PolymarketMonitor:
             "market_id": market_id,
             "condition_id": market_row["condition_id"],
             "question": market_row["question"],
+            "event_title": self._events.get(str(market_row["event_id"]), {}).get("title", ""),
             "market_type": "standard_binary",
             "fee_status": "fee_free",
             "volume_24h": market_row["volume_24h"],
@@ -2862,6 +2877,10 @@ class PolymarketMonitor:
             "total_max_cost": intent.total_max_cost,
             "intent": intent,
         }
+        event_row = self._events.get(str(market_row["event_id"]))
+        if isinstance(event_row, Mapping) and event_row.get("title_zh"):
+            opportunity["event_title_zh"] = event_row["title_zh"]
+            opportunity["title_zh"] = event_row["title_zh"]
         market_row.update({"actionable": True, "eligibility_reason": "actionable", "profit": intent.minimum_profit})
         self._upsert_signal(opportunity)
         return opportunity
@@ -2986,6 +3005,100 @@ class PolymarketMonitor:
                 (row.get("gross_upper_bound") for row in markets if isinstance(row.get("gross_upper_bound"), Decimal)),
                 default=None,
             )
+
+    def _ensure_title_translation_worker(self) -> None:
+        if self._title_translator is None:
+            return
+        if self._title_translation_queue is None:
+            self._title_translation_queue = asyncio.Queue()
+        task = self._title_translation_task
+        if task is None or task.done():
+            self._title_translation_task = asyncio.create_task(
+                self._run_title_translation_worker()
+            )
+
+    def _cached_title_zh(self, title: object) -> str | None:
+        normalized = str(title or "").strip()
+        if not normalized:
+            return None
+        if normalized in self._translated_titles:
+            return self._translated_titles[normalized]
+        if normalized in self._title_cache_checked:
+            return None
+        self._title_cache_checked.add(normalized)
+        try:
+            translated = cached_prediction_title_zh(self._store, normalized)
+        except Exception:
+            translated = None
+        if translated is not None:
+            self._translated_titles[normalized] = translated
+        return translated
+
+    def _apply_cached_title_projections(self) -> None:
+        with self._lock:
+            for event in self._events.values():
+                title = event.get("title", "")
+                translated = self._cached_title_zh(title)
+                if translated is None:
+                    event.pop("title_zh", None)
+                    event.pop("event_title_zh", None)
+                else:
+                    event["title_zh"] = translated
+                    event["event_title_zh"] = translated
+            for opportunity in self._opportunities.values():
+                event = self._events.get(str(opportunity.get("event_id", "")))
+                if event is None:
+                    continue
+                opportunity["event_title"] = event.get("title", "")
+                translated = event.get("title_zh")
+                if translated:
+                    opportunity["event_title_zh"] = translated
+                    opportunity["title_zh"] = translated
+                else:
+                    opportunity.pop("event_title_zh", None)
+                    opportunity.pop("title_zh", None)
+
+    def _enqueue_title_translations(
+        self, events: Sequence[Mapping[str, object]]
+    ) -> None:
+        if self._title_translator is None:
+            return
+        self._ensure_title_translation_worker()
+        queue = self._title_translation_queue
+        if queue is None:
+            return
+        for event in events:
+            title = str(event.get("title", "")).strip()
+            if (
+                not title
+                or title in self._translated_titles
+                or title in self._title_translation_pending
+            ):
+                continue
+            self._title_translation_pending.add(title)
+            queue.put_nowait(title)
+
+    async def _run_title_translation_worker(self) -> None:
+        queue = self._title_translation_queue
+        translator = self._title_translator
+        if queue is None or translator is None:
+            return
+        method = getattr(translator, "translate", translator)
+        if not callable(method):
+            return
+        while not self._stop_event.is_set():
+            title = await queue.get()
+            try:
+                translated = await asyncio.to_thread(method, title)
+            except Exception:
+                translated = None
+            finally:
+                self._title_translation_pending.discard(title)
+                queue.task_done()
+            if not isinstance(translated, str) or not translated.strip():
+                continue
+            self._translated_titles[title] = translated.strip()
+            self._apply_cached_title_projections()
 
     def _upsert_signal(self, opportunity: Mapping[str, object]) -> str | None:
         market_id = str(opportunity["market_id"])

@@ -403,6 +403,7 @@ def make_monitor(
     trading: FakeTrading | None = None,
     relation_discovery=discover_threshold_relation_catalog,
     relation_validator=None,
+    title_translator=None,
     clock=None,
 ):
     from open_trader.polymarket_monitor import PolymarketMonitor
@@ -414,6 +415,7 @@ def make_monitor(
         clock=clock or (lambda: NOW),
         relation_discovery=relation_discovery,
         relation_validator=relation_validator,
+        title_translator=title_translator,
     )
 
 
@@ -2893,3 +2895,56 @@ def test_runtime_confirms_books_with_bounded_concurrency(
     assert snapshot["health"]["status"] == "healthy", snapshot["health"]
     assert SlowBookClient.max_active == 8
     assert len(SlowBookClient.book_calls) == 20
+
+
+def test_title_translation_worker_is_fifo_and_does_not_block_english_snapshot(
+    tmp_path: Path,
+) -> None:
+    class BlockingTranslator:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls: list[str] = []
+            self.active = 0
+            self.max_active = 0
+
+        def translate(self, title: str) -> str | None:
+            self.calls.append(title)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.started.set()
+            self.release.wait(timeout=2)
+            self.active -= 1
+            return f"中文 {title}"
+
+    setup_public([
+        event("e-2", markets=(market("m-2"),)),
+        event("e-1", markets=(market("m-1"),)),
+    ])
+    translator = BlockingTranslator()
+
+    async def scenario() -> None:
+        monitor = make_monitor(
+            tmp_path,
+            relation_discovery=None,
+            title_translator=translator,
+        )
+        task = asyncio.create_task(monitor.run_forever())
+        assert await asyncio.to_thread(translator.started.wait, 1.0)
+        english = monitor.snapshot()
+        assert [row["title"] for row in english["events"]] == ["Event e-1", "Event e-2"]
+        assert all("title_zh" not in row for row in english["events"])
+        translator.release.set()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if all("title_zh" in row for row in monitor.snapshot()["events"]):
+                break
+        translated = monitor.snapshot()
+        assert all("title_zh" in row for row in translated["events"])
+        assert translator.max_active == 1
+        assert translator.calls == ["Event e-1", "Event e-2"]
+        monitor.stop()
+        await asyncio.wait_for(task, timeout=1.0)
+        assert monitor._title_translation_task is None
+
+    asyncio.run(scenario())

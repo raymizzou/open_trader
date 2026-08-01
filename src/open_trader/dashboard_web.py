@@ -49,6 +49,10 @@ from .prediction_arbitrage import (
 )
 from .prediction_arbitrage_execution import PredictionExecutionService
 from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_title_translation import (
+    CodexTitleTranslator,
+    cached_prediction_title_zh,
+)
 from .research_chat import ResearchChatError, ResearchChatService
 from .standard_strategies import strategy_catalog
 from .statement_import import StatementImportService
@@ -275,6 +279,28 @@ def _prediction_event_aliases(value: object) -> object:
     if isinstance(opportunities, (list, tuple)):
         result["opportunities"] = [
             _prediction_opportunity_aliases(item) for item in opportunities
+        ]
+    return result
+
+
+def _prediction_attach_cached_title(
+    store: PredictionArbitrageStore | None, value: object
+) -> object:
+    if store is None or not isinstance(value, Mapping):
+        return value
+    result = dict(value)
+    title = _prediction_first(
+        result, "event_title", "title", "question", "market_title"
+    )
+    if title is not None:
+        translated = cached_prediction_title_zh(store, str(title))
+        if translated is not None:
+            result["event_title_zh"] = translated
+            result.setdefault("title_zh", translated)
+    markets = result.get("markets")
+    if isinstance(markets, (list, tuple)):
+        result["markets"] = [
+            _prediction_attach_cached_title(store, item) for item in markets
         ]
     return result
 
@@ -554,8 +580,14 @@ def _prediction_state_payload(
     opportunities = safe_snapshot.get("opportunities")
     event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
     opportunity_rows = [row for row in opportunities if isinstance(row, Mapping)] if isinstance(opportunities, (list, tuple)) else []
-    event_rows = [_prediction_event_aliases(row) for row in event_rows]
-    opportunity_rows = [_prediction_opportunity_aliases(row) for row in opportunity_rows]
+    event_rows = [
+        _prediction_attach_cached_title(store, _prediction_event_aliases(row))
+        for row in event_rows
+    ]
+    opportunity_rows = [
+        _prediction_attach_cached_title(store, _prediction_opportunity_aliases(row))
+        for row in opportunity_rows
+    ]
     event_rows = sorted(
         (row for row in event_rows if isinstance(row, Mapping)), key=_prediction_sort_key
     )
@@ -698,7 +730,10 @@ def _prediction_history_payload(
         raise ValueError("kind must be signals, executions, or incidents")
     rows = store.histories(kind) if store is not None else []
     safe_rows = [
-        _prediction_history_aliases(kind, _prediction_safe_value(row)) for row in rows
+        _prediction_attach_cached_title(
+            store, _prediction_history_aliases(kind, _prediction_safe_value(row))
+        )
+        for row in rows
     ]
     items = safe_rows[offset : offset + limit]
     return {
@@ -1454,11 +1489,13 @@ def serve_dashboard(
                 prediction_store,
                 model=codex_model,
             )
+            title_translator = CodexTitleTranslator(prediction_store)
             prediction_monitor = PolymarketMonitor(
                 store=prediction_store,
                 trading=prediction_trading,
                 relation_discovery=discover_threshold_relation_catalog,
                 relation_validator=relation_validator,
+                title_translator=title_translator,
             )
             prediction_execution = PredictionExecutionService(
                 store=prediction_store,

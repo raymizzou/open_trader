@@ -38,6 +38,7 @@ from .prediction_arbitrage import (
     protected_buy_quantity,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_title_translation import cached_prediction_title_zh
 
 
 PREVIEW_TTL = timedelta(seconds=10)
@@ -377,6 +378,13 @@ class PredictionExecutionService:
         if not isinstance(lease_id, str) or not isinstance(current, Mapping):
             return {"state": "failed", "reason": "notification_state_unavailable"}
 
+        current = dict(current)
+        event_title = str(
+            current.get("event_title", current.get("question", "")) or ""
+        ).strip()
+        translated_title = cached_prediction_title_zh(self._store, event_title)
+        if translated_title is not None:
+            current["event_title_zh"] = translated_title
         try:
             title, message = render_yes_no_signal_notification(current)
             feishu_success = self._deliver_feishu_notification(title, message)
