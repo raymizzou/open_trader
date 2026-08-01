@@ -80,6 +80,11 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
             row[1]
             for row in connection.execute("PRAGMA index_list('signals')")
         }
+        open_query_plan = connection.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM signals WHERE ended_at IS NULL "
+            "ORDER BY started_at DESC, signal_id DESC"
+        ).fetchall()
         query_plan = connection.execute(
             "EXPLAIN QUERY PLAN "
             "SELECT payload FROM signals WHERE market_id=? ORDER BY started_at DESC",
@@ -98,7 +103,9 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "relation_scan_runs",
     }
     assert "signals_market_started_at" in indexes
+    assert "signals_open_started_at" in indexes
     assert any("signals_market_started_at" in row[3] for row in query_plan)
+    assert any("signals_open_started_at" in row[3] for row in open_query_plan)
 
 
 def test_runtime_round_trips_canonical_json_and_survives_restart(tmp_path: Path) -> None:
@@ -124,6 +131,16 @@ def test_one_open_signal_per_market_and_close_creates_new_episode(tmp_path: Path
     assert len(db.signal_history("all")) == 2
     assert db.signal_history("all")[0]["signal_id"] == second_id
     assert db.signal_history("all")[1]["ended_at"] is not None
+
+
+def test_open_signal_history_excludes_closed_episodes(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    first_id = db.upsert_signal(signal_payload("market-1", iso(datetime.now(UTC))))
+    db.close_signal("market-1", ended_at=iso(datetime.now(UTC)), reason="book_stale")
+    db.upsert_signal(signal_payload("market-2", iso(datetime.now(UTC))))
+
+    assert [row["signal_id"] for row in db.open_signal_history()] != [first_id]
+    assert [row["market_id"] for row in db.open_signal_history()] == ["market-2"]
 
 
 def test_relation_state_and_scan_tables_survive_restart(tmp_path: Path) -> None:

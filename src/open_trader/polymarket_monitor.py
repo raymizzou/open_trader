@@ -2042,10 +2042,30 @@ class PolymarketMonitor:
         )
 
     def _open_signal(self, market_id: str) -> dict[str, object] | None:
-        for row in self._store.signal_history("all"):
+        open_history = getattr(self._store, "open_signal_history", None)
+        rows = (
+            open_history()
+            if callable(open_history)
+            else (
+                row
+                for row in self._store.signal_history("all")
+                if row.get("ended_at") is None
+            )
+        )
+        for row in rows:
             if row.get("market_id") == market_id and row.get("ended_at") is None:
                 return row
         return None
+
+    def _open_signal_history(self) -> list[dict[str, object]]:
+        open_history = getattr(self._store, "open_signal_history", None)
+        if callable(open_history):
+            return list(open_history())
+        return [
+            row
+            for row in self._store.signal_history("all")
+            if row.get("ended_at") is None
+        ]
 
     def _relation_book_stale(self, token: str, now: datetime) -> bool:
         book = self._relation_books.get(token)
@@ -3380,9 +3400,7 @@ class PolymarketMonitor:
             "unavailable",
         }
         disconnected = self._stream_disconnected_at is not None
-        for signal in self._store.signal_history("all"):
-            if signal.get("ended_at") is not None:
-                continue
+        for signal in self._open_signal_history():
             market_id = str(signal.get("market_id", ""))
             relation = self._relations.get(market_id)
             if relation is None:

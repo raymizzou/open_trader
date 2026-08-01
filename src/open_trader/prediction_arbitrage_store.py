@@ -365,6 +365,9 @@ class PredictionArbitrageStore:
             CREATE INDEX IF NOT EXISTS signals_market_started_at
             ON signals(market_id, started_at DESC);
 
+            CREATE INDEX IF NOT EXISTS signals_open_started_at
+            ON signals(started_at DESC, signal_id DESC) WHERE ended_at IS NULL;
+
             DROP INDEX IF EXISTS one_nonterminal_execution;
 
             CREATE UNIQUE INDEX IF NOT EXISTS one_nonterminal_execution
@@ -855,6 +858,19 @@ class PredictionArbitrageStore:
                 )
             )
         return result
+
+    def open_signal_history(self) -> list[dict[str, object]]:
+        """Return only currently open signal episodes, newest first."""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM signals
+                WHERE ended_at IS NULL
+                ORDER BY started_at DESC, signal_id DESC
+                """
+            ).fetchall()
+        return [self._signal_result(row) for row in rows]
 
     def notification_sent_since(
         self,
