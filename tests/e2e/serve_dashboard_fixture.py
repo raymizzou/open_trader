@@ -59,15 +59,15 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         {"event_id": "event-fed-chair", "title": "下一任美联储主席人选", "volume_24h": "5900000", "markets": "14 个市场", "profit": "1.40", "actionable": False, "opportunities": [{"title": "多结果事件市场", "volume_24h": "5900000", "markets": "14 个市场", "actionable": False, "reason": "已订阅 · Negative Risk 暂不可参与"}]},
     ]
     event_labels = {
-        "event-ceasefire": ("预计净利润", "可参与"),
-        "event-btc": ("毛利润上限", "仅监控 · 收费市场"),
-        "event-fed": ("毛利润上限", "仅监控 · Negative Risk"),
-        "event-eth": ("毛利润上限", "仅监控 · 净利润不足"),
-        "event-senate": ("毛利润上限", "仅监控 · Negative Risk"),
-        "event-fed-chair": ("毛利润上限", "仅监控 · Negative Risk"),
+        "event-ceasefire": ("净利润", "可参与"),
+        "event-btc": ("毛利润上限", "收费市场不可参与"),
+        "event-fed": ("毛利润上限", "Negative Risk 暂不可参与"),
+        "event-eth": ("毛利润上限", "净利润不足"),
+        "event-senate": ("毛利润上限", "Negative Risk 暂不可参与"),
+        "event-fed-chair": ("毛利润上限", "Negative Risk 暂不可参与"),
     }
     events = [
-        {**event, "profit_label": event_labels.get(str(event.get("event_id")), ("预计净利润", "仅监控"))[0], "status": event_labels.get(str(event.get("event_id")), ("预计净利润", "仅监控"))[1]}
+        {**event, "profit_label": event_labels.get(str(event.get("event_id")), ("净利润", "暂不可参与"))[0], "status": event_labels.get(str(event.get("event_id")), ("净利润", "暂不可参与"))[1]}
         for event in events
     ]
     if scenario == "quiet":
@@ -97,7 +97,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "masked_wallet": "0x7A4E…91C2",
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
         "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
-        "heartbeat_at": "刚刚",
+        "heartbeat_at": "2026-08-01T02:00:00Z",
         "event_count": 20,
         "market_count": 331,
         "token_count": 662,
@@ -203,9 +203,9 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
 def _prediction_history(kind: str) -> list[dict[str, object]]:
     if kind == "signals":
         return [
-            {"occurred_at": "今天 14:32:08", "event_title": "停火持续至 8 月 31 日？", "duration": "2m 14s", "peak_edge": "0.060", "quantity": "20", "status": "可执行", "profit": "1.20"},
-            {"occurred_at": "今天 11:08:41", "event_title": "地缘事件市场示例 B", "duration": "18s", "peak_edge": "0.055", "quantity": "20", "status": "可执行", "profit": "1.10"},
-            {"occurred_at": "昨天 22:17:04", "event_title": "地缘事件市场示例 C", "duration": "41s", "peak_edge": "0.052", "quantity": "20", "status": "可执行", "profit": "1.04"},
+            {"signal_id": "signal-ceasefire", "opportunity_id": "opp-ceasefire", "occurred_at": "2026-08-01T01:59:00Z", "event_title": "Will the Israel-Iran ceasefire continue through August 31, 2026?", "event_title_zh": "以色列与伊朗停火是否持续至 2026 年 8 月 31 日？", "duration": "2m 14s", "initial_profit": "0.30", "live_profit": "0.38", "actionable_now": True, "notification_state": "sent"},
+            {"signal_id": "signal-fed", "opportunity_id": "opp-fed", "occurred_at": "2026-08-01T01:55:00Z", "event_title": "Will the Fed cut rates in September 2026?", "event_title_zh": "2026 年 9 月美联储是否降息？", "duration": "18s", "initial_profit": "0.20", "live_profit": "0.24", "actionable_now": False, "notification_state": "failed"},
+            {"signal_id": "signal-closed", "opportunity_id": "opp-closed", "occurred_at": "2026-08-01T01:50:00Z", "ended_at": "2026-08-01T01:50:41Z", "event_title": "Will Ethereum exceed $6,000 before September?", "event_title_zh": "以太坊会在 9 月前突破 $6,000？", "duration": "41s", "initial_profit": "0.15", "live_profit": "0.18", "actionable_now": False, "notification_state": "sent"},
         ]
     if kind == "executions":
         return [{"completed_at": "今天 14:36:12", "event_title": "停火持续至 8 月 31 日？", "quantity": "20 组", "actual_cost": "18.80", "merge_value": "20.00", "status": "已合并", "realized_profit": "1.20"}]
@@ -254,7 +254,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/prediction-arbitrage/history":
             kind = str(query.get("kind", ["signals"])[0] or "signals")
+            if type(self).prediction_scenario == "signal-error" and kind == "signals":
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.end_headers()
+                return
             items = _prediction_history(kind)
+            if type(self).prediction_scenario == "signal-closed" and kind == "signals":
+                items = [{**items[0], "ended_at": "2026-08-01T02:00:10Z", "actionable_now": False, "live_profit": None}, *items[1:]]
+            if type(self).prediction_scenario in {"degraded", "unavailable", "unknown"} and kind == "signals":
+                items = [{**item, "actionable_now": False} for item in items]
             self._send_json({"kind": kind, "items": items, "total": len(items), "limit": 100, "offset": 0, "has_more": False})
             return
         self.send_response(HTTPStatus.NOT_FOUND)

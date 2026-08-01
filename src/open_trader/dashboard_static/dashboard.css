@@ -5634,8 +5634,13 @@ table {
 .pm-stack { display: grid; gap: 10px; }
 .pm-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 14px; }
 .pm-panel-heading { align-items: start; display: flex; gap: 16px; justify-content: space-between; margin-bottom: 12px; }
+.pm-panel-heading-actions { align-items: end; display: grid; gap: 8px; justify-items: end; min-width: 0; }
 .pm-panel-heading h2, .pm-panel-heading h3 { margin: 0; }
 .pm-panel-heading p { color: var(--muted); margin: 4px 0 0; }
+.pm-clock { color: var(--muted); display: inline-flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; font-size: 12px; font-variant-numeric: tabular-nums; }
+.pm-clock small { color: inherit; }
+.pm-clock-danger { color: var(--danger); font-weight: 800; }
+.pm-signal-error { color: var(--danger) !important; font-size: 12px; font-weight: 700; margin: 6px 0 0 !important; }
 .pm-pill { border: 1px solid var(--line); border-radius: 999px; display: inline-flex; font-size: 12px; font-weight: 800; line-height: 1; padding: 7px 9px; white-space: nowrap; }
 .pm-pill.venue { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
 .pm-pill.action { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
@@ -5744,6 +5749,20 @@ table {
 .pm-table th, .pm-table td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; vertical-align: top; }
 .pm-table th { color: var(--muted); font-size: 11px; letter-spacing: 0.03em; text-transform: uppercase; }
 .pm-table tr:last-child td { border-bottom: 0; }
+.pm-signal-table { table-layout: fixed; }
+.pm-signal-table th:nth-child(1), .pm-signal-table td:nth-child(1) { width: 132px; }
+.pm-signal-table th:nth-child(2), .pm-signal-table td:nth-child(2) { width: 30%; }
+.pm-signal-table th:nth-child(7), .pm-signal-table td:nth-child(7) { width: 112px; }
+.pm-signal-table td { overflow-wrap: anywhere; }
+.pm-signal-live td { background: #fbfdfb; }
+.pm-title-cell { min-width: 0; }
+.pm-title-cell > span { display: block; line-height: 1.35; overflow-wrap: anywhere; }
+.pm-title-zh { font-weight: 800; }
+.pm-title-en { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.pm-title-cell .pm-title-en:first-child { color: var(--text); font-size: inherit; margin-top: 0; }
+.pm-relative-age { color: var(--muted); display: block; font-size: 11px; margin-top: 3px; white-space: nowrap; }
+.pm-signal-operation { white-space: nowrap; }
+.pm-signal-action { min-width: 96px; }
 .pm-modal-layer:empty { display: none; }
 .pm-modal-layer { align-items: center; background: rgba(20, 18, 15, 0.58); display: flex; inset: 0; justify-content: center; padding: 16px; position: fixed; z-index: 2000; }
 .pm-modal { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28); max-height: calc(100dvh - 32px); max-width: 720px; overflow: auto; padding: 20px; width: 100%; }
@@ -5799,6 +5818,8 @@ table {
   .pm-funnel-meta { align-items: stretch; display: grid; }
   .pm-progress { grid-template-columns: 1fr 1fr; }
   .pm-panel-heading, .pm-opportunity-title, .pm-opportunity-action, .pm-alert { align-items: stretch; display: grid; }
+  .pm-panel-heading-actions { align-items: stretch; justify-items: stretch; }
+  .pm-clock { justify-content: flex-start; }
   .pm-opportunity-metrics { grid-template-columns: 1fr 1fr; }
   .pm-threshold-formula, .pm-threshold-history { grid-template-columns: 1fr; }
   .pm-threshold-questions { grid-template-columns: 1fr; }
@@ -5813,6 +5834,10 @@ table {
   .pm-table tr:last-child { border-bottom: 0; }
   .pm-table td { border: 0; display: grid; gap: 8px; grid-template-columns: 108px minmax(0, 1fr); padding: 5px 0; }
   .pm-table td::before { color: var(--muted); content: attr(data-label); font-size: 12px; font-weight: 800; }
+  .pm-signal-table { table-layout: auto; }
+  .pm-signal-table th:nth-child(n), .pm-signal-table td:nth-child(n) { width: auto; }
+  .pm-signal-operation { white-space: normal; }
+  .pm-signal-action { width: 100%; }
   .pm-modal { padding: 16px; }
   .pm-order-legs, .pm-order-summary { grid-template-columns: 1fr; }
   .pm-modal-actions { display: grid; }

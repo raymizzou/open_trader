@@ -2690,7 +2690,7 @@ console.log(JSON.stringify({scanning:predictionRelationFunnel(scanning),noRelati
     assert "本轮未发现可验证关系" in rendered["noRelations"]
     assert "拒绝" in rendered["noPositive"]
     assert "盘口过期" in rendered["noReady"]
-    for text in ("250 ms", "初始利润", "峰值利润", "最终利润", "data_unavailable", "飞书已发", "发送失败", "未发送"):
+    for text in ("250 ms", "触发时利润", "实时利润", "飞书已发", "发送失败", "未发送"):
         assert text in rendered["history"]
 
 
@@ -5170,8 +5170,11 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "pm-controller" not in html
     assert "原型场景控制器" not in html
     assert "底部场景" not in html
-    for label in ("实盘就绪状态", "当前监控范围", "当前机会", "历史记录", "信号历史", "交易与合并", "事故"):
+    for label in ("实盘就绪状态", "当前监控范围", "套利信号", "交易与合并", "事故", "出现时间（HKT）", "触发时利润", "实时利润", "重新检查", "Watcher 数据时间", "信号刷新时间"):
         assert label in js
+    assert "data-prediction-history-panel" in js
+    assert "signalPollId" in js
+    assert "signalRequestInFlight" in js
     for copy in ("免手续费", "可能只成交一腿", "24h 成交量"):
         assert copy in js
     for fabricated in (
@@ -5192,6 +5195,40 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert ".pm-readiness" in css
     assert ".pm-opportunity" in css
     assert ".pm-modal-layer" in css
+
+
+def test_prediction_yes_no_signal_renderer_has_approved_columns_and_fail_closed_actions() -> None:
+    output = run_dashboard_js(r'''
+state.predictionMarket.signalLastSuccessAt = "2026-08-01T02:00:00Z";
+state.predictionMarket.signalError = "";
+const payload = {
+  status: "healthy",
+  health: {status: "healthy", degraded_reasons: []},
+  events: [],
+  opportunities: [],
+  histories: {signals: [
+    {occurred_at: "2026-08-01T01:59:00Z", event_title: "English market", event_title_zh: "中文标的", duration: "12s", initial_profit: "0.30", live_profit: "0.38", actionable_now: true, opportunity_id: "opp-1", notification_state: "sent"},
+    {occurred_at: "2026-08-01T01:58:00Z", event_title: "Closed market", ended_at: "2026-08-01T01:58:12Z", initial_profit: "0.20", live_profit: "0.22", actionable_now: true, opportunity_id: "opp-2", notification_state: "failed"},
+  ]},
+};
+const open = predictionYesNoWorkspace(payload, new Set());
+state.predictionMarket.signalError = "history 503";
+const failed = predictionYesNoWorkspace(payload, new Set());
+console.log(JSON.stringify({open, failed}));
+''')
+    rendered = json.loads(output)
+    for html in (rendered["open"], rendered["failed"]):
+        for label in ("套利信号", "出现时间（HKT）", "标的", "持续", "触发时利润", "实时利润", "通知", "操作"):
+            assert label in html
+        for obsolete in ("当前机会", "历史记录", "信号历史", "峰值利润", "最终利润", "窗口结束", "预计", "未下单，当前可能已失效"):
+            assert obsolete not in html
+    assert "中文标的" in rendered["open"]
+    assert rendered["open"].index("中文标的") < rendered["open"].index("English market")
+    assert 'data-action="participate"' in rendered["open"]
+    assert 'data-action="participate"' not in rendered["failed"]
+    assert 'data-label="实时利润"' in rendered["open"]
+    assert "—" in rendered["failed"]
+    assert "仅监控" not in rendered["open"] + rendered["failed"]
 
 
 def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:
