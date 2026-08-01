@@ -1,11 +1,39 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
-import open_trader.cli as cli
+import open_trader.frontend_gateway as frontend_gateway
 from open_trader.frontend_gateway import FrontendGatewayConfig
+
+
+def test_frontend_gateway_module_entrypoint_does_not_import_domain_modules() -> None:
+    script = """
+import runpy
+import sys
+sys.argv = ["open_trader", "frontend-gateway", "--help"]
+try:
+    runpy.run_module("open_trader", run_name="__main__")
+except SystemExit as error:
+    assert error.code == 0
+print("LOADED_MODULES")
+print("\\n".join(sorted(sys.modules)))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    loaded = completed.stdout.split("LOADED_MODULES\n", 1)[1].splitlines()
+
+    assert "open_trader.dashboard_web" not in loaded
+    assert "open_trader.polymarket_monitor" not in loaded
+    assert "open_trader.advice.tradingagents_adapter" not in loaded
 
 
 def test_frontend_gateway_cli_uses_loopback_defaults(
@@ -19,15 +47,17 @@ def test_frontend_gateway_cli_uses_loopback_defaults(
         captured.update(config=config, host=host, port=port)
 
     monkeypatch.setattr(
-        cli, "serve_frontend_gateway", fake_serve_frontend_gateway, raising=False
+        frontend_gateway, "serve_frontend_gateway", fake_serve_frontend_gateway
     )
 
-    assert cli.main(["frontend-gateway"]) == 0
+    assert frontend_gateway.main([]) == 0
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8766
     config = captured["config"]
     assert isinstance(config, FrontendGatewayConfig)
-    assert config.static_dir == Path(cli.__file__).with_name("dashboard_static")
+    assert config.static_dir == Path(frontend_gateway.__file__).with_name(
+        "dashboard_static"
+    )
     assert config.upstream_host == "127.0.0.1"
     assert config.upstream_port == 8767
     assert config.public_origin == "http://127.0.0.1:8766"
@@ -46,12 +76,11 @@ def test_frontend_gateway_cli_dispatches_explicit_upstream_and_origin(
         captured.update(config=config, host=host, port=port)
 
     monkeypatch.setattr(
-        cli, "serve_frontend_gateway", fake_serve_frontend_gateway, raising=False
+        frontend_gateway, "serve_frontend_gateway", fake_serve_frontend_gateway
     )
 
-    assert cli.main(
+    assert frontend_gateway.main(
         [
-            "frontend-gateway",
             "--host",
             "localhost",
             "--port",
