@@ -172,7 +172,6 @@ start_agent() {
   local label="$1" plist="$2"
   bootout_agent "$label"
   bootstrap_agent "$plist"
-  "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$label"
 }
 
 restore_single() {
@@ -180,7 +179,6 @@ restore_single() {
   bootout_agent "$LEGACY_LABEL"
   bootout_agent "$SINGLE_LABEL"
   bootstrap_agent "$SINGLE_PLIST" || return 1
-  "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$SINGLE_LABEL" || return 1
   wait_http "http://127.0.0.1:8766/"
 }
 

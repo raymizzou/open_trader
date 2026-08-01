@@ -253,6 +253,7 @@ def test_stack_cutover_verifies_legacy_before_stopping_single_and_starting_gatew
     )
     assert result.returncode == 0
     assert legacy_ready < single_stop < gateway_start < gateway_ready
+    assert not any(" kickstart " in call for call in calls)
 
 
 def test_gateway_failure_stops_stack_restores_single_and_verifies_public_url(
@@ -266,12 +267,11 @@ def test_gateway_failure_stops_stack_restores_single_and_verifies_public_url(
         if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
     ]
     assert result.returncode == 1
-    assert changes[-5:] == [
+    assert changes[-4:] == [
         f"launchctl bootout {domain}/{GATEWAY_LABEL}",
         f"launchctl bootout {domain}/{LEGACY_LABEL}",
         f"launchctl bootout {domain}/{SINGLE_LABEL}",
         f"launchctl bootstrap {domain} {agents / f'{SINGLE_LABEL}.plist'}",
-        f"launchctl kickstart -k {domain}/{SINGLE_LABEL}",
     ]
     assert calls[-1].endswith("http://127.0.0.1:8766/")
     assert "restored single-process dashboard" in result.stderr
@@ -324,12 +324,11 @@ def test_single_mode_stops_stack_starts_single_and_keeps_all_plists(
         if call.endswith("http://127.0.0.1:8766/")
     )
     assert result.returncode == 0
-    assert changes[-5:] == [
+    assert changes[-4:] == [
         f"launchctl bootout {domain}/{GATEWAY_LABEL}",
         f"launchctl bootout {domain}/{LEGACY_LABEL}",
         f"launchctl bootout {domain}/{SINGLE_LABEL}",
         f"launchctl bootstrap {domain} {agents / f'{SINGLE_LABEL}.plist'}",
-        f"launchctl kickstart -k {domain}/{SINGLE_LABEL}",
     ]
     assert single_health < public_ready
     assert {path.name for path in agents.glob("*.plist")} == {
