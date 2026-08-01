@@ -4,7 +4,7 @@
 
 **Goal:** Admit a Polymarket threshold hedge only when its fee-aware simple annualized yield is at least 15%, while keeping lower-yield observations visible in the approved complete bilingual B layout.
 
-**Architecture:** Put the single threshold constant in the existing prediction-arbitrage domain module. The monitor computes yield from the later of the two contract end times and owns visibility/actionability; the execution service repeats the same fail-closed admission check on fresh server data. Reuse the existing signal store, cached asynchronous title translator, Dashboard history endpoint, and existing table rather than adding a service or schema.
+**Architecture:** Put the single threshold constant in the existing prediction-arbitrage domain module. Relation discovery continues to require one shared valid end time; the monitor and execution service repeat the same fail-closed duration/admission checks on fresh server data. Reuse the existing signal store, cached asynchronous title translator, Dashboard history endpoint, and existing table rather than adding a service or schema.
 
 **Tech Stack:** Python 3, `Decimal`, asyncio, SQLite JSON payloads, pytest, vanilla JavaScript/CSS, Playwright, launchd.
 
@@ -13,7 +13,7 @@
 - `MIN_THRESHOLD_ANNUALIZED_YIELD = Decimal("0.15")`; equality passes.
 - Apply the gate only to `market_type="threshold_hedge"`.
 - Keep positive below-floor observations in current, 7-day, and 30-day distributions.
-- Missing, malformed, non-finite, or non-future duration data fails closed.
+- Missing, malformed, non-finite, non-future, or mismatched end-time data fails closed.
 - Do not add a Treasury feed, settlement buffer, early-exit model, venue, dependency, panel, or translation service.
 - English is the complete primary target; cached Chinese is the complete smaller second line; neither may truncate.
 - Profit copy says the modeled maximum trading fee is included and does not claim every external cost is deducted.
@@ -36,17 +36,15 @@
 - Consumes: existing `simple_annualized_yield(intent, *, now, resolution_at) -> Decimal | None`.
 - Produces: `annualized_yield`, `remaining_days`, `resolution_at`, and `eligibility_reason` on existing threshold opportunity rows.
 
-- [ ] **Step 1: Write monitor tests for later-end duration, below-floor visibility, and the inclusive floor**
+- [ ] **Step 1: Write monitor tests for shared-end duration, below-floor visibility, and the inclusive floor**
 
-Add focused tests beside the existing threshold annualized-distribution tests. Use the existing `threshold_event`, `setup_threshold_books`, `FakeRelationValidator`, and `make_monitor` helpers. Mutate both fixture end dates so the test proves the later one owns the duration:
+Add focused tests beside the existing threshold annualized-distribution tests. Use the existing `threshold_event`, `setup_threshold_books`, `FakeRelationValidator`, and `make_monitor` helpers. Keep the discovery fixture on one shared end date. After discovery, replace the in-memory relation with copies whose end dates differ or contain an invalid value so the monitor's fail-closed guard is exercised without weakening relation discovery:
 
 ```python
-def test_threshold_annualized_gate_uses_later_end_and_keeps_low_yield_visible(
+def test_threshold_annualized_gate_requires_shared_end_and_keeps_low_yield_visible(
     tmp_path: Path,
 ) -> None:
     source = threshold_event()
-    source.markets[0].end_date = "2026-09-01T00:00:00Z"
-    source.markets[1].end_date = "2027-09-01T00:00:00Z"
     setup_public([source])
     setup_threshold_books()
     monitor = make_monitor(
@@ -56,25 +54,26 @@ def test_threshold_annualized_gate_uses_later_end_and_keeps_low_yield_visible(
     )
 
     asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    relation_id, relation = next(iter(monitor._relations.items()))
+    monitor._relations[relation_id] = replace(
+        relation,
+        market_b=replace(relation.market_b, end_date="2027-09-01T00:00:00Z"),
+    )
     monitor.refresh_once()
 
     row = next(
         item for item in monitor.snapshot()["opportunities"]
         if item.get("market_type") == "threshold_hedge"
     )
-    assert row["resolution_at"] == "2027-09-01T00:00:00Z"
-    assert row["annualized_yield"] < Decimal("0.15")
+    assert row["resolution_at"] is None
+    assert row["annualized_yield"] is None
     assert row["actionable"] is False
-    assert row["eligibility_reason"] == "annualized_yield_below_minimum"
+    assert row["eligibility_reason"] == "annualized_yield_unavailable"
     history = monitor._store.signal_history("all")
     assert history[0]["annualized_yield"] == row["annualized_yield"]
-    distributions = monitor.snapshot()["relation_discovery"]["annualized_distribution"]
-    assert distributions["current"]["count"] == 1
-    assert distributions["7d"]["count"] == 1
-    assert distributions["30d"]["count"] == 1
 ```
 
-Register a ready observer in this case and assert its call list remains empty. Add a second case with one invalid end date and assert `annualized_yield is None`, `actionable is False`, and `eligibility_reason == "annualized_yield_unavailable"`. Keep the existing actionable fixture as the proof that a value above 15% continues through later checks.
+Register a ready observer in this case and assert its call list remains empty. Add a second in-memory relation case with one invalid end date and assert the same unavailable, non-actionable result; its `annualized_distribution` count remains zero because unavailable values are filtered. In the existing same-date subcent positive case, assert below-floor actionability is false while current, 7-day, and 30-day distribution counts remain one. Keep the existing shared-date actionable fixture as the proof that a value above 15% continues through later checks. The existing relation-discovery test remains the proof that mismatched dates are not catalogued.
 
 - [ ] **Step 2: Run the monitor tests and verify the new assertions fail**
 
@@ -86,7 +85,7 @@ PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
   -k 'threshold_annualized_gate or full_relation_scan_recovers_threshold_event' -q
 ```
 
-Expected: the later-end and annualized admission assertions fail because the monitor currently uses market B directly and does not enforce 15%.
+Expected: the shared-end and annualized admission assertions fail because the monitor currently trusts market B directly and does not enforce 15%.
 
 - [ ] **Step 3: Add the single constant and the minimal monitor gate**
 
@@ -96,18 +95,13 @@ In `prediction_arbitrage.py`, place the constant beside the existing threshold e
 MIN_THRESHOLD_ANNUALIZED_YIELD = Decimal("0.15")
 ```
 
-Import it into `polymarket_monitor.py`. Replace the direct market-B end date with a fail-closed later-date selection:
+Import it into `polymarket_monitor.py`. Replace the direct market-B end date with a fail-closed shared-date selection:
 
 ```python
 end_a = _timestamp_or_none(relation.market_a.end_date)
 end_b = _timestamp_or_none(relation.market_b.end_date)
-end_date = max(end_a, end_b) if end_a is not None and end_b is not None else None
-resolution_at = (
-    relation.market_a.end_date
-    if end_date is not None
-    and end_date == end_a
-    else relation.market_b.end_date if end_date is not None else None
-)
+end_date = end_a if end_a is not None and end_a == end_b else None
+resolution_at = relation.market_a.end_date if end_date is not None else None
 ```
 
 Keep using `simple_annualized_yield`. After all existing LLM, unwind, freshness, readiness, and funds checks, add only the annualized blockers:
@@ -400,7 +394,7 @@ git commit -m "feat: show annualized threshold signals in bilingual layout"
 
 - [ ] **Step 1: Add the dated operator-facing changelog entry and commit it**
 
-Under `2026-08-01`, record that LLM threshold hedges below 15% stay observable but cannot notify or preview, duration uses the later contract end date, and the signal table now shows complete English above complete cached Chinese with fee-aware annualized return.
+Under `2026-08-01`, record that LLM threshold hedges below 15% stay observable but cannot notify or preview, duration uses the shared contract end date, and the signal table now shows complete English above complete cached Chinese with fee-aware annualized return.
 
 Commit:
 

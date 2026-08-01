@@ -39,10 +39,12 @@ simple_annualized_yield =
 
 The value remains a decimal ratio: `0.15` means `15%`.
 
-For a two-leg threshold hedge, `resolution_at` is the later valid end time of
-the two contracts. This is the conservative time when the complete hedge can
-be treated as released. If either end time is missing or invalid, annualized
-yield is unavailable and admission fails closed.
+For a two-leg threshold hedge, both contracts must have the same valid end
+time. This shared time is when the complete hedge can be treated as released.
+If either end time is missing, invalid, or different, annualized yield is
+unavailable and admission fails closed. The relation discovery invariant
+already excludes mismatched end dates; the monitor and execution paths keep
+the same guard when consuming a relation or refreshed opportunity.
 
 `minimum_profit` already equals minimum payout minus both protected buy costs
 and the modeled maximum trading fees. It must be labelled as a theoretical
@@ -133,7 +135,7 @@ For a threshold hedge:
 - while translation is pending or unavailable, retain the English and keep a
   small second-line status instead of fabricating or silently truncating a
   Chinese title;
-- `资金占用` shows remaining days and the later contract end date;
+- `资金占用` shows remaining days and the shared contract end date;
 - `净回报` groups theoretical minimum profit, simple annualized yield, and
   total maximum cost, with wording that the modeled maximum fee is included;
 - `操作` shows `仅观察` plus the short blocking reason when the opportunity is
@@ -188,8 +190,8 @@ Focused automated coverage must prove:
    below-floor opportunity;
 8. standard binary arbitrage behavior is unchanged;
 9. the Dashboard shows the server-owned rejection reason;
-10. capital duration uses the later contract end time and fails closed when
-    either time is invalid;
+10. capital duration uses the shared contract end time and fails closed when
+    either time is invalid or the two times differ;
 11. every threshold target preserves the complete English pair above the
     complete cached Chinese translation without truncation on desktop or
     mobile;
