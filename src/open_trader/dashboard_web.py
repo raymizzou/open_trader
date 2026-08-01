@@ -1654,6 +1654,9 @@ def serve_dashboard(
             prediction_monitor.set_ready_observer(
                 prediction_execution.notify_ready_opportunity
             )
+            prediction_monitor.set_failure_observer(
+                prediction_execution.notify_monitor_failure
+            )
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
             # Dashboard rather than aborting the existing portfolio surface.

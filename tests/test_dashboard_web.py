@@ -2144,6 +2144,8 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
                     "status": "degraded",
                     "degraded_reasons": ["heartbeat_stale", "stream_disconnected"],
                     "heartbeat_age_seconds": "31.2",
+                    "universe_refresh_attempts": 4,
+                    "universe_retry_exhausted": False,
                 },
                 "readiness": {"balance": "50.00", "geoblock": "allowed", "relayer": "ready"},
                 "events": [{
@@ -2178,6 +2180,8 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
         "status": "degraded",
         "degraded_reasons": ["heartbeat_stale", "stream_disconnected"],
         "heartbeat_age_seconds": "31.2",
+        "universe_refresh_attempts": 4,
+        "universe_retry_exhausted": False,
     }
     assert state["failure_reason"] == "heartbeat_stale"
     assert state["first_live_order"] == "已验证"
@@ -2402,7 +2406,11 @@ const connectedButBooksStale = {
   status:"degraded",
   stale:true,
   health:{status:"degraded",degraded_reasons:["books_stale"],heartbeat_age_seconds:"0.4"},
-  relation_discovery:{websocket:{status:"connected",last_message_age_seconds:0.4}},
+  relation_discovery:{
+    status:"healthy",
+    catalog:{status:"healthy"},
+    websocket:{status:"connected",last_message_age_seconds:0.4},
+  },
   failure_reason:"books_stale",
   readiness:{status:"ready"},
   breaker:{open:false},
@@ -2438,6 +2446,56 @@ console.log(JSON.stringify({
     assert "WebSocket" not in rendered["healthyMetrics"]
     assert "过去 24 小时信号" in rendered["healthyMetrics"]
     assert rendered["unavailableMetrics"].count("<strong>-</strong>") == 4
+
+
+def test_prediction_universe_retry_and_exhaustion_alerts_render_exact_copy() -> None:
+    output = run_dashboard_js(r'''
+const retrying = {
+  status:"degraded", stale:true,
+  health:{
+    status:"degraded",
+    degraded_reasons:["universe_refresh_failed"],
+    universe_refresh_attempts:3,
+    universe_retry_exhausted:false,
+  },
+  relation_discovery:{
+    status:"healthy",
+    catalog:{status:"healthy"},
+    websocket:{status:"connected",last_message_age_seconds:0.4},
+  },
+  readiness:{status:"ready",balance:"60.40",geoblock:"allowed",relayer:"ready"},
+  masked_wallet:"0x1234…5678",
+  policy_limits:{max_wallet_balance:"65.00",max_normal_cost:"20.00",max_emergency_loss:"2.00",min_estimated_profit:"1.00"},
+  breaker:{open:false},
+};
+const exhausted = {
+  ...retrying,
+  health:{
+    ...retrying.health,
+    degraded_reasons:["universe_retry_exhausted"],
+    universe_refresh_attempts:5,
+    universe_retry_exhausted:true,
+  },
+};
+console.log(JSON.stringify({
+  retrying:predictionExecutionAlert(retrying),
+  exhausted:predictionExecutionAlert(exhausted),
+  retryingHeader:predictionPageHeader(retrying),
+  exhaustedHeader:predictionPageHeader(exhausted),
+  retryingYesNo:predictionTradingAvailable(retrying, "yes_no"),
+  retryingLlm:predictionTradingAvailable(retrying, "llm_hedge"),
+  exhaustedLlm:predictionTradingAvailable(exhausted, "llm_hedge"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "监控市场刷新失败，正在自动重试（3/5）" in rendered["retrying"]
+    assert "监控市场连续 5 次刷新失败，已停止自动重试；请重启承载预测监控的 Dashboard 服务并检查 Polymarket 连接。" in rendered["exhausted"]
+    assert "Watcher 正常" in rendered["retryingHeader"]
+    assert "Watcher 正常" in rendered["exhaustedHeader"]
+    assert rendered["retryingYesNo"] is False
+    assert rendered["retryingLlm"] is True
+    assert rendered["exhaustedLlm"] is True
 
 
 def test_prediction_llm_trading_health_is_independent_from_top_twenty_refresh() -> None:
@@ -3102,6 +3160,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     class FakeMonitor:
         kwargs: dict[str, object] = {}
         observer: object | None = None
+        failure_observer: object | None = None
 
         def __init__(self, **_: object) -> None:
             self.__class__.kwargs = dict(_)
@@ -3115,6 +3174,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def set_ready_observer(self, observer: object) -> None:
             self.__class__.observer = observer
 
+        def set_failure_observer(self, observer: object) -> None:
+            self.__class__.failure_observer = observer
+
     class FakeExecution:
         kwargs: dict[str, object] = {}
 
@@ -3123,6 +3185,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
 
         def notify_ready_opportunity(self, opportunity_id: str, signal_id: str) -> dict[str, object]:
             return {"state": "ignored", "opportunity_id": opportunity_id, "signal_id": signal_id}
+
+        def notify_monitor_failure(self, failure: object) -> dict[str, object]:
+            return {"state": "sent", "failure": failure}
 
         def reconcile_startup(self) -> dict[str, object]:
             order.append("execution.reconcile")
@@ -3174,6 +3239,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     )
     assert "Dashboard：http://127.0.0.1:8766/" in notification
     assert callable(FakeMonitor.observer)
+    assert callable(FakeMonitor.failure_observer)
 
 
 def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(

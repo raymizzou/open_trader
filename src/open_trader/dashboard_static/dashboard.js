@@ -2119,6 +2119,7 @@ function predictionFailureReasonLabel(payload) {
     universe_unavailable: "监控市场数据未返回",
     universe_stale: "监控市场数据已过期",
     universe_refresh_failed: "监控市场刷新失败",
+    universe_retry_exhausted: "监控市场连续刷新失败，已停止自动重试",
     books_stale: "可参与盘口已过期",
     readiness_stale: "交易账户检查已过期",
     readiness_unavailable: "交易账户检查不可用",
@@ -2160,6 +2161,7 @@ function predictionTradingAvailable(payload, strategy = "yes_no") {
     "universe_unavailable",
     "universe_stale",
     "universe_refresh_failed",
+    "universe_retry_exhausted",
   ]);
   const hasCriticalDegradation = degradedReasons.some(
     (reason) => !topTwentyOnlyReasons.has(reason)
@@ -2404,6 +2406,24 @@ function predictionExecutionAlert(payload, strategy = "yes_no") {
     return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交，待结算</strong><p>这是两个独立 condition 的阈值关系组合；不会 merge，结算前允许继续持有其他已确认组合。</p></div><span class="pm-pill action">待结算</span></section>`;
   }
   if (payload?.stale && !(strategy === "llm_hedge" && predictionTradingAvailable(payload, strategy))) {
+    const health = payload?.health || {};
+    const degradedReasons = Array.isArray(health.degraded_reasons)
+      ? health.degraded_reasons.map((reason) => String(reason || ""))
+      : [];
+    const universeAttempts = Number(health.universe_refresh_attempts || 0);
+    const universeExhausted = health.universe_retry_exhausted === true
+      || degradedReasons.includes("universe_retry_exhausted");
+    if (strategy !== "llm_hedge" && universeExhausted) {
+      return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>监控市场连续 5 次刷新失败</strong><p>监控市场连续 5 次刷新失败，已停止自动重试；请重启承载预测监控的 Dashboard 服务并检查 Polymarket 连接。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+    }
+    if (
+      strategy !== "llm_hedge"
+      && universeAttempts >= 1
+      && universeAttempts < 5
+      && degradedReasons.includes("universe_refresh_failed")
+    ) {
+      return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>监控市场刷新失败</strong><p>监控市场刷新失败，正在自动重试（${universeAttempts}/5）</p></div><span class="pm-pill watch">失败关闭</span></section>`;
+    }
     if (predictionWatcherIsConnected(payload)) {
       return `<section class="pm-alert danger" role="alert"><div class="pm-alert-body"><strong>当前盘口暂不可交易</strong><p>盘口数据已过期，当前不会开放下单；保留最后一次监控结果，仅供查看。</p></div><span class="pm-pill watch">失败关闭</span></section>`;
     }
