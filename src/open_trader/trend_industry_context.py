@@ -53,6 +53,7 @@ def calculate_industry_context(
     member_rows: Sequence[Mapping[str, object]],
     industry_row: Mapping[str, object] | None,
     warm_to_hot_count: int,
+    member_breadth_collected: bool = True,
 ) -> IndustryContext:
     normalized_warm_to_hot_count = _nonnegative_int(warm_to_hot_count)
     component_ids = {
@@ -134,10 +135,11 @@ def calculate_industry_context(
         )
 
     invalid_reasons: list[str] = []
-    if snapshot_coverage < Decimal("0.9"):
-        invalid_reasons.append("snapshot_coverage_below_90pct")
-    if right_state_coverage < Decimal("0.9"):
-        invalid_reasons.append("right_state_coverage_below_90pct")
+    if member_breadth_collected:
+        if snapshot_coverage < Decimal("0.9"):
+            invalid_reasons.append("snapshot_coverage_below_90pct")
+        if right_state_coverage < Decimal("0.9"):
+            invalid_reasons.append("right_state_coverage_below_90pct")
     if normalized_warm_to_hot_count is None:
         invalid_reasons.append("warm_to_hot_count_invalid")
     if temperature is None:
@@ -162,6 +164,7 @@ def calculate_industry_context(
         strength=strength,
         valid=not invalid_reasons,
         invalid_reasons=tuple(invalid_reasons),
+        member_breadth_collected=member_breadth_collected,
         aggregate_right_count_ratio=aggregate_right_count_ratio,
         aggregate_right_market_cap_ratio=aggregate_right_market_cap_ratio,
     )
@@ -253,12 +256,7 @@ def attach_prior_context(
             "prior_aggregate_right_count_ratio": prior.aggregate_right_count_ratio,
             "prior_aggregate_right_market_cap_ratio": prior.aggregate_right_market_cap_ratio,
         }
-        if (
-            prior.right_share is not None
-            and context.right_share is not None
-            and prior.temperature in temperature_order
-            and context.temperature in temperature_order
-        ):
+        if prior.temperature in temperature_order and context.temperature in temperature_order:
             current_temperature = temperature_order[context.temperature]
             prior_temperature = temperature_order[prior.temperature]
             direction = (
@@ -270,8 +268,11 @@ def attach_prior_context(
             )
             changes.update(
                 prior_temperature=prior.temperature,
-                prior_right_share=prior.right_share,
                 temperature_direction=direction,
+            )
+        if prior.right_share is not None and context.right_share is not None:
+            changes.update(
+                prior_right_share=prior.right_share,
                 right_share_change_pp=(context.right_share - prior.right_share)
                 * Decimal("100"),
             )
@@ -654,30 +655,43 @@ def _context_from_mapping(row: Mapping[str, object]) -> IndustryContext | None:
 def _context_is_valid_for_history(context: IndustryContext) -> bool:
     if not context.valid or context.invalid_reasons:
         return False
-    if context.component_count < 10:
-        return False
-    if not (
-        0 <= context.snapshot_count <= context.component_count
-        and context.snapshot_coverage >= Decimal("0.9")
-        and context.snapshot_coverage
-        == Decimal(context.snapshot_count) / Decimal(context.component_count)
-    ):
-        return False
-    if not (
-        0 <= context.tradable_count <= context.snapshot_count
-        and 0 <= context.valid_count <= context.tradable_count
-        and context.valid_count >= 10
-        and context.right_state_coverage >= Decimal("0.9")
-        and context.right_state_coverage
-        == Decimal(context.valid_count) / Decimal(context.tradable_count)
-    ):
-        return False
-    if not (
-        0 <= context.right_count <= context.valid_count
-        and context.right_share is not None
-        and 0 <= context.right_share <= 1
-        and context.right_share
-        == Decimal(context.right_count) / Decimal(context.valid_count)
+    if context.member_breadth_collected:
+        if context.component_count < 10:
+            return False
+        if not (
+            0 <= context.snapshot_count <= context.component_count
+            and context.snapshot_coverage >= Decimal("0.9")
+            and context.snapshot_coverage
+            == Decimal(context.snapshot_count) / Decimal(context.component_count)
+        ):
+            return False
+        if not (
+            0 <= context.tradable_count <= context.snapshot_count
+            and 0 <= context.valid_count <= context.tradable_count
+            and context.valid_count >= 10
+            and context.right_state_coverage >= Decimal("0.9")
+            and context.right_state_coverage
+            == Decimal(context.valid_count) / Decimal(context.tradable_count)
+        ):
+            return False
+        if not (
+            0 <= context.right_count <= context.valid_count
+            and context.right_share is not None
+            and 0 <= context.right_share <= 1
+            and context.right_share
+            == Decimal(context.right_count) / Decimal(context.valid_count)
+        ):
+            return False
+    elif not (
+        context.component_count
+        == context.snapshot_count
+        == context.tradable_count
+        == context.valid_count
+        == context.right_count
+        == 0
+        and context.snapshot_coverage == Decimal("0")
+        and context.right_state_coverage == Decimal("0")
+        and context.right_share is None
     ):
         return False
     return (
