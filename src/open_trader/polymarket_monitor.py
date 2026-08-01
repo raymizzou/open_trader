@@ -166,11 +166,16 @@ def _timestamp_or_none(value: object) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
-        number = float(value)
-        if not number == number or number in (float("inf"), float("-inf")):
+        try:
+            number = float(value)
+            if not number == number or number in (float("inf"), float("-inf")):
+                return None
+            # CLOB timestamps are epoch milliseconds; small values are seconds.
+            parsed = datetime.fromtimestamp(
+                number / (1000 if number > 10_000_000_000 else 1), UTC
+            )
+        except (OverflowError, OSError, ValueError):
             return None
-        # CLOB timestamps are epoch milliseconds; small values are seconds.
-        parsed = datetime.fromtimestamp(number / (1000 if number > 10_000_000_000 else 1), UTC)
     elif isinstance(value, str):
         text = value.strip()
         if text.endswith("Z"):

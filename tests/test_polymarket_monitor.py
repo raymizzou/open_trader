@@ -2387,8 +2387,9 @@ def test_threshold_annualized_gate_requires_shared_end_and_keeps_low_yield_visib
     assert calls == []
 
 
+@pytest.mark.parametrize("end_date", ["not-a-date", Decimal("1e20")])
 def test_threshold_annualized_gate_fails_closed_when_end_date_is_invalid(
-    tmp_path: Path,
+    tmp_path: Path, end_date: object,
 ) -> None:
     source = threshold_event()
     setup_public([source])
@@ -2404,7 +2405,7 @@ def test_threshold_annualized_gate_fails_closed_when_end_date_is_invalid(
     relation_id, relation = next(iter(monitor._relations.items()))
     monitor._relations[relation_id] = replace(
         relation,
-        market_a=replace(relation.market_a, end_date="not-a-date"),
+        market_a=replace(relation.market_a, end_date=end_date),
     )
     monitor._relation_rule_verifications[relation_id] = (
         NOW,
@@ -2420,6 +2421,10 @@ def test_threshold_annualized_gate_fails_closed_when_end_date_is_invalid(
     assert row["annualized_yield"] is None
     assert row["actionable"] is False
     assert row["eligibility_reason"] == "annualized_yield_unavailable"
+    distributions = monitor.snapshot()["relation_discovery"]["annualized_distribution"]
+    assert distributions["current"]["count"] == 0
+    assert distributions["7d"]["count"] == 0
+    assert distributions["30d"]["count"] == 0
 
 
 def test_relation_scan_logs_are_bounded_and_not_persisted(tmp_path: Path) -> None:
