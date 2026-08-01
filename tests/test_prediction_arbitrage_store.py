@@ -184,6 +184,84 @@ def test_open_signal_keeps_first_observation_and_initial_profit(tmp_path: Path) 
     assert row["peak_profit"] == "0.20"
 
 
+def test_signal_persists_action_identity_and_live_fields(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    started = "2026-07-31T00:00:00Z"
+    signal_id = db.upsert_signal(
+        {
+            **signal_payload("market-1", started),
+            "opportunity_id": "event-1:market-1",
+            "first_positive_at": started,
+            "initial_profit": Decimal("0.11"),
+            "yes_max_price": Decimal("0.42"),
+            "no_max_price": Decimal("0.47"),
+            "yes_max_cost": Decimal("8.40"),
+            "no_max_cost": Decimal("9.40"),
+            "total_max_cost": Decimal("17.80"),
+        }
+    )
+    db.upsert_signal(
+        {
+            **signal_payload("market-1", "2026-07-31T00:00:01Z"),
+            "opportunity_id": "event-1:market-1",
+            "first_positive_at": "2026-07-31T00:00:01Z",
+            "initial_profit": Decimal("0.05"),
+            "estimated_profit": Decimal("0.22"),
+            "yes_max_price": Decimal("0.43"),
+            "no_max_price": Decimal("0.46"),
+            "yes_max_cost": Decimal("8.60"),
+            "no_max_cost": Decimal("9.20"),
+            "total_max_cost": Decimal("17.80"),
+        }
+    )
+
+    row = db.signal(signal_id)
+    assert row["opportunity_id"] == "event-1:market-1"
+    assert row["yes_max_price"] == "0.43"
+    assert row["no_max_price"] == "0.46"
+    assert row["yes_max_cost"] == "8.60"
+    assert row["no_max_cost"] == "9.20"
+    assert row["total_max_cost"] == "17.80"
+    assert row["estimated_profit"] == "0.22"
+    assert row["started_at"] == "2026-07-31T00:00:00.000000Z"
+    assert row["first_positive_at"] == "2026-07-31T00:00:00.000000Z"
+    assert row["initial_profit"] == "0.11"
+
+
+def test_signal_notification_sent_since_only_counts_successful_same_market(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_arbitrage_store as store_module
+
+    now = [datetime(2026, 7, 31, 12, tzinfo=UTC)]
+    monkeypatch.setattr(store_module, "_utc_now", lambda: iso(now[0]))
+    db = store(tmp_path)
+    same_market = db.upsert_signal(signal_payload("market-1", iso(now[0])))
+    failed = db.reserve_notification_attempt(same_market, lease_seconds=0)
+    assert failed["state"] == "reserved"
+    db.complete_notification_attempt(
+        same_market, str(failed["lease_id"]), success=False
+    )
+    assert not db.notification_sent_since("market-1", now[0] - timedelta(minutes=1))
+
+    now[0] += timedelta(minutes=5)
+    delivered = db.reserve_notification_attempt(same_market, lease_seconds=0)
+    assert delivered["state"] == "reserved"
+    db.complete_notification_attempt(
+        same_market, str(delivered["lease_id"]), success=True
+    )
+    assert db.notification_sent_since("market-1", now[0] - timedelta(minutes=1))
+    assert not db.notification_sent_since("market-1", now[0] + timedelta(microseconds=1))
+
+    other_market = db.upsert_signal(signal_payload("market-2", iso(now[0])))
+    other = db.reserve_notification_attempt(other_market, lease_seconds=0)
+    assert other["state"] == "reserved"
+    db.complete_notification_attempt(
+        other_market, str(other["lease_id"]), success=True
+    )
+    assert db.notification_sent_since("market-1", now[0] - timedelta(minutes=1))
+
+
 def test_close_signal_persists_final_episode_values(tmp_path: Path) -> None:
     db = store(tmp_path)
     signal_id = db.upsert_signal(

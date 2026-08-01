@@ -853,6 +853,33 @@ class PredictionArbitrageStore:
             )
         return result
 
+    def notification_sent_since(
+        self,
+        market_id: str,
+        since: datetime,
+    ) -> bool:
+        """Return whether this market has a successful delivery at or after since."""
+
+        cutoff = _parse_timestamp(since)
+        # ponytail: scan per-market episode payloads; add a notification_sent_at
+        # index only if measured history makes this check material.
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM signals WHERE market_id=? ORDER BY started_at DESC",
+                (str(market_id),),
+            ).fetchall()
+        for row in rows:
+            payload = _load_payload(str(row["payload"]))
+            sent_at = payload.get("notification_sent_at")
+            if sent_at in (None, ""):
+                continue
+            try:
+                if _parse_timestamp(sent_at) >= cutoff:
+                    return True
+            except ValueError:
+                continue
+        return False
+
     def save_llm_cache(
         self, cache_key: str, payload: Mapping[str, object]
     ) -> None:

@@ -1292,6 +1292,48 @@ def test_observed_milliseconds_preserve_first_positive_and_close_episode(
     assert closed["ended_reason"] == "profit_non_positive"
 
 
+def test_upsert_signal_persists_yes_no_action_identity_and_initial_profit(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    first = {
+        "opportunity_id": "event-1:market-1",
+        "event_id": "event-1",
+        "market_id": "market-1",
+        "question": "Will the event happen?",
+        "market_type": "standard_binary",
+        "estimated_profit": Decimal("0.11"),
+        "yes_max_price": Decimal("0.42"),
+        "no_max_price": Decimal("0.47"),
+        "yes_max_cost": Decimal("8.40"),
+        "no_max_cost": Decimal("9.40"),
+        "total_max_cost": Decimal("17.80"),
+    }
+    signal_id = monitor._upsert_signal(first)
+    assert signal_id
+
+    monitor._upsert_signal(
+        {
+            **first,
+            "estimated_profit": Decimal("0.22"),
+            "yes_max_price": Decimal("0.43"),
+            "no_max_price": Decimal("0.46"),
+            "yes_max_cost": Decimal("8.60"),
+            "no_max_cost": Decimal("9.20"),
+        }
+    )
+
+    row = monitor._store.signal(signal_id)
+    assert row["opportunity_id"] == "event-1:market-1"
+    assert row["yes_max_price"] == "0.43"
+    assert row["no_max_price"] == "0.46"
+    assert row["yes_max_cost"] == "8.60"
+    assert row["no_max_cost"] == "9.20"
+    assert row["total_max_cost"] == "17.80"
+    assert row["estimated_profit"] == "0.22"
+    assert row["initial_profit"] == "0.11"
+
+
 def test_first_positive_refetches_exact_event_and_verifies_rules(
     tmp_path: Path,
 ) -> None:

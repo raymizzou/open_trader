@@ -3022,6 +3022,7 @@ class PolymarketMonitor:
                 )
             signal_id = self._store.upsert_signal(
                 {
+                    "opportunity_id": opportunity.get("opportunity_id"),
                     "event_id": opportunity["event_id"],
                     "market_id": market_id,
                     "question": opportunity["question"],
@@ -3041,6 +3042,11 @@ class PolymarketMonitor:
                     ),
                     "net_edge": opportunity.get("net_edge"),
                     "quantity": opportunity.get("quantity"),
+                    "yes_max_price": opportunity.get("yes_max_price"),
+                    "no_max_price": opportunity.get("no_max_price"),
+                    "yes_max_cost": opportunity.get("yes_max_cost"),
+                    "no_max_cost": opportunity.get("no_max_cost"),
+                    "total_max_cost": opportunity.get("total_max_cost"),
                     "estimated_profit": opportunity.get("estimated_profit"),
                     "profit": profit,
                     "initial_profit": initial_profit,
