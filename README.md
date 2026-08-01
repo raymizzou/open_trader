@@ -697,7 +697,10 @@ shared config, then restart the Dashboard stack from that exact worktree:
 
 ```bash
 REPO_ROOT="$PWD"
-ACCEPTED_SHA="$(git rev-parse HEAD)"
+if [ -z "${ACCEPTED_SHA:-}" ]; then
+  ACCEPTED_SHA="$(tr -d '\n' </tmp/open_trader_issue17_candidate_sha)"
+fi
+test -n "$ACCEPTED_SHA"
 export REPO_ROOT ACCEPTED_SHA
 test "$(git rev-parse HEAD)" = "$ACCEPTED_SHA"
 test -z "$(git status --short)"
