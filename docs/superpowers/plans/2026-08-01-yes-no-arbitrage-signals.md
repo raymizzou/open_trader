@@ -616,9 +616,69 @@ git commit -m "feat: promote yes-no arbitrage signals"
 
 **Files:**
 
+- Modify: `Makefile`
 - Modify: `CHANGELOG.md`
+- Test: `tests/test_dashboard_web.py`
 
-- [ ] **Step 1: Run the complete focused regression set**
+- [ ] **Step 1: Write a failing contract test for the sole final gate**
+
+Add `test_acceptance_gate_runs_prediction_playwright` to
+`tests/test_dashboard_web.py`. Read the repository `Makefile` and assert that
+the `acceptance` recipe runs this exact deterministic browser suite with the
+worktree Python:
+
+```text
+OPEN_TRADER_PYTHON="$(WORKTREE_ROOT)/.venv/bin/python"
+npm exec playwright test tests/e2e/prediction-market.spec.ts --project=chromium
+```
+
+Run:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" \
+  /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_dashboard_web.py::test_acceptance_gate_runs_prediction_playwright -q
+```
+
+Expected: FAIL because `make acceptance` does not yet aggregate Prediction
+Playwright.
+
+- [ ] **Step 2: Add Prediction Playwright to `make acceptance`**
+
+After the complete Python suite and before external live checks, add one
+fail-as-`FAIL` block:
+
+```make
+	@status=0; \
+	cd "$(WORKTREE_ROOT)" && \
+	OPEN_TRADER_PYTHON="$(WORKTREE_ROOT)/.venv/bin/python" \
+		npm exec playwright test tests/e2e/prediction-market.spec.ts \
+		--project=chromium || status=$$?; \
+	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
+```
+
+This deterministic fixture check cannot return `BLOCKED`; a failure is a code
+or local-environment `FAIL`. Keep `SKIP_POLYMARKET_LIVE=1` for unrelated
+operator workflows, but do not use it to accept this feature.
+
+- [ ] **Step 3: Run the gate contract test**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" \
+  /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
+  tests/test_dashboard_web.py::test_acceptance_gate_runs_prediction_playwright -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Commit the final-gate aggregation**
+
+```bash
+git add Makefile tests/test_dashboard_web.py
+git commit -m "test: include prediction UI in acceptance gate"
+```
+
+- [ ] **Step 5: Run the complete focused regression set**
 
 ```bash
 PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" \
@@ -636,7 +696,7 @@ OPEN_TRADER_PYTHON=/Users/ray/projects/open_trader/.venv/bin/python \
 
 Expected: PASS with exact counts recorded in the handoff notes.
 
-- [ ] **Step 2: Run safe real Polymarket readiness commands**
+- [ ] **Step 6: Run safe real Polymarket readiness commands**
 
 The ignored prediction config must exist in this exact worktree before treating a generic block as a product failure. Use the current shared operator config without printing secrets:
 
@@ -656,7 +716,7 @@ PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python \
 
 Expected: wallet status and no-submit preflight report the current real readiness without placing an order. If routing or credentials are externally unavailable, preserve the exact output for the final acceptance classification; do not weaken fail-closed logic.
 
-- [ ] **Step 3: Self-review the diff against the approved design**
+- [ ] **Step 7: Self-review the diff against the approved design**
 
 Run:
 
@@ -667,6 +727,13 @@ if git diff main...HEAD -- src/open_trader tests | \
   rg '^\+.*(TODO|TBD|FIXME|placeholder|prediction_signal_prototype|DeepSeek)'; then
   exit 1
 fi
+for id in AC-01 AC-02 AC-03 AC-04 AC-05 AC-06 AC-07 AC-08 \
+  AC-09 AC-10 AC-11 AC-12 AC-13 AC-14 AC-15; do
+  rg -q "$id" \
+    docs/superpowers/specs/2026-08-01-yes-no-arbitrage-signals-design.md
+  rg -q "$id" \
+    docs/superpowers/plans/2026-08-01-yes-no-arbitrage-signals.md
+done
 git status --short
 ```
 
@@ -676,10 +743,11 @@ Expected:
 - the renderer and E2E assertions, already covered by focused tests, expose none of the removed YES/NO copy (backend audit-field names may still exist deliberately);
 - `package-lock.json` remains excluded;
 - every design acceptance scenario has either a focused pytest or Playwright assertion;
+- AC-01 through AC-15 appear in both the approved matrix and implementation traceability table;
 - no notification code can invoke preview, preflight, or execution;
 - no browser code can fetch Polymarket or calculate profit.
 
-- [ ] **Step 4: Add and commit the dated operator changelog before any merge**
+- [ ] **Step 8: Add and commit the dated operator changelog before any merge**
 
 Add a `2026-08-01` entry describing:
 
@@ -699,7 +767,7 @@ git status --short
 
 Expected: only the pre-existing uncommitted `package-lock.json` remains. Do not merge to `main` in this task.
 
-- [ ] **Step 5: Make the candidate SHA runnable and deploy it for the final gate**
+- [ ] **Step 9: Make the candidate SHA runnable and deploy it for the final gate**
 
 The Makefile resolves `.venv` inside the worktree. Reuse the repository virtual environment without committing it:
 
@@ -713,7 +781,7 @@ test -e .venv || ln -s /Users/ray/projects/open_trader/.venv .venv
 
 Expected: launchd reports `com.open-trader.dashboard` installed and `http://127.0.0.1:8766/` ready from this worktree.
 
-- [ ] **Step 6: Run the one final Dashboard gate**
+- [ ] **Step 10: Run the one final Dashboard gate**
 
 ```bash
 make acceptance
@@ -721,11 +789,15 @@ make acceptance
 
 Expected final status: `PASS`.
 
+This single command must prove AC-01 through AC-15 by aggregating the complete
+Python suite, Prediction Playwright, real read-only Polymarket acceptance,
+trend drawdown preflight, and live Dashboard process/API/browser/log checks.
+
 - On `FAIL`, diagnose and fix the defect, rerun the relevant focused checks, recommit, redeploy the new candidate, and rerun `make acceptance`.
 - On `BLOCKED`, report the real browser/external blocker. Do not substitute curl, fixtures, mocks, screenshots, or unit tests for acceptance.
 - Do not describe the work as complete unless this command returns `PASS`.
 
-- [ ] **Step 7: Redeploy the exact accepted SHA without source or data changes**
+- [ ] **Step 11: Redeploy the exact accepted SHA without source or data changes**
 
 Record the accepted SHA, then reinstall the same worktree:
 
@@ -756,7 +828,7 @@ Expected:
 - no fresh traceback;
 - HTTP `200` from `http://127.0.0.1:8766/`.
 
-- [ ] **Step 8: Hand off for user review**
+- [ ] **Step 12: Hand off for user review**
 
 Report the accepted SHA, focused-test and Playwright counts, direct wallet/preflight result, `make acceptance` `PASS`, live PID/cwd/SHA/log proof, and review URL:
 
@@ -765,6 +837,26 @@ http://127.0.0.1:8766/
 ```
 
 State explicitly that Feishu is notification-only and orders remain manual through `重新检查` then `确认下单`. Do not capture screenshots unless the user asks.
+
+## Acceptance traceability
+
+| Criterion | Implementation and deterministic evidence | Final-gate evidence |
+| --- | --- | --- |
+| AC-01 | Task 5 renderer/static tests and 1440px/375px Playwright assert the original-style two-column layout and removed copy. | Prediction Playwright inside `make acceptance`. |
+| AC-02 | Task 5 Playwright selects `交易与合并` and `事故`, injects signal/state responses, and asserts the selected tab is unchanged. | Prediction Playwright inside `make acceptance`. |
+| AC-03 | Task 5 Playwright records request concurrency and asserts monitoring/readiness/metric DOM identity plus expanded-row state across two signal polls. | Prediction Playwright inside `make acceptance`. |
+| AC-04 | Task 4 projection tests and Task 5 Playwright assert HKT clocks, frozen danger state, and removal/recovery of actions. | Python suite and Prediction Playwright inside `make acceptance`. |
+| AC-05 | Tasks 1 and 4 prove immutable `initial_profit` and watcher-owned `live_profit`; Task 5 proves the three visible states `$0.38`, `$0.44`, and `—`. | Python suite and Prediction Playwright inside `make acceptance`. |
+| AC-06 | Task 4 enumerates open, closed, stale, degraded, missing, active-execution, and breaker states; Task 5 asserts button presence rather than disabled-button copy. | Python suite and Prediction Playwright inside `make acceptance`. |
+| AC-07 | Task 5 Playwright counts preview and execution requests for accepted and expired signals; existing execution pytest proves submit/idempotency boundaries. | Python suite and Prediction Playwright inside `make acceptance`. |
+| AC-08 | Task 2 renderer/service tests assert exact `【YES/NO 套利信号】+$0.38` content, Feishu-only routing, and forbidden-field absence using a notifier double. | Python suite inside `make acceptance`; no real Feishu send. |
+| AC-09 | Tasks 1 and 2 test successful-delivery cooldown, failed-delivery retry, per-market isolation, episode persistence, three-attempt ceiling, and close-stop behavior. | Python suite inside `make acceptance`. |
+| AC-10 | Task 3 command/cache/timeout tests prove one non-blocking Codex Luna worker; Task 5 proves English-first then cached bilingual UI. | Python suite and Prediction Playwright inside `make acceptance`; no live Codex requirement. |
+| AC-11 | Task 5 renderer and Playwright tests assert title-only translation, English retention, no neutral `仅监控`, no `预计`, and preserved exception status. | Python suite and Prediction Playwright inside `make acceptance`. |
+| AC-12 | Tasks 2, 3, and 5 retain existing threshold notification/candidate/preview/execution regression cases. | Complete Python suite and Prediction Playwright inside `make acceptance`. |
+| AC-13 | Task 5 Playwright checks 1440px/375px overflow, 44px controls, modal Escape, and focus restoration. | Prediction Playwright inside `make acceptance`. |
+| AC-14 | Task 6 runs wallet status and `preflight --no-submit`; live prediction and Dashboard acceptance verify schema, fail-closed readiness, process, API, and browser truth. | Live read-only portions of `make acceptance`; external unavailability is `BLOCKED`. |
+| AC-15 | Task 6 deploys the candidate, requires final `PASS`, then reinstalls the unchanged accepted SHA and proves new PID, cwd, SHA, fresh logs, and HTTP 200. | Final command output plus post-gate runtime evidence. |
 
 ## Final implementation checklist
 
@@ -776,5 +868,6 @@ State explicitly that Feishu is notification-only and orders remain manual throu
 - [ ] Title translation is one background Codex Luna worker and never delays a signal.
 - [ ] LLM hedge tests and behavior remain unchanged.
 - [ ] Original Dashboard style is preserved on desktop and 375px.
+- [ ] AC-01 through AC-15 each have the evidence named in the traceability table.
 - [ ] `CHANGELOG.md` is committed before any merge.
 - [ ] Final `make acceptance` is `PASS`, then the exact accepted SHA is redeployed and proven live.
