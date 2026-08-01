@@ -362,6 +362,9 @@ class PredictionArbitrageStore:
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_signal_per_market
             ON signals(market_id) WHERE ended_at IS NULL;
 
+            CREATE INDEX IF NOT EXISTS signals_market_started_at
+            ON signals(market_id, started_at DESC);
+
             DROP INDEX IF EXISTS one_nonterminal_execution;
 
             CREATE UNIQUE INDEX IF NOT EXISTS one_nonterminal_execution

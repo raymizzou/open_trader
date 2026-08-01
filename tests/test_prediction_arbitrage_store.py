@@ -76,6 +76,15 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
             for row in connection.execute("PRAGMA table_list")
                 if not row[1].startswith("sqlite_")
         }
+        indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list('signals')")
+        }
+        query_plan = connection.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT payload FROM signals WHERE market_id=? ORDER BY started_at DESC",
+            ("market-1",),
+        ).fetchall()
     assert names == {
         "runtime",
         "signals",
@@ -88,6 +97,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "relation_state",
         "relation_scan_runs",
     }
+    assert "signals_market_started_at" in indexes
+    assert any("signals_market_started_at" in row[3] for row in query_plan)
 
 
 def test_runtime_round_trips_canonical_json_and_survives_restart(tmp_path: Path) -> None:
