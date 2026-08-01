@@ -148,7 +148,7 @@ Add this pre-gate documentation and acceptance-preparation bullet at the top of
 the existing `2026-08-01` section:
 
 ```markdown
-- 补齐 Frontend Gateway Phase 0 的 README、运维手册与验收准备；已验证文档一致性和 `git diff --check`，最终 acceptance 与 exact-SHA 重部署待执行。本阶段没有页面、策略、报告、执行或 worker 行为变化。
+- 补齐 Frontend Gateway Phase 0 的 README、运维手册与验收准备；已验证文档一致性和 git diff --check，最终 acceptance 与 exact-SHA 重部署待执行。本阶段没有页面、策略、报告、执行或 worker 行为变化。
 ```
 
 - [ ] **Step 5: Check documentation consistency**
