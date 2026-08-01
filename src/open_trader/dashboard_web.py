@@ -779,7 +779,12 @@ def _prediction_history_payload(
         breaker = state.get("breaker") if isinstance(state, Mapping) else None
         breaker_closed = isinstance(breaker, Mapping) and breaker.get("open") is False
         readiness = state.get("readiness") if isinstance(state, Mapping) else None
-        accepted_readiness = {True, "ready", "allowed", "pass", "confirmed"}
+        accepted_readiness = {"ready", "allowed", "pass", "confirmed"}
+
+        def _readiness_ok(value: object) -> bool:
+            return value is True or (
+                isinstance(value, str) and value.casefold() in accepted_readiness
+            )
         readiness_status = str(readiness.get("status", "")).casefold() if isinstance(readiness, Mapping) else ""
         geoblock = readiness.get("geoblock") if isinstance(readiness, Mapping) else None
         relayer = (
@@ -792,8 +797,8 @@ def _prediction_history_payload(
         readiness_usable = (
             isinstance(readiness, Mapping)
             and readiness_status not in {"unavailable", "blocked", "fail", "failed"}
-            and geoblock in accepted_readiness
-            and relayer in accepted_readiness
+            and _readiness_ok(geoblock)
+            and _readiness_ok(relayer)
         )
         state_usable = (
             not state_stale
@@ -848,8 +853,8 @@ def _prediction_history_payload(
                 row_market_type = str(projected.get("market_type") or "standard_binary")
                 current_market_type = str(current.get("market_type") or "")
                 same_market = (
-                    market_id in (None, "")
-                    or str(current.get("market_id") or "") == str(market_id)
+                    market_id not in (None, "")
+                    and str(current.get("market_id") or "") == str(market_id)
                 )
                 if (
                     row_market_type != "standard_binary"
