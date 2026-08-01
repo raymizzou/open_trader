@@ -2847,6 +2847,50 @@ def _project_trend_trade_stats(
 def _trend_action_executions(
     data_dir: Path, *, market: str, execution_date: str, report_sha256: str
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "actions"
+        / execution_date
+    )
+    try:
+        revision = root.stat()
+        revision_key = (revision.st_mtime_ns, revision.st_ctime_ns)
+    except OSError:
+        revision_key = (-1, -1)
+    cached = _trend_action_executions_cached(
+        str(data_dir.resolve()),
+        market,
+        execution_date,
+        report_sha256,
+        *revision_key,
+    )
+    return copy.deepcopy(cached)
+
+
+@lru_cache(maxsize=256)
+def _trend_action_executions_cached(
+    data_dir: str,
+    market: str,
+    execution_date: str,
+    report_sha256: str,
+    root_mtime_ns: int,
+    root_ctime_ns: int,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    del root_mtime_ns, root_ctime_ns
+    return _trend_action_executions_uncached(
+        Path(data_dir),
+        market=market,
+        execution_date=execution_date,
+        report_sha256=report_sha256,
+    )
+
+
+def _trend_action_executions_uncached(
+    data_dir: Path, *, market: str, execution_date: str, report_sha256: str
+) -> dict[tuple[str, str], dict[str, Any]]:
     executions: dict[tuple[str, str], dict[str, Any]] = {}
     root = (
         data_dir
