@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision", "summary", "predict", "polymarket", "divergent_states", "evidence", "uncertainties"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "decision": {"enum": ["APPROVE", "REJECT"]},
+    "summary": {"type": "string"},
+    "predict": {"$ref": "#/$defs/predict_market"},
+    "polymarket": {"$ref": "#/$defs/polymarket_market"},
+    "divergent_states": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"],
+      "properties": {
+        "PREDICT_YES_POLYMARKET_NO": {"$ref": "#/$defs/divergent_state"},
+        "POLYMARKET_YES_PREDICT_NO": {"$ref": "#/$defs/divergent_state"}
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "uncertainties": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"const": "APPROVE"}}},
+      "then": {
+        "properties": {
+          "divergent_states": {
+            "properties": {
+              "PREDICT_YES_POLYMARKET_NO": {"properties": {"possible": {"const": false}}},
+              "POLYMARKET_YES_PREDICT_NO": {"properties": {"possible": {"const": false}}}
+            }
+          },
+          "evidence": {
+            "allOf": [
+              {"contains": {"properties": {"exchange": {"const": "predict.fun"}}}},
+              {"contains": {"properties": {"exchange": {"const": "polymarket"}}}}
+            ]
+          },
+          "uncertainties": {"maxItems": 0}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "venue_market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exchange", "condition_id", "rules_fingerprint"],
+      "properties": {
+        "exchange": {"type": "string"},
+        "condition_id": {"type": "string"},
+        "rules_fingerprint": {"type": "string"}
+      }
+    },
+    "predict_market": {
+      "allOf": [
+        {"$ref": "#/$defs/venue_market"},
+        {"properties": {"exchange": {"const": "predict.fun"}}}
+      ]
+    },
+    "polymarket_market": {
+      "allOf": [
+        {"$ref": "#/$defs/venue_market"},
+        {"properties": {"exchange": {"const": "polymarket"}}}
+      ]
+    },
+    "divergent_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["possible", "reason"],
+      "properties": {
+        "possible": {"type": "boolean"},
+        "reason": {"type": "string"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exchange", "field", "quote"],
+      "properties": {
+        "exchange": {"enum": ["predict.fun", "polymarket"]},
+        "field": {"type": "string"},
+        "quote": {"type": "string"}
+      }
+    }
+  }
+}
