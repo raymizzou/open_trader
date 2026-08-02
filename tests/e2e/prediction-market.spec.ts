@@ -74,7 +74,15 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('shows a venue reason instead of its old success timestamp', async ({ page }) => {
     await openPrediction(page, 'predict-pending');
     const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
-    await expect(predict).toContainText('原因：api key pending');
+    await expect(predict).toContainText('原因：Predict API Key 待分配');
+    await expect(predict).not.toContainText('最近成功');
+  });
+
+  test('localizes a Predict construction failure in its venue card', async ({ page }) => {
+    await openPrediction(page, 'predict-degraded');
+    const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
+    await expect(predict).toContainText('原因：Predict.fun 监控初始化失败');
+    await expect(predict).not.toContainText('predict construction failed');
     await expect(predict).not.toContainText('最近成功');
   });
 

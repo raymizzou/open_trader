@@ -2126,6 +2126,10 @@ function predictionFailureReasonLabel(payload) {
     readiness_stale: "交易账户检查已过期",
     readiness_unavailable: "交易账户检查不可用",
     store_write_failed: "监控记录保存失败",
+    api_key_pending: "Predict API Key 待分配",
+    predict_unavailable: "Predict.fun 数据暂不可用",
+    predict_degraded: "Predict.fun 数据连接降级",
+    predict_construction_failed: "Predict.fun 监控初始化失败",
   };
   return raw ? (labels[raw] || raw.replaceAll("_", " ")) : "状态详情未返回";
 }
