@@ -60,6 +60,7 @@ def source_with_responses(
     *,
     connector: object | None = None,
     key_loader: object = lambda: "predict-key-sentinel",
+    sleep_fn: object = lambda seconds: None,
 ) -> tuple[PredictSource, list[object]]:
     requests: list[object] = []
 
@@ -77,7 +78,7 @@ def source_with_responses(
             urlopen_fn=opener,
             websocket_connect=connector,
             now_fn=lambda: datetime(2026, 8, 2, tzinfo=UTC),
-            sleep_fn=lambda seconds: None,
+            sleep_fn=sleep_fn,
         ),
         requests,
     )
@@ -260,6 +261,13 @@ def test_stream_subscribes_and_echoes_heartbeat_without_exposing_api_key() -> No
 
 
 def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
+    reconnect_snapshots: list[dict[str, object]] = []
+    source: PredictSource
+
+    async def reconnect_sleep(seconds: float) -> None:
+        del seconds
+        reconnect_snapshots.append(source.snapshot())
+
     connections = iter(
         (
             FakeWebSocket(
@@ -277,7 +285,9 @@ def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
         )
     )
     source, _ = source_with_responses(
-        [{"success": True, "data": market()}], connector=lambda *args, **kwargs: next(connections)
+        [{"success": True, "data": market()}],
+        connector=lambda *args, **kwargs: next(connections),
+        sleep_fn=reconnect_sleep,
     )
 
     async def collect_two() -> tuple[object, object]:
@@ -290,6 +300,17 @@ def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
     _, reconnected = asyncio.run(collect_two())
 
     assert reconnected.source_timestamp == datetime.fromtimestamp(1788048001, UTC)
+    assert reconnect_snapshots == [
+        {
+            "venue": "predict.fun",
+            "wallet": "0xcE23…f435",
+            "rest": "ready",
+            "ws": "stale",
+            "ws_generation": 1,
+        }
+    ]
+    assert source.snapshot()["ws"] == "ready"
+    assert source.snapshot()["ws_generation"] == 1
 
 
 def test_non_finite_book_prices_are_dropped_without_raising() -> None:
@@ -330,7 +351,7 @@ def test_rest_and_websocket_failures_keep_each_other_health() -> None:
 
     assert asyncio.run(stream_one(websocket_source)).market_id == "123"
     assert websocket_source.snapshot()["rest"] == "ready"
-    assert websocket_source.snapshot()["ws"] == "stale"
+    assert websocket_source.snapshot()["ws"] == "ready"
 
     rest_source, _ = source_with_responses(
         [
@@ -353,3 +374,54 @@ def test_rest_and_websocket_failures_keep_each_other_health() -> None:
     assert asyncio.run(rest_source.get_order_book("123")) is None
     assert rest_source.snapshot()["rest"] == "stale"
     assert rest_source.snapshot()["ws"] == "ready"
+
+
+def test_equal_rest_and_websocket_versions_have_independent_freshness() -> None:
+    payload = {
+        "success": True,
+        "data": {
+            "marketId": 123,
+            "version": 5,
+            "updateTimestampMs": 1788048000000,
+            "asks": [["0.51", "3"]],
+            "bids": [["0.50", "2"]],
+        },
+    }
+    websocket_first, _ = source_with_responses(
+        [{"success": True, "data": market()}, payload],
+        connector=lambda *args, **kwargs: FakeWebSocket(
+            [book_message(5, 1788048000000)]
+        ),
+    )
+
+    async def ws_then_rest() -> tuple[object, object]:
+        stream = websocket_first.stream_books(("123",))
+        try:
+            return await anext(stream), await websocket_first.get_order_book("123")
+        finally:
+            await stream.aclose()
+
+    ws_book, rest_book = asyncio.run(ws_then_rest())
+    assert ws_book is not None and rest_book is not None
+    assert websocket_first.snapshot()["ws"] == "ready"
+    assert websocket_first.snapshot()["rest"] == "ready"
+
+    rest_first, _ = source_with_responses(
+        [{"success": True, "data": market()}, payload],
+        connector=lambda *args, **kwargs: FakeWebSocket(
+            [book_message(5, 1788048000000)]
+        ),
+    )
+
+    async def rest_then_ws() -> tuple[object, object]:
+        rest = await rest_first.get_order_book("123")
+        stream = rest_first.stream_books(("123",))
+        try:
+            return rest, await anext(stream)
+        finally:
+            await stream.aclose()
+
+    rest_book, ws_book = asyncio.run(rest_then_ws())
+    assert rest_book is not None and ws_book is not None
+    assert rest_first.snapshot()["rest"] == "ready"
+    assert rest_first.snapshot()["ws"] == "ready"

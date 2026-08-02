@@ -455,6 +455,88 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     assert monitor._relation_by_token == {"threshold": {"relation-1"}}
 
 
+def test_cross_venue_rest_failure_does_not_block_same_venue_subscription(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    FakePublicClient.fail_get_order_books = True
+    monitor = make_monitor(tmp_path)
+    monitor._market_by_token = {"standard": "market-1"}
+    monitor._relation_by_token = {"threshold": {"relation-1"}}
+    monitor.set_cross_venue_tokens(("cross-failing",))
+
+    asyncio.run(monitor._refresh_subscription_if_dirty(FakePublicClient()))
+
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert set(FakePublicClient.subscribe_specs[0].token_ids) == {
+        "standard",
+        "threshold",
+        "cross-failing",
+    }
+    assert monitor.cross_venue_books(("cross-failing",)) == {}
+    assert monitor._subscription_dirty is False
+
+
+def test_cross_venue_generation_discards_concurrent_old_refresh_and_subscription(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    FakePublicClient.books.update(
+        {
+            "cross-old": threshold_book("cross-old", ask="0.40", bid="0.39"),
+            "cross-new": threshold_book("cross-new", ask="0.50", bid="0.49"),
+        }
+    )
+
+    class BlockingClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refresh_started = asyncio.Event()
+            self.release_refresh = asyncio.Event()
+
+        async def get_order_books(self, *, token_ids: list[str]) -> tuple[object, ...]:
+            requested = list(token_ids)
+            self.book_calls.append(requested)
+            if requested == ["cross-old"]:
+                self.refresh_started.set()
+                await self.release_refresh.wait()
+            return tuple(self.books[token_id] for token_id in reversed(token_ids))
+
+    async def exercise() -> None:
+        monitor = make_monitor(tmp_path)
+        monitor._market_by_token = {"standard": "market-1"}
+        monitor._relation_by_token = {"threshold": {"relation-1"}}
+        client = BlockingClient()
+        monitor.set_cross_venue_tokens(("cross-old",))
+
+        old_refresh = asyncio.create_task(
+            monitor._refresh_subscription_if_dirty(client)
+        )
+        await asyncio.wait_for(client.refresh_started.wait(), timeout=1)
+        monitor.set_cross_venue_tokens(("cross-new",))
+        client.release_refresh.set()
+        await old_refresh
+
+        assert FakePublicClient.subscribe_specs == []
+        assert monitor.cross_venue_books(("cross-old", "cross-new")) == {}
+        assert monitor._subscription_dirty is True
+
+        await monitor._refresh_subscription_if_dirty(client)
+
+        assert len(FakePublicClient.subscribe_specs) == 1
+        assert set(FakePublicClient.subscribe_specs[0].token_ids) == {
+            "standard",
+            "threshold",
+            "cross-new",
+        }
+        assert "cross-old" not in FakePublicClient.subscribe_specs[0].token_ids
+        assert set(monitor.cross_venue_books(("cross-old", "cross-new"))) == {
+            "cross-new"
+        }
+
+    asyncio.run(exercise())
+
+
 def test_cross_venue_stream_books_apply_full_books_and_supported_deltas(
     tmp_path: Path,
 ) -> None:

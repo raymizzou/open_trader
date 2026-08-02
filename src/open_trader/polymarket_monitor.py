@@ -340,6 +340,7 @@ class PolymarketMonitor:
         self._cross_venue_books: dict[str, ThresholdOrderBook] = {}
         self._cross_venue_book_timestamps: dict[str, datetime] = {}
         self._cross_venue_refresh_required = False
+        self._cross_venue_generation = 0
         self._relation_volumes: dict[str, Decimal] = {}
         self._relation_rule_verifications: dict[str, tuple[datetime, str]] = {}
         self._relation_rule_failures: set[str] = set()
@@ -437,6 +438,7 @@ class PolymarketMonitor:
         with self._lock:
             if requested == self._cross_venue_tokens:
                 return
+            self._cross_venue_generation += 1
             self._cross_venue_tokens = requested
             self._cross_venue_books = {
                 token: book
@@ -1005,10 +1007,14 @@ class PolymarketMonitor:
                 | self._cross_venue_tokens
             )
             refresh_cross_venue = self._cross_venue_refresh_required
+            cross_venue_tokens = tuple(sorted(self._cross_venue_tokens))
+            cross_venue_generation = self._cross_venue_generation
         if not token_ids:
             await self._close_stream()
-            self._cross_venue_refresh_required = False
-            self._subscription_dirty = False
+            with self._lock:
+                if cross_venue_generation == self._cross_venue_generation:
+                    self._cross_venue_refresh_required = False
+                    self._subscription_dirty = False
             return
         subscribe = getattr(client, "subscribe", None)
         if not callable(subscribe):
@@ -1021,21 +1027,60 @@ class PolymarketMonitor:
             for index in range(0, len(token_ids), STREAM_SUBSCRIPTION_CHUNK_SIZE)
         ]
         previous = self._stream_handle
-        self._subscription_dirty = False
+        if refresh_cross_venue:
+            try:
+                await self._refresh_cross_venue_books(
+                    client,
+                    cross_venue_tokens,
+                    cross_venue_generation,
+                )
+            except Exception:
+                self._invalidate_cross_venue_books(cross_venue_tokens)
+        with self._lock:
+            current_tokens = (
+                set(self._market_by_token)
+                | set(self._relation_by_token)
+                | self._cross_venue_tokens
+            )
+            if (
+                cross_venue_generation != self._cross_venue_generation
+                or set(token_ids) != current_tokens
+            ):
+                self._subscription_dirty = True
+                return
         try:
-            if refresh_cross_venue:
-                await self._refresh_cross_venue_books(client)
             handle = await _call(
                 subscribe, specs[0] if len(specs) == 1 else specs
             )
         except Exception:
-            self._subscription_dirty = True
+            with self._lock:
+                self._subscription_dirty = True
             raise
-        self._stream_handle = handle
-        if refresh_cross_venue:
-            self._cross_venue_refresh_required = False
-        self._stream_connected_at = self._now()
-        self._stream_disconnected_at = None
+        with self._lock:
+            subscription_changed = (
+                cross_venue_generation != self._cross_venue_generation
+                or set(token_ids)
+                != (
+                    set(self._market_by_token)
+                    | set(self._relation_by_token)
+                    | self._cross_venue_tokens
+                )
+            )
+            if not subscription_changed:
+                self._stream_handle = handle
+                self._subscription_dirty = False
+                if refresh_cross_venue:
+                    self._cross_venue_refresh_required = False
+                self._stream_connected_at = self._now()
+                self._stream_disconnected_at = None
+            else:
+                self._subscription_dirty = True
+        if subscription_changed:
+            close = getattr(handle, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    await _call(close)
+            return
         if previous is not None and previous is not handle:
             close = getattr(previous, "close", None)
             if callable(close):
@@ -1925,21 +1970,38 @@ class PolymarketMonitor:
             received.update(batch_received)
         return books, timestamps, received
 
-    async def _refresh_cross_venue_books(self, client: object) -> None:
+    async def _refresh_cross_venue_books(
+        self,
+        client: object,
+        tokens: Sequence[str] | None = None,
+        generation: int | None = None,
+    ) -> bool:
         with self._lock:
-            tokens = sorted(self._cross_venue_tokens)
+            if tokens is None:
+                tokens = tuple(sorted(self._cross_venue_tokens))
+            else:
+                tokens = tuple(tokens)
+            if generation is None:
+                generation = self._cross_venue_generation
         books, timestamps, received = await self._fetch_threshold_books(client, tokens)
         with self._lock:
+            if (
+                generation != self._cross_venue_generation
+                or set(tokens) != self._cross_venue_tokens
+            ):
+                return False
             self._cross_venue_books = books
             self._cross_venue_book_timestamps = {
                 token: timestamps.get(token) or received[token] for token in books
             }
+            return True
 
     async def _confirm_cross_venue_books(
         self, token_ids: Sequence[str]
     ) -> dict[str, ThresholdOrderBook]:
         with self._lock:
             requested = sorted(set(token_ids) & self._cross_venue_tokens)
+            generation = self._cross_venue_generation
         if not requested:
             return {}
         client = self._public_client_factory()
@@ -1953,6 +2015,8 @@ class PolymarketMonitor:
                 with contextlib.suppress(Exception):
                     await _call(close)
         with self._lock:
+            if generation != self._cross_venue_generation:
+                return {}
             books = {
                 token: book
                 for token, book in books.items()
@@ -3200,82 +3264,84 @@ class PolymarketMonitor:
     def _update_cross_venue_stream_books(
         self, message_type: object, payload: object, tokens: Sequence[str]
     ) -> None:
-        affected = set(tokens) & self._cross_venue_tokens
-        if not affected:
-            return
-        timestamp = _timestamp_or_none(_value(payload, "timestamp", default=None))
-        if timestamp is None:
-            self._invalidate_cross_venue_books(affected)
-            return
-        if message_type == "book":
-            token = next(iter(affected))
-            asks = _asks(_value(payload, "asks", default=()))
-            bids = _asks(_value(payload, "bids", default=()))
-            if (
-                asks is None
-                or bids is None
-                or timestamp <= self._cross_venue_book_timestamps.get(token, timestamp)
-            ):
+        with self._lock:
+            affected = set(tokens) & self._cross_venue_tokens
+            if not affected:
+                return
+            timestamp = _timestamp_or_none(_value(payload, "timestamp", default=None))
+            if timestamp is None:
                 self._invalidate_cross_venue_books(affected)
                 return
-            self._cross_venue_books[token] = ThresholdOrderBook(
-                token_id=token, asks=asks, bids=bids, confirmed_at=self._now()
-            )
-            self._cross_venue_book_timestamps[token] = timestamp
-            return
-        if message_type != "price_change":
-            return
-        changes = _items(_value(payload, "price_changes", "priceChanges", default=()))
-        by_token = {
-            token: [
-                change
-                for change in changes
-                if _value(change, "token_id", "asset_id", "assetId", default=None)
-                == token
-            ]
-            for token in affected
-        }
-        for token, token_changes in by_token.items():
-            current = self._cross_venue_books.get(token)
-            if (
-                current is None
-                or not token_changes
-                or timestamp <= self._cross_venue_book_timestamps.get(token, timestamp)
-            ):
-                self._invalidate_cross_venue_books((token,))
-                continue
-            asks = {level.price: level.size for level in current.asks}
-            bids = {level.price: level.size for level in current.bids}
-            valid = True
-            for change in token_changes:
-                side = str(_value(change, "side", default="")).upper()
-                price = _decimal(_value(change, "price", default=None))
-                size = _decimal(_value(change, "size", default=None))
-                if side not in {"BUY", "SELL"} or price is None or size is None or not 0 < price <= 1 or size < 0:
-                    valid = False
-                    break
-                levels = bids if side == "BUY" else asks
-                if size == 0:
-                    levels.pop(price, None)
-                else:
-                    levels[price] = size
-            if not valid or not asks or not bids:
-                self._invalidate_cross_venue_books((token,))
-                continue
-            self._cross_venue_books[token] = ThresholdOrderBook(
-                token_id=token,
-                asks=tuple(BookLevel(price, asks[price]) for price in sorted(asks)),
-                bids=tuple(
-                    BookLevel(price, bids[price]) for price in sorted(bids, reverse=True)
-                ),
-                confirmed_at=self._now(),
-            )
-            self._cross_venue_book_timestamps[token] = timestamp
+            if message_type == "book":
+                token = next(iter(affected))
+                asks = _asks(_value(payload, "asks", default=()))
+                bids = _asks(_value(payload, "bids", default=()))
+                if (
+                    asks is None
+                    or bids is None
+                    or timestamp <= self._cross_venue_book_timestamps.get(token, timestamp)
+                ):
+                    self._invalidate_cross_venue_books(affected)
+                    return
+                self._cross_venue_books[token] = ThresholdOrderBook(
+                    token_id=token, asks=asks, bids=bids, confirmed_at=self._now()
+                )
+                self._cross_venue_book_timestamps[token] = timestamp
+                return
+            if message_type != "price_change":
+                return
+            changes = _items(_value(payload, "price_changes", "priceChanges", default=()))
+            by_token = {
+                token: [
+                    change
+                    for change in changes
+                    if _value(change, "token_id", "asset_id", "assetId", default=None)
+                    == token
+                ]
+                for token in affected
+            }
+            for token, token_changes in by_token.items():
+                current = self._cross_venue_books.get(token)
+                if (
+                    current is None
+                    or not token_changes
+                    or timestamp <= self._cross_venue_book_timestamps.get(token, timestamp)
+                ):
+                    self._invalidate_cross_venue_books((token,))
+                    continue
+                asks = {level.price: level.size for level in current.asks}
+                bids = {level.price: level.size for level in current.bids}
+                valid = True
+                for change in token_changes:
+                    side = str(_value(change, "side", default="")).upper()
+                    price = _decimal(_value(change, "price", default=None))
+                    size = _decimal(_value(change, "size", default=None))
+                    if side not in {"BUY", "SELL"} or price is None or size is None or not 0 < price <= 1 or size < 0:
+                        valid = False
+                        break
+                    levels = bids if side == "BUY" else asks
+                    if size == 0:
+                        levels.pop(price, None)
+                    else:
+                        levels[price] = size
+                if not valid or not asks or not bids:
+                    self._invalidate_cross_venue_books((token,))
+                    continue
+                self._cross_venue_books[token] = ThresholdOrderBook(
+                    token_id=token,
+                    asks=tuple(BookLevel(price, asks[price]) for price in sorted(asks)),
+                    bids=tuple(
+                        BookLevel(price, bids[price]) for price in sorted(bids, reverse=True)
+                    ),
+                    confirmed_at=self._now(),
+                )
+                self._cross_venue_book_timestamps[token] = timestamp
 
     def _invalidate_cross_venue_books(self, token_ids: Sequence[str]) -> None:
-        for token in token_ids:
-            self._cross_venue_books.pop(token, None)
-            self._cross_venue_book_timestamps.pop(token, None)
+        with self._lock:
+            for token in token_ids:
+                self._cross_venue_books.pop(token, None)
+                self._cross_venue_book_timestamps.pop(token, None)
 
     def _update_stream_book(self, market_id: str, token: str, payload: object) -> None:
         asks = _asks(_value(payload, "asks", default=()))

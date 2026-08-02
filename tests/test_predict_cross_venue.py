@@ -518,24 +518,31 @@ class FakeCrossVenuePredict:
         self.markets = markets
         self.list_calls = 0
         self.subscriptions: list[tuple[str, ...]] = []
+        self.active_subscriptions: set[tuple[str, ...]] = set()
         self.queue: asyncio.Queue[PredictBook | None] = asyncio.Queue()
         self.rest_calls = 0
         self.rest_started = asyncio.Event()
         self.polymarket_started: asyncio.Event | None = None
         self.release: asyncio.Event | None = None
         self.health = {"rest": "ready", "ws": "ready"}
+        self.ws_generation = 0
 
     async def list_open_markets(self) -> tuple[PredictMarket, ...]:
         self.list_calls += 1
         return self.markets
 
     async def stream_books(self, market_ids):
-        self.subscriptions.append(tuple(sorted(market_ids)))
-        while True:
-            book = await self.queue.get()
-            if book is None:
-                return
-            yield book
+        subscription = tuple(sorted(market_ids))
+        self.subscriptions.append(subscription)
+        self.active_subscriptions.add(subscription)
+        try:
+            while True:
+                book = await self.queue.get()
+                if book is None:
+                    return
+                yield book
+        finally:
+            self.active_subscriptions.discard(subscription)
 
     async def get_order_book(self, market_id: str) -> PredictBook | None:
         self.rest_calls += 1
@@ -546,8 +553,12 @@ class FakeCrossVenuePredict:
             await self.release.wait()
         return monitor_predict_book() if market_id == "predict-market-1" else None
 
-    def snapshot(self) -> dict[str, str]:
-        return {"venue": "predict.fun", **self.health}
+    def snapshot(self) -> dict[str, str | int]:
+        return {
+            "venue": "predict.fun",
+            **self.health,
+            "ws_generation": self.ws_generation,
+        }
 
 
 def monitor_gamma(condition_ids, *, closed: bool) -> list[dict[str, object]]:
@@ -781,11 +792,71 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
         predict.markets = (changed,)
         await wait_until(validator.second_started.is_set)
         assert polymarket.token_sets[-1] == ()
+        await wait_until(lambda: ("predict-market-1",) not in predict.active_subscriptions)
+        assert validator.release_second.is_set() is False
         validator.release_second.set()
         await wait_until(lambda: len(validator.calls) == 2)
         await monitor.stop()
 
     assert predict_cross_venue.CROSS_VENUE_DISCOVERY_SECONDS == 15 * 60
+    asyncio.run(exercise())
+
+
+def test_monitor_suspends_during_hidden_predict_reconnect_and_rearms_after_fresh_book() -> None:
+    class ReconnectingPredict(FakeCrossVenuePredict):
+        def __init__(self) -> None:
+            super().__init__(
+                (monitor_predict_market(external_ids=("poly-condition",)),)
+            )
+            self.disconnect = asyncio.Event()
+            self.disconnected = asyncio.Event()
+            self.reconnect = asyncio.Event()
+
+        async def stream_books(self, market_ids):
+            subscription = tuple(sorted(market_ids))
+            self.subscriptions.append(subscription)
+            self.active_subscriptions.add(subscription)
+            try:
+                yield monitor_predict_book()
+                await self.disconnect.wait()
+                self.health["ws"] = "stale"
+                self.ws_generation += 1
+                self.disconnected.set()
+                await self.reconnect.wait()
+                self.health["ws"] = "ready"
+                yield monitor_predict_book()
+                await asyncio.Event().wait()
+            finally:
+                self.active_subscriptions.discard(subscription)
+
+    async def exercise() -> None:
+        predict = ReconnectingPredict()
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+        predict.disconnect.set()
+        await predict.disconnected.wait()
+
+        await wait_until(lambda: polymarket.token_sets[-1] == ())
+        assert monitor.snapshot()["opportunities"] == []
+        assert predict.active_subscriptions == {("predict-market-1",)}
+
+        predict.reconnect.set()
+        await wait_until(lambda: polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1"))
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+        assert predict.subscriptions == [("predict-market-1",)]
+        await monitor.stop()
+
     asyncio.run(exercise())
 
 

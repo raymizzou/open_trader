@@ -75,10 +75,11 @@ class PredictSource:
         self._now_fn = now_fn
         self._sleep_fn = sleep_fn
         self._markets: dict[str, PredictMarket] = {}
-        self._books: dict[str, PredictBook] = {}
-        self._versions: dict[str, int] = {}
+        self._books: dict[str, dict[str, PredictBook]] = {"rest": {}, "ws": {}}
+        self._versions: dict[str, dict[str, int]] = {"rest": {}, "ws": {}}
         self._rest_status = "unknown"
         self._ws_status = "unknown"
+        self._ws_generation = 0
 
     async def list_open_markets(self) -> tuple[PredictMarket, ...]:
         cursor: str | None = None
@@ -147,8 +148,8 @@ class PredictSource:
 
         attempt = 0
         while True:
-            self._books.clear()
-            self._versions.clear()
+            self._books["ws"].clear()
+            self._versions["ws"].clear()
             self._ws_status = "stale"
             try:
                 connection = self._websocket_connect(
@@ -166,7 +167,6 @@ class PredictSource:
                                 separators=(",", ":"),
                             )
                         )
-                    self._ws_status = "ready"
                     attempt = 0
                     while True:
                         message = json.loads(await websocket.recv())
@@ -197,6 +197,7 @@ class PredictSource:
                     self._ws_status = "auth_blocked"
                     return
                 self._ws_status = "stale"
+                self._ws_generation += 1
                 attempt += 1
                 await _maybe_await(self._sleep_fn(min(2 ** (attempt - 1), _MAX_BACKOFF_SECONDS)))
 
@@ -205,12 +206,13 @@ class PredictSource:
 
         return {"wallet": _masked_wallet(self._config.wallet_address), "status": "unavailable"}
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self) -> dict[str, str | int]:
         return {
             "venue": "predict.fun",
             "wallet": _masked_wallet(self._config.wallet_address),
             "rest": self._rest_status,
             "ws": self._ws_status,
+            "ws_generation": self._ws_generation,
         }
 
     async def _rest_json(
@@ -263,7 +265,10 @@ class PredictSource:
             self._mark_stale(source)
             return None
         version = payload.get("version")
-        if not isinstance(version, int) or version <= self._versions.get(market.market_id, 0):
+        if (
+            not isinstance(version, int)
+            or version <= self._versions[source].get(market.market_id, 0)
+        ):
             self._mark_stale(source)
             return None
         timestamp = _timestamp(payload.get("updateTimestampMs"))
@@ -288,12 +293,14 @@ class PredictSource:
             source_timestamp=timestamp,
             received_at=self._now_fn(),
         )
-        self._versions[market.market_id] = version
-        self._books[market.market_id] = book
+        self._versions[source][market.market_id] = version
+        self._books[source][market.market_id] = book
+        if source == "ws":
+            self._ws_status = "ready"
         return book
 
     def _mark_stale(self, source: Literal["rest", "ws"]) -> None:
-        self._books.clear()
+        self._books[source].clear()
         if source == "rest":
             self._rest_status = "stale"
         else:

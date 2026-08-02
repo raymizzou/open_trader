@@ -56,6 +56,7 @@ _RESULT_FIELDS = {
     "divergent_states", "evidence", "uncertainties",
 }
 _CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
+_HOT_HEALTH_POLL_SECONDS = 0.05
 CROSS_VENUE_DISCOVERY_SECONDS = 15 * 60
 
 
@@ -663,6 +664,7 @@ class PredictCrossVenueMonitor:
         self._clob_lookup = clob_lookup
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
+        self._hot_restart = asyncio.Event()
         self._confirmation_tasks: dict[str, asyncio.Task[None]] = {}
         self._approved: dict[str, ExplicitMarketPair] = {}
         self._predict_books: dict[str, PredictBook] = {}
@@ -671,6 +673,7 @@ class PredictCrossVenueMonitor:
         self._matched_pairs = 0
         self._monitored_pairs = 0
         self._status = "pending"
+        self._predict_generation: int | None = None
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -709,11 +712,13 @@ class PredictCrossVenueMonitor:
         slow_task: asyncio.Task[None] | None = None
         try:
             await self._discover()
+            self._hot_restart.clear()
             while True:
                 slow_task = asyncio.create_task(
                     self._discover_after_interval()
                 )
-                await self._hot_while(slow_task)
+                while not slow_task.done():
+                    await self._hot_while(slow_task)
                 await slow_task
                 slow_task = None
         except asyncio.CancelledError:
@@ -741,7 +746,7 @@ class PredictCrossVenueMonitor:
         except Exception:
             self._matched_pairs = 0
             self._monitored_pairs = 0
-            self._approved = {}
+            self._set_approved({})
             await self._suspend_hot(status=self._source_status())
             return
         eligible = {
@@ -754,9 +759,7 @@ class PredictCrossVenueMonitor:
             for pair_id, pair in self._approved.items()
             if pair_id in eligible and self._same_fingerprints(pair, eligible[pair_id])
         }
-        self._approved = approved
-        self._drop_unapproved_state()
-        self._publish_subscriptions()
+        self._set_approved(approved)
         for pair_id, pair in eligible.items():
             if pair_id in approved:
                 continue
@@ -768,27 +771,45 @@ class PredictCrossVenueMonitor:
                 == pair.polymarket.rules_fingerprint
             ):
                 approved[pair_id] = pair
-        self._approved = approved
-        self._drop_unapproved_state()
-        self._publish_subscriptions()
+        self._set_approved(approved)
         self._status = self._source_status()
 
     async def _hot_while(self, slow_task: asyncio.Task[None]) -> None:
         market_ids = sorted(
             {pair.predict.market_id for pair in self._approved.values()}
         )
+        restart = asyncio.create_task(self._hot_restart.wait())
         if not market_ids:
-            await slow_task
+            try:
+                await asyncio.wait(
+                    (slow_task, restart), return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                if not restart.done():
+                    restart.cancel()
+                await asyncio.gather(restart, return_exceptions=True)
+                self._hot_restart.clear()
             return
         stream = self._predict.stream_books(market_ids).__aiter__()
         next_book = asyncio.create_task(stream.__anext__())
+        health_tick = asyncio.create_task(asyncio.sleep(_HOT_HEALTH_POLL_SECONDS))
         try:
             while True:
                 done, _ = await asyncio.wait(
-                    (slow_task, next_book), return_when=asyncio.FIRST_COMPLETED
+                    (slow_task, restart, health_tick, next_book),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 if slow_task in done:
                     return
+                if restart in done:
+                    self._hot_restart.clear()
+                    return
+                if health_tick in done:
+                    await self._observe_source_health()
+                    health_tick = asyncio.create_task(
+                        asyncio.sleep(_HOT_HEALTH_POLL_SECONDS)
+                    )
+                    continue
                 try:
                     book = next_book.result()
                 except StopAsyncIteration:
@@ -801,6 +822,15 @@ class PredictCrossVenueMonitor:
                     await self._suspend_hot(status="degraded")
                     await slow_task
                     return
+                generation = self._source_generation()
+                if (
+                    generation is not None
+                    and self._predict_generation is not None
+                    and generation != self._predict_generation
+                ):
+                    await self._suspend_hot(status="degraded")
+                if generation is not None:
+                    self._predict_generation = generation
                 self._status = self._source_status()
                 if self._status != "ready":
                     await self._suspend_hot(status=self._status)
@@ -810,9 +840,10 @@ class PredictCrossVenueMonitor:
                     self._process_local_book(book.market_id)
                 next_book = asyncio.create_task(stream.__anext__())
         finally:
-            if not next_book.done():
-                next_book.cancel()
-            await asyncio.gather(next_book, return_exceptions=True)
+            for task in (restart, health_tick, next_book):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(restart, health_tick, next_book, return_exceptions=True)
             close = getattr(stream, "aclose", None)
             if callable(close):
                 with contextlib.suppress(Exception):
@@ -914,6 +945,14 @@ class PredictCrossVenueMonitor:
 
     def _maintain_open_opportunities(self) -> None:
         status = self._source_status()
+        generation = self._source_generation()
+        if generation is not None:
+            if (
+                self._predict_generation is not None
+                and generation != self._predict_generation
+            ):
+                self._clear_hot_state()
+            self._predict_generation = generation
         if status != "ready":
             self._clear_hot_state()
             self._status = status
@@ -971,6 +1010,17 @@ class PredictCrossVenueMonitor:
             if task is not None:
                 task.cancel()
 
+    def _set_approved(
+        self, approved: Mapping[str, ExplicitMarketPair]
+    ) -> None:
+        replacement = dict(approved)
+        changed = replacement != self._approved
+        self._approved = replacement
+        self._drop_unapproved_state()
+        self._publish_subscriptions()
+        if changed:
+            self._hot_restart.set()
+
     def _publish_subscriptions(self) -> None:
         self._polymarket.set_cross_venue_tokens(
             sorted(
@@ -999,6 +1049,26 @@ class PredictCrossVenueMonitor:
         if values & {"stale", "auth_blocked", "blocked", "failed"}:
             return "degraded"
         return fallback
+
+    def _source_generation(self) -> int | None:
+        try:
+            generation = self._predict.snapshot().get("ws_generation")
+        except Exception:
+            return None
+        return generation if isinstance(generation, int) else None
+
+    async def _observe_source_health(self) -> None:
+        generation = self._source_generation()
+        status = self._source_status()
+        changed = (
+            generation is not None
+            and self._predict_generation is not None
+            and generation != self._predict_generation
+        )
+        if generation is not None:
+            self._predict_generation = generation
+        if changed or status != "ready":
+            await self._suspend_hot(status=status if status != "ready" else "degraded")
 
     @staticmethod
     def _same_fingerprints(
