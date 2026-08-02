@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import ipaddress
 import os
@@ -13,7 +15,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import Request, urlopen
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
@@ -33,6 +36,11 @@ from .polymarket_relation_discovery import (
     CodexRelationValidator,
     discover_threshold_relation_catalog,
 )
+from .predict_cross_venue import (
+    CodexCrossVenueEquivalenceValidator,
+    PredictCrossVenueMonitor,
+)
+from .predict_source import PredictSource
 
 # Keep the old module attribute for downstream test fakes while production
 # wiring uses the catalog result contract above.
@@ -513,6 +521,42 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
         "stale": True,
         "events": [],
         "opportunities": [],
+        "venues": [
+            {
+                "venue": "polymarket",
+                "rest": "unavailable",
+                "ws": "unavailable",
+                "wallet": "",
+                "balance": {"asset": "pUSD", "value": None},
+                "mode": "只读",
+                "last_success": None,
+                "reason": reason,
+            },
+            {
+                "venue": "predict.fun",
+                "rest": "unavailable",
+                "ws": "unavailable",
+                "wallet": "",
+                "balance": {"asset": "USDT", "value": None},
+                "mode": "只读",
+                "last_success": None,
+                "reason": "cross_venue_unavailable",
+            },
+        ],
+        "cross_venue": {
+            "status": "unavailable",
+            "mode": "observe_only",
+            "reason": "cross_venue_unavailable",
+            "funnel": {
+                "matched_pairs": 0,
+                "monitored_pairs": 0,
+                "codex_approved_pairs": 0,
+                "arbitrage_space_pairs": 0,
+                "clear_signal_pairs": 0,
+            },
+            "events": [],
+            "opportunities": [],
+        },
         "relation_discovery": {
             "status": "unavailable",
             "scan_logs": [],
@@ -529,23 +573,133 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
     }
 
 
+_CROSS_VENUE_FUNNEL_FIELDS = (
+    "matched_pairs",
+    "monitored_pairs",
+    "codex_approved_pairs",
+    "arbitrage_space_pairs",
+    "clear_signal_pairs",
+)
+
+
+def _prediction_monitor_snapshot(monitor: object | None) -> Mapping[str, object]:
+    if monitor is None:
+        return {}
+    try:
+        value = monitor.snapshot()
+    except Exception:
+        return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _prediction_cross_snapshot(monitor: object | None) -> dict[str, object]:
+    snapshot = _prediction_safe_value(_prediction_monitor_snapshot(monitor))
+    result = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+    funnel = result.get("funnel")
+    result["funnel"] = {
+        field: int(funnel.get(field) or 0) if isinstance(funnel, Mapping) else 0
+        for field in _CROSS_VENUE_FUNNEL_FIELDS
+    }
+    result.setdefault("status", "unavailable")
+    result.setdefault("mode", "observe_only")
+    result["events"] = (
+        [row for row in result.get("events", []) if isinstance(row, Mapping)]
+        if isinstance(result.get("events"), (list, tuple))
+        else []
+    )
+    result["opportunities"] = (
+        [row for row in result.get("opportunities", []) if isinstance(row, Mapping)]
+        if isinstance(result.get("opportunities"), (list, tuple))
+        else []
+    )
+    return result
+
+
+def _prediction_venues_payload(
+    *,
+    snapshot: Mapping[str, object],
+    readiness: Mapping[str, object],
+    health: Mapping[str, object],
+    masked_wallet: str,
+    breaker_open: bool,
+    cross_venue_monitor: object | None,
+    cross_venue: Mapping[str, object],
+) -> list[dict[str, object]]:
+    status = str(snapshot.get("status") or health.get("status") or "unavailable")
+    relation_discovery = snapshot.get("relation_discovery")
+    websocket = (
+        relation_discovery.get("websocket")
+        if isinstance(relation_discovery, Mapping)
+        else None
+    )
+    websocket_status = str(websocket.get("status") or "") if isinstance(websocket, Mapping) else ""
+    rest = "ready" if status == "healthy" else status
+    ws = "ready" if websocket_status == "connected" else "stale" if websocket_status else rest
+    poly_reason = readiness.get("reason")
+    if poly_reason in (None, ""):
+        degraded = health.get("degraded_reasons")
+        if isinstance(degraded, (list, tuple)) and degraded:
+            poly_reason = degraded[0]
+    poly_mode = "可以交易" if not breaker_open and rest == "ready" else "只读"
+
+    source = getattr(cross_venue_monitor, "_predict", None)
+    source_snapshot = _prediction_safe_value(_prediction_monitor_snapshot(source))
+    source_snapshot = source_snapshot if isinstance(source_snapshot, Mapping) else {}
+    predict_rest = str(source_snapshot.get("rest") or cross_venue.get("status") or "unavailable")
+    predict_ws = str(source_snapshot.get("ws") or predict_rest)
+    predict_wallet = str(source_snapshot.get("wallet") or "")
+    if predict_wallet.startswith("0x") and "…" not in predict_wallet:
+        predict_wallet = _prediction_mask_wallet(predict_wallet)
+    predict_reason = source_snapshot.get("reason") or cross_venue.get("reason")
+    if predict_rest == "pending" or predict_ws == "pending":
+        predict_mode = "API Key 待分配"
+        predict_reason = predict_reason or "api_key_pending"
+    else:
+        predict_mode = "只读"
+        if predict_reason in (None, "") and predict_rest not in {"ready", "unknown"}:
+            predict_reason = f"predict_{predict_rest}"
+    return [
+        {
+            "venue": "polymarket",
+            "rest": rest,
+            "ws": ws,
+            "wallet": masked_wallet,
+            "balance": {
+                "asset": "pUSD",
+                "value": readiness.get("p_usd_balance", readiness.get("balance")),
+            },
+            "mode": poly_mode,
+            "last_success": snapshot.get("heartbeat_at"),
+            "reason": poly_reason,
+        },
+        {
+            "venue": "predict.fun",
+            "rest": predict_rest,
+            "ws": predict_ws,
+            "wallet": predict_wallet,
+            "balance": {
+                "asset": source_snapshot.get("settlement_asset", "USDT"),
+                "value": source_snapshot.get("balance"),
+            },
+            "mode": predict_mode,
+            "last_success": source_snapshot.get("last_success"),
+            "reason": predict_reason,
+        },
+    ]
+
+
 def _prediction_state_payload(
     *,
     store: PredictionArbitrageStore | None,
     monitor: object | None,
     execution: object | None,
     csrf_token: str,
+    cross_venue_monitor: PredictCrossVenueMonitor | None = None,
 ) -> dict[str, object]:
     if monitor is None and store is None and execution is None:
         return _prediction_unavailable_state(csrf_token)
-    snapshot: Mapping[str, object] = {}
-    if monitor is not None:
-        try:
-            value = monitor.snapshot()
-            if isinstance(value, Mapping):
-                snapshot = value
-        except Exception:
-            snapshot = {}
+    snapshot = _prediction_monitor_snapshot(monitor)
+    cross_venue = _prediction_cross_snapshot(cross_venue_monitor)
     safe_snapshot = _prediction_safe_value(snapshot)
     if not isinstance(safe_snapshot, Mapping):
         safe_snapshot = {}
@@ -592,6 +746,8 @@ def _prediction_state_payload(
     opportunities = safe_snapshot.get("opportunities")
     event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
     opportunity_rows = [row for row in opportunities if isinstance(row, Mapping)] if isinstance(opportunities, (list, tuple)) else []
+    event_rows.extend(cross_venue["events"])
+    opportunity_rows.extend(cross_venue["opportunities"])
     event_rows = [
         _prediction_attach_cached_title(store, _prediction_event_aliases(row))
         for row in event_rows
@@ -699,6 +855,15 @@ def _prediction_state_payload(
         "p_usd": readiness.get("p_usd_balance", readiness.get("balance")),
         "allowance": readiness.get("p_usd_allowance", readiness.get("allowance")),
     }
+    venues = _prediction_venues_payload(
+        snapshot=snapshot,
+        readiness=readiness,
+        health=health,
+        masked_wallet=masked_wallet,
+        breaker_open=breaker_open,
+        cross_venue_monitor=cross_venue_monitor,
+        cross_venue=cross_venue,
+    )
     return {
         "status": status,
         "health": health,
@@ -714,6 +879,8 @@ def _prediction_state_payload(
         "stale": stale,
         "events": event_rows,
         "opportunities": opportunity_rows,
+        "venues": venues,
+        "cross_venue": cross_venue,
         "relation_discovery": _prediction_relation_safe_value(
             safe_snapshot.get("relation_discovery", {})
         ),
@@ -739,6 +906,7 @@ def _prediction_history_payload(
     offset: int,
     monitor: object | None = None,
     execution: object | None = None,
+    cross_venue_monitor: PredictCrossVenueMonitor | None = None,
 ) -> dict[str, object]:
     if kind not in PREDICTION_HISTORY_KINDS:
         raise ValueError("kind must be signals, executions, or incidents")
@@ -756,6 +924,7 @@ def _prediction_history_payload(
                 monitor=monitor,
                 execution=execution,
                 csrf_token="",
+                cross_venue_monitor=cross_venue_monitor,
             )
         except Exception:
             state = {}
@@ -859,6 +1028,18 @@ def _prediction_history_payload(
                     ("confirmed_at",),
                     ("confirmed_age_seconds",),
                 )
+            elif market_type == "cross_venue_yes_no":
+                required = (
+                    ("opportunity_id", "id"),
+                    ("market_type",),
+                    ("legs",),
+                    ("quantity",),
+                    ("total_max_cost",),
+                    ("minimum_profit",),
+                    ("annualized_yield",),
+                    ("resolution_at",),
+                    ("clear_signal",),
+                )
             else:
                 return False
             return all(_present(value, *names) for names in required)
@@ -881,7 +1062,7 @@ def _prediction_history_payload(
             if isinstance(current, Mapping):
                 row_market_type = str(projected.get("market_type") or "standard_binary")
                 current_market_type = str(current.get("market_type") or "")
-                same_market = (
+                same_market = row_market_type == "cross_venue_yes_no" or (
                     market_id not in (None, "")
                     and str(current.get("market_id") or "") == str(market_id)
                 )
@@ -895,6 +1076,8 @@ def _prediction_history_payload(
                 if live_profit is not None:
                     projected["live_profit"] = live_profit
                 projected["actionable_now"] = current.get("actionable") is True
+                if str(current.get("market_type") or "") == "cross_venue_yes_no":
+                    projected["signal_live_now"] = True
                 if str(current.get("market_type") or "") == "threshold_hedge":
                     for name in (
                         "annualized_yield",
@@ -1153,6 +1336,7 @@ def create_dashboard_server(
     eastmoney_password: str = "",
     prediction_store: PredictionArbitrageStore | None = None,
     prediction_monitor: object | None = None,
+    cross_venue_monitor: PredictCrossVenueMonitor | None = None,
     prediction_execution_service: object | None = None,
     prediction_session_token: str | None = None,
     prediction_csrf_token: str | None = None,
@@ -1223,6 +1407,7 @@ def create_dashboard_server(
                             offset=offset,
                             monitor=prediction_monitor,
                             execution=prediction_execution_service,
+                            cross_venue_monitor=cross_venue_monitor,
                         )
                     )
                 except Exception as exc:
@@ -1305,11 +1490,15 @@ def create_dashboard_server(
                     if path.endswith("/preview"):
                         self._require_prediction_schema(payload, {"opportunity_id"})
                         opportunity_id = self._required_prediction_string(payload, "opportunity_id")
+                        if opportunity_id.startswith("cross:"):
+                            raise ValueError("cross_venue_observation_only")
                         result = prediction_execution_service.preview(opportunity_id)
                     elif path.endswith("/executions"):
                         self._require_prediction_schema(payload, {"preview_id", "idempotency_key"})
                         preview_id = self._required_prediction_string(payload, "preview_id")
                         idempotency_key = self._required_prediction_string(payload, "idempotency_key")
+                        if preview_id.startswith("cross:"):
+                            raise ValueError("cross_venue_observation_only")
                         result = prediction_execution_service.confirm(preview_id, idempotency_key)
                     else:
                         self._require_prediction_schema(payload, {"incident_id"})
@@ -1386,6 +1575,7 @@ def create_dashboard_server(
                 monitor=prediction_monitor,
                 execution=prediction_execution_service,
                 csrf_token=prediction_csrf,
+                cross_venue_monitor=cross_venue_monitor,
             )
             self.send_response(HTTPStatus.OK)
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1626,6 +1816,106 @@ def _dashboard_runtime_metadata() -> dict[str, object]:
     }
 
 
+class _UnavailableCrossVenueMonitor:
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "status": "degraded",
+            "mode": "observe_only",
+            "reason": self._reason,
+            "funnel": {},
+            "events": [],
+            "opportunities": [],
+        }
+
+
+class _CrossVenueRuntime:
+    def __init__(self, monitor: PredictCrossVenueMonitor) -> None:
+        self._monitor = monitor
+        self._started = threading.Event()
+        self._stop_requested = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+
+        async def run() -> None:
+            try:
+                result = self._monitor.start()
+                if inspect.isawaitable(result):
+                    await result
+            finally:
+                self._started.set()
+            await asyncio.to_thread(self._stop_requested.wait)
+            result = self._monitor.stop()
+            if inspect.isawaitable(result):
+                await result
+
+        self._thread = threading.Thread(
+            target=lambda: asyncio.run(run()),
+            name="predict-cross-venue-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started.wait(timeout=5)
+
+    def stop(self) -> None:
+        self._stop_requested.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=5)
+
+
+def _cross_venue_gamma_lookup(
+    condition_ids: tuple[str, ...], *, closed: bool
+) -> tuple[object, ...]:
+    from polymarket import PublicClient
+
+    client = PublicClient()
+    try:
+        paginator = client.list_markets(condition_ids=condition_ids, closed=closed)
+        iter_items = getattr(paginator, "iter_items", None)
+        return tuple(iter_items()) if callable(iter_items) else tuple(paginator)
+    finally:
+        client.close()
+
+
+def _cross_venue_clob_lookup(condition_id: str) -> object:
+    request = Request(
+        f"https://clob.polymarket.com/markets/{quote(condition_id, safe='')}",
+        headers={"User-Agent": "OpenTrader/1.0"},
+    )
+    with urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _build_cross_venue_monitor(
+    *,
+    trading_config: object,
+    prediction_monitor: PolymarketMonitor,
+    store: PredictionArbitrageStore,
+    execution: PredictionExecutionService,
+    codex_model: str,
+) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
+    predict_config = getattr(trading_config, "predict", None)
+    if predict_config is None:
+        return _UnavailableCrossVenueMonitor("predict_not_configured")
+    try:
+        return PredictCrossVenueMonitor(
+            predict_source=PredictSource(predict_config),
+            polymarket_monitor=prediction_monitor,
+            validator=CodexCrossVenueEquivalenceValidator(store, model=codex_model),
+            gamma_lookup=_cross_venue_gamma_lookup,
+            clob_lookup=_cross_venue_clob_lookup,
+            store=store,
+            ready_observer=execution.notify_ready_opportunity,
+        )
+    except Exception:
+        return _UnavailableCrossVenueMonitor("predict_construction_failed")
+
+
 def serve_dashboard(
     config: DashboardConfig,
     *,
@@ -1634,6 +1924,7 @@ def serve_dashboard(
     eastmoney_password: str = "",
     prediction_notifier: object | None = None,
     public_url: str = "",
+    cross_venue_monitor: PredictCrossVenueMonitor | None = None,
 ) -> None:
     if public_url.strip():
         _require_loopback_host(host)
@@ -1659,13 +1950,13 @@ def serve_dashboard(
     prediction_monitor: object | None = None
     prediction_execution: object | None = None
     prediction_trading: object | None = None
+    cross_runtime: _CrossVenueRuntime | None = None
     if config.prediction_config_path is not None:
         prediction_path = config.prediction_config_path.expanduser()
         try:
             prediction_store = PredictionArbitrageStore(config.data_dir)
-            prediction_trading = PolymarketTradingClient.from_keychain(
-                load_trading_config(prediction_path)
-            )
+            trading_config = load_trading_config(prediction_path)
+            prediction_trading = PolymarketTradingClient.from_keychain(trading_config)
             codex_model = os.environ.get("OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol").strip()
             relation_validator = CodexRelationValidator(
                 prediction_store,
@@ -1693,6 +1984,14 @@ def serve_dashboard(
             prediction_monitor.set_failure_observer(
                 prediction_execution.notify_monitor_failure
             )
+            if cross_venue_monitor is None:
+                cross_venue_monitor = _build_cross_venue_monitor(
+                    trading_config=trading_config,
+                    prediction_monitor=prediction_monitor,
+                    store=prediction_store,
+                    execution=prediction_execution,
+                    codex_model=codex_model,
+                )
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
             # Dashboard rather than aborting the existing portfolio surface.
@@ -1712,6 +2011,7 @@ def serve_dashboard(
             prediction_monitor = None
             prediction_execution = None
             prediction_trading = None
+            cross_venue_monitor = None
         else:
             try:
                 # Reconcile authenticated state before any public monitor heartbeat.
@@ -1722,6 +2022,11 @@ def serve_dashboard(
                 pass
             else:
                 prediction_monitor.start()
+                if cross_venue_monitor is not None and not isinstance(
+                    cross_venue_monitor, _UnavailableCrossVenueMonitor
+                ):
+                    cross_runtime = _CrossVenueRuntime(cross_venue_monitor)
+                    cross_runtime.start()
     server = create_dashboard_server(
         config=config,
         host=host,
@@ -1730,6 +2035,7 @@ def serve_dashboard(
         eastmoney_password=eastmoney_password,
         prediction_store=prediction_store,
         prediction_monitor=prediction_monitor,
+        cross_venue_monitor=cross_venue_monitor,
         prediction_execution_service=prediction_execution,
         runtime_metadata=runtime_metadata,
     )
@@ -1741,6 +2047,8 @@ def serve_dashboard(
         print(f"poll_seconds: {config.poll_seconds}")
         server.serve_forever()
     finally:
+        if cross_runtime is not None:
+            cross_runtime.stop()
         if prediction_monitor is not None:
             try:
                 prediction_monitor.stop()

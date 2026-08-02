@@ -2080,6 +2080,417 @@ def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path:
         thread.join(timeout=5)
 
 
+def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observations() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload, _prediction_state_payload
+
+    legs = [
+        {
+            "exchange": "predict.fun",
+            "market_id": "predict-1",
+            "condition_id": "predict-condition-1",
+            "outcome": "YES",
+            "token_id": "predict-yes-1",
+            "settlement_asset": "USDT",
+        },
+        {
+            "exchange": "polymarket",
+            "market_id": "poly-1",
+            "condition_id": "poly-condition-1",
+            "outcome": "NO",
+            "token_id": "poly-no-1",
+            "settlement_asset": "pUSD",
+        },
+    ]
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "signals"
+            return [
+                {
+                    "signal_id": "cross-signal-1",
+                    "opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO",
+                    "market_type": "cross_venue_yes_no",
+                    "started_at": "2026-08-02T00:00:00Z",
+                    "legs": legs,
+                }
+            ]
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": "2026-08-02T01:00:00Z",
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                    "geoblock": "allowed",
+                    "relayer": "ready",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictSource:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "venue": "predict.fun",
+                "wallet": "0xcE23…f435",
+                "rest": "ready",
+                "ws": "ready",
+            }
+
+    class FakeCrossMonitor:
+        _predict = FakePredictSource()
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "mode": "observe_only",
+                "funnel": {
+                    "matched_pairs": 12,
+                    "monitored_pairs": 8,
+                    "codex_approved_pairs": 5,
+                    "arbitrage_space_pairs": 2,
+                    "clear_signal_pairs": 1,
+                },
+                "events": [
+                    {
+                        "event_id": "cross-event-1",
+                        "market_type": "cross_venue_yes_no",
+                        "legs": legs,
+                    }
+                ],
+                "opportunities": [
+                    {
+                        "opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO",
+                        "market_type": "cross_venue_yes_no",
+                        "execution_mode": "observe_only",
+                        "actionable": False,
+                        "clear_signal": True,
+                        "legs": legs,
+                        "quantity": "5",
+                        "total_max_cost": "9.50",
+                        "minimum_profit": "0.50",
+                        "annualized_yield": "0.20",
+                        "resolution_at": "2026-12-31T00:00:00Z",
+                    }
+                ],
+            }
+
+    store = FakeStore()
+    cross = FakeCrossMonitor()
+    state = _prediction_state_payload(
+        store=store,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=cross,
+        execution=type("Execution", (), {"_breaker_open": False})(),
+        csrf_token="csrf",
+    )
+
+    assert state["status"] == "healthy"
+    assert state["venues"] == [
+        {
+            "venue": "polymarket",
+            "rest": "ready",
+            "ws": "ready",
+            "wallet": "0x1234…5678",
+            "balance": {"asset": "pUSD", "value": "12.50"},
+            "mode": "可以交易",
+            "last_success": "2026-08-02T01:00:00Z",
+            "reason": None,
+        },
+        {
+            "venue": "predict.fun",
+            "rest": "ready",
+            "ws": "ready",
+            "wallet": "0xcE23…f435",
+            "balance": {"asset": "USDT", "value": None},
+            "mode": "只读",
+            "last_success": None,
+            "reason": None,
+        },
+    ]
+    assert state["cross_venue"]["funnel"] == {
+        "matched_pairs": 12,
+        "monitored_pairs": 8,
+        "codex_approved_pairs": 5,
+        "arbitrage_space_pairs": 2,
+        "clear_signal_pairs": 1,
+    }
+    assert state["events"][-1]["legs"] == legs
+    assert state["opportunities"][-1]["legs"] == legs
+
+    history = _prediction_history_payload(
+        store,
+        kind="signals",
+        limit=10,
+        offset=0,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=cross,
+        execution=type("Execution", (), {"_breaker_open": False})(),
+    )
+    assert history["items"][0]["legs"] == legs
+    assert history["items"][0]["signal_live_now"] is True
+    assert history["items"][0]["actionable_now"] is False
+
+
+def test_prediction_venue_pending_predict_does_not_degrade_polymarket() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": "2026-08-02T01:00:00Z",
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictSource:
+        def snapshot(self) -> dict[str, object]:
+            return {"wallet": "0xcE23…f435", "rest": "pending", "ws": "pending"}
+
+    class FakeCrossMonitor:
+        _predict = FakePredictSource()
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "pending",
+                "mode": "observe_only",
+                "funnel": {
+                    "matched_pairs": 0,
+                    "monitored_pairs": 0,
+                    "codex_approved_pairs": 0,
+                    "arbitrage_space_pairs": 0,
+                    "clear_signal_pairs": 0,
+                },
+                "events": [],
+                "opportunities": [],
+            }
+
+    state = _prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=FakeCrossMonitor(),
+        execution=None,
+        csrf_token="csrf",
+    )
+
+    assert state["status"] == "healthy"
+    assert state["health"]["status"] == "healthy"
+    assert state["venues"][0]["rest"] == "ready"
+    assert state["venues"][1] == {
+        "venue": "predict.fun",
+        "rest": "pending",
+        "ws": "pending",
+        "wallet": "0xcE23…f435",
+        "balance": {"asset": "USDT", "value": None},
+        "mode": "API Key 待分配",
+        "last_success": None,
+        "reason": "api_key_pending",
+    }
+
+
+def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {"status": "ready"},
+                "events": [],
+                "opportunities": [],
+            }
+
+    def fail_predict_source(_config: object) -> object:
+        raise RuntimeError("missing predict config")
+
+    monkeypatch.setattr(dashboard_web, "PredictSource", fail_predict_source)
+    cross = dashboard_web._build_cross_venue_monitor(
+        trading_config=type("Config", (), {"predict": object()})(),
+        prediction_monitor=FakeMonitor(),
+        store=object(),
+        execution=object(),
+        codex_model="test-model",
+    )
+    state = dashboard_web._prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        execution=None,
+        csrf_token="csrf",
+        cross_venue_monitor=cross,
+    )
+
+    assert state["status"] == "healthy"
+    assert state["venues"][0]["rest"] == "ready"
+    assert state["venues"][1]["reason"] == "predict_construction_failed"
+    assert state["cross_venue"]["status"] == "degraded"
+
+
+def test_prediction_cross_ids_are_rejected_by_server_before_execution(tmp_path: Path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls: list[tuple[str, ...]] = []
+
+        def preview(self, opportunity_id: str) -> dict[str, object]:
+            self.calls.append(("preview", opportunity_id))
+            return {"preview_id": "preview-1"}
+
+        def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
+            self.calls.append(("confirm", preview_id, idempotency_key))
+            return {"execution_id": "execution-1"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        for path, payload in (
+            ("preview", {"opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO"}),
+            ("executions", {"preview_id": "cross:preview-1", "idempotency_key": "key-1"}),
+        ):
+            request = urllib.request.Request(
+                f"{base}/api/prediction-arbitrage/{path}",
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            assert error.value.code == 400
+            assert json.loads(error.value.read().decode("utf-8"))["message"] == "cross_venue_observation_only"
+        assert execution.calls == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    order: list[str] = []
+    config = replace(
+        dashboard_config(tmp_path), prediction_config_path=tmp_path / "prediction.json"
+    )
+    config.prediction_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeTrading:
+        config = type("Config", (), {"predict": None})()
+
+        def close(self) -> None:
+            order.append("trading.close")
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            order.append("polymarket.start")
+
+        def stop(self) -> None:
+            order.append("polymarket.stop")
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+    class FakeExecution:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+        def notify_ready_opportunity(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def notify_monitor_failure(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def close(self) -> None:
+            order.append("execution.close")
+
+    class FakeCrossMonitor:
+        async def start(self) -> None:
+            order.append("cross.start")
+
+        async def stop(self) -> None:
+            order.append("cross.stop")
+
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "pending", "funnel": {}, "events": [], "opportunities": []}
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self) -> None:
+            order.append("server.serve")
+
+        def server_close(self) -> None:
+            order.append("server.close")
+
+    monkeypatch.setattr(dashboard_web, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(
+        dashboard_web.PolymarketTradingClient,
+        "from_keychain",
+        classmethod(lambda _cls, _config: FakeTrading()),
+    )
+    monkeypatch.setattr(dashboard_web, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
+
+    dashboard_web.serve_dashboard(
+        config,
+        host="127.0.0.1",
+        port=0,
+        cross_venue_monitor=FakeCrossMonitor(),
+    )
+
+    assert order.index("polymarket.start") < order.index("cross.start") < order.index("server.serve")
+    assert order.index("cross.stop") < order.index("polymarket.stop") < order.index("server.close")
+
+
 def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> None:
     from open_trader.dashboard_web import _prediction_history_payload, _prediction_state_payload
 
