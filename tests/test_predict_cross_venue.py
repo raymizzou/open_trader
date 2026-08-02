@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import subprocess
+import threading
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -14,7 +16,9 @@ import open_trader.predict_cross_venue as predict_cross_venue
 from open_trader.predict_cross_venue import (
     CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
     CodexCrossVenueEquivalenceValidator,
+    CrossVenueValidation,
     ExplicitMarketPair,
+    PredictCrossVenueMonitor,
     build_cross_venue_intents,
     resolve_explicit_market_pairs,
 )
@@ -407,3 +411,428 @@ def test_cross_venue_intent_fails_closed_for_invalid_depth_fees_and_freshness(mu
     assert build_cross_venue_intents(
         pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
     ) == ()
+
+
+def monitor_predict_book() -> PredictBook:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    return PredictBook(
+        market_id="predict-market-1",
+        yes_asks=(BookLevel(Decimal("0.55"), Decimal("10")),),
+        no_asks=(BookLevel(Decimal("0.45"), Decimal("10")),),
+        source_timestamp=now,
+        received_at=now,
+    )
+
+
+def monitor_polymarket_books() -> dict[str, ThresholdOrderBook]:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    return {
+        token: ThresholdOrderBook(
+            token_id=token,
+            asks=(BookLevel(Decimal("0.40"), Decimal("10")),),
+            bids=(BookLevel(Decimal("0.39"), Decimal("10")),),
+            confirmed_at=now,
+        )
+        for token in ("poly-yes-1", "poly-no-1")
+    }
+
+
+def rejected_predict_market() -> PredictMarket:
+    return replace(
+        monitor_predict_market(external_ids=("poly-rejected",)),
+        market_id="predict-market-rejected",
+        condition_id="predict-condition-rejected",
+        yes_token_id="predict-yes-rejected",
+        no_token_id="predict-no-rejected",
+        rules_fingerprint="predict-fingerprint-rejected",
+    )
+
+
+def monitor_predict_market(*, external_ids: tuple[str, ...]) -> PredictMarket:
+    return replace(
+        predict_market(external_ids=external_ids),
+        close_at=datetime(2026, 1, 10, tzinfo=UTC),
+        settlement_at=datetime(2026, 1, 11, tzinfo=UTC),
+    )
+
+
+def rejected_polymarket_row() -> dict[str, object]:
+    return {
+        **polymarket_row("poly-rejected"),
+        "id": "poly-market-rejected",
+        "clobTokenIds": '["poly-yes-rejected", "poly-no-rejected"]',
+    }
+
+
+async def wait_until(predicate, *, attempts: int = 500) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError("condition was not reached")
+
+
+class FakeCrossVenueValidator:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+        self.calls.append(pair.pair_id)
+        approved = pair.predict.market_id != "predict-market-rejected"
+        return CrossVenueValidation(
+            approved=approved,
+            reason="APPROVED" if approved else "LLM_REJECTED",
+            prompt_version="cross-exchange-yes-no-equivalence-v1",
+            predict_fingerprint=pair.predict.rules_fingerprint,
+            polymarket_fingerprint=pair.polymarket.rules_fingerprint,
+        )
+
+
+class FakeCrossVenuePolymarket:
+    def __init__(self) -> None:
+        self.books = monitor_polymarket_books()
+        self.token_sets: list[tuple[str, ...]] = []
+        self.confirm_calls = 0
+        self.confirm_started = asyncio.Event()
+        self.predict_started: asyncio.Event | None = None
+        self.release = asyncio.Event()
+        self.same_venue_running = True
+
+    def set_cross_venue_tokens(self, token_ids) -> None:
+        self.token_sets.append(tuple(sorted(token_ids)))
+
+    def cross_venue_books(self, token_ids) -> dict[str, ThresholdOrderBook]:
+        return {token: self.books[token] for token in token_ids if token in self.books}
+
+    async def _confirm_cross_venue_books(self, token_ids) -> dict[str, ThresholdOrderBook]:
+        self.confirm_calls += 1
+        self.confirm_started.set()
+        if self.predict_started is not None:
+            await self.predict_started.wait()
+        await self.release.wait()
+        return self.cross_venue_books(token_ids)
+
+
+class FakeCrossVenuePredict:
+    def __init__(self, markets: tuple[PredictMarket, ...]) -> None:
+        self.markets = markets
+        self.list_calls = 0
+        self.subscriptions: list[tuple[str, ...]] = []
+        self.queue: asyncio.Queue[PredictBook | None] = asyncio.Queue()
+        self.rest_calls = 0
+        self.rest_started = asyncio.Event()
+        self.polymarket_started: asyncio.Event | None = None
+        self.release: asyncio.Event | None = None
+        self.health = {"rest": "ready", "ws": "ready"}
+
+    async def list_open_markets(self) -> tuple[PredictMarket, ...]:
+        self.list_calls += 1
+        return self.markets
+
+    async def stream_books(self, market_ids):
+        self.subscriptions.append(tuple(sorted(market_ids)))
+        while True:
+            book = await self.queue.get()
+            if book is None:
+                return
+            yield book
+
+    async def get_order_book(self, market_id: str) -> PredictBook | None:
+        self.rest_calls += 1
+        self.rest_started.set()
+        if self.polymarket_started is not None:
+            await self.polymarket_started.wait()
+        if self.release is not None:
+            await self.release.wait()
+        return monitor_predict_book() if market_id == "predict-market-1" else None
+
+    def snapshot(self) -> dict[str, str]:
+        return {"venue": "predict.fun", **self.health}
+
+
+def monitor_gamma(condition_ids, *, closed: bool) -> list[dict[str, object]]:
+    del closed
+    rows = {
+        "poly-condition": polymarket_row("poly-condition"),
+        "poly-rejected": rejected_polymarket_row(),
+    }
+    rows = {
+        condition_id: {
+            **row,
+            "endDate": "2026-01-20T00:00:00Z",
+            "resolutionDate": "2026-01-21T00:00:00Z",
+        }
+        for condition_id, row in rows.items()
+    }
+    return [rows[condition_id] for condition_id in condition_ids if condition_id in rows]
+
+
+def test_monitor_validates_before_subscription_and_confirms_both_rest_books_concurrently() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (
+                monitor_predict_market(external_ids=("poly-condition",)),
+                rejected_predict_market(),
+            )
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        validator = FakeCrossVenueValidator()
+        predict.polymarket_started = polymarket.confirm_started
+        predict.release = polymarket.release
+        polymarket.predict_started = predict.rest_started
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=validator,
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        assert predict.subscriptions == [("predict-market-1",)]
+        assert polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1")
+        assert len(validator.calls) == 2
+
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(
+            lambda: predict.rest_started.is_set() and polymarket.confirm_started.is_set()
+        )
+        assert monitor.snapshot()["opportunities"] == []
+        assert polymarket.confirm_calls == 1
+        polymarket.release.set()
+        await wait_until(lambda: len(monitor.snapshot()["opportunities"]) == 2)
+
+        snapshot = monitor.snapshot()
+        assert snapshot["status"] == "ready"
+        assert snapshot["mode"] == "observe_only"
+        assert snapshot["funnel"] == {
+            "matched_pairs": 2,
+            "monitored_pairs": 2,
+            "codex_approved_pairs": 1,
+            "arbitrage_space_pairs": 1,
+            "clear_signal_pairs": 1,
+        }
+        assert {row["direction"] for row in snapshot["opportunities"]} == {
+            "PREDICT_YES_POLYMARKET_NO",
+            "POLYMARKET_YES_PREDICT_NO",
+        }
+        assert all(
+            row["market_type"] == "cross_venue_yes_no"
+            and row["execution_mode"] == "observe_only"
+            and row["actionable"] is False
+            and row["clear_signal"] is True
+            for row in snapshot["opportunities"]
+        )
+
+        await predict.queue.put(monitor_predict_book())
+        await asyncio.sleep(0.01)
+        assert len(validator.calls) == 2
+        assert polymarket.confirm_calls == 1
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        validator = FakeCrossVenueValidator()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=validator,
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+        assert polymarket.confirm_calls == 1
+
+        polymarket.books["poly-no-1"] = replace(
+            polymarket.books["poly-no-1"],
+            asks=(BookLevel(Decimal("0.80"), Decimal("10")),),
+            bids=(BookLevel(Decimal("0.79"), Decimal("10")),),
+        )
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: len(monitor.snapshot()["opportunities"]) == 1)
+        assert monitor.snapshot()["opportunities"][0]["direction"] == (
+            "POLYMARKET_YES_PREDICT_NO"
+        )
+
+        polymarket.books = {}
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: monitor.snapshot()["opportunities"] == [])
+        polymarket.books = monitor_polymarket_books()
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: polymarket.confirm_calls == 2)
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+
+        await predict.queue.put(None)
+        await wait_until(lambda: polymarket.token_sets[-1] == ())
+        assert polymarket.same_venue_running is True
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_snapshot_closes_episode_when_books_age_without_another_update() -> None:
+    async def exercise() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: now[0],
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+
+        now[0] += timedelta(seconds=11)
+
+        assert monitor.snapshot()["opportunities"] == []
+        assert monitor.snapshot()["funnel"]["clear_signal_pairs"] == 0
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_missing_api_key_is_pending_and_has_zero_cross_subscriptions() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(())
+        predict.health = {"rest": "pending", "ws": "pending"}
+        polymarket = FakeCrossVenuePolymarket()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: predict.list_calls == 1)
+        await wait_until(lambda: bool(polymarket.token_sets))
+        assert monitor.snapshot()["status"] == "pending"
+        assert polymarket.token_sets[-1] == ()
+        assert predict.subscriptions == []
+        assert polymarket.same_venue_running is True
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        from open_trader import predict_cross_venue as module
+
+        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        original = monitor_predict_market(external_ids=("poly-condition",))
+        changed = replace(original, rules_fingerprint="changed-fingerprint")
+        predict = FakeCrossVenuePredict((original,))
+        polymarket = FakeCrossVenuePolymarket()
+
+        class BlockingValidator(FakeCrossVenueValidator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.second_started = threading.Event()
+                self.release_second = threading.Event()
+
+            def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+                if self.calls:
+                    self.second_started.set()
+                    self.release_second.wait(timeout=1)
+                return super().validate(pair)
+
+        validator = BlockingValidator()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=validator,
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        predict.markets = (changed,)
+        await wait_until(validator.second_started.is_set)
+        assert polymarket.token_sets[-1] == ()
+        validator.release_second.set()
+        await wait_until(lambda: len(validator.calls) == 2)
+        await monitor.stop()
+
+    assert predict_cross_venue.CROSS_VENUE_DISCOVERY_SECONDS == 15 * 60
+    asyncio.run(exercise())
+
+
+def test_monitor_slow_codex_validation_does_not_pause_hot_books(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        from open_trader import predict_cross_venue as module
+
+        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        original = monitor_predict_market(external_ids=("poly-condition",))
+        predict = FakeCrossVenuePredict((original,))
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+
+        class BlockingValidator(FakeCrossVenueValidator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.second_started = threading.Event()
+                self.release_second = threading.Event()
+
+            def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+                if self.calls:
+                    self.second_started.set()
+                    self.release_second.wait(timeout=1)
+                return super().validate(pair)
+
+        validator = BlockingValidator()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=validator,
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        predict.markets = (original, rejected_predict_market())
+        await wait_until(validator.second_started.is_set)
+
+        await predict.queue.put(monitor_predict_book())
+
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+        assert validator.release_second.is_set() is False
+        validator.release_second.set()
+        await monitor.stop()
+
+    asyncio.run(exercise())

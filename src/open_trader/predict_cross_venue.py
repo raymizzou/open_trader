@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import copy
 import hashlib
 import json
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -18,7 +21,8 @@ from .polymarket_relation_discovery import (
     _fee,
     simple_annualized_yield_from_values,
 )
-from .predict_source import PredictBook, PredictMarket
+from .polymarket_monitor import PolymarketMonitor
+from .predict_source import PredictBook, PredictMarket, PredictSource
 from .prediction_arbitrage import (
     MIN_THRESHOLD_ANNUALIZED_YIELD,
     ThresholdOrderBook,
@@ -52,6 +56,7 @@ _RESULT_FIELDS = {
     "divergent_states", "evidence", "uncertainties",
 }
 _CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
+CROSS_VENUE_DISCOVERY_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +140,20 @@ def build_cross_venue_intents(
 ) -> tuple[CrossVenueIntent, ...]:
     """Return clear, equal-share intents for the two approved venue directions."""
 
+    return _build_cross_venue_intents(
+        pair, predict_book, polymarket_books, now=now, require_annualized_gate=True
+    )
+
+
+def _build_cross_venue_intents(
+    pair: ExplicitMarketPair,
+    predict_book: PredictBook,
+    polymarket_books: Mapping[str, ThresholdOrderBook],
+    *,
+    now: datetime,
+    require_annualized_gate: bool,
+) -> tuple[CrossVenueIntent, ...]:
+
     now = _fresh_datetime(now)
     if now is None or not _valid_market_pair(pair) or not isinstance(predict_book, PredictBook):
         return ()
@@ -211,7 +230,10 @@ def build_cross_venue_intents(
                 now=now,
                 resolution_at=resolution_at,
             )
-            if annualized is None or annualized < MIN_THRESHOLD_ANNUALIZED_YIELD:
+            if annualized is None or (
+                require_annualized_gate
+                and annualized < MIN_THRESHOLD_ANNUALIZED_YIELD
+            ):
                 continue
             intents.append(CrossVenueIntent(
                 pair_id=pair.pair_id, direction=direction, legs=legs, quantity=quantity,
@@ -619,3 +641,375 @@ class CodexCrossVenueEquivalenceValidator:
         if result.reason in {"APPROVED", "LLM_REJECTED"}:
             self.store.save_llm_cache(cache_key, {"model": self.model, "prompt_version": self.prompt_version, "structured_result": structured})
         return result
+
+
+class PredictCrossVenueMonitor:
+    """One observation-only task for slow discovery and approved-pair books."""
+
+    def __init__(
+        self,
+        *,
+        predict_source: PredictSource,
+        polymarket_monitor: PolymarketMonitor,
+        validator: CodexCrossVenueEquivalenceValidator,
+        gamma_lookup: Callable[..., Sequence[object]],
+        clob_lookup: Callable[[str], object],
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._predict = predict_source
+        self._polymarket = polymarket_monitor
+        self._validator = validator
+        self._gamma_lookup = gamma_lookup
+        self._clob_lookup = clob_lookup
+        self._clock = clock
+        self._task: asyncio.Task[None] | None = None
+        self._confirmation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._approved: dict[str, ExplicitMarketPair] = {}
+        self._predict_books: dict[str, PredictBook] = {}
+        self._opportunities: dict[tuple[str, Direction], dict[str, object]] = {}
+        self._arbitrage_pairs: set[str] = set()
+        self._matched_pairs = 0
+        self._monitored_pairs = 0
+        self._status = "pending"
+
+    async def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+            await asyncio.sleep(0)
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self._suspend_hot(status=self._source_status())
+
+    def snapshot(self) -> dict[str, object]:
+        self._maintain_open_opportunities()
+        return copy.deepcopy(
+            {
+                "status": self._status,
+                "mode": "observe_only",
+                "funnel": {
+                    "matched_pairs": self._matched_pairs,
+                    "monitored_pairs": self._monitored_pairs,
+                    "codex_approved_pairs": len(self._approved),
+                    "arbitrage_space_pairs": len(self._arbitrage_pairs),
+                    "clear_signal_pairs": len(
+                        {pair_id for pair_id, _ in self._opportunities}
+                    ),
+                },
+                "opportunities": list(self._opportunities.values()),
+                "events": [],
+            }
+        )
+
+    async def _run(self) -> None:
+        slow_task: asyncio.Task[None] | None = None
+        try:
+            await self._discover()
+            while True:
+                slow_task = asyncio.create_task(
+                    self._discover_after_interval()
+                )
+                await self._hot_while(slow_task)
+                await slow_task
+                slow_task = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._suspend_hot(status="degraded")
+        finally:
+            if slow_task is not None and not slow_task.done():
+                slow_task.cancel()
+                await asyncio.gather(slow_task, return_exceptions=True)
+
+    async def _discover_after_interval(self) -> None:
+        await asyncio.sleep(CROSS_VENUE_DISCOVERY_SECONDS)
+        await self._discover()
+
+    async def _discover(self) -> None:
+        try:
+            markets = await self._predict.list_open_markets()
+            resolution = await asyncio.to_thread(
+                resolve_explicit_market_pairs,
+                markets,
+                gamma_lookup=self._gamma_lookup,
+                clob_lookup=self._clob_lookup,
+            )
+        except Exception:
+            self._matched_pairs = 0
+            self._monitored_pairs = 0
+            self._approved = {}
+            await self._suspend_hot(status=self._source_status())
+            return
+        eligible = {
+            pair.pair_id: pair for pair in resolution.pairs if _valid_market_pair(pair)
+        }
+        self._matched_pairs = len({pair.pair_id for pair in resolution.pairs})
+        self._monitored_pairs = len(eligible)
+        approved = {
+            pair_id: pair
+            for pair_id, pair in self._approved.items()
+            if pair_id in eligible and self._same_fingerprints(pair, eligible[pair_id])
+        }
+        self._approved = approved
+        self._drop_unapproved_state()
+        self._publish_subscriptions()
+        for pair_id, pair in eligible.items():
+            if pair_id in approved:
+                continue
+            validation = await asyncio.to_thread(self._validator.validate, pair)
+            if (
+                validation.approved
+                and validation.predict_fingerprint == pair.predict.rules_fingerprint
+                and validation.polymarket_fingerprint
+                == pair.polymarket.rules_fingerprint
+            ):
+                approved[pair_id] = pair
+        self._approved = approved
+        self._drop_unapproved_state()
+        self._publish_subscriptions()
+        self._status = self._source_status()
+
+    async def _hot_while(self, slow_task: asyncio.Task[None]) -> None:
+        market_ids = sorted(
+            {pair.predict.market_id for pair in self._approved.values()}
+        )
+        if not market_ids:
+            await slow_task
+            return
+        stream = self._predict.stream_books(market_ids).__aiter__()
+        next_book = asyncio.create_task(stream.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (slow_task, next_book), return_when=asyncio.FIRST_COMPLETED
+                )
+                if slow_task in done:
+                    return
+                try:
+                    book = next_book.result()
+                except StopAsyncIteration:
+                    await self._suspend_hot(
+                        status=self._source_status(fallback="degraded")
+                    )
+                    await slow_task
+                    return
+                except Exception:
+                    await self._suspend_hot(status="degraded")
+                    await slow_task
+                    return
+                self._status = self._source_status()
+                if self._status != "ready":
+                    await self._suspend_hot(status=self._status)
+                else:
+                    self._publish_subscriptions()
+                    self._predict_books[book.market_id] = book
+                    self._process_local_book(book.market_id)
+                next_book = asyncio.create_task(stream.__anext__())
+        finally:
+            if not next_book.done():
+                next_book.cancel()
+            await asyncio.gather(next_book, return_exceptions=True)
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    await close()
+
+    def _process_local_book(self, market_id: str) -> None:
+        for pair in tuple(self._approved.values()):
+            if pair.predict.market_id != market_id:
+                continue
+            tokens = self._polymarket_tokens(pair)
+            local = _build_cross_venue_intents(
+                pair,
+                self._predict_books[market_id],
+                self._polymarket.cross_venue_books(tokens),
+                now=self._clock(),
+                require_annualized_gate=False,
+            )
+            local_directions = {intent.direction for intent in local}
+            self._prune_pair_directions(pair.pair_id, local_directions)
+            if not local:
+                self._close_pair(pair.pair_id)
+                task = self._confirmation_tasks.pop(pair.pair_id, None)
+                if task is not None:
+                    task.cancel()
+                continue
+            self._arbitrage_pairs.add(pair.pair_id)
+            open_directions = {
+                direction
+                for open_pair_id, direction in self._opportunities
+                if open_pair_id == pair.pair_id
+            }
+            if (
+                pair.pair_id not in self._confirmation_tasks
+                and local_directions - open_directions
+            ):
+                task = asyncio.create_task(self._confirm_pair(pair))
+                self._confirmation_tasks[pair.pair_id] = task
+                task.add_done_callback(
+                    lambda completed, pair_id=pair.pair_id: self._confirmation_done(
+                        pair_id, completed
+                    )
+                )
+
+    async def _confirm_pair(self, pair: ExplicitMarketPair) -> None:
+        tokens = self._polymarket_tokens(pair)
+        predict_book, polymarket_books = await asyncio.gather(
+            self._predict.get_order_book(pair.predict.market_id),
+            self._polymarket._confirm_cross_venue_books(tokens),
+        )
+        current = self._approved.get(pair.pair_id)
+        if (
+            current is None
+            or not self._same_fingerprints(pair, current)
+            or predict_book is None
+        ):
+            self._close_pair(pair.pair_id)
+            return
+        intents = build_cross_venue_intents(
+            current, predict_book, polymarket_books, now=self._clock()
+        )
+        if not intents:
+            self._close_pair(pair.pair_id)
+            return
+        for key in tuple(self._opportunities):
+            if key[0] == pair.pair_id:
+                self._opportunities.pop(key, None)
+        for intent in intents:
+            self._opportunities[(pair.pair_id, intent.direction)] = {
+                "opportunity_id": f"cross:{pair.pair_id}:{intent.direction}",
+                "pair_id": pair.pair_id,
+                "direction": intent.direction,
+                "market_type": "cross_venue_yes_no",
+                "execution_mode": "observe_only",
+                "actionable": False,
+                "clear_signal": True,
+                "legs": [asdict(leg) for leg in intent.legs],
+                "quantity": intent.quantity,
+                "total_max_cost": intent.total_max_cost,
+                "maximum_fee": intent.maximum_fee,
+                "minimum_payout": intent.minimum_payout,
+                "minimum_profit": intent.minimum_profit,
+                "annualized_yield": intent.annualized_yield,
+                "resolution_at": intent.resolution_at,
+            }
+
+    def _confirmation_done(
+        self, pair_id: str, completed: asyncio.Task[None]
+    ) -> None:
+        if self._confirmation_tasks.get(pair_id) is completed:
+            self._confirmation_tasks.pop(pair_id, None)
+        if not completed.cancelled() and completed.exception() is not None:
+            self._close_pair(pair_id)
+
+    async def _suspend_hot(self, *, status: str) -> None:
+        tasks = self._clear_hot_state()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._status = status
+
+    def _maintain_open_opportunities(self) -> None:
+        status = self._source_status()
+        if status != "ready":
+            self._clear_hot_state()
+            self._status = status
+            return
+        for pair_id in {key[0] for key in self._opportunities}:
+            pair = self._approved.get(pair_id)
+            predict_book = (
+                self._predict_books.get(pair.predict.market_id) if pair else None
+            )
+            local = (
+                ()
+                if pair is None or predict_book is None
+                else _build_cross_venue_intents(
+                    pair,
+                    predict_book,
+                    self._polymarket.cross_venue_books(
+                        self._polymarket_tokens(pair)
+                    ),
+                    now=self._clock(),
+                    require_annualized_gate=False,
+                )
+            )
+            self._prune_pair_directions(
+                pair_id, {intent.direction for intent in local}
+            )
+            if not local:
+                self._close_pair(pair_id)
+
+    def _prune_pair_directions(
+        self, pair_id: str, live_directions: set[Direction]
+    ) -> None:
+        for key in tuple(self._opportunities):
+            if key[0] == pair_id and key[1] not in live_directions:
+                self._opportunities.pop(key, None)
+
+    def _clear_hot_state(self) -> tuple[asyncio.Task[None], ...]:
+        tasks = tuple(self._confirmation_tasks.values())
+        self._confirmation_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        self._predict_books.clear()
+        self._arbitrage_pairs.clear()
+        self._opportunities.clear()
+        self._polymarket.set_cross_venue_tokens(())
+        return tasks
+
+    def _drop_unapproved_state(self) -> None:
+        for pair_id in (
+            set(self._arbitrage_pairs)
+            | {key[0] for key in self._opportunities}
+            | set(self._confirmation_tasks)
+        ) - set(self._approved):
+            self._close_pair(pair_id)
+            task = self._confirmation_tasks.pop(pair_id, None)
+            if task is not None:
+                task.cancel()
+
+    def _publish_subscriptions(self) -> None:
+        self._polymarket.set_cross_venue_tokens(
+            sorted(
+                {
+                    token
+                    for pair in self._approved.values()
+                    for token in self._polymarket_tokens(pair)
+                }
+            )
+        )
+
+    def _close_pair(self, pair_id: str) -> None:
+        self._arbitrage_pairs.discard(pair_id)
+        for key in tuple(self._opportunities):
+            if key[0] == pair_id:
+                self._opportunities.pop(key, None)
+
+    def _source_status(self, *, fallback: str = "ready") -> str:
+        try:
+            states = self._predict.snapshot()
+        except Exception:
+            return "degraded"
+        values = {states.get("rest"), states.get("ws")}
+        if "pending" in values:
+            return "pending"
+        if values & {"stale", "auth_blocked", "blocked", "failed"}:
+            return "degraded"
+        return fallback
+
+    @staticmethod
+    def _same_fingerprints(
+        first: ExplicitMarketPair, second: ExplicitMarketPair
+    ) -> bool:
+        return (
+            first.predict.rules_fingerprint == second.predict.rules_fingerprint
+            and first.polymarket.rules_fingerprint
+            == second.polymarket.rules_fingerprint
+        )
+
+    @staticmethod
+    def _polymarket_tokens(pair: ExplicitMarketPair) -> tuple[str, str]:
+        return pair.polymarket.yes_token_id, pair.polymarket.no_token_id

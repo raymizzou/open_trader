@@ -420,6 +420,163 @@ def make_monitor(
     )
 
 
+def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    FakePublicClient.books.update(
+        {
+            "cross-a": threshold_book("cross-a", ask="0.40", bid="0.39"),
+            "cross-b": threshold_book("cross-b", ask="0.50", bid="0.49"),
+        }
+    )
+    monitor = make_monitor(tmp_path)
+    monitor._market_by_token = {"standard": "market-1"}
+    monitor._relation_by_token = {"threshold": {"relation-1"}}
+    client = FakePublicClient()
+
+    monitor.set_cross_venue_tokens(("cross-b", "cross-a", "cross-a"))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert set(FakePublicClient.subscribe_specs[0].token_ids) == {
+        "standard",
+        "threshold",
+        "cross-a",
+        "cross-b",
+    }
+    assert FakePublicClient.book_calls == [["cross-a", "cross-b"]]
+    assert set(monitor.cross_venue_books(("cross-a", "cross-b"))) == {
+        "cross-a",
+        "cross-b",
+    }
+    assert monitor._market_by_token == {"standard": "market-1"}
+    assert monitor._relation_by_token == {"threshold": {"relation-1"}}
+
+
+def test_cross_venue_stream_books_apply_full_books_and_supported_deltas(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    FakePublicClient.books["cross-a"] = threshold_book(
+        "cross-a", ask="0.40", bid="0.39", now=NOW
+    )
+    monitor = make_monitor(tmp_path)
+    client = FakePublicClient()
+    monitor.set_cross_venue_tokens(("cross-a",))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    FakePublicClient.book_calls.clear()
+
+    asyncio.run(
+        monitor._process_stream_event(
+            client,
+            ns(
+                type="book",
+                payload=ns(
+                    asset_id="cross-a",
+                    timestamp=NOW + timedelta(seconds=1),
+                    asks=(ns(price="0.41", size="8"),),
+                    bids=(ns(price="0.38", size="7"),),
+                ),
+            ),
+        )
+    )
+    asyncio.run(
+        monitor._process_stream_event(
+            client,
+            ns(
+                type="price_change",
+                payload=ns(
+                    timestamp=NOW + timedelta(seconds=2),
+                    price_changes=(
+                        ns(asset_id="cross-a", side="SELL", price="0.42", size="6"),
+                        ns(asset_id="cross-a", side="BUY", price="0.39", size="5"),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    book = monitor.cross_venue_books(("cross-a",))["cross-a"]
+    assert book.asks == (
+        type(book.asks[0])(price=Decimal("0.41"), size=Decimal("8")),
+        type(book.asks[0])(price=Decimal("0.42"), size=Decimal("6")),
+    )
+    assert book.bids == (
+        type(book.bids[0])(price=Decimal("0.39"), size=Decimal("5")),
+        type(book.bids[0])(price=Decimal("0.38"), size=Decimal("7")),
+    )
+    assert FakePublicClient.book_calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        ns(
+            timestamp=NOW - timedelta(seconds=1),
+            price_changes=(
+                ns(asset_id="cross-a", side="SELL", price="0.42", size="6"),
+            ),
+        ),
+        ns(
+            timestamp=NOW + timedelta(seconds=1),
+            price_changes=(
+                ns(asset_id="cross-a", side="SELL", price="NaN", size="6"),
+            ),
+        ),
+    ],
+)
+def test_cross_venue_malformed_or_out_of_order_delta_invalidates_without_rest(
+    tmp_path: Path, payload: object,
+) -> None:
+    setup_public([])
+    FakePublicClient.books["cross-a"] = threshold_book(
+        "cross-a", ask="0.40", bid="0.39", now=NOW
+    )
+    monitor = make_monitor(tmp_path)
+    client = FakePublicClient()
+    monitor.set_cross_venue_tokens(("cross-a",))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    FakePublicClient.book_calls.clear()
+
+    asyncio.run(
+        monitor._process_stream_event(
+            client, ns(type="price_change", payload=payload)
+        )
+    )
+
+    assert monitor.cross_venue_books(("cross-a",)) == {}
+    assert FakePublicClient.book_calls == []
+
+
+def test_cross_venue_token_replacement_drops_removed_books(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    FakePublicClient.books.update(
+        {
+            "cross-a": threshold_book("cross-a", ask="0.40", bid="0.39"),
+            "cross-b": threshold_book("cross-b", ask="0.50", bid="0.49"),
+        }
+    )
+    monitor = make_monitor(tmp_path)
+    client = FakePublicClient()
+    monitor.set_cross_venue_tokens(("cross-a",))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    FakePublicClient.subscribe_specs.clear()
+    FakePublicClient.book_calls.clear()
+
+    monitor.set_cross_venue_tokens(("cross-b",))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert FakePublicClient.book_calls == [["cross-b"]]
+    assert monitor.cross_venue_books(("cross-a", "cross-b")) == {
+        "cross-b": monitor.cross_venue_books(("cross-b",))["cross-b"]
+    }
+
+
 def test_restart_loads_fresh_relation_catalog_without_full_scan(tmp_path: Path) -> None:
     relation = discover_threshold_relations([threshold_event()])[0]
     setup_public([])
