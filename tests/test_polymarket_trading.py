@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from polymarket import PRODUCTION, SecureClient
 
 import open_trader.cli as cli
+import open_trader.polymarket_trading as polymarket_trading
 from open_trader.polymarket_trading import (
     KEYCHAIN_SERVICE,
     PREDICT_API_KEY_ACCOUNT,
@@ -114,6 +118,48 @@ def test_keychain_write_never_places_secret_in_process_arguments() -> None:
     ]
     assert all("secret-sentinel" not in item for item in calls[0][0])
     assert calls[0][1] == "secret-sentinel\n"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Keychain")
+def test_keychain_write_round_trips_through_real_security(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = f"com.open-trader.test.{uuid4()}"
+    account = "signing-private-key"
+    secret = f"secret-{uuid4()}"
+    monkeypatch.setattr(polymarket_trading, "KEYCHAIN_SERVICE", service)
+
+    try:
+        store_keychain_secret(account, secret)
+        stored = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.rstrip("\r\n")
+        assert stored == secret
+    finally:
+        subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def test_keychain_read_captures_stdout_without_exposing_secret() -> None:

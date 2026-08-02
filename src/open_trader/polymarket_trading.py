@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import importlib.metadata
+import os
+import pty
 import re
 import subprocess
 import threading
@@ -166,18 +168,12 @@ def _validate_keychain_account(account: str) -> None:
         raise ValueError("unsupported polymarket keychain account")
 
 
-def store_keychain_secret(
+def _store_keychain_password(
     account: str,
+    service: str,
     secret: str,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None,
 ) -> None:
-    """Store one secret via stdin so it never appears in process arguments."""
-
-    _validate_keychain_account(account)
-    if not isinstance(secret, str) or not secret:
-        raise ValueError("keychain secret must not be empty")
-    runner = run or _run_security
     args = [
         SECURITY,
         "add-generic-password",
@@ -185,20 +181,55 @@ def store_keychain_secret(
         "-a",
         account,
         "-s",
-        KEYCHAIN_SERVICE,
+        service,
         "-w",
     ]
+    master_fd = slave_fd = -1
+    process: subprocess.Popen[bytes] | None = None
     try:
-        runner(
+        if run is not None:
+            run(args, input=f"{secret}\n", text=True, capture_output=True, check=True)
+            return
+
+        master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
             args,
-            input=f"{secret}\n",
-            text=True,
-            capture_output=True,
-            check=True,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
         )
-    except Exception as exc:
-        del exc
+        os.close(slave_fd)
+        slave_fd = -1
+        password_lines = (f"{secret}\n{secret}\n").encode()
+        if os.write(master_fd, password_lines) != len(password_lines):
+            raise OSError
+        if process.wait(timeout=5) != 0:
+            raise KeychainError()
+    except Exception:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
         raise KeychainError() from None
+    finally:
+        if master_fd >= 0:
+            os.close(master_fd)
+        if slave_fd >= 0:
+            os.close(slave_fd)
+
+
+def store_keychain_secret(
+    account: str,
+    secret: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Store one secret without placing it in process arguments."""
+
+    _validate_keychain_account(account)
+    if not isinstance(secret, str) or not secret:
+        raise ValueError("keychain secret must not be empty")
+    _store_keychain_password(account, KEYCHAIN_SERVICE, secret, run)
 
 
 def load_keychain_secret(
@@ -238,31 +269,13 @@ def store_predict_api_key(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> None:
-    """Store the Predict API key via stdin, never process arguments."""
+    """Store the Predict API key without exposing it in process arguments."""
 
     if not isinstance(secret, str) or not secret:
         raise ValueError("keychain secret must not be empty")
-    runner = run or _run_security
-    try:
-        runner(
-            [
-                SECURITY,
-                "add-generic-password",
-                "-U",
-                "-a",
-                PREDICT_API_KEY_ACCOUNT,
-                "-s",
-                PREDICT_KEYCHAIN_SERVICE,
-                "-w",
-            ],
-            input=f"{secret}\n",
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-    except Exception as exc:
-        del exc
-        raise KeychainError() from None
+    _store_keychain_password(
+        PREDICT_API_KEY_ACCOUNT, PREDICT_KEYCHAIN_SERVICE, secret, run
+    )
 
 
 def load_predict_api_key(
