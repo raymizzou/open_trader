@@ -3,6 +3,12 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-02
+
+- 新增仅只读的 Predict.fun 市场与盘口来源，REST 与 WebSocket 健康状态分别发布；仅通过 Predict 的 `polymarketConditionIds` 显式匹配 Polymarket，并在订阅前经过独立 Codex 结算等价性闸门。
+- 跨场仅监控 `Predict YES + Polymarket NO` 和 `Polymarket YES + Predict NO` 两个方向；使用 `Decimal` 和主线既有的 15% 年化准入 helper。五阶段漏斗依次展示显式匹配、受监控、Codex 核准、套利空间和明确信号；信号持久化为仅观察记录。
+- Predict.fun 主网不存在 signer、下单、授权或自动执行路径。Predict API key 尚未分配，主网 REST/WS 运行验证仍待完成；不得将当前状态视为 Predict 已可用。
+
 ## 2026-08-01
 
 - 预测市场 Top 20 监控列表刷新失败后改为每 5 秒自动重试；任一次成功即恢复正常 5 分钟节奏，连续 5 次失败后停止重试、保持 YES/NO 失败关闭，并通过 Feishu 提醒人工重启承载预测监控的 Dashboard 服务。
