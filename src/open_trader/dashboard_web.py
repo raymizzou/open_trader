@@ -301,7 +301,7 @@ def _prediction_attach_cached_title(
         result, "event_title", "title", "question", "market_title"
     )
     if title is not None:
-        translated = cached_prediction_title_zh(store, str(title))
+        translated = cached_prediction_title_zh(store, str(title), record_hit=False)
         if translated is not None:
             result["event_title_zh"] = translated
             result.setdefault("title_zh", translated)

@@ -13772,6 +13772,8 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     }
 
     class FakeStore:
+        cache_hits = 0
+
         def histories(self, kind: str) -> list[dict[str, object]]:
             assert kind == "signals"
             return rows
@@ -13801,7 +13803,7 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
             return None
 
         def record_llm_cache_hit(self) -> None:
-            return None
+            type(self).cache_hits += 1
 
     class FakeMonitor:
         profit = "0.44"
@@ -13855,6 +13857,7 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     assert items[3]["actionable_now"] is False
     assert items[3]["live_profit"] is None
     assert monitor.calls == 1
+    assert FakeStore.cache_hits == 0
 
     monitor.profit = "0.51"
     refreshed = _prediction_history_payload(

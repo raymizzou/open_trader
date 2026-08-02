@@ -574,6 +574,26 @@ def test_llm_usage_24h_counts_calls_failures_hits_and_tokens(
     db.record_llm_call(status="failed", usage={})
     db.record_llm_cache_hit()
 
+    original_connection = db._connection
+    materialized_rows = 0
+
+    def guarded_connection() -> sqlite3.Connection:
+        connection = original_connection()
+
+        def one_row_only(
+            cursor: sqlite3.Cursor, row: tuple[object, ...]
+        ) -> sqlite3.Row:
+            nonlocal materialized_rows
+            materialized_rows += 1
+            if materialized_rows > 1:
+                raise AssertionError("usage summary must materialize one aggregate row")
+            return sqlite3.Row(cursor, row)
+
+        connection.row_factory = one_row_only
+        return connection
+
+    monkeypatch.setattr(db, "_connection", guarded_connection)
+
     assert db.llm_usage_24h() == {
         "calls": 2,
         "successes": 1,

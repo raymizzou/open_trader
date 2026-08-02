@@ -406,6 +406,8 @@ class PolymarketMonitor:
         self._stream_disconnected_at: datetime | None = None
         self._subscription_dirty = False
         self._last_runtime_write: datetime | None = None
+        self._llm_usage_cache: dict[str, int] | None = None
+        self._llm_usage_cached_at: float | None = None
         self._store_failed = False
         self._universe_failed = False
         self._universe_refresh_attempts = 0
@@ -479,6 +481,7 @@ class PolymarketMonitor:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            self._llm_usage()
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=lambda: asyncio.run(self.run_forever()),
@@ -3765,10 +3768,17 @@ class PolymarketMonitor:
         }
 
     def _llm_usage(self) -> dict[str, int]:
+        now = self._monotonic()
+        if (
+            self._llm_usage_cache is not None
+            and self._llm_usage_cached_at is not None
+            and now - self._llm_usage_cached_at < 60
+        ):
+            return dict(self._llm_usage_cache)
         try:
-            return self._store.llm_usage_24h()
+            result = self._store.llm_usage_24h()
         except Exception:
-            return {
+            result = {
                 "calls": 0,
                 "successes": 0,
                 "failures": 0,
@@ -3778,6 +3788,9 @@ class PolymarketMonitor:
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
             }
+        self._llm_usage_cache = dict(result)
+        self._llm_usage_cached_at = now
+        return result
 
     @staticmethod
     def _distribution(values: Sequence[object]) -> dict[str, object]:

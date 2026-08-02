@@ -65,6 +65,7 @@ def cached_prediction_title_zh(
     *,
     model: str = TITLE_TRANSLATION_MODEL,
     prompt_version: str = TITLE_TRANSLATION_PROMPT_VERSION,
+    record_hit: bool = True,
 ) -> str | None:
     """Read a validated title translation without invoking Codex."""
 
@@ -82,7 +83,7 @@ def cached_prediction_title_zh(
     if not isinstance(cached, Mapping):
         return None
     translated = _valid_translation(normalized, cached.get("title_zh"))
-    if translated is not None:
+    if translated is not None and record_hit:
         try:
             store.record_llm_cache_hit()
         except Exception:

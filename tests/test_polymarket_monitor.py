@@ -420,6 +420,67 @@ def make_monitor(
     )
 
 
+def test_snapshot_reuses_llm_usage_summary_for_one_minute(tmp_path: Path) -> None:
+    monitor = make_monitor(tmp_path)
+    monotonic = [0.0]
+    calls = 0
+
+    def usage() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        return {
+            "calls": calls,
+            "successes": calls,
+            "failures": 0,
+            "cache_hits": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        }
+
+    monitor._monotonic = lambda: monotonic[0]
+    monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
+
+    assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
+    assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
+    monotonic[0] = 60.0
+    assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 2
+    assert calls == 2
+
+
+def test_start_primes_llm_usage_before_monitor_thread(tmp_path: Path) -> None:
+    monitor = make_monitor(tmp_path)
+    calls = 0
+
+    def usage() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        return {
+            "calls": 0,
+            "successes": 0,
+            "failures": 0,
+            "cache_hits": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        }
+
+    async def idle() -> None:
+        while not monitor._stop_event.is_set():
+            await asyncio.sleep(0.01)
+
+    monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
+    monitor.run_forever = idle  # type: ignore[method-assign]
+
+    monitor.start()
+    try:
+        assert calls == 1
+    finally:
+        monitor.stop()
+
+
 def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     tmp_path: Path,
 ) -> None:

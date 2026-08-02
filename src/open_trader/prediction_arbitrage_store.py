@@ -995,42 +995,36 @@ class PredictionArbitrageStore:
             _parse_timestamp(_utc_now()) - timedelta(hours=24)
         )
         with self._read_connection() as connection:
-            rows = connection.execute(
+            row = connection.execute(
                 """
-                SELECT kind, status, payload
+                SELECT
+                    COALESCE(SUM(CASE WHEN kind='call' THEN 1 ELSE 0 END), 0) AS calls,
+                    COALESCE(SUM(CASE WHEN kind='call' AND status='success' THEN 1 ELSE 0 END), 0) AS successes,
+                    COALESCE(SUM(CASE WHEN kind='call' AND status!='success' THEN 1 ELSE 0 END), 0) AS failures,
+                    COALESCE(SUM(CASE WHEN kind='cache_hit' THEN 1 ELSE 0 END), 0) AS cache_hits,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS input_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.cached_input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS cached_input_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS output_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens
                 FROM llm_usage
                 WHERE created_at >= ?
                 """,
                 (cutoff,),
-            ).fetchall()
-        result = {
-            "calls": 0,
-            "successes": 0,
-            "failures": 0,
-            "cache_hits": 0,
-            "input_tokens": 0,
-            "cached_input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_output_tokens": 0,
-        }
-        for row in rows:
-            if row["kind"] == "cache_hit":
-                result["cache_hits"] += 1
-                continue
-            result["calls"] += 1
-            if row["status"] == "success":
-                result["successes"] += 1
-            else:
-                result["failures"] += 1
-            usage = _load_payload(str(row["payload"]))
+            ).fetchone()
+        assert row is not None
+        return {
+            field: int(row[field])
             for field in (
+                "calls",
+                "successes",
+                "failures",
+                "cache_hits",
                 "input_tokens",
                 "cached_input_tokens",
                 "output_tokens",
                 "reasoning_output_tokens",
-            ):
-                result[field] += int(usage.get(field, 0))
-        return result
+            )
+        }
 
     def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str:
         encoded = _dump_execution_payload(payload)
