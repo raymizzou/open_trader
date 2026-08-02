@@ -5605,6 +5605,10 @@ table {
 .pm-readiness-item span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 6px; }
 .pm-readiness-item strong { display: block; line-height: 1.35; overflow-wrap: anywhere; }
 .pm-readiness-item small { color: var(--muted); display: block; margin-top: 4px; }
+.pm-venue-readiness { background: transparent; border: 0; box-shadow: none; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.pm-venue-card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 5px; padding: 12px 14px; }
+.pm-venue-card-title { align-items: center; display: flex; gap: 8px; justify-content: space-between; }
+.pm-venue-states { color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 12px; }
 .pm-tone-ok { color: var(--success); }
 .pm-tone-warning { color: #8a5a16; }
 .pm-tone-danger { color: var(--danger); }
@@ -5693,6 +5697,7 @@ table {
 .pm-funnel-grid { display: grid; gap: 7px; min-width: 0; }
 .pm-funnel-grid-catalog { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .pm-funnel-grid-activity { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+.pm-cross-venue-funnel-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .pm-funnel-stage { background: #f2eee7; border: 1px solid transparent; border-radius: 7px; min-width: 0; padding: 8px; }
 .pm-funnel-stage.live { background: #eef6f8; border-color: #a8ccd7; }
 .pm-funnel-stage.good { background: #e8f5ee; border-color: #add4bc; }
@@ -5764,6 +5769,7 @@ table {
 .pm-title-cell > span { display: block; line-height: 1.35; min-width: 0; overflow-wrap: anywhere; }
 .pm-title-cell .pm-title-en { color: var(--text); font-size: inherit; font-weight: 800; }
 .pm-title-cell .pm-title-zh { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.pm-signal-legs { color: var(--muted); display: block; font-size: 12px; margin-top: 4px; }
 .pm-relative-age { color: var(--muted); display: block; font-size: 11px; margin-top: 3px; white-space: nowrap; }
 .pm-signal-operation { white-space: nowrap; }
 .pm-signal-operation small { white-space: normal; }
@@ -5798,6 +5804,7 @@ table {
 @media (max-width: 1100px) {
   .pm-layout, .pm-llm-layout { grid-template-columns: 1fr; }
   .pm-funnel-grid-activity { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .pm-cross-venue-funnel-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 850px) {
   .pm-threshold-candidate > summary { align-items: stretch; grid-template-columns: minmax(0, 1fr) auto; }
@@ -5811,6 +5818,7 @@ table {
   .pm-strategy-tabs { display: grid; width: 100%; }
   .pm-updated { text-align: left; }
   .pm-readiness { grid-template-columns: 1fr 1fr; }
+  .pm-venue-readiness { grid-template-columns: 1fr; }
   .pm-readiness-item, .pm-readiness-item:nth-child(3) { border-right: 1px solid var(--line); }
   .pm-readiness-item:nth-child(even) { border-right: 0; }
   .pm-readiness-item:nth-child(n+3) { border-top: 1px solid var(--line); }
@@ -5819,7 +5827,7 @@ table {
   .pm-funnel-header { align-items: stretch; display: grid; }
   .pm-funnel-chips { justify-content: flex-start; }
   .pm-funnel-chip { white-space: normal; }
-  .pm-funnel-grid-catalog, .pm-funnel-grid-activity, .pm-relation-summary-grid { grid-template-columns: 1fr; }
+  .pm-funnel-grid-catalog, .pm-funnel-grid-activity, .pm-cross-venue-funnel-grid, .pm-relation-summary-grid { grid-template-columns: 1fr; }
   .pm-funnel-meta { align-items: stretch; display: grid; }
   .pm-progress { grid-template-columns: 1fr 1fr; }
   .pm-panel-heading, .pm-opportunity-title, .pm-opportunity-action, .pm-alert { align-items: stretch; display: grid; }

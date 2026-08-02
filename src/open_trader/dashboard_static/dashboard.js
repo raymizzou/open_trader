@@ -2338,6 +2338,23 @@ function predictionAnnualizedPercent(value, digits = 1) {
 }
 
 function predictionReadinessStrip(payload, strategy = "yes_no") {
+  const venues = Array.isArray(payload?.venues)
+    ? payload.venues.filter((venue) => venue && typeof venue === "object")
+    : [];
+  if (venues.length) {
+    return `<section class="pm-readiness pm-venue-readiness" aria-label="交易所连接与账户状态">${venues.map((venue) => {
+      const balance = venue.balance && typeof venue.balance === "object" ? venue.balance : {};
+      const venueName = String(venue.venue || "").toLowerCase() === "predict.fun" ? "Predict.fun" : "Polymarket";
+      const wallet = predictionMaskedWallet(venue.wallet);
+      const rest = predictionValue(venue.rest, "unavailable");
+      const ws = predictionValue(venue.ws, "unavailable");
+      const asset = predictionValue(balance.asset, "-");
+      const amount = predictionHasValue(balance.value) ? predictionMoney(balance.value) : "-";
+      const healthLabel = (value) => String(value).toLowerCase() === "unavailable" ? "不可用" : value;
+      const reason = venue.reason ? `<small>原因：${escapeHtml(predictionFailureReasonLabel(venue.reason))}</small>` : "";
+      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}</small>${reason}</article>`;
+    }).join("")}</section>`;
+  }
   const readiness = payload?.readiness || {};
   const balance = readiness.p_usd_balance ?? readiness.balance ?? payload?.balances?.p_usd;
   const wallet = readiness.masked_address || payload?.wallet?.masked_address || payload?.masked_wallet || readiness.wallet_address;
@@ -2354,6 +2371,13 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
     <article class="pm-readiness-item"><span>地区与连接</span><strong class="${predictionTone(geoblock)}">${escapeHtml(predictionValue(geoblock, "-"))}</strong><small>官方 geoblock · 本机访问</small></article>
     <article class="pm-readiness-item"><span>实盘状态</span><strong class="${available ? "pm-tone-ok" : "pm-tone-danger"}">${available ? "可以交易" : "不可用"}</strong><small>${escapeHtml(tradingNote)}</small></article>
   </section>`;
+}
+
+function predictionCrossVenueFunnel(payload) {
+  const funnel = payload?.cross_venue?.funnel && typeof payload.cross_venue.funnel === "object"
+    ? payload.cross_venue.funnel
+    : {};
+  return `<section class="pm-panel pm-relation-funnel pm-cross-venue-funnel" aria-label="跨所 YES/NO 漏斗"><header class="pm-funnel-header"><div><h2>跨所 YES/NO 漏斗</h2><p>只展示明确映射的两所标的；本阶段不提交 Predict.fun 订单。</p></div></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-cross-venue-funnel-grid">${predictionFunnelStage("两所对应标的", funnel.matched_pairs, "明确映射的市场对")}${predictionFunnelStage("正在监视", funnel.monitored_pairs, "低频候选监视，尚未进入实时 WebSocket 池", "live")}${predictionFunnelStage("Codex 认为可以", funnel.codex_approved_pairs, "通过严格等价校验")}${predictionFunnelStage("有套利空间", funnel.arbitrage_space_pairs, "实时盘口为正收益", "good")}${predictionFunnelStage("明确下单信号", funnel.clear_signal_pairs, "双 REST 确认后只读记录", "good")}</div></div></section>`;
 }
 
 function predictionExecutionProgress(execution) {
@@ -2469,6 +2493,20 @@ function predictionReplacePositiveActionLabel(value, replacement) {
   return value;
 }
 
+function predictionVenueLegLabels(value) {
+  const legs = Array.isArray(value) ? value : [];
+  return legs.map((leg) => {
+    const exchange = String(leg?.exchange || leg?.venue || "").toLowerCase();
+    const venue = exchange === "predict.fun" ? "Predict.fun" : exchange === "polymarket" ? "Polymarket" : "场所未返回";
+    const outcome = predictionValue(leg?.outcome, "结果未返回");
+    return `${venue} · ${outcome}`;
+  }).join(" / ");
+}
+
+function predictionIsCrossVenue(value) {
+  return String(value?.market_type || "").toLowerCase() === "cross_venue_yes_no";
+}
+
 function predictionEventRows(payload, expandedEventKeys = new Set()) {
   const events = predictionEvents(payload);
   const globalOpportunities = predictionOpportunities(payload);
@@ -2493,6 +2531,7 @@ function predictionEventRows(payload, expandedEventKeys = new Set()) {
       ? `<span class="pm-title-zh">${escapeHtml(titleZh)}</span><span class="pm-title-en">${escapeHtml(title)}</span>`
       : `<span class="pm-title-en">${escapeHtml(title)}</span>`;
     const volume = event.volume_24h ?? opportunity.volume_24h;
+    const legs = predictionVenueLegLabels(event.legs || opportunity.legs);
     const rawDetails = Array.isArray(event.details) ? event.details : nested.length ? nested.map((item) => [item.title || item.market_title || "市场", item.actionable ? "可参与" : predictionReasonLabel(item.reason || item.eligibility_reason || item.status)]) : [[event.market_title || "市场", event.actionable ? "可参与" : predictionReasonLabel(event.reason || event.eligibility_reason || event.status)]];
     const unavailableLabel = incomplete ? "数据不完整" : "暂不可参与";
     const details = rawDetails.map(([label, value]) => [
@@ -2512,7 +2551,7 @@ function predictionEventRows(payload, expandedEventKeys = new Set()) {
     const stateMarkup = displayStatus
       ? `<div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(displayStatus)}</div>`
       : "";
-    return `<details class="pm-event" data-event-key="${escapeHtml(eventKey)}"${expandedEventKeys.has(eventKey) ? " open" : ""}><summary><div><div class="pm-event-title">${titleMarkup}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div>${stateMarkup}</summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
+    return `<details class="pm-event" data-event-key="${escapeHtml(eventKey)}"${expandedEventKeys.has(eventKey) ? " open" : ""}><summary><div><div class="pm-event-title">${titleMarkup}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}${legs ? ` · ${escapeHtml(legs)}` : ""}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div>${stateMarkup}</summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
   }).join("");
 }
 
@@ -2789,7 +2828,8 @@ function predictionHistoryContent(payload, kind) {
       const english = predictionValue(row.event_title, "-");
       const chinese = String(row.event_title_zh || row.title_zh || "").trim();
       const secondary = chinese || "中文翻译生成中";
-      return `<span class="pm-title-en">${escapeHtml(english)}</span><span class="pm-title-zh">${escapeHtml(secondary)}</span>`;
+      const legs = predictionVenueLegLabels(row.legs);
+      return `<span class="pm-title-en">${escapeHtml(english)}</span><span class="pm-title-zh">${escapeHtml(secondary)}</span>${legs ? `<small class="pm-signal-legs">${escapeHtml(legs)}</small>` : ""}`;
     };
     const liveProfit = (row) => closed(row) ? "—" : predictionSignedMoney(row.live_profit ?? row.estimated_profit, "—");
     const threshold = (row) => String(row.market_type || "") === "threshold_hedge";
@@ -2813,6 +2853,7 @@ function predictionHistoryContent(payload, kind) {
       return `<strong class="pm-positive">${escapeHtml(profit)}</strong><small>年化 ${escapeHtml(annualized)}</small><small>最多占用 ${escapeHtml(cost)} · 含模型手续费${escapeHtml(fee)}</small>`;
     };
     const operation = (row) => {
+      if (predictionIsCrossVenue(row)) return `<span class="pm-observe">只读观察</span>`;
       const currentState = state.predictionMarket.payload || payload;
       const healthy = !String(state.predictionMarket.signalError || "").trim()
         && predictionTradingAvailable(currentState);
@@ -2907,7 +2948,7 @@ function predictionYesNoWorkspace(payload, expandedEventKeys) {
   const viewPayload = {...payload, opportunities};
   const displayedEvents = predictionEvents(viewPayload).length;
   const eventTotal = predictionHasValue(viewPayload.event_count) ? viewPayload.event_count : "-";
-  return `${predictionMetricStrip(viewPayload)}<aside class="pm-policy"><strong>V1 仅对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack">${predictionHistoryPanel(viewPayload)}</div></div>`;
+  return `${predictionCrossVenueFunnel(viewPayload)}<aside class="pm-policy"><strong>V1 仅对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack">${predictionHistoryPanel(viewPayload)}</div></div>`;
 }
 
 function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
@@ -2936,7 +2977,7 @@ function renderPredictionMarket() {
   const workspace = strategy === "llm_hedge"
     ? predictionLlmHedgeWorkspace(viewPayload, expandedRelationKeys)
     : predictionYesNoWorkspace(viewPayload, expandedEventKeys);
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionReadinessStrip(viewPayload, strategy)}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
+  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
 }
 
 function startPredictionPolling() {

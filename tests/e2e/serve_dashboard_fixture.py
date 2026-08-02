@@ -70,6 +70,23 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         {**event, "profit_label": event_labels.get(str(event.get("event_id")), ("净利润", "暂不可参与"))[0], "status": event_labels.get(str(event.get("event_id")), ("净利润", "暂不可参与"))[1]}
         for event in events
     ]
+    cross_legs = [
+        {"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture"},
+        {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"},
+    ]
+    events.append({
+        "event_id": "cross-event-fixture",
+        "title": "Will Bitcoin close above $100,000 on December 31, 2026?",
+        "title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？",
+        "market_type": "cross_venue_yes_no",
+        "execution_mode": "observe_only",
+        "legs": cross_legs,
+        "markets": "两所对应标的",
+        "profit": "0.50",
+        "profit_label": "净利润",
+        "status": "只读观察",
+        "actionable": False,
+    })
     if scenario == "quiet":
         opportunity = {**opportunity, "actionable": False}
         events[0] = {**events[0], "actionable": False, "opportunities": [opportunity]}
@@ -82,13 +99,13 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         opportunity["actionable"] = True
         events[0] = {**events[0], "actionable": True, "opportunities": [opportunity]}
     if scenario == "loading":
-        return {"status": "loading", "health": {"status": "loading", "degraded_reasons": ["universe_unavailable"]}, "failure_reason": "universe_unavailable", "readiness": {"status": "unavailable", "reason": "readiness_unavailable"}, "events": [], "opportunities": [], "histories": {"signals": []}, "breaker": {"open": True}, "csrf_token": "fixture-csrf"}
+        return {"status": "loading", "health": {"status": "loading", "degraded_reasons": ["universe_unavailable"]}, "failure_reason": "universe_unavailable", "readiness": {"status": "unavailable", "reason": "readiness_unavailable"}, "venues": [{"venue": "polymarket", "rest": "unavailable", "ws": "unavailable", "wallet": "-", "balance": {"asset": "pUSD", "value": None}, "mode": "只读"}, {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "-", "balance": {"asset": "USDT", "value": None}, "mode": "只读"}], "events": [], "opportunities": [], "histories": {"signals": []}, "breaker": {"open": True}, "csrf_token": "fixture-csrf"}
     if scenario == "degraded":
-        return {"status": "degraded", "health": {"status": "degraded", "degraded_reasons": ["heartbeat_stale"]}, "failure_reason": "heartbeat_stale", "stale": True, "readiness": {"status": "degraded", "wallet_address": "0x7A4E…91C2", "balance": "50.00", "geoblock": "blocked", "relayer": "ready"}, "wallet": {"masked_address": "0x7A4E…91C2"}, "masked_wallet": "0x7A4E…91C2", "events": events, "opportunities": [opportunity], "histories": {"signals": _prediction_history("signals")}, "signals_24h": 3, "event_count": 20, "market_count": 331, "token_count": 662, "breaker": {"open": True}, "heartbeat_at": "2026-07-28T08:17:40Z", "csrf_token": "fixture-csrf"}
+        return {"status": "degraded", "health": {"status": "degraded", "degraded_reasons": ["heartbeat_stale"]}, "failure_reason": "heartbeat_stale", "stale": True, "readiness": {"status": "degraded", "wallet_address": "0x7A4E…91C2", "balance": "50.00", "geoblock": "blocked", "relayer": "ready"}, "wallet": {"masked_address": "0x7A4E…91C2"}, "masked_wallet": "0x7A4E…91C2", "venues": [{"venue": "polymarket", "rest": "degraded", "ws": "stale", "wallet": "0x7A4E…91C2", "balance": {"asset": "pUSD", "value": "50.00"}, "mode": "只读"}, {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": None}, "mode": "只读"}], "events": events, "opportunities": [opportunity], "histories": {"signals": _prediction_history("signals")}, "signals_24h": 3, "event_count": 20, "market_count": 331, "token_count": 662, "breaker": {"open": True}, "heartbeat_at": "2026-07-28T08:17:40Z", "csrf_token": "fixture-csrf"}
     if scenario in {"unavailable", "unknown"}:
         status = "unavailable" if scenario == "unavailable" else "mystery"
         reason = "configuration_unavailable" if scenario == "unavailable" else "status_unknown"
-        return {"status": status, "health": {"status": status, "degraded_reasons": [reason]}, "failure_reason": reason, "readiness": {"status": "unavailable", "reason": reason}, "events": [], "opportunities": [], "histories": {"signals": []}, "breaker": {"open": True}, "csrf_token": "fixture-csrf"}
+        return {"status": status, "health": {"status": status, "degraded_reasons": [reason]}, "failure_reason": reason, "readiness": {"status": "unavailable", "reason": reason}, "venues": [{"venue": "polymarket", "rest": "unavailable", "ws": "unavailable", "wallet": "-", "balance": {"asset": "pUSD", "value": None}, "mode": "只读"}, {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "-", "balance": {"asset": "USDT", "value": None}, "mode": "只读"}], "events": [], "opportunities": [], "histories": {"signals": []}, "breaker": {"open": True}, "csrf_token": "fixture-csrf"}
     payload: dict[str, object] = {
         "status": "healthy",
         "health": {"status": "healthy", "degraded_reasons": []},
@@ -96,6 +113,11 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "wallet": {"masked_address": "0x7A4E…91C2"},
         "masked_wallet": "0x7A4E…91C2",
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
+        "venues": [
+            {"venue": "polymarket", "rest": "ready", "ws": "ready", "wallet": "0x7A4E…91C2", "balance": {"asset": "pUSD", "value": "50.00"}, "mode": "可以交易"},
+            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "只读"},
+        ],
+        "cross_venue": {"funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1}},
         "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
         "heartbeat_at": "2026-08-01T02:00:00Z",
         "event_count": 20,
@@ -205,6 +227,7 @@ def _prediction_history(kind: str) -> list[dict[str, object]]:
     if kind == "signals":
         return [
             {"signal_id": "signal-ceasefire", "opportunity_id": "opp-ceasefire", "occurred_at": "2026-08-01T01:59:00Z", "event_title": "Will the Israel-Iran ceasefire continue through August 31, 2026?", "event_title_zh": "以色列与伊朗停火是否持续至 2026 年 8 月 31 日？", "duration": "2m 14s", "initial_profit": "0.30", "live_profit": "0.38", "actionable_now": True, "notification_state": "sent"},
+            {"signal_id": "cross-signal-fixture", "opportunity_id": "cross:fixture:POLYMARKET_YES_PREDICT_NO", "market_type": "cross_venue_yes_no", "execution_mode": "observe_only", "occurred_at": "2026-08-01T01:57:00Z", "event_title": "Will Bitcoin close above $100,000 on December 31, 2026?", "event_title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？", "legs": [{"exchange": "polymarket", "outcome": "YES", "token_id": "poly-yes-fixture"}, {"exchange": "predict.fun", "outcome": "NO", "token_id": "predict-no-fixture"}], "duration": "38s", "initial_profit": "0.50", "live_profit": "0.52", "actionable_now": True, "notification_state": "sent"},
             {"signal_id": "signal-fed", "opportunity_id": "opp-fed", "occurred_at": "2026-08-01T01:55:00Z", "event_title": "Will the Fed cut rates in September 2026?", "event_title_zh": "2026 年 9 月美联储是否降息？", "duration": "18s", "initial_profit": "0.20", "live_profit": "0.24", "actionable_now": False, "notification_state": "failed"},
             {"signal_id": "signal-closed", "opportunity_id": "opp-closed", "occurred_at": "2026-08-01T01:50:00Z", "ended_at": "2026-08-01T01:50:41Z", "event_title": "Will Ethereum exceed $6,000 before September?", "event_title_zh": "以太坊会在 9 月前突破 $6,000？", "duration": "41s", "initial_profit": "0.15", "live_profit": "0.18", "actionable_now": False, "notification_state": "sent"},
             {"signal_id": "signal-threshold", "opportunity_id": "threshold-approved", "market_id": "threshold-approved", "market_type": "threshold_hedge", "occurred_at": "2026-08-01T01:48:00Z", "event_title": "Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?", "event_title_zh": "比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？", "minimum_profit": "0.54", "total_max_cost": "19.46", "maximum_fee": "0.12", "annualized_yield": "0.0053", "remaining_days": "152.6", "resolution_at": "2026-12-31T00:00:00Z", "eligibility_reason": "annualized_yield_below_minimum", "actionable_now": False, "notification_state": "not_sent"},

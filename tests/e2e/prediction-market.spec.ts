@@ -30,6 +30,45 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(targetRow).toContainText('比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？');
   });
 
+  test('renders the shared venue header and cross-venue funnel without cross-venue actions', async ({ page }) => {
+    for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
+      await page.setViewportSize(viewport);
+      await openPrediction(page);
+      const venueHeader = page.locator('.pm-venue-readiness');
+      const tabs = page.locator('.pm-strategy-tabs');
+      await expect(venueHeader).toBeVisible();
+      expect(await venueHeader.evaluate((header, strategyTabs) => Boolean(
+        header.compareDocumentPosition(strategyTabs) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ), await tabs.elementHandle())).toBe(true);
+      await expect(page.locator('.pm-venue-card')).toHaveCount(2);
+      const polymarket = page.locator('.pm-venue-card').filter({ hasText: 'Polymarket' });
+      for (const text of ['REST：ready', 'WebSocket：ready', '0x7A4E…91C2', '50.00 pUSD', '可以交易']) {
+        await expect(polymarket).toContainText(text);
+      }
+      const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
+      for (const text of ['REST：ready', 'WebSocket：ready', '0xcE23…f435', '12.34 USDT', '只读']) {
+        await expect(predict).toContainText(text);
+      }
+      await expect(venueHeader).not.toContainText('62.34');
+      await expect(page.locator('.pm-metrics')).toHaveCount(0);
+
+      const funnel = page.locator('.pm-cross-venue-funnel');
+      for (const text of ['两所对应标的', '正在监视', 'Codex 认为可以', '有套利空间', '明确下单信号']) {
+        await expect(funnel).toContainText(text);
+      }
+      await expect(funnel).toContainText('低频候选监视');
+      await expect(funnel).not.toContainText('WebSocket 监视');
+
+      const currentCross = page.locator('.pm-event').filter({ hasText: 'Predict.fun · YES' });
+      await expect(currentCross).toContainText('Polymarket · NO');
+      await expect(currentCross.locator('[data-action="participate"]')).toHaveCount(0);
+      const historyCross = page.locator('[data-prediction-history-panel] tbody tr').filter({ hasText: 'Polymarket · YES' });
+      await expect(historyCross).toContainText('Predict.fun · NO');
+      await expect(historyCross.locator('button')).toHaveCount(0);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    }
+  });
+
   test('preserves the production LLM hedge math and rejection evidence', async ({ page }) => {
     for (const viewport of [
       { width: 1440, height: 1100 },
@@ -68,13 +107,11 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await openPrediction(page, 'ready');
     await expect(page.locator('.dashboard-header')).toBeHidden();
     await expect(page.locator('.pm-nav button')).toHaveText(['持仓', '预测市场', '策略回测', '凯利实验室']);
-    for (const label of ['交易钱包', '可用余额', '地区与连接', '实盘状态']) {
-      await expect(page.locator('.pm-readiness')).toContainText(label);
+    for (const text of ['Polymarket', 'Predict.fun', 'REST：ready', 'WebSocket：ready']) {
+      await expect(page.locator('.pm-venue-readiness')).toContainText(text);
     }
-    await expect(page.locator('.pm-readiness-item')).toHaveCount(4);
-    await expect(page.locator('.pm-readiness')).not.toContainText('首单验证');
-    await expect(page.locator('.pm-metric')).toHaveCount(4);
-    await expect(page.locator('.pm-metrics')).not.toContainText('WebSocket');
+    await expect(page.locator('.pm-venue-card')).toHaveCount(2);
+    await expect(page.locator('.pm-metrics')).toHaveCount(0);
     await expect(page.locator('.pm-layout > .pm-panel').first()).toContainText('当前监控范围');
     await expect(page.locator('[data-prediction-history-panel]')).toContainText('套利信号');
     await expect(page.locator('body')).not.toContainText('当前机会');
@@ -188,10 +225,25 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(page.locator('.pm-threshold-candidate')).toHaveCount(2);
     await expect(page.locator('.pm-threshold-candidate').first()).toContainText('21.5%');
     await expect(page.locator('.pm-threshold-candidate').first()).not.toContainText('仅监控');
+    await expect(page.locator('.pm-relation-funnel')).toBeVisible();
+    await expect(page.locator('.pm-cross-venue-funnel')).toHaveCount(0);
     await page.evaluate(() => (
       window as Window & { startPredictionSignalPolling: () => void }
     ).startPredictionSignalPolling());
     await expect(page.locator('.pm-threshold-candidate')).toHaveCount(2);
+  });
+
+  test('same-venue actions never emit a Predict.fun mutation request', async ({ page }) => {
+    await openPrediction(page);
+    const predictMutations: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().includes('predict.fun') && !['GET', 'HEAD'].includes(request.method())) {
+        predictMutations.push(`${request.method()} ${request.url()}`);
+      }
+    });
+    await page.locator('[data-action="participate"]').first().click();
+    await expect(page.locator('.pm-modal')).toBeVisible();
+    expect(predictMutations).toEqual([]);
   });
 
   test('state-specific alerts remain truthful without neutral monitoring labels', async ({ page }) => {
@@ -205,20 +257,20 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('keeps loading, unavailable, and unknown states fail-closed', async ({ page }) => {
     await openPrediction(page, 'loading');
     await expect(page.locator('.pm-event')).toHaveCount(0);
-    await expect(page.locator('[data-prediction-history-panel] tbody tr')).toHaveCount(4);
+    await expect(page.locator('[data-prediction-history-panel] tbody tr')).toHaveCount(5);
     await expect(page.locator('[data-prediction-history-panel] [data-action="participate"]')).toHaveCount(0);
-    await expect(page.locator('.pm-readiness')).toContainText('不可用');
+    await expect(page.locator('.pm-venue-readiness')).toContainText('不可用');
 
     await openPrediction(page, 'unavailable');
     await expect(page.locator('.pm-status-line')).toContainText('Watcher 不可用');
-    await expect(page.locator('.pm-metric strong')).toHaveText(['-', '-', '-', '-']);
-    await expect(page.locator('.pm-readiness')).toContainText('不可用');
+    await expect(page.locator('.pm-metrics')).toHaveCount(0);
+    await expect(page.locator('.pm-venue-readiness')).toContainText('不可用');
     await expect(page.locator('[data-prediction-history-panel] [data-action="participate"]')).toHaveCount(0);
 
     await openPrediction(page, 'unknown');
     await expect(page.locator('.pm-status-line')).toContainText('Watcher 不可用');
-    await expect(page.locator('.pm-metric strong')).toHaveText(['-', '-', '-', '-']);
-    await expect(page.locator('.pm-readiness')).toContainText('不可用');
+    await expect(page.locator('.pm-metrics')).toHaveCount(0);
+    await expect(page.locator('.pm-venue-readiness')).toContainText('不可用');
   });
 
   test('keeps full execution progress and success facts', async ({ page }) => {
@@ -236,7 +288,9 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await openPrediction(page);
     await expect(page.locator('.pm-title-zh')).toHaveText([
       '以色列与伊朗停火是否持续至 8 月 31 日？',
+      '比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？',
       '以色列与伊朗停火是否持续至 2026 年 8 月 31 日？',
+      '比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？',
       '2026 年 9 月美联储是否降息？',
       '以太坊会在 9 月前突破 $6,000？',
       '比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？',
@@ -248,6 +302,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       '以太坊会在 9 月前突破 $6,000？',
       '2026 年美国参议院控制权',
       '下一任美联储主席人选',
+      '比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？Will Bitcoin close above $100,000 on December 31, 2026?',
     ]);
     const expectedVolumes = ['$9.7M', '$12.8M', '$15.4M', '$7.1M', '$6.8M', '$5.9M'];
     for (const [index, volume] of expectedVolumes.entries()) {
@@ -378,8 +433,8 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       await page.setViewportSize(viewport);
       await openPrediction(page, 'ready');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-      await expect.poll(() => page.locator('.pm-readiness').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(4);
-      await expect.poll(() => page.locator('.pm-metrics').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(4);
+      await expect.poll(() => page.locator('.pm-venue-readiness').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(2);
+      await expect(page.locator('.pm-metrics')).toHaveCount(0);
       await expect.poll(() => page.locator('.pm-layout').evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(' ').length)).toBe(viewport.width === 1920 ? 2 : 1);
       await expect(page.locator('.pm-volume').first()).toContainText('24h 成交量');
     }
