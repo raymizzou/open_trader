@@ -235,6 +235,7 @@ class PredictionArbitrageStore:
         self.path = self.data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._read_connection() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             self._create_schema(connection)
 
     def _connection(self) -> sqlite3.Connection:
@@ -246,7 +247,6 @@ class PredictionArbitrageStore:
         )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 

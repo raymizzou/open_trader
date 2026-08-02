@@ -114,6 +114,31 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     assert any("signals_open_started_at" in row[3] for row in open_query_plan)
 
 
+def test_store_sets_wal_once_instead_of_on_every_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader import prediction_arbitrage_store
+
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters=(), /):  # type: ignore[no-untyped-def]
+            statements.append(sql)
+            return super().execute(sql, parameters)
+
+    def connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return real_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr(prediction_arbitrage_store.sqlite3, "connect", connect)
+    db = PredictionArbitrageStore(tmp_path / "data")
+    assert sum("PRAGMA journal_mode=WAL" in sql for sql in statements) == 1
+
+    statements.clear()
+    assert db.load_llm_cache("missing") is None
+    assert all("PRAGMA journal_mode=WAL" not in sql for sql in statements)
+
+
 def test_runtime_round_trips_canonical_json_and_survives_restart(tmp_path: Path) -> None:
     payload = {"z": Decimal("1.20"), "a": {"amount": Decimal("2.00")}}
     store(tmp_path).write_runtime(payload)

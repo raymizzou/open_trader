@@ -8,7 +8,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - 新增仅只读的 Predict.fun 市场与盘口来源，REST 与 WebSocket 健康状态分别发布；仅通过 Predict 的 `polymarketConditionIds` 显式匹配 Polymarket，并在订阅前经过独立 Codex 结算等价性闸门。
 - 跨场仅监控 `Predict YES + Polymarket NO` 和 `Polymarket YES + Predict NO` 两个方向；使用 `Decimal` 和主线既有的 15% 年化准入 helper。五阶段漏斗依次展示显式匹配、受监控、Codex 核准、套利空间和明确信号；信号持久化为仅观察记录。
 - Predict.fun 主网不存在 signer、下单、授权或自动执行路径。Predict API key 尚未分配，主网 REST/WS 运行验证仍待完成；不得将当前状态视为 Predict 已可用。
-- 修复预测市场状态接口因 24 小时 Codex 用量逐行载入及每分钟关系扫描期间持锁读取历史指标而超时的问题：用量改为 SQLite 单行聚合，状态快照仅读取锁外每分钟刷新的指标缓存，Dashboard 读取缓存中文标题不再写入 cache-hit 事件；保留既有审计数据与真实 Codex 调用统计。使用现有 702 万条用量记录验证状态接口恢复 HTTP 200，相关回归 465 个通过。
+- 修复预测市场状态接口因 24 小时 Codex 用量逐行载入、持锁读取历史指标及每个只读标题查询重复协商 SQLite WAL 模式而超时的问题：用量改为 SQLite 单行聚合，状态快照仅读取锁外每分钟刷新的指标缓存，WAL 只在 Store 初始化时设置，Dashboard 读取缓存中文标题不再写入 cache-hit 事件；保留既有审计数据与真实 Codex 调用统计。使用现有 702 万条用量记录验证状态接口恢复 HTTP 200，相关回归 466 个通过。
 
 ## 2026-08-01
 
