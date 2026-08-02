@@ -43,6 +43,7 @@ Existing files modified:
 - `src/open_trader/cli.py`
 - `src/open_trader/polymarket_trading.py`
 - `src/open_trader/polymarket_monitor.py`
+- `src/open_trader/polymarket_relation_discovery.py`
 - `src/open_trader/prediction_arbitrage_store.py`
 - `src/open_trader/prediction_arbitrage_execution.py`
 - `src/open_trader/notifications.py`
@@ -390,7 +391,9 @@ Expected: PASS, including the existing threshold validator regression suite.
 **Files:**
 
 - Modify: `src/open_trader/predict_cross_venue.py`
+- Modify: `src/open_trader/polymarket_relation_discovery.py:1837-1860`
 - Modify: `tests/test_predict_cross_venue.py`
+- Modify: `tests/test_prediction_arbitrage.py`
 
 **Interfaces:**
 
@@ -472,7 +475,9 @@ PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" \
   /Users/ray/projects/open_trader/.venv/bin/python -m pytest \
   tests/test_predict_cross_venue.py tests/test_prediction_arbitrage.py -q
 git diff --check
-git add src/open_trader/predict_cross_venue.py tests/test_predict_cross_venue.py
+git add src/open_trader/predict_cross_venue.py \
+  src/open_trader/polymarket_relation_discovery.py \
+  tests/test_predict_cross_venue.py tests/test_prediction_arbitrage.py
 git commit -m "feat: calculate cross-venue yes-no signals"
 ```
 
