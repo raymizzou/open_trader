@@ -1876,10 +1876,14 @@ class _CrossVenueRuntime:
             or self._thread is threading.current_thread()
         ):
             return self._monitor.snapshot()
+        coroutine = self._snapshot_on_loop()
         try:
-            return asyncio.run_coroutine_threadsafe(
-                self._snapshot_on_loop(), loop
-            ).result(timeout=1)
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception:
+            coroutine.close()
+            return {}
+        try:
+            return future.result(timeout=1)
         except Exception:
             return {}
 

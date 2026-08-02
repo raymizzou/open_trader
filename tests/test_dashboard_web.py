@@ -2530,6 +2530,41 @@ def test_cross_venue_runtime_marshals_snapshot_onto_its_monitor_loop() -> None:
         runtime.stop()
 
 
+def test_cross_venue_runtime_closes_unscheduled_snapshot_coroutine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+    class FakeCrossMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+    runtime = dashboard_web._CrossVenueRuntime(FakeCrossMonitor())
+    runtime._loop = FakeLoop()  # type: ignore[assignment]
+    runtime._thread = threading.Thread()
+    scheduled: list[object] = []
+
+    def fail_schedule(coroutine: object, loop: object) -> object:
+        scheduled.append(coroutine)
+        raise RuntimeError("loop closed")
+
+    monkeypatch.setattr(
+        dashboard_web.asyncio, "run_coroutine_threadsafe", fail_schedule
+    )
+
+    assert runtime.snapshot() == {}
+    try:
+        assert getattr(scheduled[0], "cr_frame") is None
+    finally:
+        close = getattr(scheduled[0], "close", None)
+        if callable(close):
+            close()
+
+
 def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> None:
     from open_trader.dashboard_web import _prediction_history_payload, _prediction_state_payload
 
