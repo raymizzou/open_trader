@@ -696,6 +696,62 @@ def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -
     asyncio.run(exercise())
 
 
+def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        store = PredictionArbitrageStore(tmp_path / "data")
+        notifications: list[tuple[str, str]] = []
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            store=store,
+            ready_observer=lambda opportunity_id, signal_id: notifications.append(
+                (opportunity_id, signal_id)
+            ),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(store.open_signal_history()))
+        opportunity = next(
+            row["opportunity_id"]
+            for row in monitor.snapshot()["opportunities"]
+            if row["direction"] == "PREDICT_YES_POLYMARKET_NO"
+        )
+        opportunity_id = str(opportunity)
+        signal = next(
+            row
+            for row in store.open_signal_history()
+            if row["opportunity_id"] == opportunity_id
+        )
+        assert signal["opportunity_id"] == opportunity_id
+        assert signal["market_type"] == "cross_venue_yes_no"
+        assert signal["execution_mode"] == "observe_only"
+        assert signal["clear_signal"] is True
+        assert signal["trigger_total_max_cost"] == "9.50"
+        assert signal["trigger_minimum_profit"] == "0.2520000000"
+        assert signal["legs"][0]["token_id"] == "predict-yes-1"
+        assert signal["legs"][1]["token_id"] == "poly-no-1"
+        await wait_until(lambda: bool(notifications))
+        assert (signal["opportunity_id"], signal["signal_id"]) in notifications
+
+        await monitor.stop()
+        assert store.signal(str(signal["signal_id"]))["ended_reason"] == "data_unavailable"  # type: ignore[index]
+
+    asyncio.run(exercise())
+
+
 def test_monitor_snapshot_closes_episode_when_books_age_without_another_update() -> None:
     async def exercise() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]

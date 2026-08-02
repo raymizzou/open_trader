@@ -205,6 +205,55 @@ def test_yes_no_signal_notification_is_link_free_and_observation_only(
         assert forbidden not in message
 
 
+def test_cross_venue_yes_no_signal_notification_is_link_free_and_observation_only() -> None:
+    title, message = render_yes_no_signal_notification(
+        {
+            "market_type": "cross_venue_yes_no",
+            "pair_id": "public-pair",
+            "first_positive_at": "2026-08-02T01:23:45.678000Z",
+            "total_max_cost": "9.45",
+            "minimum_profit": "0.55",
+            "legs": [
+                {
+                    "exchange": "predict.fun",
+                    "outcome": "YES",
+                    "quantity": "10",
+                    "max_cost": "4.10",
+                    "settlement_asset": "USDT",
+                },
+                {
+                    "exchange": "polymarket",
+                    "outcome": "NO",
+                    "quantity": "10",
+                    "max_cost": "5.10",
+                    "settlement_asset": "USDC",
+                },
+            ],
+        }
+    )
+
+    assert title == "【跨交易所 YES/NO 观察信号】+$0.55"
+    for text in (
+        "Predict.fun · YES：10 份，最大成本 $4.10（USDT）",
+        "Polymarket · NO：10 份，最大成本 $5.10（USDC）",
+        "确认最大总成本：$9.45",
+        "确认最低利润：+$0.55",
+        "发现时间（HKT）：2026-08-02 09:23:45.678 HKT",
+    ):
+        assert text in message
+    for forbidden in (
+        "http",
+        "wallet",
+        "token_id",
+        "规则",
+        "credential",
+        "api_key",
+        "下单",
+        "订单",
+    ):
+        assert forbidden not in message
+
+
 def test_feishu_webhook_notifier_raises_on_api_error() -> None:
     def fake_post(
         url: str,

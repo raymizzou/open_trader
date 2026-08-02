@@ -36,6 +36,7 @@ _PRIVATE_FIELD_PARTS = (
     "access_token",
     "refresh_token",
     "auth_token",
+    "jwt",
     "session_token",
     "builder_key",
     "builder_secret",
@@ -581,14 +582,16 @@ class PredictionArbitrageStore:
         return _utc_now()
 
     def upsert_signal(self, payload: Mapping[str, object]) -> str:
-        clean = self._canonical_signal_payload(_load_payload(_dump_payload(payload)))
-        encoded = _dump_payload(clean)
+        clean = self._canonical_signal_payload(
+            _load_payload(_dump_relation_payload(payload))
+        )
+        encoded = _dump_relation_payload(clean)
         market_id = str(clean.get("market_id", "")).strip()
         if not market_id:
             raise ValueError("signal market_id is required")
         started_at = self._signal_time(clean)
         clean.setdefault("started_at", started_at)
-        encoded = _dump_payload(clean)
+        encoded = _dump_relation_payload(clean)
         now = _utc_now()
         with self._transaction() as connection:
             row = connection.execute(
@@ -601,13 +604,18 @@ class PredictionArbitrageStore:
             ).fetchone()
             if row is not None:
                 previous = _load_payload(str(row["payload"]))
-                for immutable in ("started_at", "first_positive_at", "initial_profit"):
+                immutable_fields = ["started_at", "first_positive_at", "initial_profit"]
+                if previous.get("market_type") == "cross_venue_yes_no":
+                    immutable_fields.extend(
+                        ("trigger_total_max_cost", "trigger_minimum_profit")
+                    )
+                for immutable in immutable_fields:
                     if immutable in previous:
                         clean[immutable] = previous[immutable]
                 previous.update(clean)
                 connection.execute(
                     "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
-                    (_dump_payload(previous), now, str(row["signal_id"])),
+                    (_dump_relation_payload(previous), now, str(row["signal_id"])),
                 )
                 return str(row["signal_id"])
             signal_id = _new_id()
@@ -653,13 +661,18 @@ class PredictionArbitrageStore:
                 raise KeyError(signal_id)
             previous = _load_payload(str(row["payload"]))
             clean = self._canonical_signal_payload(
-                _load_payload(_dump_payload(changes))
+                _load_payload(_dump_relation_payload(changes))
             )
-            for immutable in ("started_at", "first_positive_at", "initial_profit"):
+            immutable_fields = ["started_at", "first_positive_at", "initial_profit"]
+            if previous.get("market_type") == "cross_venue_yes_no":
+                immutable_fields.extend(
+                    ("trigger_total_max_cost", "trigger_minimum_profit")
+                )
+            for immutable in immutable_fields:
                 if immutable in previous:
                     clean[immutable] = previous[immutable]
             previous.update(clean)
-            encoded = _dump_payload(previous)
+            encoded = _dump_relation_payload(previous)
             connection.execute(
                 "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
                 (encoded, now, signal_id),
@@ -733,7 +746,7 @@ class PredictionArbitrageStore:
                 payload["order_ready_at"] = _canonical_timestamp(order_ready_at)
             connection.execute(
                 "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
-                (_dump_payload(payload), now_text, str(signal_id)),
+                (_dump_relation_payload(payload), now_text, str(signal_id)),
             )
             return {
                 "state": "reserved",
@@ -782,7 +795,7 @@ class PredictionArbitrageStore:
             updated_at = _utc_now()
             connection.execute(
                 "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
-                (_dump_payload(payload), updated_at, str(signal_id)),
+                (_dump_relation_payload(payload), updated_at, str(signal_id)),
             )
             return {
                 "state": payload["notification_state"],
@@ -810,13 +823,14 @@ class PredictionArbitrageStore:
             payload = _load_payload(str(row["payload"]))
             if updates is not None:
                 clean = self._canonical_signal_payload(
-                    _load_payload(_dump_payload(updates))
+                    _load_payload(_dump_relation_payload(updates))
                 )
-                for immutable in (
-                    "started_at",
-                    "first_positive_at",
-                    "initial_profit",
-                ):
+                immutable_fields = ["started_at", "first_positive_at", "initial_profit"]
+                if payload.get("market_type") == "cross_venue_yes_no":
+                    immutable_fields.extend(
+                        ("trigger_total_max_cost", "trigger_minimum_profit")
+                    )
+                for immutable in immutable_fields:
                     if immutable in payload:
                         clean[immutable] = payload[immutable]
                 payload.update(clean)
@@ -824,7 +838,7 @@ class PredictionArbitrageStore:
             payload["ended_reason"] = str(reason)
             connection.execute(
                 "UPDATE signals SET payload=?, ended_at=?, updated_at=? WHERE signal_id=?",
-                (_dump_payload(payload), ended, now, str(row["signal_id"])),
+                (_dump_relation_payload(payload), ended, now, str(row["signal_id"])),
             )
 
     def signal_history(self, window: SignalHistoryWindow) -> list[dict[str, object]]:
@@ -1057,9 +1071,11 @@ class PredictionArbitrageStore:
                 raise ValueError("preview_consumed")
             if now >= _parse_timestamp(preview["expires_at"]):
                 raise ValueError("preview_expired")
+            payload = str(preview["payload"])
+            if _load_payload(payload).get("market_type") == "cross_venue_yes_no":
+                raise ValueError("cross_venue_observation_only")
             execution_id = _new_id()
             created = _canonical_timestamp(now)
-            payload = str(preview["payload"])
             try:
                 connection.execute(
                     """

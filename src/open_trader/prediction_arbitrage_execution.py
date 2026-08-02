@@ -204,6 +204,11 @@ class PredictionExecutionService:
         self._release_global_lock(probe)
 
         opportunity = self._fresh_opportunity(str(opportunity_id))
+        if (
+            opportunity is not None
+            and opportunity.get("market_type") == "cross_venue_yes_no"
+        ):
+            return {"state": "rejected", "reason": "cross_venue_observation_only"}
         intent = self._intent_from_opportunity(opportunity)
         if opportunity is None or intent is None:
             return {"state": "rejected", "reason": "opportunity_unavailable"}
@@ -223,7 +228,10 @@ class PredictionExecutionService:
         signal = self._store.signal(str(signal_id))
         if signal is None:
             return {"state": "ignored", "reason": "signal_unavailable"}
-        if signal.get("market_type") == "standard_binary":
+        if signal.get("market_type") in {
+            "standard_binary",
+            "cross_venue_yes_no",
+        }:
             return self._notify_yes_no_signal(str(signal_id), signal)
         if signal.get("ended_at") is not None:
             return {"state": "ignored", "reason": "signal_closed"}
@@ -344,7 +352,7 @@ class PredictionExecutionService:
             return {"state": "ignored", "reason": "notification_attempts_exhausted"}
 
         market_id = str(signal.get("market_id", "")).strip()
-        if self._store.notification_sent_since(
+        if signal.get("market_type") != "cross_venue_yes_no" and self._store.notification_sent_since(
             market_id, _utc_now() - timedelta(minutes=30)
         ):
             self._store.update_signal(

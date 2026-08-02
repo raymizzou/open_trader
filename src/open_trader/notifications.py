@@ -436,6 +436,33 @@ def render_yes_no_signal_notification(
         moment = moment.replace(tzinfo=HONG_KONG)
     discovered = moment.astimezone(HONG_KONG).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
+    if signal.get("market_type") == "cross_venue_yes_no":
+        profit = signal.get("minimum_profit", signal.get("estimated_profit"))
+        legs = signal.get("legs")
+        lines = []
+        if isinstance(legs, (list, tuple)):
+            for leg in legs:
+                if not isinstance(leg, Mapping):
+                    continue
+                exchange = str(leg.get("exchange", "")).strip().lower()
+                venue = "Predict.fun" if exchange == "predict.fun" else "Polymarket"
+                lines.append(
+                    f"{venue} · {str(leg.get('outcome', '')).upper()}："
+                    f"{quantity(leg.get('quantity'))} 份，最大成本 "
+                    f"{money(leg.get('max_cost'))}（{str(leg.get('settlement_asset', '')).upper()}）"
+                )
+        return (
+            f"【跨交易所 YES/NO 观察信号】{money(profit, signed=True)}",
+            "\n".join(
+                (
+                    *lines,
+                    f"确认最大总成本：{money(signal.get('total_max_cost'))}",
+                    f"确认最低利润：{money(profit, signed=True)}",
+                    f"发现时间（HKT）：{discovered} HKT",
+                )
+            ),
+        )
+
     english_title = str(signal.get("event_title", signal.get("question", ""))).strip()
     chinese_title = str(signal.get("event_title_zh", "") or "").strip()
     title_lines = [line for line in (chinese_title, english_title) if line]

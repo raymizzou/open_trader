@@ -751,4 +751,100 @@ def test_relation_state_alone_preserves_public_pair_token_ids(tmp_path: Path) ->
     )
     signal = db.signal(signal_id)
     assert signal is not None
-    assert not {"token_id", "yes_token_id", "no_token_id"} & signal.keys()
+    assert {
+        "token_id": "signal-token",
+        "yes_token_id": "signal-yes",
+        "no_token_id": "signal-no",
+    }.items() <= signal.items()
+
+
+def test_cross_venue_signal_episode_preserves_public_legs_and_rearms_after_close(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+    payload = {
+        "opportunity_id": opportunity_id,
+        "market_id": opportunity_id,
+        "event_id": "public-pair",
+        "market_type": "cross_venue_yes_no",
+        "started_at": "2026-08-02T00:00:00Z",
+        "first_positive_at": "2026-08-02T00:00:00Z",
+        "trigger_total_max_cost": Decimal("9.45"),
+        "trigger_minimum_profit": Decimal("0.55"),
+        "legs": [
+            {
+                "exchange": "predict.fun",
+                "outcome": "YES",
+                "market_id": "public-predict-market",
+                "condition_id": "public-predict-condition",
+                "token_id": "public-predict-yes",
+                "yes_token_id": "public-predict-yes",
+                "no_token_id": "public-predict-no",
+                "settlement_asset": "USDT",
+                "api_key": "api-key-sentinel",
+                "nested": {"private_key": "private-key-sentinel"},
+            },
+            {
+                "exchange": "polymarket",
+                "outcome": "NO",
+                "market_id": "public-poly-market",
+                "condition_id": "public-poly-condition",
+                "token_id": "public-poly-no",
+                "settlement_asset": "USDC",
+                "proof": {"signature": "signature-sentinel", "jwt": "jwt-sentinel"},
+            },
+        ],
+    }
+
+    signal_id = db.upsert_signal(payload)
+    assert db.upsert_signal(
+        {
+            **payload,
+            "trigger_total_max_cost": Decimal("99.99"),
+            "trigger_minimum_profit": Decimal("99.99"),
+        }
+    ) == signal_id
+    signal = db.signal(signal_id)
+    assert signal is not None
+    assert signal["opportunity_id"] == opportunity_id
+    assert signal["trigger_total_max_cost"] == "9.45"
+    assert signal["trigger_minimum_profit"] == "0.55"
+    assert signal["legs"] == [
+        {
+            "exchange": "predict.fun",
+            "outcome": "YES",
+            "market_id": "public-predict-market",
+            "condition_id": "public-predict-condition",
+            "token_id": "public-predict-yes",
+            "yes_token_id": "public-predict-yes",
+            "no_token_id": "public-predict-no",
+            "settlement_asset": "USDT",
+            "nested": {},
+        },
+        {
+            "exchange": "polymarket",
+            "outcome": "NO",
+            "market_id": "public-poly-market",
+            "condition_id": "public-poly-condition",
+            "token_id": "public-poly-no",
+            "settlement_asset": "USDC",
+            "proof": {},
+        },
+    ]
+
+    db.close_signal(
+        opportunity_id,
+        ended_at="2026-08-02T00:01:00Z",
+        reason="data_unavailable",
+        updates={
+            "trigger_total_max_cost": Decimal("99.99"),
+            "trigger_minimum_profit": Decimal("99.99"),
+        },
+    )
+    closed = db.signal(signal_id)
+    assert closed is not None
+    assert closed["ended_reason"] == "data_unavailable"
+    assert closed["trigger_total_max_cost"] == "9.45"
+    assert closed["trigger_minimum_profit"] == "0.55"
+    assert db.upsert_signal(payload) != signal_id

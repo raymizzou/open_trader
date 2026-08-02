@@ -655,6 +655,8 @@ class PredictCrossVenueMonitor:
         validator: CodexCrossVenueEquivalenceValidator,
         gamma_lookup: Callable[..., Sequence[object]],
         clob_lookup: Callable[[str], object],
+        store: PredictionArbitrageStore | None = None,
+        ready_observer: Callable[[str, str], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._predict = predict_source
@@ -662,6 +664,8 @@ class PredictCrossVenueMonitor:
         self._validator = validator
         self._gamma_lookup = gamma_lookup
         self._clob_lookup = clob_lookup
+        self._store = store
+        self._ready_observer = ready_observer
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
         self._hot_restart = asyncio.Event()
@@ -907,11 +911,12 @@ class PredictCrossVenueMonitor:
         if not intents:
             self._close_pair(pair.pair_id)
             return
+        confirmed_directions = {intent.direction for intent in intents}
         for key in tuple(self._opportunities):
-            if key[0] == pair.pair_id:
-                self._opportunities.pop(key, None)
+            if key[0] == pair.pair_id and key[1] not in confirmed_directions:
+                self._close_opportunity(key)
         for intent in intents:
-            self._opportunities[(pair.pair_id, intent.direction)] = {
+            opportunity = {
                 "opportunity_id": f"cross:{pair.pair_id}:{intent.direction}",
                 "pair_id": pair.pair_id,
                 "direction": intent.direction,
@@ -928,6 +933,8 @@ class PredictCrossVenueMonitor:
                 "annualized_yield": intent.annualized_yield,
                 "resolution_at": intent.resolution_at,
             }
+            self._opportunities[(pair.pair_id, intent.direction)] = opportunity
+            self._persist_observation(opportunity)
 
     def _confirmation_done(
         self, pair_id: str, completed: asyncio.Task[None]
@@ -986,7 +993,7 @@ class PredictCrossVenueMonitor:
     ) -> None:
         for key in tuple(self._opportunities):
             if key[0] == pair_id and key[1] not in live_directions:
-                self._opportunities.pop(key, None)
+                self._close_opportunity(key)
 
     def _clear_hot_state(self) -> tuple[asyncio.Task[None], ...]:
         tasks = tuple(self._confirmation_tasks.values())
@@ -995,7 +1002,8 @@ class PredictCrossVenueMonitor:
             task.cancel()
         self._predict_books.clear()
         self._arbitrage_pairs.clear()
-        self._opportunities.clear()
+        for key in tuple(self._opportunities):
+            self._close_opportunity(key)
         self._polymarket.set_cross_venue_tokens(())
         return tasks
 
@@ -1036,7 +1044,64 @@ class PredictCrossVenueMonitor:
         self._arbitrage_pairs.discard(pair_id)
         for key in tuple(self._opportunities):
             if key[0] == pair_id:
-                self._opportunities.pop(key, None)
+                self._close_opportunity(key)
+
+    def _persist_observation(self, opportunity: Mapping[str, object]) -> None:
+        store = self._store
+        opportunity_id = str(opportunity.get("opportunity_id", "")).strip()
+        if store is None or not opportunity_id:
+            return
+        previous = next(
+            (
+                row
+                for row in store.open_signal_history()
+                if row.get("market_id") == opportunity_id
+            ),
+            {},
+        )
+        now = self._clock()
+        first_positive_at = previous.get("first_positive_at", now)
+        trigger_total_max_cost = previous.get(
+            "trigger_total_max_cost", opportunity.get("total_max_cost")
+        )
+        trigger_minimum_profit = previous.get(
+            "trigger_minimum_profit", opportunity.get("minimum_profit")
+        )
+        signal_id = store.upsert_signal(
+            {
+                **opportunity,
+                "market_id": opportunity_id,
+                "event_id": opportunity.get("pair_id"),
+                "question": "Predict.fun / Polymarket YES/NO",
+                "started_at": previous.get("started_at", first_positive_at),
+                "first_positive_at": first_positive_at,
+                "last_positive_at": now,
+                "last_seen_at": now,
+                "estimated_profit": opportunity.get("minimum_profit"),
+                "profit": opportunity.get("minimum_profit"),
+                "initial_profit": previous.get(
+                    "initial_profit", opportunity.get("minimum_profit")
+                ),
+                "trigger_total_max_cost": trigger_total_max_cost,
+                "trigger_minimum_profit": trigger_minimum_profit,
+            }
+        )
+        if self._ready_observer is not None:
+            asyncio.create_task(
+                asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
+            )
+
+    def _close_opportunity(self, key: tuple[str, Direction]) -> None:
+        opportunity = self._opportunities.pop(key, None)
+        if opportunity is None or self._store is None:
+            return
+        opportunity_id = str(opportunity.get("opportunity_id", "")).strip()
+        if opportunity_id:
+            self._store.close_signal(
+                opportunity_id,
+                ended_at=self._clock(),
+                reason="data_unavailable",
+            )
 
     def _source_status(self, *, fallback: str = "ready") -> str:
         try:
