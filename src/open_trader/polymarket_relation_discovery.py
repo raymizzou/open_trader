@@ -1842,6 +1842,21 @@ def simple_annualized_yield(
 ) -> Decimal | None:
     if not isinstance(intent, ThresholdHedgeIntent):
         return None
+    return simple_annualized_yield_from_values(
+        intent.minimum_profit,
+        intent.total_max_cost,
+        now=now,
+        resolution_at=resolution_at,
+    )
+
+
+def simple_annualized_yield_from_values(
+    minimum_profit: Decimal,
+    total_max_cost: Decimal,
+    *,
+    now: datetime,
+    resolution_at: datetime,
+) -> Decimal | None:
     start = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
     end = (
         resolution_at
@@ -1849,12 +1864,12 @@ def simple_annualized_yield(
         else resolution_at.replace(tzinfo=UTC)
     )
     seconds = Decimal(str((end.astimezone(UTC) - start.astimezone(UTC)).total_seconds()))
-    if seconds <= 0 or intent.total_max_cost <= 0:
+    if seconds <= 0 or total_max_cost <= 0:
         return None
     days = seconds / Decimal("86400")
     return (
-        intent.minimum_profit
-        / intent.total_max_cost
+        minimum_profit
+        / total_max_cost
         * Decimal("365")
         / days
     )

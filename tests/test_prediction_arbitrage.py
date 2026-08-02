@@ -25,6 +25,7 @@ from open_trader.polymarket_relation_discovery import (
     ThresholdRelation,
     build_threshold_hedge_intent,
     simple_annualized_yield,
+    simple_annualized_yield_from_values,
 )
 
 
@@ -547,3 +548,14 @@ def test_threshold_annualized_yield_uses_capital_and_remaining_days() -> None:
     )
 
     assert annualized == intent.minimum_profit / intent.total_max_cost
+
+
+def test_simple_annualized_yield_from_values_uses_profit_capital_and_days() -> None:
+    annualized = simple_annualized_yield_from_values(
+        Decimal("2"),
+        Decimal("100"),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        resolution_at=datetime(2026, 1, 11, tzinfo=UTC),
+    )
+
+    assert annualized == Decimal("0.73")

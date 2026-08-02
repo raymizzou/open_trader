@@ -13,19 +13,20 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
 
-from .polymarket_relation_discovery import _codex_events
+from .polymarket_relation_discovery import (
+    _codex_events,
+    _fee,
+    simple_annualized_yield_from_values,
+)
 from .predict_source import PredictBook, PredictMarket
 from .prediction_arbitrage import (
     MIN_THRESHOLD_ANNUALIZED_YIELD,
-    ThresholdHedgeIntent,
-    ThresholdHedgeLeg,
     ThresholdOrderBook,
     _book_segments,
     _protected_buy_candidates,
     _worst_price,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
-from .polymarket_relation_discovery import _fee, simple_annualized_yield
 
 
 Direction = Literal["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"]
@@ -204,8 +205,11 @@ def build_cross_venue_intents(
                     settlement_at=pair.polymarket.settlement_at,
                 ),
             )
-            annualized = _cross_venue_annualized_yield(
-                pair, legs, total_max_cost + maximum_fee, minimum_profit, now, resolution_at
+            annualized = simple_annualized_yield_from_values(
+                minimum_profit,
+                total_max_cost + maximum_fee,
+                now=now,
+                resolution_at=resolution_at,
             )
             if annualized is None or annualized < MIN_THRESHOLD_ANNUALIZED_YIELD:
                 continue
@@ -281,21 +285,6 @@ def _polymarket_segments(
 def _book_age(timestamp: object, now: datetime) -> bool:
     value = _fresh_datetime(timestamp)
     return value is None or not Decimal("0") <= Decimal(str((now - value).total_seconds())) <= Decimal(str(_CROSS_VENUE_BOOK_FRESHNESS_SECONDS))
-
-
-def _cross_venue_annualized_yield(
-    pair: ExplicitMarketPair, legs: tuple[CrossVenueLeg, CrossVenueLeg],
-    capital: Decimal, profit: Decimal, now: datetime, resolution_at: datetime,
-) -> Decimal | None:
-    annualized_intent = ThresholdHedgeIntent(
-        relation_id=pair.pair_id, event_id=pair.pair_id, relation="A_IMPLIES_B",
-        leg_a=ThresholdHedgeLeg("A", legs[0].condition_id, legs[0].market_id, legs[0].outcome, legs[0].token_id, legs[0].quantity, legs[0].max_price, legs[0].max_cost, pair.predict.tick_size),
-        leg_b=ThresholdHedgeLeg("B", legs[1].condition_id, legs[1].market_id, legs[1].outcome, legs[1].token_id, legs[1].quantity, legs[1].max_price, legs[1].max_cost, pair.polymarket.tick_size),
-        quantity=legs[0].quantity, maximum_fee=capital - legs[0].max_cost - legs[1].max_cost,
-        total_max_cost=capital, minimum_payout=legs[0].quantity,
-        minimum_profit=profit, net_edge=profit / legs[0].quantity,
-    )
-    return simple_annualized_yield(annualized_intent, now=now, resolution_at=resolution_at)
 
 
 def resolve_explicit_market_pairs(

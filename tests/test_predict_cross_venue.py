@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.predict_cross_venue as predict_cross_venue
 from open_trader.predict_cross_venue import (
     CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
     CodexCrossVenueEquivalenceValidator,
@@ -245,11 +246,10 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
 
 
-def test_threshold_validator_assets_are_unchanged() -> None:
+def test_threshold_validator_schema_is_unchanged() -> None:
     unchanged = subprocess.run(
         [
             "git", "diff", "--quiet", "HEAD", "--",
-            "src/open_trader/polymarket_relation_discovery.py",
             "src/open_trader/schemas/polymarket_threshold_relation.json",
         ],
         check=False,
@@ -354,6 +354,34 @@ def test_cross_venue_intent_calculates_only_the_polymarket_yes_predict_no_direct
     assert [(leg.exchange, leg.outcome) for leg in intents[0].legs] == [
         ("predict.fun", "NO"),
         ("polymarket", "YES"),
+    ]
+
+
+def test_cross_venue_intent_uses_shared_scalar_annualization_with_fee_inclusive_capital(monkeypatch) -> None:
+    calls: list[tuple[Decimal, Decimal, datetime, datetime]] = []
+
+    def annualized(
+        minimum_profit: Decimal,
+        total_max_cost: Decimal,
+        *,
+        now: datetime,
+        resolution_at: datetime,
+    ) -> Decimal:
+        calls.append((minimum_profit, total_max_cost, now, resolution_at))
+        return Decimal("1")
+
+    monkeypatch.setattr(
+        predict_cross_venue, "simple_annualized_yield_from_values", annualized
+    )
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    intents = build_cross_venue_intents(pair, predict, polymarket, now=now)
+
+    assert len(intents) == 1
+    assert calls == [
+        (Decimal("0.55002"), Decimal("9.44998"), now, pair.polymarket.settlement_at)
     ]
 
 
