@@ -179,9 +179,9 @@ def test_missing_or_rejected_key_is_safe_and_never_retried() -> None:
 
 
 class FakeWebSocket:
-    def __init__(self) -> None:
+    def __init__(self, messages: list[object] | None = None) -> None:
         self.sent: list[str] = []
-        self.messages = [
+        self.messages = messages or [
             json.dumps({"type": "M", "topic": "heartbeat", "data": 1736696400000}),
             json.dumps(
                 {
@@ -210,7 +210,26 @@ class FakeWebSocket:
     async def recv(self) -> str:
         if not self.messages:
             raise StopAsyncIteration
-        return self.messages.pop(0)
+        message = self.messages.pop(0)
+        if isinstance(message, Exception):
+            raise message
+        return str(message)
+
+
+def book_message(version: int, timestamp: int, *, asks: object = None) -> str:
+    return json.dumps(
+        {
+            "type": "M",
+            "topic": "predictOrderbook/123",
+            "data": {
+                "marketId": 123,
+                "version": version,
+                "updateTimestampMs": timestamp,
+                "asks": asks if asks is not None else [["0.51", "3"]],
+                "bids": [["0.50", "2"]],
+            },
+        }
+    )
 
 
 def test_stream_subscribes_and_echoes_heartbeat_without_exposing_api_key() -> None:
@@ -238,3 +257,99 @@ def test_stream_subscribes_and_echoes_heartbeat_without_exposing_api_key() -> No
     assert snapshot["rest"] == "ready"
     assert snapshot["ws"] == "ready"
     assert "predict-key-sentinel" not in repr(snapshot)
+
+
+def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
+    connections = iter(
+        (
+            FakeWebSocket(
+                [
+                    book_message(5, 1788048000000),
+                    ConnectionError("connection dropped"),
+                ]
+            ),
+            FakeWebSocket(
+                [
+                    book_message(1, 1788048001000),
+                    book_message(6, 1788048002000),
+                ]
+            ),
+        )
+    )
+    source, _ = source_with_responses(
+        [{"success": True, "data": market()}], connector=lambda *args, **kwargs: next(connections)
+    )
+
+    async def collect_two() -> tuple[object, object]:
+        stream = source.stream_books(("123",))
+        try:
+            return await anext(stream), await anext(stream)
+        finally:
+            await stream.aclose()
+
+    _, reconnected = asyncio.run(collect_two())
+
+    assert reconnected.source_timestamp == datetime.fromtimestamp(1788048001, UTC)
+
+
+def test_non_finite_book_prices_are_dropped_without_raising() -> None:
+    source, _ = source_with_responses(
+        [
+            {"success": True, "data": market()},
+            {
+                "success": True,
+                "data": {
+                    "marketId": 123,
+                    "version": 1,
+                    "updateTimestampMs": 1788048000000,
+                    "asks": [["NaN", "3"]],
+                    "bids": [["0.50", "2"]],
+                },
+            },
+        ]
+    )
+
+    assert asyncio.run(source.get_order_book("123")) is None
+    assert source.snapshot()["rest"] == "stale"
+
+
+def test_rest_and_websocket_failures_keep_each_other_health() -> None:
+    websocket_source, _ = source_with_responses(
+        [{"success": True, "data": market()}],
+        connector=lambda *args, **kwargs: FakeWebSocket(
+            [book_message(1, 1788048000000, asks=[]), book_message(2, 1788048001000)]
+        ),
+    )
+
+    async def stream_one(source: PredictSource) -> object:
+        stream = source.stream_books(("123",))
+        try:
+            return await anext(stream)
+        finally:
+            await stream.aclose()
+
+    assert asyncio.run(stream_one(websocket_source)).market_id == "123"
+    assert websocket_source.snapshot()["rest"] == "ready"
+    assert websocket_source.snapshot()["ws"] == "stale"
+
+    rest_source, _ = source_with_responses(
+        [
+            {"success": True, "data": market()},
+            {
+                "success": True,
+                "data": {
+                    "marketId": 123,
+                    "version": 2,
+                    "updateTimestampMs": 1788048001000,
+                    "asks": [],
+                    "bids": [["0.50", "2"]],
+                },
+            },
+        ],
+        connector=lambda *args, **kwargs: FakeWebSocket([book_message(1, 1788048000000)]),
+    )
+
+    assert asyncio.run(stream_one(rest_source)).market_id == "123"
+    assert asyncio.run(rest_source.get_order_book("123")) is None
+    assert rest_source.snapshot()["rest"] == "stale"
+    assert rest_source.snapshot()["ws"] == "ready"

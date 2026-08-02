@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -124,7 +124,7 @@ class PredictSource:
         payload = await self._rest_json(f"/v1/markets/{market.market_id}/orderbook")
         if payload is None:
             return None
-        return self._accept_book(market, payload.get("data"))
+        return self._accept_book(market, payload.get("data"), source="rest")
 
     async def stream_books(self, market_ids: Sequence[str]) -> AsyncIterator[PredictBook]:
         try:
@@ -148,6 +148,7 @@ class PredictSource:
         attempt = 0
         while True:
             self._books.clear()
+            self._versions.clear()
             self._ws_status = "stale"
             try:
                 connection = self._websocket_connect(
@@ -184,7 +185,11 @@ class PredictSource:
                         if not isinstance(topic, str) or not topic.startswith("predictOrderbook/"):
                             continue
                         market = markets.get(topic.removeprefix("predictOrderbook/"))
-                        book = self._accept_book(market, message.get("data")) if market else None
+                        book = (
+                            self._accept_book(market, message.get("data"), source="ws")
+                            if market
+                            else None
+                        )
                         if book is not None:
                             yield book
             except Exception as exc:
@@ -251,19 +256,21 @@ class PredictSource:
         with self._urlopen_fn(request, timeout=_REST_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def _accept_book(self, market: PredictMarket, payload: object) -> PredictBook | None:
+    def _accept_book(
+        self, market: PredictMarket, payload: object, *, source: Literal["rest", "ws"]
+    ) -> PredictBook | None:
         if not isinstance(payload, dict) or str(payload.get("marketId")) != market.market_id:
-            self._mark_stale()
+            self._mark_stale(source)
             return None
         version = payload.get("version")
         if not isinstance(version, int) or version <= self._versions.get(market.market_id, 0):
-            self._mark_stale()
+            self._mark_stale(source)
             return None
         timestamp = _timestamp(payload.get("updateTimestampMs"))
         asks = _levels(payload.get("asks"), market.tick_size, ascending=True)
         bids = _levels(payload.get("bids"), market.tick_size, ascending=False)
         if timestamp is None or not asks or not bids:
-            self._mark_stale()
+            self._mark_stale(source)
             return None
         no_asks = tuple(
             BookLevel(
@@ -272,7 +279,7 @@ class PredictSource:
             for level in reversed(bids)
         )
         if any(level.price < 0 or level.price > 1 for level in no_asks):
-            self._mark_stale()
+            self._mark_stale(source)
             return None
         book = PredictBook(
             market_id=market.market_id,
@@ -285,10 +292,12 @@ class PredictSource:
         self._books[market.market_id] = book
         return book
 
-    def _mark_stale(self) -> None:
+    def _mark_stale(self, source: Literal["rest", "ws"]) -> None:
         self._books.clear()
-        self._rest_status = "stale"
-        self._ws_status = "stale" if self._ws_status == "ready" else self._ws_status
+        if source == "rest":
+            self._rest_status = "stale"
+        else:
+            self._ws_status = "stale"
 
 
 def _normalise_market(payload: object) -> PredictMarket | None:
@@ -401,9 +410,10 @@ def _datetime(value: object) -> datetime | None:
 
 def _decimal(value: object) -> Decimal | None:
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _text(value: object) -> str:
