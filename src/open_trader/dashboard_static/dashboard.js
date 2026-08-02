@@ -2364,7 +2364,7 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
       const amount = predictionHasValue(balance.value) ? predictionMoney(balance.value) : "-";
       const healthLabel = (value) => String(value).toLowerCase() === "unavailable" ? "不可用" : value;
       const detail = venue.reason
-        ? `<small>原因：${escapeHtml(predictionFailureReasonLabel(venue.reason))}</small>`
+        ? `<small>原因：${escapeHtml(predictionFailureReasonLabel({failure_reason: venue.reason}))}</small>`
         : venue.last_success ? `<small>最近成功 ${escapeHtml(predictionValue(venue.last_success))}</small>` : "";
       return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}</small>${detail}</article>`;
     }).join("")}</section>`;

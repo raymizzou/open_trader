@@ -71,6 +71,13 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     }
   });
 
+  test('shows a venue reason instead of its old success timestamp', async ({ page }) => {
+    await openPrediction(page, 'predict-pending');
+    const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
+    await expect(predict).toContainText('原因：api key pending');
+    await expect(predict).not.toContainText('最近成功');
+  });
+
   test('preserves the production LLM hedge math and rejection evidence', async ({ page }) => {
     for (const viewport of [
       { width: 1440, height: 1100 },
