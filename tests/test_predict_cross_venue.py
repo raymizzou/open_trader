@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import subprocess
-from dataclasses import replace
-from datetime import UTC, datetime
+from dataclasses import asdict, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,9 +14,11 @@ from open_trader.predict_cross_venue import (
     CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
     CodexCrossVenueEquivalenceValidator,
     ExplicitMarketPair,
+    build_cross_venue_intents,
     resolve_explicit_market_pairs,
 )
-from open_trader.predict_source import PredictMarket
+from open_trader.predict_source import PredictBook, PredictMarket
+from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
 
@@ -254,3 +256,126 @@ def test_threshold_validator_assets_are_unchanged() -> None:
     )
 
     assert unchanged.returncode == 0
+
+
+def cross_venue_pair() -> ExplicitMarketPair:
+    pair = explicit_pair()
+    return ExplicitMarketPair(
+        pair_id=pair.pair_id,
+        predict=replace(pair.predict, settlement_at=datetime(2026, 1, 11, tzinfo=UTC)),
+        polymarket=replace(pair.polymarket, settlement_at=datetime(2026, 1, 21, tzinfo=UTC)),
+    )
+
+
+def cross_venue_books() -> tuple[PredictBook, dict[str, ThresholdOrderBook]]:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    predict = PredictBook(
+        market_id="predict-market-1",
+        yes_asks=(
+            BookLevel(Decimal("0.40"), Decimal("5")),
+            BookLevel(Decimal("0.41"), Decimal("5")),
+        ),
+        no_asks=(BookLevel(Decimal("0.60"), Decimal("10")),),
+        source_timestamp=now,
+        received_at=now,
+    )
+    books = {
+        "poly-yes-1": ThresholdOrderBook(
+            token_id="poly-yes-1",
+            asks=(BookLevel(Decimal("0.80"), Decimal("10")),),
+            bids=(BookLevel(Decimal("0.79"), Decimal("10")),),
+            confirmed_at=now,
+        ),
+        "poly-no-1": ThresholdOrderBook(
+            token_id="poly-no-1",
+            asks=(
+                BookLevel(Decimal("0.50"), Decimal("5")),
+                BookLevel(Decimal("0.51"), Decimal("5")),
+            ),
+            bids=(BookLevel(Decimal("0.49"), Decimal("10")),),
+            confirmed_at=now,
+        ),
+    }
+    return predict, books
+
+
+def test_cross_venue_intent_uses_decimal_depth_fees_later_settlement_and_venue_ids() -> None:
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+
+    intents = build_cross_venue_intents(
+        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+
+    assert len(intents) == 1
+    intent = intents[0]
+    assert intent.direction == "PREDICT_YES_POLYMARKET_NO"
+    assert intent.quantity == Decimal("10")
+    assert intent.total_max_cost == Decimal("9.20")
+    assert intent.maximum_fee == Decimal("0.24998")
+    assert intent.minimum_payout == Decimal("10")
+    assert intent.minimum_profit == Decimal("0.55002")
+    assert intent.resolution_at == datetime(2026, 1, 21, tzinfo=UTC)
+    assert intent.annualized_yield == Decimal("0.55002") / Decimal("9.44998") * Decimal("365") / Decimal("20")
+    assert [(leg.exchange, leg.outcome, leg.max_price, leg.max_cost, leg.maximum_fee) for leg in intent.legs] == [
+        ("predict.fun", "YES", Decimal("0.41"), Decimal("4.10"), Decimal("0.20")),
+        ("polymarket", "NO", Decimal("0.51"), Decimal("5.10"), Decimal("0.04998")),
+    ]
+    assert [(leg.settlement_asset, leg.market_id, leg.condition_id, leg.token_id) for leg in intent.legs] == [
+        ("USDT", "predict-market-1", "predict-native-condition-1", "predict-yes-1"),
+        ("USDC", "poly-market-1", "poly-condition", "poly-no-1"),
+    ]
+    assert set(asdict(intent.legs[0])) == {
+        "exchange", "market_id", "condition_id", "outcome", "token_id",
+        "settlement_asset", "quantity", "max_price", "max_cost", "maximum_fee",
+        "book_timestamp", "settlement_at",
+    }
+
+
+def test_cross_venue_intent_calculates_only_the_polymarket_yes_predict_no_direction() -> None:
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+    predict = replace(
+        predict,
+        yes_asks=(BookLevel(Decimal("0.70"), Decimal("10")),),
+        no_asks=(BookLevel(Decimal("0.30"), Decimal("10")),),
+    )
+    polymarket["poly-yes-1"] = replace(
+        polymarket["poly-yes-1"],
+        asks=(BookLevel(Decimal("0.50"), Decimal("10")),),
+        bids=(BookLevel(Decimal("0.49"), Decimal("10")),),
+    )
+
+    intents = build_cross_venue_intents(
+        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+
+    assert [intent.direction for intent in intents] == ["POLYMARKET_YES_PREDICT_NO"]
+    assert [(leg.exchange, leg.outcome) for leg in intents[0].legs] == [
+        ("predict.fun", "NO"),
+        ("polymarket", "YES"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda pair, predict, books: (replace(pair, predict=replace(pair.predict, minimum_order_size=Decimal("11"))), predict, books),
+        lambda pair, predict, books: (replace(pair, predict=replace(pair.predict, tick_size=Decimal("0.03"))), predict, books),
+        lambda pair, predict, books: (replace(pair, predict=replace(pair.predict, fee_rate_bps=Decimal("1000"))), predict, books),
+        lambda pair, predict, books: (replace(pair, polymarket=replace(pair.polymarket, settlement_at=datetime(2036, 1, 1, tzinfo=UTC))), predict, books),
+        lambda pair, predict, books: (pair, replace(predict, received_at=datetime(2026, 1, 1, tzinfo=UTC) - timedelta(seconds=11)), books),
+        lambda pair, predict, books: (pair, replace(predict, yes_asks=(BookLevel(0.40, Decimal("10")),)), books),
+        lambda pair, predict, books: (pair, replace(predict, yes_asks=(BookLevel(Decimal("0.40"), Decimal("-1")),)), books),
+        lambda pair, predict, books: (pair, replace(predict, yes_asks=(BookLevel(Decimal("NaN"), Decimal("10")),)), books),
+        lambda pair, predict, books: (pair, replace(predict, no_asks=(BookLevel(Decimal("0.59"), Decimal("10")),)), books),
+        lambda pair, predict, books: (pair, predict, {**books, "poly-no-1": replace(books["poly-no-1"], bids=(BookLevel(Decimal("0.51"), Decimal("10")),))}),
+        lambda pair, predict, books: (pair, predict, {**books, "poly-no-1": replace(books["poly-no-1"], confirmed_at=datetime(2026, 1, 1, tzinfo=UTC) - timedelta(seconds=11))}),
+    ],
+)
+def test_cross_venue_intent_fails_closed_for_invalid_depth_fees_and_freshness(mutate) -> None:
+    pair, predict, polymarket = mutate(cross_venue_pair(), *cross_venue_books())
+
+    assert build_cross_venue_intents(
+        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
+    ) == ()

@@ -14,8 +14,18 @@ from pathlib import Path
 from typing import Literal
 
 from .polymarket_relation_discovery import _codex_events
-from .predict_source import PredictMarket
+from .predict_source import PredictBook, PredictMarket
+from .prediction_arbitrage import (
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
+    ThresholdHedgeIntent,
+    ThresholdHedgeLeg,
+    ThresholdOrderBook,
+    _book_segments,
+    _protected_buy_candidates,
+    _worst_price,
+)
 from .prediction_arbitrage_store import PredictionArbitrageStore
+from .polymarket_relation_discovery import _fee, simple_annualized_yield
 
 
 Direction = Literal["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"]
@@ -40,6 +50,7 @@ _RESULT_FIELDS = {
     "schema_version", "decision", "summary", "predict", "polymarket",
     "divergent_states", "evidence", "uncertainties",
 }
+_CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +93,209 @@ class CrossVenueValidation:
     prompt_version: str
     predict_fingerprint: str
     polymarket_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class CrossVenueLeg:
+    exchange: Literal["predict.fun", "polymarket"]
+    market_id: str
+    condition_id: str
+    outcome: Literal["YES", "NO"]
+    token_id: str
+    settlement_asset: str
+    quantity: Decimal
+    max_price: Decimal
+    max_cost: Decimal
+    maximum_fee: Decimal
+    book_timestamp: datetime
+    settlement_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CrossVenueIntent:
+    pair_id: str
+    direction: Direction
+    legs: tuple[CrossVenueLeg, CrossVenueLeg]
+    quantity: Decimal
+    total_max_cost: Decimal
+    maximum_fee: Decimal
+    minimum_payout: Decimal
+    minimum_profit: Decimal
+    annualized_yield: Decimal
+    resolution_at: datetime
+
+
+def build_cross_venue_intents(
+    pair: ExplicitMarketPair,
+    predict_book: PredictBook,
+    polymarket_books: Mapping[str, ThresholdOrderBook],
+    *,
+    now: datetime,
+) -> tuple[CrossVenueIntent, ...]:
+    """Return clear, equal-share intents for the two approved venue directions."""
+
+    now = _fresh_datetime(now)
+    if now is None or not _valid_market_pair(pair) or not isinstance(predict_book, PredictBook):
+        return ()
+    predict_segments = _predict_segments(pair.predict, predict_book, now)
+    if predict_segments is None or not isinstance(polymarket_books, Mapping):
+        return ()
+    resolution_at = max(pair.predict.settlement_at, pair.polymarket.settlement_at)
+    intents: list[CrossVenueIntent] = []
+    for direction, predict_outcome, polymarket_outcome in (
+        ("PREDICT_YES_POLYMARKET_NO", "YES", "NO"),
+        ("POLYMARKET_YES_PREDICT_NO", "NO", "YES"),
+    ):
+        token_id = (
+            pair.polymarket.yes_token_id
+            if polymarket_outcome == "YES"
+            else pair.polymarket.no_token_id
+        )
+        polymarket_book = polymarket_books.get(token_id)
+        polymarket_segments = _polymarket_segments(
+            pair.polymarket, polymarket_book, token_id, now
+        )
+        if polymarket_segments is None:
+            continue
+        predict_side = predict_segments[predict_outcome]
+        candidates = _protected_buy_candidates(
+            predict_side, pair.predict.tick_size
+        )
+        polymarket_candidates = _protected_buy_candidates(
+            polymarket_segments, pair.polymarket.tick_size
+        )
+        minimum = max(pair.predict.minimum_order_size, pair.polymarket.minimum_order_size)
+        for quantity in sorted(candidates.keys() & polymarket_candidates.keys(), reverse=True):
+            if quantity < minimum:
+                continue
+            predict_price = _worst_price(predict_side, quantity)
+            polymarket_price = _worst_price(polymarket_segments, quantity)
+            if predict_price is None or polymarket_price is None:
+                continue
+            predict_cost = candidates[quantity]
+            polymarket_cost = polymarket_candidates[quantity]
+            # ponytail: conservative payout-base ceiling; replace only when Predict exposes
+            # a deterministic pre-trade fee quote.
+            predict_fee = quantity * pair.predict.fee_rate_bps / Decimal("10000")
+            polymarket_fee = _fee(
+                quantity, pair.polymarket.fee_rate_bps / Decimal("10000"), polymarket_price
+            )
+            total_max_cost = predict_cost + polymarket_cost
+            maximum_fee = predict_fee + polymarket_fee
+            minimum_payout = quantity
+            minimum_profit = minimum_payout - total_max_cost - maximum_fee
+            if total_max_cost + maximum_fee >= minimum_payout:
+                continue
+            legs = (
+                CrossVenueLeg(
+                    exchange="predict.fun", market_id=pair.predict.market_id,
+                    condition_id=pair.predict.condition_id, outcome=predict_outcome,
+                    token_id=pair.predict.yes_token_id if predict_outcome == "YES" else pair.predict.no_token_id,
+                    settlement_asset=pair.predict.settlement_asset, quantity=quantity,
+                    max_price=predict_price, max_cost=predict_cost, maximum_fee=predict_fee,
+                    book_timestamp=predict_book.source_timestamp, settlement_at=pair.predict.settlement_at,
+                ),
+                CrossVenueLeg(
+                    exchange="polymarket", market_id=pair.polymarket.market_id,
+                    condition_id=pair.polymarket.condition_id, outcome=polymarket_outcome,
+                    token_id=token_id, settlement_asset=pair.polymarket.settlement_asset,
+                    quantity=quantity, max_price=polymarket_price, max_cost=polymarket_cost,
+                    maximum_fee=polymarket_fee, book_timestamp=polymarket_book.confirmed_at,
+                    settlement_at=pair.polymarket.settlement_at,
+                ),
+            )
+            annualized = _cross_venue_annualized_yield(
+                pair, legs, total_max_cost + maximum_fee, minimum_profit, now, resolution_at
+            )
+            if annualized is None or annualized < MIN_THRESHOLD_ANNUALIZED_YIELD:
+                continue
+            intents.append(CrossVenueIntent(
+                pair_id=pair.pair_id, direction=direction, legs=legs, quantity=quantity,
+                total_max_cost=total_max_cost, maximum_fee=maximum_fee,
+                minimum_payout=minimum_payout, minimum_profit=minimum_profit,
+                annualized_yield=annualized, resolution_at=resolution_at,
+            ))
+            break
+    return tuple(intents)
+
+
+def _fresh_datetime(value: object) -> datetime | None:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    return value.astimezone(UTC)
+
+
+def _valid_market_pair(pair: object) -> bool:
+    if not isinstance(pair, ExplicitMarketPair):
+        return False
+    for market in (pair.predict, pair.polymarket):
+        if (
+            not isinstance(market, VenueMarket)
+            or not all(isinstance(value, str) and value for value in (
+                market.market_id, market.condition_id, market.yes_token_id,
+                market.no_token_id, market.settlement_asset,
+            ))
+            or market.yes_token_id == market.no_token_id
+            or _fresh_datetime(market.settlement_at) is None
+            or any(not isinstance(value, Decimal) or not value.is_finite() or value <= 0 for value in (
+                market.minimum_order_size, market.tick_size,
+            ))
+            or not isinstance(market.fee_rate_bps, Decimal)
+            or not market.fee_rate_bps.is_finite() or market.fee_rate_bps < 0
+        ):
+            return False
+    return True
+
+
+def _predict_segments(
+    market: VenueMarket, book: PredictBook, now: datetime,
+) -> dict[Literal["YES", "NO"], list[tuple[Decimal, Decimal, Decimal]]] | None:
+    if (
+        book.market_id != market.market_id
+        or any(_book_age(timestamp, now) for timestamp in (book.source_timestamp, book.received_at))
+    ):
+        return None
+    yes = _book_segments(book.yes_asks, market.tick_size)
+    no = _book_segments(book.no_asks, market.tick_size)
+    if yes is None or no is None or yes[0][0] + no[0][0] < Decimal("1"):
+        return None
+    return {"YES": yes, "NO": no}
+
+
+def _polymarket_segments(
+    market: VenueMarket, book: object, token_id: str, now: datetime,
+) -> list[tuple[Decimal, Decimal, Decimal]] | None:
+    if (
+        not isinstance(book, ThresholdOrderBook)
+        or book.token_id != token_id
+        or _book_age(book.confirmed_at, now)
+    ):
+        return None
+    asks = _book_segments(book.asks, market.tick_size)
+    bids = _book_segments(book.bids, market.tick_size)
+    if asks is None or bids is None or bids[-1][0] >= asks[0][0]:
+        return None
+    return asks
+
+
+def _book_age(timestamp: object, now: datetime) -> bool:
+    value = _fresh_datetime(timestamp)
+    return value is None or not Decimal("0") <= Decimal(str((now - value).total_seconds())) <= Decimal(str(_CROSS_VENUE_BOOK_FRESHNESS_SECONDS))
+
+
+def _cross_venue_annualized_yield(
+    pair: ExplicitMarketPair, legs: tuple[CrossVenueLeg, CrossVenueLeg],
+    capital: Decimal, profit: Decimal, now: datetime, resolution_at: datetime,
+) -> Decimal | None:
+    annualized_intent = ThresholdHedgeIntent(
+        relation_id=pair.pair_id, event_id=pair.pair_id, relation="A_IMPLIES_B",
+        leg_a=ThresholdHedgeLeg("A", legs[0].condition_id, legs[0].market_id, legs[0].outcome, legs[0].token_id, legs[0].quantity, legs[0].max_price, legs[0].max_cost, pair.predict.tick_size),
+        leg_b=ThresholdHedgeLeg("B", legs[1].condition_id, legs[1].market_id, legs[1].outcome, legs[1].token_id, legs[1].quantity, legs[1].max_price, legs[1].max_cost, pair.polymarket.tick_size),
+        quantity=legs[0].quantity, maximum_fee=capital - legs[0].max_cost - legs[1].max_cost,
+        total_max_cost=capital, minimum_payout=legs[0].quantity,
+        minimum_profit=profit, net_edge=profit / legs[0].quantity,
+    )
+    return simple_annualized_yield(annualized_intent, now=now, resolution_at=resolution_at)
 
 
 def resolve_explicit_market_pairs(
