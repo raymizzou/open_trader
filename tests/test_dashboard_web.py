@@ -2319,6 +2319,40 @@ def test_prediction_venue_pending_predict_does_not_degrade_polymarket() -> None:
     }
 
 
+def test_prediction_state_serializes_datetime_venue_success() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc),
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                    "geoblock": "allowed",
+                    "relayer": "ready",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    state = _prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        execution=type("Execution", (), {"_breaker_open": False})(),
+        csrf_token="csrf",
+    )
+
+    assert state["venues"][0]["last_success"] == datetime(
+        2026, 8, 2, 1, 0, tzinfo=timezone.utc
+    ).astimezone().isoformat()
+    json.dumps(state, ensure_ascii=False)
+
+
 def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

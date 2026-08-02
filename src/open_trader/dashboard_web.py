@@ -856,7 +856,7 @@ def _prediction_state_payload(
         "allowance": readiness.get("p_usd_allowance", readiness.get("allowance")),
     }
     venues = _prediction_venues_payload(
-        snapshot=snapshot,
+        snapshot=safe_snapshot,
         readiness=readiness,
         health=health,
         masked_wallet=masked_wallet,
