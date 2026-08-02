@@ -152,7 +152,11 @@ class PredictSource:
         while True:
             self._books["ws"].clear()
             self._versions["ws"].clear()
-            self._ws_status = "stale"
+            self._set_status(
+                "ws",
+                "stale",
+                "ws_connecting" if attempt == 0 else "ws_reconnecting",
+            )
             try:
                 connection = self._websocket_connect(
                     PREDICT_WEBSOCKET_URL, additional_headers={"x-api-key": api_key}

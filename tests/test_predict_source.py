@@ -318,6 +318,7 @@ def test_stream_subscribes_and_echoes_heartbeat_without_exposing_api_key() -> No
 
 def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
     reconnect_snapshots: list[dict[str, object]] = []
+    setup_reasons: list[object] = []
     source: PredictSource
 
     async def reconnect_sleep(seconds: float) -> None:
@@ -340,9 +341,15 @@ def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
             ),
         )
     )
+
+    def connect(*args: object, **kwargs: object) -> FakeWebSocket:
+        del args, kwargs
+        setup_reasons.append(source.snapshot()["ws_reason"])
+        return next(connections)
+
     source, _ = source_with_responses(
         [{"success": True, "data": market()}],
-        connector=lambda *args, **kwargs: next(connections),
+        connector=connect,
         sleep_fn=reconnect_sleep,
     )
 
@@ -356,6 +363,7 @@ def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
     _, reconnected = asyncio.run(collect_two())
 
     assert reconnected.source_timestamp == datetime.fromtimestamp(1788048001, UTC)
+    assert setup_reasons == ["ws_connecting", "ws_reconnecting"]
     assert [{
         "venue": "predict.fun",
         "wallet": "0xcE23…f435",

@@ -1834,25 +1834,31 @@ class _UnavailableCrossVenueMonitor:
 class _CrossVenueRuntime:
     def __init__(self, monitor: PredictCrossVenueMonitor) -> None:
         self._monitor = monitor
+        self._predict = getattr(monitor, "_predict", None)
         self._started = threading.Event()
         self._stop_requested = threading.Event()
         self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def start(self) -> None:
         if self._thread is not None:
             return
 
         async def run() -> None:
+            self._loop = asyncio.get_running_loop()
             try:
-                result = self._monitor.start()
+                try:
+                    result = self._monitor.start()
+                    if inspect.isawaitable(result):
+                        await result
+                finally:
+                    self._started.set()
+                await asyncio.to_thread(self._stop_requested.wait)
+                result = self._monitor.stop()
                 if inspect.isawaitable(result):
                     await result
             finally:
-                self._started.set()
-            await asyncio.to_thread(self._stop_requested.wait)
-            result = self._monitor.stop()
-            if inspect.isawaitable(result):
-                await result
+                self._loop = None
 
         self._thread = threading.Thread(
             target=lambda: asyncio.run(run()),
@@ -1861,6 +1867,24 @@ class _CrossVenueRuntime:
         )
         self._thread.start()
         self._started.wait(timeout=5)
+
+    def snapshot(self) -> dict[str, object]:
+        loop = self._loop
+        if (
+            loop is None
+            or loop.is_closed()
+            or self._thread is threading.current_thread()
+        ):
+            return self._monitor.snapshot()
+        try:
+            return asyncio.run_coroutine_threadsafe(
+                self._snapshot_on_loop(), loop
+            ).result(timeout=1)
+        except Exception:
+            return {}
+
+    async def _snapshot_on_loop(self) -> dict[str, object]:
+        return self._monitor.snapshot()
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -2035,7 +2059,7 @@ def serve_dashboard(
         eastmoney_password=eastmoney_password,
         prediction_store=prediction_store,
         prediction_monitor=prediction_monitor,
-        cross_venue_monitor=cross_venue_monitor,
+        cross_venue_monitor=cross_runtime or cross_venue_monitor,
         prediction_execution_service=prediction_execution,
         runtime_metadata=runtime_metadata,
     )

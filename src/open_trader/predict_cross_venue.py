@@ -716,7 +716,6 @@ class PredictCrossVenueMonitor:
         await self._suspend_hot(status=self._source_status())
 
     def snapshot(self) -> dict[str, object]:
-        self._maintain_open_opportunities()
         return copy.deepcopy(
             {
                 "status": self._status,
@@ -1162,6 +1161,8 @@ class PredictCrossVenueMonitor:
             self._predict_generation = generation
         if changed or status != "ready":
             await self._suspend_hot(status=status if status != "ready" else "degraded")
+        else:
+            self._maintain_open_opportunities()
 
     @staticmethod
     def _same_fingerprints(

@@ -2503,6 +2503,33 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
     assert order.index("cross.stop") < order.index("polymarket.stop") < order.index("server.close")
 
 
+def test_cross_venue_runtime_marshals_snapshot_onto_its_monitor_loop() -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    class FakeCrossMonitor:
+        def __init__(self) -> None:
+            self.snapshot_threads: list[int] = []
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+        def snapshot(self) -> dict[str, object]:
+            self.snapshot_threads.append(threading.get_ident())
+            return {"status": "ready", "funnel": {}, "events": [], "opportunities": []}
+
+    monitor = FakeCrossMonitor()
+    runtime = dashboard_web._CrossVenueRuntime(monitor)
+    runtime.start()
+    try:
+        assert runtime.snapshot()["status"] == "ready"
+        assert monitor.snapshot_threads == [runtime._thread.ident]  # type: ignore[union-attr]
+    finally:
+        runtime.stop()
+
+
 def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> None:
     from open_trader.dashboard_web import _prediction_history_payload, _prediction_state_payload
 

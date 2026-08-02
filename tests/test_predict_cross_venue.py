@@ -792,7 +792,8 @@ def test_monitor_snapshot_closes_episode_when_books_age_without_another_update()
 
         now[0] += timedelta(seconds=11)
 
-        assert monitor.snapshot()["opportunities"] == []
+        assert monitor.snapshot()["opportunities"]
+        await wait_until(lambda: monitor.snapshot()["opportunities"] == [])
         assert monitor.snapshot()["funnel"]["clear_signal_pairs"] == 0
         await monitor.stop()
 
