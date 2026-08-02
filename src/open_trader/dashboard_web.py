@@ -746,16 +746,22 @@ def _prediction_state_payload(
     opportunities = safe_snapshot.get("opportunities")
     event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
     opportunity_rows = [row for row in opportunities if isinstance(row, Mapping)] if isinstance(opportunities, (list, tuple)) else []
-    event_rows.extend(cross_venue["events"])
-    opportunity_rows.extend(cross_venue["opportunities"])
     event_rows = [
-        _prediction_attach_cached_title(store, _prediction_event_aliases(row))
+        _prediction_event_aliases(row)
         for row in event_rows
     ]
     opportunity_rows = [
-        _prediction_attach_cached_title(store, _prediction_opportunity_aliases(row))
+        _prediction_opportunity_aliases(row)
         for row in opportunity_rows
     ]
+    event_rows.extend(
+        _prediction_attach_cached_title(store, _prediction_event_aliases(row))
+        for row in cross_venue["events"]
+    )
+    opportunity_rows.extend(
+        _prediction_attach_cached_title(store, _prediction_opportunity_aliases(row))
+        for row in cross_venue["opportunities"]
+    )
     event_rows = sorted(
         (row for row in event_rows if isinstance(row, Mapping)), key=_prediction_sort_key
     )

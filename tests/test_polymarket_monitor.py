@@ -493,6 +493,26 @@ def test_start_primes_snapshot_metrics_before_monitor_thread(tmp_path: Path) -> 
         monitor.stop()
 
 
+def test_cached_title_projection_reads_store_outside_monitor_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader import polymarket_monitor
+
+    monitor = make_monitor(tmp_path)
+    monitor._events = {"event-1": {"title": "Will this happen?"}}
+    lock_states: list[bool] = []
+
+    def cached_title(_store: object, _title: str) -> str:
+        lock_states.append(monitor._lock._is_owned())
+        return "这会发生吗？"
+
+    monkeypatch.setattr(polymarket_monitor, "cached_prediction_title_zh", cached_title)
+    monitor._apply_cached_title_projections()
+
+    assert lock_states == [False]
+    assert monitor._events["event-1"]["title_zh"] == "这会发生吗？"
+
+
 def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     tmp_path: Path,
 ) -> None:

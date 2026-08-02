@@ -2353,6 +2353,59 @@ def test_prediction_state_serializes_datetime_venue_success() -> None:
     json.dumps(state, ensure_ascii=False)
 
 
+def test_prediction_state_does_not_requery_titles_already_owned_by_monitor() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeStore:
+        title_reads = 0
+
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return []
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+        def load_llm_cache(self, _cache_key: str) -> None:
+            type(self).title_reads += 1
+            return None
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {"status": "ready"},
+                "events": [
+                    {
+                        "event_id": "event-1",
+                        "title": "Will this happen?",
+                        "markets": [
+                            {"market_id": str(index), "question": f"Question {index}?"}
+                            for index in range(200)
+                        ],
+                    }
+                ],
+                "opportunities": [],
+            }
+
+    store = FakeStore()
+    state = _prediction_state_payload(
+        store=store,
+        monitor=FakeMonitor(),
+        execution=type("Execution", (), {"_breaker_open": False})(),
+        csrf_token="csrf",
+    )
+
+    assert len(state["events"][0]["markets"]) == 200
+    assert store.title_reads == 0
+
+
 def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

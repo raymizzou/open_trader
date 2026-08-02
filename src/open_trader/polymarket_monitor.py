@@ -3429,9 +3429,19 @@ class PolymarketMonitor:
 
     def _apply_cached_title_projections(self) -> None:
         with self._lock:
+            titles = [event.get("title", "") for event in self._events.values()]
+            titles.extend(
+                opportunity.get("question", "")
+                for opportunity in self._opportunities.values()
+                if opportunity.get("market_type") == "threshold_hedge"
+            )
+        for title in dict.fromkeys(str(title).strip() for title in titles if title):
+            self._cached_title_zh(title)
+
+        with self._lock:
             for event in self._events.values():
                 title = event.get("title", "")
-                translated = self._cached_title_zh(title)
+                translated = self._translated_titles.get(str(title).strip())
                 if translated is None:
                     event.pop("title_zh", None)
                     event.pop("event_title_zh", None)
@@ -3440,7 +3450,9 @@ class PolymarketMonitor:
                     event["event_title_zh"] = translated
             for opportunity in self._opportunities.values():
                 if opportunity.get("market_type") == "threshold_hedge":
-                    translated = self._cached_title_zh(opportunity.get("question"))
+                    translated = self._translated_titles.get(
+                        str(opportunity.get("question", "")).strip()
+                    )
                     if translated:
                         opportunity["event_title_zh"] = translated
                         opportunity["title_zh"] = translated
