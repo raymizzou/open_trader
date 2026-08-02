@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess
 from types import SimpleNamespace
 
 import pytest
@@ -14,13 +14,18 @@ from polymarket import PRODUCTION, SecureClient
 import open_trader.cli as cli
 from open_trader.polymarket_trading import (
     KEYCHAIN_SERVICE,
+    PREDICT_API_KEY_ACCOUNT,
+    PREDICT_KEYCHAIN_SERVICE,
     PolymarketTradingClient,
+    PredictConfig,
     ThresholdHedgeSubmission,
     ThresholdLegResult,
     TradingConfig,
     load_keychain_secret,
+    load_predict_api_key,
     load_trading_config,
     store_keychain_secret,
+    store_predict_api_key,
 )
 from open_trader.prediction_arbitrage import (
     PairIntent,
@@ -31,6 +36,7 @@ from open_trader.prediction_arbitrage import (
 
 SIGNER = "0x1111111111111111111111111111111111111111"
 WALLET = "0x2222222222222222222222222222222222222222"
+PREDICT_WALLET = "0xcE23B341C888A88C4C44D8B5Aa6D04A8615Ff435"
 
 
 def intent() -> PairIntent:
@@ -157,6 +163,122 @@ def test_config_accepts_canonical_addresses(tmp_path: Path) -> None:
     )
 
     assert load_trading_config(path) == TradingConfig(SIGNER, WALLET)
+
+
+def test_trading_config_accepts_only_the_optional_mainnet_predict_wallet(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "trading.json"
+    path.write_text(
+        json.dumps(
+            {
+                "signer_address": SIGNER,
+                "wallet_address": WALLET,
+                "predict": {
+                    "wallet_address": PREDICT_WALLET,
+                    "environment": "mainnet",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_trading_config(path) == TradingConfig(
+        SIGNER,
+        WALLET,
+        PredictConfig(wallet_address=PREDICT_WALLET),
+    )
+
+    for predict in (
+        None,
+        {"wallet_address": PREDICT_WALLET, "environment": "testnet"},
+        {"wallet_address": PREDICT_WALLET, "environment": "mainnet", "api_key": "no"},
+        {"wallet_address": "0x1", "environment": "mainnet"},
+    ):
+        path.write_text(
+            json.dumps(
+                {"signer_address": SIGNER, "wallet_address": WALLET, "predict": predict}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            load_trading_config(path)
+
+
+def test_predict_api_key_stays_in_its_own_keychain_service() -> None:
+    calls: list[tuple[list[str], object]] = []
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        calls.append((args, kwargs.get("input")))
+        return CompletedProcess(args, 0, "", "")
+
+    store_predict_api_key("predict-key-sentinel", run=run)
+
+    assert calls == [
+        (
+            [
+                "/usr/bin/security",
+                "add-generic-password",
+                "-U",
+                "-a",
+                PREDICT_API_KEY_ACCOUNT,
+                "-s",
+                PREDICT_KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            "predict-key-sentinel\n",
+        )
+    ]
+    assert all("predict-key-sentinel" not in item for item in calls[0][0])
+
+
+def test_load_predict_api_key_strips_value_and_redacts_failures() -> None:
+    assert load_predict_api_key(
+        run=lambda args, **kwargs: CompletedProcess(args, 0, " key-sentinel\r\n", "")
+    ) == " key-sentinel"
+
+    def unavailable(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        raise CalledProcessError(1, args, stderr="key-sentinel")
+
+    with pytest.raises(Exception) as exc_info:
+        load_predict_api_key(run=unavailable)
+    assert "key-sentinel" not in str(exc_info.value)
+
+
+def test_predict_setup_preserves_polymarket_config_and_hides_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"signer_address": SIGNER, "wallet_address": WALLET}), encoding="utf-8"
+    )
+    stored: list[str] = []
+    monkeypatch.setattr(cli, "getpass", lambda prompt: "predict-key-sentinel")
+    monkeypatch.setattr(cli, "store_predict_api_key", lambda key: stored.append(key))
+
+    assert cli.main(
+        [
+            "prediction-arb",
+            "predict",
+            "setup",
+            "--config",
+            str(config_path),
+            "--wallet-address",
+            PREDICT_WALLET,
+        ]
+    ) == 0
+
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+        "signer_address": SIGNER,
+        "wallet_address": WALLET,
+        "predict": {"wallet_address": PREDICT_WALLET, "environment": "mainnet"},
+    }
+    assert stored == ["predict-key-sentinel"]
+    assert "predict-key-sentinel" not in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["prediction-arb", "predict", "setup", "--api-key", "no"])
 
 
 def test_from_keychain_uses_official_factory_without_redacted_credentials(

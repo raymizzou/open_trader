@@ -112,6 +112,7 @@ from .polymarket_trading import (
     PolymarketTradingError,
     load_trading_config,
     store_keychain_secret,
+    store_predict_api_key,
 )
 from .polymarket_monitor import monitor_once_diagnostic
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
@@ -1275,6 +1276,19 @@ def build_parser() -> argparse.ArgumentParser:
     wallet_status.add_argument(
         "--config", type=Path, default=Path("config/prediction_arbitrage.json")
     )
+    predict_parser = prediction_commands.add_parser(
+        "predict", help="Manage the read-only Predict source"
+    )
+    predict_commands = predict_parser.add_subparsers(
+        dest="predict_command", required=True
+    )
+    predict_setup = predict_commands.add_parser(
+        "setup", help="Store the public Predict wallet and hidden API key"
+    )
+    predict_setup.add_argument(
+        "--config", type=Path, default=Path("config/prediction_arbitrage.json")
+    )
+    predict_setup.add_argument("--wallet-address", required=True)
 
     prediction_preflight = prediction_commands.add_parser(
         "preflight", help="Run the no-submit compatibility diagnostic"
@@ -1353,6 +1367,38 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "prediction-arb":
+        if args.prediction_command == "predict" and args.predict_command == "setup":
+            config_path = args.config.expanduser()
+            try:
+                config = load_trading_config(config_path)
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "signer_address": config.signer_address,
+                            "wallet_address": config.wallet_address,
+                            "predict": {
+                                "wallet_address": args.wallet_address,
+                                "environment": "mainnet",
+                            },
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.chmod(config_path, 0o600)
+                load_trading_config(config_path)
+                store_predict_api_key(getpass("Predict API key: "))
+            except (KeyboardInterrupt, EOFError):
+                print("predict setup cancelled", file=sys.stderr)
+                return 2
+            except (OSError, ValueError, KeychainError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(f"config: {config_path}")
+            print("predict_keychain: configured")
+            return 0
+
         if args.prediction_command == "wallet" and args.wallet_command == "setup":
             config_path = args.config.expanduser()
             try:

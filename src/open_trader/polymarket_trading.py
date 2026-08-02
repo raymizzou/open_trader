@@ -35,6 +35,8 @@ from .prediction_arbitrage import (
 
 SECURITY = "/usr/bin/security"
 KEYCHAIN_SERVICE = "com.open-trader.polymarket"
+PREDICT_KEYCHAIN_SERVICE = "com.open-trader.predict"
+PREDICT_API_KEY_ACCOUNT = "api-key"
 KEYCHAIN_ACCOUNTS = (
     "signing-private-key",
     "builder-key",
@@ -94,9 +96,16 @@ class KeychainError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class PredictConfig:
+    wallet_address: str
+    environment: Literal["mainnet"] = "mainnet"
+
+
+@dataclass(frozen=True, slots=True)
 class TradingConfig:
     signer_address: str
     wallet_address: str
+    predict: PredictConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +233,72 @@ def load_keychain_secret(
     return value
 
 
+def store_predict_api_key(
+    secret: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Store the Predict API key via stdin, never process arguments."""
+
+    if not isinstance(secret, str) or not secret:
+        raise ValueError("keychain secret must not be empty")
+    runner = run or _run_security
+    try:
+        runner(
+            [
+                SECURITY,
+                "add-generic-password",
+                "-U",
+                "-a",
+                PREDICT_API_KEY_ACCOUNT,
+                "-s",
+                PREDICT_KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            input=f"{secret}\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except Exception as exc:
+        del exc
+        raise KeychainError() from None
+
+
+def load_predict_api_key(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str:
+    """Load the Predict API key without exposing it in failures."""
+
+    runner = run or _run_security
+    try:
+        completed = runner(
+            [
+                SECURITY,
+                "find-generic-password",
+                "-a",
+                PREDICT_API_KEY_ACCOUNT,
+                "-s",
+                PREDICT_KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        value = getattr(completed, "stdout", "")
+    except Exception as exc:
+        del exc
+        raise KeychainError() from None
+    if not isinstance(value, str):
+        raise KeychainError("keychain_empty")
+    value = value.rstrip("\r\n")
+    if not value:
+        raise KeychainError("keychain_empty")
+    return value
+
+
 def _canonical_address(value: object, field: str) -> str:
     if not isinstance(value, str) or value != value.strip() or not _ADDRESS_RE.fullmatch(value):
         raise ValueError(f"{field} must be a canonical 20-byte hex address")
@@ -239,11 +314,27 @@ def load_trading_config(path: Path) -> TradingConfig:
     if not isinstance(payload, dict):
         raise ValueError("prediction arbitrage config must be an object")
     expected = {"signer_address", "wallet_address"}
-    if set(payload) != expected:
+    if set(payload) not in (expected, expected | {"predict"}):
         raise ValueError("prediction arbitrage config must contain signer_address and wallet_address")
+    predict: PredictConfig | None = None
+    if "predict" in payload:
+        predict_payload = payload["predict"]
+        if not isinstance(predict_payload, dict) or set(predict_payload) != {
+            "wallet_address",
+            "environment",
+        }:
+            raise ValueError("predict config must contain wallet_address and environment")
+        if predict_payload.get("environment") != "mainnet":
+            raise ValueError("predict environment must be mainnet")
+        predict = PredictConfig(
+            wallet_address=_canonical_address(
+                predict_payload.get("wallet_address"), "predict.wallet_address"
+            )
+        )
     return TradingConfig(
         signer_address=_canonical_address(payload.get("signer_address"), "signer_address"),
         wallet_address=_canonical_address(payload.get("wallet_address"), "wallet_address"),
+        predict=predict,
     )
 
 
@@ -2230,15 +2321,20 @@ __all__ = [
     "GEOBLOCK_URL",
     "KEYCHAIN_ACCOUNTS",
     "KEYCHAIN_SERVICE",
+    "PREDICT_API_KEY_ACCOUNT",
+    "PREDICT_KEYCHAIN_SERVICE",
     "KeychainError",
     "LegResult",
     "PairSubmission",
     "PolymarketTradingClient",
     "PolymarketTradingError",
+    "PredictConfig",
     "ThresholdHedgeSubmission",
     "ThresholdLegResult",
     "TradingConfig",
     "load_keychain_secret",
+    "load_predict_api_key",
     "load_trading_config",
     "store_keychain_secret",
+    "store_predict_api_key",
 ]

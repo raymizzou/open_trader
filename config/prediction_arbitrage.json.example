@@ -1,4 +1,8 @@
 {
   "signer_address": "0x0000000000000000000000000000000000000000",
-  "wallet_address": "0x0000000000000000000000000000000000000000"
+  "wallet_address": "0x0000000000000000000000000000000000000000",
+  "predict": {
+    "wallet_address": "0xcE23B341C888A88C4C44D8B5Aa6D04A8615Ff435",
+    "environment": "mainnet"
+  }
 }
