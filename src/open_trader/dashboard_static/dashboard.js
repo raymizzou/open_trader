@@ -2130,6 +2130,10 @@ function predictionFailureReasonLabel(payload) {
     predict_unavailable: "Predict.fun 数据暂不可用",
     predict_degraded: "Predict.fun 数据连接降级",
     predict_construction_failed: "Predict.fun 监控初始化失败",
+    predict_not_configured: "Predict.fun 尚未配置",
+    cross_venue_unavailable: "跨交易所监控暂不可用",
+    predict_stale: "Predict.fun 数据已过期",
+    predict_auth_blocked: "Predict.fun API Key 认证受阻",
   };
   return raw ? (labels[raw] || raw.replaceAll("_", " ")) : "状态详情未返回";
 }

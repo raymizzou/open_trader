@@ -86,6 +86,21 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(predict).not.toContainText('最近成功');
   });
 
+  test('localizes remaining Predict and cross-venue reasons in venue cards', async ({ page }) => {
+    for (const [scenario, label, rawReason] of [
+      ['predict-not-configured', 'Predict.fun 尚未配置', 'predict not configured'],
+      ['cross-venue-unavailable', '跨交易所监控暂不可用', 'cross venue unavailable'],
+      ['predict-stale', 'Predict.fun 数据已过期', 'predict stale'],
+      ['predict-auth-blocked', 'Predict.fun API Key 认证受阻', 'predict auth blocked'],
+    ]) {
+      await openPrediction(page, scenario);
+      const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
+      await expect(predict).toContainText(`原因：${label}`);
+      await expect(predict).not.toContainText(rawReason);
+      await expect(predict).not.toContainText('最近成功');
+    }
+  });
+
   test('preserves the production LLM hedge math and rejection evidence', async ({ page }) => {
     for (const viewport of [
       { width: 1440, height: 1100 },

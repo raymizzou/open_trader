@@ -140,6 +140,26 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             payload["venues"][0],
             {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": None}, "mode": "只读", "reason": "predict_construction_failed", "last_success": "2026-08-02T00:59:58Z"},
         ]
+    if scenario == "predict-not-configured":
+        payload["venues"] = [
+            payload["venues"][0],
+            {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": None}, "mode": "只读", "reason": "predict_not_configured", "last_success": "2026-08-02T00:59:58Z"},
+        ]
+    if scenario == "cross-venue-unavailable":
+        payload["venues"] = [
+            payload["venues"][0],
+            {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": None}, "mode": "只读", "reason": "cross_venue_unavailable", "last_success": "2026-08-02T00:59:58Z"},
+        ]
+    if scenario == "predict-stale":
+        payload["venues"] = [
+            payload["venues"][0],
+            {"venue": "predict.fun", "rest": "stale", "ws": "stale", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": None}, "mode": "只读", "reason": "predict_stale", "last_success": "2026-08-02T00:59:58Z"},
+        ]
+    if scenario == "predict-auth-blocked":
+        payload["venues"] = [
+            payload["venues"][0],
+            {"venue": "predict.fun", "rest": "unavailable", "ws": "unavailable", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": None}, "mode": "只读", "reason": "predict_auth_blocked", "last_success": "2026-08-02T00:59:58Z"},
+        ]
     if scenario == "threshold":
         approved_threshold = {
             "opportunity_id": "threshold-approved",
