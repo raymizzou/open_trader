@@ -74,19 +74,19 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         {"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture"},
         {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"},
     ]
-    events.append({
-        "event_id": "cross-event-fixture",
+    cross_opportunity = {
+        "opportunity_id": "cross-opportunity-fixture",
         "title": "Will Bitcoin close above $100,000 on December 31, 2026?",
         "title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？",
         "market_type": "cross_venue_yes_no",
         "execution_mode": "observe_only",
         "legs": cross_legs,
-        "markets": "两所对应标的",
-        "profit": "0.50",
-        "profit_label": "净利润",
-        "status": "只读观察",
+        "quantity": "5",
+        "total_max_cost": "9.50",
+        "minimum_profit": "0.50",
+        "volume_24h": "320000",
         "actionable": False,
-    })
+    }
     if scenario == "quiet":
         opportunity = {**opportunity, "actionable": False}
         events[0] = {**events[0], "actionable": False, "opportunities": [opportunity]}
@@ -114,8 +114,8 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "masked_wallet": "0x7A4E…91C2",
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
         "venues": [
-            {"venue": "polymarket", "rest": "ready", "ws": "ready", "wallet": "0x7A4E…91C2", "balance": {"asset": "pUSD", "value": "50.00"}, "mode": "可以交易"},
-            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "只读"},
+            {"venue": "polymarket", "rest": "ready", "ws": "ready", "wallet": "0x7A4E…91C2", "balance": {"asset": "pUSD", "value": "50.00"}, "mode": "可以交易", "last_success": "2026-08-02T01:00:00Z"},
+            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "只读", "last_success": "2026-08-02T00:59:58Z"},
         ],
         "cross_venue": {"funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1}},
         "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
@@ -125,7 +125,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "token_count": 662,
         "signals_24h": 3,
         "events": events,
-        "opportunities": [] if scenario == "quiet" else [opportunity],
+        "opportunities": [] if scenario == "quiet" else [opportunity, cross_opportunity],
         "histories": {history_kind: _prediction_history(history_kind)},
         "breaker": {"open": scenario == "incident", "status": "locked" if scenario == "incident" else "ready"},
         "csrf_token": "fixture-csrf",

@@ -2300,8 +2300,20 @@ function predictionEventDisplay(value) {
 
 function predictionEvents(payload) {
   const events = Array.isArray(payload?.events) ? payload.events.filter((item) => item && typeof item === "object") : [];
-  if (events.length) return events.map(predictionEventDisplay);
-  return (Array.isArray(payload?.opportunities) ? payload.opportunities : []).map((opportunity, index) => ({
+  const opportunities = Array.isArray(payload?.opportunities) ? payload.opportunities : [];
+  if (events.length) {
+    const knownEventIds = new Set(events.map((event) => String(event.event_id || event.id || "")));
+    const crossEvents = opportunities.filter((opportunity) => (
+      opportunity && typeof opportunity === "object"
+      && predictionIsCrossVenue(opportunity)
+      && !knownEventIds.has(String(opportunity.event_id || opportunity.opportunity_id || ""))
+    )).map((opportunity, index) => ({
+      event_id: opportunity.event_id || opportunity.opportunity_id || `cross-opportunity-${index}`,
+      ...predictionEventDisplay({...predictionOpportunityDisplay(opportunity), opportunities: [opportunity]}),
+    }));
+    return [...events.map(predictionEventDisplay), ...crossEvents];
+  }
+  return opportunities.map((opportunity, index) => ({
     event_id: opportunity.event_id || opportunity.opportunity_id || `opportunity-${index}`,
     ...predictionEventDisplay({
       ...predictionOpportunityDisplay(opportunity),
@@ -2351,8 +2363,10 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
       const asset = predictionValue(balance.asset, "-");
       const amount = predictionHasValue(balance.value) ? predictionMoney(balance.value) : "-";
       const healthLabel = (value) => String(value).toLowerCase() === "unavailable" ? "不可用" : value;
-      const reason = venue.reason ? `<small>原因：${escapeHtml(predictionFailureReasonLabel(venue.reason))}</small>` : "";
-      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}</small>${reason}</article>`;
+      const detail = venue.reason
+        ? `<small>原因：${escapeHtml(predictionFailureReasonLabel(venue.reason))}</small>`
+        : venue.last_success ? `<small>最近成功 ${escapeHtml(predictionValue(venue.last_success))}</small>` : "";
+      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}</small>${detail}</article>`;
     }).join("")}</section>`;
   }
   const readiness = payload?.readiness || {};

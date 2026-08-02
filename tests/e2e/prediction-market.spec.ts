@@ -42,11 +42,11 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       ), await tabs.elementHandle())).toBe(true);
       await expect(page.locator('.pm-venue-card')).toHaveCount(2);
       const polymarket = page.locator('.pm-venue-card').filter({ hasText: 'Polymarket' });
-      for (const text of ['REST：ready', 'WebSocket：ready', '0x7A4E…91C2', '50.00 pUSD', '可以交易']) {
+      for (const text of ['REST：ready', 'WebSocket：ready', '0x7A4E…91C2', '50.00 pUSD', '可以交易', '最近成功 2026-08-02T01:00:00Z']) {
         await expect(polymarket).toContainText(text);
       }
       const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
-      for (const text of ['REST：ready', 'WebSocket：ready', '0xcE23…f435', '12.34 USDT', '只读']) {
+      for (const text of ['REST：ready', 'WebSocket：ready', '0xcE23…f435', '12.34 USDT', '只读', '最近成功 2026-08-02T00:59:58Z']) {
         await expect(predict).toContainText(text);
       }
       await expect(venueHeader).not.toContainText('62.34');
@@ -62,9 +62,11 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       const currentCross = page.locator('.pm-event').filter({ hasText: 'Predict.fun · YES' });
       await expect(currentCross).toContainText('Polymarket · NO');
       await expect(currentCross.locator('[data-action="participate"]')).toHaveCount(0);
+      await expect(currentCross).toHaveCount(1);
       const historyCross = page.locator('[data-prediction-history-panel] tbody tr').filter({ hasText: 'Polymarket · YES' });
       await expect(historyCross).toContainText('Predict.fun · NO');
       await expect(historyCross.locator('button')).toHaveCount(0);
+      expect(await page.locator('.pm-venue-card').nth(1).evaluate((card) => getComputedStyle(card).borderRightWidth)).toBe('1px');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     }
   });
