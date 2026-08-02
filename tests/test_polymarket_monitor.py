@@ -445,7 +445,7 @@ def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) ->
         nonlocal history_calls
         assert not monitor._lock._is_owned()
         history_calls += 1
-        return []
+        return [{"signal_id": "signal-1"}] if window == "24h" else []
 
     monitor._monotonic = lambda: monotonic[0]
     monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
@@ -453,12 +453,13 @@ def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) ->
 
     monitor._refresh_snapshot_metrics()
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
+    assert monitor.snapshot()["signals_24h"] == 1
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
     monotonic[0] = 60.0
     monitor._refresh_snapshot_metrics()
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 2
     assert usage_calls == 2
-    assert history_calls == 4
+    assert history_calls == 6
 
 
 def test_start_primes_snapshot_metrics_before_monitor_thread(tmp_path: Path) -> None:

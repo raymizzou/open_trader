@@ -409,6 +409,7 @@ class PolymarketMonitor:
         self._llm_usage_cache: dict[str, int] | None = None
         self._llm_usage_cached_at: float | None = None
         self._annualized_distribution_cache: dict[str, dict[str, object]] | None = None
+        self._signals_24h_cache = 0
         self._store_failed = False
         self._universe_failed = False
         self._universe_refresh_attempts = 0
@@ -555,6 +556,7 @@ class PolymarketMonitor:
                 "health": health,
                 "events": events,
                 "opportunities": opportunities,
+                "signals_24h": self._signals_24h_cache,
                 "diagnostics": copy.deepcopy(self._diagnostics),
                 "heartbeat_at": self._heartbeat_at,
                 "universe_refreshed_at": self._universe_at,
@@ -3826,9 +3828,14 @@ class PolymarketMonitor:
             annualized = self._annualized_distributions()
         except Exception:
             annualized = self._annualized_distribution_cache or {}
+        try:
+            signals_24h = len(self._store.signal_history("24h"))
+        except Exception:
+            signals_24h = self._signals_24h_cache
         with self._lock:
             self._llm_usage_cache = dict(usage)
             self._annualized_distribution_cache = copy.deepcopy(annualized)
+            self._signals_24h_cache = signals_24h
 
     @staticmethod
     def _distribution(values: Sequence[object]) -> dict[str, object]:
