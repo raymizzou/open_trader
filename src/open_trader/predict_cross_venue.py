@@ -99,7 +99,7 @@ def resolve_explicit_market_pairs(
             if condition_id
         )
     )
-    empty = sum(
+    empty = sum(not market.polymarket_condition_ids for market in predict_markets) + sum(
         not condition_id
         for market in predict_markets
         for condition_id in market.polymarket_condition_ids
@@ -167,7 +167,9 @@ def _polymarket_market(row: object, condition_id: str) -> VenueMarket | None:
     token_ids = _json_list(_value(row, "clobTokenIds", "clob_token_ids"))
     tokens = dict(zip((_text(item).upper() for item in outcomes), (_text(item) for item in token_ids)))
     close_at = _datetime(_value(row, "endDate", "end_date", "close_at"))
-    settlement_at = _datetime(_value(row, "resolutionDate", "resolution_date", "settlement_at")) or close_at
+    settlement_at = _datetime(
+        _value(row, "resolutionDate", "resolution_date", "settlement_at")
+    )
     rate = _decimal(_value(row, "feeRateBps", "fee_rate_bps", "takerBaseFee", "taker_base_fee"))
     if rate is None:
         schedule = _value(row, "feeSchedule", "fee_schedule")

@@ -48,6 +48,7 @@ def polymarket_row(condition_id: str) -> dict[str, object]:
         "description": "This public test event resolves from the named source.",
         "resolutionSource": "Public Test Oracle",
         "endDate": "2026-12-31T00:00:00Z",
+        "resolutionDate": "2027-01-01T00:00:00Z",
         "clobTokenIds": '["poly-yes-1", "poly-no-1"]',
         "outcomes": '["Yes", "No"]',
         "orderMinSize": "5",
@@ -104,6 +105,31 @@ def test_mapping_uses_only_external_polymarket_ids_and_counts_unresolved_values(
     assert clob_calls == ["poly-external", "poly-missing"]
     assert result.skipped_empty_mappings == 1
     assert result.skipped_unresolved_mappings == 1
+
+
+def test_mapping_skips_polymarket_rows_without_actual_resolution_time() -> None:
+    result = resolve_explicit_market_pairs(
+        (predict_market(external_ids=("poly-no-resolution",)),),
+        gamma_lookup=lambda *args, **kwargs: [
+            {key: value for key, value in polymarket_row("poly-no-resolution").items() if key != "resolutionDate"}
+        ],
+        clob_lookup=lambda condition_id: None,
+    )
+
+    assert result.pairs == ()
+    assert result.skipped_unresolved_mappings == 1
+
+
+def test_mapping_counts_normalized_empty_external_id_tuples() -> None:
+    result = resolve_explicit_market_pairs(
+        (predict_market(external_ids=()),),
+        gamma_lookup=lambda *args, **kwargs: pytest.fail("Gamma called"),
+        clob_lookup=lambda condition_id: pytest.fail("CLOB called"),
+    )
+
+    assert result.pairs == ()
+    assert result.skipped_empty_mappings == 1
+    assert result.skipped_unresolved_mappings == 0
 
 
 def test_pair_id_is_deterministic_from_venue_qualified_native_condition_ids() -> None:
