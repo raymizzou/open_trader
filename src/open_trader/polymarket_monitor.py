@@ -1035,7 +1035,9 @@ class PolymarketMonitor:
                     cross_venue_generation,
                 )
             except Exception:
-                self._invalidate_cross_venue_books(cross_venue_tokens)
+                with self._lock:
+                    if cross_venue_generation == self._cross_venue_generation:
+                        self._invalidate_cross_venue_books(cross_venue_tokens)
         with self._lock:
             current_tokens = (
                 set(self._market_by_token)
