@@ -2116,6 +2116,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                     "signal_id": "cross-signal-1",
                     "opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO",
                     "market_type": "cross_venue_yes_no",
+                    "question": "Predict contract question / Polymarket contract question",
+                    "predict_question": "Predict contract question",
+                    "polymarket_question": "Polymarket contract question",
                     "started_at": "2026-08-02T00:00:00Z",
                     "legs": legs,
                 }
@@ -2173,6 +2176,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                     {
                         "opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO",
                         "market_type": "cross_venue_yes_no",
+                        "question": "Predict contract question / Polymarket contract question",
+                        "predict_question": "Predict contract question",
+                        "polymarket_question": "Polymarket contract question",
                         "execution_mode": "observe_only",
                         "actionable": False,
                         "clear_signal": True,
@@ -2228,6 +2234,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
     }
     assert state["events"][-1]["legs"] == legs
     assert state["opportunities"][-1]["legs"] == legs
+    assert state["opportunities"][-1]["question"] == "Predict contract question / Polymarket contract question"
+    assert state["opportunities"][-1]["predict_question"] == "Predict contract question"
+    assert state["opportunities"][-1]["polymarket_question"] == "Polymarket contract question"
 
     history = _prediction_history_payload(
         store,
@@ -2239,6 +2248,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         execution=type("Execution", (), {"_breaker_open": False})(),
     )
     assert history["items"][0]["legs"] == legs
+    assert history["items"][0]["question"] == "Predict contract question / Polymarket contract question"
+    assert history["items"][0]["predict_question"] == "Predict contract question"
+    assert history["items"][0]["polymarket_question"] == "Polymarket contract question"
     assert history["items"][0]["signal_live_now"] is True
     assert history["items"][0]["actionable_now"] is False
 

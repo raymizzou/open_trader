@@ -50,11 +50,13 @@
     "venue_market": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["exchange", "condition_id", "rules_fingerprint"],
+      "required": ["exchange", "condition_id", "rules_fingerprint", "close_at", "settlement_at"],
       "properties": {
         "exchange": {"type": "string"},
         "condition_id": {"type": "string"},
-        "rules_fingerprint": {"type": "string"}
+        "rules_fingerprint": {"type": "string"},
+        "close_at": {"type": "string"},
+        "settlement_at": {"type": "string"}
       }
     },
     "predict_market": {

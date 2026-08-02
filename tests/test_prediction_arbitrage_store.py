@@ -768,6 +768,9 @@ def test_cross_venue_signal_episode_preserves_public_legs_and_rearms_after_close
         "market_id": opportunity_id,
         "event_id": "public-pair",
         "market_type": "cross_venue_yes_no",
+        "question": "Predict contract question / Polymarket contract question",
+        "predict_question": "Predict contract question",
+        "polymarket_question": "Polymarket contract question",
         "started_at": "2026-08-02T00:00:00Z",
         "first_positive_at": "2026-08-02T00:00:00Z",
         "trigger_total_max_cost": Decimal("9.45"),
@@ -810,6 +813,9 @@ def test_cross_venue_signal_episode_preserves_public_legs_and_rearms_after_close
     assert signal["opportunity_id"] == opportunity_id
     assert signal["trigger_total_max_cost"] == "9.45"
     assert signal["trigger_minimum_profit"] == "0.55"
+    assert signal["question"] == "Predict contract question / Polymarket contract question"
+    assert signal["predict_question"] == "Predict contract question"
+    assert signal["polymarket_question"] == "Polymarket contract question"
     assert signal["legs"] == [
         {
             "exchange": "predict.fun",

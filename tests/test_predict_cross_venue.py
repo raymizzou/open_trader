@@ -164,11 +164,15 @@ def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
             "exchange": "predict.fun",
             "condition_id": pair.predict.condition_id,
             "rules_fingerprint": pair.predict.rules_fingerprint,
+            "close_at": pair.predict.close_at.isoformat(),
+            "settlement_at": pair.predict.settlement_at.isoformat(),
         },
         "polymarket": {
             "exchange": "polymarket",
             "condition_id": pair.polymarket.condition_id,
             "rules_fingerprint": pair.polymarket.rules_fingerprint,
+            "close_at": pair.polymarket.close_at.isoformat(),
+            "settlement_at": pair.polymarket.settlement_at.isoformat(),
         },
         "divergent_states": {
             "PREDICT_YES_POLYMARKET_NO": {"possible": False, "reason": "same rule"},
@@ -207,6 +211,8 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
 
     assert first.approved is True
     assert first.prompt_version == "cross-exchange-yes-no-equivalence-v1"
+    assert first.predict_close_at == pair.predict.close_at
+    assert first.polymarket_settlement_at == pair.polymarket.settlement_at
     assert second.approved is True
     assert len(calls) == 1
     assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == "cross-exchange-yes-no-equivalence-v1"
@@ -220,6 +226,8 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
         (lambda value: {**value, "predict": {**value["predict"], "condition_id": "wrong"}}, "IDENTITY_MISMATCH"),
         (lambda value: {**value, "polymarket": {**value["polymarket"], "exchange": "predict.fun"}}, "IDENTITY_MISMATCH"),
         (lambda value: {**value, "predict": {**value["predict"], "rules_fingerprint": "wrong"}}, "FINGERPRINT_MISMATCH"),
+        (lambda value: {**value, "predict": {**value["predict"], "close_at": "2026-12-30T00:00:00+00:00"}}, "DATE_MISMATCH"),
+        (lambda value: {**value, "polymarket": {**value["polymarket"], "settlement_at": "2027-01-02T00:00:00+00:00"}}, "DATE_MISMATCH"),
         (lambda value: {**value, "divergent_states": {**value["divergent_states"], "PREDICT_YES_POLYMARKET_NO": {"possible": True, "reason": "possible"}}}, "DIVERGENT_STATE_POSSIBLE"),
         (lambda value: {**value, "evidence": []}, "MISSING_EVIDENCE"),
         (lambda value: {**value, "evidence": [{"exchange": "predict.fun", "field": "rules", "quote": "not supplied"}, value["evidence"][1]]}, "EVIDENCE_NOT_FOUND"),
@@ -248,6 +256,7 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     assert schema["properties"]["decision"]["enum"] == ["APPROVE", "REJECT"]
     assert {"predict", "polymarket", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
+    assert {"close_at", "settlement_at"} <= set(schema["$defs"]["venue_market"]["required"])
 
 
 def test_threshold_validator_schema_is_unchanged() -> None:
@@ -485,6 +494,10 @@ class FakeCrossVenueValidator:
             prompt_version="cross-exchange-yes-no-equivalence-v1",
             predict_fingerprint=pair.predict.rules_fingerprint,
             polymarket_fingerprint=pair.polymarket.rules_fingerprint,
+            predict_close_at=pair.predict.close_at,
+            predict_settlement_at=pair.predict.settlement_at,
+            polymarket_close_at=pair.polymarket.close_at,
+            polymarket_settlement_at=pair.polymarket.settlement_at,
         )
 
 
@@ -743,6 +756,9 @@ def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
         assert signal["trigger_minimum_profit"] == "0.2520000000"
         assert signal["legs"][0]["token_id"] == "predict-yes-1"
         assert signal["legs"][1]["token_id"] == "poly-no-1"
+        assert signal["question"] == "Will the public test event resolve Yes?"
+        assert signal["predict_question"] == "Will the public test event resolve Yes?"
+        assert signal["polymarket_question"] == "Will the public test event resolve Yes?"
         await wait_until(lambda: bool(notifications))
         assert (signal["opportunity_id"], signal["signal_id"]) in notifications
 

@@ -79,6 +79,8 @@ class PredictSource:
         self._versions: dict[str, dict[str, int]] = {"rest": {}, "ws": {}}
         self._rest_status = "unknown"
         self._ws_status = "unknown"
+        self._last_success: dict[str, datetime | None] = {"rest": None, "ws": None}
+        self._failure_reason: dict[str, str | None] = {"rest": None, "ws": None}
         self._ws_generation = 0
 
     async def list_open_markets(self) -> tuple[PredictMarket, ...]:
@@ -94,7 +96,7 @@ class PredictSource:
                 return ()
             rows = payload.get("data")
             if not isinstance(rows, list):
-                self._rest_status = "stale"
+                self._mark_stale("rest")
                 return ()
             for row in rows:
                 market = _normalise_market(row)
@@ -113,7 +115,7 @@ class PredictSource:
             return None
         market = _normalise_market(payload.get("data"))
         if market is None or market.market_id != str(market_id):
-            self._rest_status = "stale"
+            self._mark_stale("rest")
             return None
         self._markets[market.market_id] = market
         return market
@@ -131,10 +133,10 @@ class PredictSource:
         try:
             api_key = self._key_loader()
         except KeychainError:
-            self._ws_status = "pending"
+            self._set_status("ws", "pending", "api_key_pending")
             return
         if not api_key:
-            self._ws_status = "pending"
+            self._set_status("ws", "pending", "api_key_pending")
             return
 
         markets: dict[str, PredictMarket] = {}
@@ -143,7 +145,7 @@ class PredictSource:
             if market is not None:
                 markets[market.market_id] = market
         if not markets:
-            self._ws_status = "stale"
+            self._mark_stale("ws")
             return
 
         attempt = 0
@@ -171,7 +173,7 @@ class PredictSource:
                     while True:
                         message = json.loads(await websocket.recv())
                         if not isinstance(message, dict):
-                            self._ws_status = "stale"
+                            self._mark_stale("ws")
                             continue
                         if message.get("topic") == "heartbeat":
                             await websocket.send(
@@ -194,25 +196,40 @@ class PredictSource:
                             yield book
             except Exception as exc:
                 if _http_status(exc) in {401, 403}:
-                    self._ws_status = "auth_blocked"
+                    self._set_status("ws", "auth_blocked", "auth_blocked")
                     return
-                self._ws_status = "stale"
+                self._mark_stale("ws")
                 self._ws_generation += 1
                 attempt += 1
                 await _maybe_await(self._sleep_fn(min(2 ** (attempt - 1), _MAX_BACKOFF_SECONDS)))
 
-    async def get_balance_snapshot(self) -> dict[str, str]:
+    async def get_balance_snapshot(self) -> dict[str, object]:
         """Expose no account data until a later approved account-read scope."""
 
-        return {"wallet": _masked_wallet(self._config.wallet_address), "status": "unavailable"}
+        return {
+            "wallet": _masked_wallet(self._config.wallet_address),
+            "status": "unavailable",
+            "asset": "USDT",
+            "value": None,
+        }
 
-    def snapshot(self) -> dict[str, str | int]:
+    def snapshot(self) -> dict[str, object]:
+        successes = [value for value in self._last_success.values() if value is not None]
         return {
             "venue": "predict.fun",
             "wallet": _masked_wallet(self._config.wallet_address),
             "rest": self._rest_status,
             "ws": self._ws_status,
             "ws_generation": self._ws_generation,
+            "rest_last_success": _timestamp_text(self._last_success["rest"]),
+            "ws_last_success": _timestamp_text(self._last_success["ws"]),
+            "last_success": _timestamp_text(max(successes)) if successes else None,
+            "balance": None,
+            "balance_state": "unavailable",
+            "settlement_asset": "USDT",
+            "rest_reason": self._failure_reason["rest"],
+            "ws_reason": self._failure_reason["ws"],
+            "reason": self._failure_reason["rest"] or self._failure_reason["ws"],
         }
 
     async def _rest_json(
@@ -221,10 +238,10 @@ class PredictSource:
         try:
             api_key = self._key_loader()
         except KeychainError:
-            self._rest_status = "pending"
+            self._set_status("rest", "pending", "api_key_pending")
             return None
         if not api_key:
-            self._rest_status = "pending"
+            self._set_status("rest", "pending", "api_key_pending")
             return None
         url = PREDICT_REST_URL + path
         if query:
@@ -236,9 +253,9 @@ class PredictSource:
             except Exception as exc:
                 status = _http_status(exc)
                 if status in {401, 403}:
-                    self._rest_status = "auth_blocked"
+                    self._set_status("rest", "auth_blocked", "auth_blocked")
                     return None
-                self._rest_status = "stale"
+                self._mark_stale("rest")
                 if status != 429 and not isinstance(exc, (OSError, URLError)):
                     return None
                 if attempt == 5:
@@ -248,9 +265,9 @@ class PredictSource:
                 )
                 continue
             if not isinstance(payload, dict) or payload.get("success") is not True:
-                self._rest_status = "stale"
+                self._mark_stale("rest")
                 return None
-            self._rest_status = "ready"
+            self._mark_ready("rest")
             return payload
         return None
 
@@ -265,9 +282,10 @@ class PredictSource:
             self._mark_stale(source)
             return None
         version = payload.get("version")
-        if (
-            not isinstance(version, int)
-            or version <= self._versions[source].get(market.market_id, 0)
+        previous = self._versions[source].get(market.market_id)
+        if not isinstance(version, int) or (
+            previous is not None
+            and (version < previous or (source == "ws" and version == previous))
         ):
             self._mark_stale(source)
             return None
@@ -295,8 +313,7 @@ class PredictSource:
         )
         self._versions[source][market.market_id] = version
         self._books[source][market.market_id] = book
-        if source == "ws":
-            self._ws_status = "ready"
+        self._mark_ready(source, at=book.received_at)
         return book
 
     def _mark_stale(self, source: Literal["rest", "ws"]) -> None:
@@ -305,6 +322,24 @@ class PredictSource:
             self._rest_status = "stale"
         else:
             self._ws_status = "stale"
+        self._failure_reason[source] = f"{source}_stale"
+
+    def _mark_ready(self, source: Literal["rest", "ws"], *, at: datetime | None = None) -> None:
+        if source == "rest":
+            self._rest_status = "ready"
+        else:
+            self._ws_status = "ready"
+        self._last_success[source] = at or self._now_fn()
+        self._failure_reason[source] = None
+
+    def _set_status(
+        self, source: Literal["rest", "ws"], status: str, reason: str
+    ) -> None:
+        if source == "rest":
+            self._rest_status = status
+        else:
+            self._ws_status = status
+        self._failure_reason[source] = reason
 
 
 def _normalise_market(payload: object) -> PredictMarket | None:
@@ -403,6 +438,10 @@ def _timestamp(value: object) -> datetime | None:
     if not isinstance(value, int) or value < 0:
         return None
     return datetime.fromtimestamp(value / 1000, UTC)
+
+
+def _timestamp_text(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def _datetime(value: object) -> datetime | None:

@@ -61,6 +61,7 @@ def source_with_responses(
     connector: object | None = None,
     key_loader: object = lambda: "predict-key-sentinel",
     sleep_fn: object = lambda seconds: None,
+    now_fn: object = lambda: datetime(2026, 8, 2, tzinfo=UTC),
 ) -> tuple[PredictSource, list[object]]:
     requests: list[object] = []
 
@@ -77,7 +78,7 @@ def source_with_responses(
             key_loader=key_loader,
             urlopen_fn=opener,
             websocket_connect=connector,
-            now_fn=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+            now_fn=now_fn,
             sleep_fn=sleep_fn,
         ),
         requests,
@@ -163,6 +164,33 @@ def test_out_of_order_book_is_dropped_and_marks_source_stale() -> None:
     assert source.snapshot()["rest"] == "stale"
 
 
+def test_repeated_rest_snapshot_version_refreshes_the_confirmed_book() -> None:
+    received = [datetime(2026, 8, 2, tzinfo=UTC)]
+    snapshot = {
+        "marketId": 123,
+        "version": 2,
+        "updateTimestampMs": 1788048000000,
+        "asks": [["0.51", "3"]],
+        "bids": [["0.50", "2"]],
+    }
+    source, _ = source_with_responses(
+        [
+            {"success": True, "data": market()},
+            {"success": True, "data": snapshot},
+            {"success": True, "data": snapshot},
+        ],
+        now_fn=lambda: received[0],
+    )
+
+    first = asyncio.run(source.get_order_book("123"))
+    received[0] = datetime(2026, 8, 2, 0, 0, 1, tzinfo=UTC)
+    second = asyncio.run(source.get_order_book("123"))
+
+    assert first is not None and second is not None
+    assert second.received_at > first.received_at
+    assert source.snapshot()["rest"] == "ready"
+
+
 def test_missing_or_rejected_key_is_safe_and_never_retried() -> None:
     pending, pending_requests = source_with_responses(
         [], key_loader=lambda: (_ for _ in ()).throw(KeychainError("keychain_empty"))
@@ -177,6 +205,34 @@ def test_missing_or_rejected_key_is_safe_and_never_retried() -> None:
     assert asyncio.run(blocked.list_open_markets()) == ()
     assert blocked.snapshot()["rest"] == "auth_blocked"
     assert len(blocked_requests) == 1
+
+
+def test_snapshot_reports_predict_health_without_api_key() -> None:
+    pending, _ = source_with_responses(
+        [], key_loader=lambda: (_ for _ in ()).throw(KeychainError("keychain_empty"))
+    )
+    blocked, _ = source_with_responses(
+        [HTTPError("https://api.predict.fun/v1/markets", 401, "no", {}, None)]
+    )
+    ready, _ = source_with_responses([{"success": True, "data": []}])
+    failed, _ = source_with_responses([{"success": False, "data": []}])
+
+    assert asyncio.run(pending.list_open_markets()) == ()
+    assert asyncio.run(blocked.list_open_markets()) == ()
+    assert asyncio.run(ready.list_open_markets()) == ()
+    assert asyncio.run(failed.list_open_markets()) == ()
+
+    pending_snapshot = pending.snapshot()
+    assert pending_snapshot["rest"] == "pending"
+    assert pending_snapshot["reason"] == "api_key_pending"
+    assert pending_snapshot["balance"] is None
+    assert pending_snapshot["balance_state"] == "unavailable"
+    assert pending_snapshot["settlement_asset"] == "USDT"
+    assert blocked.snapshot()["reason"] == "auth_blocked"
+    assert ready.snapshot()["last_success"] == "2026-08-02T00:00:00+00:00"
+    assert ready.snapshot()["reason"] is None
+    assert failed.snapshot()["reason"] == "rest_stale"
+    assert "predict-key-sentinel" not in repr(ready.snapshot())
 
 
 class FakeWebSocket:
@@ -300,15 +356,13 @@ def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
     _, reconnected = asyncio.run(collect_two())
 
     assert reconnected.source_timestamp == datetime.fromtimestamp(1788048001, UTC)
-    assert reconnect_snapshots == [
-        {
-            "venue": "predict.fun",
-            "wallet": "0xcE23…f435",
-            "rest": "ready",
-            "ws": "stale",
-            "ws_generation": 1,
-        }
-    ]
+    assert [{
+        "venue": "predict.fun",
+        "wallet": "0xcE23…f435",
+        "rest": "ready",
+        "ws": "stale",
+        "ws_generation": 1,
+    }.items() <= snapshot.items() for snapshot in reconnect_snapshots] == [True]
     assert source.snapshot()["ws"] == "ready"
     assert source.snapshot()["ws_generation"] == 1
 
