@@ -420,17 +420,19 @@ def make_monitor(
     )
 
 
-def test_snapshot_reuses_llm_usage_summary_for_one_minute(tmp_path: Path) -> None:
+def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     monotonic = [0.0]
-    calls = 0
+    usage_calls = 0
+    history_calls = 0
 
     def usage() -> dict[str, int]:
-        nonlocal calls
-        calls += 1
+        nonlocal usage_calls
+        assert not monitor._lock._is_owned()
+        usage_calls += 1
         return {
-            "calls": calls,
-            "successes": calls,
+            "calls": usage_calls,
+            "successes": usage_calls,
             "failures": 0,
             "cache_hits": 0,
             "input_tokens": 0,
@@ -439,17 +441,27 @@ def test_snapshot_reuses_llm_usage_summary_for_one_minute(tmp_path: Path) -> Non
             "reasoning_output_tokens": 0,
         }
 
+    def history(window: str) -> list[dict[str, object]]:
+        nonlocal history_calls
+        assert not monitor._lock._is_owned()
+        history_calls += 1
+        return []
+
     monitor._monotonic = lambda: monotonic[0]
     monitor._store.llm_usage_24h = usage  # type: ignore[method-assign]
+    monitor._store.signal_history = history  # type: ignore[method-assign]
 
+    monitor._refresh_snapshot_metrics()
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 1
     monotonic[0] = 60.0
+    monitor._refresh_snapshot_metrics()
     assert monitor.snapshot()["relation_discovery"]["codex_usage_24h"]["calls"] == 2
-    assert calls == 2
+    assert usage_calls == 2
+    assert history_calls == 4
 
 
-def test_start_primes_llm_usage_before_monitor_thread(tmp_path: Path) -> None:
+def test_start_primes_snapshot_metrics_before_monitor_thread(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     calls = 0
 

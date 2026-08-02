@@ -408,6 +408,7 @@ class PolymarketMonitor:
         self._last_runtime_write: datetime | None = None
         self._llm_usage_cache: dict[str, int] | None = None
         self._llm_usage_cached_at: float | None = None
+        self._annualized_distribution_cache: dict[str, dict[str, object]] | None = None
         self._store_failed = False
         self._universe_failed = False
         self._universe_refresh_attempts = 0
@@ -481,7 +482,10 @@ class PolymarketMonitor:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-            self._llm_usage()
+        self._refresh_snapshot_metrics()
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=lambda: asyncio.run(self.run_forever()),
@@ -562,8 +566,10 @@ class PolymarketMonitor:
                     "codex_queue": self._codex_queue_snapshot(now),
                     "websocket": self._websocket_snapshot(now),
                     "scan_logs": copy.deepcopy(list(self._relation_scan_logs)),
-                    "codex_usage_24h": self._llm_usage(),
-                    "annualized_distribution": self._annualized_distributions(),
+                    "codex_usage_24h": copy.deepcopy(self._llm_usage_cache or {}),
+                    "annualized_distribution": copy.deepcopy(
+                        self._annualized_distribution_cache or {}
+                    ),
                 },
             }
 
@@ -759,9 +765,11 @@ class PolymarketMonitor:
                     rows, set(self._active_relation_ids), replace_all=True
                 )
                 await self._subscribe(client)
+            self._refresh_snapshot_metrics(force=True)
             return self.snapshot()
         except Exception as exc:
             self._record_error(exc, "universe")
+            self._refresh_snapshot_metrics(force=True)
             return self.snapshot()
         finally:
             if owned_client and self._stop_event.is_set():
@@ -3767,10 +3775,11 @@ class PolymarketMonitor:
             ),
         }
 
-    def _llm_usage(self) -> dict[str, int]:
+    def _llm_usage(self, *, force: bool = False) -> dict[str, int]:
         now = self._monotonic()
         if (
-            self._llm_usage_cache is not None
+            not force
+            and self._llm_usage_cache is not None
             and self._llm_usage_cached_at is not None
             and now - self._llm_usage_cached_at < 60
         ):
@@ -3791,6 +3800,23 @@ class PolymarketMonitor:
         self._llm_usage_cache = dict(result)
         self._llm_usage_cached_at = now
         return result
+
+    def _refresh_snapshot_metrics(self, *, force: bool = False) -> None:
+        if (
+            not force
+            and self._annualized_distribution_cache is not None
+            and self._llm_usage_cached_at is not None
+            and self._monotonic() - self._llm_usage_cached_at < 60
+        ):
+            return
+        usage = self._llm_usage(force=force)
+        try:
+            annualized = self._annualized_distributions()
+        except Exception:
+            annualized = self._annualized_distribution_cache or {}
+        with self._lock:
+            self._llm_usage_cache = dict(usage)
+            self._annualized_distribution_cache = copy.deepcopy(annualized)
 
     @staticmethod
     def _distribution(values: Sequence[object]) -> dict[str, object]:
@@ -3823,11 +3849,12 @@ class PolymarketMonitor:
         }
 
     def _annualized_distributions(self) -> dict[str, dict[str, object]]:
-        current = [
-            row.get("annualized_yield")
-            for row in self._opportunities.values()
-            if row.get("market_type") == "threshold_hedge"
-        ]
+        with self._lock:
+            current = [
+                row.get("annualized_yield")
+                for row in self._opportunities.values()
+                if row.get("market_type") == "threshold_hedge"
+            ]
         history_7d = self._store.signal_history("7d")
         history_30d = self._store.signal_history("30d")
         return {
@@ -3844,6 +3871,7 @@ class PolymarketMonitor:
         now = self._now()
         if not force and self._last_runtime_write is not None and _age(now, self._last_runtime_write) < RUNTIME_WRITE_SECONDS:
             return
+        self._refresh_snapshot_metrics()
         payload = self.snapshot()
         payload.pop("readiness", None)
         # PairIntent is an in-process execution input, not a JSON/store value.
