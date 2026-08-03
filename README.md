@@ -411,23 +411,54 @@ These standard-strategy results are research-only. Custom strategy editing and
 automatic execution are explicitly out of scope; the dashboard does not place
 orders.
 
-### Deploy Local Frontend Dashboard
+### Deploy the Local Dashboard Stack
 
-```bash
-.venv/bin/python -m open_trader dashboard \
-  --portfolio data/latest/portfolio.csv \
-  --data-dir data \
-  --reports-dir reports \
-  --poll-seconds 5 \
-  --host 127.0.0.1 \
-  --port 8766
+The persistent macOS Dashboard runs as one launchd-managed stack:
+
+```text
+Browser → Frontend Gateway → Legacy Dashboard
+          127.0.0.1:8766     127.0.0.1:8767
 ```
 
-The dashboard serves locally at `http://127.0.0.1:8765` by default; the example
-above pins it to `http://127.0.0.1:8766` so the local deployment URL stays
-stable. It reads
-`data/latest/portfolio.csv`, broker detail artifacts under
-`data/broker_positions/`, and the latest trade actions and reports when present.
+`http://127.0.0.1:8766/` is the only user and review URL. The Legacy listener
+on `8767` owns the existing backend behavior and must remain loopback-only.
+
+On the first install, create the preserved single-process rollback plist before
+cutting over to the stack. After that bootstrap, stack refreshes use one command:
+
+```bash
+scripts/install_dashboard_launchd.sh --dry-run
+scripts/install_dashboard_launchd.sh --mode single
+scripts/install_dashboard_launchd.sh
+```
+
+For an existing stack, run the dry-run and stack-install commands only.
+
+Check both jobs, listeners, health identities, the forwarded quotes API, and
+fresh startup logs:
+
+```bash
+launchctl print gui/$(id -u)/com.open-trader.frontend-gateway
+launchctl print gui/$(id -u)/com.open-trader.legacy-dashboard
+lsof -nP -iTCP:8766 -sTCP:LISTEN
+lsof -nP -iTCP:8767 -sTCP:LISTEN
+curl -fsS http://127.0.0.1:8766/healthz
+curl -fsS http://127.0.0.1:8767/healthz
+curl -fsS -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8766/api/quotes
+tail -n 20 logs/frontend_gateway/launchd.out.log
+tail -n 20 logs/legacy_dashboard/launchd.out.log
+```
+
+Restore the preserved single-process layout without deleting the stack plists:
+
+```bash
+scripts/install_dashboard_launchd.sh --mode single
+```
+
+See [Frontend Gateway 双进程部署参考](docs/operations/frontend-gateway-deployment-reference.md)
+for cutover order, automatic failure recovery, temporary-port smoke checks,
+exact-SHA acceptance, and complete uninstall instructions.
 
 To generate intraday 做T signals for existing HK or US holdings:
 
@@ -479,54 +510,6 @@ Chat transcripts are stored under `data/research_chat/sessions/`. Finalization
 writes `user_llm_conclusion.json` into the research bundle and updates that
 bundle's `dashboard_view.json`. This workflow is read-only for trading: it does
 not place orders and does not modify trade action files.
-
-To keep the local frontend running after the terminal closes, start it in a
-detached `screen` session:
-
-```bash
-screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
-
-screen -dmS open_trader_dashboard_8766 zsh -lc \
-  'cd /Users/ray/projects/open_trader && export PYTHONPATH=src && exec .venv/bin/python -m open_trader dashboard --portfolio data/latest/portfolio.csv --data-dir data --reports-dir reports --poll-seconds 5 --host 127.0.0.1 --port 8766'
-```
-
-Verify the deployment:
-
-```bash
-curl -sS http://127.0.0.1:8766/ | head
-curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
-ps aux | rg 'open_trader dashboard'
-```
-
-For a structured API check, run:
-
-```bash
-.venv/bin/python - <<'PY'
-import json
-from urllib.request import urlopen
-
-with urlopen("http://127.0.0.1:8766/api/dashboard", timeout=10) as response:
-    payload = json.load(response)
-
-print("holding_count", payload.get("summary", {}).get("holding_count"))
-print("detail_available", payload.get("detail_available"))
-print(
-    "has_soxx_decision_facts",
-    any(
-        holding.get("market") == "US"
-        and holding.get("symbol") == "SOXX"
-        and bool(holding.get("decision_facts"))
-        for holding in payload.get("holdings", [])
-    ),
-)
-PY
-```
-
-Stop the detached dashboard when needed:
-
-```bash
-screen -S open_trader_dashboard_8766 -X quit
-```
 
 ## Daily Automation
 
@@ -722,8 +705,12 @@ worktree, confirm its SHA and clean state, restart all controllers with the
 shared config, then restart the Dashboard from that exact worktree:
 
 ```bash
-cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec
-export ACCEPTED_SHA=replace-with-full-accepted-sha
+REPO_ROOT="$PWD"
+if [ -z "${ACCEPTED_SHA:-}" ]; then
+  ACCEPTED_SHA="$(tr -d '\n' </tmp/open_trader_issue17_candidate_sha)"
+fi
+test -n "$ACCEPTED_SHA"
+export REPO_ROOT ACCEPTED_SHA
 test "$(git rev-parse HEAD)" = "$ACCEPTED_SHA"
 test -z "$(git status --short)"
 
@@ -732,9 +719,10 @@ scripts/install_daily_premarket_launchd.sh \
   --config /Users/ray/projects/open_trader/config/daily_premarket.env \
   --trend-only --market all
 
-screen -S open_trader_dashboard_8766 -X quit 2>/dev/null || true
-screen -dmS open_trader_dashboard_8766 zsh -lc \
-  'cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec && exec env PYTHONPATH=src .venv/bin/python -u -m open_trader dashboard --portfolio /Users/ray/projects/open_trader/data/latest/portfolio.csv --data-dir /Users/ray/projects/open_trader/data --reports-dir /Users/ray/projects/open_trader/reports --config /Users/ray/projects/open_trader/config/daily_premarket.env --poll-seconds 5 --host 127.0.0.1 --port 8766 >> /tmp/open_trader_dashboard_8766.log 2>&1'
+scripts/install_dashboard_launchd.sh --mode stack \
+  --repo-root "$REPO_ROOT" \
+  --runtime-root /Users/ray/projects/open_trader \
+  --python /Users/ray/projects/open_trader/.venv/bin/python
 ```
 
 For each CN/HK/US status document, verify the PID is live, `working_directory`
@@ -753,7 +741,7 @@ from pathlib import Path
 import time
 
 accepted_sha = os.environ["ACCEPTED_SHA"]
-worktree = "/Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec"
+worktree = os.environ["REPO_ROOT"]
 root = Path("/Users/ray/projects/open_trader/data/trend_controller")
 
 def read(market):
@@ -774,8 +762,9 @@ for market, previous in before.items():
 PY
 
 pgrep -f 'open_trader trend-market run' | xargs ps -o pid,lstart,command -p
-tail -n 80 /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
-tail -n 80 /tmp/open_trader_dashboard_8766.log
+tail -n 80 "$REPO_ROOT"/logs/daily_premarket/launchd-trend-controller-*.{out,err}.log
+tail -n 80 logs/frontend_gateway/launchd.out.log
+tail -n 80 logs/legacy_dashboard/launchd.out.log
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
 curl -sS http://127.0.0.1:8766/api/dashboard | \
   .venv/bin/python -m json.tool >/dev/null

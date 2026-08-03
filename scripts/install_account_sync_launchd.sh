@@ -77,6 +77,28 @@ bootstrap_agent() {
   done
 }
 
+wait_agent_absent() {
+  local attempt output status
+  for attempt in 1 2 3 4 5; do
+    if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1)"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ "$status" -ne 0 && "$output" == *"Could not find service"* ]]; then
+      return 0
+    fi
+    if [[ "$status" -ne 0 ]]; then
+      echo "failed to inspect launchd label: $LABEL" >&2
+      printf '%s\n' "$output" >&2
+      return 1
+    fi
+    [[ "$attempt" -lt 5 ]] && sleep 1
+  done
+  echo "launchd job is still loaded: $LABEL" >&2
+  return 1
+}
+
 controller_status_matches() {
   "$PYTHON_BIN" - "$@" <<'PY'
 from datetime import datetime
@@ -136,10 +158,10 @@ fi
 mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/account_sync" "$DATA_DIR" "$REPORTS_DIR"
 printf '%s\n' "$rendered" > "$PLIST_PATH"
 "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
+wait_agent_absent
 : > "$OUT_LOG"
 : > "$ERR_LOG"
 loaded_at="$(date +%s)"
 bootstrap_agent
-"$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LABEL"
 wait_ready "$loaded_at"
 echo "installed launchd agent: $LABEL"

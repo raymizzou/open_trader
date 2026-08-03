@@ -93,7 +93,7 @@ def test_uninstaller_targets_only_dashboard_stack_labels() -> None:
     assert "com.open-trader.premarket" not in source
 
 
-def test_dashboard_installer_retries_transient_launchctl_bootstrap(
+def test_dashboard_installer_waits_for_bootout_before_bootstrap(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -121,14 +121,40 @@ def test_dashboard_installer_retries_transient_launchctl_bootstrap(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     state = tmp_path / "bootstrap-count"
+    pending_removal = tmp_path / "pending-removal"
     launchctl = bin_dir / "launchctl"
     launchctl.write_text(
         """#!/bin/sh
+label="${2##*/}"
+if [ "$1" = "bootout" ]; then
+  if [ "$label" = "com.open-trader.dashboard" ]; then
+    echo 0 > "$FAKE_PENDING_REMOVAL"
+  fi
+  exit 0
+fi
+if [ "$1" = "print" ]; then
+  if [ "$label" = "com.open-trader.dashboard" ] && [ -f "$FAKE_PENDING_REMOVAL" ]; then
+    count="$(cat "$FAKE_PENDING_REMOVAL")"
+    count=$((count + 1))
+    echo "$count" > "$FAKE_PENDING_REMOVAL"
+    if [ "$count" -lt 2 ]; then
+      echo 'pid = 4242'
+      exit 0
+    fi
+    rm -f "$FAKE_PENDING_REMOVAL"
+  fi
+  echo 'Could not find service' >&2
+  exit 113
+fi
 if [ "$1" = "bootstrap" ]; then
   count="$(cat "$FAKE_BOOTSTRAP_STATE" 2>/dev/null || echo 0)"
   count=$((count + 1))
   echo "$count" > "$FAKE_BOOTSTRAP_STATE"
-  [ "$count" -gt 1 ] || exit 5
+  if [ -f "$FAKE_PENDING_REMOVAL" ]; then
+    echo 'Bootstrap failed: 5: Input/output error' >&2
+    rm -f "$FAKE_PENDING_REMOVAL"
+    exit 5
+  fi
 fi
 exit 0
 """,
@@ -149,7 +175,7 @@ exit 0
     )
     curl.chmod(0o755)
 
-    subprocess.run(
+    result = subprocess.run(
         [
             str(INSTALLER),
             "--mode",
@@ -169,6 +195,7 @@ exit 0
         env={
             **os.environ,
             "FAKE_BOOTSTRAP_STATE": str(state),
+            "FAKE_PENDING_REMOVAL": str(pending_removal),
             "HOME": str(tmp_path),
             "LAUNCHCTL_BIN": str(launchctl),
             "PATH": f"{bin_dir}:/usr/bin:/bin",
@@ -178,7 +205,8 @@ exit 0
         text=True,
     )
 
-    assert state.read_text(encoding="utf-8").strip() == "2"
+    assert state.read_text(encoding="utf-8").strip() == "1"
+    assert result.stderr == ""
     assert stdout_log.read_text(encoding="utf-8") == ""
     assert stderr_log.read_text(encoding="utf-8") == ""
 

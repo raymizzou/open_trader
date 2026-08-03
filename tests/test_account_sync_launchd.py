@@ -68,7 +68,7 @@ def test_dry_run_renders_runtime_paths_without_tiger_secrets(tmp_path: Path) -> 
     assert "token=" not in rendered
 
 
-def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
+def test_installer_waits_for_bootout_before_bootstrap_and_matching_status(
     tmp_path: Path,
 ) -> None:
     repo = _copy_repo(tmp_path)
@@ -79,20 +79,46 @@ def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
     bin_dir.mkdir()
     launchctl = bin_dir / "launchctl"
     bootstrap_count = tmp_path / "bootstrap-count"
+    pending_removal = tmp_path / "pending-removal"
+    loaded = tmp_path / "loaded"
     expected_sha = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
     launchctl.write_text(
         "#!/bin/sh\n"
+        "if [ \"$1\" = bootout ]; then\n"
+        "  echo 0 > \"$FAKE_PENDING_REMOVAL\"\n"
+        "  rm -f \"$FAKE_LOADED\"\n"
+        "  exit 0\n"
+        "fi\n"
         "if [ \"$1\" = print ]; then\n"
-        "  echo \"pid = $FAKE_LAUNCHD_PID\"\n"
+        "  if [ -f \"$FAKE_PENDING_REMOVAL\" ]; then\n"
+        "    count=$(cat \"$FAKE_PENDING_REMOVAL\")\n"
+        "    count=$((count + 1)); echo \"$count\" > \"$FAKE_PENDING_REMOVAL\"\n"
+        "    if [ \"$count\" -lt 2 ]; then\n"
+        "      echo \"pid = $FAKE_LAUNCHD_PID\"\n"
+        "      exit 0\n"
+        "    fi\n"
+        "    rm -f \"$FAKE_PENDING_REMOVAL\"\n"
+        "    echo 'Could not find service' >&2\n"
+        "    exit 113\n"
+        "  fi\n"
+        "  if [ -f \"$FAKE_LOADED\" ]; then\n"
+        "    echo \"pid = $FAKE_LAUNCHD_PID\"\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  echo 'Could not find service' >&2\n"
+        "  exit 113\n"
         "fi\n"
         "if [ \"$1\" = bootstrap ]; then\n"
         "  count=$(cat \"$FAKE_BOOTSTRAP_COUNT\" 2>/dev/null || echo 0)\n"
         "  count=$((count + 1)); echo \"$count\" > \"$FAKE_BOOTSTRAP_COUNT\"\n"
-        "  [ \"$count\" -lt 3 ] && exit 1\n"
-        "fi\n"
-        "if [ \"$1\" = kickstart ]; then\n"
+        "  if [ -f \"$FAKE_PENDING_REMOVAL\" ]; then\n"
+        "    echo 'Bootstrap failed: 5: Input/output error' >&2\n"
+        "    rm -f \"$FAKE_PENDING_REMOVAL\"\n"
+        "    exit 5\n"
+        "  fi\n"
+        "  : > \"$FAKE_LOADED\"\n"
         "  $FAKE_PYTHON - \"$FAKE_STATUS_PATH\" \"$FAKE_LAUNCHD_PID\" \"$FAKE_REPO\" \"$FAKE_SHA\" <<'PY'\n"
         "from datetime import datetime, timezone\n"
         "import json\n"
@@ -109,6 +135,11 @@ def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
         "  'blocker': None,\n"
         "}), encoding='utf-8')\n"
         "PY\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = kickstart ]; then\n"
+        "  echo 'unexpected kickstart' >&2\n"
+        "  exit 99\n"
         "fi\n",
         encoding="utf-8",
     )
@@ -117,6 +148,8 @@ def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
         **os.environ,
         "LAUNCHCTL_BIN": str(launchctl),
         "FAKE_BOOTSTRAP_COUNT": str(bootstrap_count),
+        "FAKE_PENDING_REMOVAL": str(pending_removal),
+        "FAKE_LOADED": str(loaded),
         "FAKE_STATUS_PATH": str(status_path),
         "FAKE_LAUNCHD_PID": "4242",
         "FAKE_PYTHON": sys.executable,
@@ -144,8 +177,9 @@ def test_installer_retries_bootstrap_kickstarts_and_waits_for_matching_status(
         env=env,
     )
 
-    assert bootstrap_count.read_text(encoding="utf-8").strip() == "3"
+    assert bootstrap_count.read_text(encoding="utf-8").strip() == "1"
     assert f"installed launchd agent: {LABEL}" in result.stdout
+    assert result.stderr == ""
 
 
 def test_installer_rejects_a_preinstall_status_without_kickstart_write(
@@ -168,10 +202,18 @@ def test_installer_rejects_a_preinstall_status_without_kickstart_write(
     )
     launchctl = tmp_path / "launchctl"
     calls = tmp_path / "launchctl-calls"
+    loaded = tmp_path / "launchd-loaded"
+    loaded.touch()
     launchctl.write_text(
         "#!/bin/sh\n"
         "echo \"$1\" >> \"$FAKE_LAUNCHCTL_CALLS\"\n"
-        "[ \"$1\" = print ] && echo 'pid = 4242'\n"
+        "if [ \"$1\" = bootout ]; then rm -f \"$FAKE_LOADED\"; exit 0; fi\n"
+        "if [ \"$1\" = bootstrap ]; then : > \"$FAKE_LOADED\"; exit 0; fi\n"
+        "if [ \"$1\" = print ]; then\n"
+        "  if [ -f \"$FAKE_LOADED\" ]; then echo 'pid = 4242'; exit 0; fi\n"
+        "  echo 'Could not find service' >&2\n"
+        "  exit 113\n"
+        "fi\n"
         "exit 0\n",
         encoding="utf-8",
     )
@@ -197,6 +239,7 @@ def test_installer_rejects_a_preinstall_status_without_kickstart_write(
             **os.environ,
             "LAUNCHCTL_BIN": str(launchctl),
             "FAKE_LAUNCHCTL_CALLS": str(calls),
+            "FAKE_LOADED": str(loaded),
         },
     )
 
@@ -204,8 +247,8 @@ def test_installer_rejects_a_preinstall_status_without_kickstart_write(
     assert "account sync controller did not publish a matching fresh status" in result.stderr
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "bootout",
+        "print",
         "bootstrap",
-        "kickstart",
         "print",
         "bootout",
     ]

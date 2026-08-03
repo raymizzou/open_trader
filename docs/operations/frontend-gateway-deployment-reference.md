@@ -1,7 +1,9 @@
 # Frontend Gateway 双进程部署参考
 
-本文件对应 GitHub Issue [#14](https://github.com/raymizzou/open_trader/issues/14) 和
-[#15](https://github.com/raymizzou/open_trader/issues/15)，用于验证和运维本地双进程链路。
+本文件对应 GitHub Issues [#14](https://github.com/raymizzou/open_trader/issues/14)、
+[#15](https://github.com/raymizzou/open_trader/issues/15)、
+[#16](https://github.com/raymizzou/open_trader/issues/16) 和
+[#17](https://github.com/raymizzou/open_trader/issues/17)，用于验证和运维本地双进程链路。
 
 ## 当前范围
 
@@ -33,7 +35,13 @@
 scripts/install_dashboard_launchd.sh --dry-run
 ```
 
-正式安装会先验证当前 `8766` 和 Legacy `8767`，确认 Legacy health 通过后才停止
+首次安装必须先生成保留的单进程回滚 plist；已有该 plist 的 stack 刷新可跳过此步：
+
+```bash
+scripts/install_dashboard_launchd.sh --mode single
+```
+
+随后正式 stack 安装会先验证当前 `8766` 和 Legacy `8767`，确认 Legacy health 通过后才停止
 旧的 `8766` job，再启动 Gateway。任何未知 listener 或 Gateway readiness 失败都会
 拒绝切换或自动恢复旧单进程，并验证 `http://127.0.0.1:8766/` HTTP 200：
 
@@ -172,6 +180,24 @@ dashboard_runtime: {...}
 ```
 
 检查记录中的 `pid`、`cwd`、`git_sha` 和 `source_state`。两个进程应来自同一个目标 worktree 和 Git SHA；Gateway health 的 `upstream_status` 必须是 `ok`。
+
+## 生产验收与 exact-SHA 交付
+
+所有文档和 CHANGELOG 先提交，随后冻结候选 SHA。最终顺序固定为：
+
+1. 运行 Gateway、launchd stack 和双运行时 acceptance 聚焦测试；
+2. 运行完整 pytest suite；
+3. 从候选 worktree 部署 Gateway、Legacy Dashboard 及 acceptance 依赖的后台进程；
+4. 直接验证两个 launchd job、两个 listener、两个 health identity 和一条经
+   `8766` 转发的 `/api/quotes` 请求；
+5. 运行一次最终 `make acceptance`；
+6. 仅在 `PASS` 后重新部署完全相同的 accepted SHA；
+7. 核对两个新 PID、cwd、SHA、source state、启动时间、新鲜 runtime 日志及
+   `http://127.0.0.1:8766/` HTTP 200。
+
+`FAIL` 必须修复并从候选验证重新开始；`BLOCKED` 必须报告实际外部或浏览器
+阻塞，不能用 curl、fixture、mock 或单元测试替代。exact-SHA 重启未改变源码或
+领域运行数据时，不重复运行 acceptance。
 
 ## 停止和回退
 
