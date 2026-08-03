@@ -22,6 +22,7 @@ from .a_share_trend import (
     INDUSTRY_STATE_FIELDS,
     UNIFIED_TREND_FIELDS,
     _balance,
+    _allocation_market_for,
     _billing_field,
     _billing_price,
     _component_api_facts,
@@ -951,11 +952,13 @@ def _attempt_market_report(
             else config.trend_animals_hk_tm_ids
         )
         process_version = _process_version(config.repo)
+        allocation_market = _allocation_market_for(allocation_reference, market)
         strategy_snapshot = live_trend_strategy_snapshot(
             market,
             process_version,
             pool_ids,
             execution_date=execution_date,
+            allocation=allocation_reference,
         )
         strategy_version = str(strategy_snapshot["strategy_version"])
         shared_entry_discipline = _uses_shared_entry_discipline(
@@ -1298,8 +1301,16 @@ def _attempt_market_report(
             generated_at=generated_at,
             market=market,
             lot_sizes=lot_sizes,
-            position_weight=Decimal("0.04"),
-            position_weight_source="fallback_4pct",
+            position_weight=Decimal(
+                str(allocation_market["entry_weight"])
+                if allocation_market is not None
+                else "0.04"
+            ),
+            position_weight_source=(
+                "trend_allocation_rank"
+                if allocation_market is not None
+                else "fallback_4pct"
+            ),
             price_fx_to_account_currency=Decimal("1"),
             process_version=process_version,
             candidate_pool_ids=pool_ids,

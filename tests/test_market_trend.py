@@ -78,6 +78,24 @@ def unlock_live_drawdown(
     )
 
 
+def allocation_for(market: str, *, rank: int, entry_weight: str) -> dict[str, object]:
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": {
+            "markets": {
+                market: {
+                    "rank": rank,
+                    "score": "95.2",
+                    "score_source": "美国ETF",
+                    "entry_weight": entry_weight,
+                    "nominal_weight": {2: "0.40", 3: "0.20"}[rank],
+                },
+            },
+        },
+    }
+
+
 class DefaultSimAccountClient:
     def __init__(self, **kwargs: object) -> None:
         self.acc_id = int(kwargs["simulate_acc_id"])
@@ -249,6 +267,29 @@ def test_live_market_strategy_snapshot_defaults_to_v8_with_exact_inheritance(
         }
         for version in ("v4", "v5", "v6", "v7", "v8")
     ]
+
+
+@pytest.mark.parametrize(
+    ("market", "rank", "weight", "pools"),
+    [
+        ("HK", 2, "0.04", (622494,)),
+        ("US", 3, "0.02", (622460,)),
+    ],
+)
+def test_allocation_market_v9_freezes_rank_weight(
+    market: str, rank: int, weight: str, pools: tuple[int, ...],
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        pools,
+        allocation=allocation_for(market, rank=rank, entry_weight=weight),
+    )
+
+    assert snapshot["strategy_version"] == "v9"
+    assert snapshot["parameters"]["target_weight"] == weight
+    assert snapshot["parameters"]["allocation_rank"] == rank
+    assert snapshot["parameters"]["min_strength"] == "95"
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:

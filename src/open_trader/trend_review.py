@@ -78,7 +78,7 @@ PROTECTION_STATE_ROOTS = {
     "US": "trend_us_tiger",
 }
 TREND_STRATEGY_VERSIONS = frozenset(
-    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"}
+    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11"}
 )
 
 
@@ -4584,14 +4584,33 @@ def normalize_trend_strategy_snapshot(
             trend_strategy_snapshot,
         )
 
-        if snapshot.get("strategy_version") in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        version = str(snapshot.get("strategy_version") or "")
+        allocation = None
+        if (market, version) in {("CN", "v11"), ("HK", "v9"), ("US", "v9")}:
+            allocation = {
+                "daily_path": parameters.get("allocation_snapshot_path"),
+                "sha256": parameters.get("allocation_snapshot_sha256"),
+                "snapshot": {
+                    "markets": {
+                        market: {
+                            "rank": parameters.get("allocation_rank"),
+                            "score": parameters.get("allocation_score"),
+                            "score_source": parameters.get("allocation_score_source"),
+                            "entry_weight": parameters.get("target_weight"),
+                            "nominal_weight": parameters.get("nominal_weight"),
+                        },
+                    },
+                },
+            }
+        if version in {
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
         }:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
                 process_version,
                 pools,
-                strategy_version=str(snapshot["strategy_version"]),
+                strategy_version=version,
+                allocation=allocation,
             )
         else:
             expected_snapshot = trend_strategy_snapshot(

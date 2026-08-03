@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import open_trader.a_share_trend as trend_module
 import open_trader.trend_delivery as trend_delivery_module
+from open_trader import trend_review
 
 from open_trader.a_share_trend import (
     A_SHARE_INDUSTRY_FIELDS,
@@ -443,6 +444,137 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
         estimated_api_cost=Decimal("1.20"),
         actual_api_cost=Decimal("1.00"),
     )
+
+
+def allocation_for(
+    market: str,
+    *,
+    rank: int,
+    entry_weight: str,
+) -> dict[str, object]:
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": {
+            "markets": {
+                market: {
+                    "rank": rank,
+                    "score": "95.2",
+                    "score_source": "美国ETF",
+                    "entry_weight": entry_weight,
+                    "nominal_weight": {1: "0.60", 2: "0.40", 3: "0.20"}[rank],
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "rank", "weight"),
+    [
+        ("CN", "v11", 1, "0.06"),
+        ("HK", "v9", 2, "0.04"),
+        ("US", "v9", 3, "0.02"),
+    ],
+)
+def test_current_allocation_versions_freeze_rank_weight(
+    market: str, version: str, rank: int, weight: str,
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (1, 2),
+        allocation=allocation_for(market, rank=rank, entry_weight=weight),
+    )
+
+    assert snapshot["strategy_version"] == version
+    assert snapshot["parameters"]["allocation_rank"] == rank
+    assert snapshot["parameters"]["target_weight"] == weight
+    assert snapshot["parameters"]["allocation_snapshot_sha256"] == "b" * 64
+    assert trend_review.normalize_trend_strategy_snapshot(snapshot, market) == snapshot
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "pools"),
+    [
+        ("CN", "v10", (622466, 697199)),
+        ("HK", "v8", (622494,)),
+        ("US", "v8", (622460,)),
+    ],
+)
+def test_cold_start_keeps_current_four_percent_versions_without_allocation_fields(
+    market: str, version: str, pools: tuple[int, ...],
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
+
+    assert snapshot["strategy_version"] == version
+    assert "allocation_rank" not in snapshot["parameters"]
+    assert "allocation_snapshot_sha256" not in snapshot["parameters"]
+
+
+def test_allocation_cn_v11_applies_rank_weight_only_to_new_hot_and_boiling_buys(
+    tmp_path: Path,
+) -> None:
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), allocation=allocation,
+    )
+    current_account = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+    )
+    automatic_bootstrap_strategy_drawdown(
+        tmp_path,
+        market="CN",
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version=str(snapshot["strategy_version"]),
+        parameters=snapshot["parameters"],
+        baseline_equity=current_account.net_value,
+        source_date="2026-07-14",
+        accepted_git_sha="a" * 40,
+        actor="pytest",
+        occurred_at="2026-07-14T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-15",
+    )
+    drawdown = trend_module.observe_strategy_equity(
+        tmp_path,
+        market="CN",
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version=str(snapshot["strategy_version"]),
+        current_equity=current_account.net_value,
+        observed_at="2026-07-14T18:00:00+08:00",
+        entry_date="2026-07-15",
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=current_account,
+        candidates=(
+            candidate("600001", temperature_curr="热"),
+            candidate("600002", temperature_curr="沸"),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version="abc123",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=snapshot,
+        position_weight=Decimal("0.06"),
+        position_weight_source="trend_allocation_rank",
+        drawdown_summary=drawdown,
+    )
+
+    assert [action.target_weight for action in built.buy_actions] == [
+        Decimal("0.06"), Decimal("0.06"),
+    ]
+    assert built.metadata["position_weight_source"] == "trend_allocation_rank"
+    trend_module.validate_report_strategy_snapshot(built)
 
 
 def test_new_mapping_report_freezes_actions_and_skips_unmapped_candidate() -> None:
