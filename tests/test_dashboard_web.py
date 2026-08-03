@@ -3596,6 +3596,9 @@ console.log(JSON.stringify({
   balances:html.includes("$12.34") && html.includes("$50.00"),
   serverValues:["$100.00","$20.00","$2.00","+$0.20"].every((value)=>html.includes(value)),
   missingLegs:predictionPreviewIsComplete({...preview,buy_legs:preview.buy_legs.slice(0,1)}),
+  missingFees:predictionPreviewIsComplete({...preview,buy_legs:[
+    {...preview.buy_legs[0],maximum_fee:undefined},preview.buy_legs[1],
+  ]}),
   missingBalances:predictionPreviewIsComplete({...preview,balances:undefined}),
   missingPolicy:predictionPreviewIsComplete({...preview,policy_limits:{max_normal_cost:"20"}}),
 }));
@@ -3609,9 +3612,51 @@ console.log(JSON.stringify({
         "balances": True,
         "serverValues": True,
         "missingLegs": False,
+        "missingFees": False,
         "missingBalances": False,
         "missingPolicy": False,
     }
+
+
+def test_prediction_cross_execution_mode_is_required_for_actions() -> None:
+    output = run_dashboard_js(r'''
+const opportunity = {
+  opportunity_id:"cross-mode-fixture",title:"Cross mode fixture",market_type:"cross_venue_yes_no",
+  execution_mode:"manual_confirm",quantity:"5",net_quantity:"5",total_max_cost:"4.80",
+  minimum_payout:"5",minimum_profit:"0.20",annualized_yield:"0.20",canonical_cutoff:"2026-12-31T00:00:00Z",
+  actionable:true,clear_signal:true,funnel_stage:5,
+  legs:[
+    {exchange:"predict.fun",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",net_quantity:"5",max_price:"0.47",max_cost:"2.35",maximum_fee:"0.02"},
+    {exchange:"polymarket",outcome:"NO",token_id:"poly-no",settlement_asset:"pUSD",net_quantity:"5",max_price:"0.49",max_cost:"2.45",maximum_fee:"0.00"},
+  ],
+};
+const payload = {
+  status:"healthy",health:{status:"healthy",degraded_reasons:[]},
+  readiness:{status:"ready",geoblock:"allowed",relayer:"ready",p_usd_balance:"50",wallet_address:"0x1234567890abcdef"},
+  policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"},
+  breaker:{open:false},
+  venues:[
+    {venue:"predict.fun",rest:"ready",ws:"ready",mode:"可以交易",balance:{value:"12.34"}},
+    {venue:"polymarket",rest:"ready",ws:"ready",mode:"可以交易",balance:{value:"50"}},
+  ],
+  cross_venue:{breaker:{open:false}},
+};
+const rendered = (mode) => predictionCrossVenueCandidateHtml({...opportunity,execution_mode:mode},payload);
+console.log(JSON.stringify({
+  manual:rendered("manual_confirm").includes('data-action="participate"'),
+  observe:rendered("observe_only"),
+  missing:rendered(undefined),
+  blocked:rendered("blocked"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["manual"] is True
+    for mode in ("observe", "missing", "blocked"):
+        assert 'data-action="participate"' not in rendered[mode]
+    assert "只观察模式" in rendered["observe"]
+    assert "执行模式未返回" in rendered["missing"]
+    assert "执行模式已阻断" in rendered["blocked"]
 
 
 def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:

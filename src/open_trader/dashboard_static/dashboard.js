@@ -2527,7 +2527,9 @@ function predictionMetricStrip(payload) {
   const actionable = payload?.breaker?.open || executionBlocked
     ? 0
     : Array.isArray(payload?.opportunities)
-      ? opportunities.filter((item) => item.actionable === true && predictionOpportunityIsComplete(item)).length
+      ? opportunities.filter((item) => item.actionable === true
+        && predictionOpportunityIsComplete(item)
+        && (!predictionIsCrossVenue(item) || predictionCrossExecutionMode(item) === "manual_confirm")).length
       : "-";
   const eventCount = predictionHasValue(payload?.event_count) ? predictionNumber(payload.event_count) : "-";
   const marketCount = predictionHasValue(payload?.market_count) ? predictionNumber(payload.market_count) : "-";
@@ -2559,6 +2561,18 @@ function predictionIsCrossVenue(value) {
   return String(value?.market_type || "").toLowerCase() === "cross_venue_yes_no";
 }
 
+function predictionCrossExecutionMode(value) {
+  return String(value?.execution_mode || "").trim().toLowerCase();
+}
+
+function predictionCrossExecutionModeReason(value) {
+  const mode = predictionCrossExecutionMode(value);
+  if (mode === "observe_only") return "当前为只观察模式，不开放下单。";
+  if (!mode) return "执行模式未返回，当前不会开放下单。";
+  if (mode === "blocked") return "当前执行模式已阻断，不开放下单。";
+  return "当前执行模式不支持下单，保留监控结果。";
+}
+
 function predictionCrossVenueTradingAvailable(payload) {
   const venues = Array.isArray(payload?.venues) ? payload.venues : [];
   const required = ["predict.fun", "polymarket"];
@@ -2580,12 +2594,19 @@ function predictionCrossVenueCandidateHtml(value, payload) {
   const titleZh = opportunity.title_zh || opportunity.title;
   const titleEn = opportunity.title_zh ? `<span class="pm-title-en">${escapeHtml(predictionValue(opportunity.title, "数据未返回"))}</span>` : "";
   const complete = predictionOpportunityIsComplete(opportunity);
-  const actionable = complete
+  const executionMode = predictionCrossExecutionMode(opportunity);
+  const executionModeAllowsAction = executionMode === "manual_confirm";
+  const observeOnlyStage5 = executionMode === "observe_only" && Number(opportunity.funnel_stage) === 5;
+  const actionable = executionModeAllowsAction && complete
     && opportunity.actionable === true
     && opportunity.clear_signal === true
     && predictionCrossVenueTradingAvailable(payload);
   const status = actionable ? "可下单明确信号" : "仅观察";
-  const reason = actionable ? "确认时会重新读取两所 REST、盘口、余额和未结算额度。" : predictionReasonLabel(opportunity.eligibility_reason || opportunity.reason || "opportunity_unavailable");
+  const reason = (!executionModeAllowsAction && (executionMode !== "observe_only" || observeOnlyStage5))
+    ? predictionCrossExecutionModeReason(opportunity)
+    : actionable
+      ? "确认时会重新读取两所 REST、盘口、余额和未结算额度。"
+      : predictionReasonLabel(opportunity.eligibility_reason || opportunity.reason || "opportunity_unavailable");
   const legRows = legs.map((leg, index) => `<article class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(predictionVenueLegLabels([leg]).replace(" · ", " · BUY "))} · FOK</span><strong>${escapeHtml(predictionValue(leg.net_quantity ?? opportunity.net_quantity, "-"))} 份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · ${escapeHtml(predictionValue(leg.settlement_asset, "资产未返回"))}</small></article>`).join("");
   return `<article class="pm-opportunity pm-cross-candidate ${actionable ? "" : "disabled"}" data-cross-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}"><div class="pm-opportunity-title"><div><h3 class="pm-event-title"><span class="pm-title-zh">${escapeHtml(predictionValue(titleZh, "数据未返回"))}</span>${titleEn}</h3><p>Predict.fun × Polymarket · 跨所 YES/NO · ${escapeHtml(predictionValue(opportunity.canonical_cutoff ?? opportunity.resolution_at, "截止时间未返回"))}</p></div><span class="pm-pill ${actionable ? "action" : "watch"}">${status}</span></div><div class="pm-order-legs">${legRows || "<div class=\"pm-empty compact\">两条跨所腿数据未返回</div>"}</div><dl class="pm-cross-metrics"><div><dt>净可兑付份额</dt><dd>${escapeHtml(predictionValue(opportunity.net_quantity, "-"))}</dd></div><div><dt>含费最大成本</dt><dd>${escapeHtml(predictionMoney(opportunity.max_cost))}</dd></div><div><dt>最低赔付</dt><dd>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</dd></div><div><dt>最低净利润</dt><dd class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit))}</dd></div><div><dt>简单年化</dt><dd>${escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 2))}</dd></div></dl><div class="pm-opportunity-action"><p>${escapeHtml(reason)}</p>${actionable ? `<button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">查看并确认跨所订单</button>` : ""}</div></article>`;
 }
@@ -2949,12 +2970,13 @@ function predictionHistoryContent(payload, kind) {
       const currentState = state.predictionMarket.payload || payload;
       const healthy = !String(state.predictionMarket.signalError || "").trim()
         && predictionTradingAvailable(currentState);
-      const actionable = row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy;
+      const crossModeAllowsAction = !cross(row) || predictionCrossExecutionMode(row) === "manual_confirm";
+      const actionable = row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy && crossModeAllowsAction;
       const button = `<button class="pm-button primary pm-signal-action" type="button" data-action="participate" data-opportunity-id="${escapeHtml(String(row.opportunity_id))}">重新检查</button>`;
       if (cross(row)) {
         return actionable && predictionCrossVenueTradingAvailable(currentState)
           ? button
-          : `<span class="pm-observe">仅观察</span><small>${escapeHtml(predictionReasonLabel(row.eligibility_reason || "opportunity_unavailable"))}</small>`;
+          : `<span class="pm-observe">仅观察</span><small>${escapeHtml(!crossModeAllowsAction ? predictionCrossExecutionModeReason(row) : predictionReasonLabel(row.eligibility_reason || "opportunity_unavailable"))}</small>`;
       }
       if (threshold(row)) {
         return actionable
@@ -3267,7 +3289,7 @@ function predictionPreviewIsComplete(value) {
       && exchanges.size === 2
       && exchanges.has("predict.fun")
       && exchanges.has("polymarket")
-      && legs.every((leg) => [leg?.exchange, leg?.outcome, leg?.token_id, leg?.settlement_asset, leg?.net_quantity, leg?.max_price, leg?.max_cost].every(predictionHasValue))
+      && legs.every((leg) => [leg?.exchange, leg?.outcome, leg?.token_id, leg?.settlement_asset, leg?.net_quantity, leg?.max_price, leg?.max_cost, leg?.maximum_fee].every(predictionHasValue))
       && ["predict.fun", "polymarket"].every((exchange) => {
         const balance = balances[exchange];
         return balance

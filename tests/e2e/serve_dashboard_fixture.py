@@ -75,12 +75,12 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"},
     ]
     cross_opportunity = {
-        "opportunity_id": "cross-opportunity-actionable-fixture",
+        "opportunity_id": "cross-opportunity-observe-only-fixture",
         "event_id": "cross-event-actionable-fixture",
         "title": "Will Bitcoin close above $100,000 on December 31, 2026?",
         "title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？",
         "market_type": "cross_venue_yes_no",
-        "execution_mode": "manual_confirm",
+        "execution_mode": "observe_only",
         "legs": [
             {**cross_legs[0], "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02", "fee_asset": "USDT", "net_quantity": "5", "settlement_asset": "USDT"},
             {**cross_legs[1], "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00", "fee_asset": "pUSD", "net_quantity": "5", "settlement_asset": "pUSD"},
@@ -94,6 +94,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "canonical_cutoff": "2026-12-31T23:59:00Z",
         "resolution_at": "2026-12-31T23:59:00Z",
         "clear_signal": True,
+        "funnel_stage": 5,
         "codex_approval": {
             "decision": "APPROVE",
             "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。",
@@ -122,9 +123,16 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         ],
         "minimum_profit": "0.08",
         "annualized_yield": "0.149",
+        "funnel_stage": 4,
         "clear_signal": False,
         "eligibility_reason": "annualized_yield_below_minimum",
         "actionable": False,
+    }
+    manual_cross_opportunity = {
+        **cross_opportunity,
+        "opportunity_id": "cross-opportunity-actionable-fixture",
+        "event_id": "cross-event-actionable-fixture",
+        "execution_mode": "manual_confirm",
     }
     if scenario == "quiet":
         opportunity = {**opportunity, "actionable": False}
@@ -157,7 +165,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "可以交易", "last_success": "2026-08-02T00:59:58Z"},
         ],
         "cross_venue": {
-            "mode": "manual_confirm",
+            "mode": "manual_confirm" if scenario == "cross-manual-confirm" else "observe_only",
             "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1},
             "unsettled": {"current": "35.20", "limit": "100"},
             "breaker": {"open": False, "scope": "cross_venue"},
@@ -169,8 +177,8 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "token_count": 662,
         "signals_24h": 3,
         "events": events,
-        "opportunities": [] if scenario == "quiet" else [opportunity, cross_opportunity, cross_below_threshold],
-        "histories": {history_kind: _prediction_history(history_kind)},
+        "opportunities": [] if scenario == "quiet" else [opportunity, manual_cross_opportunity if scenario == "cross-manual-confirm" else cross_opportunity, cross_below_threshold],
+        "histories": {history_kind: _prediction_history_for_scenario(history_kind, scenario)},
         "breaker": {"open": scenario == "incident", "status": "locked" if scenario == "incident" else "ready"},
         "csrf_token": "fixture-csrf",
     }
@@ -312,7 +320,7 @@ def _prediction_history(kind: str) -> list[dict[str, object]]:
     if kind == "signals":
         return [
             {"signal_id": "signal-ceasefire", "opportunity_id": "opp-ceasefire", "occurred_at": "2026-08-01T01:59:00Z", "event_title": "Will the Israel-Iran ceasefire continue through August 31, 2026?", "event_title_zh": "以色列与伊朗停火是否持续至 2026 年 8 月 31 日？", "duration": "2m 14s", "initial_profit": "0.30", "live_profit": "0.38", "actionable_now": True, "notification_state": "sent"},
-            {"signal_id": "cross-signal-fixture", "opportunity_id": "cross-opportunity-actionable-fixture", "market_type": "cross_venue_yes_no", "execution_mode": "manual_confirm", "occurred_at": "2026-08-01T01:57:00Z", "event_title": "Will Bitcoin close above $100,000 on December 31, 2026?", "event_title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？", "legs": [{"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture"}, {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"}], "duration": "38s", "initial_profit": "0.20", "live_profit": "0.20", "annualized_yield": "0.201", "actionable_now": True, "notification_state": "sent"},
+            {"signal_id": "cross-signal-fixture", "opportunity_id": "cross-opportunity-observe-only-fixture", "market_type": "cross_venue_yes_no", "execution_mode": "observe_only", "occurred_at": "2026-08-01T01:57:00Z", "event_title": "Will Bitcoin close above $100,000 on December 31, 2026?", "event_title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？", "legs": [{"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture"}, {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"}], "duration": "38s", "initial_profit": "0.20", "live_profit": "0.20", "annualized_yield": "0.201", "actionable_now": True, "notification_state": "sent"},
             {"signal_id": "signal-fed", "opportunity_id": "opp-fed", "occurred_at": "2026-08-01T01:55:00Z", "event_title": "Will the Fed cut rates in September 2026?", "event_title_zh": "2026 年 9 月美联储是否降息？", "duration": "18s", "initial_profit": "0.20", "live_profit": "0.24", "actionable_now": False, "notification_state": "failed"},
             {"signal_id": "signal-closed", "opportunity_id": "opp-closed", "occurred_at": "2026-08-01T01:50:00Z", "ended_at": "2026-08-01T01:50:41Z", "event_title": "Will Ethereum exceed $6,000 before September?", "event_title_zh": "以太坊会在 9 月前突破 $6,000？", "duration": "41s", "initial_profit": "0.15", "live_profit": "0.18", "actionable_now": False, "notification_state": "sent"},
             {"signal_id": "signal-threshold", "opportunity_id": "threshold-approved", "market_id": "threshold-approved", "market_type": "threshold_hedge", "occurred_at": "2026-08-01T01:48:00Z", "event_title": "Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?", "event_title_zh": "比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？", "minimum_profit": "0.54", "total_max_cost": "19.46", "maximum_fee": "0.12", "annualized_yield": "0.0053", "remaining_days": "152.6", "resolution_at": "2026-12-31T00:00:00Z", "eligibility_reason": "annualized_yield_below_minimum", "actionable_now": False, "notification_state": "not_sent"},
@@ -330,6 +338,35 @@ def _prediction_history(kind: str) -> list[dict[str, object]]:
         {"happened_at": "今天 14:43:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": [{"exchange": "predict.fun", "outcome": "YES"}, {"exchange": "polymarket", "outcome": "NO"}], "reason": "cross_dust", "remediation": "残余头寸待人工处理", "loss": "-0.80", "status": "dust_incident"},
         {"happened_at": "今天 14:44:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": [{"exchange": "predict.fun", "outcome": "YES"}, {"exchange": "polymarket", "outcome": "NO"}], "reason": "cross_circuit_breaker_open", "remediation": "已停止新的跨所订单", "loss": "-0.80", "status": "directional_incident"},
     ]
+
+
+def _prediction_history_for_scenario(kind: str, scenario: str) -> list[dict[str, object]]:
+    items = _prediction_history(kind)
+    if kind != "signals":
+        return items
+    if scenario == "cross-manual-confirm":
+        return [
+            {
+                **item,
+                "opportunity_id": "cross-opportunity-actionable-fixture",
+                "execution_mode": "manual_confirm",
+            }
+            if item.get("market_type") == "cross_venue_yes_no"
+            else item
+            for item in items
+        ]
+    if scenario == "cross-observe-only":
+        return [
+            {
+                **item,
+                "event_title": "Observe-only cross venue Bitcoin signal",
+                "event_title_zh": "跨所只观察信号",
+            }
+            if item.get("market_type") == "cross_venue_yes_no"
+            else item
+            for item in items
+        ]
+    return items
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -378,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
                 self.end_headers()
                 return
-            items = _prediction_history(kind)
+            items = _prediction_history_for_scenario(kind, type(self).prediction_scenario)
             if type(self).prediction_scenario == "signal-closed" and kind == "signals":
                 items = [{**items[0], "ended_at": "2026-08-01T02:00:10Z", "actionable_now": False, "live_profit": None}, *items[1:]]
             if type(self).prediction_scenario in {"degraded", "unavailable", "unknown"} and kind == "signals":

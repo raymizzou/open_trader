@@ -33,7 +33,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('renders shared venue truth and protects the cross-venue confirmation flow', async ({ page }) => {
     for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
       await page.setViewportSize(viewport);
-      await openPrediction(page);
+      await openPrediction(page, 'cross-manual-confirm');
       const venueHeader = page.locator('.pm-venue-readiness');
       const tabs = page.locator('.pm-strategy-tabs');
       await expect(venueHeader).toBeVisible();
@@ -100,6 +100,21 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       expect(await page.locator('.pm-venue-card').nth(1).evaluate((card) => getComputedStyle(card).borderRightWidth)).toBe('1px');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     }
+  });
+
+  test('keeps observe-only cross rows and history visible without an execution action', async ({ page }) => {
+    await openPrediction(page, 'cross-observe-only');
+    const observeOnly = page.locator('[data-cross-opportunity-id="cross-opportunity-observe-only-fixture"]');
+    await expect(observeOnly).toContainText('仅观察');
+    await expect(observeOnly).toContainText('只观察模式');
+    await expect(observeOnly.locator('[data-action="participate"]')).toHaveCount(0);
+    await expect(page.locator('.pm-cross-venue-funnel')).toContainText('可下单明确信号');
+
+    const history = page.locator('[data-prediction-history-panel]');
+    const observeSignal = history.locator('tbody tr').filter({ hasText: '跨所只观察信号' });
+    await expect(observeSignal).toContainText('仅观察');
+    await expect(observeSignal).toContainText('只观察模式');
+    await expect(observeSignal.locator('[data-action="participate"]')).toHaveCount(0);
   });
 
   test('renders cross execution history, holding, dust, breaker, and redemption states', async ({ page }) => {
