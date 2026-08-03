@@ -1703,6 +1703,7 @@ def main(argv: list[str] | None = None) -> int:
             occurred_at = now.isoformat(timespec="seconds")
             quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
             allocation = None
+            allocation_calendar_error: str | None = None
             allocation_date = now.astimezone(
                 ZoneInfo("Asia/Shanghai")
             ).date().isoformat()
@@ -1717,15 +1718,20 @@ def main(argv: list[str] | None = None) -> int:
                     in {"ready", "fallback", "holiday"}
                 ):
                     allocation_day = date.fromisoformat(allocation_date)
-                    allocation = allocation_reference_for_report(
-                        config,
-                        allocation_date=allocation_date,
-                        a_trading_days=quote.get_trading_days(
+                    try:
+                        allocation_days = quote.get_trading_days(
                             market="CN",
                             start=(allocation_day - timedelta(days=35)).isoformat(),
                             end=(allocation_day + timedelta(days=1)).isoformat(),
-                        ),
-                    )
+                        )
+                    except (FutuQuoteError, OSError) as exc:
+                        allocation_calendar_error = str(exc) or exc.__class__.__name__
+                    else:
+                        allocation = allocation_reference_for_report(
+                            config,
+                            allocation_date=allocation_date,
+                            a_trading_days=allocation_days,
+                        )
             allocation_kwargs = (
                 {"allocation": allocation} if allocation is not None else {}
             )
@@ -1739,24 +1745,36 @@ def main(argv: list[str] | None = None) -> int:
                     "HK": config.trend_animals_hk_tm_ids,
                     "US": config.trend_animals_us_tm_ids,
                 }[market]
-                strategy: dict[str, object] | None = None
-                try:
+                calendar_error = allocation_calendar_error
+                source_date = None
+                entry_eligible_from = None
+                if calendar_error is None:
                     today = now.date()
-                    trading_days = quote.get_trading_days(
-                        market=market,
-                        start=(today - timedelta(days=14)).isoformat(),
-                        end=(today + timedelta(days=21)).isoformat(),
-                    )
-                    source_date, entry_eligible_from = market_preflight_dates(
-                        market, now=now, trading_days=trading_days
-                    )
-                    strategy = live_trend_strategy_snapshot(
-                        market,
-                        accepted_git_sha,
-                        pool_ids,
-                        execution_date=entry_eligible_from,
-                        **allocation_kwargs,
-                    )
+                    try:
+                        trading_days = quote.get_trading_days(
+                            market=market,
+                            start=(today - timedelta(days=14)).isoformat(),
+                            end=(today + timedelta(days=21)).isoformat(),
+                        )
+                    except (FutuQuoteError, OSError) as exc:
+                        calendar_error = str(exc) or exc.__class__.__name__
+                    else:
+                        try:
+                            source_date, entry_eligible_from = market_preflight_dates(
+                                market, now=now, trading_days=trading_days
+                            )
+                        except ValueError as exc:
+                            calendar_error = str(exc) or exc.__class__.__name__
+                strategy = live_trend_strategy_snapshot(
+                    market,
+                    accepted_git_sha,
+                    pool_ids,
+                    execution_date=(
+                        entry_eligible_from or now.date().isoformat()
+                    ),
+                    **allocation_kwargs,
+                )
+                if calendar_error is None:
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
@@ -1764,22 +1782,14 @@ def main(argv: list[str] | None = None) -> int:
                         source_date=source_date,
                         entry_eligible_from=entry_eligible_from,
                     )
-                except Exception as exc:
-                    if strategy is None:
-                        strategy = live_trend_strategy_snapshot(
-                            market,
-                            accepted_git_sha,
-                            pool_ids,
-                            execution_date=now.date().isoformat(),
-                            **allocation_kwargs,
-                        )
+                else:
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
                         baseline_equity=None,
                         source_date=None,
                         entry_eligible_from=None,
-                        error=str(exc),
+                        error=calendar_error,
                     )
             result = run_drawdown_preflight(
                 data_dir=config.data_dir,

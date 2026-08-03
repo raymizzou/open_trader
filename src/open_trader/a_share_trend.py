@@ -32,6 +32,8 @@ from .notification_policy import render_attention, render_daily_title
 from .portfolio_risk import size_entry_by_risk
 from .parsers.base import detect_asset_class
 from .strategy_drawdown import (
+    ALLOCATION_DYNAMIC_PARAMETER_NAMES,
+    ALLOCATION_PROJECTION_VERSIONS,
     DRAWDOWN_LIMIT,
     observe_strategy_equity,
     valid_drawdown_decision,
@@ -798,7 +800,46 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     """Validate the allocation-era fields once for every frozen-report reader."""
     allocation = payload.get("allocation")
     judgments = payload.get("strategy_judgments")
+    metadata = payload.get("metadata")
+    strategy_snapshot = payload.get("strategy_snapshot")
+    parameters = (
+        strategy_snapshot.get("parameters")
+        if isinstance(strategy_snapshot, Mapping)
+        else None
+    )
     if allocation is None:
+        if isinstance(strategy_snapshot, Mapping):
+            snapshot_market = str(strategy_snapshot.get("market") or "").upper()
+            metadata_market = str(
+                metadata.get("market") or ""
+            ).upper() if isinstance(metadata, Mapping) else ""
+            if "market" in strategy_snapshot and snapshot_market not in {
+                "CN", "HK", "US",
+            }:
+                return False
+            if snapshot_market and metadata_market and snapshot_market != metadata_market:
+                return False
+            identity_market = snapshot_market or metadata_market
+            identity_version = str(
+                strategy_snapshot.get("strategy_version") or ""
+            )
+            current_identity = identity_version in {
+                *CURRENT_TREND_STRATEGY_VERSIONS.values(),
+                *ALLOCATION_PROJECTION_VERSIONS.values(),
+            }
+            if ("strategy_id" in strategy_snapshot or current_identity) and (
+                identity_market not in {"CN", "HK", "US"}
+                or not identity_version
+                or strategy_snapshot.get("strategy_id")
+                != f"trend_animals_warm_to_hot/{identity_market}/{identity_version}"
+            ):
+                return False
+            if ALLOCATION_PROJECTION_VERSIONS.get(identity_market) == identity_version:
+                return False
+        if isinstance(parameters, Mapping) and (
+            ALLOCATION_DYNAMIC_PARAMETER_NAMES - {"target_weight"}
+        ) & parameters.keys():
+            return False
         if isinstance(judgments, Mapping) and any(
             field in judgments
             for field in ("simulate_rotation_pairs", "real_rotation_pairs")
@@ -806,6 +847,61 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
             return False
         return True
     if not valid_frozen_allocation(allocation):
+        return False
+    market_value = strategy_snapshot.get("market") if isinstance(
+        strategy_snapshot, Mapping
+    ) else None
+    metadata_market = metadata.get("market") if isinstance(metadata, Mapping) else None
+    snapshot_market = (
+        market_value.upper()
+        if isinstance(market_value, str)
+        and market_value.upper() in {"CN", "HK", "US"}
+        else None
+    )
+    metadata_market_text = (
+        str(metadata_market).upper()
+        if metadata_market is not None
+        and str(metadata_market).upper() in {"CN", "HK", "US"}
+        else None
+    )
+    if market_value is not None and snapshot_market is None:
+        return False
+    if snapshot_market is not None and (
+        metadata_market is not None and metadata_market_text != snapshot_market
+    ):
+        return False
+    market = snapshot_market or metadata_market_text
+    if market is None:
+        return False
+    allocation_markets = allocation.get("markets")
+    allocation_market = (
+        allocation_markets.get(market)
+        if isinstance(allocation_markets, Mapping)
+        else None
+    )
+    allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
+    if (
+        not isinstance(strategy_snapshot, Mapping)
+        or strategy_snapshot.get("strategy_version") != allocation_version
+        or strategy_snapshot.get("strategy_id")
+        != f"trend_animals_warm_to_hot/{market}/{allocation_version}"
+        or snapshot_market is None
+        or not isinstance(parameters, Mapping)
+        or not isinstance(allocation_market, Mapping)
+        or any(
+            type(parameters.get(parameter_name)) is not type(expected)
+            or parameters.get(parameter_name) != expected
+            for parameter_name, expected in (
+                ("allocation_snapshot_path", allocation.get("daily_path")),
+                ("allocation_snapshot_sha256", allocation.get("sha256")),
+                ("allocation_rank", allocation_market.get("rank")),
+                ("allocation_score", allocation_market.get("score")),
+                ("allocation_score_source", allocation_market.get("score_source")),
+                ("target_weight", allocation_market.get("entry_weight")),
+                ("nominal_weight", allocation_market.get("nominal_weight")),
+            )
+        )
+    ):
         return False
     if not isinstance(judgments, Mapping):
         return False

@@ -582,10 +582,70 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
     allocationless_pairs = json.loads(json.dumps(payload))
     del allocationless_pairs["allocation"]
     assert not trend_module.valid_frozen_report_contract(allocationless_pairs)
-    historical = json.loads(json.dumps(allocationless_pairs))
-    historical["strategy_judgments"].pop("simulate_rotation_pairs")
-    historical["strategy_judgments"].pop("real_rotation_pairs")
+    allocation_only_without_snapshot = json.loads(json.dumps(allocationless_pairs))
+    allocation_only_without_snapshot["strategy_judgments"].pop("simulate_rotation_pairs")
+    allocation_only_without_snapshot["strategy_judgments"].pop("real_rotation_pairs")
+    for name in (
+        "allocation_snapshot_path", "allocation_snapshot_sha256",
+        "allocation_rank", "allocation_score", "allocation_score_source",
+        "target_weight", "nominal_weight",
+    ):
+        allocation_only_without_snapshot["strategy_snapshot"]["parameters"].pop(name)
+    assert not trend_module.valid_frozen_report_contract(
+        allocation_only_without_snapshot
+    )
+    for market_value in (None, ""):
+        missing_market = json.loads(json.dumps(allocation_only_without_snapshot))
+        if market_value is None:
+            missing_market["strategy_snapshot"].pop("market")
+        else:
+            missing_market["strategy_snapshot"]["market"] = market_value
+        assert not trend_module.valid_frozen_report_contract(missing_market)
+    historical = json.loads(json.dumps(allocation_only_without_snapshot))
+    historical["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v10",
+    )
+    historical["metadata"]["market"] = "CN"
     assert trend_module.valid_frozen_report_contract(historical)
+    mismatched_historical_identity = json.loads(json.dumps(historical))
+    mismatched_historical_identity["strategy_snapshot"]["strategy_id"] = (
+        "trend_animals_warm_to_hot/CN/v11"
+    )
+    assert not trend_module.valid_frozen_report_contract(
+        mismatched_historical_identity
+    )
+    cross_market_historical_identity = json.loads(json.dumps(historical))
+    cross_market_historical_identity["strategy_snapshot"].update(
+        market="HK", strategy_id="trend_animals_warm_to_hot/HK/v10",
+    )
+    assert not trend_module.valid_frozen_report_contract(
+        cross_market_historical_identity
+    )
+    for market, version, pools in (
+        ("CN", "v7", (622466, 697199)),
+        ("US", "v5", (622460, 705013)),
+    ):
+        legacy = json.loads(json.dumps(historical))
+        legacy["metadata"]["market"] = market
+        legacy["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+            market, "abc123", pools, strategy_version=version,
+        )
+        assert trend_module.valid_frozen_report_contract(legacy)
+        wrong_id = json.loads(json.dumps(legacy))
+        wrong_id["strategy_snapshot"]["strategy_id"] = (
+            "trend_animals_warm_to_hot/ZZ/v999"
+        )
+        assert not trend_module.valid_frozen_report_contract(wrong_id)
+        blank_market = json.loads(json.dumps(legacy))
+        blank_market["strategy_snapshot"]["market"] = ""
+        assert not trend_module.valid_frozen_report_contract(blank_market)
+    allocation_parameters_without_snapshot = json.loads(json.dumps(historical))
+    allocation_parameters_without_snapshot["strategy_snapshot"]["parameters"][
+        "allocation_rank"
+    ] = 1
+    assert not trend_module.valid_frozen_report_contract(
+        allocation_parameters_without_snapshot
+    )
     assert "模拟盘自动轮换" not in render_markdown(
         replace(built, allocation=None)
     )
@@ -646,6 +706,30 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
     absent_candidate = json.loads(json.dumps(payload))
     absent_candidate["strategy_judgments"]["simulate_rotation_pairs"][0]["buy_symbol"] = "MISSING"
     invalid_payloads.append(absent_candidate)
+    mismatched_strategy_allocation = json.loads(json.dumps(payload))
+    mismatched_strategy_allocation["strategy_snapshot"]["parameters"].update({
+        "allocation_snapshot_path": "data/trend_allocation/daily/2026-08-04.json",
+        "allocation_snapshot_sha256": "c" * 64,
+        "allocation_rank": 1,
+        "allocation_score": "99",
+        "allocation_score_source": "A股",
+        "target_weight": "0.06",
+        "nominal_weight": "0.60",
+    })
+    invalid_payloads.append(mismatched_strategy_allocation)
+    mismatched_market = json.loads(json.dumps(payload))
+    mismatched_market["metadata"]["market"] = "HK"
+    invalid_payloads.append(mismatched_market)
+    predecessor_with_allocation = json.loads(json.dumps(payload))
+    predecessor_with_allocation["strategy_snapshot"] = (
+        trend_module.live_trend_strategy_snapshot(
+            "CN", "abc123", (622466, 697199), strategy_version="v10",
+        )
+    )
+    invalid_payloads.append(predecessor_with_allocation)
+    boolean_rank = json.loads(json.dumps(payload))
+    boolean_rank["strategy_snapshot"]["parameters"]["allocation_rank"] = True
+    invalid_payloads.append(boolean_rank)
 
     assert not any(
         trend_module.valid_frozen_report_contract(invalid)
