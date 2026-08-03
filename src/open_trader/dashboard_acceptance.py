@@ -2509,7 +2509,7 @@ def _check_trend_artifact_projection(
     ), f"{broker} 冻结报告动作与 API 投影不一致"
     for key in ("simulate_rotation_comparisons", "real_rotation_comparisons"):
         expected = judgments.get(key, [])
-        assert isinstance(expected, list) and report.get(key) == expected, (
+        assert isinstance(expected, list) and report.get(key, []) == expected, (
             f"{broker} 冻结报告轮换比较与 API 投影不一致：{key}"
         )
     assert report.get("counts") == {
