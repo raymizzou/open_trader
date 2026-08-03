@@ -102,6 +102,7 @@ def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_m
     assert markets[0].fee_rate_bps == Decimal("200")
     assert all(request.full_url.startswith("https://api.predict.fun/") for request in requests)
     assert all(request.headers["X-api-key"] == "predict-key-sentinel" for request in requests)
+    assert all(request.headers["User-agent"] == "open-trader/0.1" for request in requests)
 
 
 def test_complete_yes_book_derives_no_asks_at_the_market_tick() -> None:

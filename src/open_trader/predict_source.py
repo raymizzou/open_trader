@@ -251,7 +251,9 @@ class PredictSource:
         if query:
             url += "?" + urlencode(query)
         for attempt in range(6):
-            request = Request(url, headers={"x-api-key": api_key})
+            request = Request(
+                url, headers={"x-api-key": api_key, "User-Agent": "open-trader/0.1"}
+            )
             try:
                 payload = await asyncio.to_thread(self._read_json, request)
             except Exception as exc:
