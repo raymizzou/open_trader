@@ -1708,6 +1708,7 @@ def _valid_v3_dashboard_trend_payload() -> dict[str, object]:
     summary = payload["risk_summary"]
     assert isinstance(snapshot, dict) and isinstance(summary, dict)
     snapshot["strategy_version"] = "v3"
+    snapshot["strategy_id"] = "trend_animals_warm_to_hot/CN/v3"
     parameters = snapshot["parameters"]
     assert isinstance(parameters, dict)
     parameters.update(
@@ -1947,6 +1948,14 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
         "reused": False, "stale_a_trading_days": 0, "failure_reason": "",
         "roots": snapshot["roots"], "markets": snapshot["markets"],
     }
+    payload["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation={
+            "daily_path": payload["allocation"]["daily_path"],
+            "sha256": payload["allocation"]["sha256"],
+            "snapshot": snapshot,
+        },
+    )
     judgments = payload["strategy_judgments"]
     assert isinstance(judgments, dict)
     judgments["simulate_rotation_pairs"] = []

@@ -1818,6 +1818,14 @@ def test_valid_report_rejects_invalid_frozen_allocation_and_rotation_pair(
         "reused": False, "stale_a_trading_days": 0, "failure_reason": "",
         "roots": snapshot["roots"], "markets": snapshot["markets"],
     }
+    report["strategy_snapshot"] = a_share_trend.live_trend_strategy_snapshot(
+        "CN", "test-sha", (622466, 697199),
+        allocation={
+            "daily_path": report["allocation"]["daily_path"],
+            "sha256": report["allocation"]["sha256"],
+            "snapshot": snapshot,
+        },
+    )
     judgments = report["strategy_judgments"]
     assert isinstance(judgments, dict)
     judgments["holding_decisions"] = [{"symbol": "WEAK"}]

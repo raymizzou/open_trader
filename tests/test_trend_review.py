@@ -468,7 +468,24 @@ def test_rebuild_uses_frozen_allocation_daily_bytes_not_latest_pointer(
         "sha256": hashlib.sha256(body.encode()).hexdigest(),
         "snapshot": snapshot,
     }
-    strategy = trend_strategy_snapshot("CN", "oldsha", (622466, 697199))
+    strategy = live_trend_strategy_snapshot(
+        "CN", "oldsha", (622466, 697199), allocation=allocation,
+    )
+    drawdown = automatic_bootstrap_strategy_drawdown(
+        tmp_path,
+        market="CN",
+        strategy_id=str(strategy["strategy_id"]),
+        strategy_version=str(strategy["strategy_version"]),
+        parameters=strategy["parameters"],
+        baseline_equity=Decimal("100000"),
+        source_date="2026-07-16",
+        accepted_git_sha="a" * 40,
+        actor="pytest",
+        occurred_at="2026-07-16T18:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-17",
+        entry_date="2026-07-17",
+    )
     report = build_report(
         as_of_date="2026-07-16",
         execution_date="2026-07-17",
@@ -477,6 +494,7 @@ def test_rebuild_uses_frozen_allocation_daily_bytes_not_latest_pointer(
         market="CN", process_version="oldsha", strategy_snapshot=strategy,
         metadata={"process_version": "oldsha"},
         allocation_reference=allocation,
+        drawdown_summary=drawdown,
     )
     source = _report_payload(report)
     frozen = trend_review.freeze_report_evidence(

@@ -308,6 +308,196 @@ def test_allocation_reference_requires_current_terminal_attempt(tmp_path: Path) 
         )
 
 
+def test_allocation_reference_must_match_the_terminal_status(
+    tmp_path: Path,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    reference = write_allocation_snapshot(config.data_dir, snapshot())
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status = {
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "phase": "ready",
+        "attempted_for": "2026-08-03",
+        "latest_daily_path": reference["daily_path"],
+        "latest_sha256": reference["sha256"],
+    }
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    loaded = trend_allocation.allocation_reference_for_report(
+        config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+    )
+    assert loaded is not None
+    assert (loaded["daily_path"], loaded["sha256"]) == (
+        reference["daily_path"], reference["sha256"],
+    )
+
+    write_allocation_snapshot(
+        config.data_dir,
+        snapshot(roots=root_rows(cn=("99", "58.3"))),
+        revision=True,
+    )
+    with pytest.raises(TrendAnimalsError, match="terminal status"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+    (config.data_dir / "trend_allocation/latest.json").unlink()
+    status["latest_daily_path"] = None
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    with pytest.raises(TrendAnimalsError, match="terminal status"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+    status["latest_sha256"] = None
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    with pytest.raises(TrendAnimalsError, match="terminal status"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("requested_date", "error"),
+    [("2026-08-02", "future snapshot"), ("2026-08-04", "requested-day snapshot")],
+)
+def test_allocation_ready_status_requires_requested_day_snapshot(
+    tmp_path: Path, requested_date: str, error: str,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    reference = write_allocation_snapshot(config.data_dir, snapshot())
+    (config.data_dir / "trend_allocation/controller_status.json").write_text(json.dumps({
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "phase": "ready",
+        "attempted_for": requested_date,
+        "latest_daily_path": reference["daily_path"],
+        "latest_sha256": reference["sha256"],
+        "blocker": None,
+    }), encoding="utf-8")
+
+    with pytest.raises(TrendAnimalsError, match=error):
+        trend_allocation.allocation_reference_for_report(
+            config,
+            allocation_date=requested_date,
+            a_trading_days=["2026-08-02", "2026-08-03", "2026-08-04"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "blocker"),
+    [("fallback", "Trend Animals unavailable"), ("holiday", None)],
+)
+def test_allocation_terminal_status_rejects_future_snapshot(
+    tmp_path: Path, phase: str, blocker: str | None,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    reference = write_allocation_snapshot(config.data_dir, snapshot())
+    (config.data_dir / "trend_allocation/controller_status.json").write_text(json.dumps({
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "phase": phase,
+        "attempted_for": "2026-08-02",
+        "latest_daily_path": reference["daily_path"],
+        "latest_sha256": reference["sha256"],
+        "blocker": blocker,
+    }), encoding="utf-8")
+
+    with pytest.raises(TrendAnimalsError, match="future snapshot"):
+        trend_allocation.allocation_reference_for_report(
+            config,
+            allocation_date="2026-08-02",
+            a_trading_days=["2026-08-02", "2026-08-03"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "blocker", "valid"),
+    [
+        ("fallback", "Trend Animals unavailable", True),
+        ("holiday", None, True),
+        ("fallback", None, False),
+        ("fallback", "", False),
+        ("holiday", "unexpected blocker", False),
+        ("ready", "unexpected blocker", False),
+    ],
+)
+def test_allocation_reference_binds_terminal_phase_to_blocker(
+    tmp_path: Path, phase: str, blocker: str | None, valid: bool,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "phase": phase,
+        "attempted_for": "2026-08-03",
+        "latest_daily_path": None,
+        "latest_sha256": None,
+        "blocker": blocker,
+    }), encoding="utf-8")
+
+    if valid:
+        assert trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        ) is None
+    else:
+        with pytest.raises(TrendAnimalsError, match="phase and blocker"):
+            trend_allocation.allocation_reference_for_report(
+                config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+            )
+
+
+def test_allocation_reference_uses_one_terminal_status_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    reference = write_allocation_snapshot(config.data_dir, snapshot())
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "phase": "ready",
+        "attempted_for": "2026-08-03",
+        "latest_daily_path": reference["daily_path"],
+        "latest_sha256": reference["sha256"],
+        "blocker": None,
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        trend_allocation,
+        "_status_failure_reason",
+        lambda _data_dir: pytest.fail("controller status was read twice"),
+    )
+
+    loaded = trend_allocation.allocation_reference_for_report(
+        config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+    )
+    assert loaded is not None
+    assert loaded["failure_reason"] is None
+
+
 def test_holiday_waits_for_the_post_close_attempt_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

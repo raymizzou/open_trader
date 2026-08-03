@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from decimal import Decimal, getcontext
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 
 from open_trader.a_share_trend import live_trend_strategy_snapshot
 from open_trader.strategy_drawdown import (
+    ALLOCATION_PROJECTION_PARAMETER_HASHES,
     UNIFIED_TREND_V5_COMPATIBILITY_REVISION,
     UNIFIED_TREND_V5_PARAMETER_HASHES,
     automatic_bootstrap_strategy_drawdown,
@@ -16,6 +18,7 @@ from open_trader.strategy_drawdown import (
     recover_strategy_drawdown_state,
     strategy_parameter_hash,
     valid_drawdown_decision,
+    valid_strategy_parameter_audit_identity,
 )
 
 
@@ -131,6 +134,193 @@ def test_parameter_hash_is_canonical() -> None:
         strategy_parameter_hash({"markets": ["CN", "HK"], "limit": "0.05"})
     )
     assert len(strategy_parameter_hash({"limit": "0.05"})) == 64
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "predecessor"),
+    [
+        ("CN", "v11", "v10"),
+        ("HK", "v9", "v8"),
+        ("US", "v9", "v8"),
+    ],
+)
+def test_daily_allocation_changes_keep_one_drawdown_identity(
+    tmp_path: Path, market: str, version: str, predecessor: str,
+) -> None:
+    def allocated_parameters(
+        day: str, sha: str, rank: int, score: str, score_source: str | None = None,
+    ) -> dict[str, object]:
+        entry, nominal = {
+            1: ("0.06", "0.60"),
+            2: ("0.04", "0.40"),
+            3: ("0.02", "0.20"),
+        }[rank]
+        reference = {
+            "daily_path": f"data/trend_allocation/daily/{day}.json",
+            "sha256": sha,
+            "snapshot": {
+                "markets": {
+                    market: {
+                        "rank": rank,
+                        "score": score,
+                        "score_source": score_source or market,
+                        "entry_weight": entry,
+                        "nominal_weight": nominal,
+                    }
+                }
+            },
+        }
+        pools = {
+            "CN": (622466, 697199),
+            "HK": (622494, 707617),
+            "US": (622460, 705013),
+        }[market]
+        return live_trend_strategy_snapshot(
+            market,
+            "a" * 40,
+            pools,
+            execution_date="2026-08-04",
+            allocation=reference,
+        )["parameters"]  # type: ignore[return-value]
+
+    legacy_rank, legacy_score, legacy_source = {
+        "CN": (3, "50.39", "ETF基金"),
+        "HK": (1, "86.97", "港股"),
+        "US": (2, "81.13", "美股"),
+    }[market]
+    first = allocated_parameters(
+        "2026-08-03-r1",
+        "a9ce9b25c605224e13c899ba9bd1f5c2194372ce409e0ada73dba37d93aa4d1a",
+        legacy_rank,
+        legacy_score,
+        legacy_source,
+    )
+    second = allocated_parameters("2026-08-04", "b" * 64, 3, "70")
+    upstream_valid = allocated_parameters("2026-08-05", "c" * 64, 2, "-1")
+    assert strategy_parameter_hash(first) == strategy_parameter_hash(second)
+    assert strategy_parameter_hash(first) == strategy_parameter_hash(upstream_valid)
+    assert strategy_parameter_hash(first) != strategy_parameter_hash(
+        {**second, "drawdown_limit": "0.06"}
+    )
+    with pytest.raises(ValueError, match="allocation strategy parameters"):
+        strategy_parameter_hash({**second, "allocation_rank": 4})
+    for name in ("target_weight", "nominal_weight"):
+        with pytest.raises(ValueError, match="allocation strategy parameters"):
+            strategy_parameter_hash({**second, name: "sNaN"})
+
+    data_dir = tmp_path / "data"
+    predecessor_key = {
+        "market": market,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{predecessor}",
+        "strategy_version": predecessor,
+    }
+    bootstrap(data_dir, predecessor_key, equity="100")
+    observe_strategy_equity(
+        data_dir,
+        **predecessor_key,
+        current_equity=Decimal("96"),
+        observed_at="2026-08-03T15:00:00+08:00",
+    )
+    request = {
+        "market": market,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+        "baseline_equity": None,
+        "source_date": "2026-08-03",
+        "accepted_git_sha": "b" * 40,
+        "actor": "pytest",
+        "occurred_at": "2026-08-03T16:20:00+08:00",
+        "reason": "new_strategy_version",
+        "entry_eligible_from": "2026-08-04",
+        "inherit_from": (
+            predecessor_key["strategy_id"], predecessor_key["strategy_version"],
+        ),
+    }
+    first_decision = automatic_bootstrap_strategy_drawdown(
+        data_dir, **request, parameters=first,
+    )
+    legacy_hash = ALLOCATION_PROJECTION_PARAMETER_HASHES[market][0]
+    assert hashlib.sha256(json.dumps(
+        first,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest() == legacy_hash
+    state_path = data_dir / "trend_drawdown/state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    bootstrap_event = next(
+        item for item in state["audit_events"]
+        if item.get("event_type") == "automatic_bootstrap"
+        and item.get("strategy_id") == request["strategy_id"]
+    )
+    bootstrap_event["parameter_hash"] = legacy_hash
+    bootstrap_event["event_id"] = "automatic-bootstrap-" + hashlib.sha256(
+        "|".join((
+            market, str(request["strategy_id"]), version, legacy_hash,
+        )).encode("utf-8")
+    ).hexdigest()
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert valid_strategy_parameter_audit_identity(
+        market=market,
+        strategy_id=str(request["strategy_id"]),
+        strategy_version=version,
+        parameters=first,
+        bootstrap_event=bootstrap_event,
+        parameter_compatibility_event=None,
+    )
+    assert not valid_strategy_parameter_audit_identity(
+        market=market,
+        strategy_id=str(request["strategy_id"]),
+        strategy_version=version,
+        parameters=second,
+        bootstrap_event=bootstrap_event,
+        parameter_compatibility_event=None,
+    )
+    assert not valid_strategy_parameter_audit_identity(
+        market=market,
+        strategy_id=str(request["strategy_id"]),
+        strategy_version=version,
+        parameters={**first, "drawdown_limit": "0.06"},
+        bootstrap_event=bootstrap_event,
+        parameter_compatibility_event=None,
+    )
+
+    migrated_decision = automatic_bootstrap_strategy_drawdown(
+        data_dir, **request, parameters=second,
+    )
+    second_decision = automatic_bootstrap_strategy_drawdown(
+        data_dir, **request, parameters=second,
+    )
+    compatibility = migrated_decision["parameter_compatibility_event"]
+    assert compatibility["compatibility_revision"] == "allocation_projection_v1"
+    assert compatibility["old_parameter_hash"] == legacy_hash
+    assert compatibility["new_parameter_hash"] == (
+        ALLOCATION_PROJECTION_PARAMETER_HASHES[market][1]
+    )
+    assert valid_strategy_parameter_audit_identity(
+        market=market,
+        strategy_id=str(request["strategy_id"]),
+        strategy_version=version,
+        parameters=second,
+        bootstrap_event=bootstrap_event,
+        parameter_compatibility_event=compatibility,
+    )
+    assert not valid_strategy_parameter_audit_identity(
+        market=market,
+        strategy_id=str(request["strategy_id"]),
+        strategy_version=version,
+        parameters={**second, "drawdown_limit": "0.06"},
+        bootstrap_event=bootstrap_event,
+        parameter_compatibility_event=compatibility,
+    )
+    assert second_decision == migrated_decision
+    assert first_decision["high_water_mark"] == second_decision["high_water_mark"]
+    assert second_decision["high_water_mark"] == "100"
+    assert second_decision["current_equity"] == "96"
 
 
 OVERHEAT_TRIM_PARAMETERS = {

@@ -492,8 +492,9 @@ def test_trend_drawdown_preflight_skips_missing_frozen_baseline_without_live_nav
     assert not (config.data_dir / "trend_drawdown/state.json").exists()
 
 
+@pytest.mark.parametrize("terminal_allocation", [False, True])
 def test_trend_drawdown_preflight_blocks_when_futu_calendar_is_unavailable(
-    tmp_path: Path, capsys, monkeypatch,
+    tmp_path: Path, capsys, monkeypatch, terminal_allocation: bool,
 ) -> None:
     config = SimpleNamespace(
         data_dir=tmp_path / "data",
@@ -505,13 +506,17 @@ def test_trend_drawdown_preflight_blocks_when_futu_calendar_is_unavailable(
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
+    if terminal_allocation:
+        status = config.data_dir / "trend_allocation/controller_status.json"
+        status.parent.mkdir(parents=True)
+        status.write_text("{}", encoding="utf-8")
 
     class UnavailableQuote:
         def __init__(self, **_: object) -> None:
             pass
 
         def get_trading_days(self, **_: object) -> list[str]:
-            raise RuntimeError("Futu trading calendar unavailable")
+            raise cli.FutuQuoteError("")
 
         def close(self) -> None:
             pass
@@ -520,6 +525,13 @@ def test_trend_drawdown_preflight_blocks_when_futu_calendar_is_unavailable(
     monkeypatch.setattr(cli, "FutuQuoteClient", UnavailableQuote)
     monkeypatch.setattr(cli, "build_notifier", lambda config: cli.NullNotifier())
     monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        cli,
+        "load_trend_allocation_status",
+        lambda config, now: {
+            "phase": "ready", "attempted_for": "2026-07-20",
+        },
+    )
     monkeypatch.setattr(
         cli,
         "_drawdown_preflight_now",
@@ -548,9 +560,63 @@ def test_trend_drawdown_preflight_blocks_when_futu_calendar_is_unavailable(
         "unavailable", "unavailable", "unavailable"
     ]
     assert all(
-        "Futu trading calendar unavailable" in item["error"]
+        "FutuQuoteError" in item["error"]
         for item in output["markets"]
     )
+
+
+@pytest.mark.parametrize("terminal_allocation", [False, True])
+def test_trend_drawdown_preflight_does_not_relabel_calendar_programmer_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_allocation: bool,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1", futu_port=11111,
+        trend_animals_a_share_tm_id=622466, trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,), trend_animals_hk_tm_ids=(622494,),
+    )
+    if terminal_allocation:
+        status = config.data_dir / "trend_allocation/controller_status.json"
+        status.parent.mkdir(parents=True)
+        status.write_text("{}", encoding="utf-8")
+
+    class BrokenQuote:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(self, **_: object) -> list[str]:
+            raise AssertionError("calendar adapter bug")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", BrokenQuote)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        cli, "load_trend_allocation_status",
+        lambda config, now: {"phase": "ready", "attempted_for": "2026-07-20"},
+    )
+    monkeypatch.setattr(
+        cli, "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-07-20T08:00:00+08:00"),
+    )
+    monkeypatch.setattr(
+        cli, "live_trend_strategy_snapshot",
+        lambda market, process_version, pool_ids, **kwargs: {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/v4",
+            "strategy_version": "v4", "parameters": {"market": market},
+        },
+    )
+    monkeypatch.setattr(
+        cli, "run_drawdown_preflight", lambda **kwargs: {"status": "unavailable"},
+    )
+
+    with pytest.raises(AssertionError, match="calendar adapter bug"):
+        cli.main([
+            "trend-drawdown-preflight", "--config", str(tmp_path / "daily.env"),
+            "--repo", str(tmp_path), "--actor", "acceptance",
+        ])
 
 
 def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_baseline(

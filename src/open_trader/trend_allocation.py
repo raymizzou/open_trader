@@ -42,6 +42,7 @@ ALLOCATION_STATUS_SCHEMA = "open_trader.trend_allocation.status.v1"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _ATTEMPT_AT = time(16, 20)
 _FALLBACK_AT = time(17, 45)
+_STATUS_FAILURE_REASON_UNSET = object()
 
 
 def _allocation_status_path(data_dir: Path) -> Path:
@@ -195,9 +196,53 @@ def allocation_reference_for_report(
     status = _read_allocation_status(config.data_dir)
     if status.get("attempted_for") != _date_text(allocation_date, "allocation_date") or status.get("phase") not in {"ready", "fallback", "holiday"}:
         raise TrendAnimalsError("allocation has not made a terminal attempt for this cycle")
-    return load_allocation_reference(
-        config.data_dir, allocation_date=allocation_date, a_trading_days=a_trading_days
+    phase = status["phase"]
+    blocker = status.get("blocker")
+    if (
+        phase == "fallback"
+        and (not isinstance(blocker, str) or not blocker.strip())
+    ) or (phase in {"ready", "holiday"} and blocker is not None):
+        raise TrendAnimalsError("allocation terminal phase and blocker are inconsistent")
+    status_path = status.get("latest_daily_path")
+    status_sha256 = status.get("latest_sha256")
+    if status_path is None and status_sha256 is None:
+        if status.get("phase") == "ready":
+            raise TrendAnimalsError(
+                "allocation terminal status reference is invalid"
+            )
+        expected = None
+    elif isinstance(status_path, str) and isinstance(status_sha256, str):
+        try:
+            expected = _reference({
+                "daily_path": status_path,
+                "sha256": status_sha256,
+            })
+        except TrendAnimalsError as exc:
+            raise TrendAnimalsError(
+                "allocation terminal status reference is invalid"
+            ) from exc
+    else:
+        raise TrendAnimalsError("allocation terminal status reference is invalid")
+    loaded = load_allocation_reference(
+        config.data_dir,
+        allocation_date=allocation_date,
+        a_trading_days=a_trading_days,
+        status_failure_reason=blocker,
     )
+    if phase == "ready" and (loaded is None or loaded["reused"] is not False):
+        raise TrendAnimalsError(
+            "allocation ready status must reference the requested-day snapshot"
+        )
+    actual = (
+        (str(loaded["daily_path"]), str(loaded["sha256"]))
+        if loaded is not None
+        else None
+    )
+    if actual != expected:
+        raise TrendAnimalsError(
+            "allocation latest pointer does not match terminal status"
+        )
+    return loaded
 
 
 def run_trend_allocation_controller(
@@ -479,6 +524,7 @@ def load_allocation_reference(
     *,
     allocation_date: str,
     a_trading_days: Iterable[str],
+    status_failure_reason: object = _STATUS_FAILURE_REASON_UNSET,
 ) -> dict[str, object] | None:
     requested_date = _date_text(allocation_date, "allocation_date")
     latest = data_dir / "trend_allocation" / "latest.json"
@@ -499,18 +545,29 @@ def load_allocation_reference(
         raise TrendAnimalsError("allocation daily snapshot hash mismatch")
     _validate_snapshot(snapshot)
     snapshot_date = str(snapshot["allocation_date"])
+    if snapshot_date > requested_date:
+        raise TrendAnimalsError("allocation latest pointer references a future snapshot")
     stale_days = 0
     for item in a_trading_days:
         day = _date_text(item, "A trading day")
         if snapshot_date < day <= requested_date:
             stale_days += 1
+    failure_reason = (
+        _status_failure_reason(data_dir)
+        if status_failure_reason is _STATUS_FAILURE_REASON_UNSET
+        else status_failure_reason
+    )
+    if failure_reason is not None and (
+        not isinstance(failure_reason, str) or not failure_reason.strip()
+    ):
+        raise TrendAnimalsError("allocation controller status is invalid")
     return {
         "daily_path": daily_path,
         "sha256": sha256,
         "snapshot": snapshot,
         "reused": snapshot_date != requested_date,
         "stale_a_trading_days": stale_days,
-        "failure_reason": _status_failure_reason(data_dir),
+        "failure_reason": failure_reason,
     }
 
 
