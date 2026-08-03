@@ -29,6 +29,7 @@ from open_trader.dashboard_acceptance import (
     validate_quotes_payload,
 )
 from open_trader.strategy_drawdown import (
+    ALLOCATION_PROJECTION_VERSIONS,
     automatic_bootstrap_strategy_drawdown,
     strategy_parameter_hash,
 )
@@ -39,9 +40,8 @@ MISSING_FRESH = object()
 
 
 def test_dashboard_acceptance_allows_current_market_versions() -> None:
-    assert "v11" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["CN"]
-    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
-    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
+    for market, version in ALLOCATION_PROJECTION_VERSIONS.items():
+        assert version in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS[market]
 
 
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
@@ -965,6 +965,8 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
             },
         }],
         "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 0, "buy": 0, "hold": 1, "review": 0},
         "audit": {
             "artifact": "2026-07-15.json",
@@ -1050,6 +1052,8 @@ def test_acceptance_suppresses_partial_when_same_symbol_has_full_exit(
         "buy_actions": [],
         "hold_actions": [],
         "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 1, "buy": 0, "hold": 0, "review": 0},
         "audit": {
             "artifact": "2026-07-15.json",
@@ -1110,6 +1114,8 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
         "generated_at": "2026-07-15T20:00:00+08:00",
         "sell_actions": [], "buy_actions": [], "hold_actions": [],
         "review_actions": [review],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 1},
         "audit": {
             "artifact": artifact.name, "candidates": complete, "excluded": {},
@@ -1212,6 +1218,8 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         ],
         "hold_actions": [],
         "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
         "audit": {
             "artifact": artifact.name,
@@ -1663,7 +1671,7 @@ def integrated_v4_payload(
         frozen_allocation = freeze_allocation_reference(allocation_reference)
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            {"CN": "v11", "HK": "v9", "US": "v9"}[market]
+            ALLOCATION_PROJECTION_VERSIONS[market]
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )
@@ -1750,7 +1758,9 @@ def integrated_v4_payload(
                 "risk_skips": [],
                 **({
                     "simulate_rotation_pairs": [],
+                    "simulate_rotation_comparisons": [],
                     "real_rotation_pairs": [],
+                    "real_rotation_comparisons": [],
                 } if current_live_versions else {}),
             },
             "risk_summary": risk_summary,
@@ -1802,6 +1812,8 @@ def integrated_v4_payload(
             "sell_actions": [],
             "hold_actions": [],
             "review_actions": [],
+            "simulate_rotation_comparisons": [],
+            "real_rotation_comparisons": [],
             "risk_skips": [],
             "risk_summary": {
                 **risk_summary,
