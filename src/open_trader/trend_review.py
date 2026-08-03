@@ -3485,6 +3485,7 @@ def _write_rotation_action_event_once(
     futu_code: str,
     side: str,
     order_id: str,
+    filled_qty: object,
     strategy_snapshot: Mapping[str, object] | None,
     recorded_at: str,
 ) -> Path | None:
@@ -3543,6 +3544,7 @@ def _write_rotation_action_event_once(
             "futu_code": futu_code,
             "side": side,
             "status": "filled",
+            "filled_qty": format(_required_decimal(filled_qty, "rotation filled quantity"), "f"),
             "order_ids": [order_id],
             "reason": "relative_rotation",
             "pair_key": pair_key,
@@ -3993,6 +3995,7 @@ def execute_relative_rotations(
                     futu_code=sell_code,
                     side="sell",
                     order_id=str(order.get("order_id") or ""),
+                    filled_qty=filled,
                     strategy_snapshot=strategy_snapshot
                     if isinstance(strategy_snapshot, Mapping) else None,
                     recorded_at=now,
@@ -4218,6 +4221,7 @@ def execute_relative_rotations(
                     futu_code=buy_code,
                     side="buy",
                     order_id=str(order.get("order_id") or ""),
+                    filled_qty=filled,
                     strategy_snapshot=strategy_snapshot
                     if isinstance(strategy_snapshot, Mapping) else None,
                     recorded_at=now,
