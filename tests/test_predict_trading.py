@@ -146,6 +146,8 @@ def test_reconcile_returns_unknown_for_pending_order_with_preexisting_position()
             return FakeResponse({"message": "dynamic-message-sentinel"})
         if request.full_url.endswith("/v1/auth"):
             return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/markets/896"):
+            return FakeResponse({"data": {"minimumOrderSize": "1"}})
         if request.full_url.endswith("/v1/orders/order-hash"):
             return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token", "signer": DEPOSIT, "status": "PENDING", "amountFilled": "1"}})
         if request.full_url.endswith("/v1/orders/matches"):
@@ -167,6 +169,8 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
             return FakeResponse({"message": "dynamic-message-sentinel"})
         if request.full_url.endswith("/v1/auth"):
             return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/markets/896"):
+            return FakeResponse({"data": {"minimumOrderSize": "1"}})
         if request.full_url.endswith("/v1/orders/order-hash"):
             return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token", "signer": DEPOSIT, "status": "FILLED", "amountFilled": "1"}})
         if request.full_url.endswith("/v1/orders/matches"):
@@ -184,6 +188,7 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
         "status": "verified",
         "filled_quantity": Decimal("1"),
         "position_quantity": Decimal("1"),
+        "minimum_order_size": Decimal("1"),
     }
 
 

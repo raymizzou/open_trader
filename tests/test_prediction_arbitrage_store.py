@@ -58,6 +58,25 @@ def cross_preview_payload(
         "market_type": "cross_venue_yes_no",
         "quantity": Decimal("20"),
         "total_max_cost": total_max_cost,
+        "intent": {
+            "intent_type": "cross_venue",
+            "legs": [
+                {
+                    "exchange": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "net_quantity": Decimal("20"),
+                },
+                {
+                    "exchange": "polymarket",
+                    "condition_id": "poly-condition",
+                    "outcome": "NO",
+                    "token_id": "poly-no",
+                    "net_quantity": Decimal("20"),
+                },
+            ],
+        },
     }
 
 
@@ -633,11 +652,92 @@ def test_cross_reservation_releases_only_proven_no_submit_or_redemption(
             "positions": {"predict.fun": "0", "polymarket": "0"},
             "redemption": {
                 "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
                 "redeemed_collateral": {"predict.fun": "10.50"},
             },
         },
     )
     db.release_cross_reservation(str(redeemed_execution["execution_id"]), reason="redeemed")
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_redemption_release_requires_the_observed_winning_venue_delta(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-winner-proof")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "0", "polymarket": "5"},
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="proof"):
+        db.release_cross_reservation(execution_id, reason="redeemed")
+
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_cross_release_sweep_recovers_a_proven_complete_after_a_crash(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-crash-retry")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5", "polymarket": "0"},
+            },
+        },
+    )
+
+    sweep = getattr(db, "release_proven_cross_completions", None)
+
+    assert callable(sweep)
+    assert sweep() == (execution_id,)
+    assert sweep() == ()
     assert db.cross_unsettled_principal() == Decimal("0")
 
 

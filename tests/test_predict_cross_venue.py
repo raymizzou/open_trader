@@ -557,10 +557,13 @@ def test_cross_venue_intent_uses_decimal_depth_fees_later_settlement_and_venue_i
         ("USDT", "predict-market-1", "predict-native-condition-1", "predict-yes-1"),
         ("USDC", "poly-market-1", "poly-condition", "poly-no-1"),
     ]
+    assert [leg.minimum_order_size for leg in intent.legs] == [
+        Decimal("5"), Decimal("5"),
+    ]
     assert set(asdict(intent.legs[0])) == {
         "exchange", "market_id", "condition_id", "outcome", "token_id",
         "settlement_asset", "requested_quantity", "net_quantity", "max_price", "max_cost", "maximum_fee", "fee_asset",
-        "book_timestamp", "settlement_at",
+        "book_timestamp", "settlement_at", "minimum_order_size",
     }
 
 

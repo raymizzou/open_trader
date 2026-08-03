@@ -1020,6 +1020,38 @@ def test_cross_leg_reconciliation_uses_order_trade_and_position_proof() -> None:
     assert reconciled["filled_quantity"] == Decimal("5")
 
 
+def test_cross_leg_reconciliation_carries_venue_minimum_order_size() -> None:
+    adapter, fake = make_adapter()
+    leg = SimpleNamespace(
+        exchange="polymarket", market_id="market-cross", condition_id="condition-cross",
+        outcome="NO", token_id="cross-no-token", settlement_asset="pUSD",
+        requested_quantity=Decimal("5"), net_quantity=Decimal("5"),
+        max_price=Decimal("0.48"), max_cost=Decimal("2.40"),
+        maximum_fee=Decimal("0.05"), fee_asset="pUSD",
+        book_timestamp=datetime.now(UTC), settlement_at=None,
+        minimum_order_size=Decimal("1"),
+    )
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
+            taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
+            side="BUY", matched_at=datetime.now(UTC),
+        )
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": "5"}
+    ]
+    result = ThresholdLegResult(
+        "polymarket", "NO", "condition-cross", "cross-no-token", True,
+        "filled", "cross-order", Decimal("5"), ("cross-trade",), "none",
+    )
+
+    reconciled = adapter.reconcile_cross_leg(leg, result, since=since)
+
+    assert reconciled.get("minimum_order_size") == Decimal("1")
+
+
 def test_threshold_reconcile_keeps_condition_and_token_refs_separate() -> None:
     adapter, fake = make_adapter()
     since = datetime.now(UTC) - timedelta(seconds=1)

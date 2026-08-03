@@ -1663,6 +1663,10 @@ class PolymarketTradingClient:
         max_cost = _field(leg, "max_cost")
         if not isinstance(max_cost, Decimal):
             return {"status": "unknown", "verified": False, "conclusively_absent": False}
+        try:
+            minimum_order_size = _decimal(_field(leg, "minimum_order_size"))
+        except ValueError:
+            minimum_order_size = None
         actual, proof = self._reconcile_threshold_leg(result, since=since)
         position = proof.get("position_ref")
         position_quantity = (
@@ -1671,7 +1675,7 @@ class PolymarketTradingClient:
             else Decimal("0")
         ) or Decimal("0")
         if proof.get("positions_verified") is True and actual > 0:
-            return {
+            reconciled: dict[str, object] = {
                 "status": "verified",
                 "verified": True,
                 "conclusively_absent": False,
@@ -1679,6 +1683,9 @@ class PolymarketTradingClient:
                 "position_quantity": position_quantity,
                 "execution_proof": {"verified": True, "venue": "polymarket", **proof},
             }
+            if minimum_order_size is not None and minimum_order_size > 0:
+                reconciled["minimum_order_size"] = minimum_order_size
+            return reconciled
         if not result.accepted and result.status != "ambiguous":
             try:
                 positions = _collect(self._client.list_positions(market=[condition_id]))

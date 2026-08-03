@@ -1098,27 +1098,75 @@ class PredictionArbitrageStore:
         return True
 
     @staticmethod
-    def _has_observed_redeemed_collateral(evidence: Mapping[str, object]) -> bool:
+    def _winner_matches_cross_payload(
+        winner: Mapping[str, object], payload: Mapping[str, object]
+    ) -> bool:
+        intent = payload.get("intent")
+        if not isinstance(intent, Mapping) or intent.get("intent_type") != "cross_venue":
+            return False
+        venue = winner.get("venue")
+        condition_id = winner.get("condition_id")
+        outcome = winner.get("outcome")
+        token_id = winner.get("token_id")
+        quantity = winner.get("quantity")
+        if (
+            venue not in {"predict.fun", "polymarket"}
+            or not all(isinstance(value, str) and value for value in (condition_id, outcome, token_id))
+            or outcome not in {"YES", "NO"}
+        ):
+            return False
+        try:
+            amount = Decimal(str(quantity))
+        except (InvalidOperation, ValueError):
+            return False
+        if not amount.is_finite() or amount <= 0:
+            return False
+        legs = intent.get("legs")
+        if not isinstance(legs, list):
+            return False
+        matches = 0
+        for leg in legs:
+            if not isinstance(leg, Mapping):
+                continue
+            if (
+                leg.get("exchange") != venue
+                or leg.get("condition_id") != condition_id
+                or leg.get("outcome") != outcome
+                or leg.get("token_id") != token_id
+            ):
+                continue
+            try:
+                maximum = Decimal(str(leg.get("net_quantity")))
+            except (InvalidOperation, ValueError):
+                continue
+            if maximum.is_finite() and amount <= maximum:
+                matches += 1
+        return matches == 1
+
+    @classmethod
+    def _has_observed_redeemed_collateral(
+        cls, evidence: Mapping[str, object], payload: Mapping[str, object]
+    ) -> bool:
         redemption = evidence.get("redemption")
         if not isinstance(redemption, Mapping) or redemption.get("observed") is not True:
+            return False
+        winner = redemption.get("winner")
+        if not isinstance(winner, Mapping) or not cls._winner_matches_cross_payload(winner, payload):
             return False
         collateral = redemption.get("redeemed_collateral")
         if not isinstance(collateral, Mapping):
             return False
-        for value in collateral.values():
-            if isinstance(value, bool):
-                continue
-            try:
-                amount = Decimal(str(value))
-            except (InvalidOperation, ValueError):
-                continue
-            if amount.is_finite() and amount > 0:
-                return True
-        return False
+        venue = str(winner["venue"])
+        try:
+            amount = Decimal(str(collateral.get(venue)))
+            required = Decimal(str(winner["quantity"]))
+        except (InvalidOperation, ValueError):
+            return False
+        return amount.is_finite() and required.is_finite() and amount >= required > 0
 
     @classmethod
     def _cross_release_is_proven(
-        cls, *, state: object, evidence: object, reason: str
+        cls, *, state: object, evidence: object, payload: Mapping[str, object], reason: str
     ) -> bool:
         if not isinstance(evidence, list):
             return False
@@ -1132,7 +1180,7 @@ class PredictionArbitrageStore:
                 if state == "both_rejected" and item.get("no_position_observed") is True:
                     return True
             elif reason == "redeemed":
-                if state == "complete" and cls._has_observed_redeemed_collateral(item):
+                if state == "complete" and cls._has_observed_redeemed_collateral(item, payload):
                     return True
         return False
 
@@ -1142,7 +1190,7 @@ class PredictionArbitrageStore:
         with self._transaction() as connection:
             row = connection.execute(
                 """
-                SELECT reservation.state AS reservation_state, execution.state, execution.evidence
+                SELECT reservation.state AS reservation_state, execution.state, execution.evidence, execution.payload
                 FROM cross_execution_reservations AS reservation
                 JOIN executions AS execution ON execution.execution_id=reservation.execution_id
                 WHERE reservation.execution_id=?
@@ -1152,7 +1200,8 @@ class PredictionArbitrageStore:
             if row is None or row["reservation_state"] == "released":
                 return
             if not self._cross_release_is_proven(
-                state=row["state"], evidence=json.loads(str(row["evidence"])), reason=reason
+                state=row["state"], evidence=json.loads(str(row["evidence"])),
+                payload=_load_payload(str(row["payload"])), reason=reason,
             ):
                 raise ValueError("cross reservation release proof missing")
             connection.execute(
@@ -1163,6 +1212,38 @@ class PredictionArbitrageStore:
                 """,
                 (_utc_now(), reason, str(execution_id)),
             )
+
+    def release_proven_cross_completions(self) -> tuple[str, ...]:
+        """Recover only terminal cross reservations whose stored redemption proof is complete."""
+
+        released: list[str] = []
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT reservation.execution_id, execution.state, execution.evidence, execution.payload
+                FROM cross_execution_reservations AS reservation
+                JOIN executions AS execution ON execution.execution_id=reservation.execution_id
+                WHERE reservation.state='reserved' AND execution.state='complete'
+                """
+            ).fetchall()
+            for row in rows:
+                if not self._cross_release_is_proven(
+                    state=row["state"], evidence=json.loads(str(row["evidence"])),
+                    payload=_load_payload(str(row["payload"])), reason="redeemed",
+                ):
+                    continue
+                execution_id = str(row["execution_id"])
+                updated = connection.execute(
+                    """
+                    UPDATE cross_execution_reservations
+                    SET state='released', released_at=?, release_reason='redeemed'
+                    WHERE execution_id=? AND state='reserved'
+                    """,
+                    (_utc_now(), execution_id),
+                )
+                if updated.rowcount == 1:
+                    released.append(execution_id)
+        return tuple(released)
 
     def consume_preview_and_create_execution(
         self, preview_id: str, idempotency_key: str

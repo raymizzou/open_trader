@@ -602,6 +602,10 @@ class PredictionExecutionService:
         """Observe automatic settlement; this method never submits redemption."""
 
         counts = {"complete": 0, "pending": 0, "unknown": 0}
+        try:
+            counts["complete"] += len(self._store.release_proven_cross_completions())
+        except Exception:
+            pass
         for row in self._store.histories("executions"):
             if row.get("state") != "holding_to_resolution":
                 continue
@@ -633,16 +637,33 @@ class PredictionExecutionService:
                 continue
             concrete = {venue: quantity for venue, quantity in positions.items() if quantity is not None}
             if any(quantity > 0 for quantity in concrete.values()):
+                winners = tuple(
+                    winner
+                    for snapshot, leg in ((polymarket, polymarket_leg), (predict, predict_leg))
+                    if (winner := self._cross_redeemable_winner(snapshot, leg)) is not None
+                )
+                evidence: dict[str, object] = {
+                    "phase": "redemption_pending",
+                    "status_text": "待兑付",
+                    "positions": {venue: format(quantity, "f") for venue, quantity in concrete.items()},
+                }
+                if len(winners) == 1:
+                    evidence["settlement"] = {"winner": winners[0]}
+                elif len(winners) > 1:
+                    self._cross_redemption_unknown(execution_id, row, "winner_ambiguous")
+                    counts["unknown"] += 1
+                    continue
                 self._transition(
                     execution_id,
                     "holding_to_resolution",
-                    {
-                        "phase": "redemption_pending",
-                        "status_text": "待兑付",
-                        "positions": {venue: format(quantity, "f") for venue, quantity in concrete.items()},
-                    },
+                    evidence,
                 )
                 counts["pending"] += 1
+                continue
+            winner = self._cross_settlement_winner(row.get("evidence"), intent)
+            if winner is None:
+                self._cross_redemption_unknown(execution_id, row, "winner_not_observed")
+                counts["unknown"] += 1
                 continue
             before = self._cross_entry_balances(row.get("evidence"))
             poly_after = _decimal(polymarket.get("p_usd_balance"))
@@ -659,8 +680,13 @@ class PredictionExecutionService:
                 "polymarket": max(Decimal("0"), poly_after - before["polymarket"]),
                 "predict.fun": max(Decimal("0"), predict_after - before["predict.fun"]),
             }
-            if not any(amount > 0 for amount in redeemed.values()):
-                self._cross_redemption_unknown(execution_id, row, "redemption_not_observed")
+            winner_venue = str(winner["venue"])
+            winner_quantity = _decimal(winner.get("quantity"))
+            if (
+                winner_quantity is None
+                or redeemed.get(winner_venue, Decimal("0")) < winner_quantity
+            ):
+                self._cross_redemption_unknown(execution_id, row, "winning_collateral_not_observed")
                 counts["unknown"] += 1
                 continue
             self._transition(
@@ -671,6 +697,7 @@ class PredictionExecutionService:
                     "positions": {venue: "0" for venue in concrete},
                     "redemption": {
                         "observed": True,
+                        "winner": winner,
                         "redeemed_collateral": {
                             venue: format(amount, "f") for venue, amount in redeemed.items()
                         },
@@ -731,6 +758,81 @@ class PredictionExecutionService:
                 values[venue] = balance
             if len(values) == 2:
                 return values
+        return None
+
+    @staticmethod
+    def _cross_redeemable_winner(
+        snapshot: Mapping[str, object], leg: CrossVenueLeg
+    ) -> dict[str, object] | None:
+        positions = snapshot.get("positions")
+        if not isinstance(positions, (list, tuple)):
+            return None
+        quantity = Decimal("0")
+        for position in positions:
+            if not isinstance(position, Mapping):
+                continue
+            token_id = position.get("token_id", position.get("tokenId", position.get("asset_id", "")))
+            if token_id != leg.token_id:
+                continue
+            condition_id = position.get("condition_id", position.get("conditionId", position.get("market", "")))
+            if condition_id not in (None, "", leg.condition_id):
+                continue
+            outcome = position.get("outcome", position.get("outcome_name", ""))
+            if outcome not in (None, "") and str(outcome).upper() != leg.outcome:
+                continue
+            redeemable = position.get("redeemable")
+            if redeemable is not True and str(redeemable).casefold() != "true":
+                continue
+            amount = _decimal(
+                position.get("size", position.get("quantity", position.get("shares", position.get("amount"))))
+            )
+            if amount is None or amount <= 0:
+                continue
+            quantity += amount
+        if quantity <= 0 or quantity > leg.net_quantity:
+            return None
+        return {
+            "venue": leg.exchange,
+            "condition_id": leg.condition_id,
+            "outcome": leg.outcome,
+            "token_id": leg.token_id,
+            "quantity": quantity,
+        }
+
+    @staticmethod
+    def _cross_settlement_winner(
+        evidence: object, intent: CrossVenueIntent
+    ) -> dict[str, object] | None:
+        if not isinstance(evidence, (list, tuple)):
+            return None
+        by_exchange = {leg.exchange: leg for leg in intent.legs}
+        for item in reversed(evidence):
+            if not isinstance(item, Mapping):
+                continue
+            settlement = item.get("settlement")
+            winner = settlement.get("winner") if isinstance(settlement, Mapping) else None
+            if not isinstance(winner, Mapping):
+                continue
+            venue = winner.get("venue")
+            leg = by_exchange.get(venue) if isinstance(venue, str) else None
+            quantity = _decimal(winner.get("quantity"))
+            if (
+                leg is None
+                or winner.get("condition_id") != leg.condition_id
+                or winner.get("outcome") != leg.outcome
+                or winner.get("token_id") != leg.token_id
+                or quantity is None
+                or quantity <= 0
+                or quantity > leg.net_quantity
+            ):
+                continue
+            return {
+                "venue": venue,
+                "condition_id": leg.condition_id,
+                "outcome": leg.outcome,
+                "token_id": leg.token_id,
+                "quantity": quantity,
+            }
         return None
 
     def _cross_redemption_unknown(
@@ -1445,14 +1547,18 @@ class PredictionExecutionService:
             )
             return
         residual = abs(positions["predict.fun"] - positions["polymarket"])
-        minimum = min(
-            (
-                _decimal(value.get("minimum_order_size"))
-                for value in reconciled.values()
-                if _decimal(value.get("minimum_order_size")) is not None
-            ),
-            default=Decimal("0"),
-        )
+        minimums = {
+            venue: _decimal(value.get("minimum_order_size"))
+            for venue, value in reconciled.items()
+        }
+        if any(value is None or value <= 0 for value in minimums.values()):
+            self._finish_cross_incident(
+                execution_id,
+                "cross_minimum_order_size_unavailable",
+                evidence={"reconciliation": reconciled},
+            )
+            return
+        minimum = min(value for value in minimums.values() if value is not None)
         loss = max(
             (
                 _decimal(value.get("worst_case_loss"))
@@ -3404,6 +3510,7 @@ class PredictionExecutionService:
             "net_quantity": format(leg.net_quantity, "f"),
             "max_price": format(leg.max_price, "f"), "max_cost": format(leg.max_cost, "f"),
             "maximum_fee": format(leg.maximum_fee, "f"), "fee_asset": leg.fee_asset,
+            "minimum_order_size": format(leg.minimum_order_size, "f"),
             "book_timestamp": _timestamp(leg.book_timestamp),
             "settlement_at": _timestamp(leg.settlement_at) if leg.settlement_at else None,
         }
@@ -3564,12 +3671,13 @@ class PredictionExecutionService:
         if not all(isinstance(value.get(name), str) and value[name].strip() for name in names):
             return None
         decimals = {name: _decimal(value.get(name)) for name in ("requested_quantity", "net_quantity", "max_price", "max_cost", "maximum_fee")}
+        minimum_order_size = _decimal(value.get("minimum_order_size", "0"))
         book_timestamp = PredictionExecutionService._datetime_from_payload(value.get("book_timestamp"))
         settlement_at = None if value.get("settlement_at") is None else PredictionExecutionService._datetime_from_payload(value.get("settlement_at"))
-        if any(item is None for item in decimals.values()) or book_timestamp is None or (value.get("settlement_at") is not None and settlement_at is None):
+        if any(item is None for item in decimals.values()) or minimum_order_size is None or minimum_order_size < 0 or book_timestamp is None or (value.get("settlement_at") is not None and settlement_at is None):
             return None
         try:
-            return CrossVenueLeg(exchange=value["exchange"], outcome=value["outcome"], book_timestamp=book_timestamp, settlement_at=settlement_at, **{name: value[name] for name in names}, **decimals)  # type: ignore[arg-type]
+            return CrossVenueLeg(exchange=value["exchange"], outcome=value["outcome"], book_timestamp=book_timestamp, settlement_at=settlement_at, minimum_order_size=minimum_order_size, **{name: value[name] for name in names}, **decimals)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return None
 

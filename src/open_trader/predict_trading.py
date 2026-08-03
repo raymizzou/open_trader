@@ -241,6 +241,14 @@ class PredictTradingClient:
                         "position_quantity": position_quantity,
                     }
                 )
+                try:
+                    minimum_order_size = _number(
+                        self._market(market_id).get("minimumOrderSize")
+                    )
+                except Exception:
+                    minimum_order_size = None
+                if minimum_order_size is not None and minimum_order_size > 0:
+                    result["minimum_order_size"] = minimum_order_size
             return result
         except Exception:
             return {"verified": False, "conclusively_absent": False, "status": "unknown"}

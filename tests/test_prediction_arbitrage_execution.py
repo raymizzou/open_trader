@@ -223,6 +223,7 @@ class FakeTrading:
         self.account_fresh = True
         self.balance = None
         self.allowance = None
+        self.positions: tuple[object, ...] = ()
         self.geoblock = True
 
     def account_snapshot(self) -> AccountSnapshot:
@@ -237,7 +238,7 @@ class FakeTrading:
             p_usd_balance=balance,
             p_usd_allowance=allowance,
             open_order_ids=(),
-            positions=(),
+            positions=self.positions,  # type: ignore[arg-type]
             checked_at=checked_at,
         )
 
@@ -953,8 +954,8 @@ def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueInte
         pair_id="public-pair",
         direction="PREDICT_YES_POLYMARKET_NO",
         legs=(
-            CrossVenueLeg("predict.fun", "predict-market", "predict-condition", "YES", "predict-yes", "USDT", Decimal("5"), Decimal("5"), predict_price, Decimal("2.30"), Decimal("0.05"), "USDT", now, None),
-            CrossVenueLeg("polymarket", "poly-market", "poly-condition", "NO", "poly-no", "pUSD", Decimal("5"), Decimal("5"), Decimal("0.47"), Decimal("2.40"), Decimal("0.05"), "pUSD", now, now + timedelta(days=30)),
+            CrossVenueLeg("predict.fun", "predict-market", "predict-condition", "YES", "predict-yes", "USDT", Decimal("5"), Decimal("5"), predict_price, Decimal("2.30"), Decimal("0.05"), "USDT", now, None, Decimal("1")),
+            CrossVenueLeg("polymarket", "poly-market", "poly-condition", "NO", "poly-no", "pUSD", Decimal("5"), Decimal("5"), Decimal("0.47"), Decimal("2.40"), Decimal("0.05"), "pUSD", now, now + timedelta(days=30), Decimal("1")),
         ),
         quantity=Decimal("5"), calculable_gas=Decimal("0"), total_max_cost=Decimal("4.70"),
         maximum_fee=Decimal("0.10"), minimum_payout=Decimal("5"), minimum_profit=Decimal("0.30"),
@@ -1040,11 +1041,15 @@ class CrossPolymarketTrading(FakeTrading):
     ) -> dict[str, object]:
         self.cross_reconcile_calls += 1
         if self.reconcile_results:
-            return self.reconcile_results.pop(0)
+            return {
+                **self.reconcile_results.pop(0),
+                "minimum_order_size": leg.minimum_order_size,
+            }
         return {
             "status": "verified", "verified": True,
             "filled_quantity": result.filled_quantity,
             "position_quantity": leg.net_quantity,
+            "minimum_order_size": leg.minimum_order_size,
             "execution_proof": {"verified": True, "venue": "polymarket"},
         }
 
@@ -1054,6 +1059,8 @@ class CrossPredictTrading:
         self.account_calls = 0
         self.allowance_ready = True
         self.account_available = True
+        self.balance = Decimal("5")
+        self.minimum_order_size = Decimal("1")
         self.positions: tuple[object, ...] = ()
         self.preflight_calls = 0
         self.submit_calls = 0
@@ -1069,7 +1076,7 @@ class CrossPredictTrading:
         self.account_calls += 1
         if not self.account_available:
             raise RuntimeError("account unavailable")
-        return {"wallet_address": "0xpredict", "available_usdt": "5", "allowance_ready": self.allowance_ready, "open_orders": (), "positions": self.positions, "checked_at": datetime.now(UTC)}
+        return {"wallet_address": "0xpredict", "available_usdt": str(self.balance), "allowance_ready": self.allowance_ready, "open_orders": (), "positions": self.positions, "checked_at": datetime.now(UTC)}
 
     def no_submit_buy_preflight(
         self, market_id: str, token_id: str, quantity_wei: int
@@ -1099,11 +1106,15 @@ class CrossPredictTrading:
         self.reconcile_calls += 1
         assert (market_id, token_id) == ("predict-market", "predict-yes")
         if self.reconcile_results:
-            return self.reconcile_results.pop(0)
+            return {
+                **self.reconcile_results.pop(0),
+                "minimum_order_size": self.minimum_order_size,
+            }
         return {
             "status": "verified", "verified": True,
             "filled_quantity": Decimal("5"),
             "position_quantity": Decimal("5"),
+            "minimum_order_size": self.minimum_order_size,
             "execution_proof": {"verified": True, "venue": "predict.fun"},
         }
 
@@ -1236,18 +1247,51 @@ def test_cross_venue_never_completes_above_emergency_limit(
 def test_cross_holding_reconciliation_releases_once_after_observed_redemption(
     tmp_path: Path,
 ) -> None:
-    service, store, trading, _cross, _predict = _cross_service(tmp_path)
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.balance = Decimal("20")
     accepted, holding = _cross_execution(service, idempotency_key="cross-redemption")
     assert holding["state"] == "holding_to_resolution"
-    trading.balance = Decimal("21")
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+
+    observed = service.reconcile_cross_holdings_once()
+    predict.positions = ()
+    predict.balance = Decimal("10")
 
     first = service.reconcile_cross_holdings_once()
     second = service.reconcile_cross_holdings_once()
 
+    assert observed == {"complete": 0, "pending": 1, "unknown": 0}
     assert first == {"complete": 1, "pending": 0, "unknown": 0}
     assert second == {"complete": 0, "pending": 0, "unknown": 0}
     assert service.execution(str(accepted["execution_id"]))["state"] == "complete"
     assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_holding_keeps_capacity_when_only_losing_venue_collateral_grows(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.balance = Decimal("20")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-losing-bump")
+    assert holding["state"] == "holding_to_resolution"
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+
+    observed = service.reconcile_cross_holdings_once()
+    predict.positions = ()
+    trading.balance = Decimal("25")
+
+    pending = service.reconcile_cross_holdings_once()
+    execution = service.execution(str(accepted["execution_id"]))
+
+    assert observed == {"complete": 0, "pending": 1, "unknown": 0}
+    assert pending == {"complete": 0, "pending": 0, "unknown": 1}
+    assert execution["state"] == "holding_to_resolution"
+    assert execution["evidence"][-1]["status_text"] == "待兑付"
+    assert store.cross_unsettled_principal() == Decimal("4.70")
 
 
 def test_cross_reservation_release_failure_becomes_an_incident(
@@ -1322,12 +1366,12 @@ def test_cross_reservation_release_failure_becomes_an_incident(
         ),
         (
             "safe_dust",
-            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "minimum_order_size": Decimal("1"), "execution_proof": {"verified": True}}),
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "execution_proof": {"verified": True}}),
             "holding_to_resolution", False, False, 1, Decimal("0.10"),
         ),
         (
             "unsafe_dust",
-            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "minimum_order_size": Decimal("1"), "worst_case_loss": Decimal("2.01"), "execution_proof": {"verified": True}}),
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "worst_case_loss": Decimal("2.01"), "execution_proof": {"verified": True}}),
             "directional_incident", False, True, 1, None,
         ),
     ],
@@ -1356,6 +1400,8 @@ def test_cross_venue_reconciliation_contains_independent_outcomes(
         evidence = final["evidence"][-1]
         assert evidence["unhedged_units"] == "0.1"
         assert evidence["worst_case_loss"] == "0.1"
+        assert evidence["reconciliation"]["predict.fun"]["minimum_order_size"] == "1"
+        assert evidence["reconciliation"]["polymarket"]["minimum_order_size"] == "1"
 
 
 def test_cross_venue_stage_five_preview_is_server_owned(tmp_path: Path) -> None:

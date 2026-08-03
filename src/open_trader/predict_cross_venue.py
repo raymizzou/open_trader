@@ -159,6 +159,7 @@ class CrossVenueLeg:
     fee_asset: str
     book_timestamp: datetime
     settlement_at: datetime | None
+    minimum_order_size: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +312,7 @@ def _build_cross_venue_intents(
                     max_price=predict_price, max_cost=predict_all_in_debit,
                     maximum_fee=predict_fee, fee_asset=pair.predict.settlement_asset,
                     book_timestamp=predict_book.source_timestamp, settlement_at=None,
+                    minimum_order_size=pair.predict.minimum_order_size,
                 ),
                 CrossVenueLeg(
                     exchange="polymarket", market_id=pair.polymarket.market_id,
@@ -321,6 +323,7 @@ def _build_cross_venue_intents(
                     maximum_fee=polymarket_fee, fee_asset=pair.polymarket.settlement_asset,
                     book_timestamp=polymarket_book.confirmed_at,
                     settlement_at=pair.polymarket.settlement_at,
+                    minimum_order_size=pair.polymarket.minimum_order_size,
                 ),
             )
             annualized = (
@@ -1398,6 +1401,7 @@ class PredictCrossVenueMonitor:
                 "max_price",
                 "max_cost",
                 "maximum_fee",
+                "minimum_order_size",
             ):
                 payload[field] = format(payload[field], "f")
             payload["book_timestamp"] = leg.book_timestamp.isoformat()
