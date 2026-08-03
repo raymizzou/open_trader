@@ -5985,9 +5985,11 @@ def _merge_rotation_orders(
 ) -> dict[str, object]:
     """Merge validated rotation fills into the existing discipline fact stream."""
     orders = payload.get("orders")
-    if not isinstance(orders, list):
+    if not isinstance(orders, list) or not all(
+        isinstance(order, Mapping) for order in orders
+    ):
         raise ValueError("trend review daily orders must be a list")
-    merged = [dict(order) for order in orders if isinstance(order, Mapping)]
+    merged = [dict(order) for order in orders]
     known_ids = {
         str(order.get("order_id") or order.get("orderid") or "")
         for order in merged
