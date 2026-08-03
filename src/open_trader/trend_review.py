@@ -1177,16 +1177,11 @@ def reserve_rotation_pairs(
         if not unused_slots:
             return tuple(reserved[index] for index in sorted(reserved))
 
-        def identity(value: Mapping[str, object]) -> tuple[object, ...]:
-            return tuple(
-                _json_value(value.get(field))
-                for field in (
-                    "sell_symbol", "sell_name", "sell_futu_symbol",
-                    "sell_global_strength", "buy_symbol", "buy_name",
-                    "buy_futu_symbol", "buy_global_strength", "strength_gap",
-                    "target_weight", "target_amount", "estimated_shares",
-                    "lot_size", "atr", "reason",
-                )
+        def identity(value: Mapping[str, object]) -> tuple[object, str, str]:
+            return (
+                value.get("pair_index"),
+                str(value.get("sell_symbol") or ""),
+                str(value.get("buy_symbol") or ""),
             )
 
         retained_identities = {identity(value) for value in reserved.values()}

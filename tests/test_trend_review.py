@@ -174,14 +174,16 @@ def test_rotation_reservation_rejects_candidate_reuse_across_slots(
 
 
 def test_rotation_revision_fills_only_the_unused_slot(tmp_path: Path) -> None:
-    def pair(index: int, sell: str, buy: str) -> dict[str, object]:
+    def pair(
+        index: int, sell: str, buy: str, *, target_amount: str = "4000",
+    ) -> dict[str, object]:
         return {
             "pair_index": index, "sell_symbol": sell, "sell_name": sell,
             "sell_futu_symbol": f"US.{sell}", "sell_global_strength": "10",
             "buy_symbol": buy, "buy_name": buy,
             "buy_futu_symbol": f"US.{buy}", "buy_global_strength": "90",
             "strength_gap": "80", "target_weight": "0.04",
-            "target_amount": "4000", "estimated_shares": 40,
+            "target_amount": target_amount, "estimated_shares": 40,
             "lot_size": 1, "atr": "5", "reason": "relative_rotation",
         }
 
@@ -193,7 +195,11 @@ def test_rotation_revision_fills_only_the_unused_slot(tmp_path: Path) -> None:
     )
     revised = trend_review.reserve_rotation_pairs(
         tmp_path, market="US", account_key="simulate-102",
-        execution_date="2026-08-04", pairs=[pair(0, "WEAK2", "STRONG2")],
+        execution_date="2026-08-04",
+        pairs=[
+            pair(0, "WEAK1", "STRONG1", target_amount="3999"),
+            pair(1, "WEAK2", "STRONG2"),
+        ],
         allocation_sha256="a" * 64,
         reserved_at="2026-08-03T16:30:00+08:00",
     )
