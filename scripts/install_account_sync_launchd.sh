@@ -143,6 +143,7 @@ wait_ready() {
     sleep 1
   done
   "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  wait_agent_absent || return 1
   echo "account sync controller did not publish a matching fresh status" >&2
   return 1
 }

@@ -67,7 +67,9 @@ def _run_installer(
 echo "launchctl $*" >> "$FAKE_CALLS"
 label="${2##*/}"
 if [[ "$1" == "bootout" ]]; then
-  rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+  if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
+    rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+  fi
   exit 0
 fi
 if [[ "$1" == "bootstrap" ]]; then
@@ -273,6 +275,23 @@ def test_stack_cutover_verifies_legacy_before_stopping_single_and_starting_gatew
     assert result.returncode == 0
     assert legacy_ready < single_stop < gateway_start < gateway_ready
     assert not any(" kickstart " in call for call in calls)
+
+
+def test_stack_does_not_bootstrap_while_bootout_remains_loaded(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        FAKE_STUCK_LABEL=LEGACY_LABEL,
+    )
+    domain = f"gui/{os.getuid()}"
+
+    assert result.returncode == 1
+    assert f"launchd job is still loaded: {LEGACY_LABEL}" in result.stderr
+    assert (
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
+        not in calls
+    )
 
 
 def test_gateway_failure_stops_stack_restores_single_and_verifies_public_url(

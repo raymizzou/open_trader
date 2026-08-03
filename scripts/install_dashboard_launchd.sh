@@ -193,14 +193,14 @@ bootstrap_agent() {
 
 start_agent() {
   local label="$1" plist="$2"
-  bootout_agent "$label"
+  bootout_agent "$label" || return 1
   bootstrap_agent "$plist"
 }
 
 restore_single() {
-  bootout_agent "$GATEWAY_LABEL"
-  bootout_agent "$LEGACY_LABEL"
-  bootout_agent "$SINGLE_LABEL"
+  bootout_agent "$GATEWAY_LABEL" || return 1
+  bootout_agent "$LEGACY_LABEL" || return 1
+  bootout_agent "$SINGLE_LABEL" || return 1
   bootstrap_agent "$SINGLE_PLIST" || return 1
   wait_http "http://127.0.0.1:8766/"
 }

@@ -251,6 +251,7 @@ def test_installer_rejects_a_preinstall_status_without_kickstart_write(
         "bootstrap",
         "print",
         "bootout",
+        "print",
     ]
 
 
