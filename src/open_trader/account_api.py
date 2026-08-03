@@ -24,6 +24,9 @@ from .account_sync_state import ACCOUNT_STALE_SECONDS, REQUIRED_BROKERS
 
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 _PARITY_ATTEMPTS = 3
+AccountApiMode = Literal["shadow", "production"]
+_ACCOUNT_ROUTE_HEADER = "X-Open-Trader-Account-Route"
+_PRODUCTION_ROUTE_MARKER = "production"
 _FUTU_NAIVE_PRICE_TIME_RE = re.compile(
     r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\Z"
 )
@@ -75,6 +78,7 @@ def create_account_api(
     host: str,
     port: int,
     runtime_metadata: Mapping[str, object] | None = None,
+    mode: AccountApiMode = "shadow",
 ) -> ThreadingHTTPServer:
     try:
         if not ipaddress.ip_address(host).is_loopback:
@@ -94,7 +98,7 @@ def create_account_api(
                         "schema_version": "open_trader.account_api.health.v1",
                         "module": "account_api",
                         "status": "ok",
-                        "mode": "shadow",
+                        "mode": mode,
                         "pid": runtime["pid"],
                         "started_at": runtime["started_at"],
                         "api_git_sha": api_sha,
@@ -105,6 +109,25 @@ def create_account_api(
                 )
                 return
             if path == "/api/v1/account/snapshot":
+                if mode == "shadow" and self.headers.get(_ACCOUNT_ROUTE_HEADER) == _PRODUCTION_ROUTE_MARKER:
+                    self._send_json(
+                        {
+                            "schema_version": 1,
+                            "status": "unavailable",
+                            "release": {
+                                "api_git_sha": str(runtime["api_git_sha"]),
+                                "worker_git_sha": load_worker_git_sha(data_dir),
+                            },
+                            "errors": [{
+                                "code": "account_api_shadow_only",
+                                "source": "release",
+                                "message": "Account API is running in shadow mode",
+                                "retryable": True,
+                            }],
+                        },
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
                 result = load_account_snapshot(
                     data_dir,
                     api_git_sha=str(runtime["api_git_sha"]),
@@ -158,14 +181,14 @@ def create_account_api(
     return server
 
 
-def serve_account_api(data_dir: Path) -> None:
+def serve_account_api(data_dir: Path, *, mode: AccountApiMode = "shadow") -> None:
     host = "127.0.0.1"
     port = 8768
-    server = create_account_api(data_dir, host=host, port=port)
+    server = create_account_api(data_dir, host=host, port=port, mode=mode)
     runtime = {
         "schema_version": "open_trader.account_api.runtime.v1",
         "module": "account_api",
-        "mode": "shadow",
+        "mode": mode,
         **server.runtime_metadata,  # type: ignore[attr-defined]
         "host": host,
         "port": server.server_address[1],
@@ -183,8 +206,9 @@ def serve_account_api(data_dir: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open-trader account-api")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--mode", choices=("shadow", "production"), default="shadow")
     args = parser.parse_args(argv)
-    serve_account_api(args.data_dir)
+    serve_account_api(args.data_dir, mode=args.mode)
     return 0
 
 

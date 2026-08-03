@@ -230,6 +230,28 @@ def test_account_api_health_is_live_without_a_matching_worker_release(
         assert snapshot.value.code == HTTPStatus.SERVICE_UNAVAILABLE
 
 
+def test_account_api_health_reports_selected_mode(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    runtime_metadata = {
+        "pid": 321,
+        "started_at": "2026-08-03T12:00:00+08:00",
+        "cwd": "/tmp/open-trader",
+        "api_git_sha": SHA,
+    }
+    for mode in ("shadow", "production"):
+        server = account_api.create_account_api(
+            data_dir,
+            host="127.0.0.1",
+            port=0,
+            runtime_metadata=runtime_metadata,
+            **({} if mode == "shadow" else {"mode": mode}),
+        )
+        with _running(server):
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            assert _get_json(base + "/healthz")["mode"] == mode
+
+
 def test_account_api_rejects_non_loopback_listener(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="loopback"):
         account_api.create_account_api(tmp_path, host="0.0.0.0", port=8768)
@@ -309,16 +331,125 @@ print("\\n".join(sorted(sys.modules)))
         assert forbidden not in loaded
 
 
-def test_account_api_cli_uses_only_the_data_dir(
+def test_account_api_cli_uses_data_dir_and_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
-    observed: list[Path] = []
-    monkeypatch.setattr(account_api, "serve_account_api", observed.append)
+    observed: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        account_api,
+        "serve_account_api",
+        lambda served_data_dir, *, mode: observed.append((served_data_dir, mode)),
+    )
 
     assert account_api.main(["--data-dir", str(data_dir)]) == 0
+    assert account_api.main(["--data-dir", str(data_dir), "--mode", "production"]) == 0
+    with pytest.raises(SystemExit, match="2"):
+        account_api.main(["--mode", "invalid"])
 
-    assert observed == [data_dir]
+    assert observed == [(data_dir, "shadow"), (data_dir, "production")]
+
+
+@pytest.mark.parametrize("mode", ["shadow", "production"])
+def test_account_api_allows_direct_snapshot_requests_in_both_modes(
+    tmp_path: Path, mode: str
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode=mode,
+    )
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+            assert response.status == HTTPStatus.OK
+
+
+def test_account_api_shadow_rejects_production_marker_with_frozen_envelope(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+    )
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/snapshot",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.load(rejected.value) == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "release": {"api_git_sha": SHA, "worker_git_sha": SHA},
+        "errors": [{
+            "code": "account_api_shadow_only",
+            "source": "release",
+            "message": "Account API is running in shadow mode",
+            "retryable": True,
+        }],
+    }
+
+
+def test_account_api_production_accepts_marker_and_preserves_etag(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        request = urllib.request.Request(
+            base + "/api/v1/account/snapshot",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with urllib.request.urlopen(request) as response:
+            assert json.load(response)["schema_version"] == 1
+            etag = response.headers["ETag"]
+        unchanged = urllib.request.Request(
+            base + "/api/v1/account/snapshot",
+            headers={
+                "X-Open-Trader-Account-Route": "production",
+                "If-None-Match": etag,
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as response:
+            urllib.request.urlopen(unchanged)
+
+    assert response.value.code == HTTPStatus.NOT_MODIFIED
+    assert response.value.read() == b""
 
 
 def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
