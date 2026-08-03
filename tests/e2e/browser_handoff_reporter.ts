@@ -1,0 +1,66 @@
+import { execFileSync } from 'node:child_process';
+import { dirname, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import type { FullResult, Reporter } from '@playwright/test';
+
+const HANDOFF_ENV = 'PREDICTION_ACCEPTANCE_BROWSER_HANDOFF';
+const REVIEW_ENV = 'PREDICTION_ACCEPTANCE_REVIEW_URL';
+const HANDOFF_MAX_AGE_SECONDS = 120;
+
+export default class BrowserHandoffReporter implements Reporter {
+  private handoffPath: string | undefined;
+
+  onBegin(): void {
+    const configuredPath = process.env[HANDOFF_ENV];
+    if (!configuredPath) return;
+
+    this.handoffPath = resolve(configuredPath);
+    try {
+      unlinkSync(this.handoffPath);
+    } catch {
+      // A missing handoff is the safe state if the run does not pass.
+    }
+  }
+
+  onEnd(result: FullResult): void {
+    if (!this.handoffPath || result.status !== 'passed') return;
+
+    const reviewRaw = process.env[REVIEW_ENV];
+    if (!reviewRaw) return;
+
+    let candidateCommit: string;
+    let review: URL;
+    try {
+      candidateCommit = execFileSync(
+        'git',
+        ['rev-parse', 'HEAD'],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      ).trim();
+      review = new URL(reviewRaw);
+    } catch {
+      return;
+    }
+    if (!candidateCommit) return;
+
+    const reviewUrl = review.toString().replace(/\/$/, '');
+    const healthUrl = new URL('/healthz', review).toString();
+    const createdAt = Date.now() / 1000;
+    const payload = {
+      schema_version: 1,
+      source: 'playwright',
+      playwright_status: 'passed',
+      browser_project: 'chromium',
+      review_url: reviewUrl,
+      health_url: healthUrl,
+      candidate_commit: candidateCommit,
+      created_at: createdAt,
+      expires_at: createdAt + HANDOFF_MAX_AGE_SECONDS,
+    };
+
+    mkdirSync(dirname(this.handoffPath), { recursive: true });
+    writeFileSync(this.handoffPath, JSON.stringify(payload), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  }
+}

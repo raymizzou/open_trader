@@ -17,6 +17,8 @@ acceptance:
 		"$(WORKTREE_ROOT)/.venv/bin/python" -m pytest "$(WORKTREE_ROOT)/tests" -q
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
+	PREDICTION_ACCEPTANCE_BROWSER_HANDOFF="$(WORKTREE_ROOT)/logs/acceptance/prediction-market-browser-handoff.json" \
+	PREDICTION_ACCEPTANCE_REVIEW_URL="$(DASHBOARD_URL)" \
 	OPEN_TRADER_PYTHON="$(WORKTREE_ROOT)/.venv/bin/python" \
 		npm exec playwright test tests/e2e/prediction-market.spec.ts \
 		--project=chromium || status=$$?; \
@@ -25,13 +27,12 @@ ifeq ($(SKIP_POLYMARKET_LIVE),1)
 	@echo "SKIPPED: Polymarket live acceptance by operator override"
 else
 	@status=0; \
-	BROWSER_READY_ARG=--browser-ready; \
 	cd "$(WORKTREE_ROOT)" && \
 	PYTHONPATH=src .venv/bin/python -m open_trader.prediction_arbitrage_acceptance \
 		--url "$(DASHBOARD_URL)" \
 		--expected-root "$(WORKTREE_ROOT)" \
 		--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json" \
-		$$BROWSER_READY_ARG || status=$$?; \
+		--browser-handoff "$(WORKTREE_ROOT)/logs/acceptance/prediction-market-browser-handoff.json" || status=$$?; \
 	if [ $$status -eq 2 ]; then echo BLOCKED; exit 2; fi; \
 	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
 endif

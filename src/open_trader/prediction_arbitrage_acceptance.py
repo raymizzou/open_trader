@@ -8,7 +8,10 @@ import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import math
 from pathlib import Path
+import subprocess
+import time
 from typing import Callable, Iterable, Iterator, Mapping
 from urllib.error import URLError
 from urllib.parse import urlparse
@@ -18,6 +21,7 @@ from predict_sdk import ApprovalScope, Side
 
 from .polymarket_trading import (
     KeychainError,
+    PolymarketTradingError,
     PolymarketTradingClient,
     PredictConfig,
     TradingConfig,
@@ -175,23 +179,6 @@ class _PolymarketReadOnlyGuard:
             "patch_json",
         }
     )
-    _NESTED_NAMES = frozenset(
-        {
-            "_ctx",
-            "ctx",
-            "clob",
-            "secure_clob",
-            "relayer",
-            "rpc",
-            "session",
-            "transport",
-            "notifier",
-            "_notifier",
-            "notification",
-            "_notification",
-        }
-    )
-
     def __init__(self) -> None:
         self.mutation_calls = 0
         self.live_notifications = 0
@@ -226,6 +213,13 @@ class _PolymarketReadOnlyGuard:
             self.mutation_calls += 1
         raise _PolymarketMutationViolation("Polymarket mutation or notification prohibited")
 
+    def protect(self, value: object) -> object:
+        if value is None or isinstance(value, (str, bytes, bytearray, bool, int, float, Decimal)):
+            return value
+        if callable(value):
+            return value
+        return self.wrap(value)
+
     def call(self, name: str, target: Callable[..., object], *args: object, **kwargs: object) -> object:
         if name.lower() == "request":
             method = kwargs.get("method")
@@ -244,9 +238,17 @@ class _PolymarketReadOnlyGuard:
 
 
 class _GuardedPolymarketValue:
+    __slots__ = ("_value", "_guard")
+
     def __init__(self, value: object, guard: _PolymarketReadOnlyGuard) -> None:
         object.__setattr__(self, "_value", value)
         object.__setattr__(self, "_guard", guard)
+
+    def __getattribute__(self, name: str) -> object:
+        if name in {"_value", "_guard"}:
+            guard = object.__getattribute__(self, "_guard")
+            guard.violation("raw_internal")
+        return object.__getattribute__(self, name)
 
     @property
     def __class__(self) -> type[object]:
@@ -261,15 +263,30 @@ class _GuardedPolymarketValue:
         value = getattr(object.__getattribute__(self, "_value"), name)
         if name.lower() == "request" and callable(value):
             return lambda *args, **kwargs: guard.call(name, value, *args, **kwargs)
-        if name in guard._NESTED_NAMES:
-            return guard.wrap(value)
-        return value
+        return guard.protect(value)
 
     def __setattr__(self, name: str, value: object) -> None:
+        if name in {"_value", "_guard"}:
+            guard = object.__getattribute__(self, "_guard")
+            guard.violation("raw_internal")
         setattr(object.__getattribute__(self, "_value"), name, value)
 
     def __call__(self, *args: object, **kwargs: object) -> object:
-        return object.__getattribute__(self, "_value")(*args, **kwargs)
+        guard = object.__getattribute__(self, "_guard")
+        value = object.__getattribute__(self, "_value")
+        return guard.call("__call__", value, *args, **kwargs)
+
+    def __getitem__(self, key: object) -> object:
+        guard = object.__getattribute__(self, "_guard")
+        value = object.__getattribute__(self, "_value")[key]  # type: ignore[index]
+        return guard.protect(value)
+
+    def __iter__(self) -> Iterator[object]:
+        guard = object.__getattribute__(self, "_guard")
+        return (guard.protect(value) for value in object.__getattribute__(self, "_value"))  # type: ignore[union-attr]
+
+    def __len__(self) -> int:
+        return len(object.__getattribute__(self, "_value"))  # type: ignore[arg-type]
 
 
 @contextmanager
@@ -283,6 +300,7 @@ def _guard_polymarket_client(
     for name in (
         "_client",
         "_ctx",
+        "_ctx_inner",
         "notifier",
         "_notifier",
         "notification",
@@ -377,6 +395,8 @@ def _http_status(exc: BaseException) -> int | None:
 def _is_external_unavailable(exc: BaseException) -> bool:
     if isinstance(exc, _ExternalUnavailable):
         return True
+    if isinstance(exc, PolymarketTradingError):
+        return exc.error_code in {"network", "timeout", "unavailable"}
     status = _http_status(exc)
     if status is not None:
         return status == 429 or status >= 500
@@ -546,16 +566,22 @@ def run_live_readiness(
     predict_client_factory: Callable[..., object] = PredictTradingClient.from_keychain,
     polymarket_client_factory: Callable[[TradingConfig], object] = PolymarketTradingClient.from_keychain,
     timeout: float = 10.0,
-    browser_ready: bool = False,
+    browser_handoff_path: Path | None = None,
     browser_url: str = "http://127.0.0.1:8766",
+    browser_root: Path | None = None,
+    browser_now_fn: Callable[[], float] = time.time,
+    browser_commit_fn: Callable[[Path], str | None] | None = None,
     browser_health_fn: Callable[[str], bool] | None = None,
 ) -> LiveReadinessReport:
     """Run only real read/auth/sign checks; no order or notification is allowed."""
 
     browser = _browser_readiness(
-        browser_ready,
+        browser_handoff_path,
         browser_url,
+        browser_root or Path.cwd(),
         health_fn=browser_health_fn or _browser_health,
+        now_fn=browser_now_fn,
+        commit_fn=browser_commit_fn or _git_commit,
     )
     if browser.status != _READY:
         return _blocked_report("browser readiness unavailable", browser=browser)
@@ -707,27 +733,92 @@ def _dashboard_is_reachable(url: str, timeout: float = 2.0) -> bool:
 
 def _browser_health(url: str, timeout: float = 2.0) -> bool:
     try:
-        with urlopen(url.rstrip("/") + "/healthz", timeout=timeout) as response:
+        target = url.rstrip("/")
+        if not urlparse(target).path.endswith("/healthz"):
+            target += "/healthz"
+        with urlopen(target, timeout=timeout) as response:
             return response.status == 200
     except OSError:
         return False
 
 
 def _browser_readiness(
-    browser_ready: bool,
+    handoff_path: Path | None,
     url: str,
+    root: Path,
     *,
     health_fn: Callable[[str], bool],
+    now_fn: Callable[[], float],
+    commit_fn: Callable[[Path], str | None],
 ) -> ReadinessCheck:
-    if not browser_ready:
-        return _blocked("Playwright browser readiness marker unavailable")
+    if handoff_path is None or not handoff_path.is_file():
+        return _blocked("Playwright browser handoff unavailable")
     try:
-        healthy = health_fn(url)
+        payload = json.loads(handoff_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _blocked("Playwright browser handoff unavailable")
+    if not isinstance(payload, Mapping):
+        return _blocked("Playwright browser handoff unavailable")
+    if not (
+        payload.get("schema_version") == 1
+        and payload.get("source") == "playwright"
+        and payload.get("playwright_status") == "passed"
+        and payload.get("browser_project") == "chromium"
+    ):
+        return _blocked("Playwright browser handoff unavailable")
+    created_at = payload.get("created_at")
+    expires_at = payload.get("expires_at")
+    if (
+        isinstance(created_at, bool)
+        or isinstance(expires_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not isinstance(expires_at, (int, float))
+        or not math.isfinite(float(created_at))
+        or not math.isfinite(float(expires_at))
+    ):
+        return _blocked("Playwright browser handoff unavailable")
+    try:
+        now = float(now_fn())
+        current_commit = commit_fn(root)
+    except Exception:
+        return _blocked("Playwright browser handoff unavailable")
+    if not math.isfinite(now):
+        return _blocked("Playwright browser handoff unavailable")
+    if (
+        float(created_at) > now + 5
+        or float(expires_at) <= now
+        or now - float(created_at) > 120
+        or float(expires_at) - float(created_at) > 120
+    ):
+        return _blocked("Playwright browser handoff expired")
+    expected_url = url.rstrip("/")
+    expected_health_url = expected_url + "/healthz"
+    if payload.get("review_url") != expected_url or payload.get("health_url") != expected_health_url:
+        return _blocked("Playwright browser handoff review URL mismatch")
+    if payload.get("candidate_commit") != current_commit:
+        return _blocked("Playwright browser handoff candidate mismatch")
+    try:
+        healthy = health_fn(str(payload["health_url"]))
     except Exception:
         healthy = False
     if not healthy:
         return _blocked("browser/dashboard health unavailable")
-    return _ready("Playwright browser marker and dashboard health ready")
+    return _ready("Playwright browser handoff and dashboard health ready")
+
+
+def _git_commit(root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    commit = completed.stdout.strip()
+    return commit or None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -735,19 +826,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", default="http://127.0.0.1:8766")
     parser.add_argument("--expected-root", type=Path, default=Path.cwd())
     parser.add_argument("--config", type=Path)
-    parser.add_argument(
-        "--browser-ready",
-        action="store_true",
-        help="accept the Playwright browser readiness handoff",
-    )
+    parser.add_argument("--browser-handoff", type=Path)
     parser.add_argument("--json", action="store_true", help="print the redacted live-readiness report")
     args = parser.parse_args(argv)
 
     config_path = args.config or args.expected_root / "config" / "prediction_arbitrage.json"
+    browser_handoff_path = args.browser_handoff or (
+        args.expected_root / "logs/acceptance/prediction-market-browser-handoff.json"
+    )
     report = run_live_readiness(
         config_path,
-        browser_ready=args.browser_ready,
+        browser_handoff_path=browser_handoff_path,
         browser_url=args.url,
+        browser_root=args.expected_root,
     )
     if args.json:
         print(json.dumps(report.as_dict(), sort_keys=True))

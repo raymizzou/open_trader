@@ -6,6 +6,9 @@ const python = process.env.OPEN_TRADER_PYTHON ?? 'python3';
 
 export default defineConfig({
   testDir: './tests/e2e',
+  reporter: process.env.PREDICTION_ACCEPTANCE_BROWSER_HANDOFF
+    ? [['./tests/e2e/browser_handoff_reporter.ts']]
+    : undefined,
   timeout: 30_000,
   expect: { timeout: 5_000 },
   use: {

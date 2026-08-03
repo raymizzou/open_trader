@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import URLError
@@ -10,7 +11,11 @@ from urllib.request import Request
 import pytest
 
 from open_trader import prediction_arbitrage_acceptance as acceptance
-from open_trader.polymarket_trading import PredictConfig, TradingConfig
+from open_trader.polymarket_trading import (
+    PolymarketTradingError,
+    PredictConfig,
+    TradingConfig,
+)
 
 
 CONFIG = TradingConfig(
@@ -82,6 +87,24 @@ class PolymarketClient:
         }
 
 
+def write_browser_handoff(tmp_path: Path, **overrides: object) -> Path:
+    path = tmp_path / "browser-handoff.json"
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "source": "playwright",
+        "playwright_status": "passed",
+        "browser_project": "chromium",
+        "review_url": "http://127.0.0.1:8766",
+        "health_url": "http://127.0.0.1:8766/healthz",
+        "candidate_commit": "test-commit",
+        "created_at": 1000.0,
+        "expires_at": 1060.0,
+    }
+    payload.update(overrides)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def readiness_report(tmp_path: Path, **overrides: object):
     config_path = tmp_path / "prediction.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -90,9 +113,12 @@ def readiness_report(tmp_path: Path, **overrides: object):
         "predict_source_factory": lambda _config, *, urlopen_fn: PredictSource(),
         "predict_client_factory": lambda _config, *, urlopen_fn: PredictClient(),
         "polymarket_client_factory": lambda _config: PolymarketClient(),
-        "browser_ready": True,
+        "browser_now_fn": lambda: 1001.0,
+        "browser_commit_fn": lambda _root: "test-commit",
         "browser_health_fn": lambda _url: True,
     }
+    if "browser_handoff_path" not in overrides:
+        factories["browser_handoff_path"] = write_browser_handoff(tmp_path)
     factories.update(overrides)
     return acceptance.run_live_readiness(config_path, **factories)
 
@@ -119,7 +145,7 @@ def test_readiness_report_distinguishes_all_no_submit_facts(tmp_path: Path) -> N
         },
         "browser": {
             "status": "PASS",
-            "detail": "Playwright browser marker and dashboard health ready",
+            "detail": "Playwright browser handoff and dashboard health ready",
         },
         "safety": {
             "zero_mutation_calls": 0,
@@ -208,6 +234,50 @@ def test_polymarket_mutation_or_notification_attempt_fails_closed(
     assert report.mutation_calls == (0 if action == "notify" else 1)
 
 
+@pytest.mark.parametrize("action", ("post_order", "redeem_positions", "notify"))
+def test_polymarket_guard_blocks_mutation_through_raw_nested_sdk_internals(
+    tmp_path: Path, action: str
+) -> None:
+    class NestedSdk:
+        def __init__(self) -> None:
+            def mutate(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+
+            self._ctx_inner = SimpleNamespace(**{action: mutate})
+
+        def __getattr__(self, name: str):
+            if name != action:
+                raise AttributeError(name)
+
+            def mutate(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+
+            return mutate
+
+    class NestedMutatingPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = NestedSdk()
+
+        def preflight_report(self) -> dict[str, object]:
+            getattr(self._client._ctx_inner, action)()
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: NestedMutatingPolymarket(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.safety.status == "FAIL"
+    assert report.live_notifications == (1 if action == "notify" else 0)
+    assert report.mutation_calls == (0 if action == "notify" else 1)
+
+
 def test_polymarket_report_without_posted_attestation_fails_closed(tmp_path: Path) -> None:
     class MissingPosted(PolymarketClient):
         def preflight_report(self) -> dict[str, object]:
@@ -259,24 +329,75 @@ def test_network_unavailability_is_blocked_but_invalid_polymarket_result_fails(
     assert report.polymarket.status == "FAIL"
 
 
-def test_browser_marker_and_health_are_required_for_live_pass(tmp_path: Path) -> None:
-    report = readiness_report(tmp_path, browser_ready=False)
+@pytest.mark.parametrize(
+    ("error_code", "expected_status"),
+    [
+        ("network", "BLOCKED"),
+        ("timeout", "BLOCKED"),
+        ("unavailable", "BLOCKED"),
+        ("auth", "FAIL"),
+        ("invalid", "FAIL"),
+    ],
+)
+def test_polymarket_setup_error_preserves_blocked_vs_fail_classification(
+    tmp_path: Path, error_code: str, expected_status: str
+) -> None:
+    def failing_polymarket(_config: object) -> object:
+        raise PolymarketTradingError(error_code)
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=failing_polymarket,
+    )
+
+    assert report.polymarket.status == expected_status
+    assert report.status == expected_status
+    assert "sentinel" not in report.polymarket.detail
+
+
+def test_browser_handoff_and_health_are_required_for_live_pass(tmp_path: Path) -> None:
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=tmp_path / "missing-browser-handoff.json",
+    )
     assert report.status == "BLOCKED"
     assert report.browser.status == "BLOCKED"
 
     report = readiness_report(
         tmp_path,
-        browser_ready=True,
+        browser_handoff_path=write_browser_handoff(tmp_path),
         browser_health_fn=lambda _url: False,
     )
     assert report.status == "BLOCKED"
     assert report.browser.detail == "BLOCKED: browser/dashboard health unavailable"
 
 
-def test_make_acceptance_passes_playwright_marker_before_live_registry() -> None:
+def test_browser_handoff_binds_fresh_url_and_candidate(tmp_path: Path) -> None:
+    report = readiness_report(tmp_path)
+    assert report.browser.status == "PASS"
+
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=write_browser_handoff(tmp_path, candidate_commit="other-commit"),
+    )
+    assert report.status == "BLOCKED"
+    assert report.browser.detail == "BLOCKED: Playwright browser handoff candidate mismatch"
+
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=write_browser_handoff(tmp_path, expires_at=999.0),
+    )
+    assert report.status == "BLOCKED"
+    assert report.browser.detail == "BLOCKED: Playwright browser handoff expired"
+
+
+def test_make_acceptance_passes_playwright_handoff_before_live_registry() -> None:
     makefile = Path(__file__).parents[1].joinpath("Makefile").read_text(encoding="utf-8")
     playwright = makefile.index("npm exec playwright test")
     registry = makefile.index("prediction_arbitrage_acceptance")
 
     assert playwright < registry
-    assert "--browser-ready" in makefile[playwright:registry]
+    assert "--browser-ready" not in makefile
+    assert "PREDICTION_ACCEPTANCE_BROWSER_HANDOFF" in makefile[:registry]
+    assert "PREDICTION_ACCEPTANCE_REVIEW_URL" in makefile[:registry]
+    assert "--browser-handoff" in makefile[registry:]
