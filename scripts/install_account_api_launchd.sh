@@ -7,6 +7,7 @@ RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-/bin/launchctl}"
+LSOF_BIN="${LSOF_BIN:-/usr/sbin/lsof}"
 CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
 WAIT_SECONDS="${ACCOUNT_API_LAUNCHD_WAIT_SECONDS:-30}"
 LABEL="com.open-trader.account-api"
@@ -119,13 +120,29 @@ raise SystemExit(0 if valid else 1)
 ' "$1" "$2" "$3"
 }
 
+process_cwd_matches() {
+  "$LSOF_BIN" -a -p "$1" -d cwd -Fn 2>/dev/null | awk -v expected="$REPO_ROOT" '
+    $1 ~ /^n/ { found = 1; if (substr($1, 2) == expected) matched = 1 }
+    END { exit !(found && matched) }
+  '
+}
+
+loopback_listener_matches() {
+  "$LSOF_BIN" -nP -a -p "$1" -iTCP:8768 -sTCP:LISTEN -Fn 2>/dev/null | awk '
+    $1 == "n127.0.0.1:8768" { found = 1 }
+    END { exit !found }
+  '
+}
+
 wait_ready() {
   local expected_sha attempt output pid health
   expected_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
     output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1 || true)"
     pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
-    if [[ -n "$pid" ]] && health="$("$CURL_BIN" -fsS http://127.0.0.1:8768/healthz 2>/dev/null)" \
+    if [[ -n "$pid" ]] && process_cwd_matches "$pid" \
+      && loopback_listener_matches "$pid" \
+      && health="$("$CURL_BIN" -fsS http://127.0.0.1:8768/healthz 2>/dev/null)" \
       && health_matches "$pid" "$expected_sha" "$health"; then
       return 0
     fi
