@@ -1976,6 +1976,7 @@ def _build_cross_venue_monitor(
             predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
             store=store,
             ready_observer=execution.notify_ready_opportunity,
+            holding_reconciler=execution.reconcile_cross_holdings_once,
         )
     except Exception:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")

@@ -38,6 +38,7 @@ from open_trader.prediction_arbitrage import (
     ThresholdHedgeIntent,
     ThresholdHedgeLeg,
 )
+from open_trader.predict_cross_venue import CrossVenueLeg
 
 
 SIGNER = "0x1111111111111111111111111111111111111111"
@@ -96,6 +97,25 @@ def threshold_intent() -> ThresholdHedgeIntent:
         minimum_payout=Decimal("10"),
         minimum_profit=Decimal("7.88"),
         net_edge=Decimal("0.788"),
+    )
+
+
+def cross_polymarket_leg() -> CrossVenueLeg:
+    return CrossVenueLeg(
+        exchange="polymarket",
+        market_id="market-cross",
+        condition_id="condition-cross",
+        outcome="NO",
+        token_id="cross-no-token",
+        settlement_asset="pUSD",
+        requested_quantity=Decimal("5"),
+        net_quantity=Decimal("5"),
+        max_price=Decimal("0.48"),
+        max_cost=Decimal("2.40"),
+        maximum_fee=Decimal("0.05"),
+        fee_asset="pUSD",
+        book_timestamp=datetime.now(UTC),
+        settlement_at=None,
     )
 
 
@@ -902,6 +922,102 @@ def test_threshold_post_exception_is_ambiguous_without_retry(
     assert result.leg_a.status == "ambiguous"
     assert result.leg_b.status == "ambiguous"
     assert "signature-sentinel" not in repr(result)
+
+
+def test_cross_leg_preflight_signs_once_then_posts_one_order_with_leg_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter()
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+    def post_one(orders: tuple[FakeSignedOrder, ...]) -> tuple[object, ...]:
+        fake.post_calls.append(orders)
+        return (
+            SimpleNamespace(
+                ok=True,
+                status="matched",
+                order_id="cross-order",
+                taking_amount=Decimal("5"),
+                trade_ids=("cross-trade",),
+            ),
+        )
+
+    fake.post_orders = post_one  # type: ignore[method-assign]
+    leg = cross_polymarket_leg()
+
+    assert adapter.no_submit_cross_leg_preflight(leg)["result"] == "PASS"
+    assert fake.post_calls == []
+
+    result = adapter.submit_cross_leg_once(leg)
+
+    assert len(fake.post_calls) == 1
+    assert len(fake.post_calls[0]) == 1
+    assert (
+        result.label,
+        result.outcome,
+        result.condition_id,
+        result.token_id,
+        result.order_id,
+        result.trade_ids,
+        result.filled_quantity,
+    ) == (
+        "polymarket",
+        "NO",
+        "condition-cross",
+        "cross-no-token",
+        "cross-order",
+        ("cross-trade",),
+        Decimal("5"),
+    )
+
+
+def test_cross_leg_transport_failure_is_ambiguous_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeClient()
+    fake.post_error = RuntimeError("signature-sentinel")
+    adapter, _ = make_adapter(fake)
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+    leg = cross_polymarket_leg()
+
+    assert adapter.no_submit_cross_leg_preflight(leg)["result"] == "PASS"
+    result = adapter.submit_cross_leg_once(leg)
+
+    assert len(fake.post_calls) == 1
+    assert result.status == "ambiguous"
+    assert result.error_code == "ambiguous"
+    assert "signature-sentinel" not in repr(result)
+
+
+def test_cross_leg_reconciliation_uses_order_trade_and_position_proof() -> None:
+    adapter, fake = make_adapter()
+    leg = cross_polymarket_leg()
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
+            taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
+            side="BUY", matched_at=datetime.now(UTC),
+        )
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": "5"}
+    ]
+    result = ThresholdLegResult(
+        "polymarket", "NO", "condition-cross", "cross-no-token", True,
+        "filled", "cross-order", Decimal("5"), ("cross-trade",), "none",
+    )
+
+    reconciled = adapter.reconcile_cross_leg(leg, result, since=since)
+
+    assert reconciled["verified"] is True
+    assert reconciled["position_quantity"] == Decimal("5")
+    assert reconciled["filled_quantity"] == Decimal("5")
 
 
 def test_threshold_reconcile_keeps_condition_and_token_refs_separate() -> None:

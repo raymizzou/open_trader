@@ -209,10 +209,16 @@ class PredictTradingClient:
             events = [row for row in activity if str(row.get("orderHash")) == order_hash]
             facts = [(_facts(match), _facts(event)) for match in matched for event in events]
             agreed = next((match for match, event in facts if match is not None and match == event), None)
-            positioned = agreed is not None and any(
+            position_quantity = sum(
+                (
+                    _number(row.get("amount")) or Decimal("0")
+                    for row in positions
+                    if str(row.get("tokenId")) == str(token_id)
+                ),
+                Decimal("0"),
+            )
+            positioned = agreed is not None and position_quantity >= agreed[1] and any(
                 str(row.get("tokenId")) == str(token_id)
-                and _number(row.get("amount")) is not None
-                and _number(row.get("amount")) >= agreed[1]
                 and _number(row.get("amountDelta", row.get("delta"))) == agreed[1]
                 for row in positions
             )
@@ -223,7 +229,19 @@ class PredictTradingClient:
                 and not events
                 and not any(str(row.get("tokenId")) == str(token_id) for row in positions)
             )
-            return {"verified": verified, "conclusively_absent": absent, "status": "verified" if verified else "absent" if absent else "unknown"}
+            result = {
+                "verified": verified,
+                "conclusively_absent": absent,
+                "status": "verified" if verified else "absent" if absent else "unknown",
+            }
+            if verified:
+                result.update(
+                    {
+                        "filled_quantity": agreed[1],
+                        "position_quantity": position_quantity,
+                    }
+                )
+            return result
         except Exception:
             return {"verified": False, "conclusively_absent": False, "status": "unknown"}
 

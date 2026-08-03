@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 from urllib.error import URLError
 
@@ -177,7 +178,13 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
         raise AssertionError(request.full_url)
 
     client, _ = make_client(urlopen_fn)
-    assert client.reconcile_buy("896", "yes-token", "order-hash") == {"verified": True, "conclusively_absent": False, "status": "verified"}
+    assert client.reconcile_buy("896", "yes-token", "order-hash") == {
+        "verified": True,
+        "conclusively_absent": False,
+        "status": "verified",
+        "filled_quantity": Decimal("1"),
+        "position_quantity": Decimal("1"),
+    }
 
 
 def test_book_parses_decimal_price_to_exact_wei() -> None:

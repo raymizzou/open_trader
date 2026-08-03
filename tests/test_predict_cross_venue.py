@@ -1279,6 +1279,25 @@ def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
     asyncio.run(exercise())
 
 
+def test_monitor_uses_existing_discovery_cycle_for_holding_reconciliation() -> None:
+    async def exercise() -> None:
+        calls: list[str] = []
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=lambda *args, **kwargs: [],
+            clob_lookup=lambda condition_id: None,
+            holding_reconciler=lambda: calls.append("once"),
+        )
+
+        await monitor._discover()
+
+        assert calls == ["once"]
+
+    asyncio.run(exercise())
+
+
 def test_monitor_snapshot_closes_episode_when_books_age_without_another_update() -> None:
     async def exercise() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]

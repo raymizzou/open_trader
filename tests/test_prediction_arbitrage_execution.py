@@ -24,6 +24,7 @@ from open_trader.polymarket_trading import (
     ThresholdHedgeSubmission,
     ThresholdLegResult,
 )
+from open_trader.predict_trading import PredictLegResult
 
 
 def _intent() -> PairIntent:
@@ -1003,12 +1004,66 @@ class CrossVenueMonitor:
         return {"opportunities": [opportunity]}
 
 
+class CrossPolymarketTrading(FakeTrading):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cross_preflight_calls = 0
+        self.cross_submit_calls = 0
+        self.cross_reconcile_calls = 0
+        self.submit_started = threading.Event()
+        self.submit_release = threading.Event()
+        self.submit_barrier: threading.Barrier | None = None
+        self.block_submit = False
+        self.submit_results: list[ThresholdLegResult] = []
+        self.reconcile_results: list[dict[str, object]] = []
+
+    def no_submit_cross_leg_preflight(self, leg: CrossVenueLeg) -> dict[str, object]:
+        self.cross_preflight_calls += 1
+        return {"result": "PASS", "leg": leg}
+
+    def submit_cross_leg_once(self, leg: CrossVenueLeg) -> ThresholdLegResult:
+        self.cross_submit_calls += 1
+        self.submit_started.set()
+        if self.submit_barrier is not None:
+            self.submit_barrier.wait(timeout=2)
+        if self.block_submit:
+            assert self.submit_release.wait(timeout=2)
+        if self.submit_results:
+            return self.submit_results.pop(0)
+        return ThresholdLegResult(
+            "polymarket", leg.outcome, leg.condition_id, leg.token_id,
+            True, "filled", "poly-order", leg.net_quantity, ("poly-trade",), "none",
+        )
+
+    def reconcile_cross_leg(
+        self, leg: CrossVenueLeg, result: ThresholdLegResult, *, since: datetime
+    ) -> dict[str, object]:
+        self.cross_reconcile_calls += 1
+        if self.reconcile_results:
+            return self.reconcile_results.pop(0)
+        return {
+            "status": "verified", "verified": True,
+            "filled_quantity": result.filled_quantity,
+            "position_quantity": leg.net_quantity,
+            "execution_proof": {"verified": True, "venue": "polymarket"},
+        }
+
+
 class CrossPredictTrading:
     def __init__(self) -> None:
         self.account_calls = 0
         self.allowance_ready = True
         self.account_available = True
         self.positions: tuple[object, ...] = ()
+        self.preflight_calls = 0
+        self.submit_calls = 0
+        self.reconcile_calls = 0
+        self.submit_started = threading.Event()
+        self.submit_release = threading.Event()
+        self.submit_barrier: threading.Barrier | None = None
+        self.block_submit = False
+        self.submit_results: list[PredictLegResult] = []
+        self.reconcile_results: list[dict[str, object]] = []
 
     def account_snapshot(self) -> dict[str, object]:
         self.account_calls += 1
@@ -1016,10 +1071,46 @@ class CrossPredictTrading:
             raise RuntimeError("account unavailable")
         return {"wallet_address": "0xpredict", "available_usdt": "5", "allowance_ready": self.allowance_ready, "open_orders": (), "positions": self.positions, "checked_at": datetime.now(UTC)}
 
+    def no_submit_buy_preflight(
+        self, market_id: str, token_id: str, quantity_wei: int
+    ) -> PredictLegResult:
+        self.preflight_calls += 1
+        assert (market_id, token_id, quantity_wei) == (
+            "predict-market", "predict-yes", 5 * 10**18
+        )
+        return PredictLegResult(True, "preflight")
 
-def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, PredictionArbitrageStore, FakeTrading, CrossVenueMonitor, CrossPredictTrading]:
+    def submit_buy_once(
+        self, market_id: str, token_id: str, quantity_wei: int
+    ) -> PredictLegResult:
+        self.submit_calls += 1
+        self.submit_started.set()
+        if self.submit_barrier is not None:
+            self.submit_barrier.wait(timeout=2)
+        if self.block_submit:
+            assert self.submit_release.wait(timeout=2)
+        if self.submit_results:
+            return self.submit_results.pop(0)
+        return PredictLegResult(True, "filled", "predict-order")
+
+    def reconcile_buy(
+        self, market_id: str, token_id: str, order_hash: str
+    ) -> dict[str, object]:
+        self.reconcile_calls += 1
+        assert (market_id, token_id) == ("predict-market", "predict-yes")
+        if self.reconcile_results:
+            return self.reconcile_results.pop(0)
+        return {
+            "status": "verified", "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "execution_proof": {"verified": True, "venue": "predict.fun"},
+        }
+
+
+def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, PredictionArbitrageStore, CrossPolymarketTrading, CrossVenueMonitor, CrossPredictTrading]:
     store = PredictionArbitrageStore(tmp_path / "data")
-    trading = FakeTrading()
+    trading = CrossPolymarketTrading()
     cross = CrossVenueMonitor(_cross_intent())
     predict = CrossPredictTrading()
     service = PredictionExecutionService(
@@ -1030,6 +1121,241 @@ def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, Predicti
     service.set_cross_venue_monitor(cross)
     assert service.reconcile_startup()["state"] == "ready"
     return service, store, trading, cross, predict
+
+
+def _cross_execution(
+    service: PredictionExecutionService, *, idempotency_key: str = "cross-submit"
+) -> tuple[dict[str, object], dict[str, object]]:
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    accepted = service.confirm(str(preview["preview_id"]), idempotency_key)
+    execution_id = str(accepted["execution_id"])
+    wait_until_terminal(service, execution_id)
+    deadline = time.monotonic() + 3
+    while execution_id in service._threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert execution_id not in service._threads
+    return accepted, service.execution(execution_id)
+
+
+def test_cross_venue_submits_both_legs_concurrently_and_deduplicates_preview(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    barrier = threading.Barrier(2)
+    trading.submit_barrier = predict.submit_barrier = barrier
+    trading.block_submit = predict.block_submit = True
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    first = service.confirm(str(preview["preview_id"]), "same-ui-key")
+    assert trading.submit_started.wait(timeout=2)
+    assert predict.submit_started.wait(timeout=2)
+    duplicate = service.confirm(str(preview["preview_id"]), "same-ui-key")
+    different_key = service.confirm(str(preview["preview_id"]), "different-ui-key")
+    trading.submit_release.set()
+    predict.submit_release.set()
+    final = wait_until_terminal(service, str(first["execution_id"]))
+
+    assert {first["execution_id"], duplicate["execution_id"], different_key["execution_id"]} == {first["execution_id"]}
+    assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+    assert final["state"] == "holding_to_resolution"
+
+
+def test_cross_venue_uses_one_bounded_completion_only_below_emergency_limit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(replace(predict_leg, max_cost=Decimal("1.90")), polymarket_leg),
+        total_max_cost=Decimal("4.30"),
+        minimum_profit=Decimal("0.70"),
+    )
+    predict.submit_results.extend(
+        (
+            PredictLegResult(False, "rejected", "", "rejected"),
+            PredictLegResult(True, "filled", "predict-order"),
+        )
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-bounded-completion")
+
+    assert final["state"] == "holding_to_resolution"
+    assert predict.submit_calls == 2
+    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.90"
+
+
+def test_cross_venue_never_completes_an_opposite_partial_fill(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    trading.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("4"),
+            "position_quantity": Decimal("4"),
+            "execution_proof": {"verified": True},
+        }
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-partial")
+
+    assert final["state"] == "directional_incident"
+    assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+
+
+def test_cross_venue_never_completes_above_emergency_limit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(replace(predict_leg, max_cost=Decimal("2.01")), polymarket_leg),
+        total_max_cost=Decimal("4.41"),
+        minimum_profit=Decimal("0.59"),
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-over-limit")
+
+    assert final["state"] == "directional_incident"
+    assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+
+
+def test_cross_holding_reconciliation_releases_once_after_observed_redemption(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, _predict = _cross_service(tmp_path)
+    accepted, holding = _cross_execution(service, idempotency_key="cross-redemption")
+    assert holding["state"] == "holding_to_resolution"
+    trading.balance = Decimal("21")
+
+    first = service.reconcile_cross_holdings_once()
+    second = service.reconcile_cross_holdings_once()
+
+    assert first == {"complete": 1, "pending": 0, "unknown": 0}
+    assert second == {"complete": 0, "pending": 0, "unknown": 0}
+    assert service.execution(str(accepted["execution_id"]))["state"] == "complete"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_reservation_release_failure_becomes_an_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.submit_results.append(
+        ThresholdLegResult(
+            "polymarket", "NO", "poly-condition", "poly-no", False,
+            "rejected", "", Decimal("0"), (), "rejected",
+        )
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    trading.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    monkeypatch.setattr(
+        store,
+        "release_cross_reservation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("release failed")),
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-release-failure")
+
+    assert final["state"] == "directional_incident"
+    assert service._cross_breaker_open is True
+    assert store.cross_unsettled_principal() > Decimal("0")
+
+
+@pytest.mark.parametrize(
+    ("name", "configure", "state", "released", "breaker", "predict_calls", "dust_loss"),
+    [
+        ("both_filled", lambda trading, predict: None, "holding_to_resolution", False, False, 1, None),
+        (
+            "both_rejected",
+            lambda trading, predict: (
+                trading.submit_results.append(ThresholdLegResult("polymarket", "NO", "poly-condition", "poly-no", False, "rejected", "", Decimal("0"), (), "rejected")),
+                predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected")),
+                trading.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+                predict.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+            ),
+            "both_rejected", True, False, 1, None,
+        ),
+        (
+            "timeout_found",
+            lambda _trading, predict: predict.submit_results.append(PredictLegResult(False, "ambiguous", "predict-order", "ambiguous")),
+            "holding_to_resolution", False, False, 1, None,
+        ),
+        (
+            "absent_retry",
+            lambda _trading, predict: (
+                predict.submit_results.extend((PredictLegResult(False, "ambiguous", "predict-order", "ambiguous"), PredictLegResult(True, "filled", "predict-order"))),
+                predict.reconcile_results.extend(({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}, {"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("5"), "execution_proof": {"verified": True}})),
+            ),
+            "holding_to_resolution", False, False, 2, None,
+        ),
+        (
+            "unknown",
+            lambda _trading, predict: (
+                predict.submit_results.append(PredictLegResult(False, "ambiguous", "predict-order", "ambiguous")),
+                predict.reconcile_results.append({"status": "unknown", "verified": False, "conclusively_absent": False}),
+            ),
+            "directional_incident", False, True, 1, None,
+        ),
+        (
+            "position_mismatch",
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4"), "execution_proof": {"verified": True}}),
+            "directional_incident", False, True, 1, None,
+        ),
+        (
+            "safe_dust",
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "minimum_order_size": Decimal("1"), "execution_proof": {"verified": True}}),
+            "holding_to_resolution", False, False, 1, Decimal("0.10"),
+        ),
+        (
+            "unsafe_dust",
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "minimum_order_size": Decimal("1"), "worst_case_loss": Decimal("2.01"), "execution_proof": {"verified": True}}),
+            "directional_incident", False, True, 1, None,
+        ),
+    ],
+)
+def test_cross_venue_reconciliation_contains_independent_outcomes(
+    tmp_path: Path,
+    name: str,
+    configure: object,
+    state: str,
+    released: bool,
+    breaker: bool,
+    predict_calls: int,
+    dust_loss: Decimal | None,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    configure(trading, predict)  # type: ignore[operator]
+
+    _accepted, final = _cross_execution(service, idempotency_key=f"cross-{name}")
+
+    assert final["state"] == state
+    assert predict.submit_calls == predict_calls
+    assert trading.cross_submit_calls == 1
+    assert service._cross_breaker_open is breaker
+    assert (store.cross_unsettled_principal() == Decimal("0")) is released
+    if dust_loss is not None:
+        evidence = final["evidence"][-1]
+        assert evidence["unhedged_units"] == "0.1"
+        assert evidence["worst_case_loss"] == "0.1"
 
 
 def test_cross_venue_stage_five_preview_is_server_owned(tmp_path: Path) -> None:

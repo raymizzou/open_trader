@@ -499,6 +499,7 @@ class PolymarketTradingClient:
         self._public_client_factory = public_client_factory or PublicClient
         self._readiness_key: tuple[PairIntent, Decimal] | None = None
         self._threshold_readiness_key: ThresholdHedgeIntent | None = None
+        self._cross_leg_readiness_key: object | None = None
 
     @classmethod
     def from_keychain(
@@ -1507,6 +1508,205 @@ class PolymarketTradingClient:
             leg_a=self._threshold_leg_result(intent.leg_a, responses[0]),
             leg_b=self._threshold_leg_result(intent.leg_b, responses[1]),
         )
+
+    @staticmethod
+    def _cross_leg_fields(
+        leg: object,
+    ) -> tuple[str, str, str, Decimal, Decimal] | None:
+        exchange = _field(leg, "exchange")
+        condition_id = _field(leg, "condition_id")
+        token_id = _field(leg, "token_id")
+        outcome = _field(leg, "outcome")
+        quantity = _field(leg, "net_quantity")
+        max_price = _field(leg, "max_price")
+        max_cost = _field(leg, "max_cost")
+        if (
+            exchange != "polymarket"
+            or not isinstance(condition_id, str)
+            or not condition_id
+            or not isinstance(token_id, str)
+            or not token_id
+            or outcome not in {"YES", "NO"}
+            or not isinstance(quantity, Decimal)
+            or not isinstance(max_price, Decimal)
+            or not isinstance(max_cost, Decimal)
+            or quantity <= 0
+            or max_price <= 0
+            or max_price > 1
+            or max_cost <= 0
+        ):
+            return None
+        return condition_id, token_id, outcome, quantity, max_price
+
+    @staticmethod
+    def _blocked_cross_leg(leg: object, error_code: str) -> ThresholdLegResult:
+        fields = PolymarketTradingClient._cross_leg_fields(leg)
+        if fields is None:
+            return ThresholdLegResult(
+                "polymarket", "YES", "", "", False, "blocked", "", Decimal("0"), (), "invalid"
+            )
+        condition_id, token_id, outcome, _quantity, _max_price = fields
+        return ThresholdLegResult(
+            "polymarket", outcome, condition_id, token_id, False, "blocked", "", Decimal("0"), (), error_code
+        )
+
+    def no_submit_cross_leg_preflight(
+        self, leg: object, *, account: AccountSnapshot | None = None
+    ) -> dict[str, object]:
+        self._cross_leg_readiness_key = None
+        summary: dict[str, object] = {
+            "posted": False,
+            "account_reads": "fail",
+            "fok_leg_signed_not_submitted": "fail",
+            "error_code": "none",
+            "result": "BLOCKED",
+        }
+        fields = self._cross_leg_fields(leg)
+        signer_match, wallet_match = self._identity_summary()
+        if fields is None:
+            summary["error_code"] = "invalid"
+            return summary
+        if signer_match != "yes" or wallet_match != "yes":
+            summary["error_code"] = "auth"
+            return summary
+        if account is None:
+            try:
+                account = self.account_snapshot()
+            except PolymarketTradingError as exc:
+                summary["error_code"] = exc.error_code
+                return summary
+        summary["account_reads"] = "pass"
+        if not self.geoblock_allowed():
+            summary["error_code"] = "geoblock_blocked"
+            return summary
+        condition_id, token_id, _outcome, quantity, max_price = fields
+        max_cost = _field(leg, "max_cost")
+        if (
+            not isinstance(max_cost, Decimal)
+            or max_cost > account.p_usd_balance
+            or max_cost > account.p_usd_allowance
+        ):
+            summary["error_code"] = "account_insufficient"
+            return summary
+        try:
+            signed = self._sign_leg(
+                token_id=token_id, amount=max_cost, max_price=max_price
+            )
+        except Exception as exc:
+            summary["error_code"] = _safe_error_code(exc)
+            return summary
+        if (
+            _field(signed, "order_type") != "FOK"
+            or _field(signed, "side") != "BUY"
+            or _field(signed, "token_id") not in (None, token_id)
+            or self._signed_quantity(signed, quantity) != quantity
+        ):
+            summary["error_code"] = "order_shape_mismatch"
+            return summary
+        del condition_id
+        summary["fok_leg_signed_not_submitted"] = "pass"
+        summary["result"] = "PASS"
+        self._cross_leg_readiness_key = leg
+        return summary
+
+    def submit_cross_leg_once(self, leg: object) -> ThresholdLegResult:
+        if self._cross_leg_readiness_key != leg:
+            return self._blocked_cross_leg(leg, "preflight_required")
+        fields = self._cross_leg_fields(leg)
+        if fields is None:
+            return self._blocked_cross_leg(leg, "invalid")
+        _condition_id, token_id, _outcome, quantity, max_price = fields
+        max_cost = _field(leg, "max_cost")
+        if not isinstance(max_cost, Decimal):
+            return self._blocked_cross_leg(leg, "invalid")
+        try:
+            signed = self._sign_leg(
+                token_id=token_id, amount=max_cost, max_price=max_price
+            )
+            if (
+                _field(signed, "order_type") != "FOK"
+                or _field(signed, "side") != "BUY"
+                or self._signed_quantity(signed, quantity) != quantity
+            ):
+                return self._blocked_cross_leg(leg, "order_shape_mismatch")
+            responses = tuple(self._client.post_orders((signed,)))
+        except Exception:
+            return ThresholdLegResult(
+                "polymarket", _outcome, _condition_id, token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            )
+        if len(responses) != 1:
+            return ThresholdLegResult(
+                "polymarket", _outcome, _condition_id, token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            )
+        return self._threshold_leg_result(
+            ThresholdHedgeLeg(
+                "polymarket",
+                _condition_id,
+                str(_field(leg, "market_id", _condition_id)),
+                _outcome,
+                token_id,
+                quantity,
+                max_price,
+                max_cost,
+                DEFAULT_TICK_SIZE,
+            ),
+            responses[0],
+        )
+
+    def reconcile_cross_leg(
+        self, leg: object, result: ThresholdLegResult, *, since: datetime
+    ) -> dict[str, object]:
+        fields = self._cross_leg_fields(leg)
+        if fields is None or not isinstance(result, ThresholdLegResult):
+            return {"status": "unknown", "verified": False, "conclusively_absent": False}
+        condition_id, token_id, outcome, quantity, max_price = fields
+        max_cost = _field(leg, "max_cost")
+        if not isinstance(max_cost, Decimal):
+            return {"status": "unknown", "verified": False, "conclusively_absent": False}
+        actual, proof = self._reconcile_threshold_leg(result, since=since)
+        position = proof.get("position_ref")
+        position_quantity = (
+            _decimal(position.get("quantity"))
+            if isinstance(position, Mapping)
+            else Decimal("0")
+        ) or Decimal("0")
+        if proof.get("positions_verified") is True and actual > 0:
+            return {
+                "status": "verified",
+                "verified": True,
+                "conclusively_absent": False,
+                "filled_quantity": actual,
+                "position_quantity": position_quantity,
+                "execution_proof": {"verified": True, "venue": "polymarket", **proof},
+            }
+        if not result.accepted and result.status != "ambiguous":
+            try:
+                positions = _collect(self._client.list_positions(market=[condition_id]))
+                for item in positions:
+                    if _field(item, "token_id", _field(item, "tokenId", "")) != token_id:
+                        continue
+                    amount = _decimal(
+                        _field(item, "size", _field(item, "quantity", _field(item, "shares")))
+                    )
+                    if amount is not None and amount > 0:
+                        return {"status": "unknown", "verified": False, "conclusively_absent": False}
+            except Exception:
+                return {"status": "unknown", "verified": False, "conclusively_absent": False}
+            return {
+                "status": "absent",
+                "verified": False,
+                "conclusively_absent": True,
+                "filled_quantity": Decimal("0"),
+                "position_quantity": Decimal("0"),
+            }
+        return {
+            "status": "unknown",
+            "verified": False,
+            "conclusively_absent": False,
+            "filled_quantity": actual,
+            "position_quantity": position_quantity,
+            "execution_proof": {"verified": False, "venue": "polymarket", **proof},
+        }
 
     def reconcile(
         self,

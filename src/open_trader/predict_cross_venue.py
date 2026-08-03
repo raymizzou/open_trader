@@ -931,6 +931,7 @@ class PredictCrossVenueMonitor:
         predict_quote_fn: Callable[[str, str, int], PredictBuyQuote] | None = None,
         store: PredictionArbitrageStore | None = None,
         ready_observer: Callable[[str, str], object] | None = None,
+        holding_reconciler: Callable[[], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._predict = predict_source
@@ -941,6 +942,7 @@ class PredictCrossVenueMonitor:
         self._predict_quote_fn = predict_quote_fn
         self._store = store
         self._ready_observer = ready_observer
+        self._holding_reconciler = holding_reconciler
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
         self._hot_restart = asyncio.Event()
@@ -1104,6 +1106,7 @@ class PredictCrossVenueMonitor:
             self._monitored_pairs = 0
             self._set_approved({})
             await self._suspend_hot(status=self._source_status())
+            await self._reconcile_holdings()
             return
         eligible = {
             pair.pair_id: pair for pair in resolution.pairs if _valid_market_pair(pair)
@@ -1147,6 +1150,15 @@ class PredictCrossVenueMonitor:
             approved, prompt_version=prompt_version, validations=validations
         )
         self._status = self._source_status()
+        await self._reconcile_holdings()
+
+    async def _reconcile_holdings(self) -> None:
+        if self._holding_reconciler is None:
+            return
+        try:
+            await asyncio.to_thread(self._holding_reconciler)
+        except Exception:
+            return
 
     async def _hot_while(self, slow_task: asyncio.Task[None]) -> None:
         market_ids = sorted(
