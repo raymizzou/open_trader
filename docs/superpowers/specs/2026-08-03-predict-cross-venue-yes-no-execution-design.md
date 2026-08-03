@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-03
 
-**Status:** Approved; exact-approval and testnet-canary amendment approved 2026-08-03
+**Status:** Approved; final confirmation, allowance, gas, and canary amendments approved 2026-08-04
 
 **Target:** Existing Open Trader prediction-market watcher, execution service, and Dashboard
 
@@ -87,6 +87,8 @@ notifications list only cross-venue opportunities.
 - a Dashboard, watcher, or production-config switch between Predict testnet and
   mainnet
 - an automatic mainnet order canary in `make acceptance`
+- testnet market availability or a testnet order as an acceptance or production
+  execution gate
 
 ## 4. Candidate Discovery and Funnel Semantics
 
@@ -281,7 +283,7 @@ An allowance of zero is the expected safe state before and after an execution.
 The readiness path must not use the SDK's "fully approved" Boolean, which is
 defined for persistent maximum approval. Exact allowance checks read the raw
 owner/spender amount and compare it with the one bounded debit.
-Before exposing an actionable preview, the server checks:
+Before exposing an actionable confirmation envelope, the server checks:
 
 - API/JWT authentication and Predict-account identity
 - available USDT
@@ -294,6 +296,19 @@ Before exposing an actionable preview, the server checks:
 V1 still admits only standard, non-NegRisk, non-yield-bearing binary markets.
 The market-derived scope is retained so a future scope expansion cannot reuse
 the wrong exchange spender accidentally.
+
+The Predict Account owns USDT, positions, and allowances. The Privy signer EOA
+pays native BNB gas for the SDK's outer Kernel transaction. The Dashboard must
+show these as two different identities. When signer BNB is insufficient, Open
+Trader shows the signer address, current balance, required balance, and minimum
+manual top-up. It never transfers BNB or other assets automatically.
+
+A nonzero allowance with no active execution is not treated as readiness. It
+opens the cross-venue breaker and requires operator review. Open Trader does
+not revoke it automatically during startup. The operator-facing cleanup action
+shows the owner, spender, current allowance, target zero allowance, signer gas
+impact, and that no USDT moves. Only after explicit confirmation may the
+execution service submit the bounded `allowance -> 0` transaction.
 
 After human confirmation, the Predict leg follows this sequence:
 
@@ -317,13 +332,15 @@ Account controlled by a Privy signer. Testnet therefore validates only the
 shared adapter path: market and book reads, quote math, caps, exact allowance,
 signed order submission, FOK behavior, and REST/position reconciliation.
 
-An explicit operator-only testnet canary command injects BNB Testnet, the
+An explicit operator-only testnet canary command may inject BNB Testnet, the
 testnet API, and the dedicated EOA Keychain credential into the same trading
-adapter methods used by production. The Dashboard, watcher, normal runtime
-configuration, and `make acceptance` remain mainnet-only. The canary is never
-started automatically. It defaults to no-submit; a mutation requires an
-explicit submit flag after showing the market, outcome, quantity, and maximum
-test-USDT debit. The hard canary cap is 1 test USDT.
+adapter methods used by production. It is an optional diagnostic, never an
+acceptance or production execution prerequisite, because a suitable testnet
+market may not exist. The Dashboard, watcher, normal runtime configuration, and
+`make acceptance` remain mainnet-only. The command is never started
+automatically. It defaults to no-submit; a mutation requires an explicit submit
+flag after showing the market, outcome, quantity, and maximum test-USDT debit.
+The hard canary cap is 1 test USDT.
 
 Predict-Account-specific behavior remains covered by:
 
@@ -335,16 +352,19 @@ Predict-Account-specific behavior remains covered by:
   the SDK's Smart Account/Kernel route, filled order, position, receipts, and
   zero remaining allowance
 
-A new mainnet order canary is required only after an SDK upgrade, signer/account
-change, Smart Account/Kernel-path change, or expansion to a new market type. It
-always requires separate operator authorization.
+No additional mainnet test order is required before production execution. The
+first genuine qualifying cross-venue opportunity is itself the one-time
+mainnet canary described in section 17. After a material SDK, signer/account,
+Smart Account/Kernel-path, or market-scope change, production re-enters that
+same bounded canary mode; it still waits for a genuine opportunity and never
+creates a separate test trade.
 
 ## 8. Preview and Human Confirmation
 
-### 8.1 Preview
+### 8.1 Confirmation envelope
 
-The existing preview boundary receives a cross-venue opportunity ID and builds
-one immutable preview containing:
+The existing preview API receives a cross-venue opportunity ID and builds one
+human-readable confirmation envelope containing:
 
 - pair ID and current pair fingerprints
 - Codex approval ID, time, summary, canonical cutoff, and evidence
@@ -356,17 +376,29 @@ one immutable preview containing:
 - available balance on each venue
 - current and post-reservation unsettled principal
 - normal 20 USDT and emergency 2 USDT limits
-- preview expiry and a unique execution ID
+- the active signal-episode ID, current data timestamps, and a one-time
+  confirmation ID
 
 The operator is not required to reread both full contracts on every trade.
 The modal shows the Codex result and canonical cutoff with expandable evidence.
-The human confirmation authorizes only the displayed price ceilings, total
-cost, and incident budget.
+The human confirmation authorizes only the displayed quantities, price
+ceilings, total-cost ceiling, minimum profit, minimum 15% annualized yield, and
+2 USDT incident budget. Better prices may execute without a second
+confirmation. A worse price may execute only while every displayed ceiling and
+minimum remains satisfied. The system never silently raises a ceiling, lowers
+a minimum, or increases quantity.
+
+The confirmation envelope has no time-to-live and is not proof that market
+conditions remain valid. A stage-5 signal remains visible for as long as fresh
+monitoring continues to satisfy all gates. If the operator confirms after any
+amount of time, the server must use current data. A closed signal episode, a
+new episode with the same pair, or changed fingerprints rejects the old
+confirmation.
 
 ### 8.2 Confirmation refresh
 
-Immediately after the user confirms and before submitting either order, the
-service refreshes by REST:
+Immediately after the user confirms and before any approval, the service
+refreshes by REST:
 
 - both rules and fingerprints
 - both market and outcome statuses
@@ -375,12 +407,17 @@ service refreshes by REST:
 - Codex approval validity
 - execution lock, circuit breaker, and unsettled reservation
 
-The system never silently raises a confirmed price ceiling.
+After exact approval, one final dual-REST refresh runs immediately before the
+two submissions. This post-approval check is also the submission-time guard;
+there is no stale preview window between it and concurrent submit. The system
+never treats the display envelope as current market evidence.
 
 - If both refreshed orders remain within the confirmed price ceilings and all
   gates pass, execution continues.
-- If either price exceeds its ceiling, a new preview and a new confirmation are
-  required.
+- If either price exceeds its ceiling or another confirmed minimum is breached,
+  execution is rejected. The stage-5 signal remains visible only if its latest
+  independent monitor state still qualifies; the operator may open a newly
+  computed confirmation envelope without waiting for an arbitrary timer.
 - If annualized yield falls below 15%, depth becomes insufficient, a fingerprint
   changes, or any readiness fact fails, the execution is cancelled with no
   order submitted.
@@ -396,8 +433,10 @@ minimize naked-leg duration. This is not an atomic transaction; either venue
 may succeed while the other fails.
 
 Both submissions use the same local execution ID and venue-specific client
-identity where supported. Repeated UI confirmation for the same preview maps to
-the same execution ID.
+identity where supported. A confirmation ID is single-use and idempotent:
+repeated UI submission returns the same execution instead of creating another.
+The execution remains bound to the original signal episode and confirmed
+envelope even though all market and account facts are re-read.
 
 ### 9.2 Unknown submission state
 
@@ -475,11 +514,22 @@ Notification deduplication keys on:
 The notification contains both venue/outcome legs, maximum cost, minimum
 profit, theoretical annualized yield, canonical cutoff, and a Dashboard deep
 link. Opening the link never submits an order; it only opens the current signal,
-which must still pass preview and manual confirmation.
+which must still produce a current confirmation envelope and pass manual
+confirmation.
 
 Notification delivery remains asynchronous and cannot affect signal
 persistence, actionability, preview, or execution. Acceptance uses a
 deterministic notifier and sends no real Feishu message.
+
+A healthy account with insufficient BNB remains Dashboard-only while no
+stage-5 signal is blocked. If insufficient BNB blocks a stage-5 signal, one
+deduplicated operational notification is sent. Residual allowance or an
+allowance-cleanup failure sends one immediate incident notification. None
+repeat until recovery changes the underlying incident generation.
+
+The Feishu action opens the Dashboard only. Feishu never exposes a direct order
+action. The Dashboard must obtain current state and require the normal human
+confirmation before any execution.
 
 ## 13. Dashboard Design
 
@@ -494,13 +544,19 @@ tabs and displays one card per venue:
 - venue name and trading mode
 - REST and WebSocket state
 - region/API readiness where applicable
-- masked wallet address
-- available balance and asset
+- masked account address
+- available balance, current execution reservation, and unsettled capital
 - most recent successful update
 
 At minimum it shows Polymarket and Predict.fun. It replaces the older
 Polymarket-only page heartbeat wording. There is no aggregate wallet-balance
 ceiling card.
+
+The Predict card separately labels the Predict Account and the gas-paying Privy
+signer. It shows USDT and allowance against the Predict Account, and BNB against
+the signer. Zero allowance with sufficient identity, balance, gas, and scoped
+approval capability is labeled `可以交易`. Insufficient BNB is `只读`; residual
+allowance with no execution is `熔断只读`.
 
 ### 13.2 YES/NO workspace
 
@@ -508,10 +564,11 @@ The YES/NO workspace contains, in order:
 
 1. shared venue health header
 2. existing strategy tabs
-3. five-stage cross-venue funnel
-4. one concise cross-venue policy note
-5. cross-venue candidate list
-6. existing signal, execution, and incident history
+3. one concise account/execution status strip
+4. five-stage cross-venue funnel
+5. one concise cross-venue policy note
+6. cross-venue candidate list
+7. existing signal, execution, and incident history
 
 The four metric cards formerly shown above the funnel are removed because they
 duplicate the funnel.
@@ -521,6 +578,18 @@ show net units, combined maximum cost, minimum payout, minimum profit,
 theoretical annualized yield, canonical cutoff, and Codex status. Observation
 rows remain visible even when below the entry threshold or pending review.
 
+While one execution holds the global lock, monitoring and funnel counts keep
+updating. Other qualifying signals remain visible but their action reads
+`已有订单执行中`. A complete V1 scan with zero eligible markets shows a healthy
+empty state, not an account or watcher failure. When a venue becomes stale,
+stages 1 through 4 retain their last successful counts with a stale timestamp;
+stage 5 becomes zero and all actions disappear.
+
+Execution history uses one top-level row per human confirmation. Approval,
+cleanup, both venue orders, reconciliation, and receipts are expandable details
+inside that row. If post-approval checks reject the opportunity, the row says
+`未下单 · 授权已清零`; only cleanup failure becomes an incident.
+
 ### 13.3 Confirmation modal
 
 Desktop keeps the existing 720px modal pattern and presents the two legs side by
@@ -528,6 +597,7 @@ side. Mobile uses the same content in one vertical sequence with a fixed action
 footer. Both show:
 
 - Predict and Polymarket legs with outcomes and price ceilings
+- native exchange IDs and read-only links to both official market pages
 - combined economics and theoretical annualized yield
 - non-atomic warning and 2 USDT remediation authorization
 - current Codex approval and expandable evidence
@@ -536,6 +606,12 @@ footer. Both show:
 - current and post-trade unsettled principal
 - refresh/reconfirm behavior
 - existing automatic redemption behavior
+
+The signal card has no countdown. The modal shows current data timestamps but
+does not imply that displayed data remains executable. Confirmation starts a
+fresh server-side check; exact approval is followed by the final submission-time
+check. An invalidated opportunity shows `未下单` and the verified allowance
+cleanup result.
 
 The confirmation button states the exact maximum combined cost. Visible action
 targets remain at least 44px high and the modal remains keyboard dismissible.
@@ -558,8 +634,11 @@ Credentials are never included in source, configuration JSON, logs, snapshots,
 Codex prompts, Feishu messages, screenshots, test fixtures, or this design.
 
 The API key authenticates Predict API requests. The Privy private key signs only
-the exact bounded order or redemption action owned by the execution service.
-Public wallet addresses may be masked in UI and logs.
+the exact bounded approval, cleanup, order, remediation, or redemption action
+owned by the execution service and authorized by this design. It never signs an
+automatic wallet transfer or BNB top-up. Public account and signer addresses
+may be masked in normal UI and logs; a manual top-up prompt may reveal the full
+signer address only for operator copy.
 
 ## 15. Failure Behavior
 
@@ -572,9 +651,12 @@ Public wallet addresses may be masked in UI and logs.
 | Canonical cutoff unavailable | No annualization and no execution. |
 | Predict net units or fee unavailable | Observation only. |
 | Book or REST state stale | Remove stage-5 actionability. |
-| Price exceeds confirmed ceiling | Cancel; require a new preview and confirmation. |
+| Price exceeds a confirmed ceiling or any confirmed minimum fails | Reject execution. Keep or remove the signal solely from fresh monitor state; a future attempt computes a new envelope. |
 | Balance, native gas, or exact-approval capability insufficient | Cancel before approval or either submit. |
 | Exact approval succeeds but the post-approval refresh fails | Submit neither order; reset allowance to zero. Reset failure opens the breaker and alerts. |
+| Nonzero allowance exists with no active execution | Open the breaker; require operator-confirmed cleanup. Never auto-revoke at startup. |
+| Signer BNB is insufficient without a blocked stage-5 signal | Dashboard-only manual top-up guidance; no transfer and no Feishu notification. |
+| Signer BNB blocks a stage-5 signal | Remove actionability and send one deduplicated operational notification. |
 | 20 USDT entry cap exceeded | Size down to a valid common quantity or reject. |
 | 100 USDT unsettled cap unavailable | Reject before reservation and submit. |
 | Duplicate confirmation | Return the existing execution; never create another. |
@@ -614,9 +696,9 @@ Public wallet addresses may be masked in UI and logs.
 
 | ID | Given / action | Required observation |
 | --- | --- | --- |
-| CV-14 | Open a current actionable signal. | Preview shows explicit venues, outcomes, net units, currencies, ceilings, economics, Codex evidence, cutoff, balances, unsettled capacity, and risk limits. |
-| CV-15 | Confirm while both refreshed books remain within the displayed ceilings. | Exactly two venue submissions start concurrently under one execution ID. |
-| CV-16 | Confirm after either price rises above its displayed ceiling or annualized yield falls below 15%. | No order is submitted; a new preview and confirmation are required. |
+| CV-14 | Open a current actionable signal. | The signal remains visible without a countdown while fresh gates pass. The envelope shows explicit venues and native IDs, outcomes, net units, currencies, ceilings, minimums, Codex evidence, cutoff, balances, unsettled capacity, and risk limits. |
+| CV-15 | Confirm at any later time while the confirmation-time and post-approval submission-time refreshes remain within every displayed bound. | Exactly two venue submissions start concurrently under one execution ID; better prices require no second confirmation. |
+| CV-16 | Confirm after either price rises above its displayed ceiling, annualized yield falls below 15%, the signal episode closed/reopened, or a fingerprint changed. | No order is submitted. An old confirmation is never treated as market evidence; any later attempt computes a current envelope. |
 | CV-17 | Double-click confirmation or repeat the same execution request. | One execution and at most one order per intended venue leg exist. |
 | CV-18 | One submit call times out. | The service queries order/account state before any retry. Unknown state opens the breaker without a duplicate order. |
 | CV-19 | Both FOK legs fill. | Independent REST/account reconciliation proves both orders and equal net positions, then state becomes `holding_to_resolution`. |
@@ -630,22 +712,26 @@ Public wallet addresses may be masked in UI and logs.
 | --- | --- | --- |
 | CV-23 | A winning position becomes redeemable. | Existing automatic redemption runs once, is independently reconciled, and only then releases unsettled principal. |
 | CV-24 | Redemption fails or remains pending. | UI and history show `待兑付`; no capacity is released and no blind transaction loop occurs. |
-| CV-25 | Render either strategy tab. | The shared header truthfully shows both venues' REST, WebSocket, wallet, balance, asset, mode, and last success. |
+| CV-25 | Render either strategy tab. | The shared header truthfully shows both venues' REST, WebSocket, mode, and last success. It separately identifies the Predict Account as owner of USDT, positions, and allowance; the Privy signer as payer of BNB gas; and shows balance, reservation, unsettled capital, allowance, and gas without conflating the two identities. |
 | CV-26 | Render the YES/NO page at 1440px and 375px. | The five funnel stages, explicit exchange labels, candidate rows, and history are readable without the removed four duplicate metric cards or horizontal overflow. |
 | CV-27 | Open the cross-venue modal on desktop and mobile. | All approved fields are visible; buttons are at least 44px; Escape closes desktop modal and restores focus; mobile action footer remains usable. |
 | CV-28 | A pair enters stage 5 repeatedly without identity change. | One Feishu notification is scheduled for the pair/direction/fingerprints; stages 1–4 send none. No real message is sent in acceptance. |
 | CV-29 | LLM hedge and legacy execution regression tests run. | Existing behavior remains unchanged apart from the intentionally shared venue header. |
+| CV-29A | A venue becomes stale after successful monitoring. | Funnel stages 1–4 retain timestamped stale counts, stage 5 becomes zero, and no action remains. |
+| CV-29B | A complete live V1 scan returns zero eligible markets. | Dashboard shows healthy empty state and acceptance is not failed or blocked solely because no market exists. |
 
 ### 16.5 Exact approval and environment verification
 
 | ID | Given / action | Required observation |
 | --- | --- | --- |
-| CV-30 | Predict has zero current allowance but valid identity, balance, native gas, and one valid scoped BUY approval step. | Account readiness permits preview; zero allowance is not reported as an account failure. |
-| CV-31 | Run the explicit testnet canary after confirming a bounded order. | The formal adapter sets only the exact EOA allowance, submits one bounded testnet order, and independently reconciles order, position, receipts, and remaining allowance. |
+| CV-30 | Predict has zero current allowance but valid identity, balance, native gas, and one valid scoped BUY approval step. | Account readiness permits a confirmation envelope; zero allowance is not reported as an account failure. |
+| CV-31 | No suitable Predict testnet market exists. | Optional testnet diagnostics may be skipped indefinitely; acceptance and mainnet execution readiness remain independently decidable. |
 | CV-32 | Exact approval succeeds but either refreshed book leaves the confirmed bounds. | Neither venue order is submitted and the Predict allowance is reset to zero. |
 | CV-33 | Allowance reset fails after a post-approval cancellation. | The execution remains non-submitted, the global cross-venue breaker opens, and an operator alert is persisted. |
-| CV-34 | Build the mainnet Predict client and run live readiness. | The builder uses the Privy signer with the Predict deposit address; JWT, balances, approval step, and signed no-submit order pass without an approval or order transaction. |
+| CV-34 | Build the mainnet Predict client and run live readiness. | The builder uses the Privy signer with the Predict deposit address; JWT, identity, balances, raw allowance, signer BNB, and scoped approval construction pass read-only. A signed no-submit order passes when a V1 market exists; otherwise it is explicitly `not_applicable` after a complete successful scan. |
 | CV-35 | Run `make acceptance`. | No testnet canary, mainnet approval, mainnet order, or live notification occurs; mutation count remains zero. |
+| CV-36 | Predict has residual nonzero allowance with no active execution. | Readiness becomes breaker/read-only; cleanup occurs only after an explicit operator confirmation and moves no USDT. |
+| CV-37 | Privy signer BNB is insufficient. | UI identifies the signer as the gas destination, shows exact manual top-up facts, and never initiates a transfer. |
 
 ### 16.6 Final Dashboard gate
 
@@ -658,12 +744,17 @@ The final gate must cover:
 - complete Python tests
 - deterministic desktop and mobile Prediction Playwright tests
 - live read-only Predict and Polymarket market, book, balance, status, and
-  no-submit readiness checks
+  no-submit readiness checks, with Predict order construction explicitly
+  `not_applicable` when a complete successful scan finds no V1 market
 - Dashboard API, process version, logs, and browser flows
 - all existing non-prediction acceptance checks
 
 The acceptance gate does not submit a real order and does not send a real
 Feishu notification.
+
+A complete successful market scan that finds zero V1-eligible markets may
+still return `PASS`. A failed or incomplete scan remains a real failure or
+blocker. Testnet canary availability is never part of this gate.
 
 Only after `make acceptance` returns `PASS` may the exact accepted SHA be
 redeployed for review. The handoff must prove the new PID, cwd, exact SHA, fresh
@@ -679,9 +770,9 @@ substitute for any gate result.
   Polymarket submit/reconcile doubles, plus direct no-submit workflow checks.
 - CV-25 through CV-29: Prediction Playwright at 1440px and 375px, including
   header, funnel, candidate, modal, keyboard, and notification assertions.
-- CV-30 through CV-35: focused readiness/execution tests, one explicit
-  operator-run EOA testnet canary using the formal adapter, mainnet read-only
-  no-submit checks, and the retained historical Smart Account canary metadata.
+- CV-30 through CV-37: focused readiness/execution tests, optional operator-run
+  EOA testnet diagnostics when a market exists, mainnet read-only no-submit
+  checks, and retained historical Smart Account canary metadata.
 - Live readiness: real read-only Predict and Polymarket API/account checks with
   no order submission and no secret output.
 - Final runtime: `make acceptance` output, exact Git SHA, process PID and cwd,
@@ -692,10 +783,10 @@ substitute for any gate result.
 The existing single-venue Predict canary is evidence for Predict authentication
 and order mechanics, not proof of cross-venue execution.
 
-The operator-only testnet canary validates the formal adapter before this first
-cross-venue mainnet canary. It does not replace the separate confirmation below
-because an EOA testnet order cannot prove a two-venue mainnet execution or the
-Predict Smart Account route.
+The optional operator-only testnet canary can diagnose the formal adapter but
+does not gate this first cross-venue mainnet canary. An EOA testnet order cannot
+prove a two-venue mainnet execution or the Predict Smart Account route, and a
+suitable testnet market may never exist.
 
 After the implementation has passed acceptance and the exact SHA is deployed,
 the first cross-venue live canary requires a separate explicit user confirmation
@@ -708,9 +799,11 @@ and must:
 - show the exact pair, direction, quantities, price ceilings, fees, and maximum
   cost before confirmation
 - reconcile both venue orders, actual positions, fees, and balances
+- verify the Predict allowance returned to zero
 - remain within the normal 2 USDT remediation limit
 
 If no current pair can satisfy the 5 USDT canary cap, no threshold is relaxed;
-the system waits for a suitable opportunity. A successful canary removes only
-the one-time 5 USDT operational constraint. The permanent 20/2/100 USDT limits
-remain.
+the system waits for a suitable opportunity. Cancellation or failure retains
+canary mode. Only a fully reconciled two-leg fill with verified positions,
+balances, fees, and zero remaining Predict allowance removes the one-time 5
+USDT operational constraint. The permanent 20/2/100 USDT limits remain.
