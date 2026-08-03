@@ -1299,12 +1299,105 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
         )
         await asyncio.sleep(0)
         assert len(notifications) == 1
+        rotated_signal = store.open_signal_history()[0]
+        assert rotated_signal["signal_id"] != signal["signal_id"]
 
         monitor._persist_observation(
             {**fresh_base, "funnel_stage": 5, "actionable": True, "clear_signal": True}
         )
         await wait_until(lambda: len(notifications) == 2)
-        assert notifications[-1] == (opportunity_id, signal["signal_id"])
+        assert notifications[-1] == (opportunity_id, rotated_signal["signal_id"])
+
+    asyncio.run(exercise())
+
+
+def test_monitor_fingerprint_rotation_isolates_in_flight_notification_lease(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        store = PredictionArbitrageStore(tmp_path / "data")
+        calls: list[str] = []
+        completions: list[tuple[str, dict[str, object]]] = []
+        old_started = threading.Event()
+        release_old = threading.Event()
+        new_completed = threading.Event()
+
+        def observer(_opportunity_id: str, signal_id: str) -> None:
+            calls.append(signal_id)
+            reservation = store.reserve_notification_attempt(signal_id)
+            assert reservation["state"] == "reserved"
+            lease_id = str(reservation["lease_id"])
+            if len(calls) == 1:
+                old_started.set()
+                assert release_old.wait(timeout=2)
+            result = store.complete_notification_attempt(
+                signal_id, lease_id, success=True
+            )
+            completions.append((signal_id, result))
+            if len(calls) == 2:
+                new_completed.set()
+
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            store=store,
+            ready_observer=observer,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        base = {
+            "opportunity_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "market_type": "cross_venue_yes_no",
+            "execution_mode": "observe_only",
+            "total_max_cost": Decimal("8.128"),
+            "minimum_profit": Decimal("1.872"),
+        }
+
+        def stage(fingerprint: str, funnel_stage: int, actionable: bool) -> dict[str, object]:
+            return {
+                **base,
+                "funnel_stage": funnel_stage,
+                "actionable": actionable,
+                "clear_signal": actionable,
+                "rules_fingerprints": {
+                    "predict.fun": fingerprint,
+                    "polymarket": "poly-fingerprint-1",
+                },
+                "codex_approval": {
+                    "decision": "APPROVE",
+                    "cache_key": f"approval-{fingerprint}",
+                },
+            }
+
+        monitor._persist_observation(stage("predict-fingerprint-1", 5, True))
+        await wait_until(old_started.is_set)
+        old_signal = store.open_signal_history()[0]
+        old_signal_id = str(old_signal["signal_id"])
+
+        monitor._persist_observation(stage("predict-fingerprint-2", 4, False))
+        rotated_signal = store.open_signal_history()[0]
+        rotated_signal_id = str(rotated_signal["signal_id"])
+        assert rotated_signal_id != old_signal_id
+
+        monitor._persist_observation(stage("predict-fingerprint-2", 5, True))
+        await wait_until(new_completed.is_set)
+        assert calls == [old_signal_id, rotated_signal_id]
+        assert store.signal(rotated_signal_id)["notification_state"] == "sent"  # type: ignore[index]
+
+        release_old.set()
+        await wait_until(lambda: len(completions) == 2)
+        completion_by_signal = dict(completions)
+        assert completion_by_signal[old_signal_id]["state"] == "closed"
+        assert completion_by_signal[rotated_signal_id]["state"] == "sent"
+        assert store.signal(rotated_signal_id)["notification_state"] == "sent"  # type: ignore[index]
+
+        monitor._persist_observation(stage("predict-fingerprint-2", 5, True))
+        await asyncio.sleep(0)
+        assert calls == [old_signal_id, rotated_signal_id]
 
     asyncio.run(exercise())
 

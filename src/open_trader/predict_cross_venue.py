@@ -1589,6 +1589,18 @@ class PredictCrossVenueMonitor:
             "trigger_minimum_profit", opportunity.get("minimum_profit")
         )
         notification_identity = cross_venue_notification_dedupe_identity(opportunity)
+        if (
+            previous
+            and notification_identity is not None
+            and previous.get("market_type") == "cross_venue_yes_no"
+            and previous.get("notification_dedupe_identity") != notification_identity
+        ):
+            store.close_signal(
+                opportunity_id,
+                ended_at=now,
+                reason="notification_identity_rotated",
+            )
+            previous = {}
         same_notification_identity = (
             notification_identity is not None
             and notification_identity == previous.get("notification_dedupe_identity")
