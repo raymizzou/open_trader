@@ -2703,7 +2703,11 @@ def test_rejected_or_unavailable_threshold_positive_relation_remains_visible(
 
 def test_subcent_threshold_profit_is_visible_and_annualized_distribution_is_reported(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import open_trader.prediction_arbitrage_store as store_module
+
+    monkeypatch.setattr(store_module, "_utc_now", lambda: NOW)
     precise = threshold_event()
     for raw_market in precise.markets:
         raw_market.trading.minimum_tick_size = Decimal("0.00005")
