@@ -327,11 +327,11 @@ Record, without secrets:
 
 This is pre-change evidence, not a completion claim.
 
-- [ ] **Step 3: Preflight on temporary ports**
+- [ ] **Step 3: Preflight the baseline API contract without claiming a healthy publication**
 
-Run all Account tests from the detached checkout, then start a production-mode Account API with `create_account_api(Path("/Users/ray/projects/open_trader/data"), host="127.0.0.1", port=0, mode="production")` in a short Python probe. Prove health mode, normal `200`, ETag, conditional `304`, and parity against `/Users/ray/projects/open_trader/data`. Stop the probe before touching launchd.
+Run all Account tests from the detached checkout, then start a production-mode Account API with `create_account_api(Path("/Users/ray/projects/open_trader/data"), host="127.0.0.1", port=0, mode="production")` in a short Python probe. Prove the selected health mode, the marker-free direct path, and the fail-closed `503 account_release_mismatch` response caused by the current Worker's different SHA. Do not require normal `200`, ETag, `304`, or parity until the baseline Worker has published its matching heartbeat. Stop the probe before touching launchd.
 
-Expected: no request is routed through live Gateway and no runtime publication is changed.
+Expected: no request is routed through live Gateway, no runtime publication is changed, and the temporary mismatch remains explicit rather than being hidden by a fallback.
 
 - [ ] **Step 4: Install the baseline Worker safely**
 
