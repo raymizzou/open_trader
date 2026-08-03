@@ -6612,20 +6612,23 @@ console.log(JSON.stringify(rows.map((row) => ({
 def test_dashboard_account_owner_keeps_snapshot_after_legacy_failure() -> None:
     output = run_dashboard_js(r'''
 const mount=()=>({textContent:"",style:{}});
-for(const id of ["current-view-value","current-view-holding-value","current-view-holding-weight","current-view-cash-note","current-view-label"]) elements[id]=mount();
-state.dashboard={summary:{portfolio_value_hkd:"999"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"999"}],holdings:[{instrument_id:"ins-qqq",strategy:"趋势"}]};
+for(const id of ["current-view-value","current-view-holding-value","current-view-holding-weight","current-view-cash-note","current-view-label","connection-status","connection-success","connection-poll","connection-task"]) elements[id]=mount();
+state.dashboard={summary:{portfolio_value_hkd:"999"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"999"}],source_statuses:[{broker:"tiger",status:"failed",display_text:"泄漏"}],holdings:[{instrument_id:"ins-qqq",strategy:"趋势"}]};
 state.accountSnapshot={status:"healthy",stale:false,
   summary:{portfolio_value_hkd:"222",holding_value_hkd:"200",holding_weight_hkd:"90%",cash_like_value_hkd:"22",holding_count:"2"},
   broker_summaries:[{broker:"tiger",account_alias:"snapshot-alias",portfolio_value_hkd:"222",holding_count:"2"}],
   positions:[{broker:"tiger",account_alias:"snapshot-alias",market:"US",asset_class:"stock",symbol:"QQQ",quantity:"2",position_id:"pos-qqq",instrument_id:"ins-qqq"}],
   cash_balances:[{broker:"tiger",account_alias:"snapshot-alias",currency:"USD",cash_balance:"22"}],
-  sources:{account:{brokers:{tiger:{status:"ok",display:"快照正常"}}}},
+  generated_at:"2026-08-04T10:00:00+08:00", quote_as_of:"2026-08-04T09:59:00+08:00",
+  sources:{account:{brokers:{tiger:{status:"ok",display:"快照正常"}}},quotes:{status:"healthy",as_of:"dashboard-quote-must-not-win"}},
 };
 renderHeaderSummary();
-const current={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),row:accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0],cash:getCashRows()[0].account_alias};
-state.dashboard=null;state.dashboardError=new Error("legacy offline");
+renderConnectionPanel();
+const current={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),sources:renderSourceStatusList(),connection:[elements["connection-status"].textContent,elements["connection-success"].textContent,elements["connection-poll"].textContent],row:accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0],cash:getCashRows()[0].account_alias};
+state.dashboard=null;state.dashboardError=new Error("legacy offline");state.accountError=new Error("account 503");
 renderHeaderSummary();
-const failed={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),row:accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0],cash:getCashRows()[0].account_alias};
+renderConnectionPanel();
+const failed={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),sources:renderSourceStatusList(),connection:[elements["connection-status"].textContent,elements["connection-success"].textContent,elements["connection-poll"].textContent],row:accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0],cash:getCashRows()[0].account_alias};
 console.log(JSON.stringify({current,failed}));
 ''')
 
@@ -6634,9 +6637,13 @@ console.log(JSON.stringify({current,failed}));
         assert rendered[phase]["header"] == "HKD 222"
         assert "HKD 222" in rendered[phase]["cards"]
         assert "HKD 999" not in rendered[phase]["cards"]
+        assert "泄漏" not in rendered[phase]["sources"]
         assert rendered[phase]["row"]["key"] == "pos-qqq"
         assert rendered[phase]["row"]["display"]["quantity"] == "2"
         assert rendered[phase]["cash"] == "snapshot-alias"
+        assert rendered[phase]["connection"][1] == "2026-08-04T09:59:00+08:00"
+    assert rendered["current"]["connection"] == ["账户与行情正常", "2026-08-04T09:59:00+08:00", "账户快照请求正常 · 行情正常"]
+    assert rendered["failed"]["connection"] == ["账户或行情不可用", "2026-08-04T09:59:00+08:00", "账户快照请求失败 · 行情正常"]
 
 
 def test_dashboard_module_isolation_keeps_account_guard_on_account_actions_only() -> None:
@@ -6651,6 +6658,25 @@ def test_dashboard_module_isolation_keeps_account_guard_on_account_actions_only(
         "function accountActionsEnabled() {",
         "if (!accountActionsEnabled()) return \"账户快照已过期，操作已禁用\";",
     ]
+
+
+def test_dashboard_account_owner_initial_failure_keeps_legacy_trend_controls() -> None:
+    output = run_dashboard_js(r'''
+const mount=()=>({innerHTML:"",textContent:"",classList:{add(){},remove(){}},setAttribute(){},removeAttribute(){},querySelector(){return null;}});
+for(const id of ["account-holdings","visible-count","workspace-grid","symbol-detail-panel","account-tabs"]) elements[id]=mount();
+state.brokerFilter="tiger";
+state.accountSnapshot=null;
+state.accountError=new Error("account 503");
+state.dashboard={trend_reports:{tiger:{available:true,report_date:"2026-08-04"}},trend_reviews:{tiger:{available:true,market_label:"美股"}}};
+renderAccountHoldings();
+console.log(JSON.stringify({
+  report:elements["account-holdings"].innerHTML.includes('data-account-view="report"'),
+  review:elements["account-holdings"].innerHTML.includes('data-account-view="simulate"'),
+  unavailable:elements["account-holdings"].innerHTML.includes("账户快照不可用"),
+}));
+''')
+
+    assert json.loads(output) == {"report": True, "review": True, "unavailable": True}
 
 
 def test_dashboard_statement_upload_requires_current_healthy_account_snapshot() -> None:

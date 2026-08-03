@@ -5262,7 +5262,11 @@ function renderAccountHoldings() {
   if (!state.accountSnapshot) {
     setAccountHoldingsFallbackLabel("账户持仓不可用");
     elements["visible-count"].textContent = "0 条";
-    container.innerHTML = `<div class="empty-state">${escapeHtml(accountSnapshotStatusText())}</div>`;
+    const groups = accountHoldingGroups();
+    const active = groups.find((group) => group.broker === state.brokerFilter) || groups[0];
+    container.innerHTML = active
+      ? renderAccountSection({...active, rows: []})
+      : `<div class="empty-state">${escapeHtml(accountSnapshotStatusText())}</div>`;
     return;
   }
   const groups = accountHoldingGroups();
@@ -5352,10 +5356,14 @@ function renderAccountSection(group) {
 function renderAccountSyncAlert(broker) {
   const sync = brokerSyncStatus(broker);
   if (!sync.unsafe) return "";
-  const title = sync.status === "failed" ? `${brokerDisplayName(broker)}账户同步失败。`
+  const title = !state.accountSnapshot ? "账户快照不可用。"
+    : sync.status === "failed" ? `${brokerDisplayName(broker)}账户同步失败。`
     : sync.status === "stale" ? `${brokerDisplayName(broker)}账户数据已过期。`
     : `${brokerDisplayName(broker)}账户同步状态未知。`;
-  return `<div class="account-sync-alert ${escapeHtml(sourceStatusClass(sync.status))}" role="status"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(sync.display)}。以下为已接受数据；新做T提醒及依赖当前持仓的动作已暂停。</span></div>`;
+  const detail = !state.accountSnapshot
+    ? "账户数据尚未确认；新做T提醒及依赖当前持仓的动作已暂停。"
+    : `${sync.display}。以下为已接受数据；新做T提醒及依赖当前持仓的动作已暂停。`;
+  return `<div class="account-sync-alert ${escapeHtml(sourceStatusClass(sync.status))}" role="status"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></div>`;
 }
 
 function renderAccountViewPanel(group) {
@@ -8823,14 +8831,21 @@ function renderActionCard(action) {
 
 function renderConnectionPanel() {
   const snapshot = state.accountSnapshot || {};
+  const quoteSource = snapshot.sources?.quotes || {};
+  const quoteStatus = String(quoteSource.status || "unknown").trim().toLowerCase();
+  const quoteHealthy = ["healthy", "ok", "fresh"].includes(quoteStatus);
+  const quoteAsOf = firstPresent(snapshot.quote_as_of, quoteSource.as_of, "-");
+  const transport = state.accountError ? "账户快照请求失败" : "账户快照请求正常";
+  const quoteLabel = quoteHealthy ? "行情正常" : quoteStatus === "stale" ? "行情已过期" : "行情不可用";
   setElementText(
     "connection-status",
-    snapshot.status === "healthy" && !state.accountError ? "账户正常" : "账户不可用",
+    snapshot.status === "healthy" && !state.accountError && quoteHealthy ? "账户与行情正常" : "账户或行情不可用",
   );
-  setElementText("connection-success", snapshot.generated_at || "-");
+  setElementText("connection-success", quoteAsOf);
+  setElementText("connection-poll", `${transport} · ${quoteLabel}`);
   setElementText(
     "connection-task",
-    accountSnapshotStatusText(),
+    `${accountSnapshotStatusText()} · 最近接受快照 ${formatPlain(snapshot.generated_at || "-")}`,
   );
 }
 
@@ -9020,24 +9035,6 @@ function renderSourceStatusList() {
       `;
     }).join("")}
   `).join("");
-}
-
-function sourceStatuses() {
-  return (state.dashboard && Array.isArray(state.dashboard.source_statuses))
-    ? state.dashboard.source_statuses
-    : [];
-}
-
-function sourceStatusLabel(row) {
-  return brokerDisplayName(row);
-}
-
-function sourceStatusValue(row) {
-  return sourceDisplayText(row);
-}
-
-function sourceDisplayText(row) {
-  return firstPresent(row.display_text, row.value, sourceKindText(row.status));
 }
 
 function sourceStatusClass(status) {
