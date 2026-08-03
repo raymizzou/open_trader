@@ -13,6 +13,7 @@ from open_trader.trend_api_stats import (
     FutuSimulateFillClient,
     TigerActualFillClient,
     _attribute_actual_fills,
+    _futu_order_attributions,
     _merge_synced_fills,
     _tiger_order_fee,
     _tiger_transaction_record,
@@ -21,7 +22,8 @@ from open_trader.trend_api_stats import (
     sync_trend_api_stats,
     write_trend_api_stats,
 )
-from open_trader.trend_review import _report_hash
+from open_trader.trend_review import _report_hash, _write_action_event
+from open_trader.trend_kelly import load_trend_kelly_rounds
 
 
 class FakeDataFrame:
@@ -120,6 +122,104 @@ def test_futu_simulate_adapter_deduplicates_orders_and_fills_without_trusting_ze
     assert result["account_id"] == "101"
     assert result["source_id"] == "simulation:futu:101"
     assert [name for name, _ in context.calls] == ["active_orders", "orders"]
+
+
+def test_rotation_action_events_flow_through_futu_attribution_and_kelly_rounds(
+    tmp_path: Path,
+) -> None:
+    class RotationContext(FakeFutuContext):
+        def history_order_list_query(self, **kwargs: object) -> tuple[int, FakeDataFrame]:
+            self.calls.append(("orders", dict(kwargs)))
+            return 0, FakeDataFrame([
+                {
+                    "order_id": "SIM-BUY", "code": "SH.WEAK", "trd_side": "BUY",
+                    "currency": "CNY", "create_time": "2026-07-19 10:00:00",
+                    "updated_time": "2026-07-19 10:01:00", "dealt_qty": "100",
+                    "dealt_avg_price": "10",
+                },
+                {
+                    "order_id": "SIM-SELL", "code": "SH.WEAK", "trd_side": "SELL",
+                    "currency": "CNY", "create_time": "2026-07-20 10:00:00",
+                    "updated_time": "2026-07-20 10:01:00", "dealt_qty": "100",
+                    "dealt_avg_price": "12",
+                },
+            ])
+
+    data_dir = tmp_path / "data"
+    report_v10_sha = "a" * 64
+    report_v11_sha = "b" * 64
+    strategy_id = "trend_animals_warm_to_hot/CN/v10"
+    strategy_v11_id = "trend_animals_warm_to_hot/CN/v11"
+    common = {
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+    }
+    _write_action_event(
+        data_dir=data_dir,
+        market="CN",
+        execution_date="2026-07-19",
+        action_key="rotation-opening",
+        payload={
+            "market": "CN", "date": "2026-07-19", "strategy_id": strategy_id,
+            "strategy_version": "v10", "report_sha256": report_v10_sha,
+            "symbol": "WEAK", "futu_code": "SH.WEAK", "side": "buy",
+            "status": "filled", "order_ids": ["SIM-BUY"],
+        },
+        recorded_at="2026-07-19T10:01:00+08:00",
+    )
+    _write_action_event(
+        data_dir=data_dir,
+        market="CN",
+        execution_date="2026-07-20",
+        action_key="rotation-closing",
+        payload={
+            "market": "CN", "date": "2026-07-20", "strategy_id": strategy_v11_id,
+            "strategy_version": "v11", "report_sha256": report_v11_sha,
+            "symbol": "WEAK", "futu_code": "SH.WEAK", "side": "sell",
+            "status": "filled", "order_ids": ["SIM-SELL"],
+        },
+        recorded_at="2026-07-20T10:01:00+08:00",
+    )
+    facts = [
+        {
+            "report_sha256": report_v10_sha, "strategy_id": strategy_id,
+            "strategy_version": "v10", **common,
+        },
+        {
+            "report_sha256": report_v11_sha, "strategy_id": strategy_v11_id,
+            "strategy_version": "v11", **common,
+        },
+    ]
+    from open_trader.trend_api_stats import _futu_order_attributions
+
+    attributions = _futu_order_attributions(data_dir, facts)
+    assert attributions["CN"]["SIM-BUY"]["strategy_version"] == "v10"
+    assert attributions["CN"]["SIM-SELL"]["strategy_version"] == "v11"
+
+    context = RotationContext()
+    client = FutuSimulateFillClient(
+        host="127.0.0.1", port=11111, simulate_acc_id=101, trd_market="CN",
+        context_factory=lambda **_: context, connectivity_checker=lambda *_: True,
+    )
+    fills = client.fetch_fills(
+        start="2026-07-19", end="2026-07-20",
+        attributions_by_order=attributions["CN"],
+    )["fills"]
+    payload = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[
+            {"market": "CN", "strategy_id": strategy_id, "strategy_version": "v10"},
+            {"market": "CN", "strategy_id": strategy_v11_id, "strategy_version": "v11"},
+        ],
+        generated_at="2026-07-21T00:00:00+00:00",
+        statistics_cutoff_at="2026-07-21T00:00:00+00:00",
+    )
+    write_trend_api_stats(data_dir, payload)
+
+    rounds = load_trend_kelly_rounds(data_dir)
+    assert len(rounds) == 1
+    assert rounds[0].opening_strategy_version == "v10"
+    assert rounds[0].kelly_eligible is True
 
 
 def test_futu_cn_order_aggregate_accepts_exchange_prefixed_symbol() -> None:

@@ -1207,6 +1207,9 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
     report = relative_rotation_report(real_pairs=[{
         **relative_rotation_pair(), "execution_mode": "manual",
     }])
+    report["strategy_judgments"]["simulate_rotation_pairs"][0][
+        "opening_strategy_version"
+    ] = "v10"
 
     for minute, price in ((30, "5"), (31, "10")):
         result = trend_review.execute_relative_rotations(
@@ -1229,8 +1232,12 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
     ))
     sell = json.loads(sell_fact.read_text(encoding="utf-8"))
     assert (sell["exit_reason"], sell["opening_strategy_version"], sell["closing_strategy_version"]) == (
-        "relative_rotation", "v11", "v11",
+        "relative_rotation", "v10", "v11",
     )
+    buy_fact = next(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/buy-filled.json"
+    ))
+    assert json.loads(buy_fact.read_text(encoding="utf-8"))["opening_strategy_version"] == "v11"
 
 
 @pytest.mark.parametrize(
