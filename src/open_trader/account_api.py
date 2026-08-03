@@ -48,6 +48,12 @@ _CASH_FIELDS = (
     "cash_balance_hkd", "available_balance_hkd", "statement_id", "confidence", "notes",
 )
 _SOURCE_BROKER_FIELDS = ("source_kind", "data_as_of", "last_success_at")
+_SOURCE_ACCOUNT_FIELDS = frozenset({"status", "as_of", "reason", "brokers"})
+_SOURCE_QUOTES_FIELDS = frozenset({"status", "as_of", "reason"})
+_SOURCE_BROKER_KEY_FIELDS = frozenset((*_SOURCE_BROKER_FIELDS, "status", "reason"))
+_SOURCES_FIELDS = frozenset({"account", "quotes"})
+_UNAVAILABLE_FIELDS = frozenset({"schema_version", "status", "release", "errors"})
+_ERROR_FIELDS = frozenset({"code", "source", "message", "retryable"})
 _SNAPSHOT_FIELDS = frozenset({
     "schema_version", "snapshot_generation", "account_generation", "generated_at",
     "quote_as_of", "status", "stale", "sources", "release", "summary",
@@ -211,7 +217,10 @@ def check_account_api_parity(
             return ParityResult("FAIL", "raw_publication_invalid", "", "")
         account_generation = expected["account_generation"]
         quote_as_of = expected["quote_as_of"]
-        if status == HTTPStatus.SERVICE_UNAVAILABLE and _is_api_unstable(payload):
+        worker_git_sha = load_worker_git_sha(data_dir)
+        if status == HTTPStatus.SERVICE_UNAVAILABLE and _is_api_unstable(
+            payload, worker_git_sha
+        ):
             return ParityResult(
                 "BLOCKED", "account_publication_unstable", account_generation, quote_as_of
             )
@@ -221,7 +230,7 @@ def check_account_api_parity(
             payload,
             etag,
             expected,
-            worker_git_sha=load_worker_git_sha(data_dir),
+            worker_git_sha=worker_git_sha,
         )
         return ParityResult(
             "PASS" if reason is None else "FAIL",
@@ -541,7 +550,11 @@ def _compare_parity_payload(
 
 
 def _compare_sources(observed: object, expected: object) -> bool:
-    if not isinstance(observed, Mapping) or not isinstance(expected, Mapping):
+    if (
+        not isinstance(observed, Mapping)
+        or not isinstance(expected, Mapping)
+        or set(observed) != _SOURCES_FIELDS
+    ):
         return False
     observed_account = observed.get("account")
     expected_account = expected.get("account")
@@ -552,6 +565,8 @@ def _compare_sources(observed: object, expected: object) -> bool:
         or not isinstance(expected_account, Mapping)
         or not isinstance(observed_quotes, Mapping)
         or not isinstance(expected_quotes, Mapping)
+        or set(observed_account) != _SOURCE_ACCOUNT_FIELDS
+        or set(observed_quotes) != _SOURCE_QUOTES_FIELDS
     ):
         return False
     for field in ("status", "as_of", "reason"):
@@ -569,7 +584,11 @@ def _compare_sources(observed: object, expected: object) -> bool:
         return False
     for broker, expected_source in expected_brokers.items():
         observed_source = observed_brokers.get(broker)
-        if not isinstance(observed_source, Mapping) or not isinstance(expected_source, Mapping):
+        if (
+            not isinstance(observed_source, Mapping)
+            or not isinstance(expected_source, Mapping)
+            or set(observed_source) != _SOURCE_BROKER_KEY_FIELDS
+        ):
             return False
         for field in (*_SOURCE_BROKER_FIELDS, "status", "reason"):
             if observed_source.get(field) != expected_source.get(field):
@@ -577,13 +596,31 @@ def _compare_sources(observed: object, expected: object) -> bool:
     return True
 
 
-def _is_api_unstable(payload: object) -> bool:
+def _is_api_unstable(payload: object, worker_git_sha: str) -> bool:
+    if not isinstance(payload, Mapping) or set(payload) != _UNAVAILABLE_FIELDS:
+        return False
+    release = payload.get("release")
+    errors = payload.get("errors")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("status") != "unavailable"
+        or not isinstance(release, Mapping)
+        or set(release) != {"api_git_sha", "worker_git_sha"}
+        or not _GIT_SHA_RE.fullmatch(str(release.get("api_git_sha", "")))
+        or release.get("worker_git_sha") != release.get("api_git_sha")
+        or release.get("worker_git_sha") != worker_git_sha
+        or not isinstance(errors, list)
+        or len(errors) != 1
+        or not isinstance(errors[0], Mapping)
+        or set(errors[0]) != _ERROR_FIELDS
+    ):
+        return False
+    error = errors[0]
     return (
-        isinstance(payload, Mapping)
-        and isinstance(payload.get("errors"), list)
-        and bool(payload["errors"])
-        and isinstance(payload["errors"][0], Mapping)
-        and payload["errors"][0].get("code") == "account_publication_unstable"
+        error.get("code") == "account_publication_unstable"
+        and error.get("source") == "account"
+        and error.get("message") == "Account publication is unstable"
+        and error.get("retryable") is True
     )
 
 

@@ -401,6 +401,24 @@ def _make_live_sources_fresh(data_dir: Path) -> None:
             "sources_mismatch",
         ),
         (
+            lambda payload: payload["sources"]["account"].update({"forged": True}),
+            "sources_mismatch",
+        ),
+        (
+            lambda payload: payload["sources"].update({"forged": True}),
+            "sources_mismatch",
+        ),
+        (
+            lambda payload: payload["sources"]["quotes"].pop("reason"),
+            "sources_mismatch",
+        ),
+        (
+            lambda payload: payload["sources"]["account"]["brokers"]["futu"].update(
+                {"forged": True}
+            ),
+            "sources_mismatch",
+        ),
+        (
             lambda payload: payload.update(
                 {
                     "errors": [{
@@ -465,6 +483,72 @@ def test_live_parity_fails_closed_on_malformed_success_json(
 
     assert result.status == "FAIL"
     assert result.reason == "api_payload_invalid"
+
+
+def test_live_parity_blocks_on_complete_unstable_503(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    payload = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "release": {"api_git_sha": SHA, "worker_git_sha": SHA},
+        "errors": [{
+            "code": "account_publication_unstable",
+            "source": "account",
+            "message": "Account publication is unstable",
+            "retryable": True,
+        }],
+    }
+    monkeypatch.setattr(
+        account_api, "_fetch_snapshot", lambda _url: (503, payload, None), raising=False
+    )
+
+    result = account_api.check_account_api_parity(data_dir)
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "account_publication_unstable"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"errors": [{"code": "account_publication_unstable"}]},
+        {
+            "schema_version": 1,
+            "status": "unavailable",
+            "release": {"api_git_sha": SHA, "worker_git_sha": SHA},
+            "errors": [{"code": "account_publication_unstable"}],
+        },
+        {
+            "schema_version": 1,
+            "status": "unavailable",
+            "release": {"api_git_sha": SHA, "worker_git_sha": SHA},
+            "errors": [{
+                "code": "account_publication_unstable",
+                "source": "quotes",
+                "message": "wrong",
+                "retryable": True,
+            }],
+        },
+    ],
+)
+def test_live_parity_fails_on_malformed_unstable_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    monkeypatch.setattr(
+        account_api, "_fetch_snapshot", lambda _url: (503, payload, None), raising=False
+    )
+
+    result = account_api.check_account_api_parity(data_dir)
+
+    assert result.status == "FAIL"
+    assert result.reason == "http_status_503"
 
 
 def test_live_parity_blocks_when_raw_publication_never_pins(
