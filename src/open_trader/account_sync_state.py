@@ -1042,6 +1042,14 @@ def _is_valid_state(value: object) -> bool:
     )
 
 
+def is_valid_account_publication(value: object) -> bool:
+    return (
+        _is_valid_state(value)
+        and isinstance(value, dict)
+        and _is_valid_dashboard_projection(value.get("dashboard_projection"))
+    )
+
+
 def _is_valid_source(value: object, broker: str) -> bool:
     if not isinstance(value, dict):
         return False
