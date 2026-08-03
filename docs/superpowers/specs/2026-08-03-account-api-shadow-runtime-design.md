@@ -1,7 +1,7 @@
 # Account API Shadow Runtime Design
 
 **Issue:** #20
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved
 **Date:** 2026-08-03
 
 ## Context
