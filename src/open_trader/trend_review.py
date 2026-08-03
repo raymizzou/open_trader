@@ -6462,12 +6462,12 @@ def _merge_rotation_orders(
             ).strip().upper()
             if existing_side != rotation_side or existing_code != rotation_code:
                 raise ValueError("conflicting rotation fill order identity")
-            for field in ("remark", "order_status", "status"):
+            for field in ("remark",):
                 existing_value = str(existing.get(field) or "").strip()
                 rotation_value = str(order.get(field) or "").strip()
                 if existing_value and rotation_value and existing_value != rotation_value:
                     raise ValueError("conflicting rotation fill order identity")
-            for field in ("dealt_qty", "dealt_avg_price", "avg_price", "price"):
+            for field in ("dealt_qty", "dealt_avg_price", "avg_price"):
                 existing_value = existing.get(field)
                 rotation_value = order.get(field)
                 if existing_value in (None, "") or rotation_value in (None, ""):
