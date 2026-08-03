@@ -10,6 +10,8 @@
 
 **Approved spec:** `docs/superpowers/specs/2026-08-03-predict-cross-venue-yes-no-execution-design.md`
 
+**Implementation baseline (2026-08-04):** Tasks 1–10 document the implementation already present on this branch. Do not replay them. The final approved confirmation, exact-allowance, signer-gas, stale-funnel, and canary amendments start at Task 11 and supersede any conflicting wording in Tasks 1–10.
+
 **Official Predict contracts used by this plan:**
 
 - `GET /v1/auth/message`, then `POST /v1/auth` with `signer`, `signature`, and the dynamic `message`.
@@ -30,6 +32,10 @@
 - A timeout is ambiguous until account/order reconciliation proves otherwise. Never blind retry a mutation.
 - Keep API key and Privy private key in Keychain only. Never persist or log JWTs, signatures, signed orders, raw auth messages, or secrets.
 - Acceptance uses deterministic submit doubles and a deterministic notifier. It submits no order and sends no real Feishu message.
+- A zero Predict USDT allowance is the healthy resting state. Never use the SDK's persistent `fully approved` Boolean as cross-venue readiness.
+- The Predict Account owns USDT, positions, and allowance; the Privy signer EOA only pays BNB gas. Display and validate them separately, and never transfer funds automatically.
+- A cross-venue confirmation has no TTL. It is single-use and bound to one signal episode, fixed quantity, price/cost ceilings, minimum profit/yield, Codex approval, and both venue fingerprints; current dual-REST checks are the only submission evidence.
+- The first genuine cross-venue fill remains in canary mode at a combined maximum cost of 5 USDT until both legs, balances, fees, positions, and zero remaining Predict allowance reconcile conclusively.
 - Run `make acceptance` only once, after all focused tests and direct no-submit checks pass.
 - The first real cross-venue canary is a separate post-acceptance operator action and requires a new explicit confirmation.
 
@@ -1022,6 +1028,531 @@ For the later explicitly approved canary, select a currently actionable pair usi
 
 ---
 
+### Task 11: Replace persistent approval readiness with exact Predict account facts
+
+**Files:**
+
+- Modify: `src/open_trader/predict_trading.py`
+- Test: `tests/test_predict_trading.py`
+
+**Interfaces:**
+
+- Keep `PredictTradingClient`; do not add another wallet or chain client.
+- `from_keychain()` derives the public signer address from the same private key passed to `OrderBuilder.make(...)`, retains only the public address, and still passes `predict_account=<configured deposit address>`.
+- `approval_facts(market_id, exact_debit_wei=0)` returns server-read Predict Account USDT, raw owner/spender allowance, one market-derived BUY approval step, signer BNB, required approval-plus-cleanup gas, and minimum manual top-up.
+- `set_exact_buy_allowance(market_id, exact_debit_wei)` and `clear_buy_allowance(market_id)` call the pinned SDK's existing `set_approval` and prove the post-transaction raw allowance.
+- `account_snapshot()` uses those facts and removes `allowance_ready`; zero allowance is healthy, while a residual allowance with no active execution is a distinct breaker fact.
+
+- [ ] **Step 1: Write failing tests for identity, raw allowance, and gas ownership**
+
+Use the existing fake builder and add only the SDK surface actually consumed: `contracts.usdt.functions.allowance(owner, spender).call()`, `get_approval_steps(...)`, native signer balance, and gas estimate. Assert:
+
+```python
+facts = client.approval_facts("896", exact_debit_wei=2_400_000)
+assert facts["predict_account"] == PREDICT_ACCOUNT
+assert facts["gas_signer"] == PRIVY_SIGNER
+assert facts["allowance"] == "0"
+assert facts["approval_scope"] == {
+    "operation": "TRADE",
+    "side": "BUY",
+    "is_neg_risk": False,
+    "is_yield_bearing": False,
+}
+assert facts["scope_ready"] is True
+assert facts["bnb_balance"] == "0.004"
+assert facts["required_bnb"] == "0.003"
+assert facts["minimum_top_up_bnb"] == "0"
+```
+
+Add failures for a missing/multiple/non-ERC20 approval step, a step whose spender/token does not match the SDK contract, negative or malformed balances, non-standard V1 market flags, and insufficient signer BNB. Prove no test invokes a transfer method.
+
+- [ ] **Step 2: Write failing exact-set and clear tests**
+
+Assert `set_exact_buy_allowance("896", 2_400_000)` calls:
+
+```python
+builder.set_approval(step, approved=True, amount=2_400_000)
+```
+
+and succeeds only when the receipt succeeds and a fresh raw read equals `2_400_000`. Assert `clear_buy_allowance("896")` calls `builder.set_approval(step, approved=False)`, succeeds only after a fresh raw read returns zero, and never calls an order or USDT transfer endpoint. A failed/ambiguous receipt or mismatched post-read returns a redacted failure mapping.
+
+- [ ] **Step 3: Run the focused tests and verify they fail**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_trading.py -k 'approval or account_snapshot or signer or gas' -q
+```
+
+Expected: failures identify the current `check_approvals(...).satisfied` readiness and missing exact-allowance/gas methods.
+
+- [ ] **Step 4: Implement the smallest adapter change**
+
+Reuse `ApprovalScope("TRADE", market.isNegRisk, market.isYieldBearing, Side.BUY)` and require exactly one `ERC20_ALLOWANCE` step. Read allowance against the configured Predict Account and that step's spender. Use the pinned SDK transaction estimate plus its 125% gas margin for one set and one cleanup transaction; convert wei to `Decimal` BNB and compute `max(required - current, 0)`. Keep SDK-private compatibility access isolated in this adapter and fail closed if the pinned surface is missing.
+
+Return only public addresses, numeric facts, step ID/spender, status, receipt hash/status, and timestamps. Never return a private key, JWT, signature, raw auth message, calldata, or signed transaction.
+
+- [ ] **Step 5: Run the focused tests and commit**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_trading.py -q
+git add src/open_trader/predict_trading.py tests/test_predict_trading.py
+git commit -m "feat: enforce exact Predict allowance facts"
+```
+
+Expected: all Predict adapter tests PASS; zero allowance is ready and all mutation tests prove exact call counts.
+
+---
+
+### Task 12: Bind confirmation to a durable signal episode without a TTL
+
+**Files:**
+
+- Modify: `src/open_trader/predict_cross_venue.py`
+- Modify: `src/open_trader/prediction_arbitrage_store.py`
+- Modify: `src/open_trader/prediction_arbitrage_execution.py`
+- Test: `tests/test_predict_cross_venue.py`
+- Test: `tests/test_prediction_arbitrage_store.py`
+- Test: `tests/test_prediction_arbitrage_execution.py`
+
+**Interfaces:**
+
+- `PredictCrossVenueMonitor` retains the durable open `signal_id` returned by `upsert_signal()` and adds it to current/refreshed opportunity payloads as `signal_episode_id`.
+- Cross-venue previews remain single-use/idempotent but ignore the legacy ten-second expiry. Legacy previews keep the existing TTL unchanged.
+- The cross confirmation envelope freezes one signal episode, exact quantity, each leg's native identity/side/quantity/price ceiling/cost ceiling, total-cost ceiling, minimum payout/profit/yield, Codex cache key, canonical cutoff, and both rules fingerprints.
+- Cross refresh can rebuild the frozen quantity. For initial canary sizing it can request the smallest common executable quantity within 5 USDT; normal monitoring continues to use its existing largest-valid-within-20 behavior.
+
+- [ ] **Step 1: Write failing signal-episode tests**
+
+Assert a stage-5 observation receives one durable `signal_episode_id`; repeated updates in the same episode keep it, closing/reopening the same pair/direction produces a new ID, and `refresh_opportunity()` returns the active ID. Verify candidate ID and rule-fingerprint rotation closes the old episode before creating the next.
+
+- [ ] **Step 2: Write failing no-TTL store tests without weakening legacy behavior**
+
+Create one legacy preview and one cross preview with an already elapsed `expires_at`. Assert:
+
+```python
+with pytest.raises(ValueError, match="preview_expired"):
+    store.consume_preview_and_create_execution(legacy_id, "legacy")
+
+execution = store.consume_preview_and_create_execution(cross_id, "cross")
+assert execution["state"] == "validating"
+assert store.consume_preview_and_create_execution(cross_id, "cross-again") == execution
+```
+
+The cross payload must include a non-empty `signal_episode_id`; reject a malformed cross payload before reserving capital. Keep the existing `expires_at` database column for schema compatibility and ignore it only after decoding a valid cross payload.
+
+- [ ] **Step 3: Write failing full-envelope refresh tests**
+
+Confirm after 11 seconds and after an hour with the same open episode and better/current prices; both must proceed to final validation. Reject before approval when any of these changes:
+
+- signal episode ID
+- pair/direction, native market/condition/token ID, or outcome
+- frozen quantity
+- either price/cost ceiling or total maximum cost would be exceeded
+- minimum payout/profit or 15% annualized yield would be breached
+- Codex cache key, rules fingerprint, or canonical cutoff
+
+Prove an old confirmation cannot authorize a reopened episode, while a newly opened envelope can. Prove cross payloads expose no countdown or `expires_at`; legacy payloads still do.
+
+- [ ] **Step 4: Write failing canary sizing tests**
+
+Add optional execution-only sizing arguments to the existing intent builder/refresh path:
+
+```python
+refresh_opportunity(
+    opportunity_id,
+    target_quantity=None,
+    max_total_cost=Decimal("5"),
+    prefer_smallest=True,
+)
+```
+
+Assert the first preview chooses the smallest common executable quantity whose combined maximum cost is at most 5. Confirmation and post-approval refresh pass `target_quantity=<confirmed quantity>` so deeper books cannot silently increase quantity. If no exact current quantity fits the stored ceilings, reject; never resize upward or relax 15%/2/20/100.
+
+- [ ] **Step 5: Run the focused tests and verify they fail**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py \
+  -k 'signal_episode or cross_preview or no_ttl or canary_quantity or preview_matches' -q
+```
+
+- [ ] **Step 6: Implement the episode/envelope changes in existing owners**
+
+Keep one in-memory `opportunity_id -> signal_id` mapping in the monitor, repopulated by normal persistence after restart and removed when the opportunity closes. Extend the existing `_cross_preview_matches()` rather than creating another validator. Treat a better current price/cost as acceptable only when every frozen maximum/minimum and the exact quantity still pass.
+
+- [ ] **Step 7: Run the complete affected tests and commit**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py -q
+git add src/open_trader/predict_cross_venue.py \
+  src/open_trader/prediction_arbitrage_store.py \
+  src/open_trader/prediction_arbitrage_execution.py \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py
+git commit -m "feat: bind cross confirmations to signal episodes"
+```
+
+---
+
+### Task 13: Add exact approval, post-approval refresh, cleanup, and durable canary mode
+
+**Files:**
+
+- Modify: `src/open_trader/prediction_arbitrage_execution.py`
+- Modify: `src/open_trader/dashboard_web.py`
+- Test: `tests/test_prediction_arbitrage_execution.py`
+- Test: `tests/test_dashboard_web.py`
+
+**Interfaces:**
+
+- `_run_cross_venue_execution()` performs: pre-approval dual REST validation -> exact Predict allowance receipt -> post-approval dual REST validation of the frozen quantity -> concurrent two-leg FOK submit -> independent reconcile -> conclusive allowance reset to zero.
+- The existing execution evidence is the canary ledger. `canary_verified=true` is written only after equal two-leg positions, orders, balances, fees, and zero Predict allowance reconcile under the current compatibility fingerprint. No new table or runtime owner is added.
+- `cleanup_predict_allowance()` is an operator-confirmed, local Dashboard action. It moves no USDT and only submits `allowance -> 0` after a fresh owner/spender/allowance/gas read.
+- Startup detects residual allowance and opens the cross breaker; it never auto-cleans.
+
+- [ ] **Step 1: Write failing exact sequencing tests**
+
+Use call-order doubles and assert the successful path is exactly:
+
+```text
+refresh both -> set exact allowance -> verify exact allowance ->
+refresh both -> start Predict submit + Polymarket submit concurrently ->
+reconcile both -> clear allowance -> verify zero -> holding_to_resolution
+```
+
+Assert the approved amount equals only the current frozen Predict debit in base units. It must not be unlimited, rounded upward beyond venue units, copied from wallet balance, or reused from an older preview.
+
+- [ ] **Step 2: Write failing cancellation and cleanup tests**
+
+Cover these boundaries:
+
+- exact approval fails: zero venue submits; execution says `未下单`; no blind retry
+- approval succeeds but second refresh breaches any envelope bound: zero venue submits; allowance clears; execution says `未下单 · 授权已清零`
+- cleanup receipt/post-read fails: zero venue submits; cross breaker opens; one immediate incident notification is persisted
+- both submissions conclusively reject: clear and verify zero before closing/releasing reservation
+- both fills reconcile: clear and verify zero before `holding_to_resolution`
+- submission remains unknown: do not claim zero/closed; keep breaker open and continue reconciliation
+
+Every test asserts exact approval, cleanup, and venue submit call counts.
+
+- [ ] **Step 3: Write failing residual-allowance startup and operator-action tests**
+
+When no active execution exists and raw allowance is nonzero, `reconcile_startup()` must return `locked/residual_predict_allowance`, open one deduplicated incident, and make zero mutation calls. Add:
+
+```python
+result = service.cleanup_predict_allowance(confirm=True)
+assert result["state"] == "ready"
+assert result["before_allowance"] == "2.4"
+assert result["after_allowance"] == "0"
+assert result["usdt_moved"] is False
+```
+
+Reject `confirm=False`, an active execution, changed owner/spender/allowance, insufficient BNB, or an already-zero allowance without mutation. Add `POST /api/prediction-arbitrage/predict-allowance/cleanup` to the existing loopback/CSRF/schema gate with body `{"confirm": true}`; do not accept client-supplied owner, spender, or amount.
+
+- [ ] **Step 4: Write failing durable canary tests**
+
+Derive a public compatibility fingerprint from pinned Predict SDK version, Predict Account, gas signer, chain, and approval-step identity. Assert:
+
+- absent matching proof -> preview/execution cap is 5 and smallest common quantity
+- cancellation, both-rejected, one-leg incident, cleanup failure, or partial reconciliation -> cap remains 5
+- only full two-leg reconcile plus fees/balances and zero allowance records `canary_verified=true`
+- a later preview with the same fingerprint uses the permanent 20 cap
+- a changed signer/account/SDK/scope fingerprint re-enters 5-cap canary mode
+
+Do not add a canary button or automatically submit a trade; this only constrains a later separately confirmed real opportunity.
+
+- [ ] **Step 5: Run focused tests and verify they fail**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py \
+  -k 'exact_allowance or post_approval or residual_allowance or allowance_cleanup or cross_canary' -q
+```
+
+- [ ] **Step 6: Implement with one cleanup helper and existing evidence/history**
+
+Extend the existing cross execution branch; do not create a second state machine. Add one helper that clears and proves allowance zero, and call it only at conclusive boundaries or post-approval cancellation. Keep unknown-submit handling fail-closed. Use existing incident/notifier persistence for cleanup failures and existing execution evidence for the compatibility/canary marker.
+
+- [ ] **Step 7: Run complete execution/server tests and commit**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_trading.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py -q
+git add src/open_trader/prediction_arbitrage_execution.py \
+  src/open_trader/dashboard_web.py \
+  tests/test_prediction_arbitrage_execution.py tests/test_dashboard_web.py
+git commit -m "feat: guard cross execution with exact allowance"
+```
+
+---
+
+### Task 14: Publish truthful stale funnel, account, gas, link, and notification state
+
+**Files:**
+
+- Modify: `src/open_trader/predict_source.py`
+- Modify: `src/open_trader/predict_cross_venue.py`
+- Modify: `src/open_trader/prediction_arbitrage_execution.py`
+- Modify: `src/open_trader/dashboard_web.py`
+- Test: `tests/test_predict_source.py`
+- Test: `tests/test_predict_cross_venue.py`
+- Test: `tests/test_prediction_arbitrage_execution.py`
+- Test: `tests/test_dashboard_web.py`
+
+**Interfaces:**
+
+- Preserve the last successful funnel counts for stages 1–4 with `stale_at`; stale/degraded source state forces stage 5 to zero and removes all actions.
+- A completed, successful V1 scan with zero eligible markets is `ready` with zero counts, not a source/account failure.
+- The venue payload labels Predict Account and gas signer separately and publishes raw allowance, USDT, BNB, required BNB, minimum manual top-up, reservation/unsettled values, and canary mode.
+- Server-owned candidate legs include official read-only market URLs. Normalize the Predict market slug from its API and use `https://predict.fun/market/<slug>`; use the Polymarket event slug already supplied by Gamma and `https://polymarket.com/event/<slug>`. If an API omits a validated slug, omit that link rather than inventing one.
+- Reuse existing signal/incident notification persistence: stage-5 gas blockage sends one operational notification per signal episode; residual allowance or cleanup failure sends one incident notification per incident generation.
+
+- [ ] **Step 1: Write failing monitor stale/empty-state tests**
+
+After a healthy snapshot with nonzero stages 1–4, force Predict REST or WebSocket stale. Assert stages 1–4 retain their exact prior values and last-success timestamp, stage 5 is zero, opportunities have no `actionable=true`, and refresh returns no executable opportunity. Then run a complete successful zero-market scan and assert all five stages are zero with `status=ready`, `empty_state=complete_scan_no_v1_market`, and no blocker.
+
+- [ ] **Step 2: Write failing venue/account projection tests**
+
+Assert `_prediction_venues_payload()` produces separate public fields:
+
+```python
+predict = venues[1]
+assert predict["account"]["role"] == "Predict Account · USDT/持仓/Allowance"
+assert predict["gas"]["role"] == "Privy signer · BNB Gas"
+assert predict["account"]["allowance"] == "0"
+assert predict["gas"]["minimum_top_up"] == "0"
+assert predict["mode"] == "可以交易"
+```
+
+Zero allowance must remain `可以交易`; insufficient BNB becomes `只读`; nonzero allowance with no active execution becomes `熔断只读`. Available balance has no upper-limit rejection. Mask both addresses in Dashboard payloads while preserving full native IDs in candidate evidence.
+
+- [ ] **Step 3: Write failing URL and notification tests**
+
+Assert valid Predict/Polymarket slugs produce official HTTPS URLs and missing/unsafe slugs produce no link. Assert:
+
+- insufficient BNB with no blocked stage-5 episode sends no Feishu message
+- the same gas-blocked stage-5 episode sends one operational message despite repeated ticks
+- a new episode may send one new message
+- residual allowance and cleanup failure each persist/send one immediate incident message
+- acceptance notifier doubles observe the messages without a real delivery call
+
+- [ ] **Step 4: Run focused tests and verify they fail**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_source.py \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py \
+  -k 'stale_funnel or complete_empty_scan or predict_account_projection or official_market_url or gas_notification or allowance_incident' -q
+```
+
+- [ ] **Step 5: Implement by extending existing snapshots and notification leases**
+
+Keep one last-success funnel mapping/timestamp on `PredictCrossVenueMonitor`; do not persist another dashboard cache. Project account/gas facts through the existing venue payload. Route operational notifications through the current ready-signal lease and incidents through the current incident notifier; do not add a queue or polling job.
+
+- [ ] **Step 6: Run complete affected tests and commit**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_source.py \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py -q
+git add src/open_trader/predict_source.py \
+  src/open_trader/predict_cross_venue.py \
+  src/open_trader/prediction_arbitrage_execution.py \
+  src/open_trader/dashboard_web.py \
+  tests/test_predict_source.py tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_execution.py tests/test_dashboard_web.py
+git commit -m "feat: expose truthful Predict execution readiness"
+```
+
+---
+
+### Task 15: Merge the final approved states into the existing YES/NO UI
+
+**Files:**
+
+- Modify: `src/open_trader/dashboard_static/dashboard.js`
+- Modify: `src/open_trader/dashboard_static/dashboard.css`
+- Modify: `tests/e2e/serve_dashboard_fixture.py`
+- Modify: `tests/e2e/prediction-market.spec.ts`
+- Test: `tests/test_dashboard_web.py`
+
+**Interfaces:**
+
+- Reuse `predictionReadinessStrip`, `predictionCrossVenueFunnel`, `predictionCrossVenueCandidateHtml`, `predictionModalHtml`, and the existing modal/focus plumbing.
+- Keep the current Open Trader header, tabs, warm palette, spacing, and layout; do not create a replacement page.
+- Add only two new operator states: manual BNB top-up guidance (read-only) and residual-allowance cleanup confirmation.
+
+- [ ] **Step 1: Add deterministic fixture states**
+
+Add fixture variants for:
+
+- ready with zero allowance
+- insufficient signer BNB with no signal
+- signer BNB blocking a stage-5 signal
+- residual allowance / breaker
+- cleanup confirmation, success, and failure
+- stale venue retaining stages 1–4 while stage 5 is zero
+- healthy complete zero-market scan
+- active first-canary 5 cap and completed-canary normal 20 cap
+- post-approval invalidation shown as `未下单 · 授权已清零`
+- grouped confirmation history with expandable approval/orders/reconciliation receipts
+
+All mutation fixture responses remain local/deterministic.
+
+- [ ] **Step 2: Write failing desktop and mobile assertions**
+
+At 1440px and 375px assert:
+
+- shared header works on YES/NO and LLM tabs
+- Predict Account/USDT/allowance and Privy signer/BNB are visibly separate
+- zero allowance reads `可以交易`; low gas reads `只读`; residual allowance reads `熔断只读`
+- manual top-up shows signer address, current/required/minimum BNB and no transfer button
+- cleanup modal shows owner, spender, current -> zero, gas effect, and `不转移 USDT`
+- stages 1–4 stale counts/timestamp remain while stage 5/action buttons disappear
+- healthy empty scan is not rendered as a failure
+- candidate/modal show explicit venue, outcome, native IDs, official links, frozen quantity/ceilings/minimums, canary cap, data timestamps, Codex/cutoff, unsettled limits, and non-atomic warning
+- there is no countdown
+- one confirmation produces one history row with expandable lifecycle details
+- buttons remain at least 44px, Escape closes/restores focus, and mobile has no horizontal overflow
+
+- [ ] **Step 3: Run UI unit/Playwright checks and verify they fail**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_dashboard_web.py -k 'prediction' -q
+OPEN_TRADER_PYTHON="$PWD/.venv/bin/python" npm exec playwright test \
+  tests/e2e/prediction-market.spec.ts --project=chromium
+```
+
+- [ ] **Step 4: Implement the smallest DOM/CSS delta**
+
+Extend the existing render functions and POST handler. Cleanup posts only `{"confirm": true}` to the server endpoint after the second human click. The BNB guidance contains copyable text only; Open Trader never opens a wallet transaction or sends a transfer. Preserve all existing LLM hedge and legacy YES/NO rendering except the intentionally shared venue-health facts.
+
+- [ ] **Step 5: Run UI checks and commit**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_dashboard_web.py -k 'prediction' -q
+OPEN_TRADER_PYTHON="$PWD/.venv/bin/python" npm exec playwright test \
+  tests/e2e/prediction-market.spec.ts --project=chromium
+git add src/open_trader/dashboard_static/dashboard.js \
+  src/open_trader/dashboard_static/dashboard.css \
+  tests/e2e/serve_dashboard_fixture.py \
+  tests/e2e/prediction-market.spec.ts tests/test_dashboard_web.py
+git commit -m "feat: show Predict allowance and gas safeguards"
+```
+
+Expected: both viewport suites PASS without a redesigned page or a live mutation.
+
+---
+
+### Task 16: Make acceptance zero-mutation, allow a complete empty scan, then deploy the exact SHA
+
+**Files:**
+
+- Modify: `src/open_trader/prediction_arbitrage_acceptance.py`
+- Modify: `tests/test_prediction_arbitrage_acceptance.py`
+- Modify: `CHANGELOG.md`
+- Review only: `Makefile`
+- Review only: `scripts/install_dashboard_launchd.sh`
+
+**Interfaces:**
+
+- Live readiness proves mainnet identity, JWT, market/book when available, USDT, raw allowance, signer BNB, scoped approval construction, and signed no-submit order construction.
+- A complete successful scan with no V1 market returns ready with Predict signed-order construction `not_applicable`; an incomplete/failed scan remains FAIL/BLOCKED.
+- `make acceptance` permits zero approval transactions, zero orders, zero transfers, zero testnet canaries, and zero real notifications.
+
+- [ ] **Step 1: Write failing acceptance tests for zero-market and zero-mutation behavior**
+
+Replace the current empty-market exception contract. Assert a source that successfully returns `[]` yields:
+
+```python
+assert report.predict_market.status == "PASS"
+assert report.predict_preflight.status == "NOT_APPLICABLE"
+assert report.mutation_calls == 0
+assert report.live_notifications == 0
+```
+
+Treat `NOT_APPLICABLE` as neutral when computing the final report status, so the complete scan still returns `PASS`. Keep network/auth/incomplete scan failures distinct. Replace the SDK fully-approved check with `approval_facts`; zero raw allowance passes. Assert the acceptance transport fails immediately if approval, cleanup, order, transfer, redemption, or real notifier mutation is attempted.
+
+- [ ] **Step 2: Run acceptance tests and verify they fail**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_acceptance.py -q
+```
+
+- [ ] **Step 3: Implement the acceptance correction and run all focused regressions**
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_source.py \
+  tests/test_predict_cross_venue.py \
+  tests/test_predict_trading.py \
+  tests/test_polymarket_trading.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_notifications.py \
+  tests/test_dashboard_web.py \
+  tests/test_prediction_arbitrage_acceptance.py -q
+OPEN_TRADER_PYTHON="$PWD/.venv/bin/python" npm exec playwright test \
+  tests/e2e/prediction-market.spec.ts --project=chromium
+```
+
+Expected: PASS, with explicit zero mutation/delivery evidence. Run the direct mainnet readiness command in no-submit mode; a complete no-market scan is allowed, but unavailable required browser/network/Keychain state is still BLOCKED.
+
+- [ ] **Step 4: Update `CHANGELOG.md` before merge and commit**
+
+Add the dated operator-facing amendment: no-TTL/current-refresh confirmation, exact Predict allowance and cleanup, separate gas signer/manual top-up, 5-USDT first cross canary, stale/empty funnel truthfulness, grouped history, and zero-mutation acceptance.
+
+```bash
+git add src/open_trader/prediction_arbitrage_acceptance.py \
+  tests/test_prediction_arbitrage_acceptance.py CHANGELOG.md
+git commit -m "test: accept final Predict execution safeguards"
+```
+
+- [ ] **Step 5: Reconcile current `main`, deploy the candidate, and run the one final gate**
+
+Preserve unrelated dirty-root files. If `main` advanced, integrate it into this branch, rerun Step 3, and deploy the resulting candidate worktree. Record the exact candidate SHA, then run:
+
+```bash
+./scripts/install_dashboard_launchd.sh \
+  --mode stack \
+  --repo-root "$PWD" \
+  --runtime-root /Users/ray/projects/open_trader \
+  --python "$PWD/.venv/bin/python"
+make acceptance
+```
+
+Expected final result: exactly `PASS`, including zero mutation counts. On FAIL, fix and repeat the final gate only after focused checks; on BLOCKED, report the blocker and do not merge or present for review.
+
+- [ ] **Step 6: Fast-forward `main`, push, and redeploy the exact accepted SHA**
+
+Verify the accepted SHA did not change, fast-forward local `main`, push `origin/main`, then redeploy that exact SHA. Do not add a merge commit after acceptance. Verify new frontend-gateway and legacy-dashboard PIDs, cwd, SHA, fresh timestamps/logs, both `/healthz` responses, and HTTP 200 at `http://127.0.0.1:8766/`.
+
+- [ ] **Step 7: Capture requested feature-state screenshots and stop before a live order**
+
+Capture desktop/mobile proof of: shared venue header, healthy zero allowance, low-gas guidance, residual-allowance cleanup modal, stale funnel, healthy empty scan, actionable canary confirmation, and grouped execution history. Use deterministic states for rare conditions and label them as UI proof; use the live page for current readiness. Do not submit an approval or order.
+
+Report the accepted SHA, final test totals, acceptance `PASS`, zero mutation/notification counts, PIDs/cwd/log timestamps, review URL, and screenshot paths. The first genuine cross-venue canary remains a later, separately confirmed user action.
+
+---
+
 ## Acceptance Coverage Map
 
 | Spec criteria | Plan evidence |
@@ -1034,15 +1565,22 @@ For the later explicitly approved canary, select a currently actionable pair usi
 | CV-25–CV-27 | Task 9 API/Playwright desktop/mobile header, funnel, candidate, modal, focus, and overflow tests |
 | CV-28 | Task 8 stage-transition/dedupe/deterministic-notifier tests |
 | CV-29 | Tasks 6–10 full legacy pytest and Playwright regressions |
-| Final Dashboard gate | Task 10 `make acceptance`, exact-SHA redeploy, runtime proof, and requested screenshots |
-| First live canary | Separate explicit post-acceptance action; Task 10 stops before mutation |
+| CV-14–CV-18 final confirmation amendment | Tasks 12–13 signal-episode, no-TTL, frozen-envelope, exact-approval, post-approval REST, concurrency, and idempotency tests |
+| CV-25–CV-29 final UI/monitor amendment | Tasks 14–15 account/signer projection, stale funnel, empty scan, operational notification, grouped history, and desktop/mobile tests |
+| CV-29A–CV-29B | Task 14 retained stale counts/stage-5 removal and complete-zero-market tests |
+| CV-30–CV-37 | Tasks 11, 13, 14, and 16 exact allowance, signer gas, cleanup, canary, and zero-mutation readiness tests |
+| Final Dashboard gate | Task 16 `make acceptance`, exact-SHA redeploy, runtime proof, and requested screenshots |
+| First live canary | Implemented as a durable 5-USDT constraint in Task 13; execution remains a separate explicit post-acceptance action |
 
 ## Plan Self-Review Checklist
 
-- [x] Every CV-01 through CV-29 criterion maps to a task and runnable check.
+- [x] Every CV-01 through CV-37 criterion, including CV-29A/B, maps to a task and runnable check.
 - [x] No task adds same-venue product focus, global semantic scan, inverse matching, automatic entry, exchange framework, queue, scheduler, FX feed, or redemption transaction loop.
 - [x] Money fields use `Decimal`; time fields are timezone-aware UTC; public token IDs remain persistable while credentials/signatures remain redacted.
 - [x] Cross-specific rules do not alter legacy 65 pUSD, minimum-profit, edge, LLM hedge, merge, or notification behavior.
 - [x] Every mutation-capable test proves call count and ambiguous-state behavior.
+- [x] Cross confirmations have no TTL but remain one-time, signal-episode-bound, and server-refreshed; legacy ten-second previews remain unchanged.
+- [x] Zero allowance is healthy, exact allowance and cleanup use the existing SDK, signer gas is separate, and no automatic asset transfer exists.
+- [x] The first live cross canary is constrained in code but cannot run during implementation or acceptance.
 - [x] `make acceptance` is the final gate, and the exact accepted SHA is redeployed before review.
 - [x] No placeholder markers remain in implementation instructions.
