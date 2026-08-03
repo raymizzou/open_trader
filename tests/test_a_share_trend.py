@@ -8641,7 +8641,7 @@ def test_report_runner_degrades_beijing_holding_kline_value_error(
 def test_report_runner_snapshot_date_mismatch_uses_deadline_contract(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_date="2026-07-13"),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -8659,7 +8659,7 @@ def test_report_runner_rejects_snapshot_tm_id_integrity_failures(
 ) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_ids=snapshot_ids),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -8671,7 +8671,7 @@ def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_p
     outage = FutuQuoteError("network down", error_type="quote_server_interrupted")
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([]),
         quote_factory=lambda **kwargs: ReadyQuote(
             [], failed_klines={"SH.000001"}, kline_error=outage
@@ -8685,7 +8685,7 @@ def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_p
 def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], invalid_billing=True),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -8700,7 +8700,7 @@ def test_report_runner_rejects_catalog_cost_drift_before_paid_snapshots(
     result = run_a_share_trend_report(
         config=trend_config(tmp_path),
         run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi(
             calls, catalog_unit_cost="0.072"
         ),
@@ -8870,7 +8870,7 @@ def test_report_runner_redacts_api_key_from_all_outputs(tmp_path: Path) -> None:
 
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: SecretApi([]),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=notifier,
     )
