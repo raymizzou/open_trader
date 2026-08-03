@@ -3742,7 +3742,11 @@ def _rotation_historical_opening_strategy_details(
             return
         if qty <= 0 or side not in {"BUY", "SELL"}:
             return
-        key = order_id or f"{source}:{trading_date}:{recorded_at}:{len(records)}"
+        key = (
+            f"{trading_date}:{order_id}"
+            if order_id
+            else f"{source}:{trading_date}:{recorded_at}:{len(records)}"
+        )
         value = str(opening_version or "").strip()
         existing = records.get(key)
         if existing is None or (
