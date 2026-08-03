@@ -154,45 +154,52 @@ def explicit_pair() -> ExplicitMarketPair:
         gamma_lookup=lambda *args, **kwargs: [polymarket_row("poly-condition")],
         clob_lookup=lambda condition_id: None,
     ).pairs[0]
+    cutoff = "at 23:59 UTC on December 31, 2026"
     return replace(
         pair,
         predict=replace(
             pair.predict,
-            resolution_source=pair.predict.resolution_provider,
-            close_at=pair.predict.event_end_at,
-            settlement_at=datetime(2027, 1, 1, tzinfo=UTC),
+            rules=f"This contract closes {cutoff} and resolves from the named source.",
+            event_end_at=datetime(2026, 12, 31, 23, 58, tzinfo=UTC),
+        ),
+        polymarket=replace(
+            pair.polymarket,
+            rules=f"This contract closes {cutoff} and resolves from the named source.",
+            close_at=datetime(2027, 1, 2, 4, 59, tzinfo=UTC),
+            settlement_at=datetime(2027, 1, 2, 5, tzinfo=UTC),
         ),
     )
 
 
 def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "decision": "APPROVE",
         "summary": "The supplied rules exclude both divergent settlement states.",
         "predict": {
             "exchange": "predict.fun",
+            "market_id": pair.predict.market_id,
             "condition_id": pair.predict.condition_id,
             "rules_fingerprint": pair.predict.rules_fingerprint,
-            "category_slug": pair.predict.category_slug,
-            "event_start_at": pair.predict.event_start_at.isoformat(),
-            "event_end_at": pair.predict.event_end_at.isoformat(),
-            "resolution_provider": pair.predict.resolution_provider,
         },
         "polymarket": {
             "exchange": "polymarket",
+            "market_id": pair.polymarket.market_id,
             "condition_id": pair.polymarket.condition_id,
             "rules_fingerprint": pair.polymarket.rules_fingerprint,
-            "close_at": pair.polymarket.close_at.isoformat(),
-            "settlement_at": pair.polymarket.settlement_at.isoformat(),
         },
+        "direct_outcome_mapping": {
+            "predict_yes": "YES", "predict_no": "NO",
+            "polymarket_yes": "YES", "polymarket_no": "NO",
+        },
+        "canonical_cutoff": "2026-12-31T23:59:00Z",
         "divergent_states": {
             "PREDICT_YES_POLYMARKET_NO": {"possible": False, "reason": "same rule"},
             "POLYMARKET_YES_PREDICT_NO": {"possible": False, "reason": "same rule"},
         },
         "evidence": [
-            {"exchange": "predict.fun", "field": "rules", "quote": pair.predict.rules},
-            {"exchange": "polymarket", "field": "rules", "quote": pair.polymarket.rules},
+            {"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"},
+            {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"},
         ],
         "uncertainties": [],
     }
@@ -222,12 +229,18 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
     second = validator.validate(pair)
 
     assert first.approved is True
-    assert first.prompt_version == "cross-exchange-yes-no-equivalence-v1"
-    assert first.predict_event_end_at == pair.predict.event_end_at
-    assert first.polymarket_settlement_at == pair.polymarket.settlement_at
+    assert first.prompt_version == "cross-exchange-yes-no-equivalence-v2"
+    assert first.canonical_cutoff == datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
+    assert first.direct_outcome_mapping == {
+        "predict_yes": "YES", "predict_no": "NO",
+        "polymarket_yes": "YES", "polymarket_no": "NO",
+    }
+    assert first.cache_key == predict_cross_venue.cross_exchange_equivalence_cache_key(
+        pair, model="gpt-test"
+    )
     assert second.approved is True
     assert len(calls) == 1
-    assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == "cross-exchange-yes-no-equivalence-v1"
+    assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == "cross-exchange-yes-no-equivalence-v2"
     assert Path(calls[0][calls[0].index("--output-schema") + 1]).name == "cross_exchange_yes_no_equivalence.json"
     assert store.llm_usage_24h()["cache_hits"] == 1
 
@@ -238,8 +251,9 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
         (lambda value: {**value, "predict": {**value["predict"], "condition_id": "wrong"}}, "IDENTITY_MISMATCH"),
         (lambda value: {**value, "polymarket": {**value["polymarket"], "exchange": "predict.fun"}}, "IDENTITY_MISMATCH"),
         (lambda value: {**value, "predict": {**value["predict"], "rules_fingerprint": "wrong"}}, "FINGERPRINT_MISMATCH"),
-        (lambda value: {**value, "predict": {**value["predict"], "event_end_at": "2026-12-30T00:00:00+00:00"}}, "DATE_MISMATCH"),
-        (lambda value: {**value, "polymarket": {**value["polymarket"], "settlement_at": "2027-01-02T00:00:00+00:00"}}, "DATE_MISMATCH"),
+        (lambda value: {**value, "direct_outcome_mapping": {**value["direct_outcome_mapping"], "predict_yes": "NO"}}, "OUTCOME_MAPPING_MISMATCH"),
+        (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59:00"}, "CUTOFF_INVALID"),
+        (lambda value: {**value, "canonical_cutoff": "not-a-date"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "divergent_states": {**value["divergent_states"], "PREDICT_YES_POLYMARKET_NO": {"possible": True, "reason": "possible"}}}, "DIVERGENT_STATE_POSSIBLE"),
         (lambda value: {**value, "evidence": []}, "MISSING_EVIDENCE"),
         (lambda value: {**value, "evidence": [{"exchange": "predict.fun", "field": "rules", "quote": "not supplied"}, value["evidence"][1]]}, "EVIDENCE_NOT_FOUND"),
@@ -266,9 +280,40 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     schema = json.loads(schema_path.read_text())
 
     assert schema["properties"]["decision"]["enum"] == ["APPROVE", "REJECT"]
-    assert {"predict", "polymarket", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
+    assert schema["properties"]["schema_version"]["const"] == 2
+    assert {"predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
-    assert {"event_start_at", "event_end_at", "resolution_provider"} <= set(schema["$defs"]["predict_market"]["required"])
+    assert set(schema["$defs"]["venue_market"]["required"]) == {"exchange", "market_id", "condition_id", "rules_fingerprint"}
+
+
+def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> None:
+    pair = explicit_pair()
+    baseline = predict_cross_venue.cross_exchange_equivalence_cache_key(pair, model="gpt-test")
+    variants = (
+        replace(pair, predict=replace(pair.predict, rules="changed rules")),
+        replace(pair, predict=replace(pair.predict, event_end_at=datetime(2027, 1, 1, tzinfo=UTC))),
+        replace(pair, predict=replace(pair.predict, yes_token_id="changed-token")),
+        replace(pair, polymarket=replace(pair.polymarket, condition_id="changed-candidate")),
+    )
+    assert baseline is not None
+    assert all(
+        predict_cross_venue.cross_exchange_equivalence_cache_key(variant, model="gpt-test") != baseline
+        for variant in variants
+    )
+    assert predict_cross_venue.cross_exchange_equivalence_cache_key(
+        pair, model="gpt-test", prompt_version="changed-prompt"
+    ) != baseline
+
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()), polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(), gamma_lookup=lambda *args, **kwargs: [],
+        clob_lookup=lambda condition_id: None,
+    )
+    monitor._set_approved({pair.pair_id: pair})
+    for variant in variants:
+        assert monitor._same_fingerprints(pair, variant) is False
+        monitor._set_approved({})
+        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
 
 
 def test_threshold_validator_schema_is_unchanged() -> None:
@@ -321,7 +366,7 @@ def cross_venue_pair() -> ExplicitMarketPair:
     pair = explicit_pair()
     return ExplicitMarketPair(
         pair_id=pair.pair_id,
-        predict=replace(pair.predict, settlement_at=datetime(2026, 1, 11, tzinfo=UTC)),
+        predict=replace(pair.predict, event_end_at=datetime(2026, 1, 11, tzinfo=UTC)),
         polymarket=replace(pair.polymarket, settlement_at=datetime(2026, 1, 21, tzinfo=UTC)),
     )
 
@@ -908,6 +953,12 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
 
         await monitor.start()
         await wait_until(lambda: bool(predict.subscriptions))
+        assert len(validator.calls) == 1
+        for _ in range(3):
+            await predict.queue.put(monitor_predict_book())
+        monitor.snapshot()
+        await asyncio.sleep(0.005)
+        assert len(validator.calls) == 1
         predict.markets = (changed,)
         await wait_until(validator.second_started.is_set)
         assert polymarket.token_sets[-1] == ()

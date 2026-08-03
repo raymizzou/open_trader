@@ -2,101 +2,46 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "decision", "summary", "predict", "polymarket", "divergent_states", "evidence", "uncertainties"],
+  "required": ["schema_version", "decision", "summary", "predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "divergent_states", "evidence", "uncertainties"],
   "properties": {
-    "schema_version": {"type": "integer", "const": 1},
+    "schema_version": {"type": "integer", "const": 2},
     "decision": {"enum": ["APPROVE", "REJECT"]},
     "summary": {"type": "string"},
     "predict": {"$ref": "#/$defs/predict_market"},
     "polymarket": {"$ref": "#/$defs/polymarket_market"},
+    "direct_outcome_mapping": {
+      "type": "object", "additionalProperties": false,
+      "required": ["predict_yes", "predict_no", "polymarket_yes", "polymarket_no"],
+      "properties": {
+        "predict_yes": {"type": "string"}, "predict_no": {"type": "string"},
+        "polymarket_yes": {"type": "string"}, "polymarket_no": {"type": "string"}
+      }
+    },
+    "canonical_cutoff": {"type": "string"},
     "divergent_states": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"],
       "properties": {
         "PREDICT_YES_POLYMARKET_NO": {"$ref": "#/$defs/divergent_state"},
         "POLYMARKET_YES_PREDICT_NO": {"$ref": "#/$defs/divergent_state"}
       }
     },
-    "evidence": {
-      "type": "array",
-      "items": {"$ref": "#/$defs/evidence"}
-    },
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
     "uncertainties": {"type": "array", "items": {"type": "string"}}
   },
-  "allOf": [
-    {
-      "if": {"properties": {"decision": {"const": "APPROVE"}}},
-      "then": {
-        "properties": {
-          "divergent_states": {
-            "properties": {
-              "PREDICT_YES_POLYMARKET_NO": {"properties": {"possible": {"const": false}}},
-              "POLYMARKET_YES_PREDICT_NO": {"properties": {"possible": {"const": false}}}
-            }
-          },
-          "evidence": {
-            "allOf": [
-              {"contains": {"properties": {"exchange": {"const": "predict.fun"}}}},
-              {"contains": {"properties": {"exchange": {"const": "polymarket"}}}}
-            ]
-          },
-          "uncertainties": {"maxItems": 0}
-        }
-      }
+  "allOf": [{"if": {"properties": {"decision": {"const": "APPROVE"}}}, "then": {
+    "properties": {
+      "direct_outcome_mapping": {"properties": {"predict_yes": {"const": "YES"}, "predict_no": {"const": "NO"}, "polymarket_yes": {"const": "YES"}, "polymarket_no": {"const": "NO"}}},
+      "divergent_states": {"properties": {"PREDICT_YES_POLYMARKET_NO": {"properties": {"possible": {"const": false}}}, "POLYMARKET_YES_PREDICT_NO": {"properties": {"possible": {"const": false}}}}},
+      "evidence": {"allOf": [{"contains": {"properties": {"exchange": {"const": "predict.fun"}}}}, {"contains": {"properties": {"exchange": {"const": "polymarket"}}}}]},
+      "uncertainties": {"maxItems": 0}
     }
-  ],
+  }}],
   "$defs": {
-    "venue_market": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["exchange", "condition_id", "rules_fingerprint", "close_at", "settlement_at"],
-      "properties": {
-        "exchange": {"type": "string"},
-        "condition_id": {"type": "string"},
-        "rules_fingerprint": {"type": "string"},
-        "close_at": {"type": "string"},
-        "settlement_at": {"type": "string"}
-      }
-    },
-    "predict_market": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["exchange", "condition_id", "rules_fingerprint", "category_slug", "event_start_at", "event_end_at", "resolution_provider"],
-      "properties": {
-        "exchange": {"const": "predict.fun"},
-        "condition_id": {"type": "string"},
-        "rules_fingerprint": {"type": "string"},
-        "category_slug": {"type": "string"},
-        "event_start_at": {"type": "string"},
-        "event_end_at": {"type": "string"},
-        "resolution_provider": {"type": "string"}
-      }
-    },
-    "polymarket_market": {
-      "allOf": [
-        {"$ref": "#/$defs/venue_market"},
-        {"properties": {"exchange": {"const": "polymarket"}}}
-      ]
-    },
-    "divergent_state": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["possible", "reason"],
-      "properties": {
-        "possible": {"type": "boolean"},
-        "reason": {"type": "string"}
-      }
-    },
-    "evidence": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["exchange", "field", "quote"],
-      "properties": {
-        "exchange": {"enum": ["predict.fun", "polymarket"]},
-        "field": {"type": "string"},
-        "quote": {"type": "string"}
-      }
-    }
+    "venue_market": {"type": "object", "additionalProperties": false, "required": ["exchange", "market_id", "condition_id", "rules_fingerprint"], "properties": {"exchange": {"type": "string"}, "market_id": {"type": "string"}, "condition_id": {"type": "string"}, "rules_fingerprint": {"type": "string"}}},
+    "predict_market": {"allOf": [{"$ref": "#/$defs/venue_market"}, {"properties": {"exchange": {"const": "predict.fun"}}}]},
+    "polymarket_market": {"allOf": [{"$ref": "#/$defs/venue_market"}, {"properties": {"exchange": {"const": "polymarket"}}}]},
+    "divergent_state": {"type": "object", "additionalProperties": false, "required": ["possible", "reason"], "properties": {"possible": {"type": "boolean"}, "reason": {"type": "string"}}},
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["exchange", "field", "quote"], "properties": {"exchange": {"enum": ["predict.fun", "polymarket"]}, "field": {"type": "string"}, "quote": {"type": "string"}}}
   }
 }
