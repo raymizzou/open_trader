@@ -6471,36 +6471,119 @@ console.log(JSON.stringify({loaded,initialPanelRenders,linkedCalls,allCalls:call
     assert rendered["attributionStates"].count("报告关联冲突") == 1
 
 
-def test_dashboard_quote_poll_reloads_published_dashboard_without_simulation_refresh() -> None:
+def test_dashboard_account_poll_is_independent_and_conditional() -> None:
     output = run_dashboard_js(r'''
-renderQuoteStatus=()=>{};
-renderHoldings=()=>{};
-state.trendSimulatePositions={tiger:{available:true,positions:[
-  {symbol:"GPN",quantity:"485"}, {symbol:"TOST",quantity:"1296"},
-]}};
 const requests=[];
-globalThis.fetch=async(url)=>{
-  requests.push(url);
-  return {ok:true,json:async()=>url==="/api/quotes"
-    ? {quotes:{}}
-    : {poll_seconds:0,marker:"published"}};
+const intervals=[];
+globalThis.window={setInterval(fn,ms){intervals.push({fn,ms});return intervals.length;},clearInterval(){},setTimeout(){return 1;},clearTimeout(){}};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+globalThis.fetch=async(url, options={})=>{
+  requests.push({url, headers: options.headers || {}});
+  if (url === "/api/v1/account/snapshot") {
+    return {ok:true,status:200,headers:{get:(name)=>name === "ETag" ? '"etag-1"' : null},json:async()=>({status:"healthy",stale:false,summary:{},broker_summaries:[],positions:[],cash_balances:[]})};
+  }
+  return {ok:true,json:async()=>({marker:"dashboard"})};
 };
 renderDashboard=()=>{};
-await refreshQuotes();
+renderHoldings=()=>{};
+state.decisionDeepLinkRestored=true;
+await loadDashboard();
+scheduleAccountPolling();
+await intervals[0].fn();
+const overlapRequests=requests.length;
+await Promise.resolve();
+await Promise.resolve();
+await intervals[0].fn();
 console.log(JSON.stringify({
   requests,
-  dashboard:state.dashboard.marker,
-  symbols:state.trendSimulatePositions.tiger.positions.map((position)=>position.symbol),
+  interval:intervals[0].ms,
+  overlapRequests,
+  snapshot:state.accountSnapshot && state.accountSnapshot.status,
+  etag:state.accountEtag,
 }));
 ''')
     rendered = json.loads(output)
 
-    assert rendered["requests"] == [
-        "/api/quotes",
-        "/api/dashboard",
+    assert [request["url"] for request in rendered["requests"]] == [
+        "/api/dashboard", "/api/v1/account/snapshot", "/api/v1/account/snapshot",
     ]
-    assert rendered["dashboard"] == "published"
-    assert rendered["symbols"] == ["GPN", "TOST"]
+    assert rendered["interval"] == 5000
+    assert rendered["overlapRequests"] == 2
+    assert rendered["snapshot"] == "healthy"
+    assert rendered["etag"] == '"etag-1"'
+    assert rendered["requests"][2]["headers"]["If-None-Match"] == '"etag-1"'
+    assert all(request["url"] != "/api/quotes" for request in rendered["requests"])
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_snapshot", "expected_etag", "expected_error", "expected_enabled"),
+    [
+        ({"status": 503}, None, "", True, False),
+        ({"status": 200, "payload": {"status": "stale", "stale": True}, "etag": '"stale"'}, "stale", '"stale"', False, False),
+        ({"status": 200, "payload": {"status": "healthy", "stale": False}, "etag": '"healthy"'}, "healthy", '"healthy"', False, True),
+    ],
+    ids=("first_failure", "stale_snapshot", "healthy_snapshot"),
+)
+def test_dashboard_account_poll_state_transitions(
+    response: dict[str, object],
+    expected_snapshot: str | None,
+    expected_etag: str,
+    expected_error: bool,
+    expected_enabled: bool,
+) -> None:
+    scenario = json.dumps(response)
+    output = run_dashboard_js(f"const scenario = {scenario};\n" + r'''
+globalThis.window={setTimeout(){return 1;},clearTimeout(){}};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+renderHoldings=()=>{};
+globalThis.fetch=async()=>({
+  ok:scenario.status === 200,
+  status:scenario.status,
+  headers:{get:()=>scenario.etag || null},
+  json:async()=>scenario.payload || {},
+});
+await loadAccountSnapshot();
+console.log(JSON.stringify({
+  snapshot:state.accountSnapshot && state.accountSnapshot.status,
+  etag:state.accountEtag,
+  error:Boolean(state.accountError),
+  enabled:accountActionsEnabled(),
+}));
+''')
+    assert json.loads(output) == {
+        "snapshot": expected_snapshot,
+        "etag": expected_etag,
+        "error": expected_error,
+        "enabled": expected_enabled,
+    }
+
+
+def test_dashboard_account_poll_failure_and_304_preserve_snapshot_and_dashboard_failure() -> None:
+    output = run_dashboard_js(r'''
+globalThis.window={setTimeout(){return 1;},clearTimeout(){}};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+renderHoldings=()=>{};
+state.accountSnapshot={status:"healthy",stale:false,summary:{},broker_summaries:[],positions:[],cash_balances:[]};
+state.accountEtag='"kept"';
+let response={ok:false,status:503,headers:{get:()=>null},json:async()=>({})};
+globalThis.fetch=async()=>response;
+await loadAccountSnapshot();
+const failed={snapshot:state.accountSnapshot.status,etag:state.accountEtag,error:Boolean(state.accountError),enabled:accountActionsEnabled()};
+response={ok:false,status:304,headers:{get:()=> '"kept"'},json:async()=>{throw new Error("304 must not parse")}};
+await loadAccountSnapshot();
+const unchanged={snapshot:state.accountSnapshot.status,etag:state.accountEtag,error:Boolean(state.accountError),enabled:accountActionsEnabled()};
+state.dashboard={marker:"legacy"};
+globalThis.fetch=async()=>({ok:false,status:503});
+renderLoadError=(error)=>{state.dashboard=null;state.dashboardError=error;};
+await loadDashboard();
+console.log(JSON.stringify({failed,unchanged,dashboard:state.dashboard,account:state.accountSnapshot.status}));
+''')
+    assert json.loads(output) == {
+        "failed": {"snapshot": "healthy", "etag": '"kept"', "error": True, "enabled": False},
+        "unchanged": {"snapshot": "healthy", "etag": '"kept"', "error": False, "enabled": True},
+        "dashboard": None,
+        "account": "healthy",
+    }
 
 
 def test_dashboard_report_does_not_load_simulation_positions_or_render_overlays() -> None:
