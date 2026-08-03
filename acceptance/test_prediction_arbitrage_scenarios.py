@@ -7,6 +7,7 @@ from open_trader.prediction_arbitrage_acceptance import SCENARIO_IDS, scenario_r
 
 def test_fixed_prediction_scenario_registry_has_no_gaps() -> None:
     results = scenario_results()
+    assert len(results) == 63
     assert len(results) == len(SCENARIO_IDS)
     assert validate_registry(results) == []
 

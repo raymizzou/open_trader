@@ -9,9 +9,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import math
+import os
 from pathlib import Path
 import subprocess
 import time
+from types import MethodType
 from typing import Callable, Iterable, Iterator, Mapping
 from urllib.error import URLError
 from urllib.parse import urlparse
@@ -141,6 +143,42 @@ class _PolymarketMutationViolation(RuntimeError):
     """Internal marker for a guarded Polymarket mutation or notification."""
 
 
+class _GuardedCallable:
+    """Call an SDK method with a guarded proxy as its self object."""
+
+    __slots__ = ("_guard", "_target", "_function", "_proxy_self")
+
+    def __init__(
+        self,
+        guard: "_PolymarketReadOnlyGuard",
+        target: Callable[..., object] | None = None,
+        *,
+        function: Callable[..., object] | None = None,
+        proxy_self: object | None = None,
+    ) -> None:
+        object.__setattr__(self, "_guard", guard)
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_function", function)
+        object.__setattr__(self, "_proxy_self", proxy_self)
+
+    def __getattribute__(self, name: str) -> object:
+        if name in {"_guard", "_target", "_function", "_proxy_self"}:
+            guard = object.__getattribute__(self, "_guard")
+            guard.violation("raw_internal")
+        return object.__getattribute__(self, name)
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        guard = object.__getattribute__(self, "_guard")
+        function = object.__getattribute__(self, "_function")
+        if function is not None:
+            result = function(
+                object.__getattribute__(self, "_proxy_self"), *args, **kwargs
+            )
+        else:
+            result = object.__getattribute__(self, "_target")(*args, **kwargs)  # type: ignore[misc]
+        return guard.protect(result)
+
+
 class _PolymarketReadOnlyGuard:
     """Hard-fail any mutation-capable SDK or transport call during preflight."""
 
@@ -216,8 +254,23 @@ class _PolymarketReadOnlyGuard:
     def protect(self, value: object) -> object:
         if value is None or isinstance(value, (str, bytes, bytearray, bool, int, float, Decimal)):
             return value
-        if callable(value):
+        if isinstance(value, (_GuardedCallable, _GuardedPolymarketValue)):
             return value
+        if isinstance(value, MethodType):
+            return _GuardedCallable(
+                self,
+                function=value.__func__,
+                proxy_self=self.wrap(value.__self__),
+            )
+        if callable(value):
+            call = getattr(value, "__call__", None)
+            if isinstance(call, MethodType):
+                return _GuardedCallable(
+                    self,
+                    function=call.__func__,
+                    proxy_self=self.wrap(value),
+                )
+            return _GuardedCallable(self, target=value)
         return self.wrap(value)
 
     def call(self, name: str, target: Callable[..., object], *args: object, **kwargs: object) -> object:
@@ -262,7 +315,8 @@ class _GuardedPolymarketValue:
             return lambda *args, **kwargs: guard.violation(name)
         value = getattr(object.__getattribute__(self, "_value"), name)
         if name.lower() == "request" and callable(value):
-            return lambda *args, **kwargs: guard.call(name, value, *args, **kwargs)
+            guarded = guard.protect(value)
+            return lambda *args, **kwargs: guard.call(name, guarded, *args, **kwargs)
         return guard.protect(value)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -567,7 +621,9 @@ def run_live_readiness(
     polymarket_client_factory: Callable[[TradingConfig], object] = PolymarketTradingClient.from_keychain,
     timeout: float = 10.0,
     browser_handoff_path: Path | None = None,
+    browser_nonce_path: Path | None = None,
     browser_url: str = "http://127.0.0.1:8766",
+    browser_fixture_url: str = "http://127.0.0.1:18766",
     browser_root: Path | None = None,
     browser_now_fn: Callable[[], float] = time.time,
     browser_commit_fn: Callable[[Path], str | None] | None = None,
@@ -577,7 +633,9 @@ def run_live_readiness(
 
     browser = _browser_readiness(
         browser_handoff_path,
+        browser_nonce_path,
         browser_url,
+        browser_fixture_url,
         browser_root or Path.cwd(),
         health_fn=browser_health_fn or _browser_health,
         now_fn=browser_now_fn,
@@ -742,9 +800,33 @@ def _browser_health(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def _consume_browser_nonce(path: Path | None) -> str | None:
+    """Atomically move the pipeline nonce out of its server-owned path once."""
+
+    if path is None:
+        return None
+    consumed_path = path.with_name(path.name + ".consumed")
+    try:
+        os.replace(path, consumed_path)
+    except OSError:
+        return None
+    try:
+        nonce = consumed_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        nonce = ""
+    finally:
+        try:
+            os.unlink(consumed_path)
+        except OSError:
+            pass
+    return nonce or None
+
+
 def _browser_readiness(
     handoff_path: Path | None,
+    nonce_path: Path | None,
     url: str,
+    fixture_url: str,
     root: Path,
     *,
     health_fn: Callable[[str], bool],
@@ -760,12 +842,22 @@ def _browser_readiness(
     if not isinstance(payload, Mapping):
         return _blocked("Playwright browser handoff unavailable")
     if not (
-        payload.get("schema_version") == 1
+        payload.get("schema_version") == 2
         and payload.get("source") == "playwright"
         and payload.get("playwright_status") == "passed"
         and payload.get("browser_project") == "chromium"
     ):
         return _blocked("Playwright browser handoff unavailable")
+    run_nonce = payload.get("run_nonce")
+    expected_fixture_url = fixture_url.rstrip("/")
+    expected_fixture_health_url = expected_fixture_url + "/healthz"
+    if (
+        not isinstance(run_nonce, str)
+        or not run_nonce
+        or payload.get("fixture_url") != expected_fixture_url
+        or payload.get("fixture_health_url") != expected_fixture_health_url
+    ):
+        return _blocked("Playwright browser fixture binding unavailable")
     created_at = payload.get("created_at")
     expires_at = payload.get("expires_at")
     if (
@@ -797,6 +889,11 @@ def _browser_readiness(
         return _blocked("Playwright browser handoff review URL mismatch")
     if payload.get("candidate_commit") != current_commit:
         return _blocked("Playwright browser handoff candidate mismatch")
+    expected_nonce = _consume_browser_nonce(nonce_path)
+    if expected_nonce is None:
+        return _blocked("Playwright browser nonce unavailable")
+    if run_nonce != expected_nonce:
+        return _blocked("Playwright browser nonce mismatch")
     try:
         healthy = health_fn(str(payload["health_url"]))
     except Exception:
@@ -834,10 +931,18 @@ def main(argv: list[str] | None = None) -> int:
     browser_handoff_path = args.browser_handoff or (
         args.expected_root / "logs/acceptance/prediction-market-browser-handoff.json"
     )
+    browser_nonce_path = Path(
+        os.environ.get(
+            "PREDICTION_ACCEPTANCE_BROWSER_NONCE_FILE",
+            str(args.expected_root / "logs/acceptance/prediction-market-browser-nonce"),
+        )
+    )
     report = run_live_readiness(
         config_path,
         browser_handoff_path=browser_handoff_path,
+        browser_nonce_path=browser_nonce_path,
         browser_url=args.url,
+        browser_fixture_url="http://127.0.0.1:18766",
         browser_root=args.expected_root,
     )
     if args.json:

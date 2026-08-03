@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import time
 from urllib.error import URLError
 from urllib.request import Request
 
@@ -90,10 +91,13 @@ class PolymarketClient:
 def write_browser_handoff(tmp_path: Path, **overrides: object) -> Path:
     path = tmp_path / "browser-handoff.json"
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "playwright",
         "playwright_status": "passed",
         "browser_project": "chromium",
+        "run_nonce": "test-nonce",
+        "fixture_url": "http://127.0.0.1:18766",
+        "fixture_health_url": "http://127.0.0.1:18766/healthz",
         "review_url": "http://127.0.0.1:8766",
         "health_url": "http://127.0.0.1:8766/healthz",
         "candidate_commit": "test-commit",
@@ -102,6 +106,12 @@ def write_browser_handoff(tmp_path: Path, **overrides: object) -> Path:
     }
     payload.update(overrides)
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def write_browser_nonce(tmp_path: Path, nonce: str = "test-nonce") -> Path:
+    path = tmp_path / "browser-nonce"
+    path.write_text(nonce, encoding="utf-8")
     return path
 
 
@@ -119,6 +129,8 @@ def readiness_report(tmp_path: Path, **overrides: object):
     }
     if "browser_handoff_path" not in overrides:
         factories["browser_handoff_path"] = write_browser_handoff(tmp_path)
+    if "browser_nonce_path" not in overrides:
+        factories["browser_nonce_path"] = write_browser_nonce(tmp_path)
     factories.update(overrides)
     return acceptance.run_live_readiness(config_path, **factories)
 
@@ -278,6 +290,99 @@ def test_polymarket_guard_blocks_mutation_through_raw_nested_sdk_internals(
     assert report.mutation_calls == (0 if action == "notify" else 1)
 
 
+def test_polymarket_guard_blocks_read_method_using_raw_nested_transport(
+    tmp_path: Path,
+) -> None:
+    class Transport:
+        def post_json(self, payload: object) -> object:
+            del payload
+            return {"posted": True}
+
+        def get(self) -> object:
+            return {"ok": True}
+
+    class Context:
+        def __init__(self) -> None:
+            self.transport = Transport()
+
+    class AdapterSdk:
+        def __init__(self) -> None:
+            self._ctx = Context()
+
+        def read_account(self) -> object:
+            return self._ctx.transport.post_json({"probe": True})
+
+    class NestedTransportPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = AdapterSdk()
+
+        def preflight_report(self) -> dict[str, object]:
+            self._client.read_account()
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: NestedTransportPolymarket(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.polymarket.status == "FAIL"
+    assert report.safety.status == "FAIL"
+    assert report.mutation_calls == 1
+    assert report.live_notifications == 0
+
+
+def test_polymarket_guard_preserves_nested_get_read_method(tmp_path: Path) -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.get_calls = 0
+
+        def get(self) -> object:
+            self.get_calls += 1
+            return {"ok": True}
+
+    transport = Transport()
+
+    class Context:
+        def __init__(self) -> None:
+            self.transport = transport
+
+    class AdapterSdk:
+        def __init__(self) -> None:
+            self._ctx = Context()
+
+        def read_account(self) -> object:
+            return self._ctx.transport.get()
+
+    class ReadOnlyNestedTransportPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = AdapterSdk()
+
+        def preflight_report(self) -> dict[str, object]:
+            self._client.read_account()
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: ReadOnlyNestedTransportPolymarket(),
+    )
+
+    assert report.status == "PASS"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+    assert transport.get_calls == 1
+
+
 def test_polymarket_report_without_posted_attestation_fails_closed(tmp_path: Path) -> None:
     class MissingPosted(PolymarketClient):
         def preflight_report(self) -> dict[str, object]:
@@ -391,6 +496,80 @@ def test_browser_handoff_binds_fresh_url_and_candidate(tmp_path: Path) -> None:
     assert report.browser.detail == "BLOCKED: Playwright browser handoff expired"
 
 
+def test_browser_handoff_requires_fixture_binding(tmp_path: Path) -> None:
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=write_browser_handoff(
+            tmp_path,
+            fixture_url="http://127.0.0.1:8766",
+            fixture_health_url="http://127.0.0.1:8766/healthz",
+        ),
+    )
+
+    assert report.status == "BLOCKED"
+    assert report.browser.detail == "BLOCKED: Playwright browser fixture binding unavailable"
+
+
+def test_browser_handoff_nonce_is_missing_wrong_or_replayed_blocked(tmp_path: Path) -> None:
+    handoff_path = write_browser_handoff(tmp_path, run_nonce="handoff-nonce")
+    nonce_path = write_browser_nonce(tmp_path, "server-nonce")
+
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=handoff_path,
+        browser_nonce_path=nonce_path,
+    )
+    assert report.status == "BLOCKED"
+    assert report.browser.detail == "BLOCKED: Playwright browser nonce mismatch"
+    assert not nonce_path.exists()
+
+    handoff_path = write_browser_handoff(tmp_path, run_nonce="server-nonce")
+    nonce_path = write_browser_nonce(tmp_path, "server-nonce")
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=handoff_path,
+        browser_nonce_path=nonce_path,
+    )
+    assert report.status == "PASS"
+    assert not nonce_path.exists()
+
+    report = readiness_report(
+        tmp_path,
+        browser_handoff_path=handoff_path,
+        browser_nonce_path=nonce_path,
+    )
+    assert report.status == "BLOCKED"
+    assert report.browser.detail == "BLOCKED: Playwright browser nonce unavailable"
+
+
+def test_direct_runner_with_arbitrary_handoff_without_pipeline_nonce_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = time.time()
+    handoff_path = write_browser_handoff(
+        tmp_path,
+        created_at=now,
+        expires_at=now + 60,
+    )
+    monkeypatch.setattr(acceptance, "_git_commit", lambda _root: "test-commit")
+    monkeypatch.setattr(acceptance, "_dashboard_is_reachable", lambda _url: False)
+
+    result = acceptance.main(
+        [
+            "--json",
+            "--expected-root",
+            str(tmp_path),
+            "--config",
+            str(tmp_path / "missing.json"),
+            "--browser-handoff",
+            str(handoff_path),
+        ]
+    )
+
+    assert result == 2
+    assert "BLOCKED: Playwright browser nonce unavailable" in capsys.readouterr().out
+
+
 def test_make_acceptance_passes_playwright_handoff_before_live_registry() -> None:
     makefile = Path(__file__).parents[1].joinpath("Makefile").read_text(encoding="utf-8")
     playwright = makefile.index("npm exec playwright test")
@@ -399,5 +578,7 @@ def test_make_acceptance_passes_playwright_handoff_before_live_registry() -> Non
     assert playwright < registry
     assert "--browser-ready" not in makefile
     assert "PREDICTION_ACCEPTANCE_BROWSER_HANDOFF" in makefile[:registry]
+    assert "PREDICTION_ACCEPTANCE_BROWSER_NONCE" in makefile[:registry]
     assert "PREDICTION_ACCEPTANCE_REVIEW_URL" in makefile[:registry]
+    assert "PREDICTION_ACCEPTANCE_BROWSER_NONCE_FILE" in makefile
     assert "--browser-handoff" in makefile[registry:]
