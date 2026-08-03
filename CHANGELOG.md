@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-03
 
+- 修复资源排名策略升级后旧 CN v11、HK/US v9 报告因兼容审计版本被误判为不可读的问题；当前 CN v12、HK/US v10 仍独立拥有新状态，旧报告只读兼容验证通过。
 - 将资源排名轮换升级为同资产大类比较“大类内强度”、跨股票/ETF 比较“全局强度”，仅在强度差达到 20（含）时形成最多两组轮换；冻结比较快照并在 Dashboard/报告显示口径、两侧强度、差值和未触发原因。当前资源排名报告版本为 CN v12、HK/US v10，沿用既有 Kelly/回撤身份，不重新积累；账户视图刷新改用保留滚动位置的原生焦点恢复。相关趋势、控制器、Dashboard 与验收回归通过（除工作树缺失的 2026-07-16 忽略复盘快照测试）。
 - Dashboard 验收白名单曾同步 CN v11、HK/US v9 资源排名策略版本，并按冻结快照验证第 1/2/3 名的 6%/4%/2% 目标仓位及买入上限；页面“当前纪律”也复用同一冻结快照，不再回退显示旧版 4%。截图仍在浏览器流程中生成，但缺失不再影响可选截图规则下的 `PASS`。Dashboard 与验收回归 560 个、全量测试 4,435 个通过。
 - R2 增加仅监听 `127.0.0.1:8768` 的只读 Account API shadow：提供强 ETag 的 v1 快照、稳定发布读取、独立 live parity 与 launchd 运维路径。Account Sync Worker 仍是唯一 writer，Gateway/Dashboard 不变；最终验证仍需完成 Worker/API 同一精确 Git SHA 的运行时证明，尚未宣告部署或验收。

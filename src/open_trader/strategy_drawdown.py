@@ -20,6 +20,9 @@ OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
 ALLOCATION_PROJECTION_COMPATIBILITY_REVISION = "allocation_projection_v1"
 ALLOCATION_PROJECTION_VERSIONS = {"CN": "v12", "HK": "v10", "US": "v10"}
+# Keep the immediately preceding allocation-era reports readable while the
+# current version owns new state and parameter transitions.
+LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v11", "HK": "v9", "US": "v9"}
 ALLOCATION_PROJECTION_PARAMETER_HASHES = {
     "CN": (
         "c9f06d07dfb9d889041c34e99b00b4484d36e48dedb5707cf705a9e152b119f7",
@@ -1156,12 +1159,11 @@ def _approved_unified_trend_v5_transition(
 
 
 def _allocation_projection_key(key: tuple[str, str, str]) -> bool:
-    version = ALLOCATION_PROJECTION_VERSIONS.get(key[0])
-    return (
-        version is not None
-        and key[1] == f"trend_animals_warm_to_hot/{key[0]}/{version}"
-        and key[2] == version
-    )
+    versions = {
+        ALLOCATION_PROJECTION_VERSIONS.get(key[0]),
+        LEGACY_ALLOCATION_PROJECTION_VERSIONS.get(key[0]),
+    }
+    return key[2] in versions and key[1] == f"trend_animals_warm_to_hot/{key[0]}/{key[2]}"
 
 
 def _approved_legacy_allocation_parameter_hash(
