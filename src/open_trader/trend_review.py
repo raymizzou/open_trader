@@ -3407,14 +3407,16 @@ def _rotation_opening_strategy_details(
             (position.get("position_opening_strategy_version"), "account_position"),
             (position.get("strategy_version"), "account_position"),
         ))
+    states: list[object] = [report.get("protection_state")]
     state_path = (
         data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
     )
     if state_path.exists():
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            states.append(json.loads(state_path.read_text(encoding="utf-8")))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            state = None
+            pass
+    for state in states:
         raw_positions = state.get("positions") if isinstance(state, Mapping) else None
         if isinstance(raw_positions, Mapping):
             state_position = raw_positions.get(sell_symbol) or raw_positions.get(sell_code)
