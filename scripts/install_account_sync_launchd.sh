@@ -99,6 +99,32 @@ wait_agent_absent() {
   return 1
 }
 
+wait_writer_lock_released() {
+  local attempt
+  for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
+    if "$PYTHON_BIN" - "$DATA_DIR/account_sync/controller.lock" <<'PY'
+import fcntl
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a+", encoding="utf-8") as lock:
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(1)
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+PY
+    then
+      return 0
+    fi
+    [[ "$attempt" -lt "$WAIT_SECONDS" ]] && sleep 1
+  done
+  echo "account sync writer lock is still held" >&2
+  return 1
+}
+
 worker_status_matches() {
   "$PYTHON_BIN" - "$@" <<'PY'
 from datetime import datetime
@@ -160,6 +186,7 @@ mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/account_sync" "$DATA_DIR" "$REPOR
 printf '%s\n' "$rendered" > "$PLIST_PATH"
 "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
 wait_agent_absent
+wait_writer_lock_released
 : > "$OUT_LOG"
 : > "$ERR_LOG"
 loaded_at="$(date +%s)"
