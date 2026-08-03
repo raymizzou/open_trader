@@ -1598,11 +1598,11 @@ class RotationPair:
     sell_symbol: str
     sell_name: str
     sell_futu_symbol: str
-    sell_global_strength: Decimal
+    sell_global_strength: Decimal | None
     buy_symbol: str
     buy_name: str
     buy_futu_symbol: str
-    buy_global_strength: Decimal
+    buy_global_strength: Decimal | None
     strength_gap: Decimal
     target_weight: Decimal
     target_amount: Decimal
@@ -1612,6 +1612,36 @@ class RotationPair:
     reason: str = "relative_rotation"
     execution_date: str = ""
     execution_mode: str = "automatic"
+    sell_asset: str = ""
+    sell_local_strength: Decimal | None = None
+    buy_asset: str = ""
+    buy_local_strength: Decimal | None = None
+    strength_basis: str | None = None
+    sell_compared_strength: Decimal | None = None
+    buy_compared_strength: Decimal | None = None
+    threshold: Decimal = Decimal("20")
+
+
+@dataclass(frozen=True)
+class RotationComparison:
+    pair_index: int
+    sell_symbol: str
+    sell_name: str
+    sell_asset: str
+    sell_local_strength: Decimal | None
+    sell_global_strength: Decimal | None
+    buy_symbol: str
+    buy_name: str
+    buy_asset: str
+    buy_local_strength: Decimal | None
+    buy_global_strength: Decimal | None
+    strength_basis: str | None
+    sell_compared_strength: Decimal | None
+    buy_compared_strength: Decimal | None
+    strength_gap: Decimal | None
+    threshold: Decimal = Decimal("20")
+    outcome: str = "data_unavailable"
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1625,6 +1655,7 @@ class HoldingSnapshot:
     danger: bool | None
     boiling: bool | None
     champagne: bool | None
+    asset: str = ""
     industry: str = ""
     industry_tm_id: int | None = None
     industry_temperature: str | None = None
@@ -1729,7 +1760,9 @@ class TrendReport:
     real_protection_state: dict[str, object] | None = None
     allocation: dict[str, object] | None = None
     simulate_rotation_pairs: tuple[RotationPair, ...] = ()
+    simulate_rotation_comparisons: tuple[RotationComparison, ...] = ()
     real_rotation_pairs: tuple[RotationPair, ...] = ()
+    real_rotation_comparisons: tuple[RotationComparison, ...] = ()
 
 
 def _broker_set(value: str) -> set[str]:
@@ -2901,29 +2934,79 @@ def plan_rotation_pairs(
     lot_sizes: Mapping[str, int] | None = None,
     require_mapping: bool = False,
 ) -> tuple[RotationPair, ...]:
-    """Match the weakest eligible holdings with stronger eligible candidates."""
+    """Match eligible holdings with stronger candidates using frozen basis rules."""
+    pairs, _ = plan_rotation_pairs_with_comparisons(
+        holdings=holdings,
+        candidates=candidates,
+        entry_weight=entry_weight,
+        available_slots=available_slots,
+        pair_slots=pair_slots,
+        net_value=net_value,
+        available_cash=available_cash,
+        market=market,
+        lot_sizes=lot_sizes,
+        require_mapping=require_mapping,
+    )
+    return pairs
+
+
+def _rotation_comparison_values(
+    holding: HoldingSnapshot,
+    candidate: CandidateInput,
+    *,
+    market: str,
+) -> tuple[str | None, Decimal | None, Decimal | None, str]:
+    allowed_assets = SEARCH_ASSETS_BY_MARKET.get(market.upper(), frozenset())
+    if (
+        not holding.asset
+        or not candidate.asset
+        or holding.asset not in allowed_assets
+        or candidate.asset not in allowed_assets
+    ):
+        return None, None, None, "大类未提供或不属于当前市场"
+    same_category = holding.asset == candidate.asset
+    basis = "local" if same_category else "global"
+    sell_value = holding.strength if same_category else holding.global_strength
+    buy_value = candidate.strength if same_category else candidate.global_strength
+    label = "大类内强度" if same_category else "全局强度"
+    if (
+        sell_value is None
+        or buy_value is None
+        or not sell_value.is_finite()
+        or not buy_value.is_finite()
+        or not Decimal("0") <= sell_value <= Decimal("100")
+        or not Decimal("0") <= buy_value <= Decimal("100")
+    ):
+        return basis, sell_value, buy_value, f"{label}未提供或无效"
+    return basis, sell_value, buy_value, ""
+
+
+def plan_rotation_pairs_with_comparisons(
+    *,
+    holdings: Sequence[HoldingSnapshot],
+    candidates: Sequence[CandidateInput],
+    entry_weight: Decimal,
+    available_slots: int,
+    pair_slots: Sequence[int],
+    net_value: Decimal = Decimal("0"),
+    available_cash: Decimal | None = None,
+    market: str = "CN",
+    lot_sizes: Mapping[str, int] | None = None,
+    require_mapping: bool = False,
+) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
+    """Return executable pairs plus the frozen explanations used to choose them."""
     if available_slots > 0:
-        return ()
+        return (), ()
     slots = tuple(pair_slots[:2])
     if len(set(slots)) != len(slots) or any(slot not in {0, 1} for slot in slots):
         raise ValueError("rotation pair slots must be unique 0/1 values")
     unique_holdings = {item.symbol: item for item in holdings}
     held_symbols = set(unique_holdings)
-    weak = sorted(
-        (
-            item
-            for item in unique_holdings.values()
-            if item.global_strength is not None and item.global_strength.is_finite()
-        ),
-        key=lambda item: (item.global_strength, item.symbol),
-    )
     unique_candidates = {item.symbol: item for item in candidates}
-    strong = sorted(
+    eligible_candidates = sorted(
         (
             item for item in unique_candidates.values()
-            if item.global_strength is not None
-            and item.global_strength.is_finite()
-            and item.symbol not in held_symbols
+            if item.symbol not in held_symbols
             and item.close is not None
             and item.close.is_finite()
             and item.close > 0
@@ -2932,17 +3015,77 @@ def plan_rotation_pairs(
             and item.atr > 0
             and (not require_mapping or bool(item.futu_symbol))
         ),
-        key=lambda item: (-item.global_strength, item.symbol),
+        key=lambda item: item.symbol,
+    )
+    rows: list[tuple[HoldingSnapshot, CandidateInput, RotationComparison]] = []
+    for holding in unique_holdings.values():
+        for candidate in eligible_candidates:
+            basis, sell_compared, buy_compared, data_reason = _rotation_comparison_values(
+                holding, candidate, market=market,
+            )
+            gap = (
+                buy_compared - sell_compared
+                if sell_compared is not None and buy_compared is not None
+                else None
+            )
+            comparison = RotationComparison(
+                pair_index=-1,
+                sell_symbol=holding.symbol,
+                sell_name=holding.name or holding.symbol,
+                sell_asset=holding.asset,
+                sell_local_strength=holding.strength,
+                sell_global_strength=holding.global_strength,
+                buy_symbol=candidate.symbol,
+                buy_name=candidate.name,
+                buy_asset=candidate.asset,
+                buy_local_strength=candidate.strength,
+                buy_global_strength=candidate.global_strength,
+                strength_basis=basis,
+                sell_compared_strength=sell_compared,
+                buy_compared_strength=buy_compared,
+                strength_gap=gap,
+                outcome=(
+                    "data_unavailable"
+                    if data_reason
+                    else "gap_below_threshold"
+                    if gap < Decimal("20")
+                    else "planned"
+                ),
+                reason=(
+                    data_reason
+                    if data_reason
+                    else f"强度差 {gap} 小于门槛 20"
+                    if gap < Decimal("20")
+                    else "relative_rotation"
+                ),
+            )
+            rows.append((holding, candidate, comparison))
+    rows.sort(
+        key=lambda item: (
+            item[2].strength_gap is None,
+            -(item[2].strength_gap or Decimal("0")),
+            0 if item[2].strength_basis == "local" else 1,
+            item[1].symbol,
+            item[0].symbol,
+        )
     )
     result: list[RotationPair] = []
-    for pair_index, held, candidate in zip(slots, weak, strong):
-        assert held.global_strength is not None
-        assert candidate.global_strength is not None
+    comparisons: list[RotationComparison] = []
+    used_symbols: set[str] = set()
+    for pair_index, (held, candidate, comparison) in zip(
+        slots,
+        (
+            row for row in rows
+            if not ({row[0].symbol, row[1].symbol} & used_symbols)
+        ),
+    ):
+        comparison = replace(comparison, pair_index=pair_index)
+        used_symbols.update((held.symbol, candidate.symbol))
+        comparisons.append(comparison)
+        if comparison.outcome != "planned":
+            continue
         assert candidate.close is not None
         assert candidate.atr is not None
-        gap = candidate.global_strength - held.global_strength
-        if gap < Decimal("20"):
-            continue
         lot_size = (
             100
             if market == "CN"
@@ -2951,6 +3094,11 @@ def plan_rotation_pairs(
             else 1
         )
         if lot_size <= 0:
+            comparisons[-1] = replace(
+                comparison,
+                outcome="sizing_blocked",
+                reason="买入手数缺失",
+            )
             continue
         target_amount = min(
             net_value * entry_weight,
@@ -2958,6 +3106,11 @@ def plan_rotation_pairs(
         )
         estimated_shares = _floor_to_lot(target_amount / candidate.close, lot_size)
         if net_value > 0 and estimated_shares <= 0:
+            comparisons[-1] = replace(
+                comparison,
+                outcome="sizing_blocked",
+                reason="按现有资金与手数规则无法生成买单",
+            )
             continue
         result.append(
             RotationPair(
@@ -2973,15 +3126,23 @@ def plan_rotation_pairs(
                     or to_futu_symbol(market, candidate.symbol)
                 ),
                 buy_global_strength=candidate.global_strength,
-                strength_gap=gap,
+                strength_gap=comparison.strength_gap or Decimal("0"),
                 target_weight=entry_weight,
                 target_amount=target_amount,
                 estimated_shares=estimated_shares,
                 lot_size=lot_size,
                 atr=candidate.atr,
+                sell_asset=held.asset,
+                sell_local_strength=held.strength,
+                buy_asset=candidate.asset,
+                buy_local_strength=candidate.strength,
+                strength_basis=comparison.strength_basis,
+                sell_compared_strength=comparison.sell_compared_strength,
+                buy_compared_strength=comparison.buy_compared_strength,
+                threshold=comparison.threshold,
             )
         )
-    return tuple(result)
+    return tuple(result), tuple(comparisons)
 
 
 def _plan_account_rotation_pairs(
@@ -3000,7 +3161,7 @@ def _plan_account_rotation_pairs(
     kelly_state: TrendKellyState | None,
     critical_data_reason: str,
     require_mapping: bool,
-) -> tuple[RotationPair, ...]:
+) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Pair first, then reuse ordinary entry sizing with each sell's proceeds."""
     positions_by_symbol = {item.symbol: item for item in account.positions}
     snapshots = [
@@ -3009,7 +3170,7 @@ def _plan_account_rotation_pairs(
         if decision.action == "HOLD"
         and (snapshot := holding_snapshots.get(decision.symbol)) is not None
     ]
-    proposed = plan_rotation_pairs(
+    proposed, comparisons = plan_rotation_pairs_with_comparisons(
         holdings=snapshots,
         candidates=[
             item for item in candidates if item.symbol not in positions_by_symbol
@@ -3023,6 +3184,9 @@ def _plan_account_rotation_pairs(
     )
     candidates_by_symbol = {item.symbol: item for item in candidates}
     selected: list[RotationPair] = []
+    comparisons_by_index = {
+        item.pair_index: item for item in comparisons
+    }
     selected_sell_symbols = set(forced_sell_symbols)
     sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
     remaining_cash = account.available_cash + sum(
@@ -3042,6 +3206,12 @@ def _plan_account_rotation_pairs(
             or not position.market_value.is_finite()
             or position.market_value <= 0
         ):
+            if pair.pair_index in comparisons_by_index:
+                comparisons_by_index[pair.pair_index] = replace(
+                    comparisons_by_index[pair.pair_index],
+                    outcome="sizing_blocked",
+                    reason="持仓市值缺失，无法计算替换仓位",
+                )
             continue
         candidate_sell_symbols = selected_sell_symbols | {pair.sell_symbol}
         existing_risk, risk_reason = _post_sell_planned_risk(
@@ -3054,7 +3224,7 @@ def _plan_account_rotation_pairs(
         if existing_risk is not None:
             existing_risk += replacement_risk
         potential_cash = remaining_cash + position.market_value * sale_factor
-        actions, _, _ = _plan_buy_actions(
+        actions, skips, _ = _plan_buy_actions(
             ranked=(candidate,),
             net_value=account.net_value,
             available_cash=potential_cash,
@@ -3070,6 +3240,20 @@ def _plan_account_rotation_pairs(
             kelly_state=kelly_state,
         )
         if not actions:
+            if pair.pair_index in comparisons_by_index:
+                skip_reason = next(
+                    (
+                        str(item.get("reason") or "")
+                        for item in skips
+                        if isinstance(item, Mapping)
+                    ),
+                    "买入规则阻止",
+                )
+                comparisons_by_index[pair.pair_index] = replace(
+                    comparisons_by_index[pair.pair_index],
+                    outcome="sizing_blocked",
+                    reason=skip_reason,
+                )
             continue
         action = actions[0]
         cash_required = (
@@ -3092,7 +3276,10 @@ def _plan_account_rotation_pairs(
                 atr=action.atr,
             )
         )
-    return tuple(selected)
+    return tuple(selected), tuple(
+        comparisons_by_index.get(item.pair_index, item)
+        for item in comparisons
+    )
 
 
 def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendReport:
@@ -4663,13 +4850,14 @@ def build_report(
 
     frozen_allocation = freeze_allocation_reference(allocation_reference)
     simulate_rotation_pairs: tuple[RotationPair, ...] = ()
+    simulate_rotation_comparisons: tuple[RotationComparison, ...] = ()
     if (
         rotation_enabled
         and post_sell_position_count == POSITION_LIMIT
         and not buy_actions
         and not drawdown_pause_reason
     ):
-        simulate_rotation_pairs = _plan_account_rotation_pairs(
+        simulate_rotation_pairs, simulate_rotation_comparisons = _plan_account_rotation_pairs(
             account=account,
             holdings=holdings,
             holding_snapshots=holding_snapshots,
@@ -4694,6 +4882,7 @@ def build_report(
             for pair in simulate_rotation_pairs
         )
     real_rotation_pairs: tuple[RotationPair, ...] = ()
+    real_rotation_comparisons: tuple[RotationComparison, ...] = ()
     if real_holdings is not None and real_holdings.status == "available":
         real_sell_symbols = {
             decision.symbol
@@ -4719,7 +4908,7 @@ def build_report(
                 exceptions=(),
                 position_count=real_holdings.position_count,
             )
-            real_rotation_pairs = _plan_account_rotation_pairs(
+            real_rotation_pairs, real_rotation_comparisons = _plan_account_rotation_pairs(
                 account=real_account,
                 holdings=real_decisions,
                 holding_snapshots=real_holdings.holding_snapshots,
@@ -4865,6 +5054,8 @@ def build_report(
         allocation=frozen_allocation,
         simulate_rotation_pairs=simulate_rotation_pairs,
         real_rotation_pairs=real_rotation_pairs,
+        simulate_rotation_comparisons=simulate_rotation_comparisons,
+        real_rotation_comparisons=real_rotation_comparisons,
     )
 
 
@@ -4923,6 +5114,7 @@ def _holding_signal(item: HoldingSnapshot, *, market: str) -> dict[str, object]:
         "danger": item.danger,
         "boiling": item.boiling,
         "champagne": item.champagne,
+        "asset": item.asset,
         "industry": item.industry,
         "industry_tm_id": item.industry_tm_id,
         "industry_temperature": item.industry_temperature,
@@ -7027,6 +7219,7 @@ def _holding_snapshot(
             if isinstance(row.get("stopwinFlagByPopChampagne"), bool)
             else None
         ),
+        asset=str(row.get("asset") or "").strip(),
         industry=str(row.get("industryName") or "").strip(),
         industry_tm_id=_optional_int(row.get("industryTmId")),
         industry_temperature=industry_temperature,
