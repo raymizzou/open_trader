@@ -175,7 +175,13 @@ class _GuardedCallable:
                 object.__getattribute__(self, "_proxy_self"), *args, **kwargs
             )
         else:
-            result = object.__getattribute__(self, "_target")(*args, **kwargs)  # type: ignore[misc]
+            target = object.__getattribute__(self, "_target")
+            name = getattr(target, "__name__", "")
+            result = (
+                guard.call(name, target, *args, **kwargs)
+                if name.lower() in {"request", "send"}
+                else target(*args, **kwargs)  # type: ignore[misc]
+            )
         return guard.protect(result)
 
 
@@ -256,6 +262,8 @@ class _PolymarketReadOnlyGuard:
         if isinstance(value, (_GuardedCallable, _GuardedPolymarketValue)):
             return value
         if isinstance(value, MethodType):
+            if value.__name__.lower() in {"request", "send", "create_market_order"}:
+                return _GuardedCallable(self, target=value)
             return _GuardedCallable(
                 self,
                 function=value.__func__,
@@ -273,13 +281,18 @@ class _PolymarketReadOnlyGuard:
         return self.wrap(value)
 
     def call(self, name: str, target: Callable[..., object], *args: object, **kwargs: object) -> object:
-        if name.lower() == "request":
+        if name.lower() in {"request", "send"}:
             method = kwargs.get("method")
             if method is None and args and isinstance(args[0], str):
                 method = args[0]
             if method is None and args and hasattr(args[0], "get_method"):
                 method = args[0].get_method()
-            if str(method).upper() != "GET":
+            if method is None and args:
+                method = getattr(args[0], "method", None)
+            if name.lower() == "send" and method is None:
+                return target(*args, **kwargs)
+            allowed = {"GET", "HEAD", "OPTIONS"} if name.lower() == "send" else {"GET"}
+            if str(method).upper() not in allowed:
                 self.violation(name)
             return target(*args, **kwargs)
         self.violation(name)

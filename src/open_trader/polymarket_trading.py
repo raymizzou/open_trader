@@ -13,11 +13,12 @@ import pty
 import re
 import subprocess
 import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Sequence, cast
+from typing import Callable, Literal, cast
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 

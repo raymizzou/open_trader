@@ -383,6 +383,86 @@ def test_polymarket_guard_preserves_nested_network_send_read_method(tmp_path: Pa
     assert transport.send_calls == 1
 
 
+def test_polymarket_guard_preserves_nested_send_internal_iterator(
+    tmp_path: Path,
+) -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.responses = iter(({"ok": True},))
+
+        def send(self) -> object:
+            return next(self.responses)
+
+    transport = Transport()
+
+    class Context:
+        def __init__(self) -> None:
+            self.transport = transport
+
+    class AdapterSdk:
+        def __init__(self) -> None:
+            self._ctx = Context()
+
+        def read_account(self) -> object:
+            return self._ctx.transport.send()
+
+    class ReadOnlyNestedTransportPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = AdapterSdk()
+
+        def preflight_report(self) -> dict[str, object]:
+            self._client.read_account()
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: ReadOnlyNestedTransportPolymarket(),
+    )
+
+    assert report.status == "PASS"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
+def test_polymarket_guard_preserves_nested_local_signing_method(
+    tmp_path: Path,
+) -> None:
+    class AdapterSdk:
+        def __init__(self) -> None:
+            self.orders = iter(({"order_type": "FOK"},))
+
+        def create_market_order(self, **_: object) -> object:
+            return next(self.orders)
+
+    class LocalSigningPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = AdapterSdk()
+
+        def preflight_report(self) -> dict[str, object]:
+            order = self._client.create_market_order(side="BUY")
+            assert order["order_type"] == "FOK"
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: LocalSigningPolymarket(),
+    )
+
+    assert report.status == "PASS"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
 def test_polymarket_guard_blocks_notifier_send_but_not_network_send(
     tmp_path: Path,
 ) -> None:
