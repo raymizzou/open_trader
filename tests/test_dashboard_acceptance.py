@@ -5013,6 +5013,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             super().__init__(payload)
             self.name = name
             self.viewport_size = viewport
+            self._requests: list[object] = []
 
         def on(self, event: str, callback: object) -> None:
             if event == "request":
@@ -5031,23 +5032,22 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
                     Request("http://dashboard/api/v1/account/snapshot", '"etag"'),
                     Request("http://dashboard/api/v1/account/snapshot", '"etag"'),
                 ):
+                    self._requests.append(request)
                     callback(request)  # type: ignore[operator]
             if event == "response":
                 class Response:
-                    def __init__(self, status: int, etag: str | None = None) -> None:
+                    def __init__(self, status: int, request: object) -> None:
                         self.url = "http://dashboard/api/v1/account/snapshot"
                         self.status = status
-                        self.request = type(
-                            "Request",
-                            (),
-                            {"header_value": lambda _self, _name: etag},
-                        )()
+                        self.request = request
 
                     def json(self) -> dict[str, object]:
                         return {"schema_version": 1, "status": "healthy", "stale": False}
 
                 for response in (
-                    Response(200), Response(304, '"etag"'), Response(304, '"etag"')
+                    Response(200, self._requests[1]),
+                    Response(304, self._requests[2]),
+                    Response(304, self._requests[3]),
                 ):
                     callback(response)  # type: ignore[operator]
 
@@ -6820,18 +6820,22 @@ def test_account_api_acceptance_requires_production_health_with_matching_release
 def test_account_api_browser_requests_prove_conditional_polling_through_gateway() -> None:
     gateway = "http://127.0.0.1:8766"
     account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
 
     assert dashboard_acceptance._browser_account_network_errors(
         [
-            (gateway + "/api/dashboard", None),
-            (account, None),
-            (account, '"account-v1"'),
-            (account, '"account-v1"'),
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"account-v1"'),
+            (second_poll_request, account, '"account-v1"'),
         ],
         [
-            (account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
-            (account, 304, '"account-v1"', None),
-            (account, 304, '"account-v1"', None),
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (first_poll_request, account, 304, '"account-v1"', None),
+            (second_poll_request, account, 304, '"account-v1"', None),
         ],
         gateway,
     ) == []
@@ -6840,19 +6844,24 @@ def test_account_api_browser_requests_prove_conditional_polling_through_gateway(
 def test_account_api_browser_requests_reject_legacy_quotes_after_cutover() -> None:
     gateway = "http://127.0.0.1:8766"
     account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    quotes_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
 
     errors = dashboard_acceptance._browser_account_network_errors(
         [
-            (gateway + "/api/dashboard", None),
-            (gateway + "/api/quotes", None),
-            (account, None),
-            (account, '"account-v1"'),
-            (account, '"account-v1"'),
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (quotes_request, gateway + "/api/quotes", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"account-v1"'),
+            (second_poll_request, account, '"account-v1"'),
         ],
         [
-            (account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
-            (account, 304, '"account-v1"', None),
-            (account, 304, '"account-v1"', None),
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (first_poll_request, account, 304, '"account-v1"', None),
+            (second_poll_request, account, 304, '"account-v1"', None),
         ],
         gateway,
     )
@@ -6863,21 +6872,51 @@ def test_account_api_browser_requests_reject_legacy_quotes_after_cutover() -> No
 def test_account_api_browser_pairs_conditional_request_with_its_response() -> None:
     gateway = "http://127.0.0.1:8766"
     account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
 
     errors = dashboard_acceptance._browser_account_network_errors(
         [
-            (gateway + "/api/dashboard", None),
-            (account, None),
-            (account, '"first"'),
-            (account, '"second"'),
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"first"'),
+            (second_poll_request, account, '"second"'),
         ],
         [
-            (account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
-            (account, 304, '"second"', None),
-            (account, 200, '"third"', {"schema_version": 1, "status": "healthy", "stale": False}),
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (second_poll_request, account, 304, '"second"', None),
+            (object(), account, 200, '"third"', {"schema_version": 1, "status": "healthy", "stale": False}),
         ],
         gateway,
         expected_sha=None,
+    )
+
+    assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+
+
+def test_account_api_browser_does_not_reuse_earlier_response_for_same_etag_request() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"same"'),
+            (second_poll_request, account, '"same"'),
+        ],
+        [
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (first_poll_request, account, 304, '"same"', None),
+            (first_poll_request, account, 304, '"same"', None),
+        ],
+        gateway,
     )
 
     assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]

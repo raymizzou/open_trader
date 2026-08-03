@@ -4410,7 +4410,7 @@ def _browser_check(
                 try:
                     page = browser.new_page(viewport=viewport)
                     browser_errors: list[str] = []
-                    browser_requests: list[tuple[str, str | None]] = []
+                    browser_requests: list[tuple[Any, str, str | None]] = []
                     browser_responses: list[Any] = []
                     page.on(
                         "console",
@@ -4423,7 +4423,8 @@ def _browser_check(
                     page.on(
                         "request",
                         lambda request: browser_requests.append((
-                            request.url, request.header_value("if-none-match"),
+                            request, request.url,
+                            request.header_value("if-none-match"),
                         )),
                     )
                     page.on("response", lambda response: browser_errors.append(
@@ -4538,8 +4539,8 @@ def _browser_check(
 
 
 def _browser_account_network_errors(
-    requests: list[tuple[str, str | None]],
-    responses: list[tuple[str, int, str | None, object | None]],
+    requests: list[tuple[Any, str, str | None]],
+    responses: list[tuple[Any, str, int, str | None, object | None]],
     gateway_url: str,
     *,
     expected_sha: str | None = None,
@@ -4547,38 +4548,38 @@ def _browser_account_network_errors(
     gateway = urlsplit(gateway_url)
     account_requests = [
         item for item in requests
-        if urlsplit(item[0]).netloc == gateway.netloc
-        and urlsplit(item[0]).path == ACCOUNT_SNAPSHOT_PATH
+        if urlsplit(item[1]).netloc == gateway.netloc
+        and urlsplit(item[1]).path == ACCOUNT_SNAPSHOT_PATH
     ]
     if len(account_requests) < 3:
         return ["浏览器未等待两个 Account 五秒轮询机会"]
-    if not any(etag for _url, etag in account_requests[1:]):
+    if not any(etag for _request, _url, etag in account_requests[1:]):
         return ["浏览器后续 Account 请求缺少 If-None-Match"]
-    if any(urlsplit(request_url).path == "/api/quotes" for request_url, _etag in requests):
+    if any(urlsplit(request_url).path == "/api/quotes" for _request, request_url, _etag in requests):
         return ["浏览器仍请求 Legacy /api/quotes"]
     if not any(
         urlsplit(request_url).netloc == gateway.netloc
         and urlsplit(request_url).path == "/api/dashboard"
-        for request_url, _etag in requests
+        for _request, request_url, _etag in requests
     ):
         return ["浏览器未请求 Legacy /api/dashboard"]
     account_responses = [
-        [response_url, status, response_etag, payload]
-        for response_url, status, response_etag, payload in responses
+        [response_request, response_url, status, response_etag, payload]
+        for response_request, response_url, status, response_etag, payload in responses
         if urlsplit(response_url).netloc == gateway.netloc
         and urlsplit(response_url).path == ACCOUNT_SNAPSHOT_PATH
     ]
-    for request_url, request_etag in account_requests[1:]:
+    for request, _request_url, _request_etag in account_requests[1:]:
         matched_index = next(
             (
                 index for index, response in enumerate(account_responses)
-                if response[0] == request_url and response[2] == request_etag
+                if response[0] is request
             ),
             None,
         )
         if matched_index is None:
             return ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
-        _response_url, status, _response_etag, payload = account_responses.pop(
+        _response_request, _response_url, status, _response_etag, payload = account_responses.pop(
             matched_index
         )
         if status == 304:
@@ -4598,7 +4599,9 @@ def _browser_account_network_errors(
     return []
 
 
-def _browser_response_record(response: Any) -> tuple[str, int, str | None, object | None]:
+def _browser_response_record(
+    response: Any,
+) -> tuple[Any, str, int, str | None, object | None]:
     request = response.request
     etag = request.header_value("if-none-match")
     payload: object | None = None
@@ -4607,7 +4610,7 @@ def _browser_response_record(response: Any) -> tuple[str, int, str | None, objec
             payload = response.json()
         except Exception:
             payload = None
-    return response.url, response.status, etag, payload
+    return request, response.url, response.status, etag, payload
 
 
 def _runtime_health_errors(
