@@ -1958,7 +1958,7 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
         market="US",
         run_date="2026-07-15",
         notifier=NullNotifier(),
-        now_fn=lambda: datetime(2026, 7, 15, 12, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
         api_factory=Api,
         quote_factory=Quote,
