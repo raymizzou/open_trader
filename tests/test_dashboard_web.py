@@ -2504,6 +2504,8 @@ def test_build_cross_venue_monitor_uses_fail_closed_server_execution_mode(
     for raw, expected in (
         (None, "observe_only"),
         ("manual_confirm", "manual_confirm"),
+        (" manual_confirm ", "observe_only"),
+        ("MANUAL_CONFIRM", "observe_only"),
         ("invalid", "observe_only"),
     ):
         if raw is None:
@@ -3719,6 +3721,9 @@ console.log(JSON.stringify({
   observe:rendered("observe_only"),
   missing:rendered(undefined),
   blocked:rendered("blocked"),
+  spacePadded:rendered(" manual_confirm "),
+  uppercase:rendered("MANUAL_CONFIRM"),
+  unknown:rendered("future_mode"),
 }));
 ''')
     rendered = json.loads(output)
@@ -3729,6 +3734,9 @@ console.log(JSON.stringify({
     assert "只观察模式" in rendered["observe"]
     assert "执行模式未返回" in rendered["missing"]
     assert "执行模式已阻断" in rendered["blocked"]
+    for mode in ("spacePadded", "uppercase", "unknown"):
+        assert 'data-action="participate"' not in rendered[mode]
+        assert "执行模式未知" in rendered[mode]
 
 
 def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:

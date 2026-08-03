@@ -1770,6 +1770,49 @@ def test_cross_venue_execution_mode_is_server_authority_for_preview_and_confirm(
 
 
 @pytest.mark.parametrize(
+    "cutoff",
+    [
+        "2099-12-31 23:59:00Z",
+        "2099-12-31T23:59Z",
+        "2099-12-31T23:59:00",
+        "2099-12-31",
+        "2099-12-31T23:59:00+08:00",
+        "2020-01-01T00:00:00Z",
+    ],
+)
+def test_cross_venue_preview_rejects_noncanonical_server_cutoff(
+    tmp_path: Path, cutoff: str
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.overrides["canonical_cutoff"] = cutoff
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "rejected",
+        "reason": "canonical_cutoff_invalid",
+    }
+
+
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        "2099-12-31 23:59:00Z",
+        "2099-12-31T23:59Z",
+        "2099-12-31T23:59:00",
+        "2099-12-31",
+        "2099-12-31T23:59:00+08:00",
+        "2020-01-01T00:00:00Z",
+    ],
+)
+def test_cross_venue_intent_payload_rejects_noncanonical_cutoff(
+    cutoff: str,
+) -> None:
+    payload = PredictionExecutionService._intent_payload(_cross_intent())
+    payload["canonical_cutoff"] = cutoff
+
+    assert PredictionExecutionService._intent_from_payload(payload) is None
+
+
+@pytest.mark.parametrize(
     ("change", "reason"),
     [
         (lambda cross, _trading, _predict: cross.overrides.update({"confirmed_age_seconds": Decimal("11")}), "books_stale"),

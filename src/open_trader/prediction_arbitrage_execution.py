@@ -46,6 +46,7 @@ from .predict_cross_venue import (
     CrossVenueIntent,
     CrossVenueLeg,
     cross_venue_notification_dedupe_identity,
+    parse_canonical_cutoff,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
@@ -3651,7 +3652,9 @@ class PredictionExecutionService:
         if intent.annualized_yield is None or not intent.annualized_yield.is_finite() or intent.annualized_yield < MIN_THRESHOLD_ANNUALIZED_YIELD:
             return "annualized_yield_below_minimum"
         cutoff = intent.canonical_cutoff
-        if cutoff is None or cutoff.tzinfo is None or cutoff.astimezone(UTC) <= _utc_now():
+        if not self._cross_canonical_cutoff_matches(opportunity, intent):
+            return "canonical_cutoff_invalid"
+        if cutoff is None or cutoff.tzinfo is not UTC or cutoff <= _utc_now():
             return "canonical_cutoff_invalid"
         approval = opportunity.get("codex_approval")
         fingerprints = opportunity.get("rules_fingerprints")
@@ -3668,6 +3671,19 @@ class PredictionExecutionService:
         ):
             return "cross_venue_identity"
         return None
+
+    @staticmethod
+    def _cross_canonical_cutoff_matches(
+        opportunity: Mapping[str, object], intent: CrossVenueIntent
+    ) -> bool:
+        cutoff = intent.canonical_cutoff
+        if cutoff is None or cutoff.tzinfo is not UTC:
+            return False
+        raw = opportunity.get("canonical_cutoff")
+        if isinstance(raw, datetime):
+            return raw.tzinfo is UTC and raw == cutoff
+        parsed = parse_canonical_cutoff(raw)
+        return parsed is not None and parsed == cutoff
 
     @staticmethod
     def _cross_venue_identity_matches(
@@ -3918,7 +3934,7 @@ class PredictionExecutionService:
             decimal_names = ("quantity", "calculable_gas", "total_max_cost", "maximum_fee", "minimum_payout", "minimum_profit")
             raw = {name: _decimal(value.get(name)) for name in decimal_names}
             annualized = None if value.get("annualized_yield") is None else _decimal(value.get("annualized_yield"))
-            cutoff = PredictionExecutionService._datetime_from_payload(value.get("canonical_cutoff"))
+            cutoff = parse_canonical_cutoff(value.get("canonical_cutoff"))
             resolution = PredictionExecutionService._datetime_from_payload(value.get("resolution_at"))
             if any(item is None for item in raw.values()) or (value.get("annualized_yield") is not None and annualized is None) or cutoff is None or resolution is None:
                 return None

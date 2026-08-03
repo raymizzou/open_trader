@@ -21,12 +21,29 @@ from open_trader.predict_cross_venue import (
     PredictCrossVenueMonitor,
     build_cross_venue_intents,
     resolve_explicit_market_pairs,
+    validate_cross_execution_mode,
 )
 from open_trader.predict_source import PredictBook, PredictMarket
 from open_trader.predict_trading import PredictBuyQuote
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("observe_only", "observe_only"),
+        ("manual_confirm", "manual_confirm"),
+        (" manual_confirm ", "observe_only"),
+        ("MANUAL_CONFIRM", "observe_only"),
+        (None, "observe_only"),
+    ],
+)
+def test_validate_cross_execution_mode_requires_exact_server_value(
+    value: object, expected: str
+) -> None:
+    assert validate_cross_execution_mode(value) == expected
 
 
 def predict_market(*, external_ids: tuple[str, ...]) -> PredictMarket:
@@ -352,6 +369,9 @@ def test_equivalence_rejects_ambiguous_opening_and_closing_time_quote(tmp_path: 
         (lambda value: {**value, "predict": {**value["predict"], "rules_fingerprint": "wrong"}}, "FINGERPRINT_MISMATCH"),
         (lambda value: {**value, "direct_outcome_mapping": {**value["direct_outcome_mapping"], "predict_yes": "NO"}}, "OUTCOME_MAPPING_MISMATCH"),
         (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59:00"}, "CUTOFF_INVALID"),
+        (lambda value: {**value, "canonical_cutoff": "2026-12-31 23:59:00Z"}, "CUTOFF_INVALID"),
+        (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59Z"}, "CUTOFF_INVALID"),
+        (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59:00+08:00"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "not-a-date"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "2027-01-01T00:00:00Z"}, "CUTOFF_EVIDENCE_MISMATCH"),
         (lambda value: {**value, "contract_shape": "COMPOUND"}, "COMPOUND_CONTRACT"),
@@ -374,6 +394,24 @@ def test_equivalence_approval_fails_closed_for_all_post_check_mismatches(tmp_pat
 
     assert result.approved is False
     assert result.reason == reason
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2099-12-31 23:59:00Z",
+        "2099-12-31T23:59Z",
+        "2099-12-31T23:59:00",
+        "2099-12-31",
+        "2099-12-31T23:59:00+08:00",
+        "2020-01-01T00:00:00Z",
+    ],
+)
+def test_canonical_cutoff_parser_requires_exact_utc_format(value: str) -> None:
+    assert predict_cross_venue._canonical_cutoff(value) is None
+    assert predict_cross_venue._canonical_cutoff(
+        "2099-12-31T23:59:00.123Z"
+    ) == datetime(2099, 12, 31, 23, 59, 0, 123000, tzinfo=UTC)
 
 
 def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_checks() -> None:
@@ -924,7 +962,7 @@ class FakeCrossVenueValidator:
             predict_event_end_at=pair.predict.event_end_at,
             polymarket_close_at=pair.polymarket.close_at,
             polymarket_settlement_at=pair.polymarket.settlement_at,
-            canonical_cutoff=datetime(2026, 1, 21, tzinfo=UTC) if approved else None,
+            canonical_cutoff=datetime(2026, 12, 31, tzinfo=UTC) if approved else None,
             direct_outcome_mapping={
                 "predict_yes": "YES",
                 "predict_no": "NO",

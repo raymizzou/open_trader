@@ -2562,7 +2562,8 @@ function predictionIsCrossVenue(value) {
 }
 
 function predictionCrossExecutionMode(value) {
-  return String(value?.execution_mode || "").trim().toLowerCase();
+  const mode = value?.execution_mode;
+  return typeof mode === "string" ? mode : "";
 }
 
 function predictionCrossExecutionModeReason(value) {
@@ -2570,7 +2571,7 @@ function predictionCrossExecutionModeReason(value) {
   if (mode === "observe_only") return "当前为只观察模式，不开放下单。";
   if (!mode) return "执行模式未返回，当前不会开放下单。";
   if (mode === "blocked") return "当前执行模式已阻断，不开放下单。";
-  return "当前执行模式不支持下单，保留监控结果。";
+  return "执行模式未知，当前不会开放下单。";
 }
 
 function predictionCrossVenueTradingAvailable(payload) {

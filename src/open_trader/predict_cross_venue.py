@@ -38,13 +38,15 @@ from .prediction_arbitrage_store import PredictionArbitrageStore
 
 Direction = Literal["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"]
 CROSS_EXECUTION_MODES = frozenset({"observe_only", "manual_confirm"})
+_CANONICAL_CUTOFF_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+)
 
 
 def validate_cross_execution_mode(value: object) -> str:
     """Return the server-owned cross execution mode, failing closed."""
 
-    mode = value.strip() if isinstance(value, str) else ""
-    return mode if mode in CROSS_EXECUTION_MODES else "observe_only"
+    return value if isinstance(value, str) and value in CROSS_EXECUTION_MODES else "observe_only"
 
 
 CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION = (
@@ -820,13 +822,16 @@ def _equivalence_validation(
 
 
 def _canonical_cutoff(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if not isinstance(value, str) or _CANONICAL_CUTOFF_PATTERN.fullmatch(value) is None:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is UTC else None
+    return parsed if parsed.tzinfo is UTC and parsed > datetime.now(UTC) else None
+
+
+parse_canonical_cutoff = _canonical_cutoff
 
 
 def _evidence_supports_cutoff(quote: object, cutoff: datetime) -> bool:
@@ -1455,7 +1460,9 @@ class PredictCrossVenueMonitor:
                 if intent.annualized_yield is not None
                 else None
             ),
-            "canonical_cutoff": intent.canonical_cutoff.isoformat(),
+            "canonical_cutoff": intent.canonical_cutoff.astimezone(UTC).isoformat().replace(
+                "+00:00", "Z"
+            ),
             "resolution_at": intent.resolution_at.isoformat(),
             "actionable": intent.actionable,
             "quote_available": intent.quote_available,
