@@ -5,13 +5,19 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Mapping
 
 from .account_sync_state import (
+    ACCOUNT_STATE_VERSION,
     REQUIRED_BROKERS,
     effective_source_status,
     is_valid_account_publication,
 )
+
+
+MAX_STABLE_READ_ATTEMPTS = 3
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 @dataclass(frozen=True)
@@ -21,11 +27,21 @@ class SnapshotResult:
     etag: str | None
 
 
+class PublicationUnavailable(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+
+
 def load_account_snapshot(
     data_dir: Path, *, api_git_sha: str, now: datetime
 ) -> SnapshotResult:
-    account, quotes, worker_sha = _load_stable_publication(data_dir)
-    return _build_snapshot(account, quotes, api_git_sha, worker_sha, now)
+    try:
+        account, quotes, worker_sha = _load_stable_publication(data_dir)
+        if not _is_git_sha(api_git_sha) or api_git_sha != worker_sha:
+            return _unavailable("account_release_mismatch", api_git_sha, worker_sha)
+        return _build_snapshot(account, quotes, api_git_sha, worker_sha, now)
+    except PublicationUnavailable as error:
+        return _unavailable(error.code, api_git_sha, "")
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -44,25 +60,153 @@ def _opaque_id(prefix: str, values: list[str]) -> str:
     ).hexdigest()
 
 
+def _read_bytes(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def _read_required(path: Path, publication: str) -> bytes:
+    try:
+        return _read_bytes(path)
+    except OSError as error:
+        code = "account_release_mismatch" if publication == "heartbeat" else f"{publication}_publication_missing"
+        raise PublicationUnavailable(code) from error
+
+
 def _load_stable_publication(data_dir: Path) -> tuple[dict[str, object], dict[str, object], str]:
     account_path = data_dir / "latest/account_sync_state.json"
     quotes_path = data_dir / "latest/quotes.json"
-    account_bytes = account_path.read_bytes()
-    quotes_bytes = quotes_path.read_bytes()
-    worker = json.loads((data_dir / "account_sync/controller_status.json").read_text(encoding="utf-8"))
-    if account_bytes != account_path.read_bytes() or quotes_bytes != quotes_path.read_bytes():
-        raise ValueError("account publication changed during read")
-    account = json.loads(account_bytes)
-    quotes = json.loads(quotes_bytes)
-    if not is_valid_account_publication(account) or not isinstance(quotes, dict):
-        raise ValueError("invalid account publication")
-    projection = account["dashboard_projection"]
-    assert isinstance(projection, dict)
-    if projection["quote_as_of"] != quotes.get("last_success_at"):
-        raise ValueError("quote publication time mismatch")
-    if not isinstance(worker, dict) or not isinstance(worker.get("git_sha"), str):
-        raise ValueError("invalid account worker status")
-    return account, quotes, worker["git_sha"]
+    heartbeat_path = data_dir / "account_sync/controller_status.json"
+    for _attempt in range(MAX_STABLE_READ_ATTEMPTS):
+        account_first = _read_required(account_path, "account")
+        quotes_first = _read_required(quotes_path, "quotes")
+        heartbeat = _read_required(heartbeat_path, "heartbeat")
+        account_second = _read_required(account_path, "account")
+        quotes_second = _read_required(quotes_path, "quotes")
+        if account_first != account_second or quotes_first != quotes_second:
+            continue
+        account = _parse_account(account_first)
+        quotes = _parse_quotes(quotes_first)
+        worker_sha = _worker_sha(heartbeat)
+        projection = account["dashboard_projection"]
+        assert isinstance(projection, dict)
+        if projection["quote_as_of"] != quotes["last_success_at"]:
+            continue
+        return account, quotes, worker_sha
+    raise PublicationUnavailable("account_publication_unstable")
+
+
+def _parse_account(raw: bytes) -> dict[str, object]:
+    try:
+        account = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublicationUnavailable("account_publication_invalid") from error
+    if not isinstance(account, dict):
+        raise PublicationUnavailable("account_publication_invalid")
+    if account.get("version") != ACCOUNT_STATE_VERSION:
+        raise PublicationUnavailable("account_schema_unsupported")
+    if not is_valid_account_publication(account):
+        raise PublicationUnavailable("account_publication_invalid")
+    return account
+
+
+def _parse_quotes(raw: bytes) -> dict[str, object]:
+    try:
+        quotes = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublicationUnavailable("quotes_publication_invalid") from error
+    if not isinstance(quotes, dict):
+        raise PublicationUnavailable("quotes_publication_invalid")
+    required = {
+        "status": str,
+        "requested_count": int,
+        "quote_count": int,
+        "missing_count": int,
+        "fetched_at": str,
+        "last_success_at": str,
+        "stale": bool,
+        "quotes": dict,
+        "diagnostic": dict,
+    }
+    if (
+        quotes.get("status") not in {"ok", "partial", "failed"}
+        or any(
+            not isinstance(quotes.get(field), kind)
+            or (kind is int and isinstance(quotes.get(field), bool))
+            for field, kind in required.items()
+        )
+        or any(
+            not isinstance(symbol, str) or not isinstance(row, dict)
+            for symbol, row in quotes["quotes"].items()
+        )
+    ):
+        raise PublicationUnavailable("quotes_publication_invalid")
+    return quotes
+
+
+def _worker_sha(raw: bytes) -> str:
+    try:
+        heartbeat = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublicationUnavailable("account_release_mismatch") from error
+    if not _is_valid_heartbeat(heartbeat):
+        raise PublicationUnavailable("account_release_mismatch")
+    git_sha = heartbeat.get("git_sha")
+    if not _is_git_sha(git_sha):
+        raise PublicationUnavailable("account_release_mismatch")
+    return git_sha
+
+
+def _is_valid_heartbeat(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "schema_version": str,
+        "working_directory": str,
+        "git_sha": str,
+        "phase": str,
+        "account_loop": dict,
+        "quote_loop": dict,
+    }
+    return (
+        value.get("schema_version") == "open_trader.account_sync.controller.v1"
+        and not isinstance(value.get("pid"), bool)
+        and isinstance(value.get("pid"), int)
+        and all(isinstance(value.get(field), kind) for field, kind in required.items())
+        and (value.get("blocker") is None or isinstance(value.get("blocker"), str))
+        and all(_is_aware_timestamp(value.get(field, "")) for field in ("started_at", "heartbeat_at"))
+    )
+
+
+def _is_git_sha(value: object) -> bool:
+    return isinstance(value, str) and _GIT_SHA_RE.fullmatch(value) is not None
+
+
+def _unavailable(code: str, api_git_sha: str, worker_git_sha: str) -> SnapshotResult:
+    source = "release" if code == "account_release_mismatch" else "quotes" if code.startswith("quotes_") else "account"
+    message = (
+        "Account API and Account Sync Worker releases differ"
+        if code == "account_release_mismatch"
+        else "Quotes publication is unavailable"
+        if source == "quotes"
+        else "Account publication is unstable"
+        if code == "account_publication_unstable"
+        else "Account publication is unavailable"
+    )
+    return SnapshotResult(
+        503,
+        {
+            "schema_version": 1,
+            "status": "unavailable",
+            "release": {"api_git_sha": api_git_sha, "worker_git_sha": worker_git_sha},
+            "errors": [{
+                "code": code,
+                "source": source,
+                "message": message,
+                "retryable": True,
+            }],
+        },
+        None,
+    )
 
 
 def _build_snapshot(
@@ -88,24 +232,43 @@ def _build_snapshot(
         (_public_cash_balance(row) for row in projection["cash_details"]),
         key=lambda row: (row["broker"], row["account_alias"], row["currency"]),
     )
-    accepted_account_as_of = max(
-        (brokers[broker]["last_success_at"] for broker in REQUIRED_BROKERS),
-        key=datetime.fromisoformat,
-    )
+    accepted_account_as_of = _accepted_account_as_of(brokers)
+    if accepted_account_as_of is None:
+        raise PublicationUnavailable("account_publication_missing")
+    if not _has_complete_quote_coverage(brokers, quotes):
+        raise PublicationUnavailable("quotes_publication_missing")
+    quote_as_of = quotes["last_success_at"]
+    assert isinstance(quote_as_of, str)
+    if not _is_aware_timestamp(quote_as_of):
+        raise PublicationUnavailable("quotes_publication_missing")
+    quotes_status = quotes["status"]
+    missing_count = quotes["missing_count"]
+    assert isinstance(quotes_status, str) and isinstance(missing_count, int)
+    if quotes_status == "partial" and missing_count > 0:
+        raise PublicationUnavailable("quotes_publication_missing")
+    if quotes_status == "failed" and not quote_as_of:
+        raise PublicationUnavailable("quotes_publication_missing")
+    broker_stale = {
+        broker: _is_broker_stale(brokers[broker], now)
+        for broker in REQUIRED_BROKERS
+    }
+    quotes_stale = quotes_status == "failed"
+    account_stale = any(broker_stale.values())
+    stale = account_stale or quotes_stale
     sources = {
         "account": {
-            "status": "healthy",
+            "status": "stale" if account_stale else "healthy",
             "as_of": accepted_account_as_of,
-            "reason": None,
+            "reason": "broker_refresh_failed" if account_stale else None,
             "brokers": {
-                broker: _broker_source(brokers[broker], now)
+                broker: _broker_source(brokers[broker], broker_stale[broker])
                 for broker in sorted(REQUIRED_BROKERS)
             },
         },
         "quotes": {
-            "status": "healthy",
-            "as_of": quotes["last_success_at"],
-            "reason": None,
+            "status": "stale" if quotes_stale else "healthy",
+            "as_of": quote_as_of,
+            "reason": "quotes_refresh_failed" if quotes_stale else None,
         },
     }
     account_generation = _sha256({
@@ -122,16 +285,16 @@ def _build_snapshot(
         "schema_version": 1,
         "account_generation": account_generation,
         "generated_at": projection["generated_at"],
-        "quote_as_of": quotes["last_success_at"],
-        "status": "healthy",
-        "stale": False,
+        "quote_as_of": quote_as_of,
+        "status": "stale" if stale else "healthy",
+        "stale": stale,
         "sources": sources,
         "release": {"api_git_sha": api_git_sha, "worker_git_sha": worker_sha},
         "summary": summary,
         "broker_summaries": broker_summaries,
         "positions": positions,
         "cash_balances": cash_balances,
-        "errors": [],
+        "errors": _stale_errors(broker_stale, quotes_stale),
     }
     snapshot_generation = _sha256(payload_without_snapshot_generation)
     payload_tail = dict(payload_without_snapshot_generation)
@@ -204,13 +367,93 @@ def _public_cash_balance(row: object) -> dict[str, str]:
     }
 
 
-def _broker_source(source: object, now: datetime) -> dict[str, object]:
+def _accepted_account_as_of(brokers: Mapping[str, object]) -> str | None:
+    accepted: list[str] = []
+    for broker in REQUIRED_BROKERS:
+        source = brokers[broker]
+        if not isinstance(source, Mapping) or source.get("status") == "unknown":
+            return None
+        last_success_at = source.get("last_success_at")
+        if not isinstance(last_success_at, str) or not last_success_at:
+            return None
+        if not _is_aware_timestamp(last_success_at):
+            return None
+        accepted.append(last_success_at)
+    return max(accepted, key=datetime.fromisoformat)
+
+
+def _is_aware_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def _is_broker_stale(source: object, now: datetime) -> bool:
     assert isinstance(source, Mapping)
-    status = effective_source_status(source, now=now)
+    return source["status"] == "failed" or effective_source_status(source, now=now) == "stale"
+
+
+def _has_complete_quote_coverage(
+    brokers: Mapping[str, object], quotes: Mapping[str, object]
+) -> bool:
+    published = quotes["quotes"]
+    assert isinstance(published, dict)
+    required = {
+        (str(position["market"]), str(position["symbol"]))
+        for broker in REQUIRED_BROKERS
+        if isinstance(brokers[broker], Mapping) and brokers[broker].get("source_kind") == "live"
+        for position in brokers[broker]["positions"]
+        if isinstance(position, Mapping)
+    }
+    return all(
+        any(_is_valid_quote_row(row, market, symbol) for row in published.values())
+        for market, symbol in required
+    )
+
+
+def _is_valid_quote_row(row: object, market: str, symbol: str) -> bool:
+    return (
+        isinstance(row, Mapping)
+        and row.get("market") == market
+        and row.get("symbol") == symbol
+        and row.get("status") == "ok"
+        and isinstance(row.get("last_price"), str)
+        and bool(row["last_price"])
+    )
+
+
+def _stale_errors(
+    broker_stale: Mapping[str, bool], quotes_stale: bool
+) -> list[dict[str, object]]:
+    errors = [
+        {
+            "code": "broker_refresh_failed",
+            "source": broker,
+            "message": "Latest broker refresh failed; serving last accepted account facts",
+            "retryable": True,
+        }
+        for broker in sorted(REQUIRED_BROKERS)
+        if broker_stale[broker]
+    ]
+    if quotes_stale:
+        errors.append({
+            "code": "quotes_refresh_failed",
+            "source": "quotes",
+            "message": "Latest quote refresh failed; serving last accepted quotes",
+            "retryable": True,
+        })
+    return errors
+
+
+def _broker_source(source: object, stale: bool) -> dict[str, object]:
+    assert isinstance(source, Mapping)
     return {
         "source_kind": source["source_kind"],
-        "status": "healthy" if status == "ok" else "stale",
+        "status": "stale" if stale else "healthy",
         "data_as_of": source["data_as_of"],
         "last_success_at": source["last_success_at"],
-        "reason": None if status == "ok" else "broker_refresh_failed",
+        "reason": "broker_refresh_failed" if stale else None,
     }

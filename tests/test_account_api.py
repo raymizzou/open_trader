@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.account_snapshot as account_snapshot
 from open_trader.account_snapshot import load_account_snapshot
 from open_trader.account_sync_state import (
     LIVE_BROKERS,
@@ -15,6 +16,7 @@ from open_trader.account_sync_state import (
     BrokerAccountCandidate,
     accept_candidate,
     empty_account_sync_state,
+    record_source_failure,
     with_dashboard_projection,
     write_json_atomic,
 )
@@ -127,6 +129,13 @@ def _write_publication(data_dir: Path, *, worker_sha: str = SHA) -> None:
     )
 
 
+def _rewrite_json(path: Path, updates: dict[str, object]) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    payload.update(updates)
+    write_json_atomic(path, payload)
+
+
 def test_snapshot_maps_current_publication_to_frozen_v1_contract(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)
@@ -207,5 +216,310 @@ def test_snapshot_whitelists_public_fields_and_requires_quote_publication_time(
     quotes["last_success_at"] = "2026-08-03T12:00:03+08:00"
     write_json_atomic(quotes_path, quotes)
 
-    with pytest.raises(ValueError, match="quote publication time"):
-        load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.payload["errors"][0]["code"] == "account_publication_unstable"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    [
+        (lambda data: (data / "latest/account_sync_state.json").unlink(), "account_publication_missing"),
+        (lambda data: (data / "latest/account_sync_state.json").write_text("{bad", encoding="utf-8"), "account_publication_invalid"),
+        (lambda data: _rewrite_json(data / "latest/account_sync_state.json", {"version": 2}), "account_schema_unsupported"),
+        (lambda data: (data / "latest/quotes.json").unlink(), "quotes_publication_missing"),
+        (lambda data: (data / "latest/quotes.json").write_text("[]", encoding="utf-8"), "quotes_publication_invalid"),
+    ],
+)
+def test_snapshot_returns_contract_503_for_invalid_publication(
+    tmp_path: Path, mutate, code: str
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    mutate(data_dir)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "release": {"api_git_sha": SHA, "worker_git_sha": ""},
+        "errors": [{
+            "code": code,
+            "source": "account" if code.startswith("account_") else "quotes",
+            "message": "Account publication is unavailable" if code.startswith("account_") else "Quotes publication is unavailable",
+            "retryable": True,
+        }],
+    }
+
+
+def test_snapshot_returns_release_mismatch_without_worker_details(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    worker_sha = "f" * 40
+    _write_publication(data_dir, worker_sha=worker_sha)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "release": {"api_git_sha": SHA, "worker_git_sha": worker_sha},
+        "errors": [{
+            "code": "account_release_mismatch",
+            "source": "release",
+            "message": "Account API and Account Sync Worker releases differ",
+            "retryable": True,
+        }],
+    }
+
+
+def test_snapshot_rejects_incomplete_worker_heartbeat(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    write_json_atomic(
+        data_dir / "account_sync/controller_status.json",
+        {
+            "schema_version": "open_trader.account_sync.controller.v1",
+            "git_sha": SHA,
+        },
+    )
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "account_release_mismatch"
+
+
+def test_snapshot_returns_stale_with_retained_broker_facts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    before = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+    path = data_dir / "latest/account_sync_state.json"
+    account = json.loads(path.read_text(encoding="utf-8"))
+    account = record_source_failure(
+        account,
+        "futu",
+        attempted_at="2026-08-03T12:00:03+08:00",
+        message="secret upstream response",
+    )
+    account["dashboard_projection"] = json.loads(path.read_text(encoding="utf-8"))["dashboard_projection"]
+    write_json_atomic(path, account)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert result.payload["status"] == "stale"
+    assert result.payload["stale"] is True
+    assert result.payload["account_generation"] == before.payload["account_generation"]
+    assert result.payload["errors"] == [{
+        "code": "broker_refresh_failed",
+        "source": "futu",
+        "message": "Latest broker refresh failed; serving last accepted account facts",
+        "retryable": True,
+    }]
+    assert "secret" not in json.dumps(result.payload)
+
+
+def test_snapshot_returns_stale_with_complete_retained_quotes(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    quotes_path = data_dir / "latest/quotes.json"
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    quotes["status"] = "failed"
+    quotes["stale"] = True
+    write_json_atomic(quotes_path, quotes)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert result.payload["status"] == "stale"
+    assert result.payload["sources"]["quotes"] == {
+        "status": "stale",
+        "as_of": "2026-08-03T12:00:04+08:00",
+        "reason": "quotes_refresh_failed",
+    }
+    assert result.payload["errors"] == [{
+        "code": "quotes_refresh_failed",
+        "source": "quotes",
+        "message": "Latest quote refresh failed; serving last accepted quotes",
+        "retryable": True,
+    }]
+
+
+def test_snapshot_keeps_complete_partial_quotes_healthy(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _rewrite_json(data_dir / "latest/quotes.json", {"status": "partial"})
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert result.payload["status"] == "healthy"
+    assert result.payload["sources"]["quotes"]["status"] == "healthy"
+    assert result.payload["errors"] == []
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"status": "partial", "missing_count": 1},
+        {"status": "failed", "quotes": {}},
+    ],
+)
+def test_snapshot_rejects_incomplete_retained_quotes(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _rewrite_json(data_dir / "latest/quotes.json", updates)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_missing"
+
+
+def test_snapshot_rejects_quotes_without_an_accepted_publication(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    account_path = data_dir / "latest/account_sync_state.json"
+    quotes_path = data_dir / "latest/quotes.json"
+    account = json.loads(account_path.read_text(encoding="utf-8"))
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    account["dashboard_projection"]["quote_as_of"] = ""
+    quotes["status"] = "partial"
+    quotes["last_success_at"] = ""
+    write_json_atomic(account_path, account)
+    write_json_atomic(quotes_path, quotes)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_missing"
+
+
+def test_snapshot_classifies_malformed_quote_rows_as_invalid(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _rewrite_json(data_dir / "latest/quotes.json", {"quotes": {"US.TEST0": []}})
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+
+
+def test_snapshot_rejects_account_source_without_accepted_facts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    path = data_dir / "latest/account_sync_state.json"
+    account = json.loads(path.read_text(encoding="utf-8"))
+    account["brokers"]["futu"]["last_success_at"] = ""
+    write_json_atomic(path, account)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "account_publication_missing"
+
+
+def test_quote_age_alone_does_not_stale_a_successful_publication(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    account_path = data_dir / "latest/account_sync_state.json"
+    quotes_path = data_dir / "latest/quotes.json"
+    account = json.loads(account_path.read_text(encoding="utf-8"))
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    old_quote = "2026-08-02T16:00:00+08:00"
+    account["dashboard_projection"]["quote_as_of"] = old_quote
+    quotes["last_success_at"] = old_quote
+    quotes["fetched_at"] = old_quote
+    for row in quotes["quotes"].values():
+        row["price_time"] = old_quote
+        row["fetched_at"] = old_quote
+    write_json_atomic(account_path, account)
+    write_json_atomic(quotes_path, quotes)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert result.payload["sources"]["quotes"]["status"] == "healthy"
+
+
+def test_live_account_age_stales_account_but_not_statement_sources(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+
+    result = load_account_snapshot(
+        data_dir,
+        api_git_sha=SHA,
+        now=datetime.fromisoformat("2026-08-03T12:03:01+08:00"),
+    )
+
+    assert result.status_code == 200
+    assert result.payload["status"] == "stale"
+    assert result.payload["sources"]["account"]["brokers"]["futu"]["status"] == "stale"
+    assert result.payload["sources"]["account"]["brokers"]["phillips"]["status"] == "healthy"
+
+
+def test_snapshot_retries_one_account_quote_read_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    real_read = Path.read_bytes
+    account_path = data_dir / "latest/account_sync_state.json"
+    calls = 0
+
+    def racing_read(path: Path) -> bytes:
+        nonlocal calls
+        body = real_read(path)
+        if path == account_path:
+            calls += 1
+            if calls == 2:
+                changed = json.loads(body)
+                changed["generation"] = "2026-08-03T12:00:01+08:00"
+                return json.dumps(changed, sort_keys=True).encode()
+        return body
+
+    monkeypatch.setattr(account_snapshot, "_read_bytes", racing_read, raising=False)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert calls >= 4
+
+
+def test_snapshot_returns_unstable_after_three_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    real_read = Path.read_bytes
+    counter = 0
+
+    def always_changing(path: Path) -> bytes:
+        nonlocal counter
+        body = real_read(path)
+        if path.name == "account_sync_state.json":
+            counter += 1
+            return body + str(counter).encode()
+        return body
+
+    monkeypatch.setattr(account_snapshot, "_read_bytes", always_changing, raising=False)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.payload["errors"][0]["code"] == "account_publication_unstable"
+    assert counter == 6
