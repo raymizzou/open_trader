@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.open-trader.account-api</string>
+  <key>WorkingDirectory</key>
+  <string>OPEN_TRADER_REPO</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>OPEN_TRADER_REPO/src</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>OPEN_TRADER_PYTHON</string>
+    <string>-m</string>
+    <string>open_trader</string>
+    <string>account-api</string>
+    <string>--data-dir</string>
+    <string>OPEN_TRADER_DATA_DIR</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>OPEN_TRADER_REPO/logs/account_api/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>OPEN_TRADER_REPO/logs/account_api/launchd.err.log</string>
+</dict>
+</plist>
