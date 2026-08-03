@@ -372,6 +372,7 @@ def _run_acceptance_main_with_reports(
     started_at = datetime.fromisoformat("2026-08-01T12:00:00+08:00")
     gateway_log = tmp_path / "gateway.log"
     legacy_log = tmp_path / "legacy.log"
+    account_log = tmp_path / "account.log"
     gateway_log.write_text(
         "frontend_gateway_runtime: "
         + json.dumps({
@@ -399,6 +400,18 @@ def _run_acceptance_main_with_reports(
             + "\n",
             encoding="utf-8",
         )
+    account_log.write_text(
+        "account_api_runtime: "
+        + json.dumps({
+            "pid": 789,
+            "git_sha": "accepted-sha",
+            "cwd": str(worktree.resolve()),
+            "source_state": "clean",
+            "started_at": "2026-08-01T12:00:01+08:00",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
     if log_read_error is not None:
         original_read_text = Path.read_text
 
@@ -419,6 +432,7 @@ def _run_acceptance_main_with_reports(
     listeners = {
         "http://127.0.0.1:8766": (123, worktree.resolve()),
         "http://127.0.0.1:8767": (legacy_pid, worktree.resolve()),
+        "http://127.0.0.1:8768": (789, worktree.resolve()),
     }
     health = {
         "http://127.0.0.1:8766": {
@@ -429,6 +443,7 @@ def _run_acceptance_main_with_reports(
                 pid=123,
             ),
             "upstream_status": "ok",
+            "account_upstream_status": "ok",
         },
         "http://127.0.0.1:8767": _runtime_health(
             worktree.resolve(),
@@ -436,6 +451,17 @@ def _run_acceptance_main_with_reports(
             schema="open_trader.legacy_dashboard.health.v1",
             pid=legacy_pid,
         ),
+        "http://127.0.0.1:8768": {
+            "schema_version": "open_trader.account_api.health.v1",
+            "module": "account_api",
+            "status": "ok",
+            "mode": "production",
+            "pid": 789,
+            "started_at": "2026-08-01T12:00:01+08:00",
+            "api_git_sha": "accepted-sha",
+            "worker_git_sha": "accepted-sha",
+            "release_match": True,
+        },
     }
     monkeypatch.setattr(dashboard_acceptance, "_listener", lambda url: listeners[url])
     monkeypatch.setattr(
@@ -470,6 +496,33 @@ def _run_acceptance_main_with_reports(
 
     monkeypatch.setattr(dashboard_acceptance, "_fetch_payload", fetch_payload)
     monkeypatch.setattr(dashboard_acceptance, "_fetch_quotes_payload", fetch_quotes)
+    account_snapshot = {
+        "schema_version": 1,
+        "snapshot_generation": "sha256:account",
+        "account_generation": "account-generation",
+        "generated_at": "2026-08-01T12:00:01+08:00",
+        "quote_as_of": "2026-08-01T12:00:01+08:00",
+        "status": "healthy",
+        "stale": False,
+        "sources": {},
+        "release": {"api_git_sha": "accepted-sha", "worker_git_sha": "accepted-sha"},
+        "summary": {},
+        "broker_summaries": [],
+        "positions": [],
+        "cash_balances": [],
+        "errors": [],
+    }
+    snapshots = iter(((200, account_snapshot, '"account"'), (304, None, '"account"')))
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_fetch_account_snapshot",
+        lambda url, **_kwargs: (record_public(url), next(snapshots))[1],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "check_account_api_parity",
+        lambda *_args, **_kwargs: type("Parity", (), {"status": "PASS", "reason": "ok"})(),
+    )
     def health_payload(url: str, path: str) -> dict[str, object]:
         assert path == "/healthz"
         return health[url]
@@ -532,6 +585,7 @@ def _run_acceptance_main_with_reports(
         "--expected-root", str(worktree),
         "--log", str(gateway_log),
         "--legacy-log", str(legacy_log),
+        "--account-log", str(account_log),
     ])
     result = json.loads(capsys.readouterr().out)
     return status, result, browser_reports
@@ -647,8 +701,12 @@ def test_make_acceptance_wires_gateway_and_legacy_runtime_logs() -> None:
     assert "logs/frontend_gateway/launchd.out.log" in makefile
     assert "LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767" in makefile
     assert "logs/legacy_dashboard/launchd.out.log" in makefile
+    assert 'ACCOUNT_API_URL ?= http://127.0.0.1:8768' in makefile
+    assert 'ACCOUNT_API_LOG ?= $(WORKTREE_ROOT)/logs/account_api/launchd.out.log' in makefile
     assert '--legacy-url "$(LEGACY_DASHBOARD_URL)"' in makefile
     assert '--legacy-log "$(LEGACY_DASHBOARD_LOG)"' in makefile
+    assert '--account-url "$(ACCOUNT_API_URL)"' in makefile
+    assert '--account-log "$(ACCOUNT_API_LOG)"' in makefile
 
 
 def test_acceptance_main_rejects_same_gateway_and_legacy_pid(
@@ -3933,7 +3991,7 @@ class TabbedAccountPage:
         return self.trend_broker != self.document_overflow_broker
 
     def wait_for_timeout(self, milliseconds: int) -> None:
-        assert milliseconds == 500
+        assert milliseconds in {500, dashboard_acceptance.ACCOUNT_POLL_PROOF_WAIT_MS}
 
     def wait_for_function(
         self, expression: str, *, arg: object, timeout: int,
@@ -4955,8 +5013,32 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             self.name = name
             self.viewport_size = viewport
 
-        def on(self, *_args: object) -> None:
-            pass
+        def on(self, event: str, callback: object) -> None:
+            if event == "request":
+                class Request:
+                    def __init__(self, url: str, etag: str | None = None) -> None:
+                        self.url = url
+                        self.etag = etag
+
+                    def header_value(self, name: str) -> str | None:
+                        assert name == "if-none-match"
+                        return self.etag
+
+                for request in (
+                    Request("http://dashboard/api/dashboard"),
+                    Request("http://dashboard/api/v1/account/snapshot"),
+                    Request("http://dashboard/api/v1/account/snapshot", '"etag"'),
+                    Request("http://dashboard/api/v1/account/snapshot", '"etag"'),
+                ):
+                    callback(request)  # type: ignore[operator]
+            if event == "response":
+                class Response:
+                    def __init__(self, status: int) -> None:
+                        self.url = "http://dashboard/api/v1/account/snapshot"
+                        self.status = status
+
+                for response in (Response(200), Response(304), Response(304)):
+                    callback(response)  # type: ignore[operator]
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
             visited.append(self.name)
@@ -6667,6 +6749,75 @@ def test_acceptance_accepts_matching_gateway_health(tmp_path: Path) -> None:
         ),
         expected_upstream_status="ok",
     ) == []
+
+
+def test_account_api_acceptance_requires_production_health_with_matching_release(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "schema_version": "open_trader.account_api.health.v1",
+        "module": "account_api",
+        "status": "ok",
+        "mode": "production",
+        "pid": 123,
+        "started_at": "2026-08-01T12:00:01+08:00",
+        "api_git_sha": "accepted-sha",
+        "worker_git_sha": "accepted-sha",
+        "release_match": True,
+    }
+
+    assert dashboard_acceptance._account_runtime_health_errors(
+        payload,
+        pid=123,
+        expected_sha="accepted-sha",
+        process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    ) == []
+
+    payload["worker_git_sha"] = "old-sha"
+    assert any(
+        "Worker Git SHA" in error
+        for error in dashboard_acceptance._account_runtime_health_errors(
+            payload,
+            pid=123,
+            expected_sha="accepted-sha",
+            process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+        )
+    )
+
+
+def test_account_api_browser_requests_prove_conditional_polling_through_gateway() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+
+    assert dashboard_acceptance._browser_account_network_errors(
+        [
+            (gateway + "/api/dashboard", None),
+            (account, None),
+            (account, '"account-v1"'),
+            (account, '"account-v1"'),
+        ],
+        [(account, 200), (account, 304), (account, 304)],
+        gateway,
+    ) == []
+
+
+def test_account_api_browser_requests_reject_legacy_quotes_after_cutover() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (gateway + "/api/dashboard", None),
+            (gateway + "/api/quotes", None),
+            (account, None),
+            (account, '"account-v1"'),
+            (account, '"account-v1"'),
+        ],
+        [(account, 200), (account, 304), (account, 304)],
+        gateway,
+    )
+
+    assert errors == ["浏览器仍请求 Legacy /api/quotes"]
 
 
 @pytest.mark.parametrize(

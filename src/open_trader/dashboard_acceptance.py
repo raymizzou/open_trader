@@ -11,9 +11,12 @@ import re
 import subprocess
 import time
 from typing import Any
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from .a_share_trend import valid_frozen_report_contract
+from .account_api import check_account_api_parity
 from .account_sync_state import DASHBOARD_POSITION_FIELDS
 from .dashboard import (
     SHANGHAI,
@@ -83,6 +86,8 @@ SIMULATE_POSITIONS_READY_EXPRESSION = """
 """
 SIMULATE_POSITIONS_READY_TIMEOUT_MS = 30_000
 DASHBOARD_API_TIMEOUT_SECONDS = 30
+ACCOUNT_SNAPSHOT_PATH = "/api/v1/account/snapshot"
+ACCOUNT_POLL_PROOF_WAIT_MS = 10_100
 WARM_LEDGER_TOKENS = {
     "--bg": "#F7F5F1",
     "--surface": "#FFFEFA",
@@ -930,6 +935,57 @@ def _fetch_quotes_payload(url: str) -> dict[str, Any]:
         if response.status != 200:
             raise RuntimeError(f"Quotes API HTTP {response.status}")
         return json.load(response)
+
+
+def _fetch_account_snapshot(
+    url: str, *, etag: str | None = None,
+) -> tuple[int, dict[str, Any] | None, str | None]:
+    headers = {"If-None-Match": etag} if etag else {}
+    request = Request(f"{url.rstrip('/')}{ACCOUNT_SNAPSHOT_PATH}", headers=headers)
+    try:
+        with urlopen(request, timeout=DASHBOARD_API_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Account snapshot HTTP {response.status}")
+            payload = json.load(response)
+            if not isinstance(payload, dict):
+                raise RuntimeError("Account snapshot 不是对象")
+            return response.status, payload, response.headers.get("ETag")
+    except HTTPError as error:
+        if error.code == 304:
+            return 304, None, error.headers.get("ETag")
+        raise
+
+
+def _account_snapshot_errors(
+    payload: object, *, expected_sha: str,
+) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return ["Account snapshot 不是对象"]
+    errors: list[str] = []
+    if payload.get("schema_version") != 1:
+        errors.append("Account snapshot schema 不匹配")
+    if payload.get("status") not in {"healthy", "stale"}:
+        errors.append("Account snapshot 状态不可用")
+    if not isinstance(payload.get("stale"), bool):
+        errors.append("Account snapshot stale 状态无效")
+    for field in (
+        "snapshot_generation", "account_generation", "generated_at", "quote_as_of",
+    ):
+        if not isinstance(payload.get(field), str) or not payload[field]:
+            errors.append(f"Account snapshot 缺少 {field}")
+    for field in ("summary", "sources", "release"):
+        if not isinstance(payload.get(field), Mapping):
+            errors.append(f"Account snapshot 缺少 {field}")
+    for field in ("broker_summaries", "positions", "cash_balances", "errors"):
+        if not isinstance(payload.get(field), list):
+            errors.append(f"Account snapshot {field} 不是列表")
+    release = payload.get("release")
+    if isinstance(release, Mapping) and (
+        release.get("api_git_sha") != expected_sha
+        or release.get("worker_git_sha") != expected_sha
+    ):
+        errors.append("Account snapshot release Git SHA 不匹配")
+    return errors
 
 
 def _fetch_json_path(url: str, path: str) -> Any:
@@ -1964,6 +2020,8 @@ def _runtime_evidence(
     expected_root: Path,
     expected_sha: str,
     expected_upstream_status: str | None = None,
+    expected_account_upstream_status: str | None = None,
+    account_api: bool = False,
 ) -> tuple[int | None, Path, datetime | None, list[str]]:
     expected_cwd = expected_root.resolve()
     try:
@@ -1984,17 +2042,26 @@ def _runtime_evidence(
         if source_changes:
             errors.append(f"{name} 源码未提交：{'；'.join(source_changes)}")
         health = _fetch_json_path(url, "/healthz")
-        errors.extend(_runtime_health_errors(
-            health,
-            name=name,
-            expected_schema=expected_schema,
-            expected_module=expected_module,
-            pid=pid,
-            expected_sha=expected_sha,
-            expected_cwd=expected_cwd,
-            process_started_at=process_started_at,
-            expected_upstream_status=expected_upstream_status,
-        ))
+        if account_api:
+            errors.extend(_account_runtime_health_errors(
+                health,
+                pid=pid,
+                expected_sha=expected_sha,
+                process_started_at=process_started_at,
+            ))
+        else:
+            errors.extend(_runtime_health_errors(
+                health,
+                name=name,
+                expected_schema=expected_schema,
+                expected_module=expected_module,
+                pid=pid,
+                expected_sha=expected_sha,
+                expected_cwd=expected_cwd,
+                process_started_at=process_started_at,
+                expected_upstream_status=expected_upstream_status,
+                expected_account_upstream_status=expected_account_upstream_status,
+            ))
         return pid, cwd, process_started_at, errors
     except Exception as exc:
         return (
@@ -4341,6 +4408,8 @@ def _browser_check(
                 try:
                     page = browser.new_page(viewport=viewport)
                     browser_errors: list[str] = []
+                    browser_requests: list[tuple[str, str | None]] = []
+                    browser_responses: list[tuple[str, int]] = []
                     page.on(
                         "console",
                         lambda message: browser_errors.append(message.text)
@@ -4349,10 +4418,23 @@ def _browser_check(
                         else None,
                     )
                     page.on("pageerror", lambda error: browser_errors.append(str(error)))
+                    page.on(
+                        "request",
+                        lambda request: browser_requests.append((
+                            request.url, request.header_value("if-none-match"),
+                        )),
+                    )
                     page.on("response", lambda response: browser_errors.append(
                         f"HTTP {response.status} {response.url}"
                     ) if response.status >= 400 else None)
+                    page.on(
+                        "response",
+                        lambda response: browser_responses.append((
+                            response.url, response.status,
+                        )),
+                    )
                     page.goto(url, wait_until="networkidle")
+                    page.wait_for_timeout(ACCOUNT_POLL_PROOF_WAIT_MS)
                     assert page.evaluate(
                         """() => {
                           const active = state.quoteIntervalId !== null;
@@ -4361,6 +4443,12 @@ def _browser_check(
                           return active;
                         }"""
                     ), "Dashboard 未启动文件轮询"
+                    errors.extend(
+                        f"{name}：{message}"
+                        for message in _browser_account_network_errors(
+                            browser_requests, browser_responses, url,
+                        )
+                    )
                     page_payload = _page_dashboard_payload(page)
                     _check_visual_contract(page)
                     _check_source_status_panel(page, page_payload)
@@ -4446,6 +4534,39 @@ def _browser_check(
     return errors, None
 
 
+def _browser_account_network_errors(
+    requests: list[tuple[str, str | None]],
+    responses: list[tuple[str, int]],
+    gateway_url: str,
+) -> list[str]:
+    gateway = urlsplit(gateway_url)
+    account_requests = [
+        item for item in requests
+        if urlsplit(item[0]).netloc == gateway.netloc
+        and urlsplit(item[0]).path == ACCOUNT_SNAPSHOT_PATH
+    ]
+    if len(account_requests) < 3:
+        return ["浏览器未等待两个 Account 五秒轮询机会"]
+    if not any(etag for _url, etag in account_requests[1:]):
+        return ["浏览器后续 Account 请求缺少 If-None-Match"]
+    if any(urlsplit(request_url).path == "/api/quotes" for request_url, _etag in requests):
+        return ["浏览器仍请求 Legacy /api/quotes"]
+    if not any(
+        urlsplit(request_url).netloc == gateway.netloc
+        and urlsplit(request_url).path == "/api/dashboard"
+        for request_url, _etag in requests
+    ):
+        return ["浏览器未请求 Legacy /api/dashboard"]
+    account_statuses = [
+        status for response_url, status in responses
+        if urlsplit(response_url).netloc == gateway.netloc
+        and urlsplit(response_url).path == ACCOUNT_SNAPSHOT_PATH
+    ]
+    if not any(status in {200, 304} for status in account_statuses[1:]):
+        return ["浏览器后续 Account 请求没有 304 或有效 200 响应"]
+    return []
+
+
 def _runtime_health_errors(
     payload: object,
     *,
@@ -4457,6 +4578,7 @@ def _runtime_health_errors(
     expected_cwd: Path,
     process_started_at: datetime,
     expected_upstream_status: str | None = None,
+    expected_account_upstream_status: str | None = None,
 ) -> list[str]:
     if not isinstance(payload, Mapping):
         return [f"{name} health 不是对象"]
@@ -4489,6 +4611,11 @@ def _runtime_health_errors(
         and payload.get("upstream_status") != expected_upstream_status
     ):
         errors.append(f"{name} health upstream 状态不匹配")
+    if (
+        expected_account_upstream_status is not None
+        and payload.get("account_upstream_status") != expected_account_upstream_status
+    ):
+        errors.append(f"{name} health Account upstream 状态不匹配")
     try:
         started_at = datetime.fromisoformat(str(payload.get("started_at") or ""))
         if started_at.tzinfo is None or started_at.utcoffset() is None:
@@ -4497,6 +4624,43 @@ def _runtime_health_errors(
             errors.append(f"{name} health 启动时间早于候选进程")
     except (TypeError, ValueError):
         errors.append(f"{name} health 启动时间无效")
+    return errors
+
+
+def _account_runtime_health_errors(
+    payload: object,
+    *,
+    pid: int,
+    expected_sha: str,
+    process_started_at: datetime,
+) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return ["Account API health 不是对象"]
+    errors: list[str] = []
+    expected = {
+        "schema_version": "open_trader.account_api.health.v1",
+        "module": "account_api",
+        "status": "ok",
+        "mode": "production",
+        "api_git_sha": expected_sha,
+        "worker_git_sha": expected_sha,
+        "release_match": True,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            label = "Worker Git SHA" if field == "worker_git_sha" else field
+            errors.append(f"Account API health {label} 不匹配")
+    health_pid = payload.get("pid")
+    if type(health_pid) is not int or health_pid <= 0 or health_pid != pid:
+        errors.append("Account API health PID 不匹配")
+    try:
+        started_at = datetime.fromisoformat(str(payload.get("started_at") or ""))
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError("timezone-aware timestamp required")
+        if started_at < process_started_at:
+            errors.append("Account API health 启动时间早于候选进程")
+    except (TypeError, ValueError):
+        errors.append("Account API health 启动时间无效")
     return errors
 
 
@@ -4736,6 +4900,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8766")
     parser.add_argument("--legacy-url", default="http://127.0.0.1:8767")
+    parser.add_argument("--account-url", default="http://127.0.0.1:8768")
     parser.add_argument("--expected-rows", type=int)
     parser.add_argument(
         "--expected-eastmoney-cny", type=Decimal
@@ -4752,6 +4917,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("logs/legacy_dashboard/launchd.out.log"),
     )
+    parser.add_argument(
+        "--account-log",
+        type=Path,
+        default=Path("logs/account_api/launchd.out.log"),
+    )
     return parser
 
 
@@ -4766,6 +4936,9 @@ def main(argv: list[str] | None = None) -> int:
     legacy_pid: int | None = None
     legacy_cwd = args.expected_root.resolve()
     legacy_started_at: datetime | None = None
+    account_pid: int | None = None
+    account_cwd = args.expected_root.resolve()
+    account_started_at: datetime | None = None
     browser_payload: dict[str, Any] = {}
     reports_dir: Path | None = None
     simulate_payloads: dict[str, dict[str, Any]] = {}
@@ -4791,6 +4964,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_root=args.expected_root,
             expected_sha=expected_sha,
             expected_upstream_status="ok",
+            expected_account_upstream_status="ok",
         )
         (
             legacy_pid,
@@ -4805,14 +4979,31 @@ def main(argv: list[str] | None = None) -> int:
             expected_root=args.expected_root,
             expected_sha=expected_sha,
         )
+        (
+            account_pid,
+            account_cwd,
+            account_started_at,
+            account_errors,
+        ) = _runtime_evidence(
+            "Account API",
+            url=args.account_url,
+            expected_schema="open_trader.account_api.health.v1",
+            expected_module="account_api",
+            expected_root=args.expected_root,
+            expected_sha=expected_sha,
+            account_api=True,
+        )
         errors.extend(gateway_errors)
         errors.extend(legacy_errors)
+        errors.extend(account_errors)
         if (
             gateway_pid is not None
             and legacy_pid is not None
             and gateway_pid == legacy_pid
         ):
             errors.append("Frontend Gateway 与 Legacy Dashboard 必须使用不同 PID")
+        if account_pid is not None and account_pid in {gateway_pid, legacy_pid}:
+            errors.append("Account API 必须使用独立 PID")
         project_data_dir = _project_data_dir(args.expected_root)
         expected_cn = _expected_cn_holdings(args.expected_root)
         phillips_total, phillips_period = _latest_phillips_expectation(
@@ -4860,8 +5051,31 @@ def main(argv: list[str] | None = None) -> int:
             first_reports_dir,
         )
         errors.extend(history_errors)
-        quotes = _fetch_quotes_payload(args.url)
-        errors.extend(validate_quotes_payload(quotes))
+        snapshot_status, snapshot, snapshot_etag = _fetch_account_snapshot(args.url)
+        if snapshot_status != 200 or snapshot is None:
+            errors.append(f"Gateway Account snapshot HTTP {snapshot_status}")
+        else:
+            errors.extend(_account_snapshot_errors(snapshot, expected_sha=expected_sha))
+            if not snapshot_etag:
+                errors.append("Gateway Account snapshot 缺少 ETag")
+            else:
+                conditional_status, conditional_snapshot, conditional_etag = (
+                    _fetch_account_snapshot(args.url, etag=snapshot_etag)
+                )
+                if conditional_status == 304:
+                    if conditional_snapshot is not None or conditional_etag != snapshot_etag:
+                        errors.append("Gateway Account snapshot 304 ETag 不匹配")
+                elif conditional_status == 200 and conditional_snapshot is not None:
+                    errors.extend(_account_snapshot_errors(
+                        conditional_snapshot, expected_sha=expected_sha,
+                    ))
+                else:
+                    errors.append(
+                        f"Gateway Account snapshot 条件请求 HTTP {conditional_status}"
+                    )
+        parity = check_account_api_parity(project_data_dir, base_url=args.account_url)
+        if parity.status != "PASS":
+            errors.append(f"Account API parity {parity.status}: {parity.reason}")
         second = _fetch_payload(args.url)
         browser_payload = second
         reports_dir = _effective_reports_dir(second, process_cwd=legacy_cwd)
@@ -4922,6 +5136,16 @@ def main(argv: list[str] | None = None) -> int:
             expected_cwd=legacy_cwd,
             process_started_at=legacy_started_at,
         ))
+    if account_pid is not None and account_started_at is not None:
+        errors.extend(_log_errors(
+            args.account_log,
+            name="Account API",
+            prefix="account_api_runtime: ",
+            pid=account_pid,
+            expected_sha=expected_sha,
+            expected_cwd=account_cwd,
+            process_started_at=account_started_at,
+        ))
     status = classify_result(
         errors, browser_blocker=blocker, external_blocker=external_blocker
     )
@@ -4931,6 +5155,7 @@ def main(argv: list[str] | None = None) -> int:
         "pid": gateway_pid,
         "gateway_pid": gateway_pid,
         "legacy_pid": legacy_pid,
+        "account_pid": account_pid,
         "errors": errors,
         "blocker": "；".join(blockers) or None,
     }

@@ -1,9 +1,17 @@
-# Account API Shadow Runtime
+# Account API Runtime Modes
 
-The R2 Account API is a loopback-only, read-only shadow process at
+The Account API has two loopback-only, read-only modes at
 `127.0.0.1:8768`. It serves only `GET /healthz` and
-`GET /api/v1/account/snapshot`. It is not a browser entry point: browsers use
-the Frontend Gateway, which has no R2 route.
+`GET /api/v1/account/snapshot`.
+
+- `shadow` is the R2 parity reader. Its snapshot is not a browser route.
+- `production` is the R3 reader. Browsers reach its snapshot only through
+  `http://127.0.0.1:8766/api/v1/account/snapshot`; the Gateway marks that route
+  as production and does not fall back to Legacy.
+
+The production sequence, rollback, controlled fault test, and acceptance gate
+are in the [Account API production cutover runbook](account-api-production-cutover.md).
+This document remains the shadow-mode reference.
 
 The Account Sync Worker remains the sole writer of
 `data/latest/account_sync_state.json`, `portfolio.csv`, and `quotes.json`.
@@ -68,4 +76,6 @@ scripts/uninstall_account_api_launchd.sh
 
 This is idempotent and affects only `com.open-trader.account-api`; it does not
 stop the Account Sync Worker, alter published data, or change Gateway or
-Dashboard behavior. There is no production switch or port override in R2.
+Dashboard behavior. For R2 shadow validation, use the default installer mode
+(or explicitly `--mode shadow`); do not use this shadow procedure as the R3
+production cutover procedure.

@@ -7,6 +7,8 @@ DASHBOARD_URL ?= http://127.0.0.1:8766
 DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log
 LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767
 LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log
+ACCOUNT_API_URL ?= http://127.0.0.1:8768
+ACCOUNT_API_LOG ?= $(WORKTREE_ROOT)/logs/account_api/launchd.out.log
 SKIP_POLYMARKET_LIVE ?= 0
 test:
 	.venv/bin/python -m pytest -q
@@ -46,4 +48,6 @@ endif
 		--log "$(DASHBOARD_LOG)" \
 		--legacy-url "$(LEGACY_DASHBOARD_URL)" \
 		--legacy-log "$(LEGACY_DASHBOARD_LOG)" \
+		--account-url "$(ACCOUNT_API_URL)" \
+		--account-log "$(ACCOUNT_API_LOG)" \
 		--expected-root "$(CURDIR)"
