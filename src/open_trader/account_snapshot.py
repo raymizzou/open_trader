@@ -563,11 +563,19 @@ def _has_complete_quote_coverage(
         for broker in REQUIRED_BROKERS
         if isinstance(brokers[broker], Mapping) and brokers[broker].get("source_kind") == "live"
         for position in brokers[broker]["positions"]
-        if isinstance(position, Mapping)
+        if isinstance(position, Mapping) and _is_quote_required_position(position)
     }
     return all(
         any(_is_valid_quote_row(row, market, symbol) for row in published.values())
         for market, symbol in required
+    )
+
+
+def _is_quote_required_position(position: Mapping[str, object]) -> bool:
+    return (
+        str(position.get("market") or "").upper() != "CASH"
+        and str(position.get("asset_class") or "").lower()
+        not in {"cash", "money_market_fund"}
     )
 
 

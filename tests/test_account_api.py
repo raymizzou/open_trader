@@ -536,6 +536,38 @@ def test_snapshot_whitelists_public_fields_and_requires_quote_publication_time(
     assert result.payload["errors"][0]["code"] == "account_publication_unstable"
 
 
+def test_snapshot_does_not_require_quotes_for_cash_like_live_positions(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    state_path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    quotes = json.loads((data_dir / "latest/quotes.json").read_text(encoding="utf-8"))
+    for broker, market, symbol, asset_class in (
+        ("futu", "CASH", "FUTU_UNMAPPED_ASSETS", "cash"),
+        ("tiger", "HK", "HK0000951506.HKD", "money_market_fund"),
+    ):
+        source = state["brokers"][broker]
+        position = dict(source["positions"][0])
+        position.update({
+            "market": market,
+            "symbol": symbol,
+            "asset_class": asset_class,
+        })
+        source["positions"].append(position)
+    state = with_dashboard_projection(
+        state,
+        quotes,
+        generated_at=quotes["last_success_at"],
+    )
+    write_json_atomic(state_path, state)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+
+
 @pytest.mark.parametrize(
     ("mutate", "code"),
     [
