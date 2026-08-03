@@ -37,10 +37,6 @@ class PredictMarket:
     event_start_at: datetime | None = None
     event_end_at: datetime | None = None
     resolution_provider: str = ""
-    # Deprecated constructor compatibility for Task 2's migration.
-    resolution_source: str = ""
-    close_at: datetime | None = None
-    settlement_at: datetime | None = None
     yes_token_id: str = ""
     no_token_id: str = ""
     settlement_asset: str = ""
@@ -425,6 +421,7 @@ def _normalise_market(
         )
         or event_start_at is None
         or event_end_at is None
+        or event_end_at <= event_start_at
         or set(tokens) != {"YES", "NO"}
         or minimum_order_size is None
         or minimum_order_size <= 0

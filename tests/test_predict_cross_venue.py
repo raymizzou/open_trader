@@ -33,9 +33,10 @@ def predict_market(*, external_ids: tuple[str, ...]) -> PredictMarket:
         condition_id="predict-native-condition-1",
         question="Will the public test event resolve Yes?",
         rules="This public test event resolves from the named source.",
-        resolution_source="Public Test Oracle",
-        close_at=datetime(2026, 12, 31, tzinfo=UTC),
-        settlement_at=datetime(2027, 1, 1, tzinfo=UTC),
+        category_slug="public-test",
+        event_start_at=datetime(2026, 1, 1, tzinfo=UTC),
+        event_end_at=datetime(2026, 1, 11, tzinfo=UTC),
+        resolution_provider="Public Test Oracle",
         yes_token_id="predict-yes-1",
         no_token_id="predict-no-1",
         settlement_asset="USDT",
@@ -148,11 +149,20 @@ def test_pair_id_is_deterministic_from_venue_qualified_native_condition_ids() ->
 
 
 def explicit_pair() -> ExplicitMarketPair:
-    return resolve_explicit_market_pairs(
+    pair = resolve_explicit_market_pairs(
         (predict_market(external_ids=("poly-condition",)),),
         gamma_lookup=lambda *args, **kwargs: [polymarket_row("poly-condition")],
         clob_lookup=lambda condition_id: None,
     ).pairs[0]
+    return replace(
+        pair,
+        predict=replace(
+            pair.predict,
+            resolution_source=pair.predict.resolution_provider,
+            close_at=pair.predict.event_end_at,
+            settlement_at=datetime(2027, 1, 1, tzinfo=UTC),
+        ),
+    )
 
 
 def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
@@ -164,8 +174,10 @@ def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
             "exchange": "predict.fun",
             "condition_id": pair.predict.condition_id,
             "rules_fingerprint": pair.predict.rules_fingerprint,
-            "close_at": pair.predict.close_at.isoformat(),
-            "settlement_at": pair.predict.settlement_at.isoformat(),
+            "category_slug": pair.predict.category_slug,
+            "event_start_at": pair.predict.event_start_at.isoformat(),
+            "event_end_at": pair.predict.event_end_at.isoformat(),
+            "resolution_provider": pair.predict.resolution_provider,
         },
         "polymarket": {
             "exchange": "polymarket",
@@ -211,7 +223,7 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
 
     assert first.approved is True
     assert first.prompt_version == "cross-exchange-yes-no-equivalence-v1"
-    assert first.predict_close_at == pair.predict.close_at
+    assert first.predict_event_end_at == pair.predict.event_end_at
     assert first.polymarket_settlement_at == pair.polymarket.settlement_at
     assert second.approved is True
     assert len(calls) == 1
@@ -226,7 +238,7 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
         (lambda value: {**value, "predict": {**value["predict"], "condition_id": "wrong"}}, "IDENTITY_MISMATCH"),
         (lambda value: {**value, "polymarket": {**value["polymarket"], "exchange": "predict.fun"}}, "IDENTITY_MISMATCH"),
         (lambda value: {**value, "predict": {**value["predict"], "rules_fingerprint": "wrong"}}, "FINGERPRINT_MISMATCH"),
-        (lambda value: {**value, "predict": {**value["predict"], "close_at": "2026-12-30T00:00:00+00:00"}}, "DATE_MISMATCH"),
+        (lambda value: {**value, "predict": {**value["predict"], "event_end_at": "2026-12-30T00:00:00+00:00"}}, "DATE_MISMATCH"),
         (lambda value: {**value, "polymarket": {**value["polymarket"], "settlement_at": "2027-01-02T00:00:00+00:00"}}, "DATE_MISMATCH"),
         (lambda value: {**value, "divergent_states": {**value["divergent_states"], "PREDICT_YES_POLYMARKET_NO": {"possible": True, "reason": "possible"}}}, "DIVERGENT_STATE_POSSIBLE"),
         (lambda value: {**value, "evidence": []}, "MISSING_EVIDENCE"),
@@ -256,7 +268,7 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     assert schema["properties"]["decision"]["enum"] == ["APPROVE", "REJECT"]
     assert {"predict", "polymarket", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
-    assert {"close_at", "settlement_at"} <= set(schema["$defs"]["venue_market"]["required"])
+    assert {"event_start_at", "event_end_at", "resolution_provider"} <= set(schema["$defs"]["predict_market"]["required"])
 
 
 def test_threshold_validator_schema_is_unchanged() -> None:
@@ -460,8 +472,8 @@ def rejected_predict_market() -> PredictMarket:
 def monitor_predict_market(*, external_ids: tuple[str, ...]) -> PredictMarket:
     return replace(
         predict_market(external_ids=external_ids),
-        close_at=datetime(2026, 1, 10, tzinfo=UTC),
-        settlement_at=datetime(2026, 1, 11, tzinfo=UTC),
+        event_end_at=datetime(2026, 1, 10, tzinfo=UTC),
+        event_start_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
 
@@ -494,8 +506,8 @@ class FakeCrossVenueValidator:
             prompt_version="cross-exchange-yes-no-equivalence-v1",
             predict_fingerprint=pair.predict.rules_fingerprint,
             polymarket_fingerprint=pair.polymarket.rules_fingerprint,
-            predict_close_at=pair.predict.close_at,
-            predict_settlement_at=pair.predict.settlement_at,
+            predict_event_start_at=pair.predict.event_start_at,
+            predict_event_end_at=pair.predict.event_end_at,
             polymarket_close_at=pair.polymarket.close_at,
             polymarket_settlement_at=pair.polymarket.settlement_at,
         )

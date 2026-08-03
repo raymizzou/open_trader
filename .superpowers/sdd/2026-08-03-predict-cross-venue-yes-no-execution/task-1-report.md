@@ -59,4 +59,68 @@ GREEN output:
 ## Concerns
 
 - `predict_cross_venue.py` still consumes the legacy timing/source fields by design; Task 2 must migrate it to canonical category timing and raw metadata before normalized Predict markets can feed that path.
-- The deprecated constructor shim is intentionally temporary and should be removed after Task 2 migrates direct callers and tests.
+- Superseded by the round 1 strict-migration fix below; no deprecated `PredictMarket` constructor shim remains.
+
+## Round 1 fix report
+
+### Changed files
+
+- `src/open_trader/predict_source.py`
+- `src/open_trader/predict_cross_venue.py`
+- `src/open_trader/schemas/cross_exchange_yes_no_equivalence.json`
+- `tests/test_predict_source.py`
+- `tests/test_predict_cross_venue.py`
+
+### Fixes
+
+- Removed `resolution_source`, `close_at`, and `settlement_at` from `PredictMarket`; no compatibility fields remain.
+- Rejected category windows where `event_end_at <= event_start_at`.
+- Added focused coverage for equal/reversed windows, official `DEFAULT`, and each fingerprint input.
+- Migrated the Predict cross-venue adapter and current Predict Codex payload/schema to category timing and `resolution_provider` without creating a Predict settlement timestamp.
+- Predict legs now carry no fabricated settlement timestamp; Polymarket timing remains unchanged.
+
+### RED/GREEN evidence
+
+RED command after strict-migration tests were added:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_source.py tests/test_predict_cross_venue.py -q
+```
+
+RED output:
+
+```text
+18 failed, 39 passed in 4.85s
+```
+
+Focused intermediate outputs:
+
+```text
+tests/test_predict_source.py: 18 passed in 0.32s
+tests/test_predict_cross_venue.py: 39 passed in 0.61s
+```
+
+Final GREEN command:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_source.py tests/test_predict_cross_venue.py -q
+```
+
+Final GREEN output:
+
+```text
+.........................................................                [100%]
+57 passed in 0.73s
+```
+
+### Self-review
+
+- `git diff --check` passed.
+- `PredictMarket` has no public legacy timing/source fields; the remaining legacy field references are Polymarket-only or the separate cross-venue internal model.
+- Normalized Predict data reaches cross-venue code through `category_slug`, `event_start_at`, `event_end_at`, and `resolution_provider`.
+- No Predict settlement timestamp is synthesized; Predict legs expose `settlement_at=None`.
+- Existing API-key/User-Agent boundaries, source filters, and no-order/no-credential constraints remain unchanged.
+
+### Concerns
+
+- Task 2 still needs to replace the current mixed v1 Codex admission contract with schema v2 canonical-cutoff/direct-polarity validation and remove the remaining Polymarket-oriented raw `close_at`/`settlement_at` fields from `VenueMarket`.

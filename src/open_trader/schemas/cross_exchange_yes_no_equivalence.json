@@ -60,10 +60,18 @@
       }
     },
     "predict_market": {
-      "allOf": [
-        {"$ref": "#/$defs/venue_market"},
-        {"properties": {"exchange": {"const": "predict.fun"}}}
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exchange", "condition_id", "rules_fingerprint", "category_slug", "event_start_at", "event_end_at", "resolution_provider"],
+      "properties": {
+        "exchange": {"const": "predict.fun"},
+        "condition_id": {"type": "string"},
+        "rules_fingerprint": {"type": "string"},
+        "category_slug": {"type": "string"},
+        "event_start_at": {"type": "string"},
+        "event_end_at": {"type": "string"},
+        "resolution_provider": {"type": "string"}
+      }
     },
     "polymarket_market": {
       "allOf": [

@@ -110,9 +110,6 @@ def test_get_market_joins_category_timing_and_resolution_provider() -> None:
     assert result.event_start_at == datetime(2026, 1, 1, tzinfo=UTC)
     assert result.event_end_at == datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
     assert result.resolution_provider == "PREDICT_DOT_FUN"
-    assert result.close_at is None
-    assert result.settlement_at is None
-    assert result.resolution_source == ""
     assert [request.full_url.removeprefix("https://api.predict.fun") for request in requests] == [
         "/v1/markets/896",
         "/v1/categories/btc-year-end",
@@ -145,6 +142,51 @@ def test_missing_or_unparseable_category_timing_excludes_market() -> None:
 
     assert asyncio.run(missing.get_market("896")) is None
     assert asyncio.run(unparseable.get_market("896")) is None
+
+
+def test_non_increasing_category_window_excludes_market() -> None:
+    equal, _ = source_with_responses(
+        [{"success": True, "data": market(id=896)}],
+        categories={"btc-year-end": category(endsAt="2026-01-01T00:00:00Z")},
+    )
+    reversed_window, _ = source_with_responses(
+        [{"success": True, "data": market(id=896)}],
+        categories={"btc-year-end": category(endsAt="2025-12-31T23:59:00Z")},
+    )
+
+    assert asyncio.run(equal.get_market("896")) is None
+    assert asyncio.run(reversed_window.get_market("896")) is None
+
+
+def test_official_default_variant_is_accepted() -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "data": market(id=896, marketVariant="DEFAULT")}]
+    )
+
+    assert asyncio.run(source.get_market("896")) is not None
+
+
+def test_rules_fingerprint_changes_with_each_matching_input() -> None:
+    def fingerprint(*, changes: dict[str, object] | None = None, category_changes: dict[str, object] | None = None) -> str:
+        source, _ = source_with_responses(
+            [{"success": True, "data": market(id=896, **(changes or {}))}],
+            categories={"btc-year-end": category(**(category_changes or {}))},
+        )
+        result = asyncio.run(source.get_market("896"))
+        assert result is not None
+        return result.rules_fingerprint
+
+    baseline = fingerprint()
+    for changes, category_changes in (
+        ({"question": "A different question"}, None),
+        ({"description": "A different rule"}, None),
+        (None, {"resolutionProvider": "OTHER"}),
+        (None, {"startsAt": "2026-01-02T00:00:00Z"}),
+        (None, {"endsAt": "2026-12-30T23:59:00Z"}),
+        ({"outcomes": [{"name": "YES", "onChainId": "other-yes"}, {"name": "NO", "onChainId": "predict-no"}]}, None),
+        ({"polymarketConditionIds": ["other-condition"]}, None),
+    ):
+        assert fingerprint(changes=changes, category_changes=category_changes) != baseline
 
 
 def test_empty_polymarket_ids_remain_empty_without_catalog_scan() -> None:
