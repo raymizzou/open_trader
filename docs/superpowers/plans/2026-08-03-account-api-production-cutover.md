@@ -344,7 +344,7 @@ This commit invalidates the earlier `88a68711` runtime checkpoint. Rebuild the d
 
 - [ ] **Step 1: Create an immutable detached baseline checkout**
 
-From the cutover worktree, set `baseline_sha` to the Task 4 SHA and run:
+From the cutover worktree, set `baseline_sha` to the Task 4A SHA and run:
 
 ```bash
 baseline_root=/Users/ray/projects/open_trader/.worktrees/issue-21-account-api-baseline
