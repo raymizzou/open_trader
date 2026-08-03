@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { dirname, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import type { FullResult, Reporter } from '@playwright/test';
 
 const HANDOFF_ENV = 'PREDICTION_ACCEPTANCE_BROWSER_HANDOFF';
