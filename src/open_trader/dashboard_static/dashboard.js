@@ -4655,6 +4655,72 @@ function renderCnTrendAudit(audit, report = {}) {
     + "</p></details>";
 }
 
+function renderTrendAllocation(report) {
+  const allocation = report?.allocation;
+  const roots = allocation?.roots;
+  const markets = allocation?.markets;
+  if (!allocation || typeof allocation !== "object" || !roots || !markets) return "";
+  const cards = [
+    ["CN", "A股"], ["HK", "港股"], ["US", "美股"],
+  ].map(([market, label]) => {
+    const root = roots[market] || {};
+    const values = markets[market] || {};
+    const stock = root.stock || {};
+    const etf = root.etf || {};
+    return `<article class="trend-allocation-card" data-market="${market}">
+      <header><h3>${escapeHtml(label)}</h3><span>第 ${escapeHtml(formatPlain(values.rank))} 名</span></header>
+      <dl>
+        <div><dt>${escapeHtml(formatPlain(stock.asset))} 全局强度</dt><dd>${escapeHtml(formatDisplayNumber(stock.global_strength))}</dd></div>
+        <div><dt>${escapeHtml(formatPlain(etf.asset))} 全局强度</dt><dd>${escapeHtml(formatDisplayNumber(etf.global_strength))}</dd></div>
+        <div><dt>市场分数</dt><dd>${escapeHtml(formatDisplayNumber(values.score))}</dd></div>
+        <div><dt>分数来源</dt><dd>${escapeHtml(formatPlain(values.score_source))}</dd></div>
+        <div aria-label="单仓基准 ${escapeHtml(decimalAsPercent(values.entry_weight, "-"))}"><dt>单仓基准</dt><dd>${escapeHtml(decimalAsPercent(values.entry_weight, "-"))}</dd></div>
+        <div aria-label="10 席位名义仓位 ${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}"><dt>10 席位名义仓位</dt><dd>${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}</dd></div>
+      </dl>
+      <p>来源 ${escapeHtml(formatPlain(stock.as_of_date))} / ${escapeHtml(formatPlain(etf.as_of_date))}</p>
+    </article>`;
+  }).join("");
+  const status = allocation.reused
+    ? `沿用旧排名 · ${formatPlain(allocation.stale_a_trading_days)} 个 A 股交易日`
+    : "当日排名";
+  const failure = hasValue(allocation.failure_reason)
+    ? `<p class="trend-allocation-warning">本次更新失败原因：${escapeHtml(formatPlain(allocation.failure_reason))}</p>`
+    : "";
+  return `<section class="trend-allocation-panel" aria-label="市场资源排名">
+    <header><h2>市场资源排名</h2><span data-status="${allocation.reused ? "reused" : "current"}">${escapeHtml(status)}</span></header>
+    <div class="trend-allocation-cards">${cards}</div>
+    <p class="trend-allocation-meta">快照 ${escapeHtml(formatPlain(allocation.allocation_date))}｜生成 ${escapeHtml(formatPlain(allocation.generated_at))}｜目标交易日 ${escapeHtml(formatPlain(report.report_date))}｜SHA ${escapeHtml(String(allocation.sha256 || "-").slice(0, 12))}</p>
+    ${failure}
+  </section>`;
+}
+
+function renderTrendRotations(report) {
+  if (!report?.allocation) return "";
+  const group = (title, mode, pairs) => {
+    const rows = cnTrendRows(pairs).map((pair) => `<article class="trend-rotation-pair">
+      <div class="trend-rotation-route">
+        <div><span>1 · MARKET 卖出</span><strong>${escapeHtml(trendIdentity({symbol: pair.sell_symbol, name: pair.sell_name}) || "数据未提供")}</strong><small>全局强度 ${escapeHtml(formatDisplayNumber(pair.sell_global_strength))}</small></div>
+        <div><span>2 · MARKET 买入</span><strong>${escapeHtml(trendIdentity({symbol: pair.buy_symbol, name: pair.buy_name}) || "数据未提供")}</strong><small>全局强度 ${escapeHtml(formatDisplayNumber(pair.buy_global_strength))}</small></div>
+      </div>
+      <dl>
+        <div><dt>强度差</dt><dd>差值 ${escapeHtml(formatDisplayNumber(pair.strength_gap))}</dd></div>
+        <div><dt>目标仓位</dt><dd>${escapeHtml(decimalAsPercent(pair.target_weight, "-"))}</dd></div>
+        <div aria-label="目标金额 ${escapeHtml(formatDisplayNumber(pair.target_amount))}"><dt>目标金额</dt><dd>${escapeHtml(formatDisplayNumber(pair.target_amount))}</dd></div>
+        <div aria-label="预计数量 ${escapeHtml(formatDisplayNumber(pair.estimated_shares))} 股"><dt>预计数量</dt><dd>${escapeHtml(formatDisplayNumber(pair.estimated_shares))} 股</dd></div>
+      </dl>
+      <p>MARKET 卖出全成后才买入｜目标交易日 ${escapeHtml(formatPlain(pair.execution_date))}｜不得跨日</p>
+    </article>`).join("");
+    return `<section class="trend-rotation-group" data-mode="${mode}"><h3>${escapeHtml(title)}</h3>${rows || "<p>无</p>"}</section>`;
+  };
+  return `<section class="trend-rotation-panel" aria-label="相对强度轮换">
+    <h2>相对强度轮换</h2>
+    <div class="trend-rotation-groups">
+      ${group("模拟盘自动", "automatic", report.simulate_rotation_pairs)}
+      ${group("实盘手动", "manual", report.real_rotation_pairs)}
+    </div>
+  </section>`;
+}
+
 function renderCnTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {
   const counts = report.counts || {};
   const audit = report.audit || {};
@@ -4683,6 +4749,8 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const disciplineCards = renderTrendDisciplineCards(report);
   const industryContext = renderTrendIndustryContext(report);
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.report_date);
+  const allocation = renderTrendAllocation(report);
+  const rotations = renderTrendRotations(report);
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
@@ -4708,9 +4776,11 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span class="trend-report-cost">${escapeHtml(trendReportCostLabel(report))}</span>
       </div>
     </header>
+    ${allocation}
     ${batchError}
     ${revisionAnomaly}
     ${sellStage}
+    ${rotations}
     ${buyStage}
     ${reviewStage}
     ${holdStage}

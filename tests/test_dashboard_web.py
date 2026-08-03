@@ -12377,6 +12377,75 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_frozen_allocation_and_relative_rotation_hierarchy() -> None:
+    output = run_dashboard_js(r'''
+const pair = (mode, sell, buy) => ({
+  sell_symbol:sell, sell_name:"弱势标的", sell_global_strength:"41",
+  buy_symbol:buy, buy_name:"强势标的", buy_global_strength:"81",
+  strength_gap:"40", target_weight:"0.06", target_amount:"6000",
+  estimated_shares:300, execution_date:"2026-08-04", execution_mode:mode,
+});
+const base = {
+  available:true, market:"CN", broker:"eastmoney", broker_label:"东方财富",
+  market_label:"A股", report_date:"2026-08-04", data_date:"2026-08-03",
+  generated_at:"2026-08-03T20:00:00+08:00", account_status:"已更新",
+  buy_window:"09:30–10:00", counts:{sell:1,buy:1,hold:0,review:0},
+  sell_actions:[{symbol:"SELL",name:"正式卖出",reason:"danger_signal"}],
+  buy_actions:[{symbol:"BUY",name:"正式买入",target_weight:"0.06"}],
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+};
+const report = {
+  ...base,
+  allocation:{
+    daily_path:"data/trend_allocation/daily/2026-08-03.json",
+    sha256:"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+    allocation_date:"2026-08-03", generated_at:"2026-08-03T16:20:00+08:00",
+    reused:true, stale_a_trading_days:2, failure_reason:"上游短暂不可用",
+    roots:{
+      CN:{stock:{asset:"A股",as_of_date:"2026-08-01",global_strength:"61"},etf:{asset:"ETF基金",as_of_date:"2026-08-01",global_strength:"62"}},
+      HK:{stock:{asset:"港股",as_of_date:"2026-08-01",global_strength:"71"},etf:{asset:"香港ETF",as_of_date:"2026-08-01",global_strength:"72"}},
+      US:{stock:{asset:"美股",as_of_date:"2026-08-01",global_strength:"81"},etf:{asset:"美国ETF",as_of_date:"2026-08-01",global_strength:"82"}},
+    },
+    markets:{
+      CN:{rank:3,score:"62",score_source:"ETF基金<script>",entry_weight:"0.02",nominal_weight:"0.20"},
+      HK:{rank:2,score:"72",score_source:"香港ETF",entry_weight:"0.04",nominal_weight:"0.40"},
+      US:{rank:1,score:"82",score_source:"美国ETF",entry_weight:"0.06",nominal_weight:"0.60"},
+    },
+  },
+  simulate_rotation_pairs:[pair("automatic", "SIM-SELL", "SIM-BUY")],
+  real_rotation_pairs:[pair("manual", "REAL-SELL", "REAL-BUY")],
+};
+const html = renderTrendReportWorkspace(report);
+const order = [
+  'trend-report-header', 'trend-allocation-panel', 'cn-trend-sell',
+  'trend-rotation-panel', 'cn-trend-buy',
+].map((needle) => html.indexOf(needle));
+if (order.some((index) => index < 0)
+    || !order.every((index, i) => i === 0 || order[i - 1] < index)) {
+  throw new Error("wrong report hierarchy\n" + html);
+}
+for (const text of [
+  "市场资源排名", "模拟盘自动", "实盘手动", "全局强度", "单仓基准 6%",
+  "10 席位名义仓位 60%", "沿用旧排名 · 2 个 A 股交易日", "2026-08-01",
+  "生成 2026-08-03T16:20:00+08:00", "目标交易日 2026-08-04", "SHA abcdef123456",
+  "SIM-SELL", "SIM-BUY", "REAL-SELL", "REAL-BUY", "差值 40",
+  "目标金额 6,000", "预计数量 300 股", "MARKET 卖出全成后才买入",
+]) {
+  if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
+}
+if ((html.match(/class="trend-allocation-card"/g) || []).length !== 3) throw new Error(html);
+if ((html.match(/class="trend-rotation-group"/g) || []).length !== 2) throw new Error(html);
+if (!html.includes("ETF基金&lt;script&gt;") || html.includes("ETF基金<script>")) throw new Error(html);
+const historical = renderTrendReportWorkspace(base, true, true);
+if (historical.includes("trend-allocation-panel") || historical.includes("trend-rotation-panel")) {
+  throw new Error("historical report without allocation changed\n" + historical);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_renders_symbol_mapping_conflict_in_existing_reason_cell() -> None:
     output = run_dashboard_js(r'''
 const html = renderTrendHoldingTable([{
