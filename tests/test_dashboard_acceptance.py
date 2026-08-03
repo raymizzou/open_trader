@@ -14,6 +14,10 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from open_trader import dashboard_acceptance
+from open_trader.a_share_trend import (
+    freeze_allocation_reference,
+    live_trend_strategy_snapshot,
+)
 import open_trader.prediction_arbitrage_acceptance as prediction_acceptance
 from open_trader.prediction_arbitrage_acceptance import SCENARIO_IDS, scenario_results, validate_registry
 from open_trader.dashboard_acceptance import (
@@ -28,6 +32,7 @@ from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     strategy_parameter_hash,
 )
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 MISSING_FRESH = object()
@@ -1561,13 +1566,59 @@ def integrated_v4_payload(
         "phillips": "trend_hk_phillips",
         "eastmoney": "trend_a_share",
     }
+    allocation_reference: dict[str, object] | None = None
+    frozen_allocation: dict[str, object] | None = None
+    allocation_snapshot: dict[str, object] | None = None
+    if current_live_versions:
+        root_specs = {
+            "CN": (("A股", "45.72"), ("ETF基金", "50.39")),
+            "HK": (("港股", "86.97"), ("香港ETF", "78.07")),
+            "US": (("美股", "81.13"), ("美国ETF", "80.12")),
+        }
+        roots = {
+            market: {
+                role: {
+                    "asset": asset,
+                    "tm_id": market_index * 10 + role_index,
+                    "as_of_date": "2026-08-03",
+                    "global_strength": strength,
+                }
+                for role_index, (role, (asset, strength)) in enumerate(
+                    zip(("stock", "etf"), specs), 1
+                )
+            }
+            for market_index, (market, specs) in enumerate(root_specs.items(), 1)
+        }
+        allocation_snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=roots,
+            previous=None,
+        )
+        allocation_reference = {
+            "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+            "sha256": "b" * 64,
+            "snapshot": allocation_snapshot,
+        }
+        frozen_allocation = freeze_allocation_reference(allocation_reference)
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            ("v10" if market == "CN" else "v8")
+            {"CN": "v11", "HK": "v9", "US": "v9"}[market]
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )
-        pending = market == "HK"
+        allocation_market = (
+            allocation_snapshot["markets"][market]  # type: ignore[index]
+            if allocation_snapshot is not None
+            else None
+        )
+        position_weight = (
+            str(allocation_market["entry_weight"])
+            if isinstance(allocation_market, Mapping)
+            else "0.04"
+        )
+        pending = market == "HK" and not current_live_versions
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {
             "status": "active",
@@ -1586,7 +1637,7 @@ def integrated_v4_payload(
         buy = {
             "action": "BUY",
             "symbol": {"CN": "600001", "HK": "00700", "US": "AAPL"}[market],
-            "target_weight": "0.04",
+            "target_weight": position_weight,
             "estimated_shares": lot_size * 3,
             "lot_size": lot_size,
         }
@@ -1598,9 +1649,19 @@ def integrated_v4_payload(
                 "market": market,
                 "broker": broker,
                 "simulate_acc_id": account_ids[broker],
+                **({
+                    "position_weight": position_weight,
+                    "position_weight_source": "trend_allocation_rank",
+                    "rotation_allocation_sha256": "b" * 64,
+                } if current_live_versions else {}),
             },
             "account": serialized_trend_account(fresh=True),
-            "strategy_snapshot": {
+            "strategy_snapshot": live_trend_strategy_snapshot(
+                market,
+                "a" * 40,
+                (622466, 697199),
+                allocation=allocation_reference,
+            ) if current_live_versions else {
                 "strategy_id": (
                     f"trend_animals_warm_to_hot/{market}/{strategy_version}"
                 ),
@@ -1628,6 +1689,10 @@ def integrated_v4_payload(
                 "holding_decisions": [],
                 "top10_candidates": [],
                 "risk_skips": [],
+                **({
+                    "simulate_rotation_pairs": [],
+                    "real_rotation_pairs": [],
+                } if current_live_versions else {}),
             },
             "risk_summary": risk_summary,
             "drawdown_summary": {
@@ -1652,6 +1717,7 @@ def integrated_v4_payload(
                 },
             },
             "data_sources": [f"Futu {market} SIMULATE account"],
+            **({"allocation": frozen_allocation} if current_live_versions else {}),
         }
         frozen["drawdown_summary"]["bootstrap_event"][  # type: ignore[index]
             "parameter_hash"

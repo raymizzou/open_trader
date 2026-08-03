@@ -13,6 +13,7 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+from .a_share_trend import valid_frozen_report_contract
 from .account_sync_state import DASHBOARD_POSITION_FIELDS
 from .dashboard import (
     SHANGHAI,
@@ -717,6 +718,9 @@ def validate_integrated_candidate(
             path = reports_dir / TREND_REPORT_DIRECTORIES[broker] / artifact
             frozen = json.loads(path.read_text(encoding="utf-8"))
             assert isinstance(frozen, Mapping), f"{broker} 冻结报告不是对象"
+            assert valid_frozen_report_contract(frozen), (
+                f"{broker} 冻结报告契约无效"
+            )
             assert report.get("report_sha256") == _report_hash(frozen), (
                 f"{broker} 报告哈希与冻结产物不一致"
             )
@@ -760,9 +764,22 @@ def validate_integrated_candidate(
             target_values = (
                 target.values() if isinstance(target, Mapping) else (target,)
             )
+            expected_target_weight = Decimal("0.04")
+            allocation = frozen.get("allocation")
+            if isinstance(allocation, Mapping):
+                markets = allocation.get("markets")
+                allocation_market = (
+                    markets.get(market) if isinstance(markets, Mapping) else None
+                )
+                assert isinstance(allocation_market, Mapping), (
+                    f"{broker} 资源排名市场缺失"
+                )
+                expected_target_weight = _position_decimal(
+                    allocation_market.get("entry_weight"), "资源排名仓位"
+                )
             assert target_values and max(
                 _position_decimal(value, "名义仓位上限") for value in target_values
-            ) == Decimal("0.04"), f"{broker} 固定名义仓位上限不是 4%"
+            ) == expected_target_weight, f"{broker} 目标仓位与资源排名不一致"
 
             summary = report.get("risk_summary")
             assert isinstance(summary, Mapping), f"{broker} 缺少风险摘要"
@@ -829,8 +846,8 @@ def validate_integrated_candidate(
                     and lot == lot.to_integral_value()
                     and quantity % lot == 0
                 ), f"{broker} 买入数量未按整手向下取整"
-                assert Decimal("0") < weight <= Decimal("0.04"), (
-                    f"{broker} 买入目标超过固定名义仓位上限"
+                assert Decimal("0") < weight <= expected_target_weight, (
+                    f"{broker} 买入目标超过资源排名仓位上限"
                 )
 
             drawdown = report.get("drawdown_summary")
