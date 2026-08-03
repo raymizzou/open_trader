@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-03
 
-**Status:** Approved
+**Status:** Approved; exact-approval and testnet-canary amendment approved 2026-08-03
 
 **Target:** Existing Open Trader prediction-market watcher, execution service, and Dashboard
 
@@ -84,6 +84,9 @@ notifications list only cross-venue opportunities.
 - a new exchange abstraction, workflow engine, queue service, or database
   solely for future venues
 - browser-side book fetching, matching, economics, or risk decisions
+- a Dashboard, watcher, or production-config switch between Predict testnet and
+  mainnet
+- an automatic mainnet order canary in `make acceptance`
 
 ## 4. Candidate Discovery and Funnel Semantics
 
@@ -247,7 +250,8 @@ it is never presented as a complete hedge.
 - Maximum incident capital impact: **22 USDT equivalent**.
 - Total unsettled cross-venue principal: **100 USDT equivalent**.
 - Available venue balance has no product upper limit; each leg only requires
-  sufficient current balance and allowance.
+  sufficient current balance and the ability to create its exact market-scoped
+  allowance after confirmation.
 - The existing 65 pUSD wallet-balance ceiling does not apply to the new
   cross-venue path and remains unchanged for legacy paths.
 
@@ -269,6 +273,71 @@ position or when the corresponding capital is actually redeemed.
 
 V1 permits only one active cross-venue execution at a time. Other approved
 opportunities remain monitored while the execution lock is held.
+
+### 7.4 Predict account readiness and exact approval
+
+Predict readiness does not require a persistent or unlimited USDT allowance.
+An allowance of zero is the expected safe state before and after an execution.
+The readiness path must not use the SDK's "fully approved" Boolean, which is
+defined for persistent maximum approval. Exact allowance checks read the raw
+owner/spender amount and compare it with the one bounded debit.
+Before exposing an actionable preview, the server checks:
+
+- API/JWT authentication and Predict-account identity
+- available USDT
+- the Privy signer and Predict deposit-address relationship
+- enough native BNB for one approval transaction and a bounded cleanup
+  transaction
+- one SDK approval step derived from the selected market's real
+  `isNegRisk`, `isYieldBearing`, and BUY side
+
+V1 still admits only standard, non-NegRisk, non-yield-bearing binary markets.
+The market-derived scope is retained so a future scope expansion cannot reuse
+the wrong exchange spender accidentally.
+
+After human confirmation, the Predict leg follows this sequence:
+
+1. refresh both venues and compute the final bounded Predict debit
+2. set the Predict USDT allowance to exactly that debit and wait for its receipt
+3. refresh both venues again because approval consumes time
+4. if all confirmed ceilings and gates still pass, submit both FOK legs
+   concurrently
+5. reconcile the Predict order, position, and remaining allowance
+
+If step 2 fails, neither venue order is submitted. If approval succeeds but the
+post-approval refresh fails, the service resets the allowance to zero before
+releasing the execution lock. A failed reset opens the cross-venue breaker and
+alerts; it never proceeds to either order. Any nonzero allowance left after a
+conclusive fill or failure is also reset to zero before the execution is closed.
+
+### 7.5 Testnet verification boundary
+
+The existing Predict testnet account is an EOA, while production uses a Predict
+Account controlled by a Privy signer. Testnet therefore validates only the
+shared adapter path: market and book reads, quote math, caps, exact allowance,
+signed order submission, FOK behavior, and REST/position reconciliation.
+
+An explicit operator-only testnet canary command injects BNB Testnet, the
+testnet API, and the dedicated EOA Keychain credential into the same trading
+adapter methods used by production. The Dashboard, watcher, normal runtime
+configuration, and `make acceptance` remain mainnet-only. The canary is never
+started automatically. It defaults to no-submit; a mutation requires an
+explicit submit flag after showing the market, outcome, quantity, and maximum
+test-USDT debit. The hard canary cap is 1 test USDT.
+
+Predict-Account-specific behavior remains covered by:
+
+- deterministic tests proving the mainnet builder receives the Privy signer and
+  `predict_account=<deposit address>`
+- mainnet read-only JWT, balance, market, book, approval-step, and signed
+  no-submit checks
+- the already completed bounded mainnet canary that proved exact approval via
+  the SDK's Smart Account/Kernel route, filled order, position, receipts, and
+  zero remaining allowance
+
+A new mainnet order canary is required only after an SDK upgrade, signer/account
+change, Smart Account/Kernel-path change, or expansion to a new market type. It
+always requires separate operator authorization.
 
 ## 8. Preview and Human Confirmation
 
@@ -302,7 +371,7 @@ service refreshes by REST:
 - both rules and fingerprints
 - both market and outcome statuses
 - both books and fee facts
-- both balances and allowances
+- both balances, current allowance state, and exact-approval prerequisites
 - Codex approval validity
 - execution lock, circuit breaker, and unsettled reservation
 
@@ -320,9 +389,11 @@ The system never silently raises a confirmed price ceiling.
 
 ### 9.1 Concurrent bounded submission
 
-After the confirmation refresh, the execution service submits the Predict and
-Polymarket FOK legs concurrently to minimize naked-leg duration. This is not an
-atomic transaction; either venue may succeed while the other fails.
+After confirmation, the execution service completes the exact Predict approval
+and then performs the required post-approval refresh. Only after that refresh
+passes does it submit the Predict and Polymarket FOK legs concurrently to
+minimize naked-leg duration. This is not an atomic transaction; either venue
+may succeed while the other fails.
 
 Both submissions use the same local execution ID and venue-specific client
 identity where supported. Repeated UI confirmation for the same preview maps to
@@ -476,6 +547,13 @@ Predict credentials remain in macOS Keychain under the existing service names:
 - service `com.open-trader.predict`, account `api-key`
 - service `com.open-trader.predict`, account `privy-private-key`
 
+The operator-only EOA testnet canary uses its existing isolated Keychain labels:
+
+- service `com.open-trader.predict-testnet-canary`, account `eoa-private-key`
+
+Mainnet and testnet credentials are never interchangeable or selected by a
+Dashboard/runtime environment switch.
+
 Credentials are never included in source, configuration JSON, logs, snapshots,
 Codex prompts, Feishu messages, screenshots, test fixtures, or this design.
 
@@ -495,7 +573,8 @@ Public wallet addresses may be masked in UI and logs.
 | Predict net units or fee unavailable | Observation only. |
 | Book or REST state stale | Remove stage-5 actionability. |
 | Price exceeds confirmed ceiling | Cancel; require a new preview and confirmation. |
-| Balance or allowance insufficient | Cancel before either submit. |
+| Balance, native gas, or exact-approval capability insufficient | Cancel before approval or either submit. |
+| Exact approval succeeds but the post-approval refresh fails | Submit neither order; reset allowance to zero. Reset failure opens the breaker and alerts. |
 | 20 USDT entry cap exceeded | Size down to a valid common quantity or reject. |
 | 100 USDT unsettled cap unavailable | Reject before reservation and submit. |
 | Duplicate confirmation | Return the existing execution; never create another. |
@@ -557,7 +636,18 @@ Public wallet addresses may be masked in UI and logs.
 | CV-28 | A pair enters stage 5 repeatedly without identity change. | One Feishu notification is scheduled for the pair/direction/fingerprints; stages 1–4 send none. No real message is sent in acceptance. |
 | CV-29 | LLM hedge and legacy execution regression tests run. | Existing behavior remains unchanged apart from the intentionally shared venue header. |
 
-### 16.5 Final Dashboard gate
+### 16.5 Exact approval and environment verification
+
+| ID | Given / action | Required observation |
+| --- | --- | --- |
+| CV-30 | Predict has zero current allowance but valid identity, balance, native gas, and one valid scoped BUY approval step. | Account readiness permits preview; zero allowance is not reported as an account failure. |
+| CV-31 | Run the explicit testnet canary after confirming a bounded order. | The formal adapter sets only the exact EOA allowance, submits one bounded testnet order, and independently reconciles order, position, receipts, and remaining allowance. |
+| CV-32 | Exact approval succeeds but either refreshed book leaves the confirmed bounds. | Neither venue order is submitted and the Predict allowance is reset to zero. |
+| CV-33 | Allowance reset fails after a post-approval cancellation. | The execution remains non-submitted, the global cross-venue breaker opens, and an operator alert is persisted. |
+| CV-34 | Build the mainnet Predict client and run live readiness. | The builder uses the Privy signer with the Predict deposit address; JWT, balances, approval step, and signed no-submit order pass without an approval or order transaction. |
+| CV-35 | Run `make acceptance`. | No testnet canary, mainnet approval, mainnet order, or live notification occurs; mutation count remains zero. |
+
+### 16.6 Final Dashboard gate
 
 `make acceptance` is the final review-readiness gate and must return `PASS`.
 Focused tests and direct workflow checks run during development; the complete
@@ -581,7 +671,7 @@ logs, and HTTP 200 review URL. Because the user requested visual confirmation,
 desktop and mobile screenshots are supplied after PASS, but screenshots do not
 substitute for any gate result.
 
-### 16.6 Required evidence
+### 16.7 Required evidence
 
 - CV-01 through CV-13: focused source, Codex-schema, matching, timing,
   economics, sizing, and reservation pytest cases.
@@ -589,6 +679,9 @@ substitute for any gate result.
   Polymarket submit/reconcile doubles, plus direct no-submit workflow checks.
 - CV-25 through CV-29: Prediction Playwright at 1440px and 375px, including
   header, funnel, candidate, modal, keyboard, and notification assertions.
+- CV-30 through CV-35: focused readiness/execution tests, one explicit
+  operator-run EOA testnet canary using the formal adapter, mainnet read-only
+  no-submit checks, and the retained historical Smart Account canary metadata.
 - Live readiness: real read-only Predict and Polymarket API/account checks with
   no order submission and no secret output.
 - Final runtime: `make acceptance` output, exact Git SHA, process PID and cwd,
@@ -598,6 +691,11 @@ substitute for any gate result.
 
 The existing single-venue Predict canary is evidence for Predict authentication
 and order mechanics, not proof of cross-venue execution.
+
+The operator-only testnet canary validates the formal adapter before this first
+cross-venue mainnet canary. It does not replace the separate confirmation below
+because an EOA testnet order cannot prove a two-venue mainnet execution or the
+Predict Smart Account route.
 
 After the implementation has passed acceptance and the exact SHA is deployed,
 the first cross-venue live canary requires a separate explicit user confirmation
