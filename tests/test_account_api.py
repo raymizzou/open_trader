@@ -6,6 +6,7 @@ from decimal import Decimal
 import hashlib
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -362,6 +363,34 @@ def test_live_parity_fails_on_wrong_opaque_id(
 
     assert result.status == "FAIL"
     assert result.reason == "position_id_mismatch"
+
+
+def test_live_parity_fails_closed_on_malformed_success_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+
+    class MalformedResponse(io.BytesIO):
+        status = HTTPStatus.OK
+        headers: dict[str, str] = {}
+
+        def __enter__(self) -> "MalformedResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+    monkeypatch.setattr(
+        account_api.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: MalformedResponse(b"{"),
+    )
+
+    result = account_api.check_account_api_parity(data_dir)
+
+    assert result.status == "FAIL"
+    assert result.reason == "api_payload_invalid"
 
 
 def test_live_parity_blocks_when_raw_publication_never_pins(

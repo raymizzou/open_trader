@@ -231,7 +231,11 @@ def _read_parity_bytes(path: Path) -> bytes:
 def _fetch_snapshot(url: str) -> tuple[int, object, str | None]:
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
-            return response.status, json.load(response), response.headers.get("ETag")
+            try:
+                payload = json.load(response)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            return response.status, payload, response.headers.get("ETag")
     except urllib.error.HTTPError as error:
         try:
             payload = json.load(error)
