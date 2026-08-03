@@ -6427,3 +6427,58 @@ def test_controller_passes_the_terminal_allocation_reference_to_report_generatio
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
     assert generated == [reference]
+
+
+def test_allocation_gate_uses_shared_shanghai_date_for_us_report_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    cycle = replace(active_cn_cycle(), market="US", as_of_date="2026-07-31")
+    captured: dict[str, object] = {}
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            captured["calendar"] = kwargs
+            return ["2026-08-03"]
+
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda _config, **kwargs: captured.update(kwargs) or {"daily_path": "data/x", "sha256": "a" * 64},
+    )
+
+    result = controller._allocation_reference_for_cycle(
+        config,
+        now=datetime.fromisoformat("2026-08-03T09:31:00-04:00"),
+        quote_client=Quote(),
+    )
+
+    assert result == {"daily_path": "data/x", "sha256": "a" * 64}
+    assert captured["allocation_date"] == "2026-08-03"
+
+
+@pytest.mark.parametrize("market", ["CN", "HK", "US"])
+def test_generate_report_passes_allocation_reference_to_market_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    reference = {"daily_path": "data/x", "sha256": "a" * 64}
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: object())
+    monkeypatch.setattr(
+        controller,
+        "run_a_share_trend_report",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(status="generated"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "run_market_trend_report",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(status="generated"),
+    )
+
+    controller._generate_report(config, market, "2026-08-03", False, reference)
+
+    assert captured["allocation_reference"] is reference

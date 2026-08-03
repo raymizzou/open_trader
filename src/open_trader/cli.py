@@ -559,7 +559,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="trend_allocation_command", required=True
     )
     trend_allocation_run = trend_allocation_commands.add_parser("run")
-    trend_allocation_run.add_argument("--revision", action="store_true")
     trend_allocation_run.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
@@ -1612,7 +1611,7 @@ def main(argv: list[str] | None = None) -> int:
                         if args.trend_allocation_command == "once"
                         else None
                     ),
-                    revision=args.revision,
+                    revision=(args.revision if args.trend_allocation_command == "once" else False),
                 )
         except (FileNotFoundError, ValueError, RuntimeError, ZoneInfoNotFoundError) as exc:
             print(str(exc), file=sys.stderr)

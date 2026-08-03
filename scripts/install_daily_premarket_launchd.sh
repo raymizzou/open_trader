@@ -409,7 +409,7 @@ install_rendered() {
     stderr_offset="$(wc -c < "$stderr_path" | tr -d '[:space:]')"
   fi
   loaded_at="$(date +%s)"
-  launchctl load "$target"
+  launchctl bootstrap "gui/$UID" "$target"
   verify_loaded_controller "$label" "$market" "$loaded_at" "$stderr_offset"
   echo "installed launchd agent: $target"
 }
@@ -424,7 +424,7 @@ install_allocation() {
   stderr_offset=0
   if [[ -f "$stderr_path" ]]; then stderr_offset="$(wc -c < "$stderr_path" | tr -d '[:space:]')"; fi
   loaded_at="$(date +%s)"
-  launchctl load "$target"
+  launchctl bootstrap "gui/$UID" "$target"
   verify_loaded_allocation "$label" "$loaded_at" "$stderr_offset"
   echo "installed launchd agent: $target"
 }

@@ -659,8 +659,6 @@ def _generate_report(
     revision: bool,
     allocation_reference: Mapping[str, object] | None = None,
 ) -> None:
-    # The controller, rather than a market report, owns the allocation decision.
-    del allocation_reference
     require_trend_executor(config, hostname_fn=socket.gethostname)
     notifier = build_notifier(config)
     result = (
@@ -669,6 +667,7 @@ def _generate_report(
             run_date=run_date,
             revision=revision,
             notifier=notifier,
+            allocation_reference=allocation_reference,
         )
         if market == "CN"
         else run_market_trend_report(
@@ -677,6 +676,7 @@ def _generate_report(
             run_date=run_date,
             revision=revision,
             notifier=notifier,
+            allocation_reference=allocation_reference,
         )
     )
     if result.status not in {"generated", "existing", "holiday"}:
@@ -685,21 +685,24 @@ def _generate_report(
 
 def _allocation_reference_for_cycle(
     config: DailyPremarketConfig,
-    cycle: ControllerCycle,
     *,
+    now: datetime,
     quote_client: object,
 ) -> Mapping[str, object] | None:
     """Use the single Shanghai allocation decision; reports never produce one."""
     if not config.trend_animals_api_key:
         return None
-    day = date.fromisoformat(cycle.as_of_date)
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=ZoneInfo(config.timezone))
+    allocation_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    day = date.fromisoformat(allocation_date)
     a_trading_days = quote_client.get_trading_days(
         market="CN",
         start=(day - timedelta(days=35)).isoformat(),
         end=(day + timedelta(days=1)).isoformat(),
     )
     return allocation_reference_for_report(
-        config, allocation_date=cycle.as_of_date, a_trading_days=a_trading_days
+        config, allocation_date=allocation_date, a_trading_days=a_trading_days
     )
 
 
@@ -2966,7 +2969,7 @@ def run_trend_market_controller(
                         else revision_pending
                     )
                     allocation_reference = _allocation_reference_for_cycle(
-                        config, work_cycle, quote_client=shared_quote()
+                        config, now=now, quote_client=shared_quote()
                     )
                     report_args: tuple[object, ...] = (
                         config,

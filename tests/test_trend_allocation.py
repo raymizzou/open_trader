@@ -14,7 +14,7 @@ from open_trader.trend_allocation import (
     load_allocation_reference,
     write_allocation_snapshot,
 )
-from open_trader.daily_premarket import DailyPremarketConfig
+from open_trader.daily_premarket import DailyPremarketConfig, NotificationAttempt
 import open_trader.trend_allocation as trend_allocation
 from open_trader.trend_animals import TrendAnimalsError
 
@@ -228,3 +228,75 @@ def test_allocation_reference_requires_current_terminal_attempt(tmp_path: Path) 
         trend_allocation.allocation_reference_for_report(
             config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
         )
+
+
+def test_holiday_waits_for_the_post_close_attempt_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+
+    class Quote:
+        def get_cn_trading_days(self, **_kwargs: object) -> list[str]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    class StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(trend_allocation, "require_trend_executor", lambda *_args, **_kwargs: None)
+    with pytest.raises(StopLoop):
+        trend_allocation.run_trend_allocation_controller(
+            config,
+            now_fn=lambda: datetime.fromisoformat("2026-08-03T16:19:00+08:00"),
+            sleep_fn=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
+            quote_factory=lambda **_kwargs: Quote(),
+        )
+
+    status = json.loads(
+        (config.data_dir / "trend_allocation/controller_status.json").read_text()
+    )
+    assert status["phase"] == "waiting"
+    assert status["attempted_for"] is None
+
+
+def test_failure_marker_requires_delivery_and_recovery_is_not_normal_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    outcomes = [
+        [NotificationAttempt(channel="feishu", success=False, error="offline")],
+        [NotificationAttempt(channel="feishu", success=True)],
+        [NotificationAttempt(channel="feishu", success=True)],
+    ]
+    monkeypatch.setattr(trend_allocation, "build_notifier", lambda _config: object())
+    monkeypatch.setattr(
+        trend_allocation,
+        "send_notification_with_results",
+        lambda *_args, **_kwargs: outcomes.pop(0),
+    )
+
+    assert not trend_allocation._notify_allocation_failure_once(
+        config, allocation_date="2026-08-03", reason="offline"
+    )
+    marker = config.data_dir / "trend_allocation/notifications/2026-08-03.json"
+    assert not marker.exists()
+    assert trend_allocation._notify_allocation_failure_once(
+        config, allocation_date="2026-08-03", reason="offline"
+    )
+    assert json.loads(marker.read_text())["delivered"] is True
+    assert trend_allocation._notify_allocation_recovery(
+        config, allocation_date="2026-08-03"
+    )
+    assert json.loads(marker.read_text())["recovered"] is True

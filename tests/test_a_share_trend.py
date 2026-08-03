@@ -6804,7 +6804,7 @@ def test_report_runner_waits_once_then_retries_until_ready(tmp_path: Path) -> No
     assert calls[:4] == ["futu.calendar", "api.update_status", "futu.calendar", "api.update_status"]
 
 
-def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Path) -> None:
+def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Path) -> None:
     calls: list[str] = []
     sleeps: list[float] = []
     feishu = RecordingFeishu()
@@ -6813,7 +6813,7 @@ def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Pat
     config = trend_config(tmp_path)
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-        datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14", now_fn=lambda: next(times),
@@ -6842,7 +6842,7 @@ def test_report_runner_retries_systemic_futu_failure_through_deadline(tmp_path: 
     calls: list[str] = []
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-        datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14", now_fn=lambda: next(times),

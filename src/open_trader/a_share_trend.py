@@ -6043,6 +6043,7 @@ def _attempt_report(
     quote_factory: Callable[..., object],
     account_factory: Callable[..., object],
     notifier: Notifier,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
     quote = quote_factory(host=config.futu_host, port=config.futu_port)
@@ -6537,6 +6538,7 @@ def run_a_share_trend_report(
     quote_factory: Callable[..., object] = FutuQuoteClient,
     account_factory: Callable[..., object] | None = None,
     notifier: Notifier | None = None,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
     notifier = notifier or NullNotifier()
@@ -6600,17 +6602,22 @@ def run_a_share_trend_report(
         )
         while True:
             try:
-                attempt = _attempt_report(
-                    config=config,
-                    run_date=run_date,
-                    artifact_stem=artifact_stem,
-                    process_version=version,
-                    api_factory=api_factory,
-                    quote_factory=quote_factory,
-                    account_factory=(
+                attempt_kwargs: dict[str, object] = {
+                    "config": config,
+                    "run_date": run_date,
+                    "artifact_stem": artifact_stem,
+                    "process_version": version,
+                    "api_factory": api_factory,
+                    "quote_factory": quote_factory,
+                    "account_factory": (
                         account_factory or FutuSimulateOrderExecutionClient
                     ),
-                    notifier=notifier,
+                    "notifier": notifier,
+                }
+                if allocation_reference is not None:
+                    attempt_kwargs["allocation_reference"] = allocation_reference
+                attempt = _attempt_report(
+                    **attempt_kwargs,
                 )
                 if attempt.status in {"generated", "existing", "holiday"}:
                     return attempt

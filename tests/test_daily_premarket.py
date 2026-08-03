@@ -4617,7 +4617,7 @@ def test_launchd_installer_executor_migrates_only_requested_market(
             continue
         assert (agents / f"{label}.plist").exists()
     calls = launchctl_log.read_text(encoding="utf-8").splitlines()
-    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    bootstrap_index = next(i for i, call in enumerate(calls) if call.startswith("bootstrap "))
     for label in ["com.open-trader.trend-us-report", "com.open-trader.trend-us-watch"]:
         bootout_index = next(i for i, call in enumerate(calls) if call.endswith(label))
         print_index = next(
@@ -4625,14 +4625,14 @@ def test_launchd_installer_executor_migrates_only_requested_market(
             for i, call in enumerate(calls)
             if call.startswith("print ") and call.endswith(label)
         )
-        assert bootout_index < print_index < load_index
+        assert bootout_index < print_index < bootstrap_index
     controller_print = next(
         i
         for i, call in enumerate(calls)
         if call.startswith("print ")
         and call.endswith("com.open-trader.trend-market-controller.us")
     )
-    assert controller_print < load_index
+    assert controller_print < bootstrap_index
     assert not any("trend-hk-" in call or "controller.hk" in call for call in calls)
     assert not any("trend-a-share" in call or "controller.cn" in call for call in calls)
 
@@ -4647,14 +4647,14 @@ def test_launchd_installer_waits_for_fresh_matching_controller_status(
 
     assert result.returncode == 0, result.stderr
     assert "verified launchd controller: US pid=4242" in result.stdout
-    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
-    post_load_prints = [
+    bootstrap_index = next(i for i, call in enumerate(calls) if call.startswith("bootstrap "))
+    post_bootstrap_prints = [
         call for i, call in enumerate(calls)
-        if i > load_index
+        if i > bootstrap_index
         and call.startswith("print ")
         and call.endswith("com.open-trader.trend-market-controller.us")
     ]
-    assert len(post_load_prints) == (2 if status_mode == "eventual-fresh" else 1)
+    assert len(post_bootstrap_prints) == (2 if status_mode == "eventual-fresh" else 1)
     runtime_log = (
         repo
         / "logs/daily_premarket/launchd-trend-controller-us.out.log"
@@ -4679,9 +4679,9 @@ def test_launchd_installer_fails_closed_on_unmatched_controller_status(
 
     assert result.returncode == 1
     assert "controller did not write fresh matching status" in result.stderr
-    load_index = next(i for i, call in enumerate(calls) if call.startswith("load "))
+    bootstrap_index = next(i for i, call in enumerate(calls) if call.startswith("bootstrap "))
     assert any(
-        i > load_index
+        i > bootstrap_index
         and call.startswith("print ")
         and call.endswith("com.open-trader.trend-market-controller.us")
         for i, call in enumerate(calls)
@@ -4730,7 +4730,7 @@ def test_launchd_installer_readonly_cleans_all_trend_automation(
     assert "effective mode: readonly" in result.stdout
     assert not any((agents / f"{label}.plist").exists() for label in _all_trend_labels())
     calls = launchctl_log.read_text(encoding="utf-8").splitlines()
-    assert not any(call.startswith("load ") for call in calls)
+    assert not any(call.startswith("bootstrap ") for call in calls)
     for label in _all_trend_labels():
         assert any(call.endswith(label) for call in calls)
 
@@ -4774,7 +4774,7 @@ def test_launchd_installer_refuses_load_while_legacy_label_is_present(
     assert result.returncode == 1
     assert "legacy launchd job is still loaded" in result.stderr
     calls = launchctl_log.read_text(encoding="utf-8").splitlines()
-    assert not any(call.startswith("load ") for call in calls)
+    assert not any(call.startswith("bootstrap ") for call in calls)
 
 
 def test_launchd_installer_rejects_orphan_process_for_selected_market(
@@ -4809,7 +4809,7 @@ def test_launchd_installer_rejects_orphan_process_for_selected_market(
     assert result.returncode == 1
     assert "legacy trend process is still running for US" in result.stderr
     assert not any(
-        call.startswith("load ")
+        call.startswith("bootstrap ")
         for call in launchctl_log.read_text(encoding="utf-8").splitlines()
     )
     patterns = pgrep_log.read_text(encoding="utf-8").splitlines()
@@ -4855,10 +4855,10 @@ def test_launchd_installer_stops_all_labels_before_orphan_process_fence(
             and call.endswith(f"trend-market-controller.{market}")
         )
         assert print_index < first_probe
-    assert not any(call.startswith("launchctl load ") for call in calls)
+    assert not any(call.startswith("launchctl bootstrap ") for call in calls)
 
 
-def test_launchd_installer_fences_every_selected_market_before_first_load(
+def test_launchd_installer_fences_every_selected_market_before_first_bootstrap(
     tmp_path: Path,
 ) -> None:
     repo = _copy_launchd_installer_assets(tmp_path)
@@ -4890,8 +4890,8 @@ def test_launchd_installer_fences_every_selected_market_before_first_load(
     assert result.returncode == 0, result.stderr
     calls = operations.read_text(encoding="utf-8").splitlines()
     probes = [i for i, call in enumerate(calls) if call.startswith("pgrep ")]
-    first_load = next(
-        i for i, call in enumerate(calls) if call.startswith("launchctl load ")
+    first_bootstrap = next(
+        i for i, call in enumerate(calls) if call.startswith("launchctl bootstrap ")
     )
     assert len(probes) == 6
     first_probe = min(probes)
@@ -4909,7 +4909,7 @@ def test_launchd_installer_fences_every_selected_market_before_first_load(
             and call.endswith(label)
             for i, call in enumerate(calls)
         )
-    assert max(probes) < first_load
+    assert max(probes) < first_bootstrap
 
 
 def test_launchd_installer_fails_after_five_present_label_checks(
@@ -4949,7 +4949,7 @@ def test_launchd_installer_fails_after_five_present_label_checks(
     ]
     assert len(prints) == 5
     assert not any(call.startswith("pgrep ") for call in calls)
-    assert not any(call.startswith("launchctl load ") for call in calls)
+    assert not any(call.startswith("launchctl bootstrap ") for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -5001,7 +5001,7 @@ def test_launchd_installer_fails_closed_on_launchctl_print_error(
     ]
     assert len(error_prints) == 1
     assert not any(call.startswith("pgrep ") for call in calls)
-    assert not any(call.startswith("launchctl load ") for call in calls)
+    assert not any(call.startswith("launchctl bootstrap ") for call in calls)
 
 
 def test_launchd_installer_readonly_fails_when_orphan_process_remains(
@@ -5035,7 +5035,7 @@ def test_launchd_installer_readonly_fails_when_orphan_process_remains(
     assert "legacy trend process is still running for CN" in result.stderr
     assert "readonly host: no trend controller installed" not in result.stdout
     assert not any(
-        call.startswith("load ")
+        call.startswith("bootstrap ")
         for call in launchctl_log.read_text(encoding="utf-8").splitlines()
     )
 
@@ -5353,6 +5353,7 @@ def test_launchd_uninstaller_explicit_all_removes_cn_jobs(tmp_path: Path) -> Non
         agents / "com.open-trader.premarket.hk.plist",
         agents / "com.open-trader.premarket.us.plist",
         agents / "com.open-trader.premarket.plist",
+        agents / "com.open-trader.trend-allocation.plist",
         *(agents / f"{label}.plist" for label in _all_trend_labels()),
     ]
     for path in paths:
@@ -5385,6 +5386,8 @@ def test_launchd_uninstaller_trend_only_removes_only_requested_market(
     agents.mkdir(parents=True)
     for label in _all_trend_labels():
         (agents / f"{label}.plist").write_text("plist\n", encoding="utf-8")
+    allocation = agents / "com.open-trader.trend-allocation.plist"
+    allocation.write_text("plist\n", encoding="utf-8")
 
     subprocess.run(
         [
@@ -5406,6 +5409,7 @@ def test_launchd_uninstaller_trend_only_removes_only_requested_market(
     for label in _all_trend_labels():
         exists = (agents / f"{label}.plist").exists()
         assert exists is not ("trend-us-" in label or ".us" in label)
+    assert allocation.exists()
     calls = (tmp_path / "launchctl.log").read_text(encoding="utf-8").splitlines()
     for label in [
         "com.open-trader.trend-market-controller.us",
@@ -5741,8 +5745,12 @@ if [[ "${1:-}" == "bootout" ]]; then
   rm -f "$state_dir/$label" "$state_dir/$label.prints"
   exit "${OPEN_TRADER_BOOTOUT_EXIT:-0}"
 fi
-if [[ "${1:-}" == "load" ]]; then
-  plist="${2:-}"
+if [[ "${1:-}" == "load" || "${1:-}" == "bootstrap" ]]; then
+  if [[ "${1:-}" == "bootstrap" ]]; then
+    plist="${3:-}"
+  else
+    plist="${2:-}"
+  fi
   label="$(basename "$plist" .plist)"
   if [[ "$label" == "com.open-trader.trend-allocation" ]]; then
     status_market="ALLOCATION"

@@ -94,17 +94,70 @@ def _read_allocation_status(data_dir: Path) -> dict[str, object]:
     return value
 
 
+def _allocation_notification_path(data_dir: Path, allocation_date: str) -> Path:
+    return data_dir / "trend_allocation" / "notifications" / f"{allocation_date}.json"
+
+
 def _notify_allocation_failure_once(
     config: DailyPremarketConfig, *, allocation_date: str, reason: str
-) -> None:
-    path = config.data_dir / "trend_allocation" / "notifications" / f"{allocation_date}.json"
-    if path.exists():
-        return
-    _write_json_atomic(path, {"allocation_date": allocation_date, "reason": reason})
-    send_notification_with_results(
-        build_notifier(config), "趋势配置快照阻塞",
-        f"{allocation_date} 配置刷新失败；沿用最近成功快照。原因：{reason}",
-    )
+) -> bool:
+    path = _allocation_notification_path(config.data_dir, allocation_date)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        existing = None
+    if isinstance(existing, Mapping) and existing.get("delivered") is True:
+        return False
+    try:
+        attempts = send_notification_with_results(
+            build_notifier(config), "趋势配置快照阻塞",
+            f"{allocation_date} 配置刷新失败；沿用最近成功快照。原因：{reason}",
+        )
+    except Exception:
+        return False
+    if not any(attempt.success for attempt in attempts):
+        return False
+    _write_json_atomic(path, {
+        "allocation_date": allocation_date,
+        "reason": reason,
+        "delivered": True,
+    })
+    return True
+
+
+def _notify_allocation_recovery(
+    config: DailyPremarketConfig, *, allocation_date: str
+) -> bool:
+    root = config.data_dir / "trend_allocation" / "notifications"
+    if not root.exists():
+        return False
+    changed = False
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("delivered") is not True
+            or payload.get("recovered") is True
+        ):
+            continue
+        failed_date = str(payload.get("allocation_date") or path.stem)
+        try:
+            attempts = send_notification_with_results(
+                build_notifier(config), "趋势配置快照恢复",
+                f"{failed_date} 配置刷新阻塞已恢复；{allocation_date} 已生成新快照。",
+            )
+        except Exception:
+            continue
+        if not any(attempt.success for attempt in attempts):
+            continue
+        updated = dict(payload)
+        updated["recovered"] = True
+        _write_json_atomic(path, updated)
+        changed = True
+    return changed
 
 
 def load_trend_allocation_status(
@@ -157,10 +210,14 @@ def run_trend_allocation_controller(
     lock = RunLock(config.data_dir / "runs/.trend_allocation.lock")
     with lock:
         failures = 0
+        failure_day: str | None = None
         while True:
             now = now_fn()
             now = (now.replace(tzinfo=_SHANGHAI) if now.tzinfo is None else now).astimezone(_SHANGHAI)
             day = _date_text(allocation_date or now.date().isoformat(), "allocation_date")
+            if day != failure_day:
+                failures = 0
+                failure_day = day
             quote = quote_factory(host=config.futu_host, port=config.futu_port)
             try:
                 days = sorted(quote.get_cn_trading_days(
@@ -181,6 +238,15 @@ def run_trend_allocation_controller(
             existing: Mapping[str, object] | None = None
             if _allocation_status_path(config.data_dir).exists():
                 existing = _read_allocation_status(config.data_dir)
+            if not once and now.time() < _ATTEMPT_AT:
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase="waiting", attempted_for=None,
+                    reference=reference, blocker=None,
+                    next_check_at=datetime.combine(now.date(), _ATTEMPT_AT, tzinfo=_SHANGHAI),
+                    process_version=process_version,
+                ))
+                sleep_fn(5)
+                continue
             if (
                 not once
                 and existing is not None
@@ -199,15 +265,6 @@ def run_trend_allocation_controller(
                     return status
                 sleep_fn(60)
                 continue
-            if not once and now.time() < _ATTEMPT_AT:
-                status = _write_allocation_status(config, _allocation_status(
-                    config, now=now, phase="waiting", attempted_for=None,
-                    reference=reference, blocker=None,
-                    next_check_at=datetime.combine(now.date(), _ATTEMPT_AT, tzinfo=_SHANGHAI),
-                    process_version=process_version,
-                ))
-                sleep_fn(5)
-                continue
             try:
                 api = api_factory(
                     api_key=config.trend_animals_api_key,
@@ -222,10 +279,9 @@ def run_trend_allocation_controller(
             except Exception as exc:
                 failures += 1
                 reason = str(exc) or exc.__class__.__name__
-                if failures == 1:
-                    _notify_allocation_failure_once(
-                        config, allocation_date=day, reason=reason
-                    )
+                _notify_allocation_failure_once(
+                    config, allocation_date=day, reason=reason
+                )
                 terminal = once or now.time() >= _FALLBACK_AT
                 if terminal:
                     status = _write_allocation_status(config, _allocation_status(
@@ -251,6 +307,8 @@ def run_trend_allocation_controller(
                 reference=reference, blocker=None, next_check_at=now + timedelta(days=1),
                 process_version=process_version,
             ))
+            _notify_allocation_recovery(config, allocation_date=day)
+            failures = 0
             if once:
                 return status
             sleep_fn(60)

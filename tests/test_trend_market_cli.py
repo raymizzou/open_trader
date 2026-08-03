@@ -86,6 +86,12 @@ def test_trend_allocation_parser_routes_once_revision_and_status() -> None:
     assert status.trend_allocation_command == "status"
 
 
+def test_trend_allocation_run_does_not_accept_revision() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args(["trend-allocation", "run", "--revision"])
+    assert exc_info.value.code == 2
+
+
 def test_trend_allocation_once_rebases_runtime_and_enforces_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

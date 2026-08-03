@@ -878,6 +878,7 @@ def _attempt_market_report(
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
     account_factory: Callable[..., object] | None = None,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> AShareTrendRunResult:
     market = _market(market)
     settings = MARKET_SETTINGS[market]
@@ -1473,6 +1474,7 @@ def run_market_trend_report(
     now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
     sleep_fn: Callable[[float], None] = sleep,
     attempt_fn: Callable[..., AShareTrendRunResult] = _attempt_market_report,
+    allocation_reference: Mapping[str, object] | None = None,
     **attempt_dependencies: object,
 ) -> AShareTrendRunResult:
     market = _market(market)
@@ -1485,6 +1487,9 @@ def run_market_trend_report(
     if not configured_ids:
         raise ValueError(f"Trend Animals {market} tmId list is required")
     with RunLock(paths.report_lock):
+        report_dependencies = dict(attempt_dependencies)
+        if allocation_reference is not None:
+            report_dependencies["allocation_reference"] = allocation_reference
         return _run_market_trend_retry(
             config=config,
             market=market,
@@ -1495,7 +1500,7 @@ def run_market_trend_report(
             sleep_fn=sleep_fn,
             attempt_fn=attempt_fn,
             paths=paths,
-            attempt_dependencies=attempt_dependencies,
+            attempt_dependencies=report_dependencies,
         )
 
 
