@@ -28,10 +28,10 @@
 
 | Checkpoint | Last task included | Permitted production files | Runtime purpose |
 | --- | --- | --- | --- |
-| Baseline SHA | Task 4 | Account stable-ID helper, Account API mode/guard, Account API installer, Worker installer lock check | First production Account release and rollback target |
+| Baseline SHA | Task 4A | Account stable-ID helper, Account API mode/guard, Account API installer, Worker installer lock check, real Futu timestamp normalization | First production Account release and rollback target |
 | Cutover SHA | Task 11 | Gateway routing, Legacy enrichment ID, browser polling/composition, installer readiness, acceptance, docs/log | Final candidate and accepted deployment |
 
-After Task 4, record `git rev-parse HEAD` as the baseline SHA. Tasks 6–11 must not modify:
+After Task 4A, record `git rev-parse HEAD` as the baseline SHA. Tasks 6–11 must not modify:
 
 - `src/open_trader/account_snapshot.py`
 - `src/open_trader/account_api.py`
@@ -39,8 +39,9 @@ After Task 4, record `git rev-parse HEAD` as the baseline SHA. Tasks 6–11 must
 - `ops/launchd/com.open-trader.account-api.plist.template`
 - `scripts/install_account_api_launchd.sh`
 - `scripts/install_account_sync_launchd.sh`
+- `src/open_trader/dashboard_quotes.py`
 
-If any of those files must change, stop, discard the recorded checkpoint, make the correction, rerun Tasks 1–5, and record a new baseline SHA.
+If any of those files must change, stop, discard the recorded checkpoint, make the correction, rerun Tasks 1–5 and Task 4A, and record a new baseline SHA.
 
 ## Task 1: Publish the Existing Stable-ID Constructors
 
@@ -288,6 +289,49 @@ git diff --quiet HEAD -- src/open_trader/account_snapshot.py src/open_trader/acc
 ```
 
 Expected: `git rev-parse` prints the immutable baseline SHA and `git diff --quiet` exits 0. Record the SHA in the execution notes used for the Issue #21 evidence.
+
+## Task 4A: Normalize Real Futu US Publication Timestamps Before Baseline Freeze
+
+**Files:**
+
+- Modify: `src/open_trader/dashboard_quotes.py`
+- Modify: `tests/test_dashboard_quotes.py`
+
+- [ ] **Step 1: Write the red producer regression test**
+
+Extend the existing fake Futu snapshot test with `update_time="2026-07-15 03:03:01"` and assert the published US `price_time` is `2026-07-15 03:03:01.000`. Keep the existing millisecond input assertion unchanged. This is the smallest seam that reproduces the live rows rejected by `account_snapshot.py`.
+
+- [ ] **Step 2: Prove the test is red against the current producer**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_dashboard_quotes.py -k 'price_time or active_session'
+```
+
+Expected: the new seconds-only case fails because `_select_us_price()` currently copies Futu `update_time` unchanged.
+
+- [ ] **Step 3: Normalize only valid naive Futu timestamps at publication**
+
+Add one private helper beside the existing quote-time helpers. Parse a valid naive ISO timestamp with `datetime.fromisoformat()` and emit `isoformat(sep=" ", timespec="milliseconds")`; preserve an empty or malformed value unchanged so the existing Account validator still fails closed. Apply it only to the active US `price_time` returned by `_select_us_price()`.
+
+Do not broaden `account_snapshot` validation, fabricate a timezone, change `fetched_at`, change non-US timestamps, or alter quote session selection.
+
+- [ ] **Step 4: Run producer and Account regression tests**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_dashboard_quotes.py tests/test_account_api.py
+```
+
+Expected: all tests pass, including existing millisecond normalization and Account v1 time-zone conversion tests.
+
+- [ ] **Step 5: Commit the corrected baseline candidate**
+
+```bash
+git add src/open_trader/dashboard_quotes.py tests/test_dashboard_quotes.py
+git commit -m "fix: normalize Futu quote publication times (#21)"
+git rev-parse HEAD
+```
+
+This commit invalidates the earlier `88a68711` runtime checkpoint. Rebuild the detached baseline checkout from this new SHA and repeat Task 5 before Gateway work.
 
 ## Task 5: Prove the Baseline Account Release Before Browser Cutover
 
