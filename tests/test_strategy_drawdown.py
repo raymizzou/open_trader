@@ -139,9 +139,9 @@ def test_parameter_hash_is_canonical() -> None:
 @pytest.mark.parametrize(
     ("market", "version", "predecessor"),
     [
-        ("CN", "v11", "v10"),
-        ("HK", "v9", "v8"),
-        ("US", "v9", "v8"),
+        ("CN", "v12", "v11"),
+        ("HK", "v10", "v9"),
+        ("US", "v10", "v9"),
     ],
 )
 def test_daily_allocation_changes_keep_one_drawdown_identity(

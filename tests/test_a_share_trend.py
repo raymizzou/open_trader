@@ -38,6 +38,7 @@ from open_trader.a_share_trend import (
     load_protection_state,
     load_watch_events,
     plan_rotation_pairs,
+    plan_rotation_pairs_with_comparisons,
     render_trend_failure_text,
     render_trend_feishu_text,
     render_markdown,
@@ -286,6 +287,7 @@ def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
 def candidate(
     symbol: str,
     *,
+    tm_id: int | None = None,
     strength: str | None = "96",
     days: int | None = 3,
     amount: str | None = "2",
@@ -308,7 +310,7 @@ def candidate(
     global_strength: str | None = None,
 ) -> CandidateInput:
     return CandidateInput(
-        tm_id=int(symbol),
+        tm_id=(int(symbol) if tm_id is None and symbol.isdigit() else tm_id or 900002),
         symbol=symbol,
         exchange=exchange,
         name=f"股票{symbol}" if name is None else name,
@@ -398,6 +400,7 @@ def serialized_position() -> dict[str, object]:
 def holding(
     symbol: str,
     *,
+    tm_id: int | None = None,
     right_side: bool | None = True,
     danger: bool | None = False,
     boiling: bool | None = False,
@@ -405,6 +408,7 @@ def holding(
     industry: str = "电力",
     industry_tm_id: int | None = 700001,
     industry_temperature: str | None = "热",
+    asset: str = "A股",
     filter_price: str | None = "10",
     market_cap: str | None = "100",
     strength: str | None = "96",
@@ -415,7 +419,7 @@ def holding(
     global_strength: str | None = None,
 ) -> HoldingSnapshot:
     return HoldingSnapshot(
-        tm_id=int(symbol),
+        tm_id=(int(symbol) if tm_id is None and symbol.isdigit() else tm_id or 900001),
         symbol=symbol,
         exchange="SH",
         name=f"股票{symbol}",
@@ -424,6 +428,7 @@ def holding(
         danger=danger,
         boiling=boiling,
         champagne=champagne,
+        asset=asset,
         industry=industry,
         industry_tm_id=industry_tm_id,
         industry_temperature=industry_temperature,
@@ -440,17 +445,82 @@ def holding(
     )
 
 
+def test_same_category_rotation_uses_local_strength() -> None:
+    pairs, comparisons = plan_rotation_pairs_with_comparisons(
+        holdings=(
+            holding(
+                "PM", asset="美股", strength="76", global_strength="86.18",
+            ),
+        ),
+        candidates=(
+            candidate(
+                "SHEL", asset="美股", strength="98.6", global_strength="95.36",
+            ),
+        ),
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+        market="US",
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in pairs] == [
+        ("PM", "SHEL"),
+    ]
+    assert comparisons[0].strength_basis == "local"
+    assert comparisons[0].strength_gap == Decimal("22.6")
+    assert comparisons[0].outcome == "planned"
+
+
+def test_cross_category_rotation_uses_global_strength() -> None:
+    pairs, comparisons = plan_rotation_pairs_with_comparisons(
+        holdings=(
+            holding(
+                "SPY", asset="美国ETF", strength="99", global_strength="70",
+            ),
+        ),
+        candidates=(
+            candidate(
+                "SHEL", asset="美股", strength="75", global_strength="90",
+            ),
+        ),
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+        market="US",
+    )
+
+    assert len(pairs) == 1
+    assert comparisons[0].strength_basis == "global"
+    assert comparisons[0].strength_gap == Decimal("20")
+
+
+def test_rotation_comparison_does_not_fallback_between_strength_scopes() -> None:
+    _, same_category = plan_rotation_pairs_with_comparisons(
+        holdings=(holding("PM", asset="美股", strength=None, global_strength="10"),),
+        candidates=(candidate("SHEL", asset="美股", strength="99", global_strength="90"),),
+        entry_weight=Decimal("0.04"), available_slots=0, pair_slots=(0, 1), market="US",
+    )
+    _, cross_category = plan_rotation_pairs_with_comparisons(
+        holdings=(holding("SPY", asset="美国ETF", strength="1", global_strength=None),),
+        candidates=(candidate("SHEL", asset="美股", strength="99", global_strength="90"),),
+        entry_weight=Decimal("0.04"), available_slots=0, pair_slots=(0, 1), market="US",
+    )
+
+    assert same_category[0].outcome == "data_unavailable"
+    assert cross_category[0].outcome == "data_unavailable"
+
+
 def test_rotation_pairs_weakest_with_strongest_at_inclusive_twenty_points() -> None:
     """A 20-point edge is actionable; 19.9 would not be."""
     pairs = plan_rotation_pairs(
         holdings=[
-            holding("100001", global_strength="10"),
-            holding("100002", global_strength="20"),
-            holding("100003", global_strength="80"),
+            holding("100001", strength="10", global_strength="10"),
+            holding("100002", strength="20", global_strength="20"),
+            holding("100003", strength="80", global_strength="80"),
         ],
         candidates=[
-            candidate("200001", global_strength="90"),
-            candidate("200002", global_strength="40"),
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
         ],
         entry_weight=Decimal("0.04"),
         available_slots=0,
@@ -466,14 +536,14 @@ def test_rotation_pairs_weakest_with_strongest_at_inclusive_twenty_points() -> N
 def test_rotation_pairs_reject_19_9_and_use_stable_unique_symbols() -> None:
     pairs = plan_rotation_pairs(
         holdings=[
-            holding("100002", global_strength="20"),
-            holding("100001", global_strength="20"),
+            holding("100002", strength="20", global_strength="20"),
+            holding("100001", strength="20", global_strength="20"),
         ],
         candidates=[
-            candidate("200002", global_strength="39.9"),
-            candidate("200001", global_strength="40"),
-            candidate("200001", global_strength="99"),
-            candidate("100001", global_strength="100"),
+            candidate("200002", strength="39.9", global_strength="39.9"),
+            candidate("200001", strength="40", global_strength="40"),
+            candidate("200001", strength="99", global_strength="99"),
+            candidate("100001", strength="100", global_strength="100"),
         ],
         entry_weight=Decimal("0.04"),
         available_slots=0,
@@ -515,12 +585,14 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         execution_date="2026-07-15",
         account=simulated,
         candidates=[
-            candidate("200001", global_strength="90"),
-            candidate("200002", global_strength="40"),
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
         ],
         holding_snapshots={
             symbol: holding(
-                symbol, global_strength=("10" if index == 0 else "20"),
+                symbol,
+                strength=("10" if index == 0 else "20"),
+                global_strength=("10" if index == 0 else "20"),
             )
             for index, symbol in enumerate(held_symbols)
         },
@@ -560,7 +632,18 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         (pair["sell_symbol"], pair["buy_symbol"])
         for pair in payload["strategy_judgments"]["simulate_rotation_pairs"]
     ] == [("100000", "200001"), ("100001", "200002")]
+    comparisons = payload["strategy_judgments"][
+        "simulate_rotation_comparisons"
+    ]
+    assert comparisons[0]["strength_basis"] == "global"
+    assert comparisons[0]["strength_gap"] == "80"
+    assert comparisons[0]["outcome"] == "planned"
     assert trend_module.valid_frozen_report_contract(payload)
+    invalid_comparison = json.loads(json.dumps(payload))
+    invalid_comparison["strategy_judgments"][
+        "simulate_rotation_comparisons"
+    ][0]["strength_gap"] = "79"
+    assert not trend_module.valid_frozen_report_contract(invalid_comparison)
     valid_real_pair = json.loads(json.dumps(payload))
     real_pair = copy.deepcopy(
         valid_real_pair["strategy_judgments"]["simulate_rotation_pairs"][0]
@@ -571,11 +654,16 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         sell_futu_symbol="SH.REAL",
         execution_mode="manual",
     )
+    real_comparison = copy.deepcopy(
+        valid_real_pair["strategy_judgments"]["simulate_rotation_comparisons"][0]
+    )
+    real_comparison.update(sell_symbol="REAL", sell_name="Real")
     valid_real_pair["strategy_judgments"].update(
         real_holding_decisions=[{"symbol": "REAL"}],
         real_holding_decisions_status="available",
         real_holding_decisions_source={},
         real_rotation_pairs=[real_pair],
+        real_rotation_comparisons=[real_comparison],
     )
     assert trend_module.valid_frozen_report_contract(valid_real_pair)
 
@@ -650,6 +738,21 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         replace(built, allocation=None)
     )
     markdown = render_markdown(built)
+    comparison_only = replace(
+        built,
+        simulate_rotation_pairs=(),
+        simulate_rotation_comparisons=(replace(
+            built.simulate_rotation_comparisons[0],
+            strength_gap=Decimal("19.9"),
+            outcome="gap_below_threshold",
+            reason="强度差 19.9 小于门槛 20",
+        ),),
+    )
+    comparison_markdown = render_markdown(comparison_only)
+    assert "未触发" in comparison_markdown
+    assert "门槛 20" in comparison_markdown
+    assert "还差 0.1" in comparison_markdown
+    assert "无。" not in comparison_markdown.split("## 模拟盘自动轮换", 1)[1].split("##", 1)[0]
     ordered_payload = json.loads(json.dumps(payload))
     ordered_payload["strategy_judgments"]["formal_actions"] = [
         {"action": "SELL_ALL", "symbol": "EXIT", "name": "Exit", "reason": "danger_signal"},
@@ -851,7 +954,7 @@ def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
             symbol: (
                 None
                 if symbol == real_symbols[-1]
-                else holding(symbol, global_strength="60")
+                else holding(symbol, strength="60", global_strength="60")
             )
             for symbol in real_symbols
         },
@@ -878,12 +981,12 @@ def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
         execution_date="2026-07-15",
         account=simulated,
         candidates=[
-            candidate(real_symbols[-1], global_strength="100"),
-            candidate("200001", global_strength="90"),
-            candidate("200002", global_strength="40"),
+            candidate(real_symbols[-1], asset="ETF基金", strength="96", global_strength="100"),
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
         ],
         holding_snapshots={
-            symbol: holding(symbol, global_strength="10")
+            symbol: holding(symbol, strength="10", global_strength="10")
             for symbol in simulated_symbols
         },
         bars_by_symbol={symbol: bars() for symbol in simulated_symbols},
@@ -1033,9 +1136,9 @@ def active_drawdown_for(
 @pytest.mark.parametrize(
     ("market", "version", "rank", "weight"),
     [
-        ("CN", "v11", 1, "0.06"),
-        ("HK", "v9", 2, "0.04"),
-        ("US", "v9", 3, "0.02"),
+        ("CN", "v12", 1, "0.06"),
+        ("HK", "v10", 2, "0.04"),
+        ("US", "v10", 3, "0.02"),
     ],
 )
 def test_current_allocation_versions_freeze_rank_weight(
@@ -6301,6 +6404,7 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "danger": False,
         "boiling": None,
         "champagne": False,
+        "asset": "A股",
         "industry": "电力",
         "industry_tm_id": 700001,
         "industry_temperature": "热",
