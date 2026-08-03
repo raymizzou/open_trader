@@ -676,7 +676,50 @@ def _prediction_predict_account_snapshot(execution: object | None) -> Mapping[st
     except Exception:
         return {}
     safe = _prediction_safe_value(value)
-    return safe if isinstance(safe, Mapping) else {}
+    if not isinstance(safe, Mapping):
+        return {}
+    normalized = _prediction_normalize_predict_account_snapshot(safe)
+    return normalized if isinstance(normalized, Mapping) else {}
+
+
+def _prediction_normalize_predict_account_snapshot(
+    snapshot: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    normalized = dict(snapshot)
+    required = ("wallet_address", "available_usdt", "open_orders", "positions", "checked_at")
+    if not all(name in normalized for name in required):
+        return None
+    has_current = all(
+        name in normalized
+        for name in ("allowance", "scope_ready", "gas_ready", "allowance_breaker")
+    )
+    if has_current:
+        if (
+            not isinstance(normalized.get("scope_ready"), bool)
+            or not isinstance(normalized.get("gas_ready"), bool)
+            or not isinstance(normalized.get("allowance_breaker"), bool)
+            or normalized.get("allowance") in (None, "")
+        ):
+            return None
+        return normalized
+    if "allowance_ready" not in normalized:
+        return None
+    ready = normalized.get("allowance_ready") is True
+    normalized["allowance"] = "0" if ready else ""
+    normalized["scope_ready"] = ready
+    normalized["gas_ready"] = ready
+    normalized["allowance_breaker"] = not ready
+    return normalized
+
+
+def _prediction_predict_account_ready(snapshot: Mapping[str, object]) -> bool:
+    return (
+        snapshot.get("scope_ready") is True
+        and snapshot.get("gas_ready") is True
+        and snapshot.get("allowance_breaker") is False
+        and snapshot.get("allowance") not in (None, "")
+        and snapshot.get("available_usdt") not in (None, "")
+    )
 
 
 def _prediction_venues_payload(
@@ -724,10 +767,7 @@ def _prediction_venues_payload(
         predict_wallet = _prediction_mask_wallet(predict_wallet)
     predict_reason = source_snapshot.get("reason") or cross_venue.get("reason")
     cross_breaker_open = bool(getattr(execution, "_cross_breaker_open", True))
-    predict_account_ready = (
-        predict_account.get("allowance_ready") is True
-        and predict_account.get("available_usdt") not in (None, "")
-    )
+    predict_account_ready = _prediction_predict_account_ready(predict_account)
     if predict_rest == "pending" or predict_ws == "pending":
         predict_mode = "API Key 待分配"
         predict_reason = predict_reason or "api_key_pending"

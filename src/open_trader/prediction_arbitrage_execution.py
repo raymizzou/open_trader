@@ -111,6 +111,46 @@ def _age_seconds(value: object) -> float | None:
     return max(0.0, (_utc_now() - moment.astimezone(UTC)).total_seconds())
 
 
+def _normalize_predict_account_snapshot(
+    snapshot: Mapping[str, object],
+) -> dict[str, object] | None:
+    normalized = dict(snapshot)
+    required = ("wallet_address", "available_usdt", "open_orders", "positions", "checked_at")
+    if not all(name in normalized for name in required):
+        return None
+    has_current = all(
+        name in normalized
+        for name in ("allowance", "scope_ready", "gas_ready", "allowance_breaker")
+    )
+    if has_current:
+        if (
+            not isinstance(normalized.get("scope_ready"), bool)
+            or not isinstance(normalized.get("gas_ready"), bool)
+            or not isinstance(normalized.get("allowance_breaker"), bool)
+            or normalized.get("allowance") in (None, "")
+        ):
+            return None
+        return normalized
+    if "allowance_ready" not in normalized:
+        return None
+    ready = normalized.get("allowance_ready") is True
+    normalized["allowance"] = "0" if ready else ""
+    normalized["scope_ready"] = ready
+    normalized["gas_ready"] = ready
+    normalized["allowance_breaker"] = not ready
+    return normalized
+
+
+def _predict_account_snapshot_ready(snapshot: Mapping[str, object]) -> bool:
+    return (
+        snapshot.get("scope_ready") is True
+        and snapshot.get("gas_ready") is True
+        and snapshot.get("allowance_breaker") is False
+        and snapshot.get("allowance") not in (None, "")
+        and snapshot.get("available_usdt") not in (None, "")
+    )
+
+
 def _call(method: object, *args: object, **kwargs: object) -> object:
     if not callable(method):
         return None
@@ -2703,13 +2743,17 @@ class PredictionExecutionService:
             or poly_balance < poly_leg.max_cost
             or poly_allowance < poly_leg.max_cost
             or predict_balance < predict_leg.max_cost
-            or predict.get("allowance_ready") is not True
+            or not _predict_account_snapshot_ready(predict)
         ):
             return None, "account_insufficient"
         return {
             "predict.fun": {
                 "asset": "USDT", "wallet_address": str(predict["wallet_address"]),
-                "available_balance": predict_balance, "allowance_ready": True,
+                "available_balance": predict_balance,
+                "allowance": predict.get("allowance"),
+                "scope_ready": predict.get("scope_ready"),
+                "gas_ready": predict.get("gas_ready"),
+                "allowance_breaker": predict.get("allowance_breaker"),
             },
             "polymarket": {
                 "asset": "pUSD", "wallet_address": str(polymarket["wallet_address"]),
@@ -2728,7 +2772,8 @@ class PredictionExecutionService:
         if not isinstance(value, Mapping):
             return None
         snapshot = dict(value)
-        if not all(name in snapshot for name in ("wallet_address", "available_usdt", "allowance_ready", "open_orders", "positions", "checked_at")):
+        snapshot = _normalize_predict_account_snapshot(snapshot)
+        if snapshot is None:
             return None
         age = _age_seconds(snapshot.get("checked_at"))
         if age is None or age > 60 or not self._snapshot_collections_valid({"open_order_ids": snapshot["open_orders"], "positions": snapshot["positions"]}):

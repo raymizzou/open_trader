@@ -444,8 +444,9 @@ class PredictTradingClient:
         amount = _non_negative_int(exact_debit_wei, "approval")
         if amount <= 0:
             return {"success": False, "status": "rejected", "error_code": "invalid_amount"}
-        facts = dict(self.approval_facts(market_id, exact_debit_wei=amount))
-        step = facts["_approval_step"]
+        scope = self._approval_scope_for_market(market_id)
+        facts = dict(self._approval_facts_for_scope(scope, exact_debit_wei=amount))
+        step = self._approval_step(scope)
         try:
             result = self._builder.set_approval(step, approved=True, amount=amount)
         except Exception:
@@ -460,8 +461,9 @@ class PredictTradingClient:
         return self._allowance_result(True, "none", facts, result)
 
     def clear_buy_allowance(self, market_id: str) -> Mapping[str, object]:
-        facts = dict(self.approval_facts(market_id, exact_debit_wei=0))
-        step = facts["_approval_step"]
+        scope = self._approval_scope_for_market(market_id)
+        facts = dict(self._approval_facts_for_scope(scope, exact_debit_wei=0))
+        step = self._approval_step(scope)
         try:
             result = self._builder.set_approval(step, approved=False)
         except Exception:
@@ -586,7 +588,10 @@ class PredictTradingClient:
         amount = _non_negative_int(exact_debit_wei, "approval")
         step = self._approval_step(scope)
         allowance = self._raw_allowance(step)
-        available_usdt = _non_negative_int(self._builder.balance_of("USDT"), "allowance")
+        available_usdt = _non_negative_int(
+            self._builder.balance_of("USDT", self._config.wallet_address),
+            "allowance",
+        )
         set_cost = self._approval_cost_wei(step, amount)
         clear_cost = self._approval_cost_wei(step, 0)
         bnb_balance_wei = self._signer_bnb_balance_wei()
@@ -609,7 +614,6 @@ class PredictTradingClient:
             "bnb_balance": _bnb_wei_string(bnb_balance_wei),
             "required_bnb": _bnb_wei_string(required_bnb_wei),
             "minimum_top_up_bnb": _bnb_wei_string(minimum_top_up_wei),
-            "_approval_step": step,
         }
 
     def _approval_step(self, scope: ApprovalScope) -> object:

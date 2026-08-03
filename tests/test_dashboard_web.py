@@ -2203,7 +2203,10 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
             return {
                 "wallet_address": "0xcE2300000000000000000000000000000000f435",
                 "available_usdt": "7.50",
-                "allowance_ready": True,
+                "allowance": "0",
+                "scope_ready": True,
+                "gas_ready": True,
+                "allowance_breaker": False,
                 "open_orders": [],
                 "positions": [],
                 "checked_at": datetime.now(timezone.utc),
@@ -2281,6 +2284,74 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
     assert history["items"][0]["signal_live_now"] is True
     assert history["items"][0]["actionable_now"] is False
     assert history["items"][0]["execution_mode"] == "observe_only"
+
+
+def test_prediction_state_payload_accepts_legacy_predict_allowance_ready_fallback() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": "2026-08-02T01:00:00Z",
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictSource:
+        def snapshot(self) -> dict[str, object]:
+            return {"wallet": "0xcE23…f435", "rest": "ready", "ws": "ready"}
+
+    class FakeCrossMonitor:
+        _predict = FakePredictSource()
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "mode": "observe_only",
+                "funnel": {
+                    "matched_pairs": 0,
+                    "monitored_pairs": 0,
+                    "codex_approved_pairs": 0,
+                    "arbitrage_space_pairs": 0,
+                    "clear_signal_pairs": 0,
+                },
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xcE2300000000000000000000000000000000f435",
+                "available_usdt": "7.50",
+                "allowance_ready": True,
+                "open_orders": [],
+                "positions": [],
+                "checked_at": datetime.now(timezone.utc),
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = FakePredictTrading()
+
+    state = _prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=FakeCrossMonitor(),
+        execution=FakeExecution(),
+        csrf_token="csrf",
+    )
+
+    assert state["venues"][1]["mode"] == "可以交易"
 
 
 def test_prediction_venue_pending_predict_does_not_degrade_polymarket() -> None:

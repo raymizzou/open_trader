@@ -1124,6 +1124,11 @@ class CrossPolymarketTrading(FakeTrading):
 class CrossPredictTrading:
     def __init__(self) -> None:
         self.account_calls = 0
+        self.scope_ready = True
+        self.gas_ready = True
+        self.allowance_breaker = False
+        self.allowance = "0"
+        self.use_legacy_allowance_ready = False
         self.allowance_ready = True
         self.account_available = True
         self.balance = Decimal("5")
@@ -1150,7 +1155,25 @@ class CrossPredictTrading:
         self.account_calls += 1
         if not self.account_available:
             raise RuntimeError("account unavailable")
-        return {"wallet_address": "0xpredict", "available_usdt": str(self.balance), "allowance_ready": self.allowance_ready, "open_orders": (), "positions": self.positions, "checked_at": datetime.now(UTC)}
+        snapshot = {
+            "wallet_address": "0xpredict",
+            "available_usdt": str(self.balance),
+            "open_orders": (),
+            "positions": self.positions,
+            "checked_at": datetime.now(UTC),
+        }
+        if self.use_legacy_allowance_ready:
+            snapshot["allowance_ready"] = self.allowance_ready
+            return snapshot
+        snapshot.update(
+            {
+                "allowance": self.allowance,
+                "scope_ready": self.scope_ready,
+                "gas_ready": self.gas_ready,
+                "allowance_breaker": self.allowance_breaker,
+            }
+        )
+        return snapshot
 
     def no_submit_buy_preflight(
         self, market_id: str, token_id: str, quantity_wei: int
@@ -1868,7 +1891,7 @@ def test_cross_venue_intent_payload_accepts_expired_exact_cutoff_for_holding() -
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=None)), "canonical_cutoff_invalid"),
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=datetime(2020, 1, 1, tzinfo=UTC))), "canonical_cutoff_invalid"),
         (lambda _cross, trading, _predict: setattr(trading, "balance", Decimal("1")), "account_insufficient"),
-        (lambda _cross, _trading, predict: setattr(predict, "allowance_ready", False), "account_insufficient"),
+        (lambda _cross, _trading, predict: setattr(predict, "allowance_breaker", True), "account_insufficient"),
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, quote_available=False)), "opportunity_not_actionable"),
     ],
 )
@@ -1881,6 +1904,36 @@ def test_cross_venue_preview_fails_closed_on_current_admission_changes(
     assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
         "state": "rejected", "reason": reason
     }
+
+
+def test_cross_venue_preview_accepts_zero_allowance_snapshot_without_allowance_ready(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "0"
+    predict.scope_ready = True
+    predict.gas_ready = True
+    predict.allowance_breaker = False
+
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert preview["state"] == "previewed"
+    assert preview["balances"]["predict.fun"]["available_balance"] == "5"
+
+
+def test_fresh_predict_account_snapshot_normalizes_legacy_allowance_ready_fallback(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.use_legacy_allowance_ready = True
+    predict.allowance_ready = True
+
+    snapshot = service._fresh_predict_account_snapshot()
+
+    assert snapshot is not None
+    assert snapshot["scope_ready"] is True
+    assert snapshot["gas_ready"] is True
+    assert snapshot["allowance_breaker"] is False
 
 
 def test_cross_venue_confirmation_rechecks_fingerprint_before_no_submit_release(

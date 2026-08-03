@@ -43,6 +43,7 @@ class FakeBuilder:
         self.price_per_share = 1000000
         self.max_collateral_debit = 1000000
         self.quote_calls = 0
+        self.balance_of_calls: list[tuple[str, str | None]] = []
         self.allowance_value: object = 1000000
         self.usdt_balance: object = 5000000
         self.gas_estimate = 1200000
@@ -118,8 +119,9 @@ class FakeBuilder:
     def sign_typed_data_order(self, typed) -> dict[str, object]:
         return {"signed": "order-sentinel"}
 
-    def balance_of(self, asset: str) -> str:
+    def balance_of(self, asset: str, address: str | None = None) -> str:
         assert asset == "USDT"
+        self.balance_of_calls.append((asset, address))
         return self.usdt_balance
 
     def allowance(self, **kwargs: object) -> str:
@@ -523,6 +525,9 @@ def test_approval_facts_report_predict_account_owner_allowance_and_gas() -> None
     assert facts["bnb_balance"] == "0.004"
     assert facts["required_bnb"] == "0.003"
     assert facts["minimum_top_up_bnb"] == "0"
+    assert "_approval_step" not in facts
+    assert not any(str(key).startswith("_") for key in facts)
+    assert client._builder.balance_of_calls == [("USDT", DEPOSIT)]  # type: ignore[attr-defined]
     assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
 
@@ -605,6 +610,8 @@ def test_set_exact_buy_allowance_uses_sdk_set_approval_and_proves_exact_post_rea
     assert (step.id, approved, amount) == ("ERC20_ALLOWANCE:CTF_EXCHANGE", True, 2_400_000)
     assert result["success"] is True
     assert result["allowance"] == "2400000"
+    assert "_approval_step" not in result
+    assert not any(str(key).startswith("_") for key in result)
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
     assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
 
@@ -620,6 +627,8 @@ def test_clear_buy_allowance_uses_sdk_revoke_and_proves_zero_post_read() -> None
     assert (step.id, approved, amount) == ("ERC20_ALLOWANCE:CTF_EXCHANGE", False, None)
     assert result["success"] is True
     assert result["allowance"] == "0"
+    assert "_approval_step" not in result
+    assert not any(str(key).startswith("_") for key in result)
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
     assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
 
@@ -649,6 +658,8 @@ def test_allowance_mutations_return_redacted_failures_on_receipt_or_post_read_am
 
     assert result["success"] is False
     assert result["error_code"] == error_code
+    assert "_approval_step" not in result
+    assert not any(str(key).startswith("_") for key in result)
     assert "signature-sentinel" not in json.dumps(result, default=str)
     assert "api-key-sentinel" not in json.dumps(result, default=str)
     assert PRIVATE_KEY not in json.dumps(result, default=str)
