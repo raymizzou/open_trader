@@ -3055,7 +3055,7 @@ class TabbedAccountLocator:
             if suffix == ".cn-trend-table":
                 return int(view == "simulate" or report.get("real_position_status") == "available")
             if suffix == ".cn-trend-table thead th":
-                return 10 if (view == "simulate" or report.get("real_position_status") == "available") else 0
+                return 11 if (view == "simulate" or report.get("real_position_status") == "available") else 0
             if suffix == ".cn-trend-card":
                 return len(items)
         if self.selector in {
@@ -3543,7 +3543,7 @@ class TabbedAccountLocator:
             '[data-trend-holding-panel="simulate"] .cn-trend-table thead th',
         }:
             return [
-                "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+                "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业",
                 "当前判断", "活动保护线", "持仓提示",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-report-header dd":
