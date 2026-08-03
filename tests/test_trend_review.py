@@ -1268,6 +1268,15 @@ def test_relative_rotation_named_pending_facts_are_replayed_and_idempotent(
     assert not list(tmp_path.glob(
         "trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"
     ))
+    pending_path = next(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/preflight-quote-pending.json"
+    ))
+    malformed = pending_path.parent / "arbitrary-pending.json"
+    malformed.write_text(
+        pending_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="invalid relative rotation fact"):
+        trend_review._rotation_events(pending_path.parent)
 
     class SellWithoutRefresh(FakeTrendSimClient):
         def place_order(self, request: dict[str, object]) -> dict[str, object]:

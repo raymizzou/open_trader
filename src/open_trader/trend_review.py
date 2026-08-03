@@ -3377,7 +3377,12 @@ def _validate_rotation_event(
         valid_name = (
             stem == "terminal" if kind == "terminal" else
             (
-                stem.startswith("pending-") or stem.endswith("-pending")
+                stem.startswith("pending-")
+                or stem in {
+                    "preflight-quote-pending",
+                    "post-sell-account-pending",
+                    "post-sell-quote-pending",
+                }
             ) if kind == "pending" else
             stem == "sell-filled" if kind in {"sell_fill", "sell_observation"} else
             stem == "buy-filled" if kind == "buy_fill" else
