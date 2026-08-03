@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-03
 
-**Status:** Approved architecture and UI design; written specification pending user review
+**Status:** Approved
 
 **Target:** Existing Open Trader prediction-market watcher, execution service, and Dashboard
 
