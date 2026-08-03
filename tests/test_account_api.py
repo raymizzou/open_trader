@@ -33,9 +33,15 @@ def _contract_sha(value: object) -> str:
     ).hexdigest()
 
 
-def _write_publication(data_dir: Path, *, worker_sha: str = SHA) -> None:
+def _write_publication(
+    data_dir: Path,
+    *,
+    worker_sha: str = SHA,
+    quote_price_time: str | None = None,
+) -> None:
     account_as_of = "2026-08-03T12:00:00+08:00"
     quote_as_of = "2026-08-03T12:00:04+08:00"
+    quote_price_time = quote_price_time or quote_as_of
     state = empty_account_sync_state()
     for index, broker in enumerate(REQUIRED_BROKERS):
         live = broker in LIVE_BROKERS
@@ -101,7 +107,7 @@ def _write_publication(data_dir: Path, *, worker_sha: str = SHA) -> None:
                 "status": "ok",
                 "last_price": "11",
                 "price_session": "regular",
-                "price_time": quote_as_of,
+                "price_time": quote_price_time,
                 "fetched_at": quote_as_of,
                 "stale": False,
             }
@@ -464,6 +470,21 @@ def test_snapshot_rejects_non_aware_quote_fetched_at(tmp_path: Path) -> None:
     assert result.status_code == 503
     assert result.etag is None
     assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+
+
+def test_snapshot_accepts_futu_active_us_price_time(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    price_time = "2026-08-03 04:18:41.889"
+    _write_publication(data_dir, quote_price_time=price_time)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert result.payload["status"] == "healthy"
+    futu_position = next(
+        row for row in result.payload["positions"] if row["broker"] == "futu"
+    )
+    assert futu_position["price_as_of"] == price_time
 
 
 def test_snapshot_rejects_negative_quote_count(tmp_path: Path) -> None:

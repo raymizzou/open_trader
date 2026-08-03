@@ -20,6 +20,9 @@ from .account_sync_state import (
 
 MAX_STABLE_READ_ATTEMPTS = 3
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_FUTU_NAIVE_PRICE_TIME_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -227,7 +230,7 @@ def _is_valid_quote_row_payload(symbol: object, row: object) -> bool:
         or row["market"] + "." + row["symbol"] != symbol
         or row["status"] not in {"ok", "missing_quote"}
         or not _is_aware_timestamp(row["fetched_at"])
-        or (row["price_time"] and not _is_aware_timestamp(row["price_time"]))
+        or not _is_valid_quote_price_time(row["market"], row["price_time"])
     ):
         return False
     if row["status"] == "ok":
@@ -237,6 +240,20 @@ def _is_valid_quote_row_payload(symbol: object, row: object) -> bool:
             return False
         return price.is_finite() and price > 0
     return not row["last_price"]
+
+
+def _is_valid_quote_price_time(market: object, value: object) -> bool:
+    if not isinstance(market, str) or not isinstance(value, str):
+        return False
+    if not value or _is_aware_timestamp(value):
+        return True
+    if market != "US" or _FUTU_NAIVE_PRICE_TIME_RE.fullmatch(value) is None:
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:
+        return False
+    return True
 
 
 def _worker_sha(raw: bytes) -> str:
