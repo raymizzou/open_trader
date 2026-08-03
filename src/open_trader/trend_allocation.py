@@ -227,6 +227,37 @@ def run_trend_allocation_controller(
             if day != failure_day:
                 failures = 0
                 failure_day = day
+            existing: Mapping[str, object] | None = None
+            if _allocation_status_path(config.data_dir).exists():
+                existing = _read_allocation_status(config.data_dir)
+            if (
+                not once
+                and now.time() >= _ATTEMPT_AT
+                and existing is not None
+                and existing.get("attempted_for") == day
+                and existing.get("phase") in {"ready", "fallback", "holiday"}
+            ):
+                daily_path = existing.get("latest_daily_path")
+                sha256 = existing.get("latest_sha256")
+                existing_blocker = existing.get("blocker")
+                if not (
+                    (daily_path is None and sha256 is None)
+                    or (isinstance(daily_path, str) and isinstance(sha256, str))
+                ) or (existing_blocker is not None and not isinstance(existing_blocker, str)):
+                    raise TrendAnimalsError("allocation controller status is invalid")
+                reference = (
+                    {"daily_path": daily_path, "sha256": sha256}
+                    if daily_path is not None
+                    else None
+                )
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase=str(existing["phase"]), attempted_for=day,
+                    reference=reference, blocker=existing_blocker,
+                    next_check_at=now + timedelta(seconds=60),
+                    process_version=process_version,
+                ))
+                sleep_fn(60)
+                continue
             quote = quote_factory(host=config.futu_host, port=config.futu_port)
             try:
                 days = sorted(quote.get_cn_trading_days(
@@ -244,9 +275,6 @@ def run_trend_allocation_controller(
                 {"daily_path": latest["daily_path"], "sha256": latest["sha256"]}
                 if latest else None
             )
-            existing: Mapping[str, object] | None = None
-            if _allocation_status_path(config.data_dir).exists():
-                existing = _read_allocation_status(config.data_dir)
             if not once and now.time() < _ATTEMPT_AT:
                 status = _write_allocation_status(config, _allocation_status(
                     config, now=now, phase="waiting", attempted_for=None,
@@ -255,14 +283,6 @@ def run_trend_allocation_controller(
                     process_version=process_version,
                 ))
                 sleep_fn(5)
-                continue
-            if (
-                not once
-                and existing is not None
-                and existing.get("attempted_for") == day
-                and existing.get("phase") in {"ready", "fallback", "holiday"}
-            ):
-                sleep_fn(60)
                 continue
             if day not in days:
                 status = _write_allocation_status(config, _allocation_status(
