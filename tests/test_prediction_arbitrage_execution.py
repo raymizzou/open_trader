@@ -1040,6 +1040,8 @@ class CrossVenueMonitor:
         self.refresh_requests: list[dict[str, object]] = []
         self.refresh_intent_resolver: object | None = None
         self.available = True
+        self.call_log: list[str] = []
+        self.max_normal_cost_requests: list[Decimal | None] = []
 
     def _opportunity(self, intent: CrossVenueIntent) -> dict[str, object]:
         now = datetime.now(UTC)
@@ -1072,6 +1074,8 @@ class CrossVenueMonitor:
         prefer_smallest: bool = False,
     ) -> dict[str, object] | None:
         self.refresh_calls += 1
+        self.call_log.append("refresh")
+        self.max_normal_cost_requests.append(max_total_cost)
         self.refresh_requests.append(
             {
                 "opportunity_id": opportunity_id,
@@ -1115,12 +1119,15 @@ class CrossPolymarketTrading(FakeTrading):
         self.cross_remediation_options: dict[str, dict[str, object]] = {}
         self.cross_remediation_option_calls: list[dict[str, object]] = []
         self.cross_remediation_calls: list[dict[str, object]] = []
+        self.call_log: list[str] = []
 
     def no_submit_cross_leg_preflight(self, leg: CrossVenueLeg) -> dict[str, object]:
+        self.call_log.append("poly_preflight")
         self.cross_preflight_calls += 1
         return {"result": "PASS", "leg": leg}
 
     def submit_cross_leg_once(self, leg: CrossVenueLeg) -> ThresholdLegResult:
+        self.call_log.append("poly_submit")
         self.cross_submit_calls += 1
         self.cross_submitted_legs.append(leg)
         self.submit_started.set()
@@ -1140,6 +1147,7 @@ class CrossPolymarketTrading(FakeTrading):
     def reconcile_cross_leg(
         self, leg: CrossVenueLeg, result: ThresholdLegResult, *, since: datetime
     ) -> dict[str, object]:
+        self.call_log.append("poly_reconcile")
         self.cross_reconcile_calls += 1
         if self.reconcile_results:
             return {
@@ -1197,8 +1205,22 @@ class CrossPredictTrading:
         self.cross_remediation_options: dict[str, dict[str, object]] = {}
         self.cross_remediation_option_calls: list[dict[str, object]] = []
         self.default_filled_quantity = Decimal("5")
+        self.call_log: list[str] = []
+        self.predict_account = "0xpredict-account"
+        self.gas_signer = "0xgas-signer"
+        self.chain = "bnb-mainnet"
+        self.sdk_version = "predict-sdk-1"
+        self.approval_step_id = "approval-step-buy"
+        self.bnb_balance = "0.01"
+        self.required_bnb = "0.003"
+        self.minimum_top_up_bnb = "0"
+        self.approval_calls: list[tuple[str, int]] = []
+        self.clear_calls: list[str] = []
+        self.approval_results: list[dict[str, object]] = []
+        self.clear_results: list[dict[str, object]] = []
 
     def account_snapshot(self) -> dict[str, object]:
+        self.call_log.append("predict_account")
         self.account_calls += 1
         if not self.account_available:
             raise RuntimeError("account unavailable")
@@ -1218,9 +1240,44 @@ class CrossPredictTrading:
                 "scope_ready": self.scope_ready,
                 "gas_ready": self.gas_ready,
                 "allowance_breaker": self.allowance_breaker,
+                "predict_account": self.predict_account,
+                "gas_signer": self.gas_signer,
+                "chain": self.chain,
+                "sdk_version": self.sdk_version,
+                "approval_step_id": self.approval_step_id,
+                "bnb_balance": self.bnb_balance,
+                "required_bnb": self.required_bnb,
+                "minimum_top_up_bnb": self.minimum_top_up_bnb,
             }
         )
         return snapshot
+
+    def set_exact_buy_allowance(self, market_id: str, exact_debit_wei: int) -> dict[str, object]:
+        self.call_log.append("set_allowance")
+        self.approval_calls.append((market_id, exact_debit_wei))
+        if self.approval_results:
+            return self.approval_results.pop(0)
+        self.allowance = str(Decimal(exact_debit_wei) / Decimal("1000000"))
+        return {
+            "status": "confirmed",
+            "market_id": market_id,
+            "exact_debit_wei": exact_debit_wei,
+            "allowance": self.allowance,
+            "transaction_hash": "0xapprove",
+        }
+
+    def clear_buy_allowance(self, market_id: str) -> dict[str, object]:
+        self.call_log.append("clear_allowance")
+        self.clear_calls.append(market_id)
+        if self.clear_results:
+            return self.clear_results.pop(0)
+        self.allowance = "0"
+        return {
+            "status": "confirmed",
+            "market_id": market_id,
+            "allowance": "0",
+            "transaction_hash": "0xclear",
+        }
 
     def no_submit_buy_preflight(
         self, market_id: str, token_id: str, quantity_wei: int
@@ -1231,6 +1288,7 @@ class CrossPredictTrading:
         return PredictLegResult(True, "preflight")
 
     def no_submit_cross_buy_preflight(self, order: dict[str, object]) -> PredictLegResult:
+        self.call_log.append("predict_preflight")
         self.preflight_calls += 1
         self.cross_entry_preflight_orders.append(dict(order))
         assert order["venue"] == "predict.fun"
@@ -1246,6 +1304,7 @@ class CrossPredictTrading:
     def submit_buy_once(
         self, market_id: str, token_id: str, quantity_wei: int
     ) -> PredictLegResult:
+        self.call_log.append("predict_submit")
         self.submit_calls += 1
         self.submit_started.set()
         if self.submit_barrier is not None:
@@ -1269,6 +1328,7 @@ class CrossPredictTrading:
     def reconcile_buy(
         self, market_id: str, token_id: str, order_hash: str
     ) -> dict[str, object]:
+        self.call_log.append("predict_reconcile")
         self.reconcile_calls += 1
         assert (market_id, token_id) == ("predict-market", "predict-yes")
         if self.reconcile_results:
@@ -1334,6 +1394,8 @@ def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, Predicti
         notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
         lock_path=tmp_path / "execution.lock",
     )
+    call_log: list[str] = []
+    trading.call_log = predict.call_log = cross.call_log = call_log
     service.set_cross_venue_monitor(cross)
     assert service.reconcile_startup()["state"] == "ready"
     return service, store, trading, cross, predict
@@ -1351,6 +1413,266 @@ def _cross_execution(
         time.sleep(0.01)
     assert execution_id not in service._threads
     return accepted, service.execution(execution_id)
+
+
+def test_cross_exact_allowance_wraps_current_dual_rest_refresh_before_submit(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-exact-allowance")
+
+    assert final["state"] == "holding_to_resolution"
+    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.clear_calls == ["predict-market"]
+    set_allowance = cross.call_log.index("set_allowance")
+    refreshes = [index for index, item in enumerate(cross.call_log) if item == "refresh"]
+    first_refresh = max(index for index in refreshes if index < set_allowance)
+    second_refresh = min(index for index in refreshes if index > set_allowance)
+    predict_submit = cross.call_log.index("predict_submit")
+    poly_submit = cross.call_log.index("poly_submit")
+    predict_reconcile = cross.call_log.index("predict_reconcile")
+    poly_reconcile = cross.call_log.index("poly_reconcile")
+    clear_allowance = cross.call_log.index("clear_allowance")
+    assert first_refresh < set_allowance < second_refresh
+    assert second_refresh < predict_submit
+    assert second_refresh < poly_submit
+    assert predict_submit < predict_reconcile < clear_allowance
+    assert poly_submit < poly_reconcile < clear_allowance
+    assert final["evidence"][-1]["predict_allowance"] == {
+        "market_id": "predict-market",
+        "after": "0",
+        "zero_verified": True,
+    }
+    assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+
+
+def test_cross_exact_approval_failure_posts_neither_venue(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {"status": "rejected", "market_id": "predict-market", "allowance": "0"}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-approval-fails")
+
+    assert final["state"] == "both_rejected"
+    assert final["evidence"][-1]["status_text"] == "未下单"
+    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+
+
+def test_cross_post_approval_refresh_breach_clears_allowance_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    refreshes = 0
+
+    def resolver(**_: object) -> CrossVenueIntent:
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes < 3:
+            return cross.intent
+        return replace(
+            cross.intent,
+            legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
+            total_max_cost=Decimal("4.71"),
+        )
+
+    cross.refresh_intent_resolver = resolver
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-post-approval-breach")
+
+    assert final["state"] == "both_rejected"
+    assert final["evidence"][-1]["status_text"] == "未下单 · 授权已清零"
+    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.clear_calls == ["predict-market"]
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+
+
+def test_cross_cleanup_failure_opens_breaker_and_persists_one_incident(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict.clear_results.append(
+        {"status": "confirmed", "market_id": "predict-market", "allowance": "0.01"}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-cleanup-fails")
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_cleanup_failed"
+    assert service._cross_breaker_open is True
+    assert predict.clear_calls == ["predict-market"]
+    assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert incidents[0]["reason"] == "predict_allowance_cleanup_failed"
+
+
+def test_cross_both_rejected_clears_allowance_before_releasing_capacity(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    trading.submit_results.append(
+        ThresholdLegResult(
+            "polymarket", "NO", "poly-condition", "poly-no", False,
+            "rejected", "", Decimal("0"), (), "rejected",
+        )
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    trading.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-both-rejects-clear")
+
+    assert final["state"] == "both_rejected"
+    assert predict.clear_calls == ["predict-market"]
+    assert cross.call_log.index("clear_allowance") < cross.call_log.index("predict_account", cross.call_log.index("clear_allowance"))
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_unknown_submit_keeps_allowance_and_breaker_fail_closed(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.submit_results.append(PredictLegResult(False, "ambiguous", "predict-order", "ambiguous"))
+    predict.reconcile_results.append(
+        {"status": "unknown", "verified": False, "conclusively_absent": False}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-unknown-keeps-allowance")
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "cross_reconciliation_unknown"
+    assert predict.clear_calls == []
+    assert service._cross_breaker_open is True
+    assert store.cross_unsettled_principal() == Decimal("4.70")
+
+
+def test_residual_predict_allowance_startup_locks_and_operator_cleanup_is_read_only(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    service._cross_breaker_open = False
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "residual_predict_allowance"
+    assert predict.clear_calls == []
+    assert trading.cross_submit_calls == 0
+    assert store.unacknowledged_incident()["reason"] == "residual_predict_allowance"
+
+    cleanup = service.cleanup_predict_allowance(confirm=True)
+
+    assert cleanup["state"] == "ready"
+    assert cleanup["before_allowance"] == "2.4"
+    assert cleanup["after_allowance"] == "0"
+    assert cleanup["usdt_moved"] is False
+    assert predict.clear_calls == ["predict-market"]
+
+
+@pytest.mark.parametrize("confirm", [False])
+def test_predict_allowance_cleanup_rejects_without_confirmation(
+    tmp_path: Path, confirm: bool,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+
+    result = service.cleanup_predict_allowance(confirm=confirm)
+
+    assert result == {"state": "locked", "reason": "confirmation_required"}
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_active_execution_without_mutation(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    store.consume_preview_and_create_execution(str(preview["preview_id"]), "cleanup-active")
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {"state": "locked", "reason": "active_execution"}
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_insufficient_bnb_without_mutation(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    predict.minimum_top_up_bnb = "0.001"
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {
+        "state": "locked",
+        "reason": "insufficient_bnb",
+        "minimum_top_up_bnb": "0.001",
+    }
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_already_zero_without_mutation(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {"state": "locked", "reason": "allowance_already_zero"}
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_changed_identity_after_clear(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    original = predict.clear_buy_allowance
+
+    def changed_identity_clear(market_id: str) -> dict[str, object]:
+        result = original(market_id)
+        predict.gas_signer = "0xchanged"
+        return result
+
+    predict.clear_buy_allowance = changed_identity_clear  # type: ignore[method-assign]
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+    assert predict.clear_calls == ["predict-market"]
+
+
+def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verified(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, predict = _cross_service(tmp_path)
+
+    first = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    _accepted, final = _cross_execution(service, idempotency_key="cross-canary-first")
+    second = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    predict.gas_signer = "0xchanged-gas-signer"
+    changed = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert first["policy_limits"]["max_normal_cost"] == "5"
+    assert final["evidence"][-1]["canary_verified"] is True
+    assert second["policy_limits"]["max_normal_cost"] == "20"
+    assert changed["policy_limits"]["max_normal_cost"] == "5"
+    assert cross.max_normal_cost_requests[:2] == [Decimal("5"), Decimal("5")]
+    assert cross.max_normal_cost_requests[-2:] == [Decimal("20"), Decimal("5")]
 
 
 def test_cross_venue_submits_both_legs_concurrently_and_deduplicates_preview(
@@ -1848,7 +2170,7 @@ def test_cross_preview_is_server_owned_without_expires_at_or_countdown(
     assert preview["balances"]["predict.fun"]["asset"] == "USDT"
     assert preview["balances"]["polymarket"]["asset"] == "pUSD"
     assert preview["unsettled"]["limit"] == "100"
-    assert preview["policy_limits"]["max_normal_cost"] == "20"
+    assert preview["policy_limits"]["max_normal_cost"] == "5"
     assert preview["policy_limits"]["max_emergency_loss"] == "2"
     assert "expires_at" not in preview
 

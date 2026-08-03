@@ -1626,6 +1626,7 @@ def create_dashboard_server(
                     "/api/prediction-arbitrage/preview",
                     "/api/prediction-arbitrage/executions",
                     "/api/prediction-arbitrage/circuit-breaker/reset",
+                    "/api/prediction-arbitrage/predict-allowance/cleanup",
                 }:
                     self._require_prediction_mutation()
                     payload = self._read_json_body()
@@ -1640,10 +1641,15 @@ def create_dashboard_server(
                         preview_id = self._required_prediction_string(payload, "preview_id")
                         idempotency_key = self._required_prediction_string(payload, "idempotency_key")
                         result = prediction_execution_service.confirm(preview_id, idempotency_key)
-                    else:
+                    elif path.endswith("/circuit-breaker/reset"):
                         self._require_prediction_schema(payload, {"incident_id"})
                         incident_id = self._required_prediction_string(payload, "incident_id")
                         result = prediction_execution_service.reset_breaker(incident_id)
+                    else:
+                        self._require_prediction_schema(payload, {"confirm"})
+                        if payload.get("confirm") is not True:
+                            raise ValueError("confirm must be true")
+                        result = prediction_execution_service.cleanup_predict_allowance(confirm=True)
                     self._send_json(_prediction_safe_value(result))
                     return
                 if path in {

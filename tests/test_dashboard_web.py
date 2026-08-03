@@ -4183,6 +4183,82 @@ def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
         thread.join(timeout=5)
 
 
+def test_prediction_arbitrage_allowance_cleanup_schema_is_confirm_only(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls: list[bool] = []
+
+        def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
+            self.calls.append(confirm)
+            return {
+                "state": "ready",
+                "before_allowance": "2.4",
+                "after_allowance": "0",
+                "usdt_moved": False,
+            }
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        for payload in (
+            {},
+            {"confirm": False},
+            {"confirm": True, "owner": "0xabc"},
+            {"confirm": True, "spender": "0xdef"},
+            {"confirm": True, "amount": "0"},
+        ):
+            request = urllib.request.Request(
+                f"{base}/api/prediction-arbitrage/predict-allowance/cleanup",
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            assert error.value.code == 400
+        assert execution.calls == []
+
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/predict-allowance/cleanup",
+            data=b'{"confirm":true}',
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        assert result == {
+            "state": "ready",
+            "before_allowance": "2.4",
+            "after_allowance": "0",
+            "usdt_moved": False,
+        }
+        assert execution.calls == [True]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_prediction_arbitrage_cli_rejects_non_loopback_prediction_listener(
     tmp_path: Path,
 ) -> None:
