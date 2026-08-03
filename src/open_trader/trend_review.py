@@ -78,7 +78,10 @@ PROTECTION_STATE_ROOTS = {
     "US": "trend_us_tiger",
 }
 TREND_STRATEGY_VERSIONS = frozenset(
-    {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11"}
+    {
+        "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12",
+    }
 )
 
 
@@ -588,6 +591,12 @@ def freeze_report_evidence(
             ),
             "simulate_rotation_pairs": getattr(report, "simulate_rotation_pairs", ()),
             "real_rotation_pairs": getattr(report, "real_rotation_pairs", ()),
+            "simulate_rotation_comparisons": getattr(
+                report, "simulate_rotation_comparisons", ()
+            ),
+            "real_rotation_comparisons": getattr(
+                report, "real_rotation_comparisons", ()
+            ),
             **(
                 {"allocation": allocation_evidence}
                 if allocation_evidence is not None
@@ -1077,23 +1086,13 @@ def _valid_rotation_pair(pair: object, pair_index: int) -> bool:
     ):
         return False
     try:
-        sell_strength = Decimal(str(pair.get("sell_global_strength")))
-        buy_strength = Decimal(str(pair.get("buy_global_strength")))
-        gap = Decimal(str(pair.get("strength_gap")))
         weight = Decimal(str(pair.get("target_weight")))
         amount = Decimal(str(pair.get("target_amount")))
         atr = Decimal(str(pair.get("atr")))
     except (InvalidOperation, ValueError):
         return False
     if (
-        not all(
-            value.is_finite()
-            for value in (sell_strength, buy_strength, gap, weight, amount, atr)
-        )
-        or not Decimal("0") <= sell_strength <= Decimal("100")
-        or not Decimal("0") <= buy_strength <= Decimal("100")
-        or gap != buy_strength - sell_strength
-        or gap < Decimal("20")
+        not all(value.is_finite() for value in (weight, amount, atr))
         or not Decimal("0") < weight <= Decimal("1")
         or amount <= 0
         or atr <= 0
@@ -1101,6 +1100,63 @@ def _valid_rotation_pair(pair: object, pair_index: int) -> bool:
         or pair["sell_futu_symbol"] == pair["buy_futu_symbol"]
         or pair["reason"] != "relative_rotation"
     ):
+        return False
+    basis = pair.get("strength_basis")
+    if basis is None:
+        try:
+            sell_strength = Decimal(str(pair.get("sell_global_strength")))
+            buy_strength = Decimal(str(pair.get("buy_global_strength")))
+            gap = Decimal(str(pair.get("strength_gap")))
+        except (InvalidOperation, ValueError):
+            return False
+        if (
+            not all(value.is_finite() for value in (sell_strength, buy_strength, gap))
+            or not Decimal("0") <= sell_strength <= Decimal("100")
+            or not Decimal("0") <= buy_strength <= Decimal("100")
+            or gap != buy_strength - sell_strength
+            or gap < Decimal("20")
+        ):
+            return False
+    elif basis in {"local", "global"}:
+        sell_asset = str(pair.get("sell_asset") or "")
+        buy_asset = str(pair.get("buy_asset") or "")
+        if not sell_asset or not buy_asset:
+            return False
+        try:
+            optional = lambda name: (
+                None
+                if pair.get(name) is None or str(pair.get(name)).strip() == ""
+                else Decimal(str(pair.get(name)))
+            )
+            sell_local = optional("sell_local_strength")
+            buy_local = optional("buy_local_strength")
+            sell_global = optional("sell_global_strength")
+            buy_global = optional("buy_global_strength")
+            sell_compared = optional("sell_compared_strength")
+            buy_compared = optional("buy_compared_strength")
+            gap = optional("strength_gap")
+            threshold = Decimal(str(pair.get("threshold")))
+        except (InvalidOperation, ValueError):
+            return False
+        if threshold != Decimal("20") or gap is None:
+            return False
+        if basis == "local":
+            if sell_asset != buy_asset or sell_compared != sell_local or buy_compared != buy_local:
+                return False
+        else:
+            if sell_asset == buy_asset or sell_compared != sell_global or buy_compared != buy_global:
+                return False
+        if (
+            sell_compared is None
+            or buy_compared is None
+            or not all(value.is_finite() for value in (sell_compared, buy_compared, gap))
+            or not Decimal("0") <= sell_compared <= Decimal("100")
+            or not Decimal("0") <= buy_compared <= Decimal("100")
+            or gap != buy_compared - sell_compared
+            or gap < threshold
+        ):
+            return False
+    else:
         return False
     valid_sizes = all(
         isinstance(pair.get(field), int)
@@ -4913,7 +4969,7 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"}:
+    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}:
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -6525,7 +6581,11 @@ def normalize_trend_strategy_snapshot(
 
         version = str(snapshot.get("strategy_version") or "")
         allocation = None
-        if (market, version) in {("CN", "v11"), ("HK", "v9"), ("US", "v9")}:
+        if (market, version) in {
+            ("CN", "v11"), ("CN", "v12"),
+            ("HK", "v9"), ("HK", "v10"),
+            ("US", "v9"), ("US", "v10"),
+        }:
             allocation = {
                 "daily_path": parameters.get("allocation_snapshot_path"),
                 "sha256": parameters.get("allocation_snapshot_sha256"),
@@ -6542,7 +6602,7 @@ def normalize_trend_strategy_snapshot(
                 },
             }
         if version in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
         }:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
@@ -7486,7 +7546,7 @@ def build_trend_review_projection(
         fact
         for fact in effective_facts
         if fact_identity(fact)[2] in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
         }
     ]
     target_candidates = live_facts or effective_facts
@@ -7745,15 +7805,15 @@ def rebuild_trend_report_from_evidence(
         "price_fx_to_account_currency",
     }
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
     }:
         required.add("normal_cost_rate")
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
     }:
         required.update({"kelly_rounds", "kelly_data_reason"})
     if strategy_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
     }:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
@@ -7768,6 +7828,7 @@ def rebuild_trend_report_from_evidence(
         HoldingSnapshot,
         RealHoldingInput,
         RotationPair,
+        RotationComparison,
         _finalize_market_report,
         _report_payload,
         build_report,
@@ -8115,7 +8176,7 @@ def rebuild_trend_report_from_evidence(
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
     } and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
@@ -8229,7 +8290,7 @@ def rebuild_trend_report_from_evidence(
         drawdown_summary=(
             inputs["drawdown_summary"]
             if strategy_version in {
-                "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+                "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
             }
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
@@ -8256,11 +8317,16 @@ def rebuild_trend_report_from_evidence(
         )
     decimal_pair_fields = {
         "sell_global_strength",
+        "sell_local_strength",
         "buy_global_strength",
+        "buy_local_strength",
+        "sell_compared_strength",
+        "buy_compared_strength",
         "strength_gap",
         "target_weight",
         "target_amount",
         "atr",
+        "threshold",
     }
 
     def frozen_pairs(field: str) -> tuple[RotationPair, ...]:
@@ -8295,9 +8361,38 @@ def rebuild_trend_report_from_evidence(
                 RotationPair(
                     **{
                         key: Decimal(str(value))
-                        if key in decimal_pair_fields
+                        if key in decimal_pair_fields and value is not None
                         else value
                         for key, value in values.items()
+                    }
+                )
+            )
+        return tuple(result)
+
+    decimal_comparison_fields = {
+        "sell_local_strength", "sell_global_strength",
+        "buy_local_strength", "buy_global_strength",
+        "sell_compared_strength", "buy_compared_strength",
+        "strength_gap", "threshold",
+    }
+
+    def frozen_comparisons(field: str) -> tuple[RotationComparison, ...]:
+        raw_comparisons = inputs.get(field, [])
+        if not isinstance(raw_comparisons, list):
+            raise TrendReplayIncompleteError(f"invalid original input: {field}")
+        result: list[RotationComparison] = []
+        for raw_comparison in raw_comparisons:
+            if not isinstance(raw_comparison, Mapping):
+                raise TrendReplayIncompleteError(f"invalid original input: {field}")
+            result.append(
+                RotationComparison(
+                    **{
+                        key: (
+                            Decimal(str(value))
+                            if key in decimal_comparison_fields and value is not None
+                            else value
+                        )
+                        for key, value in raw_comparison.items()
                     }
                 )
             )
@@ -8308,6 +8403,12 @@ def rebuild_trend_report_from_evidence(
             report,
             simulate_rotation_pairs=frozen_pairs("simulate_rotation_pairs"),
             real_rotation_pairs=frozen_pairs("real_rotation_pairs"),
+            simulate_rotation_comparisons=frozen_comparisons(
+                "simulate_rotation_comparisons"
+            ),
+            real_rotation_comparisons=frozen_comparisons(
+                "real_rotation_comparisons"
+            ),
         )
     payload = _report_payload(report)
     if market in {"US", "HK"}:

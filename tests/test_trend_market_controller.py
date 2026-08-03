@@ -1837,9 +1837,22 @@ def test_valid_report_rejects_invalid_frozen_allocation_and_rotation_pair(
         "buy_global_strength": "90", "strength_gap": "80", "target_weight": "0.04",
         "target_amount": "4000", "estimated_shares": 400, "lot_size": 100,
         "atr": "0.5", "reason": "relative_rotation", "execution_date": "2026-07-20",
-        "execution_mode": "automatic",
+        "execution_mode": "automatic", "sell_asset": "A股", "buy_asset": "A股",
+        "sell_local_strength": "10", "buy_local_strength": "90",
+        "strength_basis": "local", "sell_compared_strength": "10",
+        "buy_compared_strength": "90", "threshold": "20",
+    }]
+    judgments["simulate_rotation_comparisons"] = [{
+        "pair_index": 0, "sell_symbol": "WEAK", "sell_name": "Weak", "sell_asset": "A股",
+        "sell_local_strength": "10", "sell_global_strength": "10",
+        "buy_symbol": "STRONG", "buy_name": "Strong", "buy_asset": "A股",
+        "buy_local_strength": "90", "buy_global_strength": "90",
+        "strength_basis": "local", "sell_compared_strength": "10",
+        "buy_compared_strength": "90", "strength_gap": "80", "threshold": "20",
+        "outcome": "planned", "reason": "relative_rotation",
     }]
     judgments["real_rotation_pairs"] = []
+    judgments["real_rotation_comparisons"] = []
 
     assert controller._valid_report(config, "CN", "2026-07-20", path, report)
     malformed = json.loads(json.dumps(report))

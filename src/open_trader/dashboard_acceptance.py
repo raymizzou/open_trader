@@ -62,9 +62,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11"}),
-    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
 }
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
@@ -1695,6 +1695,7 @@ def _check_trend_account_views(
         )
         _check_integrated_trend_ui(report_root, report, broker)
         _check_frozen_trend_disciplines(report_root, report, broker, page=page)
+        _check_trend_rotation_visibility(report_root, report, broker)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
             f"{broker} 当前趋势报告日期未显示"
         )
@@ -2282,6 +2283,53 @@ def _check_integrated_trend_ui(
         risk.locator(":scope > summary").click()
 
 
+def _check_trend_rotation_visibility(
+    report_root: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    if not report.get("allocation"):
+        assert report_root.locator(".trend-rotation-panel").count() == 0, (
+            f"{broker} 无资源排名时仍显示轮换面板"
+        )
+        return
+    panel = report_root.locator(".trend-rotation-panel")
+    assert panel.count() == 1, f"{broker} 缺少相对强度轮换面板"
+    for mode, key in (
+        ("automatic", "simulate_rotation_comparisons"),
+        ("manual", "real_rotation_comparisons"),
+    ):
+        comparisons = report.get(key)
+        comparisons = comparisons if isinstance(comparisons, list) else []
+        group = panel.locator(f'.trend-rotation-group[data-mode="{mode}"]')
+        assert group.count() == 1, f"{broker} 缺少 {mode} 轮换组"
+        text = group.inner_text()
+        for comparison in comparisons:
+            assert isinstance(comparison, Mapping), f"{broker} 轮换比较格式无效"
+            for value in (
+                comparison.get("sell_symbol"), comparison.get("sell_name"),
+                comparison.get("buy_symbol"), comparison.get("buy_name"),
+            ):
+                if value:
+                    assert str(value) in text, f"{broker} 轮换比较缺少 {value}"
+            basis = comparison.get("strength_basis")
+            basis_label = {
+                "local": "大类内强度",
+                "global": "全局强度",
+            }.get(str(basis), "数据不可用")
+            assert basis_label in text, f"{broker} 轮换比较缺少比较口径"
+            assert f"强度差" in text, f"{broker} 轮换比较缺少强度差"
+            outcome = str(comparison.get("outcome") or "")
+            if outcome == "gap_below_threshold":
+                assert "未触发 · 门槛" in text and "还差" in text, (
+                    f"{broker} 轮换比较缺少门槛未触发原因"
+                )
+            elif outcome == "sizing_blocked":
+                assert "未执行" in text, f"{broker} 轮换比较缺少仓位阻断原因"
+            elif outcome == "data_unavailable":
+                assert "数据不可用" in text or "未触发" in text, (
+                    f"{broker} 轮换比较缺少数据不可用原因"
+                )
+
+
 def _display_number(value: Any) -> str:
     raw = _plain(value).strip()
     match = re.fullmatch(r"([+-]?)(\d+)(?:\.(\d+))?", raw)
@@ -2459,6 +2507,11 @@ def _check_trend_artifact_projection(
         ] == value
         for key, value in expected_actions.items()
     ), f"{broker} 冻结报告动作与 API 投影不一致"
+    for key in ("simulate_rotation_comparisons", "real_rotation_comparisons"):
+        expected = judgments.get(key, [])
+        assert isinstance(expected, list) and report.get(key) == expected, (
+            f"{broker} 冻结报告轮换比较与 API 投影不一致：{key}"
+        )
     assert report.get("counts") == {
         "sell": len(sells),
         "buy": len(buys),
@@ -2499,10 +2552,13 @@ def _trend_action_reason_label(
     ) in {
         ("CN", "v9"),
         ("CN", "v10"),
+        ("CN", "v12"),
         ("US", "v6"),
         ("US", "v7"),
+        ("US", "v10"),
         ("HK", "v6"),
         ("HK", "v7"),
+        ("HK", "v10"),
     }:
         try:
             initial = Decimal(str(item.get("initial_line")))

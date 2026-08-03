@@ -4145,6 +4145,11 @@ console.log(JSON.stringify({
     }
 
 
+def test_dashboard_refresh_focus_restoration_prevents_scroll_jump() -> None:
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    assert '.querySelector(`[data-account-view="${focusedView}"]`)?.focus({preventScroll: true});' in source
+
+
 def test_dashboard_numbers_never_show_more_than_two_decimal_places() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify([
@@ -7571,9 +7576,9 @@ const sectionHeaders = (html, marker) => {
   const end = html.indexOf("</section>", headingIndex);
   return [...html.slice(start, end).matchAll(/<th scope="col">([^<]+)<\/th>/g)].map((match) => match[1]);
 };
-const expectedBuy = ["标的", "动作", "筛选价（Trend Animals）", "执行参考价", "温度变化", "节气", "强度", "行业", "行业温度", "行业确认", "市值（亿元）", "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线"];
+const expectedBuy = ["标的", "动作", "筛选价（Trend Animals）", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业", "行业温度", "行业确认", "市值（亿元）", "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线"];
 const expectedSell = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "触发原因", "活动保护线", "持仓提示"];
-const expectedHold = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业", "当前判断", "活动保护线", "持仓提示"];
+const expectedHold = ["标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业", "当前判断", "活动保护线", "持仓提示"];
 const expectedReview = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "复核原因", "活动保护线", "持仓提示"];
 for (const market of ["CN", "US", "HK"]) {
   const html = renderTrendReportWorkspace(base(market));
@@ -8462,7 +8467,7 @@ if (usBuyHold.includes('disabled title="富途未返回该标的期权异动"'))
 if ((usBuyHold.match(/>期权异动<\/button>/g) || []).length !== 2) throw new Error(usBuyHold);
 if (usSell.includes("期权异动") || usReview.includes("期权异动")) throw new Error(usSell + usReview);
 if (cn.includes("期权异动")) throw new Error(cn);
-if ((usBuy.match(/<th scope="col">/g) || []).length !== 16) throw new Error(usBuy);
+if ((usBuy.match(/<th scope="col">/g) || []).length !== 17) throw new Error(usBuy);
 let opened = 0;
 let closed = 0;
 const dialog = {showModal(){opened += 1;}, close(){closed += 1;}};
@@ -12532,6 +12537,42 @@ if (historical.includes("trend-allocation-panel") || historical.includes("trend-
 console.log("ok");
 ''')
 
+    assert "ok" in output
+
+
+def test_dashboard_renders_hybrid_rotation_basis_and_non_trigger_reasons() -> None:
+    output = run_dashboard_js(r'''
+const comparison = (overrides = {}) => ({
+  pair_index: 0,
+  sell_symbol: "SELL", sell_name: "弱势股票", sell_asset: "A股",
+  sell_local_strength: "76", sell_global_strength: "61",
+  buy_symbol: "BUY", buy_name: "强势ETF", buy_asset: "ETF基金",
+  buy_local_strength: "88", buy_global_strength: "96",
+  strength_basis: "global", sell_compared_strength: "61",
+  buy_compared_strength: "96", strength_gap: "35", threshold: "20",
+  outcome: "planned", reason: "relative_rotation", ...overrides,
+});
+const report = {
+  allocation: {markets:{CN:{rank:1,score:"90",score_source:"A股"}},roots:{}},
+  market:"CN", broker:"eastmoney", broker_label:"东方财富", market_label:"A股",
+  report_date:"2026-08-04", data_date:"2026-08-03", generated_at:"now",
+  account_status:"已更新", buy_window:"09:30–10:00",
+  counts:{sell:0,buy:0,hold:0,review:0}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  simulate_rotation_pairs:[{pair_index:0,target_weight:"0.04",target_amount:"4000",estimated_shares:100,execution_date:"2026-08-04"}],
+  real_rotation_pairs:[],
+  simulate_rotation_comparisons:[
+    comparison(),
+    comparison({pair_index:1, sell_symbol:"SELL2", sell_name:"弱势ETF", sell_asset:"ETF基金", sell_local_strength:"60", sell_global_strength:"60", buy_symbol:"BUY2", buy_name:"候选股票", buy_asset:"A股", buy_local_strength:"80", buy_global_strength:"79", strength_basis:"global", sell_compared_strength:"60", buy_compared_strength:"79", strength_gap:"19.9", outcome:"gap_below_threshold", reason:"强度差 19.9 小于门槛 20"}),
+    comparison({pair_index:2, sell_symbol:"SELL3", buy_symbol:"BUY3", strength_gap:"30", outcome:"sizing_blocked", reason:"买入手数缺失"}),
+    comparison({pair_index:3, sell_symbol:"SELL4", buy_symbol:"BUY4", strength_basis:null, sell_compared_strength:null, buy_compared_strength:null, strength_gap:null, outcome:"data_unavailable", reason:"大类未提供或不属于当前市场"}),
+  ],
+};
+const html = renderTrendReportWorkspace(report);
+for (const text of ["大类内强度", "全局强度", "比较口径", "未触发", "门槛 20", "还差 0.1", "买入手数缺失", "大类未提供或不属于当前市场", "目标金额 4,000", "预计数量 100 股"]) {
+  if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
+}
+console.log("ok");
+''')
     assert "ok" in output
 
 

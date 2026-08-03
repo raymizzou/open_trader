@@ -47,7 +47,7 @@
 
 - `HoldingSnapshot.asset: str` freezes the same Trend Animals category already present in unified holding rows.
 - `RotationComparison` freezes the selected buy/sell identities, both strengths, basis, compared values, gap, threshold, outcome, and reason.
-- `plan_rotation_pairs(...)` returns executable proposals plus at most two stable comparison rows; `_plan_account_rotation_pairs(...)` applies existing sizing/risk rules and converts blocked proposals to `sizing_blocked`.
+- `plan_rotation_pairs_with_comparisons(...)` returns executable proposals plus at most two stable comparison rows; the existing `plan_rotation_pairs(...)` wrapper stays pair-only for execution callers. `_plan_account_rotation_pairs(...)` applies existing sizing/risk rules and converts blocked proposals to `sizing_blocked`.
 
 - [ ] **Step 1: Add failing same-category and cross-category tests**
 
@@ -55,7 +55,7 @@ Update the test holding helper to default `asset="A股"`. Add tests equivalent t
 
 ```python
 def test_same_category_rotation_uses_local_strength() -> None:
-    pairs, comparisons = plan_rotation_pairs(
+    pairs, comparisons = plan_rotation_pairs_with_comparisons(
         holdings=(holding("PM", asset="美股", strength="76", global_strength="86.18"),),
         candidates=(candidate("SHEL", asset="美股", strength="98.6", global_strength="95.36"),),
         entry_weight=Decimal("0.04"), available_slots=0, pair_slots=(0, 1),
@@ -69,7 +69,7 @@ def test_same_category_rotation_uses_local_strength() -> None:
 
 
 def test_cross_category_rotation_uses_global_strength() -> None:
-    pairs, comparisons = plan_rotation_pairs(
+    pairs, comparisons = plan_rotation_pairs_with_comparisons(
         holdings=(holding("SPY", asset="美国ETF", strength="99", global_strength="70"),),
         candidates=(candidate("SHEL", asset="美股", strength="75", global_strength="90"),),
         entry_weight=Decimal("0.04"), available_slots=0, pair_slots=(0, 1),

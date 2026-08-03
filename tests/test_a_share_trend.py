@@ -632,7 +632,18 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         (pair["sell_symbol"], pair["buy_symbol"])
         for pair in payload["strategy_judgments"]["simulate_rotation_pairs"]
     ] == [("100000", "200001"), ("100001", "200002")]
+    comparisons = payload["strategy_judgments"][
+        "simulate_rotation_comparisons"
+    ]
+    assert comparisons[0]["strength_basis"] == "global"
+    assert comparisons[0]["strength_gap"] == "80"
+    assert comparisons[0]["outcome"] == "planned"
     assert trend_module.valid_frozen_report_contract(payload)
+    invalid_comparison = json.loads(json.dumps(payload))
+    invalid_comparison["strategy_judgments"][
+        "simulate_rotation_comparisons"
+    ][0]["strength_gap"] = "79"
+    assert not trend_module.valid_frozen_report_contract(invalid_comparison)
     valid_real_pair = json.loads(json.dumps(payload))
     real_pair = copy.deepcopy(
         valid_real_pair["strategy_judgments"]["simulate_rotation_pairs"][0]
@@ -643,11 +654,16 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         sell_futu_symbol="SH.REAL",
         execution_mode="manual",
     )
+    real_comparison = copy.deepcopy(
+        valid_real_pair["strategy_judgments"]["simulate_rotation_comparisons"][0]
+    )
+    real_comparison.update(sell_symbol="REAL", sell_name="Real")
     valid_real_pair["strategy_judgments"].update(
         real_holding_decisions=[{"symbol": "REAL"}],
         real_holding_decisions_status="available",
         real_holding_decisions_source={},
         real_rotation_pairs=[real_pair],
+        real_rotation_comparisons=[real_comparison],
     )
     assert trend_module.valid_frozen_report_contract(valid_real_pair)
 
@@ -722,6 +738,21 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         replace(built, allocation=None)
     )
     markdown = render_markdown(built)
+    comparison_only = replace(
+        built,
+        simulate_rotation_pairs=(),
+        simulate_rotation_comparisons=(replace(
+            built.simulate_rotation_comparisons[0],
+            strength_gap=Decimal("19.9"),
+            outcome="gap_below_threshold",
+            reason="强度差 19.9 小于门槛 20",
+        ),),
+    )
+    comparison_markdown = render_markdown(comparison_only)
+    assert "未触发" in comparison_markdown
+    assert "门槛 20" in comparison_markdown
+    assert "还差 0.1" in comparison_markdown
+    assert "无。" not in comparison_markdown.split("## 模拟盘自动轮换", 1)[1].split("##", 1)[0]
     ordered_payload = json.loads(json.dumps(payload))
     ordered_payload["strategy_judgments"]["formal_actions"] = [
         {"action": "SELL_ALL", "symbol": "EXIT", "name": "Exit", "reason": "danger_signal"},
@@ -1105,9 +1136,9 @@ def active_drawdown_for(
 @pytest.mark.parametrize(
     ("market", "version", "rank", "weight"),
     [
-        ("CN", "v11", 1, "0.06"),
-        ("HK", "v9", 2, "0.04"),
-        ("US", "v9", 3, "0.02"),
+        ("CN", "v12", 1, "0.06"),
+        ("HK", "v10", 2, "0.04"),
+        ("US", "v10", 3, "0.02"),
     ],
 )
 def test_current_allocation_versions_freeze_rank_weight(

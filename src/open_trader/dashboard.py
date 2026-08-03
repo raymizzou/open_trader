@@ -1143,6 +1143,24 @@ def _project_trend_money_items(
     ]
 
 
+def _project_trend_strength_fields(
+    items: list[dict[str, Any]], snapshots: object,
+) -> list[dict[str, Any]]:
+    by_symbol = (
+        snapshots if isinstance(snapshots, dict) else {}
+    )
+    projected: list[dict[str, Any]] = []
+    for item in items:
+        row = dict(item)
+        snapshot = by_symbol.get(str(row.get("symbol") or ""))
+        if isinstance(snapshot, dict):
+            for key in ("strength", "global_strength"):
+                if row.get(key) in (None, "") and snapshot.get(key) not in (None, ""):
+                    row[key] = snapshot[key]
+        projected.append(row)
+    return projected
+
+
 def _project_trend_order_decimal(value: object) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
@@ -2157,6 +2175,10 @@ def _project_broker_trend_report(
             "hold_actions": [],
             "review_actions": [],
             "real_position_actions": [],
+            "simulate_rotation_pairs": [],
+            "simulate_rotation_comparisons": [],
+            "real_rotation_pairs": [],
+            "real_rotation_comparisons": [],
             "real_position_status": "unavailable",
             "real_position_reason": execution_batch_error,
             "real_position_source": {},
@@ -2187,6 +2209,20 @@ def _project_broker_trend_report(
         _project_trend_actions(payload, executions)
     )
     real_position_actions = _project_trend_real_actions(payload)
+    frozen_signals = payload.get("signal_snapshots")
+    frozen_signals = frozen_signals if isinstance(frozen_signals, dict) else {}
+    buy_actions = _project_trend_strength_fields(
+        buy_actions, frozen_signals.get("candidates")
+    )
+    sell_actions = _project_trend_strength_fields(
+        sell_actions, frozen_signals.get("holdings")
+    )
+    hold_actions = _project_trend_strength_fields(
+        hold_actions, frozen_signals.get("holdings")
+    )
+    real_position_actions = _project_trend_strength_fields(
+        real_position_actions, frozen_signals.get("real_holdings")
+    )
     included_symbols = {
         symbol
         for item in [*buy_actions, *hold_actions]
@@ -2384,6 +2420,24 @@ def _project_broker_trend_report(
         ) if payload.get("allocation") is not None else [],
         "real_rotation_pairs": (
             payload["strategy_judgments"].get("real_rotation_pairs", [])
+            if payload.get("allocation") is not None
+            else []
+        ),
+        "simulate_rotation_comparisons": (
+            copy.deepcopy(
+                payload["strategy_judgments"].get(
+                    "simulate_rotation_comparisons", []
+                )
+            )
+            if payload.get("allocation") is not None
+            else []
+        ),
+        "real_rotation_comparisons": (
+            copy.deepcopy(
+                payload["strategy_judgments"].get(
+                    "real_rotation_comparisons", []
+                )
+            )
             if payload.get("allocation") is not None
             else []
         ),
