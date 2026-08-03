@@ -2120,6 +2120,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                     "signal_id": "cross-signal-1",
                     "opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO",
                     "market_type": "cross_venue_yes_no",
+                    "execution_mode": "manual_confirm",
                     "question": "Predict contract question / Polymarket contract question",
                     "predict_question": "Predict contract question",
                     "polymarket_question": "Polymarket contract question",
@@ -2279,6 +2280,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
     assert history["items"][0]["polymarket_question"] == "Polymarket contract question"
     assert history["items"][0]["signal_live_now"] is True
     assert history["items"][0]["actionable_now"] is False
+    assert history["items"][0]["execution_mode"] == "observe_only"
 
 
 def test_prediction_venue_pending_predict_does_not_degrade_polymarket() -> None:
@@ -3572,15 +3574,15 @@ const preview = {
   state:"previewed", preview_id:"cross-preview-real", market_type:"cross_venue_yes_no",
   question:"Will Bitcoin close above $100,000 on December 31, 2026?",
   buy_legs:[
-    {exchange:"predict.fun",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",net_quantity:"5",max_price:"0.470",max_cost:"2.35",maximum_fee:"0.02"},
-    {exchange:"polymarket",outcome:"NO",token_id:"poly-no",settlement_asset:"pUSD",net_quantity:"5",max_price:"0.490",max_cost:"2.45",maximum_fee:"0.00"},
+    {exchange:"predict.fun",market_id:"predict-market",condition_id:"predict-condition",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",fee_asset:"USDT",net_quantity:"5",max_price:"0.470",max_cost:"2.35",maximum_fee:"0.02"},
+    {exchange:"polymarket",market_id:"poly-market",condition_id:"poly-condition",outcome:"NO",token_id:"poly-no",settlement_asset:"pUSD",fee_asset:"pUSD",net_quantity:"5",max_price:"0.490",max_cost:"2.45",maximum_fee:"0.00"},
   ],
   net_quantity:"5", total_max_cost:"4.80", minimum_payout:"5.00", minimum_profit:"0.20",
-  annualized_yield:"0.201", canonical_cutoff:"2026-12-31T23:59:00Z",
+  annualized_yield:"0.201", canonical_cutoff:"2099-12-31T23:59:00Z", direction:"PREDICT_YES_POLYMARKET_NO",
   codex_approval:{decision:"APPROVE",summary:"server approval",evidence:[
     {exchange:"predict.fun",field:"cutoff",quote:"server predict cutoff"},
     {exchange:"polymarket",field:"cutoff",quote:"server polymarket cutoff"},
-  ]},
+  ],direct_outcome_mapping:{predict_yes:"YES",predict_no:"NO",polymarket_yes:"YES",polymarket_no:"NO"}},
   balances:{
     "predict.fun":{asset:"USDT",wallet_address:"0xcE23…f435",available_balance:"12.34",allowance_ready:true},
     polymarket:{asset:"pUSD",wallet_address:"0x7A4E…91C2",available_balance:"50.00",allowance:"50.00"},
@@ -3599,6 +3601,14 @@ console.log(JSON.stringify({
   missingFees:predictionPreviewIsComplete({...preview,buy_legs:[
     {...preview.buy_legs[0],maximum_fee:undefined},preview.buy_legs[1],
   ]}),
+  rejectDecision:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,decision:"REJECT"}}),
+  invalidMapping:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,direct_outcome_mapping:{...preview.codex_approval.direct_outcome_mapping,polymarket_no:"YES"}}}),
+  invalidCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"not-a-date"}),
+  expiredCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2020-01-01T00:00:00Z"}),
+  invertedOutcomes:predictionPreviewIsComplete({...preview,buy_legs:[preview.buy_legs[0],{...preview.buy_legs[1],outcome:"YES"}]}),
+  nonNumericFees:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],maximum_fee:"fee"},preview.buy_legs[1]]}),
+  missingFeeAsset:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],fee_asset:undefined},preview.buy_legs[1]]}),
+  missingIdentity:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],condition_id:undefined},preview.buy_legs[1]]}),
   missingBalances:predictionPreviewIsComplete({...preview,balances:undefined}),
   missingPolicy:predictionPreviewIsComplete({...preview,policy_limits:{max_normal_cost:"20"}}),
 }));
@@ -3613,6 +3623,14 @@ console.log(JSON.stringify({
         "serverValues": True,
         "missingLegs": False,
         "missingFees": False,
+        "rejectDecision": False,
+        "invalidMapping": False,
+        "invalidCutoff": False,
+        "expiredCutoff": False,
+        "invertedOutcomes": False,
+        "nonNumericFees": False,
+        "missingFeeAsset": False,
+        "missingIdentity": False,
         "missingBalances": False,
         "missingPolicy": False,
     }

@@ -2970,13 +2970,24 @@ function predictionHistoryContent(payload, kind) {
       const currentState = state.predictionMarket.payload || payload;
       const healthy = !String(state.predictionMarket.signalError || "").trim()
         && predictionTradingAvailable(currentState);
-      const crossModeAllowsAction = !cross(row) || predictionCrossExecutionMode(row) === "manual_confirm";
+      const liveCrossOpportunity = cross(row) && Array.isArray(currentState?.opportunities)
+        ? currentState.opportunities.find((candidate) => (
+          predictionIsCrossVenue(candidate)
+          && String(candidate?.opportunity_id ?? candidate?.id ?? "") === String(row.opportunity_id ?? "")
+        ))
+        : null;
+      const effectiveCrossRow = cross(row)
+        ? liveCrossOpportunity
+          ? {...row, execution_mode: liveCrossOpportunity.execution_mode}
+          : {...row, execution_mode: undefined}
+        : row;
+      const crossModeAllowsAction = !cross(row) || predictionCrossExecutionMode(effectiveCrossRow) === "manual_confirm";
       const actionable = row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy && crossModeAllowsAction;
       const button = `<button class="pm-button primary pm-signal-action" type="button" data-action="participate" data-opportunity-id="${escapeHtml(String(row.opportunity_id))}">重新检查</button>`;
       if (cross(row)) {
         return actionable && predictionCrossVenueTradingAvailable(currentState)
           ? button
-          : `<span class="pm-observe">仅观察</span><small>${escapeHtml(!crossModeAllowsAction ? predictionCrossExecutionModeReason(row) : predictionReasonLabel(row.eligibility_reason || "opportunity_unavailable"))}</small>`;
+          : `<span class="pm-observe">仅观察</span><small>${escapeHtml(!crossModeAllowsAction ? predictionCrossExecutionModeReason(effectiveCrossRow) : predictionReasonLabel(row.eligibility_reason || "opportunity_unavailable"))}</small>`;
       }
       if (threshold(row)) {
         return actionable
@@ -3276,20 +3287,73 @@ function predictionPreviewIsComplete(value) {
     const balances = preview.balances && typeof preview.balances === "object" && !Array.isArray(preview.balances) ? preview.balances : {};
     const evidence = Array.isArray(preview.codex_approval?.evidence) ? preview.codex_approval.evidence : [];
     const exchanges = new Set(legs.map((leg) => String(leg?.exchange || "").toLowerCase()));
+    const tokenIds = new Set(legs.map((leg) => leg?.token_id));
     const policy = preview.policy_limits || {};
-    const numericFields = [
-      preview.net_quantity, preview.max_cost, preview.minimum_payout, preview.profit, preview.annualized_yield,
-      preview.unsettled?.current, preview.unsettled?.after, preview.unsettled?.limit,
-      policy.max_normal_cost, policy.max_emergency_loss,
-    ];
-    return [preview.preview_id, preview.title, preview.market_type, preview.canonical_cutoff, preview.codex_approval?.decision, preview.codex_approval?.summary]
-      .every(predictionHasValue)
-      && numericFields.every((item) => predictionHasValue(item) && Number.isFinite(Number(item)))
-      && legs.length === 2
+    const finitePositive = (item, maximum) => {
+      const number = Number(item);
+      return predictionHasValue(item)
+        && Number.isFinite(number)
+        && number > 0
+        && (maximum === undefined || number <= maximum);
+    };
+    const finiteNonNegative = (item) => {
+      const number = Number(item);
+      return predictionHasValue(item) && Number.isFinite(number) && number >= 0;
+    };
+    const identity = (item) => typeof item === "string" && item.trim().length > 0;
+    const cutoffTimestamp = typeof preview.canonical_cutoff === "string"
+      ? Date.parse(preview.canonical_cutoff)
+      : NaN;
+    const expectedMapping = {
+      predict_yes: "YES",
+      predict_no: "NO",
+      polymarket_yes: "YES",
+      polymarket_no: "NO",
+    };
+    const mapping = preview.codex_approval?.direct_outcome_mapping;
+    const mappingValid = mapping
+      && typeof mapping === "object"
+      && !Array.isArray(mapping)
+      && Object.keys(mapping).length === Object.keys(expectedMapping).length
+      && Object.entries(expectedMapping).every(([key, expected]) => mapping[key] === expected);
+    const expectedOutcomes = {
+      PREDICT_YES_POLYMARKET_NO: {"predict.fun": "YES", polymarket: "NO"},
+      POLYMARKET_YES_PREDICT_NO: {"predict.fun": "NO", polymarket: "YES"},
+    }[String(preview.direction || "").trim().toUpperCase()];
+    const identitiesValid = legs.length === 2
       && exchanges.size === 2
       && exchanges.has("predict.fun")
       && exchanges.has("polymarket")
-      && legs.every((leg) => [leg?.exchange, leg?.outcome, leg?.token_id, leg?.settlement_asset, leg?.net_quantity, leg?.max_price, leg?.max_cost, leg?.maximum_fee].every(predictionHasValue))
+      && tokenIds.size === 2
+      && expectedOutcomes
+      && legs.every((leg) => (
+        expectedOutcomes[leg?.exchange]
+        && leg?.outcome === expectedOutcomes[leg?.exchange]
+        && [leg?.exchange, leg?.market_id, leg?.condition_id, leg?.token_id, leg?.settlement_asset, leg?.fee_asset]
+          .every(identity)
+      ));
+    const economicsValid = legs.every((leg) => (
+      finitePositive(leg?.net_quantity)
+      && finitePositive(leg?.max_price, 1)
+      && finitePositive(leg?.max_cost)
+      && finiteNonNegative(leg?.maximum_fee)
+    ));
+    const numericFieldsValid = [
+      preview.net_quantity, preview.max_cost, preview.minimum_payout, preview.profit, preview.annualized_yield,
+      policy.max_normal_cost, policy.max_emergency_loss,
+    ].every((item) => finitePositive(item));
+    const unsettledValid = [preview.unsettled?.current, preview.unsettled?.after, preview.unsettled?.limit]
+      .every(finiteNonNegative);
+    return [preview.preview_id, preview.title, preview.market_type, preview.canonical_cutoff, preview.codex_approval?.summary]
+      .every(predictionHasValue)
+      && preview.codex_approval?.decision === "APPROVE"
+      && Number.isFinite(cutoffTimestamp)
+      && cutoffTimestamp > Date.now()
+      && mappingValid
+      && identitiesValid
+      && economicsValid
+      && numericFieldsValid
+      && unsettledValid
       && ["predict.fun", "polymarket"].every((exchange) => {
         const balance = balances[exchange];
         return balance
@@ -3365,7 +3429,7 @@ function predictionModalHtml(kind, data = {}) {
       const venue = exchange === "predict.fun" ? "Predict.fun" : "Polymarket";
       return `${venue} ${predictionMoney(balance.available_balance)} ${predictionValue(balance.asset, "-")}`;
     }).filter(Boolean).join(" · ");
-    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>确认后分别向 Predict.fun 与 Polymarket 提交受限 FOK 订单；确认前不会提交任何订单。</p></header><div class="pm-order-market"><span>Predict.fun × Polymarket · 跨所 YES/NO · 统一结算截止 ${escapeHtml(predictionValue(opportunity.canonical_cutoff, "未返回"))}</span><strong>${escapeHtml(predictionValue(opportunity.title, "数据未返回"))}</strong></div><div class="pm-order-legs">${legs.map((leg, index) => `<article class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(predictionVenueLegLabels([leg]).replace(" · ", " · BUY "))} · FOK · ${escapeHtml(predictionValue(leg.settlement_asset, "资产未返回"))}</span><strong>${escapeHtml(predictionValue(leg.net_quantity, "-"))} 净份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · 手续费 ${escapeHtml(predictionMoney(leg.maximum_fee))}</small></article>`).join("")}</div><div class="pm-order-summary"><div><span>净可兑付份额</span><strong>${escapeHtml(predictionValue(opportunity.net_quantity, "-"))}</strong></div><div><span>含费最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost))}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>最低净利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit))}</strong></div><div><span>简单年化</span><strong>${escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 2))}</strong></div></div><div class="pm-risk-note" role="note"><strong>两笔订单不是原子交易</strong><p>可能只成交一腿。你授权系统最多承担 ${escapeHtml(emergencyCap)} 预计损失进行补腿或平仓；两所分别结算后自动兑付，异常会熔断。</p></div><div class="pm-check-list"><div class="pm-check"><span>单笔成本上限</span><strong>${escapeHtml(normalCap)}</strong></div><div class="pm-check"><span>应急损失上限</span><strong>${escapeHtml(emergencyCap)}</strong></div><div class="pm-check"><span>Codex ${escapeHtml(predictionValue(approval.decision, "未返回"))}</span><strong>${escapeHtml(predictionValue(approval.summary, "结构化理由未返回"))}</strong></div>${evidence.map((item) => `<div class="pm-check"><span>${escapeHtml(predictionValue(item.exchange, "交易所"))} · ${escapeHtml(predictionValue(item.field, "证据"))}</span><strong>${escapeHtml(predictionValue(item.quote, "证据未返回"))}</strong></div>`).join("")}<div class="pm-check"><span>可用余额</span><strong>${escapeHtml(balanceSummary || "余额数据未返回")}</strong></div><div class="pm-check"><span>待结算占用</span><strong>${escapeHtml(`${predictionMoney(unsettled.current)} → ${predictionMoney(unsettled.after)} / ${predictionMoney(unsettled.limit)}`)}</strong></div><div class="pm-check"><span>自动兑付</span><strong>两所分别完成结算后读取余额和回执</strong></div><div class="pm-check"><span>确认时处理</span><strong>重新读取两所 REST、盘口、余额和未结算额度</strong></div></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="confirm">确认下单 · 最多 ${escapeHtml(normalCap)}</button></footer></section>`;
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">${title}</h2><p>确认后分别向 Predict.fun 与 Polymarket 提交受限 FOK 订单；确认前不会提交任何订单。</p></header><div class="pm-order-market"><span>Predict.fun × Polymarket · 跨所 YES/NO · 统一结算截止 ${escapeHtml(predictionValue(opportunity.canonical_cutoff, "未返回"))}</span><strong>${escapeHtml(predictionValue(opportunity.title, "数据未返回"))}</strong></div><div class="pm-order-legs">${legs.map((leg, index) => `<article class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(predictionVenueLegLabels([leg]).replace(" · ", " · BUY "))} · FOK · ${escapeHtml(predictionValue(leg.settlement_asset, "资产未返回"))}</span><strong>${escapeHtml(predictionValue(leg.net_quantity, "-"))} 净份 @ 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · 手续费 ${escapeHtml(predictionMoney(leg.maximum_fee))} ${escapeHtml(predictionValue(leg.fee_asset, "费用资产未返回"))}</small></article>`).join("")}</div><div class="pm-order-summary"><div><span>净可兑付份额</span><strong>${escapeHtml(predictionValue(opportunity.net_quantity, "-"))}</strong></div><div><span>含费最大成本</span><strong>${escapeHtml(predictionMoney(opportunity.max_cost))}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</strong></div><div><span>最低净利润</span><strong class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit))}</strong></div><div><span>简单年化</span><strong>${escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 2))}</strong></div></div><div class="pm-risk-note" role="note"><strong>两笔订单不是原子交易</strong><p>可能只成交一腿。你授权系统最多承担 ${escapeHtml(emergencyCap)} 预计损失进行补腿或平仓；两所分别结算后自动兑付，异常会熔断。</p></div><div class="pm-check-list"><div class="pm-check"><span>单笔成本上限</span><strong>${escapeHtml(normalCap)}</strong></div><div class="pm-check"><span>应急损失上限</span><strong>${escapeHtml(emergencyCap)}</strong></div><div class="pm-check"><span>Codex ${escapeHtml(predictionValue(approval.decision, "未返回"))}</span><strong>${escapeHtml(predictionValue(approval.summary, "结构化理由未返回"))}</strong></div>${evidence.map((item) => `<div class="pm-check"><span>${escapeHtml(predictionValue(item.exchange, "交易所"))} · ${escapeHtml(predictionValue(item.field, "证据"))}</span><strong>${escapeHtml(predictionValue(item.quote, "证据未返回"))}</strong></div>`).join("")}<div class="pm-check"><span>可用余额</span><strong>${escapeHtml(balanceSummary || "余额数据未返回")}</strong></div><div class="pm-check"><span>待结算占用</span><strong>${escapeHtml(`${predictionMoney(unsettled.current)} → ${predictionMoney(unsettled.after)} / ${predictionMoney(unsettled.limit)}`)}</strong></div><div class="pm-check"><span>自动兑付</span><strong>两所分别完成结算后读取余额和回执</strong></div><div class="pm-check"><span>确认时处理</span><strong>重新读取两所 REST、盘口、余额和未结算额度</strong></div></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="confirm">确认下单 · 最多 ${escapeHtml(normalCap)}</button></footer></section>`;
   }
   if (String(opportunity.market_type || "") === "threshold_hedge") {
     const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];

@@ -117,6 +117,15 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(observeSignal.locator('[data-action="participate"]')).toHaveCount(0);
   });
 
+  test('history follows the live cross execution mode instead of stale stored mode', async ({ page }) => {
+    await openPrediction(page, 'cross-history-stale-manual');
+    const history = page.locator('[data-prediction-history-panel]');
+    const staleSignal = history.locator('tbody tr').filter({ hasText: '历史陈旧手动信号' });
+    await expect(staleSignal).toContainText('仅观察');
+    await expect(staleSignal).toContainText('只观察模式');
+    await expect(staleSignal.locator('[data-action="participate"]')).toHaveCount(0);
+  });
+
   test('renders cross execution history, holding, dust, breaker, and redemption states', async ({ page }) => {
     await openPrediction(page, 'cross-submitting');
     await expect(page.locator('.pm-progress')).toContainText('正在提交');

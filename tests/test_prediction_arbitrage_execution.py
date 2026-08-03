@@ -1034,6 +1034,7 @@ class CrossVenueMonitor:
             "opportunity_id": f"cross:{self.intent.pair_id}:{self.intent.direction}",
             "pair_id": self.intent.pair_id,
             "market_type": "cross_venue_yes_no", "funnel_stage": 5,
+            "execution_mode": "manual_confirm",
             "actionable": True, "clear_signal": True, "intent": self.intent,
             "direction": self.intent.direction,
             "confirmed_at": now, "confirmed_age_seconds": Decimal("1"),
@@ -1738,6 +1739,34 @@ def test_cross_venue_stage_five_preview_is_server_owned(tmp_path: Path) -> None:
     assert preview["unsettled"]["limit"] == "100"
     assert preview["policy_limits"]["max_normal_cost"] == "20"
     assert preview["policy_limits"]["max_emergency_loss"] == "2"
+
+
+def test_cross_venue_execution_mode_is_server_authority_for_preview_and_confirm(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+
+    cross.overrides["execution_mode"] = "observe_only"
+    rejected = service.preview(opportunity_id)
+
+    assert rejected == {"state": "rejected", "reason": "cross_execution_mode"}
+    assert trading.cross_submit_calls == 0
+    assert predict.submit_calls == 0
+
+    cross.overrides["execution_mode"] = "manual_confirm"
+    preview = service.preview(opportunity_id)
+    assert preview["state"] == "previewed"
+
+    # A stale/forged preview cannot authorize a fresh observe-only opportunity.
+    cross.overrides["execution_mode"] = "observe_only"
+    accepted = service.confirm(str(preview["preview_id"]), "cross-observe-only")
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    assert final["evidence"][-1]["reason"] == "cross_execution_mode"
+    assert trading.cross_submit_calls == 0
+    assert predict.submit_calls == 0
 
 
 @pytest.mark.parametrize(

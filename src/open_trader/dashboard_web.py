@@ -1166,6 +1166,11 @@ def _prediction_history_payload(
                 )
                 if row_market_type != current_market_type or not same_market:
                     current = None
+            if (
+                isinstance(current, Mapping)
+                and str(current.get("market_type") or "") == "cross_venue_yes_no"
+            ):
+                projected["execution_mode"] = current.get("execution_mode")
             is_open = not projected.get("ended_at")
             complete = isinstance(current, Mapping) and _complete(current)
             current_usable = bool(is_open and state_usable and complete)

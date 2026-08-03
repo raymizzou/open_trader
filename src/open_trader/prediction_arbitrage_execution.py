@@ -3613,6 +3613,8 @@ class PredictionExecutionService:
     def _validate_cross_venue_opportunity(
         self, opportunity: Mapping[str, object], intent: CrossVenueIntent
     ) -> str | None:
+        if opportunity.get("execution_mode") != "manual_confirm":
+            return "cross_execution_mode"
         if (
             opportunity.get("market_type") != "cross_venue_yes_no"
             or opportunity.get("funnel_stage") != 5
