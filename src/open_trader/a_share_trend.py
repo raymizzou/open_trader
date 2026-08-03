@@ -6590,7 +6590,7 @@ def run_a_share_trend_report(
             return recovered
         version = _process_version(config.repo)
         log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
-        deadline = datetime.combine(run_day, time(18, 0), tzinfo=SHANGHAI)
+        deadline = datetime.combine(run_day, time(19, 0), tzinfo=SHANGHAI)
         notified_waiting = False
         last_error = "Trend Animals update status is not ready"
         _write_run_log(

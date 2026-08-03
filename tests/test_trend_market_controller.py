@@ -6380,3 +6380,50 @@ def test_pending_revision_recovers_existing_failed_r1_and_binds_completion(
 
 def test_controller_cycle_has_no_unused_buy_window_field() -> None:
     assert "buy_window_open" not in {field.name for field in fields(ControllerCycle)}
+
+
+def test_controller_never_generates_report_before_allocation_terminal_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_allocation_reference_for_cycle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("allocation has not made a terminal attempt")
+        ),
+    )
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(object()),
+    )
+
+    result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == []
+    assert result["phase"] == "blocked"
+    assert "terminal attempt" in str(result["blocker"])
+
+
+@pytest.mark.parametrize("reference", [
+    {"daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": "a" * 64},
+    None,
+])
+def test_controller_passes_the_terminal_allocation_reference_to_report_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: dict[str, str] | None,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_allocation_reference_for_cycle", lambda *_args, **_kwargs: reference
+    )
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(_args[-1])
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == [reference]

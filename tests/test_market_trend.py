@@ -849,8 +849,8 @@ def test_market_report_keeps_retrying_after_old_ten_deadline(
     assert sleeps == [600.0, 600.0]
 
 
-def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None:
-    now = datetime(2026, 7, 15, 12, 0, tzinfo=SHANGHAI)
+def test_market_report_failure_owns_day_at_19_shanghai_deadline(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 15, 19, 0, tzinfo=SHANGHAI)
     cfg = config(tmp_path)
     notifier = RecordingFeishu()
     result = run_market_trend_report(

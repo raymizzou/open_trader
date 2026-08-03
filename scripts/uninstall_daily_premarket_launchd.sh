@@ -75,6 +75,7 @@ if [[ "$TREND_ONLY" -eq 0 ]]; then
 fi
 
 if [[ "$TREND_ONLY" -eq 1 || "$MARKET_REQUESTED" -eq 1 ]]; then
+  remove_label "com.open-trader.trend-allocation"
   if [[ "$MARKET" == "all" ]]; then
     trend_markets=("CN" "HK" "US")
   else

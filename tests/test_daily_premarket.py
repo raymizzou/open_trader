@@ -5648,6 +5648,15 @@ write_controller_status() {
   status_repo="$3"
   status_sha="$4"
   status_market="$5"
+  if [[ "$status_market" == "ALLOCATION" ]]; then
+    status_path="$status_repo/data/trend_allocation/controller_status.json"
+    mkdir -p "$(dirname "$status_path")" "$status_repo/logs/daily_premarket"
+    : >> "$status_repo/logs/daily_premarket/launchd-trend-allocation.out.log"
+    : >> "$status_repo/logs/daily_premarket/launchd-trend-allocation.err.log"
+    heartbeat="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s\\n' "{\\"schema_version\\":\\"open_trader.trend_allocation.status.v1\\",\\"effective_mode\\":\\"execute\\",\\"pid\\":$status_pid,\\"working_directory\\":\\"$status_repo\\",\\"git_sha\\":\\"$status_sha\\",\\"heartbeat_at\\":\\"$heartbeat\\"}" > "$status_path"
+    return
+  fi
   status_path="$status_repo/data/trend_controller/$status_market/status.json"
   mkdir -p "$(dirname "$status_path")" "$status_repo/logs/daily_premarket"
   : >> "$status_repo/logs/daily_premarket/launchd-trend-controller-$(printf '%s' "$status_market" | tr '[:upper:]' '[:lower:]').out.log"
@@ -5735,7 +5744,11 @@ fi
 if [[ "${1:-}" == "load" ]]; then
   plist="${2:-}"
   label="$(basename "$plist" .plist)"
-  status_market="$(printf '%s' "${label##*.}" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$label" == "com.open-trader.trend-allocation" ]]; then
+    status_market="ALLOCATION"
+  else
+    status_market="$(printf '%s' "${label##*.}" | tr '[:lower:]' '[:upper:]')"
+  fi
   status_repo="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$plist")"
   status_sha="$(git -C "$status_repo" rev-parse HEAD)"
   status_pid=4242
@@ -5787,6 +5800,7 @@ def _copy_launchd_installer_assets(tmp_path: Path) -> Path:
     )
     for name in [
         "com.open-trader.trend-market-controller.plist.template",
+        "com.open-trader.trend-allocation.plist.template",
     ]:
         source = source_root / "ops/launchd" / name
         shutil.copy2(source, repo / "ops/launchd" / name)
@@ -5841,3 +5855,35 @@ def _run_fake_controller_install(
     )
     calls = launchctl_log.read_text(encoding="utf-8").splitlines()
     return result, repo, calls
+
+
+def test_launchd_installer_renders_and_installs_allocation_before_market_controllers(
+    tmp_path: Path,
+) -> None:
+    repo = _copy_launchd_installer_assets(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = _fake_launchctl_bin(tmp_path)
+    (repo / "config/daily_premarket.env").write_text(
+        "\n".join([
+            f"OPEN_TRADER_REPO={repo}",
+            "OPEN_TRADER_PYTHON=.venv/bin/python",
+            "TREND_ANIMALS_API_KEY=test-key",
+            f"OPEN_TRADER_TREND_EXECUTOR_HOST={_local_hostname()}",
+        ]), encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(repo / "scripts/install_daily_premarket_launchd.sh"), "--trend-only", "--market", "all"],
+        check=True, capture_output=True, encoding="utf-8",
+        env={"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    allocation = home / "Library/LaunchAgents/com.open-trader.trend-allocation.plist"
+    payload = plistlib.loads(allocation.read_bytes())
+    assert payload["ProgramArguments"] == [
+        str(repo / ".venv/bin/python"), "-m", "open_trader", "trend-allocation", "run",
+        "--config", str(repo / "config/daily_premarket.env"),
+    ]
+    assert payload["RunAtLoad"] is True and payload["KeepAlive"] is True
+    assert "verified launchd allocation: pid=4242" in result.stdout

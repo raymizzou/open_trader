@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,8 @@ from open_trader.trend_allocation import (
     load_allocation_reference,
     write_allocation_snapshot,
 )
+from open_trader.daily_premarket import DailyPremarketConfig
+import open_trader.trend_allocation as trend_allocation
 from open_trader.trend_animals import TrendAnimalsError
 
 
@@ -160,3 +163,68 @@ def test_load_rejects_bad_pointer_hash_schema_and_returns_none_when_cold(tmp_pat
     latest.write_text(json.dumps({"daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": hashlib.sha256(b"{}").hexdigest()}), encoding="utf-8")
     with pytest.raises(TrendAnimalsError):
         load_allocation_reference(tmp_path, allocation_date="2026-08-03", a_trading_days=[])
+
+
+def test_allocation_once_writes_terminal_snapshot_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / ".venv/bin/python", timezone="Asia/Shanghai",
+        deadline="21:10", futu_host="127.0.0.1", futu_port=11111,
+        data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "logs", portfolio=tmp_path / "data/latest/portfolio.csv",
+        trend_executor_host="executor", trend_animals_api_key="test-key",
+    )
+
+    class Quote:
+        def get_cn_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-08-03"]
+
+        def close(self) -> None:
+            pass
+
+    class Api:
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": "2026-08-03"}
+                for asset in ("A股", "ETF基金", "港股", "香港ETF", "美股", "美国ETF")
+            ]
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return [
+                {"tmId": index, "tickerName": asset, "asset": asset}
+                for index, asset in enumerate(("A股", "ETF基金", "港股", "香港ETF", "美股", "美国ETF"), 1)
+            ]
+
+        def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
+            del fields
+            assets = ("A股", "ETF基金", "港股", "香港ETF", "美股", "美国ETF")
+            return [{"tmId": item, "tickerName": assets[item - 1], "asset": assets[item - 1], "asOfDate": expected_date, "trendStrengthGlobalCurr": str(item)} for item in tm_ids]
+
+    monkeypatch.setattr(trend_allocation, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.chdir(tmp_path)
+    status = trend_allocation.run_trend_allocation_controller(
+        config, once=True, allocation_date="2026-08-03",
+        now_fn=lambda: datetime.fromisoformat("2026-08-03T16:21:00+08:00"),
+        quote_factory=lambda **_kwargs: Quote(), api_factory=lambda **_kwargs: Api(),
+    )
+
+    assert status | {
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "pid": status["pid"], "working_directory": str(tmp_path),
+        "git_sha": status["git_sha"], "phase": "ready", "attempted_for": "2026-08-03",
+        "latest_daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "latest_sha256": status["latest_sha256"], "blocker": None,
+    } == status
+
+
+def test_allocation_reference_requires_current_terminal_attempt(tmp_path: Path) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+
+    with pytest.raises(TrendAnimalsError, match="terminal"):
+        trend_allocation.allocation_reference_for_report(
+            config, allocation_date="2026-08-03", a_trading_days=["2026-08-03"]
+        )

@@ -41,6 +41,7 @@ from .kelly_order_execution import (
     FutuSimulateOrderExecutionClient,
 )
 from .market_trend import market_paths, run_market_trend_report
+from .trend_allocation import allocation_reference_for_report
 from .market_trend_watch import (
     MARKET_TIMEZONES,
     market_session,
@@ -103,6 +104,7 @@ class ControllerCycle:
 class ReportTask:
     cycle: ControllerCycle
     completes_revision_request: bool
+    allocation_reference: Mapping[str, object] | None = None
 
 
 def _market(value: str) -> str:
@@ -651,8 +653,14 @@ def _recovery_revision_for_report(
 
 
 def _generate_report(
-    config: DailyPremarketConfig, market: str, run_date: str, revision: bool
+    config: DailyPremarketConfig,
+    market: str,
+    run_date: str,
+    revision: bool,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> None:
+    # The controller, rather than a market report, owns the allocation decision.
+    del allocation_reference
     require_trend_executor(config, hostname_fn=socket.gethostname)
     notifier = build_notifier(config)
     result = (
@@ -673,6 +681,26 @@ def _generate_report(
     )
     if result.status not in {"generated", "existing", "holiday"}:
         raise RuntimeError(f"{market} trend report generation returned {result.status}")
+
+
+def _allocation_reference_for_cycle(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    *,
+    quote_client: object,
+) -> Mapping[str, object] | None:
+    """Use the single Shanghai allocation decision; reports never produce one."""
+    if not config.trend_animals_api_key:
+        return None
+    day = date.fromisoformat(cycle.as_of_date)
+    a_trading_days = quote_client.get_trading_days(
+        market="CN",
+        start=(day - timedelta(days=35)).isoformat(),
+        end=(day + timedelta(days=1)).isoformat(),
+    )
+    return allocation_reference_for_report(
+        config, allocation_date=cycle.as_of_date, a_trading_days=a_trading_days
+    )
 
 
 def _gate_futu_trade_context(
@@ -2937,16 +2965,22 @@ def run_trend_market_controller(
                         if recovery_revision is not None
                         else revision_pending
                     )
-                    future = pool.submit(
-                        _generate_report,
+                    allocation_reference = _allocation_reference_for_cycle(
+                        config, work_cycle, quote_client=shared_quote()
+                    )
+                    report_args: tuple[object, ...] = (
                         config,
                         market,
                         work_cycle.report_run_date,
                         generator_revision,
                     )
+                    if config.trend_animals_api_key:
+                        report_args += (allocation_reference,)
+                    future = pool.submit(_generate_report, *report_args)
                     report_target = ReportTask(
                         cycle=work_cycle,
                         completes_revision_request=revision_pending,
+                        allocation_reference=allocation_reference,
                     )
 
                 if future is not None and (future.done() or once):

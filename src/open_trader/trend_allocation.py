@@ -5,12 +5,25 @@ import json
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
+from time import sleep
+from typing import Callable
+from zoneinfo import ZoneInfo
 
-from .trend_animals import TrendAnimalsError
+from .a_share_trend import _process_version
+from .daily_premarket import (
+    DailyPremarketConfig,
+    RunLock,
+    build_notifier,
+    require_trend_executor,
+    send_notification_with_results,
+    trend_execution_mode,
+)
+from .futu_quote import FutuQuoteClient
+from .trend_animals import TrendAnimalsClient, TrendAnimalsError
 
 
 ROOT_ASSETS = {
@@ -25,6 +38,222 @@ ROOT_FIELDS = (
 )
 _ROOT_ASSET_ORDER = tuple(asset for assets in ROOT_ASSETS.values() for asset in assets)
 _DAILY_PATH = re.compile(r"data/trend_allocation/daily/(\d{4}-\d{2}-\d{2})(?:-r[1-9]\d*)?\.json$")
+ALLOCATION_STATUS_SCHEMA = "open_trader.trend_allocation.status.v1"
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_ATTEMPT_AT = time(16, 20)
+_FALLBACK_AT = time(17, 45)
+
+
+def _allocation_status_path(data_dir: Path) -> Path:
+    return data_dir / "trend_allocation" / "controller_status.json"
+
+
+def _allocation_status(
+    config: DailyPremarketConfig,
+    *,
+    now: datetime,
+    phase: str,
+    attempted_for: str | None,
+    reference: Mapping[str, object] | None,
+    blocker: str | None,
+    next_check_at: datetime,
+    process_version: str,
+) -> dict[str, object]:
+    mode = trend_execution_mode(config)
+    return {
+        "schema_version": ALLOCATION_STATUS_SCHEMA,
+        "effective_mode": mode.mode,
+        "executor_host": mode.executor_host,
+        "local_host": mode.local_host,
+        "pid": os.getpid(),
+        "working_directory": str(Path.cwd().resolve()),
+        "git_sha": process_version,
+        "phase": phase,
+        "heartbeat_at": now.isoformat(timespec="seconds"),
+        "attempted_for": attempted_for,
+        "latest_daily_path": reference.get("daily_path") if reference else None,
+        "latest_sha256": reference.get("sha256") if reference else None,
+        "blocker": blocker,
+        "next_check_at": next_check_at.isoformat(timespec="seconds"),
+    }
+
+
+def _write_allocation_status(config: DailyPremarketConfig, payload: Mapping[str, object]) -> dict[str, object]:
+    _write_json_atomic(_allocation_status_path(config.data_dir), payload)
+    return dict(payload)
+
+
+def _read_allocation_status(data_dir: Path) -> dict[str, object]:
+    path = _allocation_status_path(data_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TrendAnimalsError("allocation controller status is invalid") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != ALLOCATION_STATUS_SCHEMA:
+        raise TrendAnimalsError("allocation controller status is invalid")
+    return value
+
+
+def _notify_allocation_failure_once(
+    config: DailyPremarketConfig, *, allocation_date: str, reason: str
+) -> None:
+    path = config.data_dir / "trend_allocation" / "notifications" / f"{allocation_date}.json"
+    if path.exists():
+        return
+    _write_json_atomic(path, {"allocation_date": allocation_date, "reason": reason})
+    send_notification_with_results(
+        build_notifier(config), "趋势配置快照阻塞",
+        f"{allocation_date} 配置刷新失败；沿用最近成功快照。原因：{reason}",
+    )
+
+
+def load_trend_allocation_status(
+    config: DailyPremarketConfig, *, now: datetime | None = None
+) -> dict[str, object]:
+    current = (now or datetime.now(_SHANGHAI)).astimezone(_SHANGHAI)
+    mode = trend_execution_mode(config)
+    if mode.mode == "readonly":
+        return _allocation_status(
+            config, now=current, phase="readonly", attempted_for=None,
+            reference=None, blocker=mode.reason, next_check_at=current,
+            process_version=_process_version(config.repo),
+        )
+    return _read_allocation_status(config.data_dir)
+
+
+def allocation_reference_for_report(
+    config: DailyPremarketConfig,
+    *,
+    allocation_date: str,
+    a_trading_days: Iterable[str],
+) -> dict[str, object] | None:
+    """Return the shared allocation only after that cycle made a terminal decision."""
+    if not _allocation_status_path(config.data_dir).exists():
+        raise TrendAnimalsError("allocation has not made a terminal attempt for this cycle")
+    status = _read_allocation_status(config.data_dir)
+    if status.get("attempted_for") != _date_text(allocation_date, "allocation_date") or status.get("phase") not in {"ready", "fallback", "holiday"}:
+        raise TrendAnimalsError("allocation has not made a terminal attempt for this cycle")
+    return load_allocation_reference(
+        config.data_dir, allocation_date=allocation_date, a_trading_days=a_trading_days
+    )
+
+
+def run_trend_allocation_controller(
+    config: DailyPremarketConfig,
+    *,
+    once: bool = False,
+    allocation_date: str | None = None,
+    revision: bool = False,
+    now_fn: Callable[[], datetime] = datetime.now,
+    sleep_fn: Callable[[float], None] = sleep,
+    quote_factory: Callable[..., object] = FutuQuoteClient,
+    api_factory: Callable[..., object] = TrendAnimalsClient,
+) -> dict[str, object]:
+    """Persist one post-close cross-market allocation, retrying only in its fixed window."""
+    require_trend_executor(config)
+    process_version = _process_version(config.repo)
+    if not re.fullmatch(r"[0-9a-f]{40}", process_version):
+        process_version = "0" * 40
+    lock = RunLock(config.data_dir / "runs/.trend_allocation.lock")
+    with lock:
+        failures = 0
+        while True:
+            now = now_fn()
+            now = (now.replace(tzinfo=_SHANGHAI) if now.tzinfo is None else now).astimezone(_SHANGHAI)
+            day = _date_text(allocation_date or now.date().isoformat(), "allocation_date")
+            quote = quote_factory(host=config.futu_host, port=config.futu_port)
+            try:
+                days = sorted(quote.get_cn_trading_days(
+                    start=(date.fromisoformat(day) - timedelta(days=35)).isoformat(),
+                    end=(date.fromisoformat(day) + timedelta(days=14)).isoformat(),
+                ))
+            finally:
+                close = getattr(quote, "close", None)
+                if callable(close):
+                    close()
+            latest = load_allocation_reference(
+                config.data_dir, allocation_date=day, a_trading_days=days
+            )
+            reference = (
+                {"daily_path": latest["daily_path"], "sha256": latest["sha256"]}
+                if latest else None
+            )
+            existing: Mapping[str, object] | None = None
+            if _allocation_status_path(config.data_dir).exists():
+                existing = _read_allocation_status(config.data_dir)
+            if (
+                not once
+                and existing is not None
+                and existing.get("attempted_for") == day
+                and existing.get("phase") in {"ready", "fallback", "holiday"}
+            ):
+                sleep_fn(60)
+                continue
+            if day not in days:
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase="holiday", attempted_for=day,
+                    reference=reference, blocker=None, next_check_at=now + timedelta(days=1),
+                    process_version=process_version,
+                ))
+                if once:
+                    return status
+                sleep_fn(60)
+                continue
+            if not once and now.time() < _ATTEMPT_AT:
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase="waiting", attempted_for=None,
+                    reference=reference, blocker=None,
+                    next_check_at=datetime.combine(now.date(), _ATTEMPT_AT, tzinfo=_SHANGHAI),
+                    process_version=process_version,
+                ))
+                sleep_fn(5)
+                continue
+            try:
+                api = api_factory(
+                    api_key=config.trend_animals_api_key,
+                    cache_dir=config.data_dir / "trend_animals/cache",
+                )
+                previous = latest.get("snapshot") if latest else None
+                snapshot = build_allocation_snapshot(
+                    allocation_date=day, generated_at=now.isoformat(timespec="seconds"),
+                    git_sha=process_version, roots=fetch_allocation_roots(api), previous=previous,
+                )
+                reference = write_allocation_snapshot(config.data_dir, snapshot, revision=revision)
+            except Exception as exc:
+                failures += 1
+                reason = str(exc) or exc.__class__.__name__
+                if failures == 1:
+                    _notify_allocation_failure_once(
+                        config, allocation_date=day, reason=reason
+                    )
+                terminal = once or now.time() >= _FALLBACK_AT
+                if terminal:
+                    status = _write_allocation_status(config, _allocation_status(
+                        config, now=now, phase="fallback", attempted_for=day,
+                        reference=reference, blocker=reason, next_check_at=now + timedelta(days=1),
+                        process_version=process_version,
+                    ))
+                    if once:
+                        return status
+                    sleep_fn(60)
+                    continue
+                retry_seconds = min(300, 5 * 2 ** min(failures, 6))
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase="retrying", attempted_for=day,
+                    reference=reference, blocker=reason,
+                    next_check_at=now + timedelta(seconds=retry_seconds),
+                    process_version=process_version,
+                ))
+                sleep_fn(retry_seconds)
+                continue
+            status = _write_allocation_status(config, _allocation_status(
+                config, now=now, phase="ready", attempted_for=day,
+                reference=reference, blocker=None, next_check_at=now + timedelta(days=1),
+                process_version=process_version,
+            ))
+            if once:
+                return status
+            sleep_fn(60)
 
 
 def fetch_allocation_roots(api: object) -> dict[str, object]:
