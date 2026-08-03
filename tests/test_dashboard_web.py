@@ -250,6 +250,81 @@ def test_dashboard_preserves_terminal_trend_action_status(
     assert executions[("TRV", "buy")]["status"] == status
 
 
+def test_dashboard_projects_only_valid_simulated_rotation_facts(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_simulated_rotation_pairs
+    from open_trader.trend_review import _rotation_pair_key
+
+    report_sha = "a" * 64
+    common = {
+        "schema_version": "open_trader.trend_review.rotation.v1",
+        "market": "US",
+        "account_id": 101,
+        "execution_date": "2026-07-20",
+        "report_sha256": report_sha,
+    }
+
+    def root(pair_index: int) -> tuple[Path, str]:
+        pair_key = _rotation_pair_key(
+            "US", 101, "2026-07-20", report_sha, pair_index
+        )
+        path = (
+            tmp_path / "trend_review/ledgers/US/rotations/2026-07-20"
+            / pair_key
+        )
+        path.mkdir(parents=True)
+        return path, pair_key
+
+    terminal_root, terminal_key = root(0)
+    (terminal_root / "terminal.json").write_text(json.dumps({
+        **common, "kind": "terminal", "pair_index": 0,
+        "pair_key": terminal_key, "status": "complete",
+    }), encoding="utf-8")
+
+    fill_root, fill_key = root(1)
+    request = {
+        "market": "US", "futu_code": "US.WEAK", "side": "SELL",
+        "qty": "10", "remark": "rotation:test",
+    }
+    (fill_root / "sell-filled.json").write_text(json.dumps({
+        **common, "kind": "sell_fill", "status": "filled",
+        "pair_index": 1, "pair_key": fill_key,
+        "sell_futu_symbol": "US.WEAK", "buy_futu_symbol": "US.STRONG",
+        "target_qty": "10", "filled_qty": "10", "request": request,
+        "order": {
+            "order_id": "sell-1", "code": "US.WEAK", "trd_side": "SELL",
+            "remark": "rotation:test", "qty": "10", "dealt_qty": "10",
+            "order_status": "FILLED_ALL",
+        },
+    }), encoding="utf-8")
+
+    invalid_root, _ = root(2)
+    (invalid_root / "terminal.json").write_text("{broken", encoding="utf-8")
+    unrelated_key = _rotation_pair_key(
+        "US", 202, "2026-07-20", report_sha, 2
+    )
+    (invalid_root / "unrelated.json").write_text(json.dumps({
+        **common, "account_id": 202, "kind": "terminal", "pair_index": 2,
+        "pair_key": unrelated_key, "status": "complete",
+    }), encoding="utf-8")
+
+    frozen_pairs = [{"pair_index": index} for index in range(3)]
+    projected = _project_simulated_rotation_pairs(
+        frozen_pairs,
+        data_dir=tmp_path,
+        market="US",
+        execution_date="2026-07-20",
+        report_sha256=report_sha,
+        account_id=101,
+    )
+
+    assert [pair["execution_status"] for pair in projected] == [
+        "完成", "卖出已成交", "待执行",
+    ]
+    assert frozen_pairs == [{"pair_index": index} for index in range(3)]
+
+
 def test_dashboard_uses_latest_action_event_across_timezone_offsets(
     tmp_path: Path,
 ) -> None:
