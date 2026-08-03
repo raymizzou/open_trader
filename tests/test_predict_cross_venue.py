@@ -1222,7 +1222,7 @@ def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -
     asyncio.run(exercise())
 
 
-def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
+def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
     tmp_path: Path,
 ) -> None:
     async def exercise() -> None:
@@ -1247,37 +1247,64 @@ def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
-        await monitor.start()
-        await wait_until(lambda: bool(predict.subscriptions))
-        await predict.queue.put(monitor_predict_book())
-        await wait_until(lambda: bool(store.open_signal_history()))
-        opportunity = next(
-            row["opportunity_id"]
-            for row in monitor.snapshot()["opportunities"]
-            if row["direction"] == "PREDICT_YES_POLYMARKET_NO"
-        )
-        opportunity_id = str(opportunity)
-        signal = next(
-            row
-            for row in store.open_signal_history()
-            if row["opportunity_id"] == opportunity_id
-        )
-        assert signal["opportunity_id"] == opportunity_id
-        assert signal["market_type"] == "cross_venue_yes_no"
-        assert signal["execution_mode"] == "observe_only"
-        assert signal["clear_signal"] is True
-        assert signal["trigger_total_max_cost"] == "8.128000"
-        assert signal["trigger_minimum_profit"] == "1.872000"
-        assert signal["legs"][0]["token_id"] == "predict-yes-1"
-        assert signal["legs"][1]["token_id"] == "poly-no-1"
-        assert signal["question"] == "Will the public test event resolve Yes?"
-        assert signal["predict_question"] == "Will the public test event resolve Yes?"
-        assert signal["polymarket_question"] == "Will the public test event resolve Yes?"
-        await wait_until(lambda: bool(notifications))
-        assert (signal["opportunity_id"], signal["signal_id"]) in notifications
+        opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+        base = {
+            "opportunity_id": opportunity_id,
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "market_type": "cross_venue_yes_no",
+            "execution_mode": "observe_only",
+            "total_max_cost": Decimal("8.128"),
+            "minimum_profit": Decimal("1.872"),
+            "rules_fingerprints": {
+                "predict.fun": "predict-fingerprint-1",
+                "polymarket": "poly-fingerprint-1",
+            },
+            "codex_approval": {"decision": "APPROVE", "cache_key": "approval-1"},
+        }
+        for stage in range(1, 5):
+            monitor._persist_observation(
+                {**base, "funnel_stage": stage, "actionable": False, "clear_signal": False}
+            )
+        await asyncio.sleep(0)
+        assert notifications == []
 
-        await monitor.stop()
-        assert store.signal(str(signal["signal_id"]))["ended_reason"] == "data_unavailable"  # type: ignore[index]
+        signal = store.open_signal_history()[0]
+        assert signal["notification_dedupe_identity"] == {
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "predict_fingerprint": "predict-fingerprint-1",
+            "polymarket_fingerprint": "poly-fingerprint-1",
+        }
+
+        stage_five = {**base, "funnel_stage": 5, "actionable": True, "clear_signal": True}
+        monitor._persist_observation(stage_five)
+        await wait_until(lambda: len(notifications) == 1)
+        assert notifications == [(opportunity_id, signal["signal_id"])]
+
+        monitor._persist_observation(stage_five)
+        await asyncio.sleep(0)
+        assert len(notifications) == 1
+
+        fresh_base = {
+            **base,
+            "rules_fingerprints": {
+                "predict.fun": "predict-fingerprint-2",
+                "polymarket": "poly-fingerprint-1",
+            },
+            "codex_approval": {"decision": "APPROVE", "cache_key": "approval-2"},
+        }
+        monitor._persist_observation(
+            {**fresh_base, "funnel_stage": 4, "actionable": False, "clear_signal": False}
+        )
+        await asyncio.sleep(0)
+        assert len(notifications) == 1
+
+        monitor._persist_observation(
+            {**fresh_base, "funnel_stage": 5, "actionable": True, "clear_signal": True}
+        )
+        await wait_until(lambda: len(notifications) == 2)
+        assert notifications[-1] == (opportunity_id, signal["signal_id"])
 
     asyncio.run(exercise())
 

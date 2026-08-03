@@ -814,19 +814,37 @@ def _standard_notification_signal(
 
 def _cross_venue_notification_signal(store: PredictionArbitrageStore) -> str:
     now = datetime.now(UTC).isoformat()
+    cutoff = (datetime.now(UTC) + timedelta(days=30)).isoformat()
     return store.upsert_signal(
         {
             "opportunity_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
             "market_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
             "event_id": "public-pair",
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
             "market_type": "cross_venue_yes_no",
             "execution_mode": "observe_only",
+            "funnel_stage": 5,
+            "actionable": True,
             "clear_signal": True,
+            "quote_available": True,
             "started_at": now,
             "first_positive_at": now,
             "total_max_cost": Decimal("9.45"),
             "minimum_profit": Decimal("0.55"),
             "estimated_profit": Decimal("0.55"),
+            "annualized_yield": Decimal("0.16"),
+            "canonical_cutoff": cutoff,
+            "notification_dedupe_identity": {
+                "pair_id": "public-pair",
+                "direction": "PREDICT_YES_POLYMARKET_NO",
+                "predict_fingerprint": "predict-fingerprint",
+                "polymarket_fingerprint": "poly-fingerprint",
+            },
+            "rules_fingerprints": {
+                "predict.fun": "predict-fingerprint",
+                "polymarket": "poly-fingerprint",
+            },
             "legs": [
                 {
                     "exchange": "predict.fun",
@@ -927,13 +945,16 @@ def test_notify_ready_opportunity_standard_sends_feishu_observation_without_pref
     assert store.signal(signal_id)["notification_state"] == "sent"  # type: ignore[index]
 
 
-def test_notify_ready_opportunity_cross_venue_sends_without_prepare_or_trading(
-    tmp_path: Path,
+def test_cross_venue_notification_rechecks_stage_5_without_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    service, trading, store, _monitor, macos, feishu = standard_notification_fixture(tmp_path)
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
     signal_id = _cross_venue_notification_signal(store)
-    service._prepare_opportunity = lambda *_args: pytest.fail(  # type: ignore[method-assign]
-        "cross observation must not prepare an order"
+    monkeypatch.setattr(
+        store,
+        "create_preview",
+        lambda *_args, **_kwargs: pytest.fail("notification must not create a preview"),
     )
 
     result = service.notify_ready_opportunity(
@@ -943,9 +964,31 @@ def test_notify_ready_opportunity_cross_venue_sends_without_prepare_or_trading(
     assert result == {"state": "sent", "signal_id": signal_id}
     assert feishu.calls == 1
     assert macos.calls == 0
-    assert trading.preflight_calls == 0
-    assert trading.batch_calls == 0
+    assert cross.refresh_calls == 1
+    assert trading.cross_preflight_calls == 0
+    assert predict.preflight_calls == 0
     assert store.active_execution() is None
+    assert store.cross_unsettled_principal() == Decimal("0")
+    assert "/?prediction_signal=" in feishu.messages[-1][1]
+
+
+def test_cross_venue_notification_failure_keeps_signal_actionable(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, _predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    feishu.fail = True
+    signal_id = _cross_venue_notification_signal(store)
+
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "failed", "reason": "notification_failed"}
+
+    signal = store.signal(signal_id)
+    assert signal is not None
+    assert signal["actionable"] is True
+    assert signal["funnel_stage"] == 5
+    assert signal["ended_at"] is None
 
 
 def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueIntent:
@@ -989,6 +1032,7 @@ class CrossVenueMonitor:
         now = datetime.now(UTC)
         opportunity: dict[str, object] = {
             "opportunity_id": f"cross:{self.intent.pair_id}:{self.intent.direction}",
+            "pair_id": self.intent.pair_id,
             "market_type": "cross_venue_yes_no", "funnel_stage": 5,
             "actionable": True, "clear_signal": True, "intent": self.intent,
             "direction": self.intent.direction,

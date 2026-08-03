@@ -86,6 +86,25 @@ _PREDICT_COLLATERAL_UNITS = Decimal(10**6)
 _PREDICT_SHARE_UNITS = Decimal(10**18)
 
 
+def cross_venue_notification_dedupe_identity(
+    opportunity: Mapping[str, object],
+) -> dict[str, str] | None:
+    """Return the persisted identity for one approved cross-venue signal."""
+
+    fingerprints = opportunity.get("rules_fingerprints")
+    if not isinstance(fingerprints, Mapping):
+        return None
+    values = {
+        "pair_id": opportunity.get("pair_id"),
+        "direction": opportunity.get("direction"),
+        "predict_fingerprint": fingerprints.get("predict.fun"),
+        "polymarket_fingerprint": fingerprints.get("polymarket"),
+    }
+    if not all(isinstance(value, str) and value.strip() for value in values.values()):
+        return None
+    return {name: str(value) for name, value in values.items()}
+
+
 @dataclass(frozen=True, slots=True)
 class VenueMarket:
     exchange: Literal["predict.fun", "polymarket"]
@@ -1569,6 +1588,15 @@ class PredictCrossVenueMonitor:
         trigger_minimum_profit = previous.get(
             "trigger_minimum_profit", opportunity.get("minimum_profit")
         )
+        notification_identity = cross_venue_notification_dedupe_identity(opportunity)
+        same_notification_identity = (
+            notification_identity is not None
+            and notification_identity == previous.get("notification_dedupe_identity")
+        )
+        notification_reset = (
+            notification_identity is not None and not same_notification_identity
+        )
+        approval = opportunity.get("codex_approval")
         signal_id = store.upsert_signal(
             {
                 **opportunity,
@@ -1588,9 +1616,26 @@ class PredictCrossVenueMonitor:
                 ),
                 "trigger_total_max_cost": trigger_total_max_cost,
                 "trigger_minimum_profit": trigger_minimum_profit,
+                "notification_dedupe_identity": notification_identity,
+                **(
+                    {"notification_state": "pending", "notification_attempts": 0}
+                    if notification_reset
+                    else {}
+                ),
             }
         )
-        if self._ready_observer is not None:
+        if (
+            self._ready_observer is not None
+            and notification_identity is not None
+            and opportunity.get("funnel_stage") == 5
+            and opportunity.get("actionable") is True
+            and isinstance(approval, Mapping)
+            and approval.get("decision") == "APPROVE"
+            and not (
+                same_notification_identity
+                and previous.get("actionable") is True
+            )
+        ):
             asyncio.create_task(
                 asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
             )

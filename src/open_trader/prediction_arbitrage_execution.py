@@ -42,7 +42,11 @@ from .prediction_arbitrage import (
     ThresholdHedgeLeg,
     protected_buy_quantity,
 )
-from .predict_cross_venue import CrossVenueIntent, CrossVenueLeg
+from .predict_cross_venue import (
+    CrossVenueIntent,
+    CrossVenueLeg,
+    cross_venue_notification_dedupe_identity,
+)
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
 
@@ -240,10 +244,11 @@ class PredictionExecutionService:
         signal = self._store.signal(str(signal_id))
         if signal is None:
             return {"state": "ignored", "reason": "signal_unavailable"}
-        if signal.get("market_type") in {
-            "standard_binary",
-            "cross_venue_yes_no",
-        }:
+        if signal.get("market_type") == "cross_venue_yes_no":
+            return self._notify_cross_venue_signal(
+                str(opportunity_id), str(signal_id), signal
+            )
+        if signal.get("market_type") == "standard_binary":
             return self._notify_yes_no_signal(str(signal_id), signal)
         if signal.get("ended_at") is not None:
             return {"state": "ignored", "reason": "signal_closed"}
@@ -344,8 +349,36 @@ class PredictionExecutionService:
             return {"state": "ignored", "reason": "signal_closed"}
         return {"state": "failed", "reason": "notification_failed"}
 
+    def _notify_cross_venue_signal(
+        self,
+        opportunity_id: str,
+        signal_id: str,
+        signal: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Recheck a cross signal without creating an execution preview."""
+
+        prepared = self._prepare_opportunity(opportunity_id)
+        if isinstance(prepared, dict):
+            return {"state": "failed", "reason": prepared.get("reason", "not_ready")}
+        opportunity, intent, _account = prepared
+        if not isinstance(intent, CrossVenueIntent):
+            return {"state": "failed", "reason": "unsupported_intent"}
+        identity = cross_venue_notification_dedupe_identity(opportunity)
+        if (
+            identity is None
+            or identity != signal.get("notification_dedupe_identity")
+        ):
+            return {"state": "failed", "reason": "opportunity_changed"}
+        return self._notify_yes_no_signal(
+            signal_id, signal, rendered_signal={**opportunity, "signal_id": signal_id}
+        )
+
     def _notify_yes_no_signal(
-        self, signal_id: str, signal: Mapping[str, object]
+        self,
+        signal_id: str,
+        signal: Mapping[str, object],
+        *,
+        rendered_signal: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         if signal.get("ended_at") is not None:
             return {"state": "ignored", "reason": "signal_closed"}
@@ -401,12 +434,15 @@ class PredictionExecutionService:
             return {"state": "failed", "reason": "notification_state_unavailable"}
 
         current = dict(current)
-        event_title = str(
-            current.get("event_title", current.get("question", "")) or ""
-        ).strip()
-        translated_title = cached_prediction_title_zh(self._store, event_title)
-        if translated_title is not None:
-            current["event_title_zh"] = translated_title
+        if rendered_signal is None:
+            event_title = str(
+                current.get("event_title", current.get("question", "")) or ""
+            ).strip()
+            translated_title = cached_prediction_title_zh(self._store, event_title)
+            if translated_title is not None:
+                current["event_title_zh"] = translated_title
+        else:
+            current.update(rendered_signal)
         try:
             title, message = render_yes_no_signal_notification(current)
             feishu_success = self._deliver_feishu_notification(title, message)

@@ -205,14 +205,17 @@ def test_yes_no_signal_notification_is_link_free_and_observation_only(
         assert forbidden not in message
 
 
-def test_cross_venue_yes_no_signal_notification_is_link_free_and_observation_only() -> None:
+def test_cross_venue_yes_no_signal_notification_has_actionable_deep_link() -> None:
     title, message = render_yes_no_signal_notification(
         {
             "market_type": "cross_venue_yes_no",
+            "signal_id": "cross-signal-1",
             "pair_id": "public-pair",
             "first_positive_at": "2026-08-02T01:23:45.678000Z",
             "total_max_cost": "9.45",
             "minimum_profit": "0.55",
+            "annualized_yield": "0.16",
+            "canonical_cutoff": "2026-08-10T12:34:56.789000Z",
             "legs": [
                 {
                     "exchange": "predict.fun",
@@ -232,17 +235,19 @@ def test_cross_venue_yes_no_signal_notification_is_link_free_and_observation_onl
         }
     )
 
-    assert title == "【跨交易所 YES/NO 观察信号】+$0.55"
+    assert title == "【跨交易所 YES/NO 可执行信号】+$0.55"
     for text in (
         "Predict.fun · YES：10 份，最大成本 $4.10（USDT）",
         "Polymarket · NO：10 份，最大成本 $5.10（USDC）",
         "确认最大总成本：$9.45",
         "确认最低利润：+$0.55",
+        "理论年化收益：16.00%",
+        "统一截止时间：2026-08-10 20:34:56.789 HKT",
         "发现时间（HKT）：2026-08-02 09:23:45.678 HKT",
+        "Dashboard：/?prediction_signal=cross-signal-1",
     ):
         assert text in message
     for forbidden in (
-        "http",
         "wallet",
         "token_id",
         "规则",

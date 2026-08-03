@@ -401,7 +401,7 @@ def render_prediction_opportunity_notification(
 def render_yes_no_signal_notification(
     signal: Mapping[str, object],
 ) -> tuple[str, str]:
-    """Render a link-free observation alert from the persisted signal facts."""
+    """Render a YES/NO signal alert from persisted signal facts."""
 
     def decimal(value: object) -> Decimal:
         try:
@@ -421,23 +421,29 @@ def render_yes_no_signal_notification(
             rendered = rendered.rstrip("0").rstrip(".")
         return rendered or "0"
 
-    raw_time = signal.get("first_positive_at", signal.get("started_at", ""))
-    if isinstance(raw_time, datetime):
-        moment = raw_time
-    else:
-        text = str(raw_time).strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            moment = datetime.fromisoformat(text)
-        except ValueError:
-            moment = datetime.now(HONG_KONG)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=HONG_KONG)
-    discovered = moment.astimezone(HONG_KONG).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    def timestamp(value: object) -> str:
+        if isinstance(value, datetime):
+            moment = value
+        else:
+            text = str(value).strip()
+            if not text:
+                return ""
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                moment = datetime.fromisoformat(text)
+            except ValueError:
+                return str(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=HONG_KONG)
+        rendered = moment.astimezone(HONG_KONG).strftime("%Y-%m-%d %H:%M:%S.%f")
+        return f"{rendered[:-3]} HKT"
+
+    discovered = timestamp(signal.get("first_positive_at", signal.get("started_at", "")))
 
     if signal.get("market_type") == "cross_venue_yes_no":
         profit = signal.get("minimum_profit", signal.get("estimated_profit"))
+        annualized = decimal(signal.get("annualized_yield")) * Decimal("100")
         legs = signal.get("legs")
         lines = []
         if isinstance(legs, (list, tuple)):
@@ -452,13 +458,16 @@ def render_yes_no_signal_notification(
                     f"{money(leg.get('max_cost'))}（{str(leg.get('settlement_asset', '')).upper()}）"
                 )
         return (
-            f"【跨交易所 YES/NO 观察信号】{money(profit, signed=True)}",
+            f"【跨交易所 YES/NO 可执行信号】{money(profit, signed=True)}",
             "\n".join(
                 (
                     *lines,
                     f"确认最大总成本：{money(signal.get('total_max_cost'))}",
                     f"确认最低利润：{money(profit, signed=True)}",
-                    f"发现时间（HKT）：{discovered} HKT",
+                    f"理论年化收益：{annualized.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}%",
+                    f"统一截止时间：{timestamp(signal.get('canonical_cutoff'))}",
+                    f"发现时间（HKT）：{discovered}",
+                    f"Dashboard：/?prediction_signal={signal.get('signal_id', '')}",
                 )
             ),
         )
@@ -476,7 +485,7 @@ def render_yes_no_signal_notification(
             f"数量：{quantity(signal.get('quantity'))}",
             f"最大成本：{money(signal.get('total_max_cost'))}",
             f"当前利润：{money(profit, signed=True)}",
-            f"发现时间（HKT）：{discovered} HKT",
+            f"发现时间（HKT）：{discovered}",
         )
     )
     return title, message
