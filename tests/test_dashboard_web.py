@@ -6613,22 +6613,24 @@ def test_dashboard_account_owner_keeps_snapshot_after_legacy_failure() -> None:
     output = run_dashboard_js(r'''
 const mount=()=>({textContent:"",style:{}});
 for(const id of ["current-view-value","current-view-holding-value","current-view-holding-weight","current-view-cash-note","current-view-label","connection-status","connection-success","connection-poll","connection-task"]) elements[id]=mount();
-state.dashboard={summary:{portfolio_value_hkd:"999"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"999"}],source_statuses:[{broker:"tiger",status:"failed",display_text:"泄漏"}],holdings:[{instrument_id:"ins-qqq",strategy:"趋势"}]};
+state.dashboard={summary:{portfolio_value_hkd:"999"},broker_summaries:[{broker:"tiger",portfolio_value_hkd:"999"}],source_statuses:[{broker:"tiger",status:"failed",display_text:"泄漏"}],holdings:[{instrument_id:"ins-qqq",strategy:"趋势",last_price:"999"}]};
 state.accountSnapshot={status:"healthy",stale:false,
   summary:{portfolio_value_hkd:"222",holding_value_hkd:"200",holding_weight_hkd:"90%",cash_like_value_hkd:"22",holding_count:"2"},
   broker_summaries:[{broker:"tiger",account_alias:"snapshot-alias",portfolio_value_hkd:"222",holding_count:"2"}],
-  positions:[{broker:"tiger",account_alias:"snapshot-alias",market:"US",asset_class:"stock",symbol:"QQQ",quantity:"2",position_id:"pos-qqq",instrument_id:"ins-qqq"}],
+  positions:[{broker:"tiger",account_alias:"snapshot-alias",market:"US",asset_class:"stock",symbol:"QQQ",quantity:"2",position_id:"pos-qqq",instrument_id:"ins-qqq",last_price:"500"}],
   cash_balances:[{broker:"tiger",account_alias:"snapshot-alias",currency:"USD",cash_balance:"22"}],
   generated_at:"2026-08-04T10:00:00+08:00", quote_as_of:"2026-08-04T09:59:00+08:00",
   sources:{account:{brokers:{tiger:{status:"ok",display:"快照正常"}}},quotes:{status:"healthy",as_of:"dashboard-quote-must-not-win"}},
 };
 renderHeaderSummary();
 renderConnectionPanel();
-const current={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),sources:renderSourceStatusList(),connection:[elements["connection-status"].textContent,elements["connection-success"].textContent,elements["connection-poll"].textContent],row:accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0],cash:getCashRows()[0].account_alias};
+const currentRow=accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0];
+const current={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),sources:renderSourceStatusList(),connection:[elements["connection-status"].textContent,elements["connection-success"].textContent,elements["connection-poll"].textContent],row:currentRow,rowHtml:renderAccountHoldingRow(currentRow),cash:getCashRows()[0].account_alias};
 state.dashboard=null;state.dashboardError=new Error("legacy offline");state.accountError=new Error("account 503");
 renderHeaderSummary();
 renderConnectionPanel();
-const failed={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),sources:renderSourceStatusList(),connection:[elements["connection-status"].textContent,elements["connection-success"].textContent,elements["connection-poll"].textContent],row:accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0],cash:getCashRows()[0].account_alias};
+const failedRow=accountHoldingGroups().find((group)=>group.broker==="tiger").rows[0];
+const failed={header:elements["current-view-value"].textContent,cards:renderBrokerSummaryCards(),sources:renderSourceStatusList(),connection:[elements["connection-status"].textContent,elements["connection-success"].textContent,elements["connection-poll"].textContent],row:failedRow,rowHtml:renderAccountHoldingRow(failedRow),cash:getCashRows()[0].account_alias};
 console.log(JSON.stringify({current,failed}));
 ''')
 
@@ -6640,6 +6642,9 @@ console.log(JSON.stringify({current,failed}));
         assert "泄漏" not in rendered[phase]["sources"]
         assert rendered[phase]["row"]["key"] == "pos-qqq"
         assert rendered[phase]["row"]["display"]["quantity"] == "2"
+        assert rendered[phase]["row"]["display"]["last_price"] == "500"
+        assert "500" in rendered[phase]["rowHtml"]
+        assert "999" not in rendered[phase]["rowHtml"]
         assert rendered[phase]["cash"] == "snapshot-alias"
         assert rendered[phase]["connection"][1] == "2026-08-04T09:59:00+08:00"
     assert rendered["current"]["connection"] == ["账户与行情正常", "2026-08-04T09:59:00+08:00", "账户快照请求正常 · 行情正常"]
