@@ -7224,7 +7224,7 @@ def test_missing_industry_row_excludes_only_affected_candidate(
 def test_industry_snapshot_failure_blocks_report(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi(
             [], industry_error=TrendAnimalsError("industry unavailable")
         ),
