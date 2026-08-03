@@ -4259,6 +4259,68 @@ def test_prediction_arbitrage_allowance_cleanup_schema_is_confirm_only(
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize("failure", ["host", "origin", "cookie", "csrf", "address"])
+def test_prediction_arbitrage_allowance_cleanup_rejects_route_specific_mutation_security_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls = 0
+
+        def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
+            self.calls += 1
+            return {"state": "ready", "confirm": confirm}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        if failure == "host":
+            headers["Host"] = "not-the-listener"
+        elif failure == "origin":
+            headers["Origin"] = "http://127.0.0.1:9999"
+        elif failure == "cookie":
+            headers["Cookie"] = "ot_prediction_session=wrong"
+        elif failure == "csrf":
+            headers["X-CSRF-Token"] = "wrong"
+        elif failure == "address":
+            monkeypatch.setattr(dashboard_web, "_is_loopback_address", lambda _value: False)
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/predict-allowance/cleanup",
+            data=b"not-json",
+            headers=headers,
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 403
+        assert execution.calls == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_prediction_arbitrage_cli_rejects_non_loopback_prediction_listener(
     tmp_path: Path,
 ) -> None:

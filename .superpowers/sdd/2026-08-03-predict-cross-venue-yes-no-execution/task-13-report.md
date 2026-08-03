@@ -93,3 +93,70 @@ Both exited 0.
 
 - The full affected suite reports one existing `websockets.legacy` deprecation warning from the environment; no test failure.
 - No live approval/order/transfer/acceptance was run, by task constraint.
+
+## Fix round 1/5
+
+### Reviewer findings addressed
+
+- Post-approval envelope breach with cleanup receipt/post-read failure now routes through the existing immediate incident path with reason `predict_allowance_cleanup_failed`. It opens the cross breaker, persists exactly one incident, submits zero venue orders, and does not release the cross reservation through the no-submit close path.
+- Confirmed approval with unavailable or mismatched exact-allowance post-read is now distinguished from no-mutation approval failure. The possible-mutation path fails closed with `predict_allowance_approval_unverified`, opens the breaker, persists one incident, and submits zero venue orders.
+- Durable canary verification no longer self-certifies `fees_verified` or `balances_verified`. `canary_verified=true` is only written when existing reconciliation evidence proves:
+  - both venues verified fills and positions,
+  - concrete order and trade references,
+  - actual fee facts,
+  - post-fill balance baseline,
+  - zero Predict allowance proof,
+  - matching compatibility fingerprint.
+- Added negative canary coverage for cancellation, both rejected, one-leg incident, cleanup failure, partial reconciliation, and missing fee proof; all remain on the 5 USDT canary cap.
+- Added cleanup route-specific mutation-security tests for Host, Origin, session cookie, CSRF, and loopback-address rejection before body parsing. Schema tests continue to reject client owner/spender/amount and accept only `{"confirm": true}`.
+
+### Round 1 TDD evidence
+
+Focused red command:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py \
+  -k 'approval_unverified or unverified_post_read or post_approval_breach_cleanup or cross_canary or allowance_cleanup' -q
+```
+
+Red result before fix:
+
+```text
+4 failed, 15 passed, 494 deselected, 1 warning
+```
+
+Focused green after fix:
+
+```text
+20 passed, 493 deselected, 1 warning in 4.86s
+```
+
+Full affected green:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_trading.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py -q
+
+612 passed, 1 warning in 48.43s
+```
+
+Extra checks:
+
+```text
+git diff --check
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m py_compile \
+  src/open_trader/prediction_arbitrage_execution.py src/open_trader/dashboard_web.py
+```
+
+Both exited 0.
+
+### Round 1 concerns
+
+- The only warning remains the existing `websockets.legacy` deprecation warning from the test environment.
+- No live approval/order/transfer was run.
+- `make acceptance` was not run per instruction.

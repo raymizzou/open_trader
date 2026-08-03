@@ -1635,7 +1635,17 @@ class PredictionExecutionService:
         if exact_debit_wei is None:
             self._finish_cross_rejected(execution_id, "predict_allowance_amount_invalid", intent)
             return
-        if self._set_exact_predict_allowance(predict_leg.market_id, exact_debit_wei) is None:
+        approval, possible_mutation = self._set_exact_predict_allowance(
+            predict_leg.market_id, exact_debit_wei
+        )
+        if approval is None:
+            if possible_mutation:
+                self._finish_cross_incident(
+                    execution_id,
+                    "predict_allowance_approval_unverified",
+                    evidence={"market_id": predict_leg.market_id, "submitted": False},
+                )
+                return
             self._finish_cross_rejected(
                 execution_id,
                 "predict_allowance_approval_failed",
@@ -1662,18 +1672,24 @@ class PredictionExecutionService:
         )
         if reason is not None or refreshed_account is None:
             cleanup = self._clear_predict_allowance_zero(predict_leg.market_id)
+            if cleanup is None:
+                self._finish_cross_incident(
+                    execution_id,
+                    "predict_allowance_cleanup_failed",
+                    evidence={
+                        "market_id": predict_leg.market_id,
+                        "submitted": False,
+                        "status_text": "未下单 · 授权清零失败",
+                        "rejection_reason": reason or volatile_reason or "readiness_unavailable",
+                    },
+                )
+                return
             self._finish_cross_rejected(
                 execution_id,
                 reason or volatile_reason or "readiness_unavailable",
                 intent,
-                status_text=(
-                    "未下单 · 授权已清零"
-                    if cleanup is not None
-                    else "未下单 · 授权清零失败"
-                ),
+                status_text="未下单 · 授权已清零",
             )
-            if cleanup is None:
-                self._cross_breaker_open = True
             return
         intent = refreshed_intent
         by_exchange = {leg.exchange: leg for leg in intent.legs}
@@ -1970,26 +1986,26 @@ class PredictionExecutionService:
 
     def _set_exact_predict_allowance(
         self, market_id: str, exact_debit_wei: int
-    ) -> dict[str, object] | None:
+    ) -> tuple[dict[str, object] | None, bool]:
         method = getattr(self._predict_trading, "set_exact_buy_allowance", None)
         if not callable(method):
-            return None
+            return None, False
         try:
             result = _call(method, market_id, exact_debit_wei)
         except Exception:
-            return None
+            return None, False
         if not isinstance(result, Mapping) or str(result.get("status", "")).lower() != "confirmed":
-            return None
+            return None, False
         snapshot = self._fresh_predict_account_snapshot()
         expected = Decimal(exact_debit_wei) / Decimal("1000000")
         if snapshot is None or _decimal(snapshot.get("allowance")) != expected:
-            return None
+            return None, True
         return {
             "market_id": market_id,
             "after": format(expected, "f"),
             "exact_debit_wei": exact_debit_wei,
             "exact_verified": True,
-        }
+        }, True
 
     def _clear_predict_allowance_zero(self, market_id: str) -> dict[str, object] | None:
         method = getattr(self._predict_trading, "clear_buy_allowance", None)
@@ -2145,14 +2161,66 @@ class PredictionExecutionService:
             cleanup.get("zero_verified") is True
             and established
             and baseline is not None
+            and self._cross_canary_reconciliation_verified(reconciled)
         ):
             fingerprint = self._predict_canary_fingerprint()
             if fingerprint is not None:
                 evidence["canary_verified"] = True
                 evidence["canary_fingerprint"] = fingerprint
-                evidence["fees_verified"] = True
-                evidence["balances_verified"] = True
         self._transition(execution_id, "holding_to_resolution", evidence)
+
+    @staticmethod
+    def _cross_canary_reconciliation_verified(
+        reconciled: Mapping[str, Mapping[str, object]]
+    ) -> bool:
+        if set(reconciled) != {"predict.fun", "polymarket"}:
+            return False
+        for venue, value in reconciled.items():
+            if value.get("verified") is not True:
+                return False
+            filled = _decimal(value.get("filled_quantity"))
+            position = _decimal(value.get("position_quantity"))
+            if filled is None or position is None or filled <= 0 or position <= 0:
+                return False
+            fee = _decimal(value.get("actual_fee"))
+            proof = value.get("execution_proof")
+            if not isinstance(proof, Mapping) or proof.get("verified") is not True:
+                return False
+            proof_fee = _decimal(proof.get("fee", proof.get("actual_fee")))
+            if fee is None and proof_fee is None:
+                return False
+            if not PredictionExecutionService._proof_has_order_refs(proof, venue):
+                return False
+        return True
+
+    @staticmethod
+    def _proof_has_order_refs(proof: Mapping[str, object], venue: str) -> bool:
+        direct_orders = proof.get("order_ids")
+        direct_trades = proof.get("trade_ids")
+        if (
+            isinstance(direct_orders, (list, tuple))
+            and isinstance(direct_trades, (list, tuple))
+            and any(isinstance(item, str) and item.strip() for item in direct_orders)
+            and any(isinstance(item, str) and item.strip() for item in direct_trades)
+        ):
+            return True
+        matched = proof.get("matched_refs")
+        if not isinstance(matched, Mapping):
+            return False
+        candidates = (matched.get(venue), *matched.values())
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            orders = candidate.get("order_ids")
+            trades = candidate.get("trade_ids")
+            if (
+                isinstance(orders, (list, tuple))
+                and isinstance(trades, (list, tuple))
+                and any(isinstance(item, str) and item.strip() for item in orders)
+                and any(isinstance(item, str) and item.strip() for item in trades)
+            ):
+                return True
+        return False
 
     def _cross_post_fill_baseline(self) -> dict[str, Decimal] | None:
         """Persist balances after the two actual positions are proven.
