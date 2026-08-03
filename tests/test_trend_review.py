@@ -1111,6 +1111,498 @@ class FakeTrendSimClient:
         return {"orders": self.orders}
 
 
+def relative_rotation_pair(
+    *, index: int = 0, sell: str = "WEAK", buy: str = "STRONG",
+) -> dict[str, object]:
+    return {
+        "pair_index": index,
+        "sell_symbol": sell,
+        "sell_name": sell.title(),
+        "sell_futu_symbol": f"SH.{sell}",
+        "sell_global_strength": "10",
+        "buy_symbol": buy,
+        "buy_name": buy.title(),
+        "buy_futu_symbol": f"SH.{buy}",
+        "buy_global_strength": "90",
+        "strength_gap": "80",
+        "target_weight": "0.06",
+        "target_amount": "6000",
+        "estimated_shares": 600,
+        "lot_size": 100,
+        "atr": "0.1",
+        "reason": "relative_rotation",
+        "execution_date": "2026-07-20",
+        "execution_mode": "automatic",
+    }
+
+
+def relative_rotation_report(
+    *,
+    pairs: list[dict[str, object]] | None = None,
+    real_pairs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "execution_date": "2026-07-20",
+        "metadata": {"price_fx_to_account_currency": "1"},
+        "risk_summary": {
+            "normal_cost_rate": "0.001",
+            "portfolio_remaining_risk": "4000",
+        },
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v11",
+            "strategy_version": "v11",
+        },
+        "strategy_judgments": {
+            "formal_actions": [],
+            "simulate_rotation_pairs": (
+                pairs if pairs is not None else [relative_rotation_pair()]
+            ),
+            "real_rotation_pairs": real_pairs if real_pairs is not None else [],
+        },
+    }
+
+
+def full_rotation_positions() -> list[dict[str, object]]:
+    return [
+        {
+            "code": "SH.WEAK",
+            "qty": "1000",
+            "can_sell_qty": "1000",
+            "market_val": "7000",
+        },
+        *[
+            {
+                "code": f"SH.HOLD{index}",
+                "qty": "100",
+                "can_sell_qty": "100",
+                "market_val": "1000",
+            }
+            for index in range(1, 10)
+        ],
+    ]
+
+
+def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
+    tmp_path: Path,
+) -> None:
+    class FilledClient(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "7" if request["side"] == "SELL" else "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [
+                    item for item in self.positions if item["code"] != "SH.WEAK"
+                ]
+                self.cash = "6993"
+            return response
+
+    client = FilledClient(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report(real_pairs=[{
+        **relative_rotation_pair(), "execution_mode": "manual",
+    }])
+
+    for minute, price in ((30, "5"), (31, "10")):
+        result = trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal(price)},
+        )
+
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+    assert all(request["order_type"] == "MARKET" for request in client.requests)
+    assert client.requests[0]["qty"] == "1000"
+    assert client.requests[1]["qty"] == "600"
+    assert result["status"] == "complete"
+    assert trend_review.relative_rotations_completed(
+        tmp_path, report=report, market="CN", execution_date="2026-07-20"
+    )
+    sell_fact = next(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/sell-filled.json"
+    ))
+    sell = json.loads(sell_fact.read_text(encoding="utf-8"))
+    assert (sell["exit_reason"], sell["opening_strategy_version"], sell["closing_strategy_version"]) == (
+        "relative_rotation", "v11", "v11",
+    )
+
+
+@pytest.mark.parametrize(
+    ("positions", "source_date", "reason"),
+    [
+        (full_rotation_positions()[:-1], None, "account_not_full"),
+        ([item for item in full_rotation_positions() if item["code"] != "SH.WEAK"], None, "weak_holding_absent"),
+        (full_rotation_positions() + [{"code": "SH.STRONG", "qty": "1"}], None, "candidate_already_held"),
+        (full_rotation_positions(), "2026-07-19", "stale_account_state"),
+    ],
+)
+def test_relative_rotation_skips_invalid_live_account_once(
+    tmp_path: Path,
+    positions: list[dict[str, object]],
+    source_date: str | None,
+    reason: str,
+) -> None:
+    client = FakeTrendSimClient(positions=positions)
+    if source_date is not None:
+        original = client.account_snapshot
+        client.account_snapshot = lambda: {**original(), "source_date": source_date}  # type: ignore[method-assign]
+
+    for _ in range(2):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(), client=client,
+            market="CN", execution_date="2026-07-20",
+            now="2026-07-20T10:30:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    assert client.requests == []
+    terminal = list(tmp_path.glob("trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"))
+    assert len(terminal) == 1
+    assert json.loads(terminal[0].read_text(encoding="utf-8"))["reason"] == reason
+
+
+def test_relative_rotation_zero_candidate_quantity_never_writes_sell_intent(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    pair = report["strategy_judgments"]["simulate_rotation_pairs"][0]
+    pair["lot_size"] = 1000
+
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-20T10:30:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("100")},
+    )
+
+    assert client.requests == []
+    assert not list(tmp_path.glob("trend_review/ledgers/CN/rotations/**/*sell*intent.json"))
+
+
+@pytest.mark.parametrize(
+    ("status", "filled"),
+    [("FILLED_PART", "100"), ("REJECTED", "0"), ("MYSTERY", "0")],
+)
+def test_relative_rotation_sell_without_full_proof_never_buys(
+    tmp_path: Path, status: str, filled: str,
+) -> None:
+    class SellOutcome(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": filled, "dealt_avg_price": "7",
+                "order_status": status,
+            })
+            return response
+
+    client = SellOutcome(cash="0", positions=full_rotation_positions())
+    for minute in (30, 31):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(), client=client,
+            market="CN", execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    assert [request["side"] for request in client.requests] == ["SELL"]
+
+
+@pytest.mark.parametrize(
+    ("buy_outcomes", "expected_buys", "terminal_status"),
+    [
+        ([('FILLED_PART', '100')], 1, "partial"),
+        ([('REJECTED', '0')], 1, "failed"),
+        ([('CANCELLED_ALL', '0'), ('FILLED_ALL', '600')], 2, "complete"),
+        ([('CANCELLED_ALL', '0'), ('CANCELLED_ALL', '0')], 2, "incomplete"),
+    ],
+)
+def test_relative_rotation_buy_terminal_and_single_retry_rules(
+    tmp_path: Path,
+    buy_outcomes: list[tuple[str, str]],
+    expected_buys: int,
+    terminal_status: str,
+) -> None:
+    class Outcomes(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            if request["side"] == "SELL":
+                status, filled = "FILLED_ALL", request["qty"]
+                self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+                self.cash = "6993"
+            else:
+                status, filled = buy_outcomes.pop(0)
+            self.orders[-1].update({
+                "dealt_qty": filled, "dealt_avg_price": "10",
+                "order_status": status,
+            })
+            return response
+
+    client = Outcomes(cash="0", positions=full_rotation_positions())
+    for minute in (30, 31):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(), client=client,
+            market="CN", execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    assert [request["side"] for request in client.requests].count("BUY") == expected_buys
+    terminal = next(tmp_path.glob("trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"))
+    assert json.loads(terminal.read_text(encoding="utf-8"))["status"] == terminal_status
+
+
+def test_relative_rotation_pair_failure_does_not_block_second_pair(
+    tmp_path: Path,
+) -> None:
+    pairs = [
+        relative_rotation_pair(index=0, sell="WEAK1", buy="NOQUOTE"),
+        relative_rotation_pair(index=1, sell="WEAK2", buy="STRONG2"),
+    ]
+    pairs[0]["lot_size"] = 1000
+    positions = [
+        {"code": "SH.WEAK1", "qty": "1000", "can_sell_qty": "1000", "market_val": "7000"},
+        {"code": "SH.WEAK2", "qty": "1000", "can_sell_qty": "1000", "market_val": "7000"},
+        *[
+            {"code": f"SH.HOLD{index}", "qty": "100", "can_sell_qty": "100", "market_val": "1000"}
+            for index in range(1, 9)
+        ],
+    ]
+
+    class FilledSecond(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [item for item in self.positions if item["code"] != request["futu_code"]]
+                self.cash = "6993"
+            return response
+
+    client = FilledSecond(cash="0", positions=positions)
+    for minute in (30, 31):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(pairs=pairs), client=client,
+            market="CN", execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.NOQUOTE": Decimal("100"), "SH.STRONG2": Decimal("10")},
+        )
+
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.WEAK2", "SH.STRONG2",
+    ]
+
+
+def test_relative_rotation_post_sell_zero_quantity_keeps_cash(
+    tmp_path: Path,
+) -> None:
+    class NoSettledCash(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "7",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+            return response
+
+    client = NoSettledCash(cash="0", positions=full_rotation_positions())
+    for minute in (30, 31):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(), client=client,
+            market="CN", execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    assert [request["side"] for request in client.requests] == ["SELL"]
+    terminal = next(tmp_path.glob("trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"))
+    assert json.loads(terminal.read_text(encoding="utf-8"))["reason"] == "post_sell_candidate_quantity_zero"
+
+
+def test_relative_rotation_crash_after_sell_proof_resumes_one_buy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SellFilled(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+                self.cash = "6993"
+            return response
+
+    client = SellFilled(cash="0", positions=full_rotation_positions())
+    original = trend_review._write_rotation_fact
+    crashed = False
+
+    def crash_once(root: Path, name: str, payload: dict[str, object]) -> Path:
+        nonlocal crashed
+        if name == "buy-attempt-1-intent" and not crashed:
+            crashed = True
+            raise RuntimeError("crash after sell proof")
+        return original(root, name, payload)
+
+    monkeypatch.setattr(trend_review, "_write_rotation_fact", crash_once)
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=relative_rotation_report(), client=client,
+        market="CN", execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    with pytest.raises(RuntimeError, match="crash after sell proof"):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(), client=client,
+            market="CN", execution_date="2026-07-20",
+            now="2026-07-20T10:31:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=relative_rotation_report(), client=client,
+        market="CN", execution_date="2026-07-20",
+        now="2026-07-20T10:32:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+
+
+def test_relative_rotation_uncertain_buy_restart_never_duplicates(
+    tmp_path: Path,
+) -> None:
+    class UncertainBuy(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            if request["side"] == "BUY":
+                self.requests.append(request)
+                raise RuntimeError("uncertain transport")
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "7",
+                "order_status": "FILLED_ALL",
+            })
+            self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+            self.cash = "6993"
+            return response
+
+    client = UncertainBuy(cash="0", positions=full_rotation_positions())
+    for minute in (30, 31, 32):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=relative_rotation_report(), client=client,
+            market="CN", execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+
+
+def test_relative_rotation_late_fill_and_next_date_leave_cash_without_retry(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-20T15:00:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    client.orders[0].update({
+        "dealt_qty": "1000", "dealt_avg_price": "7", "order_status": "FILLED_ALL",
+    })
+    client.positions = [item for item in client.positions if item["code"] != "SH.WEAK"]
+    client.cash = "6993"
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-20T15:01:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-21T09:31:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+
+    assert [request["side"] for request in client.requests] == ["SELL"]
+    terminal = next(tmp_path.glob("trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"))
+    assert json.loads(terminal.read_text(encoding="utf-8"))["reason"] == "buy_session_closed"
+
+
+def test_relative_rotation_active_buy_never_retries_on_next_date(
+    tmp_path: Path,
+) -> None:
+    class ActiveBuy(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            if request["side"] == "SELL":
+                self.orders[-1].update({
+                    "dealt_qty": request["qty"], "dealt_avg_price": "7",
+                    "order_status": "FILLED_ALL",
+                })
+                self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+                self.cash = "6993"
+            return response
+
+    client = ActiveBuy(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    for now in (
+        "2026-07-20T10:30:00+08:00",
+        "2026-07-20T10:31:00+08:00",
+        "2026-07-21T09:31:00+08:00",
+    ):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20", now=now,
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+    terminal = next(tmp_path.glob("trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"))
+    assert json.loads(terminal.read_text(encoding="utf-8"))["reason"] == "execution_date_ended"
+
+
+def test_hk_relative_rotation_can_buy_after_ten_during_continuous_session(
+    tmp_path: Path,
+) -> None:
+    report = relative_rotation_report()
+    pair = report["strategy_judgments"]["simulate_rotation_pairs"][0]
+    pair.update({"sell_futu_symbol": "HK.WEAK", "buy_futu_symbol": "HK.STRONG"})
+    positions = [
+        {**item, "code": str(item["code"]).replace("SH.", "HK.")}
+        for item in full_rotation_positions()
+    ]
+
+    class Filled(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [item for item in self.positions if item["code"] != "HK.WEAK"]
+                self.cash = "6993"
+            return response
+
+    client = Filled(cash="0", positions=positions)
+    for minute in (30, 31):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="HK",
+            execution_date="2026-07-20",
+            now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"HK.STRONG": Decimal("10")},
+        )
+
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+
+
 def cn_buy_report(
     *, weight: str = "0.04", symbol: str = "600001", shares: int = 400
 ) -> dict[str, object]:

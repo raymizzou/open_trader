@@ -3140,6 +3140,711 @@ def _floor_to_lot(value: Decimal, lot_size: int) -> int:
     return int(value // Decimal(lot_size)) * lot_size
 
 
+def _rotation_pair_key(
+    market: str,
+    account_id: int,
+    execution_date: str,
+    report_sha: str,
+    pair_index: int,
+) -> str:
+    identity = f"{market}:{account_id}:{execution_date}:{report_sha}:{pair_index}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _rotation_position(
+    snapshot: Mapping[str, object], futu_code: str
+) -> Mapping[str, object] | None:
+    return next(
+        (
+            item
+            for item in _positive_positions(snapshot)
+            if str(
+                item.get("code", item.get("futu_code", item.get("symbol", "")))
+            ).strip().upper()
+            == futu_code.strip().upper()
+        ),
+        None,
+    )
+
+
+def _rotation_quantity(
+    pair: Mapping[str, object],
+    report: Mapping[str, object],
+    snapshot: Mapping[str, object],
+    price: Decimal,
+    cash: Decimal,
+) -> int:
+    from .portfolio_risk import size_entry_by_risk
+
+    nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
+    weight = _required_decimal(pair.get("target_weight"), "rotation target weight")
+    atr = _required_decimal(pair.get("atr"), "rotation ATR")
+    lot_size = int(pair.get("lot_size") or 0)
+    metadata = report.get("metadata")
+    fx = _required_decimal(
+        metadata.get("price_fx_to_account_currency", "1")
+        if isinstance(metadata, Mapping)
+        else "1",
+        "price FX",
+    )
+    risk_summary = report.get("risk_summary")
+    cost_rate = _required_decimal(
+        risk_summary.get("normal_cost_rate")
+        if isinstance(risk_summary, Mapping)
+        else None,
+        "normal cost rate",
+    )
+    remaining_risk: Decimal | None = None
+    judgments = report.get("strategy_judgments")
+    decisions = (
+        judgments.get("holding_decisions")
+        if isinstance(judgments, Mapping)
+        else None
+    )
+    if isinstance(decisions, list):
+        by_code = {
+            str(item.get("futu_symbol") or item.get("symbol") or "").strip().upper(): item
+            for item in decisions
+            if isinstance(item, Mapping)
+        }
+        planned = Decimal("0")
+        try:
+            for position in _positive_positions(snapshot):
+                code = str(
+                    position.get("code", position.get("futu_code", position.get("symbol", "")))
+                ).strip().upper()
+                holding = by_code[code]
+                quantity = _required_decimal(
+                    position.get("qty", position.get("quantity")), "position quantity"
+                )
+                close = _required_decimal(holding.get("close"), "holding close")
+                line = _required_decimal(holding.get("active_line"), "active protection line")
+                planned += quantity * (
+                    max(Decimal("0"), close - line) * fx
+                    + close * fx * cost_rate
+                )
+            remaining_risk = max(Decimal("0"), nav * Decimal("0.04") - planned)
+        except (KeyError, ValueError):
+            remaining_risk = None
+    if remaining_risk is None:
+        remaining_risk = _required_decimal(
+            risk_summary.get("portfolio_remaining_risk", nav * Decimal("0.04"))
+            if isinstance(risk_summary, Mapping)
+            else nav * Decimal("0.04"),
+            "portfolio remaining risk",
+        )
+    if (
+        nav <= 0
+        or weight <= 0
+        or atr <= 0
+        or lot_size <= 0
+        or price <= 0
+        or cash < 0
+        or cost_rate < 0
+        or remaining_risk < 0
+    ):
+        raise ValueError("rotation sizing inputs are invalid")
+    sized = size_entry_by_risk(
+        entry_price=price,
+        protection_line=max(Decimal("0"), price - Decimal("2") * atr),
+        fx_to_account_currency=fx,
+        portfolio_nav=nav,
+        nominal_weight_limit=weight,
+        single_entry_risk_limit=nav * Decimal("0.004"),
+        portfolio_remaining_risk=remaining_risk,
+        available_cash=cash,
+        lot_size=Decimal(lot_size),
+        normal_cost_rate=cost_rate,
+    )
+    return int(sized.final_quantity)
+
+
+def _rotation_events(root: Path) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid relative rotation fact: {path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"invalid relative rotation fact: {path}")
+        events.append(payload)
+    return events
+
+
+def _write_rotation_fact(root: Path, name: str, payload: Mapping[str, object]) -> Path:
+    body = _canonical_json_bytes(payload)
+    return _write_immutable(root / f"{name}.json", body)
+
+
+def _rotation_terminal(
+    root: Path,
+    evidence: Mapping[str, object],
+    *,
+    status: str,
+    reason: str,
+    recorded_at: str,
+) -> Path:
+    return _write_rotation_fact(
+        root,
+        "terminal",
+        {**evidence, "status": status, "reason": reason, "recorded_at": recorded_at},
+    )
+
+
+def _continuous_session_open(market: str, current: datetime) -> bool:
+    value = current.time().replace(tzinfo=None)
+    return {
+        "CN": time(9, 30) <= value <= time(11, 30)
+        or time(13) <= value <= time(15),
+        "HK": time(9, 30) <= value <= time(12)
+        or time(13) <= value <= time(16),
+        "US": time(9, 30) <= value <= time(16),
+    }[market]
+
+
+def execute_relative_rotations(
+    *,
+    data_dir: Path,
+    report: Mapping[str, object],
+    client: object,
+    market: str,
+    execution_date: str,
+    now: str,
+    quote_prices: Mapping[str, Decimal],
+) -> dict[str, object]:
+    """Execute frozen simulated rotation pairs; real pairs remain display-only."""
+    market = _market(market)
+    execution_date = date.fromisoformat(execution_date).isoformat()
+    current = datetime.fromisoformat(now).astimezone(MARKET_TIMEZONES[market])
+    judgments = report.get("strategy_judgments")
+    pairs = (
+        judgments.get("simulate_rotation_pairs")
+        if isinstance(judgments, Mapping)
+        else None
+    )
+    if not isinstance(pairs, list):
+        raise ValueError("trend report simulated rotation pairs are unavailable")
+    if not pairs:
+        return {
+            "status": "unchanged", "market": market, "date": execution_date,
+            "submitted_count": 0, "artifact_paths": [],
+        }
+
+    report_sha = _report_hash(report)
+    submitted = 0
+    artifacts: list[str] = []
+    terminal_count = 0
+    for pair in pairs:
+        sell_proved_now = False
+        if not isinstance(pair, Mapping):
+            raise ValueError("relative rotation pair is invalid")
+        pair_index = pair.get("pair_index")
+        if (
+            isinstance(pair_index, bool)
+            or not isinstance(pair_index, int)
+            or pair.get("execution_mode") != "automatic"
+            or pair.get("execution_date") != execution_date
+            or pair.get("reason") != "relative_rotation"
+        ):
+            raise ValueError("relative rotation pair is invalid")
+        snapshot = client.account_snapshot()
+        if not isinstance(snapshot, Mapping):
+            raise TrendReviewAccountStateError("simulate account snapshot is invalid")
+        account_id = int(snapshot.get("acc_id") or 0)
+        metadata = report.get("metadata")
+        expected_account_id = (
+            metadata.get("simulate_acc_id")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if (
+            expected_account_id is not None
+            and (
+                isinstance(expected_account_id, bool)
+                or not isinstance(expected_account_id, int)
+                or expected_account_id != account_id
+            )
+        ):
+            raise TrendReviewAccountStateError("configured simulate account changed")
+        _ensure_discipline_account(data_dir, market, snapshot)
+        pair_key = _rotation_pair_key(
+            market, account_id, execution_date, report_sha, pair_index
+        )
+        root = (
+            data_dir / "trend_review" / "ledgers" / market / "rotations"
+            / execution_date / pair_key
+        )
+        evidence = {
+            "schema_version": "open_trader.trend_review.rotation.v1",
+            "market": market,
+            "account_id": account_id,
+            "execution_date": execution_date,
+            "report_sha256": report_sha,
+            "pair_index": pair_index,
+            "pair_key": pair_key,
+            "sell_symbol": pair.get("sell_symbol"),
+            "buy_symbol": pair.get("buy_symbol"),
+        }
+        events = _rotation_events(root)
+        if any(event.get("kind") == "terminal" for event in events):
+            terminal_count += 1
+            continue
+        if current.date() != date.fromisoformat(execution_date):
+            status = "missed" if not any(
+                event.get("kind") == "sell_observation"
+                and event.get("status") == "filled"
+                for event in events
+            ) else "incomplete"
+            path = _rotation_terminal(
+                root, {**evidence, "kind": "terminal"}, status=status,
+                reason="execution_date_ended", recorded_at=now,
+            )
+            artifacts.append(str(path))
+            terminal_count += 1
+            continue
+
+        sell_code = str(pair.get("sell_futu_symbol") or "").strip().upper()
+        buy_code = str(pair.get("buy_futu_symbol") or "").strip().upper()
+        sell_intent = next(
+            (event for event in events if event.get("kind") == "sell_intent"), None
+        )
+        sell_filled = any(
+            event.get("kind") == "sell_observation" and event.get("status") == "filled"
+            for event in events
+        )
+        if sell_intent is None and not sell_filled:
+            stale_date = next(
+                (
+                    str(snapshot[field])
+                    for field in ("source_date", "as_of_date", "trading_date")
+                    if snapshot.get(field)
+                ),
+                execution_date,
+            )
+            positions = _positive_positions(snapshot)
+            weak = _rotation_position(snapshot, sell_code)
+            reason = (
+                "stale_account_state" if stale_date != execution_date
+                else "weak_holding_absent" if weak is None
+                else "candidate_already_held"
+                if _rotation_position(snapshot, buy_code) is not None
+                else "account_not_full" if len(positions) != 10
+                else ""
+            )
+            if not reason and buy_code not in quote_prices:
+                if not any(
+                    event.get("kind") == "pending"
+                    and event.get("reason") == "current_quote_unavailable"
+                    for event in events
+                ):
+                    artifacts.append(str(_write_rotation_fact(
+                        root, "preflight-quote-pending",
+                        {**evidence, "kind": "pending", "status": "pending",
+                         "reason": "current_quote_unavailable", "recorded_at": now},
+                    )))
+                continue
+            try:
+                sell_qty = _required_decimal(
+                    weak.get("can_sell_qty", weak.get("sellable_qty", weak.get("qty")))
+                    if weak is not None else "0",
+                    "rotation sellable quantity",
+                )
+                cash = _required_decimal(
+                    snapshot.get("available_cash", snapshot.get("cash")),
+                    "simulate available cash",
+                )
+                market_value = _required_decimal(
+                    weak.get("market_val", weak.get("market_value"))
+                    if weak is not None else "0",
+                    "rotation holding market value",
+                )
+                risk_summary = report.get("risk_summary")
+                cost = _required_decimal(
+                    risk_summary.get("normal_cost_rate")
+                    if isinstance(risk_summary, Mapping) else None,
+                    "normal cost rate",
+                )
+                price = _required_decimal(quote_prices.get(buy_code), "current quote price")
+                preflight_qty = _rotation_quantity(
+                    pair, report, snapshot, price,
+                    cash + market_value * max(Decimal("0"), Decimal("1") - cost),
+                )
+            except ValueError:
+                sell_qty = Decimal("0")
+                preflight_qty = 0
+            if not reason and sell_qty <= 0:
+                reason = "weak_holding_unsellable"
+            if not reason and preflight_qty <= 0:
+                reason = "candidate_quantity_zero"
+            if reason:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="skipped",
+                    reason=reason, recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            if not _continuous_session_open(market, current):
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="missed",
+                    reason="continuous_session_closed", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            request = {
+                "market": market, "futu_code": sell_code, "side": "SELL",
+                "order_type": "MARKET", "price": "0", "qty": format(sell_qty, "f"),
+                "remark": f"rotation:{market}:{execution_date}:{pair_key[:16]}:S:1",
+            }
+            intent_path = _write_rotation_fact(
+                root, "sell-attempt-1-intent",
+                {**evidence, "kind": "sell_intent", "attempt": 1,
+                 "request": request, "recorded_at": now},
+            )
+            artifacts.append(str(intent_path))
+            try:
+                response = client.place_order(request)
+                submitted += 1
+            except Exception as exc:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="uncertain",
+                    reason=f"sell_submit_uncertain: {exc}", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            result_path = _write_rotation_fact(
+                root, "sell-attempt-1-result",
+                {**evidence, "kind": "sell_result", "attempt": 1,
+                 "request": request, "response": response, "recorded_at": now},
+            )
+            artifacts.append(str(result_path))
+            sell_intent = {"request": request}
+
+        if not sell_filled:
+            request = sell_intent.get("request") if isinstance(sell_intent, Mapping) else None
+            if not isinstance(request, Mapping):
+                raise ValueError("relative rotation sell intent is invalid")
+            orders = _listed_orders(client, start=execution_date, end=execution_date)
+            fact, order = _broker_attempt_fact(orders, request)
+            if fact != "exact" or order is None:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="uncertain",
+                    reason="sell_intent_without_broker_proof", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            target = _required_decimal(request.get("qty"), "rotation sell quantity")
+            filled = _required_decimal(order.get("dealt_qty", "0"), "broker dealt quantity")
+            broker_status = str(order.get("order_status", order.get("status", ""))).upper()
+            if (
+                filled == target
+                and broker_status in {"FILLED", "FILLED_ALL"}
+                and str(order.get("order_id") or "").strip()
+            ):
+                strategy_snapshot = report.get("strategy_snapshot")
+                closing_version = str(
+                    strategy_snapshot.get("strategy_version") or ""
+                    if isinstance(strategy_snapshot, Mapping)
+                    else ""
+                )
+                judgments = report.get("strategy_judgments")
+                holdings = (
+                    judgments.get("holding_decisions", [])
+                    if isinstance(judgments, Mapping)
+                    else []
+                )
+                holding = next(
+                    (
+                        item for item in holdings
+                        if isinstance(item, Mapping)
+                        and item.get("symbol") == pair.get("sell_symbol")
+                    ),
+                    {},
+                )
+                observation = _write_rotation_fact(
+                    root, "sell-filled",
+                    {**evidence, "kind": "sell_observation", "status": "filled",
+                     "target_qty": format(target, "f"), "filled_qty": format(filled, "f"),
+                     "order_id": str(order.get("order_id") or ""),
+                     "exit_reason": "relative_rotation",
+                     "opening_strategy_version": str(
+                         holding.get("opening_strategy_version") or closing_version
+                     ),
+                     "closing_strategy_version": closing_version,
+                     "recorded_at": now},
+                )
+                artifacts.append(str(observation))
+                sell_filled = True
+                sell_proved_now = True
+            elif filled > 0:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="partial",
+                    reason="sell_partial_fill", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            elif broker_status in REJECTED_ORDER_STATUSES | {"CANCELLED", "CANCELLED_ALL", "CANCELLED_PART"}:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="failed",
+                    reason="sell_not_filled", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            elif broker_status not in ACTIVE_ORDER_STATUSES:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="uncertain",
+                    reason="sell_status_uncertain", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                continue
+            else:
+                continue
+
+        # The next controller pass refreshes both the account and quote after
+        # the durable sell proof before any buy can be submitted.
+        if sell_proved_now and _continuous_session_open(market, current):
+            continue
+
+        refreshed = client.account_snapshot()
+        if not isinstance(refreshed, Mapping):
+            raise TrendReviewAccountStateError("simulate account snapshot is invalid")
+        if not _continuous_session_open(market, current):
+            path = _rotation_terminal(
+                root, {**evidence, "kind": "terminal"}, status="incomplete",
+                reason="buy_session_closed", recorded_at=now,
+            )
+            artifacts.append(str(path))
+            terminal_count += 1
+            continue
+        if _rotation_position(refreshed, sell_code) is not None:
+            if not any(
+                event.get("kind") == "pending"
+                and event.get("reason") == "post_sell_account_not_refreshed"
+                for event in _rotation_events(root)
+            ):
+                artifacts.append(str(_write_rotation_fact(
+                    root, "post-sell-account-pending",
+                    {**evidence, "kind": "pending", "status": "pending",
+                     "reason": "post_sell_account_not_refreshed", "recorded_at": now},
+                )))
+            continue
+        if _rotation_position(refreshed, buy_code) is not None:
+            path = _rotation_terminal(
+                root, {**evidence, "kind": "terminal"}, status="incomplete",
+                reason="candidate_already_held_after_sell", recorded_at=now,
+            )
+            artifacts.append(str(path))
+            terminal_count += 1
+            continue
+        if buy_code not in quote_prices:
+            if not any(
+                event.get("kind") == "pending"
+                and event.get("reason") == "post_sell_quote_unavailable"
+                for event in _rotation_events(root)
+            ):
+                artifacts.append(str(_write_rotation_fact(
+                    root, "post-sell-quote-pending",
+                    {**evidence, "kind": "pending", "status": "pending",
+                     "reason": "post_sell_quote_unavailable", "recorded_at": now},
+                )))
+            continue
+        try:
+            buy_qty = _rotation_quantity(
+                pair, report, refreshed,
+                _required_decimal(quote_prices.get(buy_code), "current quote price"),
+                _required_decimal(
+                    refreshed.get("available_cash", refreshed.get("cash")),
+                    "simulate available cash",
+                ),
+            )
+        except ValueError:
+            buy_qty = 0
+        if buy_qty <= 0:
+            path = _rotation_terminal(
+                root, {**evidence, "kind": "terminal"}, status="incomplete",
+                reason="post_sell_candidate_quantity_zero", recorded_at=now,
+            )
+            artifacts.append(str(path))
+            terminal_count += 1
+            continue
+
+        events = _rotation_events(root)
+        completed_pair = False
+        for attempt in (1, 2):
+            intent = next(
+                (
+                    event for event in events
+                    if event.get("kind") == "buy_intent" and event.get("attempt") == attempt
+                ),
+                None,
+            )
+            if intent is None:
+                request = {
+                    "market": market, "futu_code": buy_code, "side": "BUY",
+                    "order_type": "MARKET", "price": "0", "qty": str(buy_qty),
+                    "remark": f"rotation:{market}:{execution_date}:{pair_key[:16]}:B:{attempt}",
+                }
+                intent_path = _write_rotation_fact(
+                    root, f"buy-attempt-{attempt}-intent",
+                    {**evidence, "kind": "buy_intent", "attempt": attempt,
+                     "request": request, "recorded_at": now},
+                )
+                artifacts.append(str(intent_path))
+                try:
+                    response = client.place_order(request)
+                    submitted += 1
+                except Exception as exc:
+                    path = _rotation_terminal(
+                        root, {**evidence, "kind": "terminal"}, status="uncertain",
+                        reason=f"buy_submit_uncertain: {exc}", recorded_at=now,
+                    )
+                    artifacts.append(str(path))
+                    terminal_count += 1
+                    break
+                result_path = _write_rotation_fact(
+                    root, f"buy-attempt-{attempt}-result",
+                    {**evidence, "kind": "buy_result", "attempt": attempt,
+                     "request": request, "response": response, "recorded_at": now},
+                )
+                artifacts.append(str(result_path))
+                intent = {"request": request}
+                events = _rotation_events(root)
+            request = intent.get("request") if isinstance(intent, Mapping) else None
+            if not isinstance(request, Mapping):
+                raise ValueError("relative rotation buy intent is invalid")
+            fact, order = _broker_attempt_fact(
+                _listed_orders(client, start=execution_date, end=execution_date), request
+            )
+            if fact != "exact" or order is None:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="uncertain",
+                    reason="buy_intent_without_broker_proof", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                break
+            target = _required_decimal(request.get("qty"), "rotation buy quantity")
+            filled = _required_decimal(order.get("dealt_qty", "0"), "broker dealt quantity")
+            broker_status = str(order.get("order_status", order.get("status", ""))).upper()
+            if (
+                filled == target
+                and broker_status in {"FILLED", "FILLED_ALL"}
+                and str(order.get("order_id") or "").strip()
+            ):
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal",
+                           "exit_reason": "relative_rotation",
+                           "opening_strategy_version": str(pair.get("opening_strategy_version") or ""),
+                           "closing_strategy_version": str(
+                               report.get("strategy_snapshot", {}).get("strategy_version", "")
+                               if isinstance(report.get("strategy_snapshot"), Mapping) else ""
+                           )},
+                    status="complete", reason="buy_filled", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                completed_pair = True
+                break
+            if filled > 0:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="partial",
+                    reason="buy_partial_fill", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                break
+            if broker_status in {"CANCELLED", "CANCELLED_ALL", "CANCELLED_PART"}:
+                if attempt == 1:
+                    continue
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="incomplete",
+                    reason="buy_zero_fill_after_retry", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                break
+            if broker_status in REJECTED_ORDER_STATUSES:
+                path = _rotation_terminal(
+                    root, {**evidence, "kind": "terminal"}, status="failed",
+                    reason="buy_rejected", recorded_at=now,
+                )
+                artifacts.append(str(path))
+                terminal_count += 1
+                break
+            if broker_status in ACTIVE_ORDER_STATUSES:
+                break
+            path = _rotation_terminal(
+                root, {**evidence, "kind": "terminal"}, status="uncertain",
+                reason="buy_status_uncertain", recorded_at=now,
+            )
+            artifacts.append(str(path))
+            terminal_count += 1
+            break
+        if completed_pair:
+            continue
+
+    return {
+        "status": "complete" if terminal_count == len(pairs) else "submitted"
+        if submitted else "pending",
+        "market": market,
+        "date": execution_date,
+        "submitted_count": submitted,
+        "artifact_paths": artifacts,
+    }
+
+
+def relative_rotations_completed(
+    data_dir: Path,
+    *,
+    report: Mapping[str, object],
+    market: str,
+    execution_date: str,
+) -> bool:
+    """Return whether every frozen simulated pair has a durable terminal fact."""
+    market = _market(market)
+    judgments = report.get("strategy_judgments")
+    pairs = (
+        judgments.get("simulate_rotation_pairs", [])
+        if isinstance(judgments, Mapping)
+        else None
+    )
+    if not isinstance(pairs, list):
+        raise ValueError("trend report simulated rotation pairs are unavailable")
+    report_sha = _report_hash(report)
+    terminals = [
+        payload
+        for path in (
+            data_dir / "trend_review" / "ledgers" / market / "rotations"
+            / execution_date
+        ).glob("*/terminal.json")
+        if isinstance(
+            payload := json.loads(path.read_text(encoding="utf-8")), dict
+        )
+    ]
+    return all(
+        sum(
+            terminal.get("schema_version")
+            == "open_trader.trend_review.rotation.v1"
+            and terminal.get("market") == market
+            and terminal.get("execution_date") == execution_date
+            and terminal.get("report_sha256") == report_sha
+            and terminal.get("pair_index") == pair.get("pair_index")
+            and terminal.get("kind") == "terminal"
+            for terminal in terminals
+        )
+        == 1
+        for pair in pairs
+        if isinstance(pair, Mapping)
+    ) and all(isinstance(pair, Mapping) for pair in pairs)
+
+
 def _overheat_trim_quantity(
     position_qty: Decimal, fraction: Decimal, lot_size: int
 ) -> Decimal:

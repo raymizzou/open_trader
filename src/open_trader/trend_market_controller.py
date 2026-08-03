@@ -69,6 +69,7 @@ from .trend_review import (
     benchmark_fact,
     build_trend_review_projection,
     capture_trend_review_close,
+    execute_relative_rotations,
     execute_trend_review_open,
     execute_trend_review_stop,
     load_trend_action_audit,
@@ -76,6 +77,7 @@ from .trend_review import (
     overheat_trim_progress,
     _preflight_open_actions,
     record_trend_review_missed_buys,
+    relative_rotations_completed,
     trend_action_futu_symbol,
 )
 
@@ -937,21 +939,14 @@ def _execute_locked_report(
         raise ValueError(f"invalid locked trend report: {locked_path}")
     judgments = locked_report["strategy_judgments"]
     actions = judgments["formal_actions"]
-    if not actions:
-        return {
-            "status": "unchanged",
-            "market": market,
-            "date": execution_date,
-            "submitted_count": 0,
-            "artifact_paths": [],
-        }
+    rotation_pairs = judgments.get("simulate_rotation_pairs", [])
     missed = record_trend_review_missed_buys(
         data_dir=config.data_dir,
         report=locked_report,
         market=market,
         execution_date=execution_date,
         now=now,
-    )
+    ) if actions else 0
     sell_symbols = {
         trend_action_futu_symbol(locked_report, action, market)
         for action in actions
@@ -963,7 +958,7 @@ def _execute_locked_report(
         not in sell_symbols
         for action in actions
     )
-    if missed == eligible_buys == len(actions):
+    if actions and missed == eligible_buys == len(actions) and not rotation_pairs:
         return {
             "status": "missed_window",
             "market": market,
@@ -981,6 +976,12 @@ def _execute_locked_report(
                 and trend_action_futu_symbol(locked_report, action, market)
                 not in sell_symbols
             )
+        } | {
+            str(pair.get("buy_futu_symbol") or "")
+            for pair in rotation_pairs
+            if allow_new_buys
+            and isinstance(pair, Mapping)
+            and str(pair.get("buy_futu_symbol") or "")
         }
     )
     quote = quote_client
@@ -1004,7 +1005,7 @@ def _execute_locked_report(
         client = _new_order_client(
             config, market, quote_client if quote_client is not None else quote
         )
-        execution = execute_trend_review_open(
+        ordinary = execute_trend_review_open(
             data_dir=config.data_dir,
             report=locked_report,
             client=client,
@@ -1013,9 +1014,52 @@ def _execute_locked_report(
             now=now,
             quote_prices=prices,
         )
-        if allow_new_buys and execution.get("status") == "quote_unavailable":
+        if allow_new_buys and ordinary.get("status") == "quote_unavailable":
             raise RuntimeError("current quote unavailable for pending trend buy")
-        return execution
+        ordinary_complete = not actions or _execution_completed(
+            config,
+            ControllerCycle(
+                market=market,
+                as_of_date=as_of_date,
+                execution_date=execution_date,
+                report_run_date=str(locked_report.get("generated_at") or "")[:10],
+                session="execution",
+                market_open=True,
+                next_check_at=datetime.fromisoformat(now),
+            ),
+            include_rotations=False,
+        )
+        rotation = (
+            execute_relative_rotations(
+                data_dir=config.data_dir,
+                report=locked_report,
+                client=client,
+                market=market,
+                execution_date=execution_date,
+                now=now,
+                quote_prices=prices,
+            )
+            if allow_new_buys and rotation_pairs and ordinary_complete
+            else {
+                "status": "unchanged", "submitted_count": 0,
+                "artifact_paths": [],
+            }
+        )
+        return {
+            "status": (
+                rotation.get("status")
+                if rotation.get("status") != "unchanged"
+                else ordinary.get("status")
+            ),
+            "market": market,
+            "date": execution_date,
+            "submitted_count": int(ordinary.get("submitted_count") or 0)
+            + int(rotation.get("submitted_count") or 0),
+            "artifact_paths": [
+                *ordinary.get("artifact_paths", []),
+                *rotation.get("artifact_paths", []),
+            ],
+        }
     finally:
         if quote is not None and owns_quote:
             quote.close()
@@ -2381,6 +2425,7 @@ def _execution_completed(
     cycle: ControllerCycle,
     *,
     progress: Callable[[], None] | None = None,
+    include_rotations: bool = True,
 ) -> bool:
     if _legacy_cycle_cutover(config, cycle):
         return True
@@ -2409,7 +2454,12 @@ def _execution_completed(
     judgments = report["strategy_judgments"]
     actions = judgments["formal_actions"]
     if not actions:
-        return True
+        return not include_rotations or relative_rotations_completed(
+            config.data_dir,
+            report=report,
+            market=cycle.market,
+            execution_date=cycle.execution_date,
+        )
 
     sell_symbols = {
         trend_action_futu_symbol(report, action, cycle.market)
@@ -2506,7 +2556,12 @@ def _execution_completed(
         ):
             continue
         return False
-    return True
+    return not include_rotations or relative_rotations_completed(
+        config.data_dir,
+        report=report,
+        market=cycle.market,
+        execution_date=cycle.execution_date,
+    )
 
 
 def _durable_report_cycles(
@@ -3081,13 +3136,18 @@ def run_trend_market_controller(
                         if isinstance(judgments, dict)
                         else None
                     )
+                    rotation_pairs = (
+                        judgments.get("simulate_rotation_pairs")
+                        if isinstance(judgments, dict)
+                        else None
+                    )
                     if (
                         _execution_completed(
                             config,
                             work_cycle,
                             progress=reconciliation_progress,
                         )
-                        and formal_actions
+                        and (formal_actions or rotation_pairs)
                     ):
                         execution = {
                             "status": "reconciled",

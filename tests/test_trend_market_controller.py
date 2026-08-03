@@ -5953,6 +5953,97 @@ def test_global_execution_noop_protocol_is_removed() -> None:
     assert not hasattr(controller, "_execution_noop_path")
 
 
+def test_relative_rotation_runs_after_ordinary_actions_and_merges_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "strategy_judgments": {
+            "formal_actions": [],
+            "simulate_rotation_pairs": [{"buy_futu_symbol": "SH.STRONG"}],
+            "real_rotation_pairs": [{"buy_futu_symbol": "SH.REAL"}],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    calls: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            assert symbols == ["SH.STRONG"]
+            return {"SH.STRONG": SimpleNamespace(last_price=Decimal("10"))}
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **_kwargs: calls.append("ordinary") or {
+            "status": "unchanged", "submitted_count": 0, "artifact_paths": ["ordinary"],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **_kwargs: calls.append("rotation") or {
+            "status": "submitted", "submitted_count": 2, "artifact_paths": ["rotation"],
+        },
+    )
+
+    result = controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    assert calls == ["ordinary", "rotation"]
+    assert result["submitted_count"] == 2
+    assert result["artifact_paths"] == ["ordinary", "rotation"]
+
+
+def test_execution_completion_audits_relative_rotation_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    report_path = tmp_path / "locked.json"
+    report = {
+        "strategy_judgments": {
+            "formal_actions": [], "simulate_rotation_pairs": [{}],
+            "real_rotation_pairs": [{}],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    batch = config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    batch.parent.mkdir(parents=True)
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1", "market": "CN",
+        "execution_date": "2026-07-20", "report_path": str(report_path),
+        "report_sha256": _report_hash(report),
+    }), encoding="utf-8")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    audited: list[object] = []
+    monkeypatch.setattr(
+        controller, "relative_rotations_completed",
+        lambda *_args, **_kwargs: audited.append(_kwargs["report"]) or False,
+    )
+
+    assert controller._execution_completed(config, cycle) is False
+    assert audited == [report]
+
+
 def test_revision_request_freezes_latest_report_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
