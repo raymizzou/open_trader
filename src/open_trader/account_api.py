@@ -1,22 +1,55 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Mapping
+from typing import Literal, Mapping
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 
 from .account_snapshot import load_account_snapshot, load_worker_git_sha
 
 
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_PARITY_ATTEMPTS = 3
+_SUMMARY_FIELDS = (
+    "holding_value_hkd", "cash_like_value_hkd", "portfolio_value_hkd",
+    "holding_weight_hkd", "cash_like_weight_hkd", "holding_count", "broker_count",
+)
+_BROKER_SUMMARY_FIELDS = (
+    "broker", "label", "source_kind", "detail_available", "holding_value_hkd",
+    "cash_like_value_hkd", "portfolio_value_hkd", "holding_count",
+)
+_POSITION_FIELDS = (
+    "broker", "account_alias", "market", "asset_class", "symbol", "name", "currency",
+    "quantity", "cost_price", "cost_value", "last_price", "price_kind", "price_as_of",
+    "market_value", "market_value_usd", "market_value_hkd", "cost_value_hkd",
+    "unrealized_pnl", "unrealized_pnl_pct", "account_weight_hkd", "portfolio_weight_hkd",
+    "statement_id", "confidence", "notes",
+)
+_CASH_FIELDS = (
+    "broker", "account_alias", "currency", "cash_balance", "available_balance",
+    "cash_balance_hkd", "available_balance_hkd", "statement_id", "confidence", "notes",
+)
+_SOURCE_BROKER_FIELDS = ("source_kind", "data_as_of", "last_success_at")
+
+
+@dataclass(frozen=True)
+class ParityResult:
+    status: Literal["PASS", "FAIL", "BLOCKED"]
+    reason: str
+    account_generation: str
+    quote_as_of: str
 
 
 def create_account_api(
@@ -136,6 +169,258 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     serve_account_api(args.data_dir)
     return 0
+
+
+def check_account_api_parity(
+    data_dir: Path,
+    *,
+    base_url: str = "http://127.0.0.1:8768",
+    attempts: int = _PARITY_ATTEMPTS,
+) -> ParityResult:
+    account_path = data_dir / "latest/account_sync_state.json"
+    quotes_path = data_dir / "latest/quotes.json"
+    snapshot_url = base_url.rstrip("/") + "/api/v1/account/snapshot"
+    for _ in range(min(max(attempts, 1), _PARITY_ATTEMPTS)):
+        try:
+            account_first = _read_parity_bytes(account_path)
+            quotes_first = _read_parity_bytes(quotes_path)
+            status, payload, etag = _fetch_snapshot(snapshot_url)
+            account_second = _read_parity_bytes(account_path)
+            quotes_second = _read_parity_bytes(quotes_path)
+        except OSError:
+            return ParityResult("FAIL", "api_request_failed", "", "")
+        if account_first != account_second or quotes_first != quotes_second:
+            continue
+        expected = _raw_parity_projection(account_first, quotes_first)
+        if expected is None:
+            return ParityResult("FAIL", "raw_publication_invalid", "", "")
+        account_generation = expected["account_generation"]
+        quote_as_of = expected["quote_as_of"]
+        if status == HTTPStatus.SERVICE_UNAVAILABLE and _is_api_unstable(payload):
+            return ParityResult(
+                "BLOCKED", "account_publication_unstable", account_generation, quote_as_of
+            )
+        if status != HTTPStatus.OK:
+            return ParityResult("FAIL", f"http_status_{status}", account_generation, quote_as_of)
+        reason = _compare_parity_payload(payload, etag, expected)
+        return ParityResult(
+            "PASS" if reason is None else "FAIL",
+            "ok" if reason is None else reason,
+            account_generation,
+            quote_as_of,
+        )
+    return ParityResult("BLOCKED", "publication_changed_during_parity", "", "")
+
+
+def parity_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="open-trader account-api-parity")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    args = parser.parse_args(argv)
+    result = check_account_api_parity(args.data_dir)
+    print(
+        f"{result.status} {result.reason} "
+        f"account_generation={result.account_generation} quote_as_of={result.quote_as_of}"
+    )
+    return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[result.status]
+
+
+def _read_parity_bytes(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def _fetch_snapshot(url: str) -> tuple[int, object, str | None]:
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return response.status, json.load(response), response.headers.get("ETag")
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.load(error)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        return error.code, payload, error.headers.get("ETag")
+
+
+def _raw_parity_projection(account_raw: bytes, quotes_raw: bytes) -> dict[str, object] | None:
+    try:
+        account = json.loads(account_raw)
+        quotes = json.loads(quotes_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(account, dict) or not isinstance(quotes, dict):
+        return None
+    projection = account.get("dashboard_projection")
+    brokers = account.get("brokers")
+    if not isinstance(projection, dict) or not isinstance(brokers, dict):
+        return None
+    try:
+        summary = _public_fields(projection["summary"], _SUMMARY_FIELDS)
+        broker_summaries = sorted(
+            (_public_fields(row, _BROKER_SUMMARY_FIELDS) for row in projection["broker_summaries"]),
+            key=lambda row: str(row["broker"]),
+        )
+        positions = sorted(
+            (_parity_position(row) for row in projection["broker_positions"]),
+            key=lambda row: (
+                str(row["broker"]), str(row["account_alias"]), str(row["market"]),
+                str(row["asset_class"]), str(row["symbol"]), str(row["position_id"]),
+            ),
+        )
+        cash_balances = sorted(
+            (_public_fields(row, _CASH_FIELDS) for row in projection["cash_details"]),
+            key=lambda row: (str(row["broker"]), str(row["account_alias"]), str(row["currency"])),
+        )
+        quote_as_of = quotes["last_success_at"]
+        generated_at = projection["generated_at"]
+        projection_quote_as_of = projection["quote_as_of"]
+        if not isinstance(quote_as_of, str) or not isinstance(generated_at, str):
+            return None
+        if projection_quote_as_of != quote_as_of:
+            return None
+        source_brokers = {
+            name: _public_fields(source, _SOURCE_BROKER_FIELDS)
+            for name, source in brokers.items()
+            if isinstance(name, str)
+        }
+        if len(source_brokers) != len(brokers) or not source_brokers:
+            return None
+        accepted_account_as_of = max(
+            (str(source["last_success_at"]) for source in source_brokers.values()),
+            key=datetime.fromisoformat,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    account_generation = _parity_sha({
+        "summary": summary,
+        "broker_summaries": broker_summaries,
+        "positions": positions,
+        "cash_balances": cash_balances,
+        "accepted_account_as_of": accepted_account_as_of,
+        "accepted_broker_data_as_of": {
+            broker: source_brokers[broker]["data_as_of"]
+            for broker in sorted(source_brokers)
+        },
+    })
+    return {
+        "summary": summary,
+        "broker_summaries": broker_summaries,
+        "positions": positions,
+        "cash_balances": cash_balances,
+        "generated_at": generated_at,
+        "quote_as_of": quote_as_of,
+        "account_as_of": accepted_account_as_of,
+        "source_brokers": source_brokers,
+        "account_generation": account_generation,
+    }
+
+
+def _public_fields(value: object, fields: tuple[str, ...]) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("not a mapping")
+    return {field: value[field] for field in fields}
+
+
+def _parity_position(value: object) -> dict[str, object]:
+    position = _public_fields(value, _POSITION_FIELDS)
+    try:
+        instrument_id = "ins_" + hashlib.sha256(json.dumps(
+            [
+                str(position["market"]).strip().upper(),
+                str(position["asset_class"]).strip().lower(),
+                str(position["symbol"]).strip().upper(),
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        position["instrument_id"] = instrument_id
+        position["position_id"] = "pos_" + hashlib.sha256(json.dumps(
+            [
+                str(position["broker"]).strip().lower(),
+                str(position["account_alias"]).strip(),
+                instrument_id,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        raise TypeError("invalid position") from None
+    return position
+
+
+def _parity_sha(value: object) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")).hexdigest()
+
+
+def _compare_parity_payload(
+    payload: object, etag: str | None, expected: Mapping[str, object]
+) -> str | None:
+    if not isinstance(payload, dict):
+        return "api_payload_invalid"
+    for field in ("generated_at", "quote_as_of", "summary", "broker_summaries", "cash_balances"):
+        expected_value = expected[field]
+        observed = payload.get(field)
+        if observed != expected_value:
+            return f"{field}_mismatch"
+    positions = payload.get("positions")
+    expected_positions = expected["positions"]
+    if not isinstance(positions, list) or positions != expected_positions:
+        if isinstance(positions, list) and len(positions) == len(expected_positions):
+            for observed, raw in zip(positions, expected_positions):
+                if not isinstance(observed, Mapping) or not isinstance(raw, Mapping):
+                    break
+                for field in ("instrument_id", "position_id", *_POSITION_FIELDS):
+                    if observed.get(field) != raw.get(field):
+                        return f"{field}_mismatch"
+        return "positions_mismatch"
+    sources = payload.get("sources")
+    if not isinstance(sources, Mapping):
+        return "sources_mismatch"
+    account_source = sources.get("account")
+    quote_source = sources.get("quotes")
+    if (
+        not isinstance(account_source, Mapping)
+        or account_source.get("as_of") != expected["account_as_of"]
+        or not isinstance(quote_source, Mapping)
+        or quote_source.get("as_of") != expected["quote_as_of"]
+    ):
+        return "sources_mismatch"
+    api_brokers = account_source.get("brokers")
+    if not isinstance(api_brokers, Mapping):
+        return "sources_mismatch"
+    for broker, source in expected["source_brokers"].items():
+        observed = api_brokers.get(broker)
+        if not isinstance(observed, Mapping) or any(
+            observed.get(field) != source[field]
+            for field in _SOURCE_BROKER_FIELDS
+        ):
+            return "sources_mismatch"
+    account_generation = expected["account_generation"]
+    if payload.get("account_generation") != account_generation:
+        return "account_generation_mismatch"
+    snapshot_generation = payload.get("snapshot_generation")
+    if not isinstance(snapshot_generation, str):
+        return "snapshot_generation_mismatch"
+    visible = dict(payload)
+    visible.pop("snapshot_generation", None)
+    if snapshot_generation != _parity_sha(visible):
+        return "snapshot_generation_mismatch"
+    expected_etag = f'"account-v1-{snapshot_generation.removeprefix("sha256:")}"'
+    if etag is None:
+        return "etag_missing"
+    if etag != expected_etag:
+        return "etag_mismatch"
+    return None
+
+
+def _is_api_unstable(payload: object) -> bool:
+    return (
+        isinstance(payload, Mapping)
+        and isinstance(payload.get("errors"), list)
+        and bool(payload["errors"])
+        and isinstance(payload["errors"][0], Mapping)
+        and payload["errors"][0].get("code") == "account_publication_unstable"
+    )
 
 
 def _runtime_metadata() -> dict[str, object]:

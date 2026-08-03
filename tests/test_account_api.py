@@ -267,6 +267,43 @@ print("\\n".join(sorted(sys.modules)))
         assert forbidden not in loaded
 
 
+def test_account_api_parity_entrypoint_does_not_import_domain_adapters() -> None:
+    script = '''
+import runpy, sys
+sys.argv = ["open_trader", "account-api-parity", "--help"]
+try:
+    runpy.run_module("open_trader", run_name="__main__")
+except SystemExit as error:
+    assert error.code == 0
+print("LOADED_MODULES")
+print("\\n".join(sorted(sys.modules)))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    loaded = completed.stdout.split("LOADED_MODULES\n", 1)[1].splitlines()
+    for forbidden in (
+        "open_trader.account_sync_worker",
+        "open_trader.frontend_gateway",
+        "open_trader.dashboard_web",
+        "open_trader.futu_account",
+        "open_trader.tiger_account",
+        "open_trader.futu_quote",
+        "open_trader.pipeline",
+        "open_trader.trend_review",
+        "open_trader.trend_kelly",
+    ):
+        assert forbidden not in loaded
+
+
 def test_account_api_cli_uses_only_the_data_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -277,6 +314,104 @@ def test_account_api_cli_uses_only_the_data_dir(
     assert account_api.main(["--data-dir", str(data_dir)]) == 0
 
     assert observed == [data_dir]
+
+
+def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 1,
+            "started_at": NOW.isoformat(),
+            "cwd": str(tmp_path),
+            "api_git_sha": SHA,
+        },
+    )
+
+    with _running(server):
+        result = account_api.check_account_api_parity(
+            data_dir,
+            base_url=f"http://127.0.0.1:{server.server_address[1]}",
+        )
+
+    assert result.status == "PASS"
+    assert result.reason == "ok"
+    assert result.account_generation.startswith("sha256:")
+    assert result.quote_as_of == "2026-08-03T12:00:04+08:00"
+
+
+def test_live_parity_fails_on_wrong_opaque_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    snapshot = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+    payload = dict(snapshot.payload)
+    positions = list(payload["positions"])
+    positions[0] = {**positions[0], "position_id": "pos_wrong"}
+    payload["positions"] = positions
+    monkeypatch.setattr(
+        account_api, "_fetch_snapshot", lambda _url: (200, payload, snapshot.etag),
+        raising=False,
+    )
+
+    result = account_api.check_account_api_parity(data_dir)
+
+    assert result.status == "FAIL"
+    assert result.reason == "position_id_mismatch"
+
+
+def test_live_parity_blocks_when_raw_publication_never_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    real_read = Path.read_bytes
+    counter = 0
+
+    def changing(path: Path) -> bytes:
+        nonlocal counter
+        body = real_read(path)
+        if path.name == "account_sync_state.json":
+            counter += 1
+            return body + str(counter).encode()
+        return body
+
+    monkeypatch.setattr(account_api, "_read_parity_bytes", changing, raising=False)
+
+    result = account_api.check_account_api_parity(data_dir)
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "publication_changed_during_parity"
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_exit"),
+    [
+        ("PASS", 0),
+        ("FAIL", 1),
+        ("BLOCKED", 2),
+    ],
+)
+def test_account_api_parity_cli_reports_status_and_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    result: str,
+    expected_exit: int,
+) -> None:
+    monkeypatch.setattr(
+        account_api,
+        "check_account_api_parity",
+        lambda data_dir: account_api.ParityResult(result, "test_reason", "sha256:test", "quote"),
+        raising=False,
+    )
+
+    assert account_api.parity_main(["--data-dir", str(tmp_path / "data")]) == expected_exit
+    assert capsys.readouterr().out.split()[0] == result
 
 
 def _rewrite_json(path: Path, updates: dict[str, object]) -> None:

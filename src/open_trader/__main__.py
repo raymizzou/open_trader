@@ -13,6 +13,10 @@ def main(argv: list[str] | None = None) -> int:
         from .account_api import main as account_api_main
 
         return account_api_main(args[1:])
+    if args[:1] == ["account-api-parity"]:
+        from .account_api import parity_main
+
+        return parity_main(args[1:])
     from .cli import main as cli_main
 
     return cli_main(args)
