@@ -319,7 +319,7 @@ def test_account_api_cli_uses_only_the_data_dir(
 
 def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
-    _write_publication(data_dir)
+    _write_publication(data_dir, quote_price_time="2026-08-03 04:18:41.889")
     server = account_api.create_account_api(
         data_dir,
         host="127.0.0.1",
@@ -349,6 +349,7 @@ def test_live_parity_fails_on_wrong_opaque_id(
 ) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)
+    _make_live_sources_fresh(data_dir)
     snapshot = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
     payload = dict(snapshot.payload)
     positions = list(payload["positions"])
@@ -363,6 +364,79 @@ def test_live_parity_fails_on_wrong_opaque_id(
 
     assert result.status == "FAIL"
     assert result.reason == "position_id_mismatch"
+
+
+def _resign_snapshot_payload(payload: dict[str, object]) -> str:
+    visible = dict(payload)
+    visible.pop("snapshot_generation", None)
+    generation = _contract_sha(visible)
+    payload["snapshot_generation"] = generation
+    return f'"account-v1-{generation.removeprefix("sha256:")}"'
+
+
+def _make_live_sources_fresh(data_dir: Path) -> None:
+    path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    for broker in LIVE_BROKERS:
+        state["brokers"][broker]["attempted_at"] = "2099-01-01T00:00:00+00:00"
+        state["brokers"][broker]["last_success_at"] = "2099-01-01T00:00:00+00:00"
+    write_json_atomic(path, state)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda payload: payload.update({"forged": True}), "envelope_fields_mismatch"),
+        (lambda payload: payload.update({"schema_version": 2}), "schema_version_mismatch"),
+        (lambda payload: payload.update({"status": "stale"}), "status_mismatch"),
+        (lambda payload: payload.update({"stale": True}), "stale_mismatch"),
+        (
+            lambda payload: payload.update(
+                {"release": {"api_git_sha": "f" * 40, "worker_git_sha": "f" * 40}}
+            ),
+            "release_mismatch",
+        ),
+        (
+            lambda payload: payload["sources"]["account"].update({"status": "stale"}),
+            "sources_mismatch",
+        ),
+        (
+            lambda payload: payload.update(
+                {
+                    "errors": [{
+                        "code": "forged_error",
+                        "source": "account",
+                        "message": "forged",
+                        "retryable": True,
+                    }]
+                }
+            ),
+            "errors_mismatch",
+        ),
+    ],
+)
+def test_live_parity_rejects_resigned_v1_envelope_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation,
+    reason: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _make_live_sources_fresh(data_dir)
+    snapshot = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+    payload = json.loads(json.dumps(snapshot.payload))
+    mutation(payload)
+    etag = _resign_snapshot_payload(payload)
+    monkeypatch.setattr(
+        account_api, "_fetch_snapshot", lambda _url: (200, payload, etag),
+        raising=False,
+    )
+
+    result = account_api.check_account_api_parity(data_dir)
+
+    assert result.status == "FAIL"
+    assert result.reason == reason
 
 
 def test_live_parity_fails_closed_on_malformed_success_json(
