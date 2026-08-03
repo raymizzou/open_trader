@@ -1313,6 +1313,45 @@ def _order_matches_request(
     )
 
 
+def _rotation_exact_full_fill(
+    order: Mapping[str, object],
+    request: Mapping[str, object],
+    *,
+    expected_side: str,
+) -> tuple[Decimal, Decimal] | None:
+    """Return target/dealt quantities only for an exact, full broker fill.
+
+    Rotation facts are durable execution evidence, so a matching remark alone
+    is insufficient.  The broker row must identify the same side/code/remark,
+    carry the requested quantity, and report a non-empty order id with the
+    entire requested quantity dealt.
+    """
+    if not _order_matches_request(order, request):
+        return None
+    try:
+        target = _required_decimal(request.get("qty"), "rotation target quantity")
+        broker_qty = _required_decimal(order.get("qty"), "broker order quantity")
+        dealt = _required_decimal(order.get("dealt_qty"), "broker dealt quantity")
+    except ValueError:
+        return None
+    if target <= 0 or broker_qty != target or dealt != target:
+        return None
+    order_id = str(order.get("order_id") or order.get("orderid") or "").strip()
+    order_side = str(order.get("trd_side", order.get("side", ""))).strip()
+    request_side = str(request.get("side") or "").strip()
+    order_code = str(order.get("code", order.get("futu_code", ""))).strip().upper()
+    request_code = str(request.get("futu_code") or "").strip().upper()
+    if (
+        not order_id
+        or str(order.get("remark") or "") != str(request.get("remark") or "")
+        or order_side.rsplit(".", 1)[-1].upper() != expected_side.upper()
+        or request_side.rsplit(".", 1)[-1].upper() != expected_side.upper()
+        or order_code != request_code
+    ):
+        return None
+    return target, dealt
+
+
 def _order_has_action_identity(
     order: Mapping[str, object], request: Mapping[str, object]
 ) -> bool:
@@ -3319,6 +3358,21 @@ def _validate_rotation_event(
     if not isinstance(kind, str) or not kind:
         raise ValueError(label)
     if path is not None:
+        # Rotation facts are scoped to their canonical pair directory.  A
+        # copied fact in a sibling pair must never participate in sequencing
+        # or completion decisions, even when its payload is otherwise valid.
+        expected_pair_root = (
+            path.parent.parent.parent.parent / "rotations"
+            / trading_date / pair_key
+        )
+        if (
+            path.parent != expected_pair_root
+            or path.parent.name != pair_key
+            or path.parent.parent.name != trading_date
+            or path.parent.parent.parent.name != "rotations"
+            or path.parent.parent.parent.parent.name != normalized_market
+        ):
+            raise ValueError(label)
         stem = path.stem
         valid_name = (
             stem == "terminal" if kind == "terminal" else
@@ -3510,11 +3564,30 @@ def _write_rotation_action_event_once(
             str(value).strip() for value in (raw_order_ids or []) if str(value).strip()
         }
         if order_id in event_order_ids:
+            existing_filled_qty = event.get("filled_qty")
+            if existing_filled_qty is not None:
+                try:
+                    if _required_decimal(existing_filled_qty, "rotation action filled quantity") != _required_decimal(
+                        filled_qty, "rotation filled quantity"
+                    ):
+                        raise ValueError(
+                            f"conflicting rotation action attribution: {event_path}"
+                        )
+                except ValueError as exc:
+                    if str(exc).startswith("conflicting rotation action attribution"):
+                        raise
+                    raise ValueError(
+                        f"invalid rotation action filled quantity: {event_path}"
+                    ) from exc
             if (
                 event.get("report_sha256") != report_sha
                 or event.get("pair_key") != pair_key
-                or event.get("pair_index") != pair_index
+                or event.get("pair_index", event.get("action_index")) != pair_index
                 or event.get("status") != "filled"
+                or str(event.get("futu_code") or "").strip().upper()
+                != futu_code.strip().upper()
+                or str(event.get("side") or "").strip().rsplit(".", 1)[-1].upper()
+                != side.strip().rsplit(".", 1)[-1].upper()
             ):
                 raise ValueError(f"conflicting rotation action attribution: {event_path}")
             return event_path
@@ -3555,6 +3628,60 @@ def _write_rotation_action_event_once(
     )
 
 
+def _ensure_rotation_action_attribution(
+    *,
+    data_dir: Path,
+    market: str,
+    execution_date: str,
+    report_sha: str,
+    pair: Mapping[str, object],
+    pair_index: int,
+    pair_key: str,
+    event: Mapping[str, object],
+    report: Mapping[str, object],
+    recorded_at: str,
+) -> Path | None:
+    """Repair the action attribution after a fill fact was durably written.
+
+    The fill fact and action ledger are separate immutable writes.  A crash
+    between them must be recoverable without submitting another order, so each
+    controller pass replays this idempotent attribution step for every fill.
+    """
+    order = event.get("order")
+    if not isinstance(order, Mapping):
+        raise ValueError("relative rotation fill order is invalid")
+    is_sell = event.get("kind") in {"sell_fill", "sell_observation"}
+    side = "sell" if is_sell else "buy"
+    code = str(
+        pair.get("sell_futu_symbol") if is_sell else pair.get("buy_futu_symbol")
+        or order.get("futu_code") or order.get("code") or ""
+    ).strip().upper()
+    order_id = str(order.get("order_id") or order.get("orderid") or "").strip()
+    if not code or not order_id:
+        raise ValueError("relative rotation fill action identity is invalid")
+    filled_qty = event.get("filled_qty", order.get("dealt_qty"))
+    strategy_snapshot = event.get("strategy_snapshot")
+    if not isinstance(strategy_snapshot, Mapping):
+        strategy_snapshot = report.get("strategy_snapshot")
+    return _write_rotation_action_event_once(
+        data_dir=data_dir,
+        market=market,
+        execution_date=execution_date,
+        report_sha=report_sha,
+        pair_index=pair_index,
+        pair_key=pair_key,
+        symbol=pair.get("sell_symbol") if is_sell else pair.get("buy_symbol"),
+        futu_code=code,
+        side=side,
+        order_id=order_id,
+        filled_qty=filled_qty,
+        strategy_snapshot=(
+            strategy_snapshot if isinstance(strategy_snapshot, Mapping) else None
+        ),
+        recorded_at=str(event.get("recorded_at") or recorded_at),
+    )
+
+
 def _rotation_opening_strategy_details(
     data_dir: Path,
     *,
@@ -3588,12 +3715,21 @@ def _rotation_opening_strategy_details(
                 ))
                 break
     position = _rotation_position(snapshot, sell_code)
+    position_provenance_present = isinstance(position, Mapping)
     if isinstance(position, Mapping):
         candidates.extend((
             (position.get("opening_strategy_version"), "account_position"),
             (position.get("position_opening_strategy_version"), "account_position"),
+            (position.get("entry_strategy_version"), "account_position"),
+            (position.get("opening_report_strategy_version"), "account_position"),
             (position.get("strategy_version"), "account_position"),
         ))
+        position_strategy = position.get("strategy_snapshot")
+        if isinstance(position_strategy, Mapping):
+            candidates.extend((
+                (position_strategy.get("opening_strategy_version"), "account_position"),
+                (position_strategy.get("strategy_version"), "account_position"),
+            ))
     states: list[object] = [report.get("protection_state")]
     state_path = (
         data_dir / PROTECTION_STATE_ROOTS[market] / "protection_state.json"
@@ -3608,15 +3744,29 @@ def _rotation_opening_strategy_details(
         if isinstance(raw_positions, Mapping):
             state_position = raw_positions.get(sell_symbol) or raw_positions.get(sell_code)
             if isinstance(state_position, Mapping):
+                position_provenance_present = True
                 candidates.extend((
                     (state_position.get("opening_strategy_version"), "protection_state"),
                     (state_position.get("position_opening_strategy_version"), "protection_state"),
+                    (state_position.get("entry_strategy_version"), "protection_state"),
+                    (state_position.get("opening_report_strategy_version"), "protection_state"),
                     (state_position.get("strategy_version"), "protection_state"),
                 ))
+                state_strategy = state_position.get("strategy_snapshot")
+                if isinstance(state_strategy, Mapping):
+                    candidates.extend((
+                        (state_strategy.get("opening_strategy_version"), "protection_state"),
+                        (state_strategy.get("strategy_version"), "protection_state"),
+                    ))
     for candidate, source in candidates:
         value = str(candidate or "").strip()
         if value:
             return value, source
+    if position_provenance_present:
+        # An existing holding without provenance must not be silently
+        # attributed to the report that is closing it.  Keep the lifecycle
+        # visible, but make its Kelly attribution explicitly unknown.
+        return "unknown", "unattributed_existing_position"
     strategy_snapshot = report.get("strategy_snapshot")
     return str(
         strategy_snapshot.get("strategy_version")
@@ -3763,6 +3913,30 @@ def execute_relative_rotations(
             "buy_futu_symbol": pair.get("buy_futu_symbol"),
         }
         events = _rotation_events(root)
+        # Reconcile any durable fill facts before checking terminal state.  A
+        # process crash can leave the fill sidecar committed while its action
+        # attribution is absent; replaying this step is idempotent and avoids
+        # resubmitting the broker order.
+        for fill_event in events:
+            if (
+                fill_event.get("kind") not in {"sell_observation", "sell_fill", "buy_fill"}
+                or fill_event.get("status") != "filled"
+            ):
+                continue
+            action_path = _ensure_rotation_action_attribution(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                report_sha=report_sha,
+                pair=pair,
+                pair_index=pair_index,
+                pair_key=pair_key,
+                event=fill_event,
+                report=report,
+                recorded_at=now,
+            )
+            if action_path is not None:
+                artifacts.append(str(action_path))
         terminal = next(
             (
                 event for event in events
@@ -3951,13 +4125,25 @@ def execute_relative_rotations(
                 uncertain_pending = True
                 continue
             target = _required_decimal(request.get("qty"), "rotation sell quantity")
-            filled = _required_decimal(order.get("dealt_qty", "0"), "broker dealt quantity")
+            try:
+                filled = _required_decimal(order.get("dealt_qty", "0"), "broker dealt quantity")
+            except ValueError:
+                path = _rotation_pending(
+                    root, evidence, reason="sell_fill_quantity_invalid",
+                    recorded_at=now, uncertain=True,
+                )
+                artifacts.append(str(path))
+                uncertain_pending = True
+                continue
             broker_status = str(order.get("order_status", order.get("status", ""))).upper()
+            full_fill = _rotation_exact_full_fill(
+                order, request, expected_side="SELL"
+            )
             if (
-                filled == target
+                full_fill is not None
                 and broker_status in {"FILLED", "FILLED_ALL"}
-                and str(order.get("order_id") or "").strip()
             ):
+                target, filled = full_fill
                 strategy_snapshot = report.get("strategy_snapshot")
                 closing_version = str(
                     strategy_snapshot.get("strategy_version") or ""
@@ -4006,6 +4192,14 @@ def execute_relative_rotations(
                     artifacts.append(str(action_path))
                 sell_filled = True
                 sell_proved_now = True
+            elif filled == target:
+                path = _rotation_pending(
+                    root, evidence, reason="sell_fill_proof_incomplete",
+                    recorded_at=now, uncertain=True,
+                )
+                artifacts.append(str(path))
+                uncertain_pending = True
+                continue
             elif filled > 0:
                 path = _rotation_terminal(
                     root, {**evidence, "kind": "terminal"}, status="partial",
@@ -4154,13 +4348,25 @@ def execute_relative_rotations(
                 uncertain_pending = True
                 break
             target = _required_decimal(request.get("qty"), "rotation buy quantity")
-            filled = _required_decimal(order.get("dealt_qty", "0"), "broker dealt quantity")
+            try:
+                filled = _required_decimal(order.get("dealt_qty", "0"), "broker dealt quantity")
+            except ValueError:
+                path = _rotation_pending(
+                    root, evidence, reason="buy_fill_quantity_invalid",
+                    recorded_at=now, uncertain=True,
+                )
+                artifacts.append(str(path))
+                uncertain_pending = True
+                break
             broker_status = str(order.get("order_status", order.get("status", ""))).upper()
+            full_fill = _rotation_exact_full_fill(
+                order, request, expected_side="BUY"
+            )
             if (
-                filled == target
+                full_fill is not None
                 and broker_status in {"FILLED", "FILLED_ALL"}
-                and str(order.get("order_id") or "").strip()
             ):
+                target, filled = full_fill
                 sell_fill = next(
                     (
                         event for event in _rotation_events(root)
@@ -4240,6 +4446,14 @@ def execute_relative_rotations(
                 artifacts.append(str(path))
                 terminal_count += 1
                 completed_pair = True
+                break
+            if filled == target:
+                path = _rotation_pending(
+                    root, evidence, reason="buy_fill_proof_incomplete",
+                    recorded_at=now, uncertain=True,
+                )
+                artifacts.append(str(path))
+                uncertain_pending = True
                 break
             if filled > 0:
                 path = _rotation_terminal(
@@ -6248,6 +6462,25 @@ def _merge_rotation_orders(
             ).strip().upper()
             if existing_side != rotation_side or existing_code != rotation_code:
                 raise ValueError("conflicting rotation fill order identity")
+            for field in ("remark", "order_status", "status"):
+                existing_value = str(existing.get(field) or "").strip()
+                rotation_value = str(order.get(field) or "").strip()
+                if existing_value and rotation_value and existing_value != rotation_value:
+                    raise ValueError("conflicting rotation fill order identity")
+            for field in ("dealt_qty", "dealt_avg_price", "avg_price", "price"):
+                existing_value = existing.get(field)
+                rotation_value = order.get(field)
+                if existing_value in (None, "") or rotation_value in (None, ""):
+                    continue
+                try:
+                    if _required_decimal(existing_value, f"existing {field}") != _required_decimal(
+                        rotation_value, f"rotation {field}"
+                    ):
+                        raise ValueError("conflicting rotation fill order identity")
+                except ValueError as exc:
+                    if str(exc) == "conflicting rotation fill order identity":
+                        raise
+                    raise ValueError("conflicting rotation fill order identity") from exc
             merged[index] = {
                 **existing,
                 **{

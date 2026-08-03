@@ -1239,6 +1239,213 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
     ))
     assert json.loads(buy_fact.read_text(encoding="utf-8"))["opening_strategy_version"] == "v11"
 
+    merged = trend_review._merge_rotation_orders(
+        {"orders": [dict(client.orders[0])]}, tmp_path, "CN", "2026-07-20"
+    )
+    assert merged["orders"][0]["pair_key"]
+    conflicting = dict(client.orders[0])
+    conflicting["dealt_qty"] = "999"
+    with pytest.raises(ValueError, match="conflicting rotation fill order identity"):
+        trend_review._merge_rotation_orders(
+            {"orders": [conflicting]}, tmp_path, "CN", "2026-07-20"
+        )
+
+
+def test_relative_rotation_named_pending_facts_are_replayed_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    client = FakeTrendSimClient(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    for _ in range(2):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20", now="2026-07-20T10:30:00+08:00",
+            quote_prices={},
+        )
+    assert len(list(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/preflight-quote-pending.json"
+    ))) == 1
+    assert not list(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"
+    ))
+
+    class SellWithoutRefresh(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "7",
+                "order_status": "FILLED_ALL",
+            })
+            return response
+
+    client = SellWithoutRefresh(cash="0", positions=full_rotation_positions())
+    for minute in (30, 31, 32):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path / "post-sell", report=report, client=client, market="CN",
+            execution_date="2026-07-20", now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+    assert len(list((tmp_path / "post-sell").glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/post-sell-account-pending.json"
+    ))) == 1
+
+
+def test_relative_rotation_events_bind_the_pair_path(
+    tmp_path: Path,
+) -> None:
+    report = relative_rotation_report()
+    report_sha = trend_review._report_hash(report)
+    pair_key = trend_review._rotation_pair_key("CN", 101, "2026-07-20", report_sha, 0)
+    payload = {
+        "schema_version": "open_trader.trend_review.rotation.v1",
+        "kind": "terminal", "market": "CN", "account_id": 101,
+        "execution_date": "2026-07-20", "report_sha256": report_sha,
+        "pair_index": 0, "pair_key": pair_key, "status": "complete",
+    }
+    sibling = (
+        tmp_path / "trend_review/ledgers/CN/rotations/2026-07-20"
+        / ("f" * 64)
+    )
+    sibling.mkdir(parents=True)
+    (sibling / "terminal.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid relative rotation fact"):
+        trend_review._rotation_events(sibling)
+
+
+def test_relative_rotation_requires_exact_full_fill_and_no_sidecar_on_bad_quantity(
+    tmp_path: Path,
+) -> None:
+    class MalformedFill(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": "not-a-quantity", "order_status": "FILLED_ALL",
+            })
+            return response
+
+    client = MalformedFill(cash="0", positions=full_rotation_positions())
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=relative_rotation_report(), client=client,
+        market="CN", execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00", quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    assert not list(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/sell-filled.json"
+    ))
+    assert not list(tmp_path.glob(
+        "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+    ))
+
+
+def test_relative_rotation_repairs_action_attribution_after_sell_and_buy_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Filled(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+                self.cash = "6993"
+            return response
+
+    client = Filled(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    original = trend_review._write_rotation_action_event_once
+    crashed = False
+
+    def crash_sell(**kwargs: object) -> Path | None:
+        nonlocal crashed
+        if kwargs.get("side") == "sell" and not crashed:
+            crashed = True
+            raise RuntimeError("crash after sell action")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(trend_review, "_write_rotation_action_event_once", crash_sell)
+    with pytest.raises(RuntimeError, match="crash after sell action"):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20", now="2026-07-20T10:30:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+    monkeypatch.setattr(trend_review, "_write_rotation_action_event_once", original)
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-20T10:31:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+    assert trend_review.relative_rotations_completed(
+        tmp_path, report=report, market="CN", execution_date="2026-07-20"
+    )
+
+    client = Filled(cash="0", positions=full_rotation_positions())
+    tmp_path = tmp_path / "buy-crash"
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-20T10:30:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    crashed = False
+
+    def crash_buy(**kwargs: object) -> Path | None:
+        nonlocal crashed
+        if kwargs.get("side") == "buy" and not crashed:
+            crashed = True
+            raise RuntimeError("crash after buy action")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(trend_review, "_write_rotation_action_event_once", crash_buy)
+    with pytest.raises(RuntimeError, match="crash after buy action"):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20", now="2026-07-20T10:31:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+    monkeypatch.setattr(trend_review, "_write_rotation_action_event_once", original)
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path, report=report, client=client, market="CN",
+        execution_date="2026-07-20", now="2026-07-20T10:32:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+    )
+    assert [request["side"] for request in client.requests] == ["SELL", "BUY"]
+    assert trend_review.relative_rotations_completed(
+        tmp_path, report=report, market="CN", execution_date="2026-07-20"
+    )
+
+
+def test_relative_rotation_opening_version_uses_position_provenance_or_unknown(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = relative_rotation_report()
+    details = trend_review._rotation_opening_strategy_details(
+        tmp_path, market="CN", pair=pair, report=report,
+        snapshot={"positions": [{
+            "code": "SH.WEAK", "qty": "1000", "opening_strategy_version": "v9",
+        }]},
+    )
+    assert details == ("v9", "account_position")
+    unknown = trend_review._rotation_opening_strategy_details(
+        tmp_path, market="CN", pair=pair, report=report,
+        snapshot={"positions": [{"code": "SH.WEAK", "qty": "1000"}]},
+    )
+    assert unknown == ("unknown", "unattributed_existing_position")
+    write_protection_state(
+        tmp_path / "trend_a_share/protection_state.json",
+        {"schema_version": 1, "positions": {
+            "SH.WEAK": {"opening_strategy_version": "v8", "updated_for": "2026-07-20"},
+        }},
+    )
+    protected = trend_review._rotation_opening_strategy_details(
+        tmp_path, market="CN", pair=pair, report=report,
+        snapshot={"positions": [{"code": "SH.WEAK", "qty": "1000"}]},
+    )
+    assert protected == ("v8", "protection_state")
+
 
 @pytest.mark.parametrize(
     ("positions", "source_date", "reason"),
