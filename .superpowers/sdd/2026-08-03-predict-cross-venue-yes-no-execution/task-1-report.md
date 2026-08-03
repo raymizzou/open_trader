@@ -124,3 +124,45 @@ Final GREEN output:
 ### Concerns
 
 - Task 2 still needs to replace the current mixed v1 Codex admission contract with schema v2 canonical-cutoff/direct-polarity validation and remove the remaining Polymarket-oriented raw `close_at`/`settlement_at` fields from `VenueMarket`.
+
+## Round 2 fix report
+
+### Change
+
+- `_valid_market_pair()` now requires Predict `category_slug`, `resolution_provider`, timezone-aware `event_start_at`, timezone-aware `event_end_at`, and a strictly increasing category window before any payload construction.
+- Added a focused regression covering each incomplete canonical Predict metadata field.
+- No fabricated settlement timestamp or deferred typed-`None` cleanup was added.
+
+### TDD evidence
+
+RED command:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_cross_venue.py -k 'incomplete_predict_canonical_metadata' -q
+```
+
+RED output:
+
+```text
+F                                                                        [100%]
+1 failed, 39 deselected in 0.40s
+```
+
+GREEN focused and affected-suite commands:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_cross_venue.py -k 'incomplete_predict_canonical_metadata' -q
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_source.py tests/test_predict_cross_venue.py -q
+```
+
+GREEN output:
+
+```text
+1 passed, 39 deselected in 0.33s
+58 passed in 0.59s
+```
+
+### Self-review
+
+- The guard rejects missing category slug/provider, missing start/end, and non-increasing windows before `_equivalence_market_payload()` can call `isoformat()`.
+- `git diff --check` is required before commit; no unrelated files or runtime paths are touched.

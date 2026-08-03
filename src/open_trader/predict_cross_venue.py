@@ -272,7 +272,16 @@ def _valid_market_pair(pair: object) -> bool:
             ))
             or market.yes_token_id == market.no_token_id
             or (
-                _fresh_datetime(market.event_end_at) is None
+                not all(
+                    isinstance(value, str) and value
+                    for value in (
+                        market.category_slug,
+                        market.resolution_provider,
+                    )
+                )
+                or _fresh_datetime(market.event_start_at) is None
+                or _fresh_datetime(market.event_end_at) is None
+                or market.event_end_at <= market.event_start_at
                 if market.exchange == "predict.fun"
                 else _fresh_datetime(market.settlement_at) is None
             )

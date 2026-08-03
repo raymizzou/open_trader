@@ -283,6 +283,19 @@ def test_threshold_validator_schema_is_unchanged() -> None:
     assert unchanged.returncode == 0
 
 
+def test_incomplete_predict_canonical_metadata_fails_closed_before_payload() -> None:
+    pair = explicit_pair()
+
+    for field, value in (
+        ("category_slug", ""),
+        ("event_start_at", None),
+        ("event_end_at", None),
+        ("resolution_provider", ""),
+    ):
+        malformed = replace(pair.predict, **{field: value})
+        assert predict_cross_venue._valid_market_pair(replace(pair, predict=malformed)) is False
+
+
 def cross_venue_pair() -> ExplicitMarketPair:
     pair = explicit_pair()
     return ExplicitMarketPair(
