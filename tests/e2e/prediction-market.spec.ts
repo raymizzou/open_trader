@@ -117,6 +117,31 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(observeSignal.locator('[data-action="participate"]')).toHaveCount(0);
   });
 
+  test('keeps cross candidates visible without action for noncanonical or expired cutoffs', async ({ page }) => {
+    let cutoff = '2099-12-31';
+    await page.route('**/api/prediction-arbitrage/state*', async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      for (const opportunity of payload.opportunities ?? []) {
+        if (opportunity.market_type === 'cross_venue_yes_no') opportunity.canonical_cutoff = cutoff;
+      }
+      await route.fulfill({ response, body: JSON.stringify(payload) });
+    });
+
+    for (const invalidCutoff of [
+      '2099-12-31',
+      '2099-12-31T23:59:00',
+      '2099-12-31T23:59:00+08:00',
+      '2020-01-01T00:00:00Z',
+    ]) {
+      cutoff = invalidCutoff;
+      await openPrediction(page, 'cross-manual-confirm');
+      const candidate = page.locator('[data-cross-opportunity-id="cross-opportunity-actionable-fixture"]');
+      await expect(candidate).toBeVisible();
+      await expect(candidate.locator('[data-action="participate"]')).toHaveCount(0);
+    }
+  });
+
   test('history follows the live cross execution mode instead of stale stored mode', async ({ page }) => {
     await openPrediction(page, 'cross-history-stale-manual');
     const history = page.locator('[data-prediction-history-panel]');

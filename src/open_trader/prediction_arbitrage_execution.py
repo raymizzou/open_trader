@@ -45,6 +45,7 @@ from .prediction_arbitrage import (
 from .predict_cross_venue import (
     CrossVenueIntent,
     CrossVenueLeg,
+    canonical_cutoff_is_future,
     cross_venue_notification_dedupe_identity,
     parse_canonical_cutoff,
 )
@@ -3654,7 +3655,7 @@ class PredictionExecutionService:
         cutoff = intent.canonical_cutoff
         if not self._cross_canonical_cutoff_matches(opportunity, intent):
             return "canonical_cutoff_invalid"
-        if cutoff is None or cutoff.tzinfo is not UTC or cutoff <= _utc_now():
+        if cutoff is None or not canonical_cutoff_is_future(cutoff):
             return "canonical_cutoff_invalid"
         approval = opportunity.get("codex_approval")
         fingerprints = opportunity.get("rules_fingerprints")

@@ -3697,7 +3697,7 @@ def test_prediction_cross_execution_mode_is_required_for_actions() -> None:
 const opportunity = {
   opportunity_id:"cross-mode-fixture",title:"Cross mode fixture",market_type:"cross_venue_yes_no",
   execution_mode:"manual_confirm",quantity:"5",net_quantity:"5",total_max_cost:"4.80",
-  minimum_payout:"5",minimum_profit:"0.20",annualized_yield:"0.20",canonical_cutoff:"2026-12-31T00:00:00Z",
+  minimum_payout:"5",minimum_profit:"0.20",annualized_yield:"0.20",canonical_cutoff:"2099-12-31T00:00:00Z",
   actionable:true,clear_signal:true,funnel_stage:5,
   legs:[
     {exchange:"predict.fun",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",net_quantity:"5",max_price:"0.47",max_cost:"2.35",maximum_fee:"0.02"},
@@ -3716,6 +3716,7 @@ const payload = {
   cross_venue:{breaker:{open:false}},
 };
 const rendered = (mode) => predictionCrossVenueCandidateHtml({...opportunity,execution_mode:mode},payload);
+const renderedCutoff = (cutoff) => predictionCrossVenueCandidateHtml({...opportunity,execution_mode:"manual_confirm",canonical_cutoff:cutoff},payload);
 console.log(JSON.stringify({
   manual:rendered("manual_confirm").includes('data-action="participate"'),
   observe:rendered("observe_only"),
@@ -3724,6 +3725,11 @@ console.log(JSON.stringify({
   spacePadded:rendered(" manual_confirm "),
   uppercase:rendered("MANUAL_CONFIRM"),
   unknown:rendered("future_mode"),
+  validFutureCutoff:renderedCutoff("2099-12-31T23:59:00.123Z").includes('data-action="participate"'),
+  expiredCutoff:renderedCutoff("2020-01-01T00:00:00Z"),
+  dateOnlyCutoff:renderedCutoff("2099-12-31"),
+  naiveCutoff:renderedCutoff("2099-12-31T23:59:00"),
+  offsetCutoff:renderedCutoff("2099-12-31T23:59:00+08:00"),
 }));
 ''')
     rendered = json.loads(output)
@@ -3737,6 +3743,9 @@ console.log(JSON.stringify({
     for mode in ("spacePadded", "uppercase", "unknown"):
         assert 'data-action="participate"' not in rendered[mode]
         assert "执行模式未知" in rendered[mode]
+    assert rendered["validFutureCutoff"] is True
+    for mode in ("expiredCutoff", "dateOnlyCutoff", "naiveCutoff", "offsetCutoff"):
+        assert 'data-action="participate"' not in rendered[mode]
 
 
 def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:

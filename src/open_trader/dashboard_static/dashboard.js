@@ -2154,6 +2154,17 @@ function predictionHasValue(value) {
   return value !== null && value !== undefined && String(value).trim() !== "";
 }
 
+function predictionCanonicalUtcCutoff(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function predictionFutureCanonicalUtcCutoff(value) {
+  const timestamp = predictionCanonicalUtcCutoff(value);
+  return timestamp !== null && timestamp > Date.now();
+}
+
 function predictionPolicyIsComplete(policy) {
   return ["max_wallet_balance", "max_normal_cost", "max_emergency_loss", "min_estimated_profit"]
     .every((key) => predictionHasValue(policy?.[key]) && Number.isFinite(Number(policy[key])));
@@ -2266,8 +2277,9 @@ function predictionOpportunityIsComplete(value) {
       opportunity.minimum_payout,
       opportunity.profit,
       opportunity.annualized_yield,
-      opportunity.canonical_cutoff ?? opportunity.resolution_at,
+      opportunity.canonical_cutoff,
     ].every(predictionHasValue)
+      && predictionFutureCanonicalUtcCutoff(opportunity.canonical_cutoff)
       && legs.length === 2
       && exchanges.size === 2
       && exchanges.has("predict.fun")
@@ -3302,11 +3314,7 @@ function predictionPreviewIsComplete(value) {
       return predictionHasValue(item) && Number.isFinite(number) && number >= 0;
     };
     const identity = (item) => typeof item === "string" && item.trim().length > 0;
-    const canonicalUtcCutoff = typeof preview.canonical_cutoff === "string"
-      && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(preview.canonical_cutoff);
-    const cutoffTimestamp = canonicalUtcCutoff
-      ? Date.parse(preview.canonical_cutoff)
-      : NaN;
+    const cutoffTimestamp = predictionCanonicalUtcCutoff(preview.canonical_cutoff);
     const expectedMapping = {
       predict_yes: "YES",
       predict_no: "NO",
@@ -3350,7 +3358,7 @@ function predictionPreviewIsComplete(value) {
     return [preview.preview_id, preview.title, preview.market_type, preview.canonical_cutoff, preview.codex_approval?.summary]
       .every(predictionHasValue)
       && preview.codex_approval?.decision === "APPROVE"
-      && Number.isFinite(cutoffTimestamp)
+      && cutoffTimestamp !== null
       && cutoffTimestamp > Date.now()
       && mappingValid
       && identitiesValid

@@ -372,6 +372,7 @@ def test_equivalence_rejects_ambiguous_opening_and_closing_time_quote(tmp_path: 
         (lambda value: {**value, "canonical_cutoff": "2026-12-31 23:59:00Z"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59Z"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59:00+08:00"}, "CUTOFF_INVALID"),
+        (lambda value: {**value, "canonical_cutoff": "2020-01-01T00:00:00Z"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "not-a-date"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "2027-01-01T00:00:00Z"}, "CUTOFF_EVIDENCE_MISMATCH"),
         (lambda value: {**value, "contract_shape": "COMPOUND"}, "COMPOUND_CONTRACT"),
@@ -404,7 +405,6 @@ def test_equivalence_approval_fails_closed_for_all_post_check_mismatches(tmp_pat
         "2099-12-31T23:59:00",
         "2099-12-31",
         "2099-12-31T23:59:00+08:00",
-        "2020-01-01T00:00:00Z",
     ],
 )
 def test_canonical_cutoff_parser_requires_exact_utc_format(value: str) -> None:
@@ -412,6 +412,16 @@ def test_canonical_cutoff_parser_requires_exact_utc_format(value: str) -> None:
     assert predict_cross_venue._canonical_cutoff(
         "2099-12-31T23:59:00.123Z"
     ) == datetime(2099, 12, 31, 23, 59, 0, 123000, tzinfo=UTC)
+
+
+def test_canonical_cutoff_parser_accepts_expired_exact_utc_for_persistence() -> None:
+    expired = predict_cross_venue._canonical_cutoff("2020-01-01T00:00:00Z")
+
+    assert expired == datetime(2020, 1, 1, tzinfo=UTC)
+    assert predict_cross_venue.canonical_cutoff_is_future(expired) is False
+    assert predict_cross_venue.canonical_cutoff_is_future(
+        "2099-12-31T23:59:00Z"
+    ) is True
 
 
 def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_checks() -> None:

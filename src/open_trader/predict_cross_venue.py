@@ -789,7 +789,7 @@ def _equivalence_validation(
     if structured["direct_outcome_mapping"] != direct:
         return _cross_venue_validation(pair, False, "OUTCOME_MAPPING_MISMATCH", prompt_version)
     cutoff = _canonical_cutoff(structured["canonical_cutoff"])
-    if cutoff is None:
+    if cutoff is None or not canonical_cutoff_is_future(cutoff):
         return _cross_venue_validation(pair, False, "CUTOFF_INVALID", prompt_version)
     if structured["contract_shape"] != "BINARY":
         return _cross_venue_validation(pair, False, "COMPOUND_CONTRACT", prompt_version)
@@ -828,10 +828,22 @@ def _canonical_cutoff(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is UTC and parsed > datetime.now(UTC) else None
+    return parsed if parsed.tzinfo is UTC else None
 
 
 parse_canonical_cutoff = _canonical_cutoff
+
+
+def canonical_cutoff_is_future(
+    value: object, *, now: datetime | None = None
+) -> bool:
+    cutoff = value if isinstance(value, datetime) else parse_canonical_cutoff(value)
+    if not isinstance(cutoff, datetime) or cutoff.tzinfo is not UTC:
+        return False
+    reference = now if isinstance(now, datetime) else datetime.now(UTC)
+    if reference.tzinfo is None:
+        return False
+    return cutoff > reference.astimezone(UTC)
 
 
 def _evidence_supports_cutoff(quote: object, cutoff: datetime) -> bool:

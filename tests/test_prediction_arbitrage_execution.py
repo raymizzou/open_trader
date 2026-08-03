@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 import threading
 import time
@@ -1585,6 +1586,43 @@ def test_cross_holding_reconciliation_releases_once_after_observed_redemption(
     assert store.cross_unsettled_principal() == Decimal("0")
 
 
+def test_cross_holding_reconciliation_accepts_expired_persisted_cutoff(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.balance = Decimal("20")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-expired-cutoff")
+    assert holding["state"] == "holding_to_resolution"
+
+    execution_id = str(accepted["execution_id"])
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT payload FROM executions WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row[0]))
+        payload["intent"]["canonical_cutoff"] = "2020-01-01T00:00:00Z"
+        connection.execute(
+            "UPDATE executions SET payload = ? WHERE execution_id = ?",
+            (json.dumps(payload), execution_id),
+        )
+
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+    observed = service.reconcile_cross_holdings_once()
+    predict.positions = ()
+    predict.balance = Decimal("10")
+
+    released = service.reconcile_cross_holdings_once()
+
+    assert observed == {"complete": 0, "pending": 1, "unknown": 0}
+    assert released == {"complete": 1, "pending": 0, "unknown": 0}
+    assert service.execution(execution_id)["state"] == "complete"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
 def test_cross_holding_keeps_capacity_when_only_losing_venue_collateral_grows(
     tmp_path: Path,
 ) -> None:
@@ -1800,7 +1838,6 @@ def test_cross_venue_preview_rejects_noncanonical_server_cutoff(
         "2099-12-31T23:59:00",
         "2099-12-31",
         "2099-12-31T23:59:00+08:00",
-        "2020-01-01T00:00:00Z",
     ],
 )
 def test_cross_venue_intent_payload_rejects_noncanonical_cutoff(
@@ -1812,6 +1849,16 @@ def test_cross_venue_intent_payload_rejects_noncanonical_cutoff(
     assert PredictionExecutionService._intent_from_payload(payload) is None
 
 
+def test_cross_venue_intent_payload_accepts_expired_exact_cutoff_for_holding() -> None:
+    payload = PredictionExecutionService._intent_payload(_cross_intent())
+    payload["canonical_cutoff"] = "2020-01-01T00:00:00Z"
+
+    intent = PredictionExecutionService._intent_from_payload(payload)
+
+    assert intent is not None
+    assert intent.canonical_cutoff == datetime(2020, 1, 1, tzinfo=UTC)
+
+
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
@@ -1819,6 +1866,7 @@ def test_cross_venue_intent_payload_rejects_noncanonical_cutoff(
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, legs=(replace(cross.intent.legs[0], book_timestamp=datetime.now(UTC) - timedelta(seconds=11)), cross.intent.legs[1]))), "books_stale"),
         (lambda cross, _trading, _predict: cross.overrides.update({"codex_approval": {"decision": "REJECT"}}), "codex_not_approved"),
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=None)), "canonical_cutoff_invalid"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=datetime(2020, 1, 1, tzinfo=UTC))), "canonical_cutoff_invalid"),
         (lambda _cross, trading, _predict: setattr(trading, "balance", Decimal("1")), "account_insufficient"),
         (lambda _cross, _trading, predict: setattr(predict, "allowance_ready", False), "account_insufficient"),
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, quote_available=False)), "opportunity_not_actionable"),
