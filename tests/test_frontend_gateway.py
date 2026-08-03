@@ -26,9 +26,11 @@ class _Upstream(ThreadingHTTPServer):
     def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
         self.response_status = 200
+        self.response_reason: str | None = None
         self.response_body: bytes | None = None
         self.response_headers: list[tuple[str, str]] = []
         self.response_delay = 0.0
+        self.health_body: bytes | None = None
         super().__init__(("127.0.0.1", 0), _UpstreamHandler)
 
 
@@ -51,20 +53,22 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
-        response = (
-            {
-                "schema_version": "open_trader.legacy_dashboard.health.v1",
-                "module": "legacy_dashboard",
-            }
-            if self.path == "/healthz"
-            else {"ok": True}
-        )
+        response = {"ok": True}
         encoded = (
-            self.server.response_body
+            self.server.health_body
+            if self.path == "/healthz" and self.server.health_body is not None
+            else self.server.response_body
             if self.server.response_body is not None
             else json.dumps(response).encode()
         )
-        self.send_response(self.server.response_status)
+        if self.path == "/healthz" and self.server.health_body is None:
+            encoded = json.dumps(
+                {
+                    "schema_version": "open_trader.legacy_dashboard.health.v1",
+                    "module": "legacy_dashboard",
+                }
+            ).encode()
+        self.send_response(self.server.response_status, self.server.response_reason)
         if not any(name.lower() == "content-type" for name, _ in self.server.response_headers):
             self.send_header("Content-Type", "application/json")
         for name, value in self.server.response_headers:
@@ -105,6 +109,7 @@ def _write_static_files(static_dir: Path) -> dict[str, bytes]:
 def _gateway(
     static_dir: Path,
     upstream_port: int,
+    account_upstream_port: int | None = None,
     *,
     timeout: float = 1.0,
     max_request_body_bytes: int = 20 * 1024 * 1024,
@@ -113,6 +118,7 @@ def _gateway(
         config=FrontendGatewayConfig(
             static_dir=static_dir,
             upstream_port=upstream_port,
+            account_upstream_port=account_upstream_port or upstream_port,
             public_origin="http://127.0.0.1:8766",
             upstream_timeout_seconds=timeout,
             max_request_body_bytes=max_request_body_bytes,
@@ -176,6 +182,197 @@ def test_gateway_health_reports_runtime_and_upstream_status(tmp_path: Path) -> N
     assert isinstance(payload["pid"], int)
     assert payload["cwd"]
     assert upstream.requests[0]["path"] == "/healthz"
+
+
+def test_gateway_routes_only_the_exact_account_snapshot_path(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        for route in ("/api/v1/account/snapshot", "/api/v1/account/snapshot?fresh=1"):
+            with urllib.request.urlopen(base + route, timeout=5) as response:
+                assert response.status == 200
+        for route in (
+            "/api/v1/account/snapshot/child",
+            "/api/dashboard",
+            "/api/quotes",
+            "/api/statements",
+            "/api/simulate",
+            "/api/anything-else",
+        ):
+            with urllib.request.urlopen(base + route, timeout=5) as response:
+                assert response.status == 200
+
+    assert [request["path"] for request in account.requests] == [
+        "/api/v1/account/snapshot",
+        "/api/v1/account/snapshot?fresh=1",
+    ]
+    assert [request["path"] for request in legacy.requests] == [
+        "/api/v1/account/snapshot/child",
+        "/api/dashboard",
+        "/api/quotes",
+        "/api/statements",
+        "/api/simulate",
+        "/api/anything-else",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "body"),
+    [
+        (200, "Account Ready", b'{"account":true}'),
+        (304, "Account Not Modified", b""),
+        (503, "Account Contract Unavailable", b'{"code":"contract_unavailable"}'),
+    ],
+)
+def test_gateway_preserves_account_response_details(
+    tmp_path: Path,
+    status: int,
+    reason: str,
+    body: bytes,
+) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    account.response_status = status
+    account.response_reason = reason
+    account.response_body = body
+    account.response_headers = [
+        ("ETag", '"account-v1"'),
+        ("X-Account-Trace", "one"),
+        ("X-Account-Trace", "two"),
+    ]
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        connection = http.client.HTTPConnection(base.removeprefix("http://"), timeout=5)
+        connection.request("GET", "/api/v1/account/snapshot")
+        response = connection.getresponse()
+        response_body = response.read()
+        response_headers = response.getheaders()
+        connection.close()
+
+    assert (response.status, response.reason, response_body) == (status, reason, body)
+    assert ("ETag", '"account-v1"') in response_headers
+    assert [value for name, value in response_headers if name == "X-Account-Trace"] == [
+        "one",
+        "two",
+    ]
+    assert legacy.requests == []
+
+
+def test_gateway_marks_and_rewrites_account_requests_without_legacy_authority(
+    tmp_path: Path,
+) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        connection = http.client.HTTPConnection(base.removeprefix("http://"), timeout=5)
+        connection.putrequest("GET", "/api/v1/account/snapshot")
+        connection.putheader("Origin", "http://127.0.0.1:8766")
+        connection.putheader("Referer", "http://127.0.0.1:8766/dashboard")
+        connection.putheader("X-Open-Trader-Account-Route", "caller-value")
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+
+    headers = account.requests[0]["headers"]
+    account_origin = f"http://127.0.0.1:{account.server_address[1]}"
+    assert headers["X-Open-Trader-Account-Route"] == "production"
+    assert headers["Origin"] == account_origin
+    assert headers["Referer"] == account_origin + "/dashboard"
+    assert legacy.requests == []
+
+
+def test_gateway_reports_account_and_legacy_health_independently(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    account.health_body = json.dumps(
+        {"module": "account_api", "mode": "production"}
+    ).encode()
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            payload = json.load(response)
+
+    assert payload["upstream_status"] == "ok"
+    assert payload["legacy_upstream_status"] == "ok"
+    assert payload["account_upstream_status"] == "ok"
+
+
+def test_gateway_health_keeps_legacy_and_account_failures_independent(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    account.health_body = json.dumps({"module": "account_api", "mode": "shadow"}).encode()
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            shadow_payload = json.load(response)
+    assert shadow_payload["legacy_upstream_status"] == "ok"
+    assert shadow_payload["account_upstream_status"] == "unavailable"
+
+    socket_holder = socket.socket()
+    socket_holder.bind(("127.0.0.1", 0))
+    unavailable_port = socket_holder.getsockname()[1]
+    socket_holder.close()
+    account = _Upstream()
+    account.health_body = json.dumps(
+        {"module": "account_api", "mode": "production"}
+    ).encode()
+    with _running(account), _gateway(
+        tmp_path / "static", unavailable_port, account.server_address[1], timeout=0.05
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            unavailable_payload = json.load(response)
+    assert unavailable_payload["upstream_status"] == "unavailable"
+    assert unavailable_payload["legacy_upstream_status"] == "unavailable"
+    assert unavailable_payload["account_upstream_status"] == "ok"
+
+    legacy = _Upstream()
+    socket_holder = socket.socket()
+    socket_holder.bind(("127.0.0.1", 0))
+    unavailable_port = socket_holder.getsockname()[1]
+    socket_holder.close()
+    with _running(legacy), _gateway(
+        tmp_path / "static", legacy.server_address[1], unavailable_port, timeout=0.05
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            unavailable_account_payload = json.load(response)
+    assert unavailable_account_payload["legacy_upstream_status"] == "ok"
+    assert unavailable_account_payload["account_upstream_status"] == "unavailable"
+
+
+def test_gateway_returns_account_503_without_using_legacy(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    socket_holder = socket.socket()
+    socket_holder.bind(("127.0.0.1", 0))
+    unavailable_port = socket_holder.getsockname()[1]
+    socket_holder.close()
+    with _running(legacy), _gateway(
+        tmp_path / "static", legacy.server_address[1], unavailable_port, timeout=0.05
+    ) as base:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(base + "/api/v1/account/snapshot", timeout=5)
+        payload = json.load(error.value)
+
+    assert error.value.code == 503
+    assert payload == {
+        "schema_version": "open_trader.frontend_gateway.error.v1",
+        "code": "account_module_unavailable",
+        "message": "Account module is unavailable",
+    }
+    assert legacy.requests == []
 
 
 def test_gateway_forwards_api_get_path_query_status_and_body(tmp_path: Path) -> None:
