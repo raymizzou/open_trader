@@ -223,6 +223,14 @@ The Worker command is `account-sync-worker`. During R1 the stable launchd label
 `controller_status.json` / `controller.lock` names retain their historical
 token; they are compatibility identifiers, not HTTP Controller roles.
 
+```text
+Account Sync Worker → raw Account publication → Account API shadow (127.0.0.1:8768)
+```
+
+The shadow API is a loopback-only, read-only operator process; browsers still
+use only Frontend Gateway. See the [Account API shadow runtime runbook](docs/operations/account-api-shadow-runtime.md)
+for install, inspection, parity, and rollback.
+
 The Dashboard has no account or quote write path and no manual refresh action.
 It only projects `data/latest/account_sync_state.json`,
 `data/latest/portfolio.csv`, `data/latest/quotes.json`, and
