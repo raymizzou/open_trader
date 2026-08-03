@@ -67,6 +67,7 @@ class PredictTradingClient:
         self._api_key = api_key
         self._jwt: str | None = None
         self._urlopen_fn = urlopen_fn
+        self._cross_entry_ready: tuple[tuple[object, ...], PredictBuyQuote, Mapping[str, object]] | None = None
 
     @classmethod
     def from_keychain(
@@ -178,6 +179,127 @@ class PredictTradingClient:
         try:
             market = self._market(market_id)
             response = self._json("/v1/orders", method="POST", data=self._order_body(self.quote_market_buy(market_id, token_id, quantity_wei), market), auth=True)
+            row = _data(response)
+            order_id = row.get("hash") or row.get("id")
+            return PredictLegResult(True, "accepted", str(order_id or ""))
+        except (HTTPError, URLError, OSError):
+            return PredictLegResult(False, "ambiguous", error_code="ambiguous")
+        except Exception:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+
+    def _cross_entry_bound(self, order: Mapping[str, object]) -> tuple[tuple[object, ...], str, str, int, int, Decimal, Decimal, Decimal, Decimal] | None:
+        """Validate one persisted cross-leg bound without accepting replacement terms."""
+
+        execution_id = order.get("execution_id")
+        idempotency_key = order.get("idempotency_key")
+        market_id = order.get("market_id")
+        condition_id = order.get("condition_id")
+        token_id = order.get("token_id")
+        outcome = order.get("outcome")
+        if (
+            order.get("venue") != "predict.fun"
+            or not all(isinstance(value, str) and value.strip() for value in (
+                execution_id, idempotency_key, market_id, condition_id, token_id
+            ))
+            or execution_id != idempotency_key
+            or outcome not in {"YES", "NO"}
+        ):
+            return None
+        requested = _number(order.get("requested_quantity"))
+        net = _number(order.get("net_quantity"))
+        max_price = _number(order.get("max_price"))
+        max_cost = _number(order.get("max_cost"))
+        maximum_fee = _number(order.get("maximum_fee"))
+        calculable_gas = _number(order.get("calculable_gas"))
+        requested_units = _scaled_integer(requested, 10**18)
+        net_units = _scaled_integer(net, 10**18)
+        price_units = _scaled_integer(max_price, 10**6)
+        cost_units = _scaled_integer(max_cost, 10**6)
+        if (
+            requested is None
+            or net is None
+            or max_price is None
+            or max_cost is None
+            or maximum_fee is None
+            or calculable_gas is None
+            or requested_units is None
+            or net_units is None
+            or price_units is None
+            or cost_units is None
+            or net > requested
+            or maximum_fee < 0
+            or calculable_gas < 0
+        ):
+            return None
+        key = (
+            execution_id, idempotency_key, market_id, condition_id, token_id, outcome,
+            requested_units, net_units, price_units, cost_units,
+            format(maximum_fee, "f"), format(calculable_gas, "f"),
+        )
+        return (
+            key, market_id, token_id, requested_units, net_units,
+            max_price, max_cost, maximum_fee, calculable_gas,
+        )
+
+    def no_submit_cross_buy_preflight(self, order: Mapping[str, object]) -> PredictLegResult:
+        """Bind one fresh Predict FOK quote to the approved cross-leg ceiling."""
+
+        bound = self._cross_entry_bound(order)
+        self._cross_entry_ready = None
+        if bound is None:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+        (
+            key, market_id, token_id, requested_units, net_units,
+            max_price, max_cost, maximum_fee, calculable_gas,
+        ) = bound
+        try:
+            market = self._market(market_id)
+            book_payload = _data(self._json(f"/v1/markets/{market_id}/orderbook", auth=True))
+            stamp = _book_timestamp(book_payload.get("updateTimestampMs"))
+            age = None if stamp is None else (datetime.now(UTC) - stamp).total_seconds()
+            if stamp is None or age is None or age < 0 or age > 10:
+                return PredictLegResult(False, "rejected", error_code="rejected")
+            amounts = self._builder.get_market_order_amounts(
+                MarketHelperInput(Side.BUY, requested_units, slippage_bps=0, is_min_amount_out=True),
+                _book(book_payload),
+            )
+            quote = PredictBuyQuote(
+                market_id, token_id, int(amounts.price_per_share),
+                int(amounts.maker_amount), int(amounts.taker_amount),
+            )
+            if quote.minimum_redeemable_units != net_units:
+                return PredictLegResult(False, "rejected", error_code="rejected")
+            price = Decimal(quote.price_per_share_wei) / Decimal(10**6)
+            debit = Decimal(quote.max_collateral_debit) / Decimal(10**6)
+            fee = debit - (Decimal(net_units) / Decimal(10**18)) * price
+            if (
+                price <= 0
+                or price > max_price
+                or debit <= 0
+                or fee < 0
+                or fee > maximum_fee
+                or debit + calculable_gas > max_cost
+            ):
+                return PredictLegResult(False, "rejected", error_code="rejected")
+            self._order_body(quote, market)
+            self._cross_entry_ready = (key, quote, market)
+            return PredictLegResult(True, "preflight")
+        except Exception:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+
+    def submit_cross_buy_once(self, order: Mapping[str, object]) -> PredictLegResult:
+        """Submit only the exact preflight-bound FOK order once."""
+
+        bound = self._cross_entry_bound(order)
+        ready = self._cross_entry_ready
+        if bound is None or ready is None or ready[0] != bound[0]:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+        self._cross_entry_ready = None
+        try:
+            _key, quote, market = ready
+            response = self._json(
+                "/v1/orders", method="POST", data=self._order_body(quote, market), auth=True
+            )
             row = _data(response)
             order_id = row.get("hash") or row.get("id")
             return PredictLegResult(True, "accepted", str(order_id or ""))

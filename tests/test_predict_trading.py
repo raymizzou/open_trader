@@ -32,13 +32,24 @@ class FakeResponse:
 
 class FakeBuilder:
     last_order_input = None
+
+    def __init__(self) -> None:
+        self.price_per_share = 1000000
+        self.max_collateral_debit = 1000000
+        self.quote_calls = 0
+
     def sign_predict_account_message(self, message: str) -> str:
         assert message == "dynamic-message-sentinel"
         return "signature-sentinel"
 
     def get_market_order_amounts(self, input, book) -> SimpleNamespace:
         assert input.quantity_wei == 10**18
-        return SimpleNamespace(maker_amount=1000000, taker_amount=10**18, price_per_share=1000000)
+        self.quote_calls += 1
+        return SimpleNamespace(
+            maker_amount=self.max_collateral_debit,
+            taker_amount=10**18,
+            price_per_share=self.price_per_share,
+        )
 
     def build_order(self, strategy: str, input) -> dict[str, object]:
         assert strategy == "MARKET"
@@ -122,6 +133,123 @@ def test_preflight_signs_market_fok_without_order_request() -> None:
     assert result.accepted is True
     assert result.status == "preflight"
     assert not any("/v1/orders" in request.full_url for request in requests)
+
+
+def test_cross_entry_rejects_a_moved_quote_above_approved_ceiling_without_post() -> None:
+    requests = []
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    def urlopen_fn(request, **kwargs):
+        requests.append(request)
+        if request.full_url.endswith("/v1/markets/896/orderbook"):
+            return FakeResponse(
+                {"data": {"marketId": 896, "updateTimestampMs": now_ms, "asks": [["0.51", "3"]], "bids": [["0.50", "2"]]}}
+            )
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+    client._builder.price_per_share = 510000  # type: ignore[attr-defined]
+    client._builder.max_collateral_debit = 510000  # type: ignore[attr-defined]
+    order = {
+        "execution_id": "cross-entry-1",
+        "idempotency_key": "cross-entry-1",
+        "venue": "predict.fun",
+        "market_id": "896",
+        "condition_id": "predict-condition",
+        "token_id": "yes-token",
+        "outcome": "YES",
+        "requested_quantity": Decimal("1"),
+        "net_quantity": Decimal("1"),
+        "max_price": Decimal("0.50"),
+        "max_cost": Decimal("0.50"),
+        "maximum_fee": Decimal("0.01"),
+        "calculable_gas": Decimal("0"),
+    }
+
+    result = client.no_submit_cross_buy_preflight(order)
+
+    assert result.accepted is False
+    assert result.status == "rejected"
+    assert not any(
+        request.full_url.endswith("/v1/orders") and request.get_method() == "POST"
+        for request in requests
+    )
+
+
+def test_cross_entry_posts_only_the_preflight_bound_order() -> None:
+    requests = []
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    def urlopen_fn(request, **kwargs):
+        requests.append(request)
+        if request.full_url.endswith("/v1/markets/896/orderbook"):
+            return FakeResponse(
+                {"data": {"marketId": 896, "updateTimestampMs": now_ms, "asks": [["1.00", "3"]], "bids": [["0.99", "2"]]}}
+            )
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+    order = {
+        "execution_id": "cross-entry-2",
+        "idempotency_key": "cross-entry-2",
+        "venue": "predict.fun",
+        "market_id": "896",
+        "condition_id": "predict-condition",
+        "token_id": "yes-token",
+        "outcome": "YES",
+        "requested_quantity": Decimal("1"),
+        "net_quantity": Decimal("1"),
+        "max_price": Decimal("1"),
+        "max_cost": Decimal("1"),
+        "maximum_fee": Decimal("0"),
+        "calculable_gas": Decimal("0"),
+    }
+
+    assert client.no_submit_cross_buy_preflight(order).accepted is True
+    result = client.submit_cross_buy_once(order)
+
+    assert result.accepted is True
+    assert client._builder.quote_calls == 1  # type: ignore[attr-defined]
+    assert sum(
+        request.full_url.endswith("/v1/orders") and request.get_method() == "POST"
+        for request in requests
+    ) == 1
+
+
+def test_cross_entry_rejects_quote_and_calculable_gas_over_approved_cost() -> None:
+    requests = []
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    def urlopen_fn(request, **kwargs):
+        requests.append(request)
+        if request.full_url.endswith("/v1/markets/896/orderbook"):
+            return FakeResponse(
+                {"data": {"marketId": 896, "updateTimestampMs": now_ms, "asks": [["1.00", "3"]], "bids": [["0.99", "2"]]}}
+            )
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+    order = {
+        "execution_id": "cross-entry-3",
+        "idempotency_key": "cross-entry-3",
+        "venue": "predict.fun",
+        "market_id": "896",
+        "condition_id": "predict-condition",
+        "token_id": "yes-token",
+        "outcome": "YES",
+        "requested_quantity": Decimal("1"),
+        "net_quantity": Decimal("1"),
+        "max_price": Decimal("1"),
+        "max_cost": Decimal("1"),
+        "maximum_fee": Decimal("0"),
+        "calculable_gas": Decimal("0.01"),
+    }
+
+    assert client.no_submit_cross_buy_preflight(order).accepted is False
+    assert not any(
+        request.full_url.endswith("/v1/orders") and request.get_method() == "POST"
+        for request in requests
+    )
 
 
 def test_submit_posts_once_and_transport_error_is_ambiguous() -> None:

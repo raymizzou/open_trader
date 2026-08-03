@@ -51,12 +51,13 @@ def cross_preview_payload(
     *,
     market_id: str = "cross-market-1",
     total_max_cost: Decimal = Decimal("20.00"),
+    net_quantity: Decimal = Decimal("5"),
 ) -> dict[str, object]:
     return {
         "event_id": "cross-event-1",
         "market_id": market_id,
         "market_type": "cross_venue_yes_no",
-        "quantity": Decimal("20"),
+        "quantity": net_quantity,
         "total_max_cost": total_max_cost,
         "intent": {
             "intent_type": "cross_venue",
@@ -66,14 +67,14 @@ def cross_preview_payload(
                     "condition_id": "predict-condition",
                     "outcome": "YES",
                     "token_id": "predict-yes",
-                    "net_quantity": Decimal("20"),
+                    "net_quantity": net_quantity,
                 },
                 {
                     "exchange": "polymarket",
                     "condition_id": "poly-condition",
                     "outcome": "NO",
                     "token_id": "poly-no",
-                    "net_quantity": Decimal("20"),
+                    "net_quantity": net_quantity,
                 },
             ],
         },
@@ -758,6 +759,98 @@ def test_cross_release_sweep_recovers_a_proven_complete_after_a_crash(
     assert callable(sweep)
     assert sweep() == (execution_id,)
     assert sweep() == ()
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_release_sweep_requires_exact_persisted_winner_net_quantity(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(
+        total_max_cost=Decimal("10.50"), net_quantity=Decimal("10")
+    )
+    preview_id = db.create_preview(
+        payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-partial-sweep")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "10", "polymarket": "10"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5", "polymarket": "0"},
+            },
+        },
+    )
+
+    assert db.release_proven_cross_completions() == ()
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_cross_release_sweep_recovers_exact_ten_unit_settlement_after_a_crash(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(
+        total_max_cost=Decimal("10.50"), net_quantity=Decimal("10")
+    )
+    preview_id = db.create_preview(
+        payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-exact-ten-sweep")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "10", "polymarket": "10"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "10",
+                },
+                "redeemed_collateral": {"predict.fun": "10", "polymarket": "0"},
+            },
+        },
+    )
+
+    assert db.release_proven_cross_completions() == (execution_id,)
     assert db.cross_unsettled_principal() == Decimal("0")
 
 

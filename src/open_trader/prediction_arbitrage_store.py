@@ -1139,7 +1139,7 @@ class PredictionArbitrageStore:
                 maximum = Decimal(str(leg.get("net_quantity")))
             except (InvalidOperation, ValueError):
                 continue
-            if maximum.is_finite() and amount <= maximum:
+            if maximum.is_finite() and amount == maximum:
                 matches += 1
         return matches == 1
 

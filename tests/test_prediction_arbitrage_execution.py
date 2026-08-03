@@ -1084,6 +1084,9 @@ class CrossPredictTrading:
         self.minimum_order_size = Decimal("1")
         self.positions: tuple[object, ...] = ()
         self.preflight_calls = 0
+        self.cross_entry_preflight_orders: list[dict[str, object]] = []
+        self.cross_entry_submit_orders: list[dict[str, object]] = []
+        self.cross_entry_allowed = True
         self.submit_calls = 0
         self.reconcile_calls = 0
         self.submit_started = threading.Event()
@@ -1111,6 +1114,19 @@ class CrossPredictTrading:
         assert quantity_wei > 0
         return PredictLegResult(True, "preflight")
 
+    def no_submit_cross_buy_preflight(self, order: dict[str, object]) -> PredictLegResult:
+        self.preflight_calls += 1
+        self.cross_entry_preflight_orders.append(dict(order))
+        assert order["venue"] == "predict.fun"
+        assert order["market_id"] == "predict-market"
+        assert order["token_id"] == "predict-yes"
+        assert order["execution_id"] == order["idempotency_key"]
+        return PredictLegResult(
+            self.cross_entry_allowed,
+            "preflight" if self.cross_entry_allowed else "rejected",
+            error_code="none" if self.cross_entry_allowed else "rejected",
+        )
+
     def submit_buy_once(
         self, market_id: str, token_id: str, quantity_wei: int
     ) -> PredictLegResult:
@@ -1125,6 +1141,14 @@ class CrossPredictTrading:
         if self.submit_results:
             return self.submit_results.pop(0)
         return PredictLegResult(True, "filled", "predict-order")
+
+    def submit_cross_buy_once(self, order: dict[str, object]) -> PredictLegResult:
+        self.cross_entry_submit_orders.append(dict(order))
+        return self.submit_buy_once(
+            str(order["market_id"]),
+            str(order["token_id"]),
+            int(Decimal(str(order["requested_quantity"])) * Decimal(10**18)),
+        )
 
     def reconcile_buy(
         self, market_id: str, token_id: str, order_hash: str
@@ -1233,7 +1257,24 @@ def test_cross_venue_submits_both_legs_concurrently_and_deduplicates_preview(
 
     assert {first["execution_id"], duplicate["execution_id"], different_key["execution_id"]} == {first["execution_id"]}
     assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+    assert predict.cross_entry_preflight_orders == predict.cross_entry_submit_orders
+    assert predict.cross_entry_submit_orders[0]["execution_id"] == first["execution_id"]
     assert final["state"] == "holding_to_resolution"
+
+
+def test_cross_predict_entry_rejection_posts_neither_venue_and_stays_fail_closed(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.cross_entry_allowed = False
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-entry-bound-rejected")
+
+    assert final["state"] == "both_rejected"
+    assert predict.cross_entry_preflight_orders
+    assert predict.cross_entry_submit_orders == []
+    assert predict.submit_calls == 0
+    assert trading.cross_submit_calls == 0
 
 
 def test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limit(
@@ -1352,6 +1393,43 @@ def test_cross_holding_settlement_uses_post_fill_baseline_not_preorder_balance(
     assert completed == {"complete": 1, "pending": 0, "unknown": 0}
     assert service.execution(str(accepted["execution_id"]))["state"] == "complete"
     assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_holding_settlement_requires_exact_redeemable_net_quantity(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(predict_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+            replace(polymarket_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+        ),
+        quantity=Decimal("10"),
+        minimum_payout=Decimal("10"),
+    )
+    predict.default_filled_quantity = Decimal("10")
+    trading.balance = predict.balance = Decimal("100")
+    trading.balance_after_cross_submit = predict.balance_after_cross_submit = Decimal("90")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-partial-redemption")
+
+    assert holding["state"] == "holding_to_resolution"
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+    assert service.reconcile_cross_holdings_once() == {
+        "complete": 0, "pending": 1, "unknown": 0,
+    }
+    predict.positions = ()
+    predict.balance = Decimal("95")
+    trading.balance = Decimal("100")
+
+    assert service.reconcile_cross_holdings_once() == {
+        "complete": 0, "pending": 0, "unknown": 1,
+    }
+    assert service.execution(str(accepted["execution_id"]))["state"] == "holding_to_resolution"
+    assert store.cross_unsettled_principal() > Decimal("0")
 
 
 def test_cross_remediation_prefers_fresh_cheaper_polymarket_unwind_once(

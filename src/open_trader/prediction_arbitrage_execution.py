@@ -791,7 +791,7 @@ class PredictionExecutionService:
             if amount is None or amount <= 0:
                 continue
             quantity += amount
-        if quantity <= 0 or quantity > leg.net_quantity:
+        if quantity != leg.net_quantity:
             return None
         return {
             "venue": leg.exchange,
@@ -825,7 +825,7 @@ class PredictionExecutionService:
                 or winner.get("token_id") != leg.token_id
                 or quantity is None
                 or quantity <= 0
-                or quantity > leg.net_quantity
+                or quantity != leg.net_quantity
             ):
                 continue
             return {
@@ -1376,7 +1376,10 @@ class PredictionExecutionService:
         if predict_leg is None or polymarket_leg is None or self._predict_trading is None:
             self._finish_cross_incident(execution_id, "cross_clients_unavailable")
             return
-        predict_preflight = getattr(self._predict_trading, "no_submit_buy_preflight", None)
+        predict_order = self._cross_predict_entry_order(
+            execution_id, intent, predict_leg
+        )
+        predict_preflight = getattr(self._predict_trading, "no_submit_cross_buy_preflight", None)
         polymarket_preflight = getattr(self._trading, "no_submit_cross_leg_preflight", None)
         if not callable(predict_preflight) or not callable(polymarket_preflight):
             self._finish_cross_rejected(execution_id, "cross_preflight_unavailable", intent)
@@ -1384,9 +1387,7 @@ class PredictionExecutionService:
         try:
             predict_ready = _call(
                 predict_preflight,
-                predict_leg.market_id,
-                predict_leg.token_id,
-                int(predict_leg.requested_quantity * Decimal(10**18)),
+                predict_order,
             )
             polymarket_ready = _call(polymarket_preflight, polymarket_leg)
         except Exception:
@@ -1406,7 +1407,7 @@ class PredictionExecutionService:
             },
         )
         submitted_at = _utc_now()
-        predict_submit = getattr(self._predict_trading, "submit_buy_once", None)
+        predict_submit = getattr(self._predict_trading, "submit_cross_buy_once", None)
         polymarket_submit = getattr(self._trading, "submit_cross_leg_once", None)
         if not callable(predict_submit) or not callable(polymarket_submit):
             self._finish_cross_incident(execution_id, "cross_submission_unavailable")
@@ -1415,9 +1416,7 @@ class PredictionExecutionService:
             predict_future = executor.submit(
                 _call,
                 predict_submit,
-                predict_leg.market_id,
-                predict_leg.token_id,
-                int(predict_leg.requested_quantity * Decimal(10**18)),
+                predict_order,
             )
             polymarket_future = executor.submit(_call, polymarket_submit, polymarket_leg)
             try:
@@ -1462,7 +1461,7 @@ class PredictionExecutionService:
                 {"phase": "bounded_retry", "venue": venue, "execution_id": execution_id},
             )
             retry = self._submit_cross_leg_once(
-                venue, predict_leg, polymarket_leg
+                venue, execution_id, intent, predict_leg, polymarket_leg
             )
             results[venue] = retry
             retry_leg = predict_leg if venue == "predict.fun" else polymarket_leg
@@ -1617,21 +1616,50 @@ class PredictionExecutionService:
         }
 
     def _submit_cross_leg_once(
-        self, venue: str, predict_leg: CrossVenueLeg, polymarket_leg: CrossVenueLeg
+        self,
+        venue: str,
+        execution_id: str,
+        intent: CrossVenueIntent,
+        predict_leg: CrossVenueLeg,
+        polymarket_leg: CrossVenueLeg,
     ) -> object:
         if venue == "predict.fun":
-            submit = getattr(self._predict_trading, "submit_buy_once", None)
-            return _call(
-                submit,
-                predict_leg.market_id,
-                predict_leg.token_id,
-                int(predict_leg.requested_quantity * Decimal(10**18)),
-            ) if callable(submit) else {"status": "ambiguous", "error_code": "ambiguous"}
+            preflight = getattr(self._predict_trading, "no_submit_cross_buy_preflight", None)
+            submit = getattr(self._predict_trading, "submit_cross_buy_once", None)
+            order = self._cross_predict_entry_order(execution_id, intent, predict_leg)
+            if not callable(preflight) or not callable(submit):
+                return {"status": "ambiguous", "error_code": "ambiguous"}
+            try:
+                if not self._preflight_passed(_call(preflight, order)):
+                    return {"status": "rejected", "error_code": "rejected"}
+                return _call(submit, order)
+            except Exception:
+                return {"status": "ambiguous", "error_code": "ambiguous"}
         submit = getattr(self._trading, "submit_cross_leg_once", None)
         return _call(submit, polymarket_leg) if callable(submit) else ThresholdLegResult(
             "polymarket", polymarket_leg.outcome, polymarket_leg.condition_id,
             polymarket_leg.token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous",
         )
+
+    @staticmethod
+    def _cross_predict_entry_order(
+        execution_id: str, intent: CrossVenueIntent, leg: CrossVenueLeg
+    ) -> dict[str, object]:
+        return {
+            "execution_id": execution_id,
+            "idempotency_key": execution_id,
+            "venue": "predict.fun",
+            "market_id": leg.market_id,
+            "condition_id": leg.condition_id,
+            "token_id": leg.token_id,
+            "outcome": leg.outcome,
+            "requested_quantity": leg.requested_quantity,
+            "net_quantity": leg.net_quantity,
+            "max_price": leg.max_price,
+            "max_cost": leg.max_cost,
+            "maximum_fee": leg.maximum_fee,
+            "calculable_gas": intent.calculable_gas,
+        }
 
     def _reconcile_predict_cross_leg(
         self, leg: CrossVenueLeg, result: object
