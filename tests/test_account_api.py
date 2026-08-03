@@ -6,6 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from open_trader.account_snapshot import load_account_snapshot
 from open_trader.account_sync_state import (
     LIVE_BROKERS,
@@ -177,3 +179,33 @@ def test_snapshot_maps_current_publication_to_frozen_v1_contract(tmp_path: Path)
     visible.pop("snapshot_generation")
     assert result.payload["snapshot_generation"] == _contract_sha(visible)
     assert not ({"risk_flag", "actionable", "decision_plan"} & result.payload.keys())
+
+
+def test_snapshot_whitelists_public_fields_and_requires_quote_publication_time(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    state_path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    projection = state["dashboard_projection"]
+    projection["summary"]["risk_flag"] = "overweight"
+    projection["broker_summaries"][0]["actionable"] = True
+    projection["broker_positions"][0]["decision_plan"] = {"action": "buy"}
+    projection["cash_details"][0]["research"] = "private"
+    write_json_atomic(state_path, state)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert "risk_flag" not in result.payload["summary"]
+    assert "actionable" not in result.payload["broker_summaries"][0]
+    assert "decision_plan" not in result.payload["positions"][0]
+    assert "research" not in result.payload["cash_balances"][0]
+
+    quotes_path = data_dir / "latest/quotes.json"
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    quotes["last_success_at"] = "2026-08-03T12:00:03+08:00"
+    write_json_atomic(quotes_path, quotes)
+
+    with pytest.raises(ValueError, match="quote publication time"):
+        load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)

@@ -56,6 +56,10 @@ def _load_stable_publication(data_dir: Path) -> tuple[dict[str, object], dict[st
     quotes = json.loads(quotes_bytes)
     if not is_valid_account_publication(account) or not isinstance(quotes, dict):
         raise ValueError("invalid account publication")
+    projection = account["dashboard_projection"]
+    assert isinstance(projection, dict)
+    if projection["quote_as_of"] != quotes.get("last_success_at"):
+        raise ValueError("quote publication time mismatch")
     if not isinstance(worker, dict) or not isinstance(worker.get("git_sha"), str):
         raise ValueError("invalid account worker status")
     return account, quotes, worker["git_sha"]
@@ -71,14 +75,17 @@ def _build_snapshot(
     projection = account["dashboard_projection"]
     brokers = account["brokers"]
     assert isinstance(projection, dict) and isinstance(brokers, dict)
-    summary = dict(projection["summary"])
-    broker_summaries = sorted((dict(row) for row in projection["broker_summaries"]), key=lambda row: row["broker"])
+    summary = _public_summary(projection["summary"])
+    broker_summaries = sorted(
+        (_public_broker_summary(row) for row in projection["broker_summaries"]),
+        key=lambda row: row["broker"],
+    )
     positions = sorted(
         (_position_row(row) for row in projection["broker_positions"]),
         key=lambda row: (row["broker"], row["account_alias"], row["market"], row["asset_class"], row["symbol"], row["position_id"]),
     )
     cash_balances = sorted(
-        (dict(row) for row in projection["cash_details"]),
+        (_public_cash_balance(row) for row in projection["cash_details"]),
         key=lambda row: (row["broker"], row["account_alias"], row["currency"]),
     )
     accepted_account_as_of = max(
@@ -97,7 +104,7 @@ def _build_snapshot(
         },
         "quotes": {
             "status": "healthy",
-            "as_of": projection["quote_as_of"],
+            "as_of": quotes["last_success_at"],
             "reason": None,
         },
     }
@@ -115,7 +122,7 @@ def _build_snapshot(
         "schema_version": 1,
         "account_generation": account_generation,
         "generated_at": projection["generated_at"],
-        "quote_as_of": projection["quote_as_of"],
+        "quote_as_of": quotes["last_success_at"],
         "status": "healthy",
         "stale": False,
         "sources": sources,
@@ -138,7 +145,7 @@ def _build_snapshot(
 
 
 def _position_row(row: Mapping[str, str]) -> dict[str, str]:
-    position = dict(row)
+    position = _public_position(row)
     instrument_id = _opaque_id("ins_", [
         position["market"].strip().upper(),
         position["asset_class"].strip().lower(),
@@ -149,6 +156,52 @@ def _position_row(row: Mapping[str, str]) -> dict[str, str]:
         position["broker"].strip().lower(), position["account_alias"].strip(), instrument_id,
     ])
     return position
+
+
+def _public_summary(row: object) -> dict[str, object]:
+    assert isinstance(row, Mapping)
+    return {
+        key: row[key]
+        for key in (
+            "holding_value_hkd", "cash_like_value_hkd", "portfolio_value_hkd",
+            "holding_weight_hkd", "cash_like_weight_hkd", "holding_count", "broker_count",
+        )
+    }
+
+
+def _public_broker_summary(row: object) -> dict[str, object]:
+    assert isinstance(row, Mapping)
+    return {
+        key: row[key]
+        for key in (
+            "broker", "label", "source_kind", "detail_available", "holding_value_hkd",
+            "cash_like_value_hkd", "portfolio_value_hkd", "holding_count",
+        )
+    }
+
+
+def _public_position(row: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: row[key]
+        for key in (
+            "broker", "account_alias", "market", "asset_class", "symbol", "name", "currency",
+            "quantity", "cost_price", "cost_value", "last_price", "price_kind", "price_as_of",
+            "market_value", "market_value_usd", "market_value_hkd", "cost_value_hkd",
+            "unrealized_pnl", "unrealized_pnl_pct", "account_weight_hkd", "portfolio_weight_hkd",
+            "statement_id", "confidence", "notes",
+        )
+    }
+
+
+def _public_cash_balance(row: object) -> dict[str, str]:
+    assert isinstance(row, Mapping)
+    return {
+        key: row[key]
+        for key in (
+            "broker", "account_alias", "currency", "cash_balance", "available_balance",
+            "cash_balance_hkd", "available_balance_hkd", "statement_id", "confidence", "notes",
+        )
+    }
 
 
 def _broker_source(source: object, now: datetime) -> dict[str, object]:
