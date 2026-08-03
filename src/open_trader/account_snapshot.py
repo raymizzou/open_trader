@@ -169,10 +169,35 @@ def _parse_quotes(raw: bytes) -> dict[str, object]:
         )
         or quotes["quote_count"] + quotes["missing_count"]
         != quotes["requested_count"]
+        or not _is_aware_timestamp(quotes["fetched_at"])
+        or (
+            quotes["last_success_at"]
+            and not _is_aware_timestamp(quotes["last_success_at"])
+        )
         or any(
             not _is_valid_quote_row_payload(symbol, row)
             for symbol, row in quotes["quotes"].items()
         )
+    ):
+        raise PublicationUnavailable("quotes_publication_invalid")
+    rows = quotes["quotes"]
+    assert isinstance(rows, dict)
+    ok_count = sum(row["status"] == "ok" for row in rows.values())
+    missing_count = sum(row["status"] == "missing_quote" for row in rows.values())
+    retained_failure = (
+        quotes["status"] == "failed"
+        and quotes["requested_count"] == 0
+        and quotes["quote_count"] == 0
+        and quotes["missing_count"] == 0
+        and bool(rows)
+        and bool(quotes["last_success_at"])
+    )
+    if not retained_failure and (
+        quotes["status"] in {"ok", "partial"} or rows
+    ) and (
+        len(rows) != quotes["requested_count"]
+        or ok_count != quotes["quote_count"]
+        or missing_count != quotes["missing_count"]
     ):
         raise PublicationUnavailable("quotes_publication_invalid")
     return quotes

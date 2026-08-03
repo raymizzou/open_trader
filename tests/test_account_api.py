@@ -337,6 +337,9 @@ def test_snapshot_returns_stale_with_complete_retained_quotes(tmp_path: Path) ->
     quotes_path = data_dir / "latest/quotes.json"
     quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
     quotes["status"] = "failed"
+    quotes["requested_count"] = 0
+    quotes["quote_count"] = 0
+    quotes["missing_count"] = 0
     quotes["stale"] = True
     write_json_atomic(quotes_path, quotes)
 
@@ -382,7 +385,16 @@ def test_snapshot_rejects_incomplete_retained_quotes(
 ) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)
-    _rewrite_json(data_dir / "latest/quotes.json", updates)
+    quotes_path = data_dir / "latest/quotes.json"
+    if updates["status"] == "partial":
+        quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+        quotes.update(updates)
+        quotes["quotes"]["US.TEST0"].update(
+            {"status": "missing_quote", "last_price": "", "price_time": ""}
+        )
+        write_json_atomic(quotes_path, quotes)
+    else:
+        _rewrite_json(quotes_path, updates)
 
     result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
 
@@ -439,10 +451,40 @@ def test_snapshot_rejects_nonfinite_quote_price(tmp_path: Path) -> None:
     assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
 
 
+def test_snapshot_rejects_non_aware_quote_fetched_at(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _rewrite_json(
+        data_dir / "latest/quotes.json",
+        {"fetched_at": "not-an-iso-timestamp"},
+    )
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+
+
 def test_snapshot_rejects_negative_quote_count(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)
     _rewrite_json(data_dir / "latest/quotes.json", {"missing_count": -1})
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+
+
+def test_snapshot_rejects_quote_count_row_mismatch(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _rewrite_json(
+        data_dir / "latest/quotes.json",
+        {"requested_count": 3, "quote_count": 3, "missing_count": 0},
+    )
 
     result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
 
