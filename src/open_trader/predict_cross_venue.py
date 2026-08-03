@@ -507,7 +507,9 @@ def _decimal(value: object) -> Decimal | None:
 def cross_exchange_equivalence_cache_key(
     pair: ExplicitMarketPair, *, model: str,
     prompt_version: str = CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
-) -> str:
+) -> str | None:
+    if not _valid_market_pair(pair):
+        return None
     payload = json.dumps(
         {
             "predict": _equivalence_market_payload(pair.predict),
@@ -677,6 +679,8 @@ class CodexCrossVenueEquivalenceValidator:
 
     def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
         cache_key = cross_exchange_equivalence_cache_key(pair, model=self.model, prompt_version=self.prompt_version)
+        if cache_key is None:
+            return self._result(pair, "MARKET_INVALID")
         if cached := self._cached(pair, cache_key):
             return cached
         command = [

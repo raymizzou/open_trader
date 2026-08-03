@@ -296,6 +296,27 @@ def test_incomplete_predict_canonical_metadata_fails_closed_before_payload() -> 
         assert predict_cross_venue._valid_market_pair(replace(pair, predict=malformed)) is False
 
 
+def test_direct_validator_and_cache_key_fail_closed_for_malformed_pair(tmp_path: Path) -> None:
+    pair = explicit_pair()
+    malformed = replace(pair, predict=replace(pair.predict, event_start_at=None))
+
+    assert predict_cross_venue.cross_exchange_equivalence_cache_key(
+        malformed, model="gpt-test"
+    ) is None
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path / "data"),
+        model="gpt-test",
+        runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Codex must not run for malformed metadata")
+        ),
+    )
+
+    result = validator.validate(malformed)
+
+    assert result.approved is False
+    assert result.reason == "MARKET_INVALID"
+
+
 def cross_venue_pair() -> ExplicitMarketPair:
     pair = explicit_pair()
     return ExplicitMarketPair(

@@ -166,3 +166,47 @@ GREEN output:
 
 - The guard rejects missing category slug/provider, missing start/end, and non-increasing windows before `_equivalence_market_payload()` can call `isoformat()`.
 - `git diff --check` is required before commit; no unrelated files or runtime paths are touched.
+
+## Round 3 fix report
+
+### Change
+
+- Made `cross_exchange_equivalence_cache_key()` the shared validation boundary: malformed pairs return `None` before payload construction.
+- Made `CodexCrossVenueEquivalenceValidator.validate()` fail closed with `MARKET_INVALID` when that boundary rejects the pair, without invoking Codex.
+- Added a direct malformed-pair regression covering both cache-key and validator paths.
+- Preserved canonical Predict metadata and the absence of fabricated settlement timestamps.
+
+### TDD evidence
+
+RED command:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_cross_venue.py -k 'direct_validator_and_cache_key' -q
+```
+
+RED output:
+
+```text
+F                                                                        [100%]
+1 failed, 40 deselected in 0.40s
+```
+
+GREEN commands:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_cross_venue.py -k 'direct_validator_and_cache_key' -q
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest tests/test_predict_source.py tests/test_predict_cross_venue.py -q
+```
+
+GREEN output:
+
+```text
+1 passed, 40 deselected in 0.30s
+59 passed in 0.61s
+```
+
+### Self-review
+
+- Both direct entry paths now share `_valid_market_pair()` through the cache-key boundary.
+- Invalid canonical metadata cannot reach `_equivalence_market_payload()` or the Codex runner.
+- No unrelated files, live processes, credentials, or order paths were touched.
