@@ -4387,6 +4387,8 @@ def _browser_check(
     reports_dir: Path | None = None,
     simulate_payloads: Mapping[str, Mapping[str, Any]] | None = None,
     history_expectations: Mapping[str, list[Mapping[str, Any]]] | None = None,
+    *,
+    expected_sha: str | None = None,
 ) -> tuple[list[str], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -4409,7 +4411,7 @@ def _browser_check(
                     page = browser.new_page(viewport=viewport)
                     browser_errors: list[str] = []
                     browser_requests: list[tuple[str, str | None]] = []
-                    browser_responses: list[tuple[str, int]] = []
+                    browser_responses: list[Any] = []
                     page.on(
                         "console",
                         lambda message: browser_errors.append(message.text)
@@ -4429,9 +4431,7 @@ def _browser_check(
                     ) if response.status >= 400 else None)
                     page.on(
                         "response",
-                        lambda response: browser_responses.append((
-                            response.url, response.status,
-                        )),
+                        lambda response: browser_responses.append(response),
                     )
                     page.goto(url, wait_until="networkidle")
                     page.wait_for_timeout(ACCOUNT_POLL_PROOF_WAIT_MS)
@@ -4446,7 +4446,10 @@ def _browser_check(
                     errors.extend(
                         f"{name}：{message}"
                         for message in _browser_account_network_errors(
-                            browser_requests, browser_responses, url,
+                            browser_requests,
+                            [_browser_response_record(response) for response in browser_responses],
+                            url,
+                            expected_sha=expected_sha,
                         )
                     )
                     page_payload = _page_dashboard_payload(page)
@@ -4536,8 +4539,10 @@ def _browser_check(
 
 def _browser_account_network_errors(
     requests: list[tuple[str, str | None]],
-    responses: list[tuple[str, int]],
+    responses: list[tuple[str, int, str | None, object | None]],
     gateway_url: str,
+    *,
+    expected_sha: str | None = None,
 ) -> list[str]:
     gateway = urlsplit(gateway_url)
     account_requests = [
@@ -4557,14 +4562,52 @@ def _browser_account_network_errors(
         for request_url, _etag in requests
     ):
         return ["浏览器未请求 Legacy /api/dashboard"]
-    account_statuses = [
-        status for response_url, status in responses
+    account_responses = [
+        [response_url, status, response_etag, payload]
+        for response_url, status, response_etag, payload in responses
         if urlsplit(response_url).netloc == gateway.netloc
         and urlsplit(response_url).path == ACCOUNT_SNAPSHOT_PATH
     ]
-    if not any(status in {200, 304} for status in account_statuses[1:]):
-        return ["浏览器后续 Account 请求没有 304 或有效 200 响应"]
+    for request_url, request_etag in account_requests[1:]:
+        matched_index = next(
+            (
+                index for index, response in enumerate(account_responses)
+                if response[0] == request_url and response[2] == request_etag
+            ),
+            None,
+        )
+        if matched_index is None:
+            return ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+        _response_url, status, _response_etag, payload = account_responses.pop(
+            matched_index
+        )
+        if status == 304:
+            continue
+        if status != 200:
+            return ["浏览器后续 Account 请求响应状态无效"]
+        if expected_sha is not None:
+            errors = _account_snapshot_errors(payload, expected_sha=expected_sha)
+        else:
+            errors = [] if isinstance(payload, Mapping) and payload.get(
+                "schema_version"
+            ) == 1 and payload.get("status") in {"healthy", "stale"} and isinstance(
+                payload.get("stale"), bool
+            ) else ["浏览器后续 Account 200 响应契约无效"]
+        if errors:
+            return ["浏览器后续 Account 请求响应契约无效"]
     return []
+
+
+def _browser_response_record(response: Any) -> tuple[str, int, str | None, object | None]:
+    request = response.request
+    etag = request.header_value("if-none-match")
+    payload: object | None = None
+    if response.status == 200 and urlsplit(response.url).path == ACCOUNT_SNAPSHOT_PATH:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+    return response.url, response.status, etag, payload
 
 
 def _runtime_health_errors(

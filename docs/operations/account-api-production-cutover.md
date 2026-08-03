@@ -27,12 +27,19 @@ git -C "$CANDIDATE_WORKTREE" diff --exit-code "$BASELINE_SHA".."$CUTOVER_SHA" --
   scripts/install_account_sync_launchd.sh
 git worktree add --detach /absolute/path/to/open-trader-r3 "$CUTOVER_SHA"
 export CUTOVER_ROOT=/absolute/path/to/open-trader-r3
-export OPEN_TRADER_PYTHON="$CUTOVER_ROOT/.venv/bin/python"
+export OPEN_TRADER_PYTHON="${OPEN_TRADER_PYTHON:-$(command -v python3)}"
+test -n "$OPEN_TRADER_PYTHON"
+test -x "$OPEN_TRADER_PYTHON"
+export PYTHONPATH="$CUTOVER_ROOT:$CUTOVER_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+"$OPEN_TRADER_PYTHON" -c \
+  'import open_trader, pytest; import playwright.sync_api'
 ```
 
 The protected-file diff must be empty. A non-empty status or protected-file
 diff stops the cutover. Do not improvise a second writer or edit the deployed
-checkout.
+checkout. The verified `$OPEN_TRADER_PYTHON` is shared by the Worker, Account
+API, Dashboard acceptance, and `make acceptance`; do not assume a detached
+worktree has its own `.venv`.
 
 ## Preflight and cutover
 
@@ -70,7 +77,7 @@ tail -n 100 logs/account_sync/launchd.out.log
 tail -n 100 logs/account_api/launchd.out.log
 tail -n 100 logs/frontend_gateway/launchd.out.log
 tail -n 100 logs/legacy_dashboard/launchd.out.log
-PYTHONPATH=src .venv/bin/python -m open_trader account-api-parity --data-dir data
+PYTHONPATH="$PYTHONPATH" "$OPEN_TRADER_PYTHON" -m open_trader account-api-parity --data-dir data
 ```
 
 Confirm one listener per port; every runtime record has the detached `cwd`,
@@ -98,6 +105,11 @@ If a publication advances between requests, a contract-valid `200` with a new
 ETag is valid; otherwise the conditional request must be `304`. Keep
 `$PROBE_DIR` until operator acceptance.
 
+The acceptance suite also exercises the Gateway with an existing upstream
+harness and asserts that the Account route overwrites any caller-supplied
+`X-Open-Trader-Account-Route` value with `production`; this is not inferred
+from the downstream response body.
+
 ## Controlled Account-only fault and recovery
 
 Only after the normal preflight passes, prove that Account failure is isolated
@@ -107,12 +119,14 @@ Legacy Dashboard running:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.open-trader.account-api
-curl -sS -o /dev/null -w '%{http_code}\n' \
+FAULT_DIR="$(mktemp -d)"
+curl -sS -o "$FAULT_DIR/account.json" -w '%{http_code}\n' \
   http://127.0.0.1:8766/api/v1/account/snapshot
+rg '"code"[[:space:]]*:[[:space:]]*"account_module_unavailable"' "$FAULT_DIR/account.json"
 curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/api/dashboard
 scripts/install_account_api_launchd.sh --mode production --repo-root "$CUTOVER_ROOT"
 curl -fsS http://127.0.0.1:8766/api/v1/account/snapshot
-PYTHONPATH=src .venv/bin/python -m open_trader account-api-parity --data-dir data
+PYTHONPATH="$PYTHONPATH" "$OPEN_TRADER_PYTHON" -m open_trader account-api-parity --data-dir data
 ```
 
 The Account route must be `503 account_module_unavailable` while stopped;
@@ -143,3 +157,16 @@ the same ordered candidate commands after the rollback Worker lock is released.
 Do not delete plists, logs, detached worktrees, or `$PROBE_DIR` until the
 operator has accepted the final `make acceptance` result. Cleanup happens only
 after that acceptance record is retained.
+
+## Final acceptance gate
+
+After the controlled fault has recovered and the exact candidate SHA has been
+rechecked, run the final gate with the verified shared interpreter:
+
+```bash
+PYTHON_BIN="$OPEN_TRADER_PYTHON" make acceptance
+```
+
+Only a `PASS` result is acceptance. `FAIL` requires fixing the candidate and
+repeating the cutover checks; `BLOCKED` must be reported as an unavailable
+browser or external environment.

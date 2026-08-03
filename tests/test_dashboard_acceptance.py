@@ -66,9 +66,9 @@ def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -
 
 def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
-    registry = "python -m open_trader.prediction_arbitrage_acceptance"
+    registry = "open_trader.prediction_arbitrage_acceptance"
     assert registry in makefile
-    assert makefile.index(registry) < makefile.index("python -m open_trader.dashboard_acceptance")
+    assert makefile.index(registry) < makefile.index("open_trader.dashboard_acceptance")
     assert '--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json"' in makefile
 
 
@@ -180,7 +180,8 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
         'LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log'
         in makefile
     )
-    assert "test:\n\t.venv/bin/python -m pytest -q" in makefile
+    assert 'PYTHON_BIN ?=' in makefile
+    assert '"$(PYTHON_BIN)" -m pytest -q' in makefile
     assert "acceptance: test" not in makefile
     assert "EXPECTED_CN" not in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
@@ -5033,11 +5034,21 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
                     callback(request)  # type: ignore[operator]
             if event == "response":
                 class Response:
-                    def __init__(self, status: int) -> None:
+                    def __init__(self, status: int, etag: str | None = None) -> None:
                         self.url = "http://dashboard/api/v1/account/snapshot"
                         self.status = status
+                        self.request = type(
+                            "Request",
+                            (),
+                            {"header_value": lambda _self, _name: etag},
+                        )()
 
-                for response in (Response(200), Response(304), Response(304)):
+                    def json(self) -> dict[str, object]:
+                        return {"schema_version": 1, "status": "healthy", "stale": False}
+
+                for response in (
+                    Response(200), Response(304, '"etag"'), Response(304, '"etag"')
+                ):
                     callback(response)  # type: ignore[operator]
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
@@ -6784,6 +6795,27 @@ def test_account_api_acceptance_requires_production_health_with_matching_release
         )
     )
 
+    payload["mode"] = "shadow"
+    payload["worker_git_sha"] = "accepted-sha"
+    payload["release_match"] = True
+    errors = dashboard_acceptance._account_runtime_health_errors(
+        payload,
+        pid=123,
+        expected_sha="accepted-sha",
+        process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    )
+    assert any("mode 不匹配" in error for error in errors)
+
+    payload["mode"] = "production"
+    payload["release_match"] = False
+    errors = dashboard_acceptance._account_runtime_health_errors(
+        payload,
+        pid=123,
+        expected_sha="accepted-sha",
+        process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    )
+    assert any("release_match 不匹配" in error for error in errors)
+
 
 def test_account_api_browser_requests_prove_conditional_polling_through_gateway() -> None:
     gateway = "http://127.0.0.1:8766"
@@ -6796,7 +6828,11 @@ def test_account_api_browser_requests_prove_conditional_polling_through_gateway(
             (account, '"account-v1"'),
             (account, '"account-v1"'),
         ],
-        [(account, 200), (account, 304), (account, 304)],
+        [
+            (account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (account, 304, '"account-v1"', None),
+            (account, 304, '"account-v1"', None),
+        ],
         gateway,
     ) == []
 
@@ -6813,11 +6849,77 @@ def test_account_api_browser_requests_reject_legacy_quotes_after_cutover() -> No
             (account, '"account-v1"'),
             (account, '"account-v1"'),
         ],
-        [(account, 200), (account, 304), (account, 304)],
+        [
+            (account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (account, 304, '"account-v1"', None),
+            (account, 304, '"account-v1"', None),
+        ],
         gateway,
     )
 
     assert errors == ["浏览器仍请求 Legacy /api/quotes"]
+
+
+def test_account_api_browser_pairs_conditional_request_with_its_response() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (gateway + "/api/dashboard", None),
+            (account, None),
+            (account, '"first"'),
+            (account, '"second"'),
+        ],
+        [
+            (account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (account, 304, '"second"', None),
+            (account, 200, '"third"', {"schema_version": 1, "status": "healthy", "stale": False}),
+        ],
+        gateway,
+        expected_sha=None,
+    )
+
+    assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+
+
+def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
+
+    assert "PYTHON_BIN ?=" in makefile
+    assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' in makefile
+
+
+def test_account_cutover_runbook_verifies_shared_interpreter_and_final_gate() -> None:
+    runbook = (
+        Path(__file__).parents[1]
+        / "docs/operations/account-api-production-cutover.md"
+    ).read_text(encoding="utf-8")
+
+    assert "command -v python3" in runbook
+    assert 'test -x "$OPEN_TRADER_PYTHON"' in runbook
+    assert "make acceptance" in runbook
+    assert ".venv/bin/python" not in runbook
+
+
+def test_account_api_gateway_request_injects_production_route_marker(tmp_path: Path) -> None:
+    from test_frontend_gateway import _gateway, _running, _Upstream, _write_static_files
+
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        request = dashboard_acceptance.Request(
+            base + "/api/v1/account/snapshot",
+            headers={"X-Open-Trader-Account-Route": "caller-value"},
+        )
+        with dashboard_acceptance.urlopen(request, timeout=5) as response:
+            response.read()
+
+    assert account.requests[0]["headers"]["X-Open-Trader-Account-Route"] == "production"
+    assert legacy.requests == []
 
 
 @pytest.mark.parametrize(
