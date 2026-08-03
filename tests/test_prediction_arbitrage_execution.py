@@ -841,10 +841,34 @@ def _cross_venue_notification_signal(store: PredictionArbitrageStore) -> str:
                 "direction": "PREDICT_YES_POLYMARKET_NO",
                 "predict_fingerprint": "predict-fingerprint",
                 "polymarket_fingerprint": "poly-fingerprint",
+                "predict_market_id": "predict-market",
+                "predict_condition_id": "predict-condition",
+                "predict_yes_token_id": "predict-yes",
+                "predict_no_token_id": "predict-no",
+                "polymarket_market_id": "poly-market",
+                "polymarket_condition_id": "poly-condition",
+                "polymarket_yes_token_id": "poly-yes",
+                "polymarket_no_token_id": "poly-no",
             },
             "rules_fingerprints": {
                 "predict.fun": "predict-fingerprint",
                 "polymarket": "poly-fingerprint",
+            },
+            "approved_candidates": {
+                "predict.fun": {
+                    "market_id": "predict-market",
+                    "condition_id": "predict-condition",
+                    "yes_token_id": "predict-yes",
+                    "no_token_id": "predict-no",
+                    "rules_fingerprint": "predict-fingerprint",
+                },
+                "polymarket": {
+                    "market_id": "poly-market",
+                    "condition_id": "poly-condition",
+                    "yes_token_id": "poly-yes",
+                    "no_token_id": "poly-no",
+                    "rules_fingerprint": "poly-fingerprint",
+                },
             },
             "legs": [
                 {

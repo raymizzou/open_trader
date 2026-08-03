@@ -59,7 +59,15 @@ _PRIVATE_FIELD_PARTS = (
     "order_payload",
 )
 _PUBLIC_RELATION_TOKEN_FIELDS = frozenset(
-    {"token_id", "yes_token_id", "no_token_id"}
+    {
+        "token_id",
+        "yes_token_id",
+        "no_token_id",
+        "predict_yes_token_id",
+        "predict_no_token_id",
+        "polymarket_yes_token_id",
+        "polymarket_no_token_id",
+    }
 )
 
 
@@ -1081,11 +1089,109 @@ class PredictionArbitrageStore:
             return self._reserved_cross_principal(connection)
 
     @staticmethod
-    def _valid_cross_preview_payload(payload: Mapping[str, object]) -> bool:
+    def _nonempty_string(value: object) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _valid_decimal(value: object) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return False
+        return amount.is_finite() and amount > 0
+
+    @classmethod
+    def _valid_cross_preview_candidate(cls, candidate: object) -> bool:
+        return isinstance(candidate, Mapping) and all(
+            cls._nonempty_string(candidate.get(field))
+            for field in ("market_id", "condition_id", "yes_token_id", "no_token_id")
+        )
+
+    @classmethod
+    def _valid_cross_preview_leg(
+        cls, leg: object, *, exchange: str, outcome: str
+    ) -> bool:
+        return (
+            isinstance(leg, Mapping)
+            and leg.get("exchange") == exchange
+            and leg.get("outcome") == outcome
+            and all(
+                cls._nonempty_string(leg.get(field))
+                for field in ("market_id", "condition_id", "token_id")
+            )
+            and all(
+                cls._valid_decimal(leg.get(field))
+                for field in ("requested_quantity", "net_quantity", "max_price", "max_cost")
+            )
+        )
+
+    @classmethod
+    def _valid_cross_preview_payload(
+        cls, payload: Mapping[str, object]
+    ) -> bool:
+        intent = payload.get("intent")
+        if not (
+            payload.get("market_type") == "cross_venue_yes_no"
+            and all(
+                cls._nonempty_string(payload.get(field))
+                for field in (
+                    "opportunity_id",
+                    "execution_id",
+                    "signal_episode_id",
+                    "pair_id",
+                    "direction",
+                    "canonical_cutoff",
+                )
+            )
+            and cls._valid_decimal(payload.get("total_max_cost"))
+            and cls._valid_decimal(payload.get("minimum_payout"))
+            and cls._valid_decimal(payload.get("minimum_profit"))
+            and cls._valid_decimal(payload.get("annualized_yield"))
+        ):
+            return False
+        try:
+            _parse_timestamp(payload.get("canonical_cutoff"))
+        except ValueError:
+            return False
+        if not isinstance(intent, Mapping) or intent.get("intent_type") != "cross_venue":
+            return False
+        legs = intent.get("legs")
+        if not isinstance(legs, list) or len(legs) != 2:
+            return False
+        if not (
+            cls._valid_cross_preview_leg(legs[0], exchange="predict.fun", outcome="YES")
+            and cls._valid_cross_preview_leg(legs[1], exchange="polymarket", outcome="NO")
+        ) and not (
+            cls._valid_cross_preview_leg(legs[0], exchange="predict.fun", outcome="NO")
+            and cls._valid_cross_preview_leg(legs[1], exchange="polymarket", outcome="YES")
+        ):
+            return False
+        rules_fingerprints = payload.get("rules_fingerprints")
+        if not (
+            isinstance(rules_fingerprints, Mapping)
+            and all(
+                cls._nonempty_string(rules_fingerprints.get(exchange))
+                for exchange in ("predict.fun", "polymarket")
+            )
+        ):
+            return False
+        approved_candidates = payload.get("approved_candidates")
+        if not (
+            isinstance(approved_candidates, Mapping)
+            and cls._valid_cross_preview_candidate(approved_candidates.get("predict.fun"))
+            and cls._valid_cross_preview_candidate(approved_candidates.get("polymarket"))
+        ):
+            return False
+        approval = payload.get("codex_approval")
         return bool(
-            str(payload.get("signal_episode_id", "")).strip()
-            and isinstance(payload.get("intent"), Mapping)
-            and payload["intent"].get("intent_type") == "cross_venue"
+            isinstance(approval, Mapping)
+            and approval.get("decision") == "APPROVE"
+            and cls._nonempty_string(approval.get("cache_key"))
+            and isinstance(approval.get("direct_outcome_mapping"), Mapping)
+            and isinstance(approval.get("evidence"), list)
+            and approval.get("evidence")
         )
 
     @staticmethod
@@ -1326,6 +1432,8 @@ class PredictionArbitrageStore:
             cross_amount: Decimal | None = None
             if preview_payload.get("market_type") == "cross_venue_yes_no":
                 if not self._valid_cross_preview_payload(preview_payload):
+                    if now >= _parse_timestamp(preview["expires_at"]):
+                        raise ValueError("preview_expired")
                     raise ValueError("cross_preview_invalid")
                 cross_amount = self._cross_reservation_amount(preview_payload)
                 if (

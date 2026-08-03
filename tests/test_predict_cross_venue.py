@@ -1409,6 +1409,22 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
                 "predict.fun": "predict-fingerprint-1",
                 "polymarket": "poly-fingerprint-1",
             },
+            "approved_candidates": {
+                "predict.fun": {
+                    "market_id": "predict-market-1",
+                    "condition_id": "predict-condition-1",
+                    "yes_token_id": "predict-yes-1",
+                    "no_token_id": "predict-no-1",
+                    "rules_fingerprint": "predict-fingerprint-1",
+                },
+                "polymarket": {
+                    "market_id": "poly-market-1",
+                    "condition_id": "poly-condition-1",
+                    "yes_token_id": "poly-yes-1",
+                    "no_token_id": "poly-no-1",
+                    "rules_fingerprint": "poly-fingerprint-1",
+                },
+            },
             "codex_approval": {"decision": "APPROVE", "cache_key": "approval-1"},
         }
         for stage in range(1, 5):
@@ -1424,6 +1440,14 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
             "direction": "PREDICT_YES_POLYMARKET_NO",
             "predict_fingerprint": "predict-fingerprint-1",
             "polymarket_fingerprint": "poly-fingerprint-1",
+            "predict_market_id": "predict-market-1",
+            "predict_condition_id": "predict-condition-1",
+            "predict_yes_token_id": "predict-yes-1",
+            "predict_no_token_id": "predict-no-1",
+            "polymarket_market_id": "poly-market-1",
+            "polymarket_condition_id": "poly-condition-1",
+            "polymarket_yes_token_id": "poly-yes-1",
+            "polymarket_no_token_id": "poly-no-1",
         }
 
         stage_five = {**base, "funnel_stage": 5, "actionable": True, "clear_signal": True}
@@ -1456,6 +1480,83 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
         )
         await wait_until(lambda: len(notifications) == 2)
         assert notifications[-1] == (opportunity_id, rotated_signal["signal_id"])
+
+    asyncio.run(exercise())
+
+
+def test_monitor_candidate_identity_rotation_closes_old_episode_and_creates_new_signal_id(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        store = PredictionArbitrageStore(tmp_path / "data")
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            store=store,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        base = {
+            "opportunity_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "market_type": "cross_venue_yes_no",
+            "execution_mode": "observe_only",
+            "total_max_cost": Decimal("8.128"),
+            "minimum_profit": Decimal("1.872"),
+            "rules_fingerprints": {
+                "predict.fun": "predict-fingerprint-1",
+                "polymarket": "poly-fingerprint-1",
+            },
+            "approved_candidates": {
+                "predict.fun": {
+                    "market_id": "predict-market-1",
+                    "condition_id": "predict-condition-1",
+                    "yes_token_id": "predict-yes-1",
+                    "no_token_id": "predict-no-1",
+                    "rules_fingerprint": "predict-fingerprint-1",
+                },
+                "polymarket": {
+                    "market_id": "poly-market-1",
+                    "condition_id": "poly-condition-1",
+                    "yes_token_id": "poly-yes-1",
+                    "no_token_id": "poly-no-1",
+                    "rules_fingerprint": "poly-fingerprint-1",
+                },
+            },
+            "codex_approval": {"decision": "APPROVE", "cache_key": "approval-1"},
+        }
+
+        monitor._persist_observation(
+            {**base, "funnel_stage": 4, "actionable": False, "clear_signal": False}
+        )
+        first = store.open_signal_history()[0]
+
+        changed_candidate = {
+            **base,
+            "approved_candidates": {
+                **base["approved_candidates"],
+                "predict.fun": {
+                    **base["approved_candidates"]["predict.fun"],
+                    "yes_token_id": "predict-yes-rotated",
+                },
+            },
+        }
+        monitor._persist_observation(
+            {
+                **changed_candidate,
+                "funnel_stage": 4,
+                "actionable": False,
+                "clear_signal": False,
+            }
+        )
+
+        rotated = store.open_signal_history()[0]
+        assert rotated["signal_id"] != first["signal_id"]
+        assert store.signal(str(first["signal_id"]))["ended_reason"] == "notification_identity_rotated"  # type: ignore[index]
+        assert rotated["notification_dedupe_identity"]["predict_yes_token_id"] == "predict-yes-rotated"  # type: ignore[index]
 
     asyncio.run(exercise())
 

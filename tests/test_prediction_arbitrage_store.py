@@ -54,28 +54,78 @@ def cross_preview_payload(
     net_quantity: Decimal = Decimal("5"),
 ) -> dict[str, object]:
     return {
+        "execution_id": f"execution:{market_id}",
+        "opportunity_id": f"cross:{market_id}:PREDICT_YES_POLYMARKET_NO",
         "event_id": "cross-event-1",
         "market_id": market_id,
         "market_type": "cross_venue_yes_no",
         "signal_episode_id": f"signal:{market_id}",
+        "pair_id": market_id,
+        "direction": "PREDICT_YES_POLYMARKET_NO",
         "quantity": net_quantity,
         "total_max_cost": total_max_cost,
+        "minimum_payout": net_quantity,
+        "minimum_profit": Decimal("0.50"),
+        "annualized_yield": Decimal("0.16"),
+        "canonical_cutoff": "2026-09-03T00:00:00Z",
+        "rules_fingerprints": {
+            "predict.fun": "predict-fingerprint",
+            "polymarket": "poly-fingerprint",
+        },
+        "approved_candidates": {
+            "predict.fun": {
+                "market_id": "predict-market",
+                "condition_id": "predict-condition",
+                "yes_token_id": "predict-yes",
+                "no_token_id": "predict-no",
+                "rules_fingerprint": "predict-fingerprint",
+            },
+            "polymarket": {
+                "market_id": "poly-market",
+                "condition_id": "poly-condition",
+                "yes_token_id": "poly-yes",
+                "no_token_id": "poly-no",
+                "rules_fingerprint": "poly-fingerprint",
+            },
+        },
+        "codex_approval": {
+            "decision": "APPROVE",
+            "cache_key": "cross-cache",
+            "direct_outcome_mapping": {
+                "predict_yes": "YES",
+                "predict_no": "NO",
+                "polymarket_yes": "YES",
+                "polymarket_no": "NO",
+            },
+            "evidence": [
+                {"exchange": "predict.fun", "quote": "same rules"},
+                {"exchange": "polymarket", "quote": "same rules"},
+            ],
+        },
         "intent": {
             "intent_type": "cross_venue",
             "legs": [
                 {
                     "exchange": "predict.fun",
+                    "market_id": "predict-market",
                     "condition_id": "predict-condition",
                     "outcome": "YES",
                     "token_id": "predict-yes",
+                    "requested_quantity": net_quantity,
                     "net_quantity": net_quantity,
+                    "max_price": Decimal("0.45"),
+                    "max_cost": Decimal("2.25"),
                 },
                 {
                     "exchange": "polymarket",
+                    "market_id": "poly-market",
                     "condition_id": "poly-condition",
                     "outcome": "NO",
                     "token_id": "poly-no",
+                    "requested_quantity": net_quantity,
                     "net_quantity": net_quantity,
+                    "max_price": Decimal("0.45"),
+                    "max_cost": Decimal("2.25"),
                 },
             ],
         },
@@ -543,11 +593,71 @@ def test_cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving(
     payload["signal_episode_id"] = ""
     preview_id = db.create_preview(
         payload,
-        expires_at=iso(datetime.now(UTC) - timedelta(hours=1)),
+        expires_at=iso(datetime.now(UTC) + timedelta(hours=1)),
     )
 
     with pytest.raises(ValueError, match="cross_preview_invalid"):
         db.consume_preview_and_create_execution(preview_id, "cross-invalid")
+
+    assert db.cross_unsettled_principal() == Decimal("0")
+    with sqlite3.connect(db.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM cross_execution_reservations"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("opportunity_id", lambda payload: payload.pop("opportunity_id")),
+        ("execution_id", lambda payload: payload.pop("execution_id")),
+        ("signal_episode_id", lambda payload: payload.pop("signal_episode_id")),
+        ("pair_id", lambda payload: payload.pop("pair_id")),
+        ("direction", lambda payload: payload.pop("direction")),
+        ("canonical_cutoff", lambda payload: payload.pop("canonical_cutoff")),
+        ("rules_fingerprints", lambda payload: payload.pop("rules_fingerprints")),
+        ("approved_candidates", lambda payload: payload.pop("approved_candidates")),
+        ("codex_approval", lambda payload: payload.pop("codex_approval")),
+        ("minimum_payout", lambda payload: payload.pop("minimum_payout")),
+        ("minimum_profit", lambda payload: payload.pop("minimum_profit")),
+        ("annualized_yield", lambda payload: payload.pop("annualized_yield")),
+        (
+            "intent_legs",
+            lambda payload: payload["intent"].__setitem__("legs", payload["intent"]["legs"][:1]),
+        ),
+        (
+            "intent_predict_market_id",
+            lambda payload: payload["intent"]["legs"][0].pop("market_id"),
+        ),
+        (
+            "intent_predict_requested_quantity",
+            lambda payload: payload["intent"]["legs"][0].pop("requested_quantity"),
+        ),
+        (
+            "intent_poly_max_cost",
+            lambda payload: payload["intent"]["legs"][1].pop("max_cost"),
+        ),
+    ],
+)
+def test_expired_incomplete_cross_preview_keeps_legacy_ttl_and_never_reserves(
+    tmp_path: Path,
+    label: str,
+    mutate,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(total_max_cost=Decimal("10.50"))
+    mutate(payload)
+    preview_id = db.create_preview(
+        payload,
+        expires_at=iso(datetime.now(UTC) - timedelta(hours=1)),
+    )
+
+    with pytest.raises(ValueError, match="preview_expired"):
+        db.consume_preview_and_create_execution(preview_id, f"cross-expired-{label}")
 
     assert db.cross_unsettled_principal() == Decimal("0")
     with sqlite3.connect(db.path) as connection:

@@ -114,7 +114,20 @@ def cross_venue_notification_dedupe_identity(
     }
     if not all(isinstance(value, str) and value.strip() for value in values.values()):
         return None
-    return {name: str(value) for name, value in values.items()}
+    result = {name: str(value) for name, value in values.items()}
+    approved_candidates = opportunity.get("approved_candidates")
+    if not isinstance(approved_candidates, Mapping):
+        return result
+    for exchange, prefix in (("predict.fun", "predict"), ("polymarket", "polymarket")):
+        candidate = approved_candidates.get(exchange)
+        if not isinstance(candidate, Mapping):
+            return result
+        for field in ("market_id", "condition_id", "yes_token_id", "no_token_id"):
+            value = candidate.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return result
+            result[f"{prefix}_{field}"] = value
+    return result
 
 
 @dataclass(frozen=True, slots=True)
