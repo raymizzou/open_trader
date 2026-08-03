@@ -20,7 +20,11 @@ import pytest
 
 import open_trader.account_api as account_api
 import open_trader.account_snapshot as account_snapshot
-from open_trader.account_snapshot import load_account_snapshot
+from open_trader.account_snapshot import (
+    build_instrument_id,
+    build_position_id,
+    load_account_snapshot,
+)
 from open_trader.account_sync_state import (
     LIVE_BROKERS,
     REQUIRED_BROKERS,
@@ -660,6 +664,42 @@ def test_snapshot_maps_current_publication_to_frozen_v1_contract(tmp_path: Path)
     visible.pop("snapshot_generation")
     assert result.payload["snapshot_generation"] == _contract_sha(visible)
     assert not ({"risk_flag", "actionable", "decision_plan"} & result.payload.keys())
+
+
+def test_public_stable_id_helpers_match_position_rows() -> None:
+    position = account_snapshot._position_row({
+        "broker": "FUTU",
+        "account_alias": "futu_main",
+        "market": "US",
+        "asset_class": "OPTION",
+        "symbol": "VIXY260821C22000",
+        "name": "VIXY option",
+        "currency": "USD",
+        "quantity": "1",
+        "cost_price": "1",
+        "cost_value": "1",
+        "last_price": "1",
+        "price_kind": "live",
+        "price_as_of": "2026-08-03T12:00:04+08:00",
+        "market_value": "1",
+        "market_value_usd": "1",
+        "market_value_hkd": "7.8",
+        "cost_value_hkd": "7.8",
+        "unrealized_pnl": "0",
+        "unrealized_pnl_pct": "0",
+        "account_weight_hkd": "1",
+        "portfolio_weight_hkd": "1",
+        "statement_id": "",
+        "confidence": "high",
+        "notes": "",
+    })
+
+    instrument_id = build_instrument_id("us", "OPTION", " vixy260821c22000 ")
+
+    assert instrument_id == position["instrument_id"]
+    assert build_position_id("FUTU", "futu_main", instrument_id) == position["position_id"]
+    assert instrument_id == build_instrument_id(" US ", " option ", " VIXY260821C22000 ")
+    assert instrument_id != build_instrument_id("us", "STOCK", " vixy260821c22000 ")
 
 
 def test_snapshot_whitelists_public_fields_and_requires_quote_publication_time(
