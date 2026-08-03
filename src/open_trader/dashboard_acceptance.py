@@ -20,6 +20,7 @@ from .dashboard import (
     _is_dashboard_holding,
     _project_trend_actions,
     _project_trend_money_fields,
+    _project_trend_strength_fields,
     _read_csv_rows,
     _valid_partial_trend_action,
 )
@@ -2494,6 +2495,17 @@ def _check_trend_artifact_projection(
         "hold_actions": holds,
         "review_actions": reviews,
     }
+    frozen_signals = payload.get("signal_snapshots")
+    frozen_signals = frozen_signals if isinstance(frozen_signals, Mapping) else {}
+    expected_actions["buy_actions"] = _project_trend_strength_fields(
+        expected_actions["buy_actions"], frozen_signals.get("candidates")
+    )
+    expected_actions["sell_actions"] = _project_trend_strength_fields(
+        expected_actions["sell_actions"], frozen_signals.get("holdings")
+    )
+    expected_actions["hold_actions"] = _project_trend_strength_fields(
+        expected_actions["hold_actions"], frozen_signals.get("holdings")
+    )
     assert all(
         isinstance(projected := report.get(key), list)
         and all(isinstance(item, Mapping) for item in projected)

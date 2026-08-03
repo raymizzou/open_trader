@@ -881,7 +881,9 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
             }],
             "top10_candidates": [],
         },
-        "signal_snapshots": {"holdings": {"EOG": {"phase": "立夏"}}},
+        "signal_snapshots": {
+            "holdings": {"EOG": {"phase": "立夏", "global_strength": "92.0"}},
+        },
         "excluded": {},
         "industry_concentration": [],
         "data_sources": [],
@@ -898,6 +900,7 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
         "hold_actions": [{
             "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
             "phase": "立夏",
+            "global_strength": "92.0",
             "trend_report_state": "included",
             "option_anomaly": {
                 "available": False,
