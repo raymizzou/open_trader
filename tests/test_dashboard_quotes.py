@@ -260,6 +260,36 @@ def test_quote_service_normalizes_active_us_price_time_to_milliseconds(
     assert result.quotes["US.MSFT"]["price_time"] == "2026-07-15 03:03:01.000"
 
 
+@pytest.mark.parametrize(
+    ("update_time", "expected_price_time"),
+    [
+        ("2026-07-15", "2026-07-15"),
+        ("not-a-timestamp", "not-a-timestamp"),
+        ("2026-07-15T03:03:01+00:00", "2026-07-15T03:03:01+00:00"),
+    ],
+)
+def test_quote_service_preserves_non_naive_futu_price_time(
+    tmp_path: Path, update_time: str, expected_price_time: str
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        update_time=update_time,
+        last="61.23",
+        pre="60.73",
+        after="62.22",
+        overnight="61.50",
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+
+    assert result.quotes["US.MSFT"]["price_time"] == expected_price_time
+
+
 def test_quote_service_labels_active_session_fallback_without_fake_time(
     tmp_path: Path,
 ) -> None:

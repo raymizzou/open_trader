@@ -411,6 +411,8 @@ def _select_us_price(
 
 
 def _normalize_futu_us_price_time(value: str) -> str:
+    if len(value) < 19 or value[10] not in {" ", "T"} or value[11:].count(":") < 2:
+        return value
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
