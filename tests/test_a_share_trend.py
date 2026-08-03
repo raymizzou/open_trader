@@ -602,7 +602,12 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         assert "市场资源排名" in text
         assert "模拟盘自动轮换" in text
         assert "MARKET 卖出全成后才买入" in text
-    assert feishu.index("\n卖出\n") < feishu.index("模拟盘自动轮换") < feishu.index("\n买入\n")
+    assert (
+        feishu.index("市场资源排名")
+        < feishu.index("\n卖出\n")
+        < feishu.index("模拟盘自动轮换")
+        < feishu.index("\n买入\n")
+    )
 
     invalid_payloads = []
     wrong_hash = json.loads(json.dumps(payload))

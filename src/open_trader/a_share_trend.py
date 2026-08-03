@@ -5242,6 +5242,13 @@ def render_trend_feishu_text(
         f"账户状态：{status}",
         summary,
     ]
+    allocation = payload.get("allocation")
+    if allocation is not None:
+        if not isinstance(allocation, Mapping):
+            raise ValueError("冻结配置无效")
+        lines.extend(
+            _allocation_markdown_lines(allocation, execution_date=execution_date)
+        )
     if cost_label := _serialized_api_cost_label(payload):
         lines.append(cost_label)
     _append_feishu_action_sections(
@@ -5252,13 +5259,7 @@ def render_trend_feishu_text(
         market=market,
         current_exit_discipline=current_exit_discipline,
     )
-    allocation = payload.get("allocation")
     if allocation is not None:
-        if not isinstance(allocation, Mapping):
-            raise ValueError("冻结配置无效")
-        lines.extend(
-            _allocation_markdown_lines(allocation, execution_date=execution_date)
-        )
         lines.extend(
             _rotation_markdown_lines(
                 [
