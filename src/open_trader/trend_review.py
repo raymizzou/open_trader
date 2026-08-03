@@ -3430,7 +3430,30 @@ def _validate_rotation_event(
         if not order_id or side != expected_side or (expected_code and order_code != expected_code):
             raise ValueError(label)
     if kind in {"sell_fill", "sell_observation", "buy_fill"}:
-        if str(payload.get("status") or "") != "filled" or not isinstance(order, Mapping):
+        if (
+            str(payload.get("status") or "") != "filled"
+            or not isinstance(request, Mapping)
+            or not isinstance(order, Mapping)
+            or str(order.get("order_status", order.get("status", ""))).upper()
+            not in {"FILLED", "FILLED_ALL", "DEALT_ALL"}
+        ):
+            raise ValueError(label)
+        try:
+            target_qty = _required_decimal(payload.get("target_qty"), "rotation target quantity")
+            filled_qty = _required_decimal(payload.get("filled_qty"), "rotation filled quantity")
+            request_qty = _required_decimal(request.get("qty"), "request quantity")
+            broker_qty = _required_decimal(order.get("qty"), "broker order quantity")
+            dealt_qty = _required_decimal(order.get("dealt_qty"), "broker dealt quantity")
+        except ValueError:
+            raise ValueError(label) from None
+        if (
+            target_qty <= 0
+            or target_qty != filled_qty
+            or target_qty != request_qty
+            or target_qty != broker_qty
+            or target_qty != dealt_qty
+            or not _order_matches_request(order, request)
+        ):
             raise ValueError(label)
 
 
@@ -3687,6 +3710,169 @@ def _ensure_rotation_action_attribution(
     )
 
 
+def _rotation_historical_opening_strategy_details(
+    data_dir: Path,
+    *,
+    market: str,
+    futu_code: str,
+    execution_date: str,
+) -> tuple[str, str] | None:
+    """Recover an open simulated position's strategy from prior fill facts.
+
+    Account snapshots and protection state deliberately contain no strategy
+    provenance in production.  The validated discipline/action streams are
+    the durable historical source: replay filled buys and sells for this
+    code, retaining the strategy attached to the still-open buy lot.
+    """
+    records: dict[str, dict[str, object]] = {}
+
+    def add_record(
+        *,
+        trading_date: str,
+        recorded_at: str,
+        order_id: str,
+        side: str,
+        quantity: object,
+        opening_version: object,
+        source: str,
+    ) -> None:
+        try:
+            qty = _required_decimal(quantity, "historical rotation fill quantity")
+        except ValueError:
+            return
+        if qty <= 0 or side not in {"BUY", "SELL"}:
+            return
+        key = order_id or f"{source}:{trading_date}:{recorded_at}:{len(records)}"
+        value = str(opening_version or "").strip()
+        existing = records.get(key)
+        if existing is None or (
+            not str(existing.get("opening_version") or "").strip() and value
+        ):
+            records[key] = {
+                "date": trading_date,
+                "recorded_at": recorded_at,
+                "side": side,
+                "quantity": qty,
+                "opening_version": value,
+                "source": source,
+            }
+
+    discipline_root = data_dir / "trend_review" / "facts" / "discipline" / market
+    for path in sorted(discipline_root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            trading_date = date.fromisoformat(path.stem).isoformat()
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            continue
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != "open_trader.trend_review.discipline.v1"
+            or payload.get("market") != market
+            or payload.get("date") != trading_date
+            or trading_date >= execution_date
+            or not isinstance(payload.get("orders"), list)
+        ):
+            continue
+        fact_snapshot = payload.get("strategy_snapshot")
+        for index, order in enumerate(payload["orders"]):
+            if not isinstance(order, Mapping):
+                continue
+            status = str(order.get("status") or order.get("order_status") or "").upper()
+            if status not in {"FILLED", "FILLED_ALL", "DEALT_ALL"}:
+                continue
+            code = str(order.get("code") or order.get("futu_code") or "").strip().upper()
+            if code != futu_code:
+                continue
+            side = str(order.get("side") or order.get("trd_side") or "").upper()
+            opening_snapshot = order.get("strategy_snapshot")
+            opening_version = (
+                order.get("opening_strategy_version")
+                or (
+                    opening_snapshot.get("strategy_version")
+                    if isinstance(opening_snapshot, Mapping)
+                    else None
+                )
+                or (
+                    fact_snapshot.get("strategy_version")
+                    if isinstance(fact_snapshot, Mapping)
+                    else None
+                )
+            )
+            add_record(
+                trading_date=trading_date,
+                recorded_at=str(order.get("updated_time") or order.get("create_time") or index),
+                order_id=str(order.get("order_id") or order.get("orderid") or ""),
+                side=side,
+                quantity=order.get("dealt_qty", order.get("qty")),
+                opening_version=opening_version,
+                source="historical_discipline",
+            )
+
+    action_root = data_dir / "trend_review" / "ledgers" / market / "actions"
+    for date_root in sorted(action_root.glob("*")):
+        if not date_root.is_dir():
+            continue
+        try:
+            trading_date = date.fromisoformat(date_root.name).isoformat()
+        except ValueError:
+            continue
+        if trading_date >= execution_date:
+            continue
+        for path in sorted(date_root.glob("*/*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping) or payload.get("status") != "filled":
+                continue
+            code = str(payload.get("futu_code") or "").strip().upper()
+            if code != futu_code:
+                continue
+            side = str(payload.get("side") or "").strip().upper()
+            order_ids = payload.get("order_ids")
+            order_id = (
+                str(order_ids[0]).strip()
+                if isinstance(order_ids, list) and len(order_ids) == 1
+                else ""
+            )
+            add_record(
+                trading_date=trading_date,
+                recorded_at=str(payload.get("recorded_at") or path.name),
+                order_id=order_id,
+                side=side,
+                quantity=payload.get("filled_qty"),
+                opening_version=payload.get("strategy_version") if side == "BUY" else "",
+                source="historical_action",
+            )
+
+    ordered = sorted(
+        records.values(),
+        key=lambda item: (
+            str(item.get("date") or ""),
+            str(item.get("recorded_at") or ""),
+            str(item.get("source") or ""),
+        ),
+    )
+    open_quantity = Decimal("0")
+    opening_version = ""
+    opening_source = ""
+    for record in ordered:
+        quantity = _required_decimal(record.get("quantity"), "historical rotation quantity")
+        if record.get("side") == "BUY":
+            if open_quantity <= 0:
+                opening_version = str(record.get("opening_version") or "").strip() or "unknown"
+                opening_source = str(record.get("source") or "historical")
+            open_quantity += quantity
+        elif open_quantity > 0:
+            open_quantity = max(Decimal("0"), open_quantity - quantity)
+            if open_quantity == 0:
+                opening_version = ""
+                opening_source = ""
+    if open_quantity > 0:
+        return opening_version or "unknown", opening_source or "historical_unknown"
+    return None
+
+
 def _rotation_opening_strategy_details(
     data_dir: Path,
     *,
@@ -3767,17 +3953,20 @@ def _rotation_opening_strategy_details(
         value = str(candidate or "").strip()
         if value:
             return value, source
+    historical = _rotation_historical_opening_strategy_details(
+        data_dir,
+        market=market,
+        futu_code=sell_code,
+        execution_date=str(report.get("execution_date") or "9999-12-31"),
+    )
+    if historical is not None:
+        return historical
     if position_provenance_present:
         # An existing holding without provenance must not be silently
         # attributed to the report that is closing it.  Keep the lifecycle
         # visible, but make its Kelly attribution explicitly unknown.
         return "unknown", "unattributed_existing_position"
-    strategy_snapshot = report.get("strategy_snapshot")
-    return str(
-        strategy_snapshot.get("strategy_version")
-        if isinstance(strategy_snapshot, Mapping)
-        else ""
-    ), "closing_strategy_version_fallback"
+    return "unknown", "unattributed_existing_position"
 
 
 def _rotation_opening_strategy_version(
@@ -4090,10 +4279,25 @@ def execute_relative_rotations(
                 "order_type": "MARKET", "price": "0", "qty": format(sell_qty, "f"),
                 "remark": f"rotation:{market}:{execution_date}:{pair_key[:16]}:S:1",
             }
+            opening_version, opening_source = _rotation_opening_strategy_details(
+                data_dir,
+                market=market,
+                pair=pair,
+                report=report,
+                snapshot=snapshot,
+            )
+            sell_intent_payload = {
+                **evidence,
+                "kind": "sell_intent",
+                "attempt": 1,
+                "request": request,
+                "opening_strategy_version": opening_version,
+                "opening_strategy_version_source": opening_source,
+                "recorded_at": now,
+            }
             intent_path = _write_rotation_fact(
                 root, "sell-attempt-1-intent",
-                {**evidence, "kind": "sell_intent", "attempt": 1,
-                 "request": request, "recorded_at": now},
+                sell_intent_payload,
             )
             artifacts.append(str(intent_path))
             try:
@@ -4110,10 +4314,13 @@ def execute_relative_rotations(
             result_path = _write_rotation_fact(
                 root, "sell-attempt-1-result",
                 {**evidence, "kind": "sell_result", "attempt": 1,
-                 "request": request, "response": response, "recorded_at": now},
+                 "request": request, "response": response,
+                 "opening_strategy_version": opening_version,
+                 "opening_strategy_version_source": opening_source,
+                 "recorded_at": now},
             )
             artifacts.append(str(result_path))
-            sell_intent = {"request": request}
+            sell_intent = sell_intent_payload
 
         if not sell_filled:
             request = sell_intent.get("request") if isinstance(sell_intent, Mapping) else None
@@ -4155,13 +4362,24 @@ def execute_relative_rotations(
                     if isinstance(strategy_snapshot, Mapping)
                     else ""
                 )
-                opening_version, opening_source = _rotation_opening_strategy_details(
-                    data_dir,
-                    market=market,
-                    pair=pair,
-                    report=report,
-                    snapshot=snapshot,
-                )
+                opening_version = str(
+                    sell_intent.get("opening_strategy_version")
+                    if isinstance(sell_intent, Mapping)
+                    else ""
+                ).strip()
+                opening_source = str(
+                    sell_intent.get("opening_strategy_version_source")
+                    if isinstance(sell_intent, Mapping)
+                    else ""
+                ).strip()
+                if not opening_version:
+                    opening_version, opening_source = _rotation_opening_strategy_details(
+                        data_dir,
+                        market=market,
+                        pair=pair,
+                        report=report,
+                        snapshot=snapshot,
+                    )
                 observation = _write_rotation_fact(
                     root, "sell-filled",
                     {**evidence, "kind": "sell_fill", "status": "filled",
@@ -6511,6 +6729,30 @@ def _merge_rotation_orders(
                 and existing_price != rotation_price
             ):
                 raise ValueError("conflicting rotation fill order identity")
+
+            def normalized_status(order_row: Mapping[str, object]) -> str:
+                raw_status = str(
+                    order_row.get("order_status") or order_row.get("status") or ""
+                ).strip().upper()
+                return {
+                    "FILLED_ALL": "FILLED",
+                    "DEALT_ALL": "FILLED",
+                    "FILLED_PART": "PARTIAL",
+                    "CANCELLED_PART": "PARTIAL",
+                    "CANCELLED_ALL": "CANCELLED",
+                    "CANCELLED": "CANCELLED",
+                }.get(raw_status, raw_status)
+
+            existing_status = normalized_status(existing)
+            rotation_status = normalized_status(order)
+            if (
+                existing_status
+                and rotation_status
+                and existing_status != rotation_status
+                and existing_status
+                not in {"SUBMITTING", "SUBMITTED", "WAITING_SUBMIT", "ACTIVE"}
+            ):
+                raise ValueError("conflicting rotation fill order identity")
             merged[index] = {
                 **existing,
                 **{
@@ -6521,6 +6763,8 @@ def _merge_rotation_orders(
                         "execution_date", "opening_strategy_version",
                         "opening_strategy_version_source", "closing_strategy_version",
                         "strategy_snapshot", "exit_reason",
+                        "order_status", "status", "dealt_qty", "dealt_avg_price",
+                        "avg_price",
                     }
                 },
             }
@@ -6550,6 +6794,11 @@ def _rotation_fill_orders(
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid relative rotation fill: {path}") from exc
+            if isinstance(payload, Mapping):
+                try:
+                    _validate_rotation_event(payload, path)
+                except ValueError as exc:
+                    raise ValueError(f"invalid relative rotation fill: {path}") from exc
             order = payload.get("order") if isinstance(payload, Mapping) else None
             if (
                 not isinstance(payload, Mapping)

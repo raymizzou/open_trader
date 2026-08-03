@@ -1243,6 +1243,12 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
         {"orders": [dict(client.orders[0])]}, tmp_path, "CN", "2026-07-20"
     )
     assert merged["orders"][0]["pair_key"]
+    stale_status = dict(client.orders[0])
+    stale_status["order_status"] = "SUBMITTED"
+    upgraded = trend_review._merge_rotation_orders(
+        {"orders": [stale_status]}, tmp_path, "CN", "2026-07-20"
+    )
+    assert upgraded["orders"][0]["order_status"] == "FILLED_ALL"
     conflicting = dict(client.orders[0])
     conflicting["dealt_qty"] = "999"
     with pytest.raises(ValueError, match="conflicting rotation fill order identity"):
@@ -1319,6 +1325,38 @@ def test_relative_rotation_events_bind_the_pair_path(
     (sibling / "terminal.json").write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="invalid relative rotation fact"):
         trend_review._rotation_events(sibling)
+
+
+def test_relative_rotation_events_reject_incomplete_fill_sidecar(
+    tmp_path: Path,
+) -> None:
+    report = relative_rotation_report()
+    report_sha = trend_review._report_hash(report)
+    pair_key = trend_review._rotation_pair_key("CN", 101, "2026-07-20", report_sha, 0)
+    root = (
+        tmp_path / "trend_review/ledgers/CN/rotations/2026-07-20" / pair_key
+    )
+    root.mkdir(parents=True)
+    request = {
+        "market": "CN", "futu_code": "SH.WEAK", "side": "SELL",
+        "qty": "1000", "remark": "rotation:test",
+    }
+    payload = {
+        "schema_version": "open_trader.trend_review.rotation.v1",
+        "kind": "sell_fill", "status": "filled", "market": "CN",
+        "account_id": 101, "execution_date": "2026-07-20",
+        "report_sha256": report_sha, "pair_index": 0, "pair_key": pair_key,
+        "sell_futu_symbol": "SH.WEAK", "buy_futu_symbol": "SH.STRONG",
+        "target_qty": "1000", "filled_qty": "1000", "request": request,
+        "order": {
+            "order_id": "bad-status", "code": "SH.WEAK", "trd_side": "SELL",
+            "remark": "rotation:test", "qty": "1000", "dealt_qty": "1000",
+            "order_status": "CANCELLED_PART",
+        },
+    }
+    (root / "sell-filled.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid relative rotation fact"):
+        trend_review._rotation_events(root)
 
 
 def test_relative_rotation_requires_exact_full_fill_and_no_sidecar_on_bad_quantity(
@@ -1454,6 +1492,38 @@ def test_relative_rotation_opening_version_uses_position_provenance_or_unknown(
         snapshot={"positions": [{"code": "SH.WEAK", "qty": "1000"}]},
     )
     assert protected == ("v8", "protection_state")
+
+
+def test_relative_rotation_opening_version_recovers_prior_buy_fact_after_snapshot_clears(
+    tmp_path: Path,
+) -> None:
+    trend_review.freeze_discipline_fact(
+        tmp_path,
+        "CN",
+        "2026-07-19",
+        "100000",
+        [{
+            "order_id": "prior-buy",
+            "code": "SH.WEAK",
+            "trd_side": "BUY",
+            "qty": "1000",
+            "dealt_qty": "1000",
+            "dealt_avg_price": "7",
+            "order_status": "FILLED_ALL",
+            "remark": "ordinary:prior-buy",
+        }],
+        {"strategy_id": "trend_animals_warm_to_hot/CN/v10", "strategy_version": "v10"},
+    )
+    pair = relative_rotation_pair()
+    report = relative_rotation_report()
+    details = trend_review._rotation_opening_strategy_details(
+        tmp_path,
+        market="CN",
+        pair=pair,
+        report=report,
+        snapshot={"positions": []},
+    )
+    assert details == ("v10", "historical_discipline")
 
 
 @pytest.mark.parametrize(
