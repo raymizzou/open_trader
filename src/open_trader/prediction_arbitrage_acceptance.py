@@ -186,7 +186,6 @@ class _PolymarketReadOnlyGuard:
         {
             "notify",
             "notify_live",
-            "send",
             "send_notification",
             "drop_notifications",
         }
@@ -243,15 +242,15 @@ class _PolymarketReadOnlyGuard:
             return "mutation"
         return None
 
-    def violation(self, name: str) -> None:
-        kind = self._kind(name)
+    def violation(self, name: str, *, kind: str | None = None) -> None:
+        kind = kind or self._kind(name)
         if kind == "notification":
             self.live_notifications += 1
         else:
             self.mutation_calls += 1
         raise _PolymarketMutationViolation("Polymarket mutation or notification prohibited")
 
-    def protect(self, value: object) -> object:
+    def protect(self, value: object, *, notification_scope: bool = False) -> object:
         if value is None or isinstance(value, (str, bytes, bytearray, bool, int, float, Decimal)):
             return value
         if isinstance(value, (_GuardedCallable, _GuardedPolymarketValue)):
@@ -260,7 +259,7 @@ class _PolymarketReadOnlyGuard:
             return _GuardedCallable(
                 self,
                 function=value.__func__,
-                proxy_self=self.wrap(value.__self__),
+                proxy_self=self.wrap(value.__self__, notification_scope=notification_scope),
             )
         if callable(value):
             call = getattr(value, "__call__", None)
@@ -268,7 +267,7 @@ class _PolymarketReadOnlyGuard:
                 return _GuardedCallable(
                     self,
                     function=call.__func__,
-                    proxy_self=self.wrap(value),
+                    proxy_self=self.wrap(value, notification_scope=notification_scope),
                 )
             return _GuardedCallable(self, target=value)
         return self.wrap(value)
@@ -286,16 +285,23 @@ class _PolymarketReadOnlyGuard:
         self.violation(name)
         return None
 
-    def wrap(self, value: object) -> "_GuardedPolymarketValue":
-        return _GuardedPolymarketValue(value, self)
+    def wrap(self, value: object, *, notification_scope: bool = False) -> "_GuardedPolymarketValue":
+        return _GuardedPolymarketValue(value, self, notification_scope=notification_scope)
 
 
 class _GuardedPolymarketValue:
-    __slots__ = ("_value", "_guard")
+    __slots__ = ("_value", "_guard", "_notification_scope")
 
-    def __init__(self, value: object, guard: _PolymarketReadOnlyGuard) -> None:
+    def __init__(
+        self,
+        value: object,
+        guard: _PolymarketReadOnlyGuard,
+        *,
+        notification_scope: bool = False,
+    ) -> None:
         object.__setattr__(self, "_value", value)
         object.__setattr__(self, "_guard", guard)
+        object.__setattr__(self, "_notification_scope", notification_scope)
 
     def __getattribute__(self, name: str) -> object:
         if name in {"_value", "_guard"}:
@@ -310,14 +316,23 @@ class _GuardedPolymarketValue:
 
     def __getattr__(self, name: str) -> object:
         guard = object.__getattribute__(self, "_guard")
+        notification_scope = object.__getattribute__(self, "_notification_scope")
         kind = guard._kind(name)
         if kind is not None:
             return lambda *args, **kwargs: guard.violation(name)
+        if name.lower() == "send" and notification_scope:
+            return lambda *args, **kwargs: guard.violation(name, kind="notification")
         value = getattr(object.__getattribute__(self, "_value"), name)
         if name.lower() == "request" and callable(value):
-            guarded = guard.protect(value)
+            guarded = guard.protect(value, notification_scope=notification_scope)
             return lambda *args, **kwargs: guard.call(name, guarded, *args, **kwargs)
-        return guard.protect(value)
+        child_scope = notification_scope or name.lower() in {
+            "notifier",
+            "_notifier",
+            "notification",
+            "_notification",
+        }
+        return guard.protect(value, notification_scope=child_scope)
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in {"_value", "_guard"}:
@@ -333,11 +348,15 @@ class _GuardedPolymarketValue:
     def __getitem__(self, key: object) -> object:
         guard = object.__getattribute__(self, "_guard")
         value = object.__getattribute__(self, "_value")[key]  # type: ignore[index]
-        return guard.protect(value)
+        return guard.protect(
+            value,
+            notification_scope=object.__getattribute__(self, "_notification_scope"),
+        )
 
     def __iter__(self) -> Iterator[object]:
         guard = object.__getattribute__(self, "_guard")
-        return (guard.protect(value) for value in object.__getattribute__(self, "_value"))  # type: ignore[union-attr]
+        scope = object.__getattribute__(self, "_notification_scope")
+        return (guard.protect(value, notification_scope=scope) for value in object.__getattribute__(self, "_value"))  # type: ignore[union-attr]
 
     def __len__(self) -> int:
         return len(object.__getattribute__(self, "_value"))  # type: ignore[arg-type]
@@ -365,14 +384,22 @@ def _guard_polymarket_client(
         except AttributeError:
             continue
         try:
-            setattr(client, name, guard.wrap(value))
+            setattr(
+                client,
+                name,
+                guard.wrap(
+                    value,
+                    notification_scope=name.lower()
+                    in {"notifier", "_notifier", "notification", "_notification"},
+                ),
+            )
         except Exception:
             for restored_name, restored_value in reversed(replacements):
                 setattr(client, restored_name, restored_value)
             raise RuntimeError("Polymarket read-only guard unavailable") from None
         replacements.append((name, value))
 
-    direct_names = set(guard._MUTATION_NAMES) | set(guard._NOTIFICATION_NAMES) | {"request"}
+    direct_names = set(guard._MUTATION_NAMES) | set(guard._NOTIFICATION_NAMES) | {"request", "send"}
     direct_names.update(name for name in dir(client) if guard._kind(name) is not None)
     try:
         for name in direct_names:

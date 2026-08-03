@@ -337,13 +337,13 @@ def test_polymarket_guard_blocks_read_method_using_raw_nested_transport(
     assert report.live_notifications == 0
 
 
-def test_polymarket_guard_preserves_nested_get_read_method(tmp_path: Path) -> None:
+def test_polymarket_guard_preserves_nested_network_send_read_method(tmp_path: Path) -> None:
     class Transport:
         def __init__(self) -> None:
-            self.get_calls = 0
+            self.send_calls = 0
 
-        def get(self) -> object:
-            self.get_calls += 1
+        def send(self) -> object:
+            self.send_calls += 1
             return {"ok": True}
 
     transport = Transport()
@@ -357,7 +357,7 @@ def test_polymarket_guard_preserves_nested_get_read_method(tmp_path: Path) -> No
             self._ctx = Context()
 
         def read_account(self) -> object:
-            return self._ctx.transport.get()
+            return self._ctx.transport.send()
 
     class ReadOnlyNestedTransportPolymarket(PolymarketClient):
         def __init__(self) -> None:
@@ -380,7 +380,39 @@ def test_polymarket_guard_preserves_nested_get_read_method(tmp_path: Path) -> No
     assert report.status == "PASS"
     assert report.mutation_calls == 0
     assert report.live_notifications == 0
-    assert transport.get_calls == 1
+    assert transport.send_calls == 1
+
+
+def test_polymarket_guard_blocks_notifier_send_but_not_network_send(
+    tmp_path: Path,
+) -> None:
+    class Notifier:
+        def send(self) -> None:
+            return None
+
+    class NotifyingPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = SimpleNamespace()
+            self.notifier = Notifier()
+
+        def preflight_report(self) -> dict[str, object]:
+            self.notifier.send()
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: NotifyingPolymarket(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.safety.status == "FAIL"
+    assert report.live_notifications == 1
+    assert report.mutation_calls == 0
 
 
 def test_polymarket_report_without_posted_attestation_fails_closed(tmp_path: Path) -> None:

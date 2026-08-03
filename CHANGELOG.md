@@ -9,6 +9,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - 受保护的人工跨场执行保留现有风险上限、双腿价格/成本上限、签名预检、幂等与对账边界；Predict 适配器、五阶段漏斗、顶部状态和确认弹窗只展示事实，不自动提交、撤单或赎回。
 - 预测市场验收现在分别报告 Predict REST/WS 盘口、Predict JWT/余额/授权、已签名未提交预检、Polymarket 来源/账户/预检，以及零变更调用和零真实通知；缺少外部、浏览器或 Keychain 环境明确为 `BLOCKED`，认证或读取异常明确为脱敏 `FAIL`。
 - Polymarket 预检现在由验收侧硬性拦截下单、赎回、其他变更和通知调用，并要求显式 `posted: false`；SDK 内部读取也通过代理 self 经过同一只读边界。Playwright 通过后写入带一次性 nonce、有效期、实际 `18766` fixture URL、`8766` review URL/healthz 和当前 Git SHA 的 handoff，registry 只消费一次匹配 nonce。
+- 修正验收只读边界对底层 HTTP `send` 的误判：普通网络读取允许通过，通知对象的 `send` 仍硬失败并计入真实通知尝试。
 
 ## 2026-08-02
 
