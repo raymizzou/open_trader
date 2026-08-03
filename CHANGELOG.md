@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-03
 
+- Dashboard 验收白名单同步当前 CN v11、HK/US v9 资源排名策略版本；截图仍在浏览器流程中生成，但缺失不再影响可选截图规则下的 `PASS`。Dashboard 验收回归 310 个、全量测试 4,435 个通过。
 - R2 增加仅监听 `127.0.0.1:8768` 的只读 Account API shadow：提供强 ETag 的 v1 快照、稳定发布读取、独立 live parity 与 launchd 运维路径。Account Sync Worker 仍是唯一 writer，Gateway/Dashboard 不变；最终验证仍需完成 Worker/API 同一精确 Git SHA 的运行时证明，尚未宣告部署或验收。
 - 资源排名策略的累计回撤身份不再包含每日变化的快照路径、SHA、排名、分数和仓位；上线前的旧全量哈希会保留高水位并只追加一次兼容审计，稳定策略参数仍逐项验真，报告策略参数也必须与冻结资源快照一致。终态状态将阶段、阻塞原因、快照引用与 `latest` 绑定为同一次读取，富途日历不可用仍结构化标记为 `BLOCKED`，程序错误不再被误报为外部阻塞。
 - 累计回撤预检现在读取当天已终态的共享资源快照，使 CN v11、HK/US v9 正确继承既有高水位而非被误判为状态缺失；未生成当天快照时仍沿用原预检路径，相关回撤与资源排名测试 69 个通过。

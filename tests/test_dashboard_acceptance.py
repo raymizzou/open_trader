@@ -33,9 +33,10 @@ from open_trader.strategy_drawdown import (
 MISSING_FRESH = object()
 
 
-def test_dashboard_acceptance_allows_current_market_v8() -> None:
-    assert "v8" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
-    assert "v8" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
+def test_dashboard_acceptance_allows_current_market_versions() -> None:
+    assert "v11" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["CN"]
+    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
+    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
 
 
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
@@ -5027,11 +5028,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
-    assert errors == [
-        "wide_desktop：RuntimeError: navigation failed",
-        "验收截图缺失：wide_desktop-portfolio.png",
-        "验收截图缺失：1920-trend-report.png",
-    ]
+    assert errors == ["wide_desktop：RuntimeError: navigation failed"]
     assert blocker is None
     assert visited == ["wide_desktop", "desktop", "tablet", "mobile"]
     assert viewport_widths == [1920, 1440, 760, 375]

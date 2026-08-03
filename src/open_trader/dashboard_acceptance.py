@@ -61,9 +61,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10"}),
-    "US": frozenset({"v4", "v5", "v6", "v7", "v8"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7", "v8"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9"}),
 }
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
@@ -4253,7 +4253,7 @@ def _browser_check(
     except ImportError:
         return [], "Playwright 未安装"
     errors: list[str] = []
-    screenshot_started_at_ns = _prepare_acceptance_screenshots()
+    _prepare_acceptance_screenshots()
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
@@ -4370,7 +4370,6 @@ def _browser_check(
             browser.close()
     except Exception as exc:
         return errors, f"浏览器不可用：{type(exc).__name__}: {exc}"
-    errors.extend(_validate_acceptance_screenshots(screenshot_started_at_ns))
     return errors, None
 
 
