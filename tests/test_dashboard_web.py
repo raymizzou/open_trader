@@ -15,6 +15,7 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -2109,6 +2110,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         def unacknowledged_incident(self) -> None:
             return None
 
+        def cross_unsettled_principal(self) -> Decimal:
+            return Decimal("35.20")
+
         def histories(self, kind: str) -> list[dict[str, object]]:
             assert kind == "signals"
             return [
@@ -2187,10 +2191,27 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                         "total_max_cost": "9.50",
                         "minimum_profit": "0.50",
                         "annualized_yield": "0.20",
+                        "canonical_cutoff": "2026-12-31T00:00:00Z",
                         "resolution_at": "2026-12-31T00:00:00Z",
                     }
                 ],
             }
+
+    class FakePredictTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xcE2300000000000000000000000000000000f435",
+                "available_usdt": "7.50",
+                "allowance_ready": True,
+                "open_orders": [],
+                "positions": [],
+                "checked_at": datetime.now(timezone.utc),
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = FakePredictTrading()
 
     store = FakeStore()
     cross = FakeCrossMonitor()
@@ -2198,7 +2219,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         store=store,
         monitor=FakeMonitor(),
         cross_venue_monitor=cross,
-        execution=type("Execution", (), {"_breaker_open": False})(),
+        execution=FakeExecution(),
         csrf_token="csrf",
     )
 
@@ -2219,8 +2240,8 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
             "rest": "ready",
             "ws": "ready",
             "wallet": "0xcE23…f435",
-            "balance": {"asset": "USDT", "value": None},
-            "mode": "只读",
+            "balance": {"asset": "USDT", "value": "7.50"},
+            "mode": "可以交易",
             "last_success": None,
             "reason": None,
         },
@@ -2232,11 +2253,16 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         "arbitrage_space_pairs": 2,
         "clear_signal_pairs": 1,
     }
+    assert state["cross_venue"]["unsettled"] == {"current": "35.20", "limit": "100"}
+    assert state["cross_venue"]["breaker"] == {"open": False, "scope": "cross_venue"}
     assert state["events"][-1]["legs"] == legs
     assert state["opportunities"][-1]["legs"] == legs
     assert state["opportunities"][-1]["question"] == "Predict contract question / Polymarket contract question"
     assert state["opportunities"][-1]["predict_question"] == "Predict contract question"
     assert state["opportunities"][-1]["polymarket_question"] == "Polymarket contract question"
+    assert state["opportunities"][-1]["unsettled"] == {
+        "current": "35.20", "after": "44.70", "limit": "100"
+    }
 
     history = _prediction_history_payload(
         store,
@@ -2245,7 +2271,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         offset=0,
         monitor=FakeMonitor(),
         cross_venue_monitor=cross,
-        execution=type("Execution", (), {"_breaker_open": False})(),
+        execution=FakeExecution(),
     )
     assert history["items"][0]["legs"] == legs
     assert history["items"][0]["question"] == "Predict contract question / Polymarket contract question"

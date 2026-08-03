@@ -30,7 +30,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(targetRow).toContainText('比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？');
   });
 
-  test('renders the shared venue header and cross-venue funnel without cross-venue actions', async ({ page }) => {
+  test('renders shared venue truth and protects the cross-venue confirmation flow', async ({ page }) => {
     for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
       await page.setViewportSize(viewport);
       await openPrediction(page);
@@ -46,28 +46,78 @@ test.describe('YES/NO arbitrage signal workspace', () => {
         await expect(polymarket).toContainText(text);
       }
       const predict = page.locator('.pm-venue-card').filter({ hasText: 'Predict.fun' });
-      for (const text of ['REST：ready', 'WebSocket：ready', '0xcE23…f435', '12.34 USDT', '只读', '最近成功 2026-08-02T00:59:58Z']) {
+      for (const text of ['REST：ready', 'WebSocket：ready', '0xcE23…f435', '12.34 USDT', '可以交易', '最近成功 2026-08-02T00:59:58Z']) {
         await expect(predict).toContainText(text);
       }
       await expect(venueHeader).not.toContainText('62.34');
       await expect(page.locator('.pm-metrics')).toHaveCount(0);
+      await page.getByRole('button', { name: 'LLM对冲套利', exact: true }).click();
+      await expect(page.locator('.pm-venue-readiness')).toContainText('Predict.fun');
+      await page.getByRole('button', { name: 'YES/NO套利', exact: true }).click();
 
       const funnel = page.locator('.pm-cross-venue-funnel');
-      for (const text of ['两所对应标的', '正在监视', 'Codex 认为可以', '有套利空间', '明确下单信号']) {
-        await expect(funnel).toContainText(text);
-      }
-      await expect(funnel).toContainText('低频候选监视');
-      await expect(funnel).not.toContainText('WebSocket 监视');
+      await expect(funnel.locator('.pm-funnel-stage > span')).toHaveText([
+        '两所对应标的', '正在监视', 'Codex 认为可以', '有套利空间', '可下单明确信号',
+      ]);
+      await expect(funnel).toContainText('低频候选');
+      await expect(funnel).toContainText('Codex queue');
+      await expect(funnel).toContainText('实时 REST 准入');
 
-      const currentCross = page.locator('.pm-event').filter({ hasText: 'Predict.fun · YES' });
-      await expect(currentCross).toContainText('Polymarket · NO');
-      await expect(currentCross.locator('[data-action="participate"]')).toHaveCount(0);
-      await expect(currentCross).toHaveCount(1);
-      const historyCross = page.locator('[data-prediction-history-panel] tbody tr').filter({ hasText: 'Polymarket · YES' });
-      await expect(historyCross).toContainText('Predict.fun · NO');
-      await expect(historyCross.locator('button')).toHaveCount(0);
+      const actionableCross = page.locator('[data-cross-opportunity-id="cross-opportunity-actionable-fixture"]');
+      await expect(actionableCross).toContainText('Predict.fun · BUY YES');
+      await expect(actionableCross).toContainText('Polymarket · BUY NO');
+      const blockedCross = page.locator('[data-cross-opportunity-id="cross-opportunity-below-threshold-fixture"]');
+      await expect(blockedCross).toContainText('年化低于 15% 入场门槛');
+      await expect(blockedCross.locator('[data-action="participate"]')).toHaveCount(0);
+      const previewRequests: string[] = [];
+      const confirmRequests: string[] = [];
+      page.on('request', (request) => {
+        if (request.url().includes('/prediction-arbitrage/preview')) previewRequests.push(request.method());
+        if (request.url().includes('/prediction-arbitrage/executions')) confirmRequests.push(request.method());
+      });
+      const trigger = actionableCross.getByRole('button', { name: '查看并确认跨所订单' });
+      await trigger.click();
+      expect(confirmRequests).toEqual([]);
+      await expect(page.locator('.pm-modal')).toBeVisible();
+      for (const text of [
+        'Predict.fun · BUY YES', 'Polymarket · BUY NO', '最高 $0.470', '最高 $0.490',
+        '净可兑付份额', 'USDT', 'pUSD', '含费最大成本', '最低赔付', '最低净利润',
+        '简单年化', '统一结算截止', 'Codex APPROVE', '可用余额', '待结算占用',
+        '$20.00', '$2.00', '自动兑付', '不是原子交易',
+      ]) {
+        await expect(page.locator('.pm-modal')).toContainText(text);
+      }
+      if (viewport.width === 375) {
+        await expect(page.locator('.pm-modal-actions')).toHaveCSS('position', 'sticky');
+      }
+      await page.keyboard.press('Escape');
+      await expect(page.locator('.pm-modal')).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+      await trigger.click();
+      await page.getByRole('button', { name: /确认下单/ }).dblclick();
+      await expect.poll(() => confirmRequests.length).toBe(1);
+      expect(previewRequests).toEqual(['POST', 'POST']);
       expect(await page.locator('.pm-venue-card').nth(1).evaluate((card) => getComputedStyle(card).borderRightWidth)).toBe('1px');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    }
+  });
+
+  test('renders cross execution history, holding, dust, breaker, and redemption states', async ({ page }) => {
+    await openPrediction(page, 'cross-submitting');
+    await expect(page.locator('.pm-progress')).toContainText('正在提交');
+    await openPrediction(page, 'cross-reconciling');
+    await expect(page.locator('.pm-progress')).toContainText('正在读取两腿结果');
+    await openPrediction(page, 'cross-holding');
+    await expect(page.locator('.pm-alert')).toContainText('待兑付');
+    await page.getByRole('button', { name: '交易与合并', exact: true }).click();
+    const executions = page.locator('[data-prediction-history-panel]');
+    for (const text of ['Predict.fun · YES', 'Polymarket · NO', 'submitting', 'reconciling', '待兑付']) {
+      await expect(executions).toContainText(text);
+    }
+    await page.getByRole('button', { name: '事故', exact: true }).click();
+    const incidents = page.locator('[data-prediction-history-panel]');
+    for (const text of ['dust incident', '跨所熔断', 'Predict.fun · YES', 'Polymarket · NO']) {
+      await expect(incidents).toContainText(text);
     }
   });
 
@@ -153,7 +203,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
 
   test('preserves keyboard focus and cost disclosures in the manual confirmation modal', async ({ page }) => {
     await openPrediction(page, 'confirmation');
-    const trigger = page.locator('[data-action="participate"]').first();
+    const trigger = page.locator('[data-action="participate"][data-opportunity-id="opp-ceasefire"]');
     await trigger.click();
     await expect(page.locator('.pm-modal')).toBeVisible();
     for (const copy of ['确认真实下单', '$20', '$2', '免手续费']) {
@@ -321,6 +371,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(page.locator('.pm-title-zh')).toHaveText([
       '以色列与伊朗停火是否持续至 8 月 31 日？',
       '比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？',
+      '以太坊会在 2026 年 12 月 31 日收于 $6,000 以上吗？',
       '以色列与伊朗停火是否持续至 2026 年 8 月 31 日？',
       '比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？',
       '2026 年 9 月美联储是否降息？',
@@ -335,6 +386,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       '2026 年美国参议院控制权',
       '下一任美联储主席人选',
       '比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？Will Bitcoin close above $100,000 on December 31, 2026?',
+      '以太坊会在 2026 年 12 月 31 日收于 $6,000 以上吗？Will Ethereum close above $6,000 on December 31, 2026?',
     ]);
     const expectedVolumes = ['$9.7M', '$12.8M', '$15.4M', '$7.1M', '$6.8M', '$5.9M'];
     for (const [index, volume] of expectedVolumes.entries()) {

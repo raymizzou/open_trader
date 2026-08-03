@@ -50,6 +50,7 @@ from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .daily_premarket import build_notifier
 from .notifications import NullNotifier
 from .prediction_arbitrage import (
+    MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
     MAX_WALLET_BALANCE,
@@ -516,6 +517,7 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
             "min_estimated_profit": format(MIN_ESTIMATED_PROFIT, "f"),
             "min_net_edge": format(MIN_NET_EDGE, "f"),
             "max_emergency_loss": format(MAX_EMERGENCY_LOSS, "f"),
+            "max_cross_unsettled_principal": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f"),
         },
         "heartbeat": None,
         "heartbeat_at": None,
@@ -557,6 +559,8 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
             },
             "events": [],
             "opportunities": [],
+            "unsettled": {"current": None, "limit": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f")},
+            "breaker": {"open": True, "scope": "cross_venue"},
         },
         "relation_discovery": {
             "status": "unavailable",
@@ -616,6 +620,64 @@ def _prediction_cross_snapshot(monitor: object | None) -> dict[str, object]:
     return result
 
 
+def _prediction_cross_unsettled(store: PredictionArbitrageStore | None) -> tuple[dict[str, object], Decimal | None]:
+    current: Decimal | None = None
+    method = getattr(store, "cross_unsettled_principal", None)
+    if callable(method):
+        try:
+            value = method()
+            parsed = Decimal(str(value))
+            if parsed.is_finite() and parsed >= 0:
+                current = parsed
+        except Exception:
+            current = None
+    return {
+        "current": format(current, "f") if current is not None else None,
+        "limit": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f"),
+    }, current
+
+
+def _prediction_cross_opportunity_runtime(
+    value: object,
+    *,
+    unsettled: Mapping[str, object],
+    current: Decimal | None,
+    cross_breaker_open: bool,
+) -> object:
+    if not isinstance(value, Mapping) or value.get("market_type") != "cross_venue_yes_no":
+        return value
+    result = dict(value)
+    result["cross_breaker"] = {"open": cross_breaker_open, "scope": "cross_venue"}
+    if current is None:
+        return result
+    try:
+        total = Decimal(str(result.get("total_max_cost")))
+    except Exception:
+        return result
+    if not total.is_finite() or total < 0:
+        return result
+    result["unsettled"] = {
+        **unsettled,
+        "after": format(current + total, "f"),
+    }
+    return result
+
+
+def _prediction_predict_account_snapshot(execution: object | None) -> Mapping[str, object]:
+    fresh = getattr(execution, "_fresh_predict_account_snapshot", None)
+    method = fresh if callable(fresh) else getattr(
+        getattr(execution, "_predict_trading", None), "account_snapshot", None
+    )
+    if not callable(method):
+        return {}
+    try:
+        value = method()
+    except Exception:
+        return {}
+    safe = _prediction_safe_value(value)
+    return safe if isinstance(safe, Mapping) else {}
+
+
 def _prediction_venues_payload(
     *,
     snapshot: Mapping[str, object],
@@ -623,6 +685,7 @@ def _prediction_venues_payload(
     health: Mapping[str, object],
     masked_wallet: str,
     breaker_open: bool,
+    execution: object | None,
     cross_venue_monitor: object | None,
     cross_venue: Mapping[str, object],
 ) -> list[dict[str, object]]:
@@ -648,15 +711,29 @@ def _prediction_venues_payload(
     source_snapshot = source_snapshot if isinstance(source_snapshot, Mapping) else {}
     predict_rest = str(source_snapshot.get("rest") or cross_venue.get("status") or "unavailable")
     predict_ws = str(source_snapshot.get("ws") or predict_rest)
+    predict_account = (
+        _prediction_predict_account_snapshot(execution)
+        if predict_rest == "ready" and predict_ws == "ready"
+        else {}
+    )
     predict_wallet = str(source_snapshot.get("wallet") or "")
+    if not predict_wallet:
+        predict_wallet = str(predict_account.get("wallet_address") or "")
     if predict_wallet.startswith("0x") and "…" not in predict_wallet:
         predict_wallet = _prediction_mask_wallet(predict_wallet)
     predict_reason = source_snapshot.get("reason") or cross_venue.get("reason")
+    cross_breaker_open = bool(getattr(execution, "_cross_breaker_open", True))
+    predict_account_ready = (
+        predict_account.get("allowance_ready") is True
+        and predict_account.get("available_usdt") not in (None, "")
+    )
     if predict_rest == "pending" or predict_ws == "pending":
         predict_mode = "API Key 待分配"
         predict_reason = predict_reason or "api_key_pending"
     else:
-        predict_mode = "只读"
+        predict_mode = "可以交易" if predict_account_ready and not breaker_open and not cross_breaker_open else "只读"
+        if predict_reason in (None, "") and not predict_account_ready and getattr(execution, "_predict_trading", None) is not None:
+            predict_reason = "predict_account_unavailable"
         if predict_reason in (None, "") and predict_rest not in {"ready", "unknown"}:
             predict_reason = f"predict_{predict_rest}"
     return [
@@ -680,7 +757,7 @@ def _prediction_venues_payload(
             "wallet": predict_wallet,
             "balance": {
                 "asset": source_snapshot.get("settlement_asset", "USDT"),
-                "value": source_snapshot.get("balance"),
+                "value": predict_account.get("available_usdt", source_snapshot.get("balance")),
             },
             "mode": predict_mode,
             "last_success": source_snapshot.get("last_success"),
@@ -743,6 +820,19 @@ def _prediction_state_payload(
             breaker_open = True
     elif execution is not None:
         breaker_open = bool(getattr(execution, "_breaker_open", True))
+    cross_breaker_open = bool(getattr(execution, "_cross_breaker_open", True))
+    cross_unsettled, cross_unsettled_current = _prediction_cross_unsettled(store)
+    cross_venue["unsettled"] = cross_unsettled
+    cross_venue["breaker"] = {"open": cross_breaker_open, "scope": "cross_venue"}
+    cross_venue["opportunities"] = [
+        _prediction_cross_opportunity_runtime(
+            row,
+            unsettled=cross_unsettled,
+            current=cross_unsettled_current,
+            cross_breaker_open=cross_breaker_open,
+        )
+        for row in cross_venue["opportunities"]
+    ]
     events = safe_snapshot.get("events")
     opportunities = safe_snapshot.get("opportunities")
     event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
@@ -868,6 +958,7 @@ def _prediction_state_payload(
         health=health,
         masked_wallet=masked_wallet,
         breaker_open=breaker_open,
+        execution=execution,
         cross_venue_monitor=cross_venue_monitor,
         cross_venue=cross_venue,
     )

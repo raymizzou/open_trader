@@ -75,16 +75,55 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"},
     ]
     cross_opportunity = {
-        "opportunity_id": "cross-opportunity-fixture",
+        "opportunity_id": "cross-opportunity-actionable-fixture",
+        "event_id": "cross-event-actionable-fixture",
         "title": "Will Bitcoin close above $100,000 on December 31, 2026?",
         "title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？",
         "market_type": "cross_venue_yes_no",
-        "execution_mode": "observe_only",
-        "legs": cross_legs,
+        "execution_mode": "manual_confirm",
+        "legs": [
+            {**cross_legs[0], "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02", "fee_asset": "USDT", "net_quantity": "5", "settlement_asset": "USDT"},
+            {**cross_legs[1], "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00", "fee_asset": "pUSD", "net_quantity": "5", "settlement_asset": "pUSD"},
+        ],
         "quantity": "5",
-        "total_max_cost": "9.50",
-        "minimum_profit": "0.50",
+        "net_quantity": "5",
+        "total_max_cost": "4.80",
+        "minimum_payout": "5.00",
+        "minimum_profit": "0.20",
+        "annualized_yield": "0.201",
+        "canonical_cutoff": "2026-12-31T23:59:00Z",
+        "resolution_at": "2026-12-31T23:59:00Z",
+        "clear_signal": True,
+        "codex_approval": {
+            "decision": "APPROVE",
+            "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。",
+            "evidence": [
+                {"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"},
+                {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"},
+            ],
+        },
+        "venue_balances": [
+            {"exchange": "predict.fun", "wallet": "0xcE23…f435", "asset": "USDT", "available": "12.34"},
+            {"exchange": "polymarket", "wallet": "0x7A4E…91C2", "asset": "pUSD", "available": "50.00"},
+        ],
+        "unsettled": {"current": "35.20", "after": "40.00", "limit": "100"},
         "volume_24h": "320000",
+        "actionable": True,
+    }
+    cross_below_threshold = {
+        **cross_opportunity,
+        "opportunity_id": "cross-opportunity-below-threshold-fixture",
+        "event_id": "cross-event-below-threshold-fixture",
+        "title": "Will Ethereum close above $6,000 on December 31, 2026?",
+        "title_zh": "以太坊会在 2026 年 12 月 31 日收于 $6,000 以上吗？",
+        "legs": [
+            {**cross_opportunity["legs"][0], "token_id": "predict-yes-below-threshold"},
+            {**cross_opportunity["legs"][1], "token_id": "poly-no-below-threshold"},
+        ],
+        "minimum_profit": "0.08",
+        "annualized_yield": "0.149",
+        "clear_signal": False,
+        "eligibility_reason": "annualized_yield_below_minimum",
         "actionable": False,
     }
     if scenario == "quiet":
@@ -115,17 +154,22 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
         "venues": [
             {"venue": "polymarket", "rest": "ready", "ws": "ready", "wallet": "0x7A4E…91C2", "balance": {"asset": "pUSD", "value": "50.00"}, "mode": "可以交易", "last_success": "2026-08-02T01:00:00Z"},
-            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "只读", "last_success": "2026-08-02T00:59:58Z"},
+            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "可以交易", "last_success": "2026-08-02T00:59:58Z"},
         ],
-        "cross_venue": {"funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1}},
-        "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "min_estimated_profit": "1"},
+        "cross_venue": {
+            "mode": "manual_confirm",
+            "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1},
+            "unsettled": {"current": "35.20", "limit": "100"},
+            "breaker": {"open": False, "scope": "cross_venue"},
+        },
+        "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100", "min_estimated_profit": "1"},
         "heartbeat_at": "2026-08-01T02:00:00Z",
         "event_count": 20,
         "market_count": 331,
         "token_count": 662,
         "signals_24h": 3,
         "events": events,
-        "opportunities": [] if scenario == "quiet" else [opportunity, cross_opportunity],
+        "opportunities": [] if scenario == "quiet" else [opportunity, cross_opportunity, cross_below_threshold],
         "histories": {history_kind: _prediction_history(history_kind)},
         "breaker": {"open": scenario == "incident", "status": "locked" if scenario == "incident" else "ready"},
         "csrf_token": "fixture-csrf",
@@ -240,7 +284,18 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
                 "30d": {"count": 302, "median": "0.19", "p90": "0.31"},
             },
         }
-    if scenario == "executing":
+    if scenario == "cross-submitting":
+        payload["current_execution"] = {"execution_id": "cross-exec-fixture", "status": "submitting", "market_type": "cross_venue_yes_no", "event_title": cross_opportunity["title"], "legs": cross_opportunity["legs"]}
+    elif scenario == "cross-reconciling":
+        payload["current_execution"] = {"execution_id": "cross-exec-fixture", "status": "reconciling", "market_type": "cross_venue_yes_no", "event_title": cross_opportunity["title"], "legs": cross_opportunity["legs"]}
+    elif scenario == "cross-holding":
+        payload["current_execution"] = {"execution_id": "cross-exec-fixture", "status": "holding_to_resolution", "market_type": "cross_venue_yes_no", "event_title": cross_opportunity["title"], "legs": cross_opportunity["legs"], "redemption_status": "pending"}
+    elif scenario == "cross-dust":
+        payload["breaker"] = {"open": True, "status": "locked", "incident": {"incident_id": "cross-dust-fixture", "happened_at": "2026-08-02T01:05:00Z", "event_title": cross_opportunity["title"], "reason": "cross_dust", "remediation": "残余头寸待人工处理", "loss": "-0.80", "state": "dust_incident", "legs": cross_opportunity["legs"]}}
+    elif scenario == "cross-breaker":
+        payload["cross_venue"]["breaker"] = {"open": True, "scope": "cross_venue", "reason": "cross_circuit_breaker_open"}
+        payload["breaker"] = {"open": True, "status": "locked", "incident": {"incident_id": "cross-breaker-fixture", "happened_at": "2026-08-02T01:06:00Z", "event_title": cross_opportunity["title"], "reason": "cross_circuit_breaker_open", "remediation": "已停止新的跨所订单", "loss": "-0.80", "state": "directional_incident", "legs": cross_opportunity["legs"]}}
+    elif scenario == "executing":
         payload["current_execution"] = {"execution_id": "exec-fixture", "status": "reconciling", "event_title": "停火持续至 8 月 31 日？"}
     elif scenario == "success":
         payload["current_execution"] = {"execution_id": "exec-fixture", "status": "completed", "event_title": opportunity["title"], "quantity": "20", "realized_profit": "1.20", "actual_cost": "18.80", "merge_value": "20.00", "completed_at": "14:36:12"}
@@ -257,14 +312,24 @@ def _prediction_history(kind: str) -> list[dict[str, object]]:
     if kind == "signals":
         return [
             {"signal_id": "signal-ceasefire", "opportunity_id": "opp-ceasefire", "occurred_at": "2026-08-01T01:59:00Z", "event_title": "Will the Israel-Iran ceasefire continue through August 31, 2026?", "event_title_zh": "以色列与伊朗停火是否持续至 2026 年 8 月 31 日？", "duration": "2m 14s", "initial_profit": "0.30", "live_profit": "0.38", "actionable_now": True, "notification_state": "sent"},
-            {"signal_id": "cross-signal-fixture", "opportunity_id": "cross:fixture:POLYMARKET_YES_PREDICT_NO", "market_type": "cross_venue_yes_no", "execution_mode": "observe_only", "occurred_at": "2026-08-01T01:57:00Z", "event_title": "Will Bitcoin close above $100,000 on December 31, 2026?", "event_title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？", "legs": [{"exchange": "polymarket", "outcome": "YES", "token_id": "poly-yes-fixture"}, {"exchange": "predict.fun", "outcome": "NO", "token_id": "predict-no-fixture"}], "duration": "38s", "initial_profit": "0.50", "live_profit": "0.52", "actionable_now": True, "notification_state": "sent"},
+            {"signal_id": "cross-signal-fixture", "opportunity_id": "cross-opportunity-actionable-fixture", "market_type": "cross_venue_yes_no", "execution_mode": "manual_confirm", "occurred_at": "2026-08-01T01:57:00Z", "event_title": "Will Bitcoin close above $100,000 on December 31, 2026?", "event_title_zh": "比特币会在 2026 年 12 月 31 日收于 $100,000 以上吗？", "legs": [{"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture"}, {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"}], "duration": "38s", "initial_profit": "0.20", "live_profit": "0.20", "annualized_yield": "0.201", "actionable_now": True, "notification_state": "sent"},
             {"signal_id": "signal-fed", "opportunity_id": "opp-fed", "occurred_at": "2026-08-01T01:55:00Z", "event_title": "Will the Fed cut rates in September 2026?", "event_title_zh": "2026 年 9 月美联储是否降息？", "duration": "18s", "initial_profit": "0.20", "live_profit": "0.24", "actionable_now": False, "notification_state": "failed"},
             {"signal_id": "signal-closed", "opportunity_id": "opp-closed", "occurred_at": "2026-08-01T01:50:00Z", "ended_at": "2026-08-01T01:50:41Z", "event_title": "Will Ethereum exceed $6,000 before September?", "event_title_zh": "以太坊会在 9 月前突破 $6,000？", "duration": "41s", "initial_profit": "0.15", "live_profit": "0.18", "actionable_now": False, "notification_state": "sent"},
             {"signal_id": "signal-threshold", "opportunity_id": "threshold-approved", "market_id": "threshold-approved", "market_type": "threshold_hedge", "occurred_at": "2026-08-01T01:48:00Z", "event_title": "Will Bitcoin be above $90,000 on December 31, 2026? / Will Bitcoin be above $100,000 on December 31, 2026?", "event_title_zh": "比特币在 12 月 31 日是否高于 9 万美元？ / 比特币在 12 月 31 日是否高于 10 万美元？", "minimum_profit": "0.54", "total_max_cost": "19.46", "maximum_fee": "0.12", "annualized_yield": "0.0053", "remaining_days": "152.6", "resolution_at": "2026-12-31T00:00:00Z", "eligibility_reason": "annualized_yield_below_minimum", "actionable_now": False, "notification_state": "not_sent"},
         ]
     if kind == "executions":
-        return [{"completed_at": "今天 14:36:12", "event_title": "停火持续至 8 月 31 日？", "quantity": "20 组", "actual_cost": "18.80", "merge_value": "20.00", "status": "已合并", "realized_profit": "1.20"}]
-    return [{"happened_at": "今天 14:36:09", "event_title": "停火持续至 8 月 31 日？", "reason": "YES 成交、NO 被拒", "remediation": "卖回 20 YES", "loss": "-0.60", "status": "已消除敞口 · 待解除熔断"}]
+        legs = [{"exchange": "predict.fun", "outcome": "YES"}, {"exchange": "polymarket", "outcome": "NO"}]
+        return [
+            {"completed_at": "今天 14:36:12", "event_title": "停火持续至 8 月 31 日？", "quantity": "20 组", "actual_cost": "18.80", "merge_value": "20.00", "status": "已合并", "realized_profit": "1.20"},
+            {"completed_at": "今天 14:40:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": legs, "state": "submitting", "status": "submitting", "quantity": "5", "actual_cost": "4.80"},
+            {"completed_at": "今天 14:41:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": legs, "state": "reconciling", "status": "reconciling", "quantity": "5", "actual_cost": "4.80"},
+            {"completed_at": "今天 14:42:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": legs, "state": "holding_to_resolution", "status": "待兑付", "redemption_status": "pending", "quantity": "5", "actual_cost": "4.80"},
+        ]
+    return [
+        {"happened_at": "今天 14:36:09", "event_title": "停火持续至 8 月 31 日？", "reason": "YES 成交、NO 被拒", "remediation": "卖回 20 YES", "loss": "-0.60", "status": "已消除敞口 · 待解除熔断"},
+        {"happened_at": "今天 14:43:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": [{"exchange": "predict.fun", "outcome": "YES"}, {"exchange": "polymarket", "outcome": "NO"}], "reason": "cross_dust", "remediation": "残余头寸待人工处理", "loss": "-0.80", "status": "dust_incident"},
+        {"happened_at": "今天 14:44:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no", "legs": [{"exchange": "predict.fun", "outcome": "YES"}, {"exchange": "polymarket", "outcome": "NO"}], "reason": "cross_circuit_breaker_open", "remediation": "已停止新的跨所订单", "loss": "-0.80", "status": "directional_incident"},
+    ]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -355,6 +420,29 @@ class Handler(BaseHTTPRequestHandler):
                     "total_max_cost": "18.80",
                     "merge_value": "20.00",
                     "minimum_profit": "1.20",
+                })
+            elif body.get("opportunity_id") == "cross-opportunity-actionable-fixture":
+                self._send_json({
+                    "state": "previewed",
+                    "preview_id": "cross-preview-fixture",
+                    "title": "Will Bitcoin close above $100,000 on December 31, 2026?",
+                    "market_type": "cross_venue_yes_no",
+                    "quantity": "5",
+                    "net_quantity": "5",
+                    "legs": [
+                        {"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture", "settlement_asset": "USDT", "quantity": "5", "net_quantity": "5", "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02"},
+                        {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture", "settlement_asset": "pUSD", "quantity": "5", "net_quantity": "5", "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00"},
+                    ],
+                    "total_max_cost": "4.80",
+                    "minimum_payout": "5.00",
+                    "minimum_profit": "0.20",
+                    "annualized_yield": "0.201",
+                    "canonical_cutoff": "2026-12-31T23:59:00Z",
+                    "codex_approval": {"decision": "APPROVE", "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。", "evidence": [{"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"}, {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"}]},
+                    "venue_balances": [{"exchange": "predict.fun", "wallet": "0xcE23…f435", "asset": "USDT", "available": "12.34"}, {"exchange": "polymarket", "wallet": "0x7A4E…91C2", "asset": "pUSD", "available": "50.00"}],
+                    "unsettled": {"current": "35.20", "after": "40.00", "limit": "100"},
+                    "wallet_address": "0x7A4E1234567890ABCDEF91C2",
+                    "policy_limits": {"max_normal_cost": "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100", "max_wallet_balance": "65", "min_estimated_profit": "1"},
                 })
             else:
                 opportunity = dict(_prediction_payload("ready")["opportunities"][0])

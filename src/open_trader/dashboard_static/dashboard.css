@@ -5676,6 +5676,10 @@ table {
 .pm-opportunity-metrics div { background: #f2eee7; border-radius: 6px; padding: 10px; }
 .pm-opportunity-metrics dt { color: var(--muted); font-size: 11px; margin-bottom: 5px; }
 .pm-opportunity-metrics dd { font-size: 15px; font-weight: 850; margin: 0; }
+.pm-cross-metrics { display: grid; gap: 8px; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 12px 0; }
+.pm-cross-metrics div { background: #f2eee7; border-radius: 6px; min-width: 0; padding: 10px; }
+.pm-cross-metrics dt { color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+.pm-cross-metrics dd { font-size: 15px; font-weight: 850; margin: 0; overflow-wrap: anywhere; }
 .pm-positive { color: var(--success); }
 .pm-opportunity-action { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
 .pm-opportunity-action p { color: var(--muted); margin: 0; }
@@ -5835,7 +5839,7 @@ table {
   .pm-panel-heading, .pm-opportunity-title, .pm-opportunity-action, .pm-alert { align-items: stretch; display: grid; }
   .pm-panel-heading-actions { align-items: stretch; justify-items: stretch; }
   .pm-clock { justify-content: flex-start; }
-  .pm-opportunity-metrics { grid-template-columns: 1fr 1fr; }
+  .pm-opportunity-metrics, .pm-cross-metrics { grid-template-columns: 1fr 1fr; }
   .pm-threshold-formula, .pm-threshold-history { grid-template-columns: 1fr; }
   .pm-threshold-questions { grid-template-columns: 1fr; }
   .pm-participate { width: 100%; }
@@ -5855,7 +5859,7 @@ table {
   .pm-signal-action { width: 100%; }
   .pm-modal { padding: 16px; }
   .pm-order-legs, .pm-order-summary { grid-template-columns: 1fr; }
-  .pm-modal-actions { display: grid; }
+  .pm-modal-actions { background: var(--surface); bottom: -16px; display: grid; padding: 12px 0 16px; position: sticky; }
   .pm-modal-actions .pm-button { width: 100%; }
 }
 @media (max-width: 390px) {
