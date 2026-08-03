@@ -525,7 +525,8 @@ def _favorite_roots(rows: object) -> dict[str, Mapping[str, object]]:
         if not isinstance(row, Mapping):
             raise TrendAnimalsError("allocation favorites are invalid")
         asset = row.get("asset")
-        if isinstance(asset, str) and asset in found:
+        name = row.get("tickername", row.get("tickerName"))
+        if isinstance(asset, str) and asset in found and name == asset:
             tm_id = _tm_id(row)
             if tm_id in ids:
                 raise TrendAnimalsError("allocation favorites have duplicate tmId")

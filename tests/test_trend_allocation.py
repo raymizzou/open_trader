@@ -103,9 +103,12 @@ def test_fetch_allocation_roots_uses_exact_assets_dates_and_minimal_batched_fiel
 
         def get_favorites_tickers(self) -> list[dict[str, object]]:
             return [
-                {"tmId": index, "tickerName": asset, "asset": asset}
+                {"tmId": index, "tickername": asset, "asset": asset}
                 for index, asset in enumerate(("A股", "ETF基金", "港股", "香港ETF", "美股", "美国ETF"), 1)
-            ] + [{"tmId": 99, "tickerName": "ignore", "asset": "行业"}]
+            ] + [
+                {"tmId": 98, "tickername": "平安银行", "asset": "A股"},
+                {"tmId": 99, "tickername": "ignore", "asset": "行业"},
+            ]
 
         def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
             self.calls.append((tm_ids, fields, expected_date))
