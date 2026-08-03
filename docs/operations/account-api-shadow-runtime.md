@@ -26,7 +26,7 @@ R2_PROBE_DIR="$(mktemp -d)"
 curl -fsS -D "$R2_PROBE_DIR/headers" \
   -o "$R2_PROBE_DIR/snapshot.json" \
   http://127.0.0.1:8768/api/v1/account/snapshot
-.venv/bin/python -m open_trader account-api-parity --data-dir data
+PYTHONPATH=src .venv/bin/python -m open_trader account-api-parity --data-dir data
 tail -n 100 logs/account_api/launchd.out.log
 tail -n 100 logs/account_api/launchd.err.log
 scripts/uninstall_account_api_launchd.sh
