@@ -6472,7 +6472,7 @@ def _merge_rotation_orders(
                 rotation_value = str(order.get(field) or "").strip()
                 if existing_value and rotation_value and existing_value != rotation_value:
                     raise ValueError("conflicting rotation fill order identity")
-            for field in ("dealt_qty", "dealt_avg_price", "avg_price"):
+            for field in ("dealt_qty",):
                 existing_value = existing.get(field)
                 rotation_value = order.get(field)
                 if existing_value in (None, "") or rotation_value in (None, ""):
@@ -6486,6 +6486,31 @@ def _merge_rotation_orders(
                     if str(exc) == "conflicting rotation fill order identity":
                         raise
                     raise ValueError("conflicting rotation fill order identity") from exc
+
+            def execution_price(order_row: Mapping[str, object]) -> Decimal | None:
+                for field in ("dealt_avg_price", "avg_price", "price"):
+                    raw_value = order_row.get(field)
+                    if raw_value in (None, ""):
+                        continue
+                    try:
+                        value = _required_decimal(raw_value, f"{field} identity")
+                    except ValueError as exc:
+                        raise ValueError("conflicting rotation fill order identity") from exc
+                    # A market order's request price is conventionally zero;
+                    # it is not an execution-price identity.
+                    if field == "price" and value == 0:
+                        continue
+                    return value
+                return None
+
+            existing_price = execution_price(existing)
+            rotation_price = execution_price(order)
+            if (
+                existing_price is not None
+                and rotation_price is not None
+                and existing_price != rotation_price
+            ):
+                raise ValueError("conflicting rotation fill order identity")
             merged[index] = {
                 **existing,
                 **{
