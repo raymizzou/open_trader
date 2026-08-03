@@ -121,25 +121,43 @@ health_matches() {
 import json
 import sys
 
-module, upstream = sys.argv[1:]
+module = sys.argv[1]
 payload = json.load(sys.stdin)
 valid = payload.get("module") == module
-if upstream:
-    valid = valid and payload.get("upstream_status") == upstream
+if module == "frontend_gateway":
+    valid = valid and payload.get("legacy_upstream_status") == "ok"
+    valid = valid and payload.get("account_upstream_status") == "ok"
 raise SystemExit(0 if valid else 1)
-' "$2" "$3"
+' "$2"
+}
+
+health_failure() {
+  printf '%s' "$1" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+for component in ("legacy", "account"):
+    status = payload.get(f"{component}_upstream_status")
+    if status != "ok":
+        print(f"{component} upstream is {status or 'unavailable'}")
+        break
+'
 }
 
 wait_health() {
-  local url="$1" module="$2" upstream="${3:-}" attempt payload
+  local url="$1" module="$2" attempt payload
   [[ -x "$CURL_BIN" ]] || { echo "curl is unavailable: $CURL_BIN" >&2; return 1; }
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
     payload="$("$CURL_BIN" --fail --silent --show-error --max-time 2 "$url" 2>/dev/null || true)"
-    if [[ -n "$payload" ]] && health_matches "$payload" "$module" "$upstream"; then
+    if [[ -n "$payload" ]] && health_matches "$payload" "$module"; then
       return 0
     fi
     sleep 1
   done
+  if [[ "$module" == "frontend_gateway" && -n "$payload" ]]; then
+    health_failure "$payload" >&2
+  fi
   echo "$module did not become ready at $url" >&2
   return 1
 }
@@ -197,24 +215,6 @@ start_agent() {
   bootstrap_agent "$plist"
 }
 
-restore_single() {
-  bootout_agent "$GATEWAY_LABEL" || return 1
-  bootout_agent "$LEGACY_LABEL" || return 1
-  bootout_agent "$SINGLE_LABEL" || return 1
-  bootstrap_agent "$SINGLE_PLIST" || return 1
-  wait_http "http://127.0.0.1:8766/"
-}
-
-fail_stack() {
-  local reason="$1"
-  if restore_single; then
-    echo "$reason; restored single-process dashboard" >&2
-  else
-    echo "$reason; FAILED TO RESTORE single-process dashboard" >&2
-  fi
-  return 1
-}
-
 install_single() {
   single_rendered="$(render_template "$SINGLE_TEMPLATE")"
   lint_plist "$single_rendered"
@@ -227,7 +227,7 @@ install_single() {
   : > "$OUT_LOG"
   : > "$ERR_LOG"
   start_agent "$SINGLE_LABEL" "$SINGLE_PLIST"
-  wait_health "http://127.0.0.1:8766/healthz" "legacy_dashboard" ""
+  wait_health "http://127.0.0.1:8766/healthz" "legacy_dashboard"
   wait_http "http://127.0.0.1:8766/"
   echo "installed launchd agent: $SINGLE_LABEL"
   echo "review URL: http://127.0.0.1:8766/"
@@ -257,17 +257,17 @@ install_stack() {
   : > "$LEGACY_ERR_LOG"
 
   if ! start_agent "$LEGACY_LABEL" "$LEGACY_PLIST" || \
-    ! wait_health "http://127.0.0.1:8767/healthz" "legacy_dashboard" ""; then
-    fail_stack "legacy dashboard failed readiness"
+    ! wait_health "http://127.0.0.1:8767/healthz" "legacy_dashboard"; then
+    echo "legacy dashboard failed readiness" >&2
     return 1
   fi
 
   bootout_agent "$SINGLE_LABEL"
   bootout_agent "$GATEWAY_LABEL"
   if ! start_agent "$GATEWAY_LABEL" "$GATEWAY_PLIST" || \
-    ! wait_health "http://127.0.0.1:8766/healthz" "frontend_gateway" "ok" || \
+    ! wait_health "http://127.0.0.1:8766/healthz" "frontend_gateway" || \
     ! wait_http "http://127.0.0.1:8766/"; then
-    fail_stack "frontend gateway failed readiness"
+    echo "frontend gateway failed readiness" >&2
     return 1
   fi
   echo "installed launchd stack: $GATEWAY_LABEL + $LEGACY_LABEL"

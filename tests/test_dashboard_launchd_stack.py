@@ -74,6 +74,9 @@ if [[ "$1" == "bootout" ]]; then
 fi
 if [[ "$1" == "bootstrap" ]]; then
   label="$(basename "$3" .plist)"
+  if [[ "$label" == "com.open-trader.frontend-gateway" && "${FAKE_FAIL_GATEWAY_BOOTSTRAP:-0}" == "1" ]]; then
+    exit 5
+  fi
   : > "$FAKE_LAUNCHD_STATE_DIR/$label"
   exit 0
 fi
@@ -118,7 +121,9 @@ case "$url" in
     if [[ "${FAKE_SINGLE_HEALTH:-0}" == "1" ]]; then
       printf '%s\\n' '{"module":"legacy_dashboard"}'
     else
-      printf '%s\\n' '{"module":"frontend_gateway","upstream_status":"ok"}'
+      account_status="ok"
+      [[ "${FAKE_ACCOUNT_HEALTH_MODE:-production}" == "production" ]] || account_status="unavailable"
+      printf '%s\\n' '{"module":"frontend_gateway","upstream_status":"ok","legacy_upstream_status":"'"${FAKE_GATEWAY_LEGACY_STATUS:-ok}"'","account_upstream_status":"'"$account_status"'"}'
     fi ;;
 esac
 exit 0
@@ -294,25 +299,46 @@ def test_stack_does_not_bootstrap_while_bootout_remains_loaded(
     )
 
 
-def test_gateway_failure_stops_stack_restores_single_and_verifies_public_url(
+@pytest.mark.parametrize(
+    ("failure", "env_overrides", "expected_error"),
+    [
+        (
+            "legacy unavailable",
+            {"FAKE_GATEWAY_LEGACY_STATUS": "unavailable"},
+            "legacy upstream is unavailable",
+        ),
+        (
+            "account shadow",
+            {"FAKE_ACCOUNT_HEALTH_MODE": "shadow"},
+            "account upstream is unavailable",
+        ),
+        (
+            "account unavailable",
+            {"FAKE_ACCOUNT_HEALTH_MODE": "unavailable"},
+            "account upstream is unavailable",
+        ),
+        (
+            "gateway bootstrap",
+            {"FAKE_FAIL_GATEWAY_BOOTSTRAP": "1"},
+            "frontend gateway failed readiness",
+        ),
+    ],
+)
+def test_stack_failures_do_not_restore_or_bootstrap_single(
     tmp_path: Path,
+    failure: str,
+    env_overrides: dict[str, str],
+    expected_error: str,
 ) -> None:
-    result, calls, agents = _run_installer(tmp_path, FAKE_FAIL_GATEWAY="1")
+    result, calls, agents = _run_installer(tmp_path, **env_overrides)
     domain = f"gui/{os.getuid()}"
-    changes = [
-        call
-        for call in calls
-        if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
-    ]
+
     assert result.returncode == 1
-    assert changes[-4:] == [
-        f"launchctl bootout {domain}/{GATEWAY_LABEL}",
-        f"launchctl bootout {domain}/{LEGACY_LABEL}",
-        f"launchctl bootout {domain}/{SINGLE_LABEL}",
-        f"launchctl bootstrap {domain} {agents / f'{SINGLE_LABEL}.plist'}",
-    ]
-    assert calls[-1].endswith("http://127.0.0.1:8766/")
-    assert "restored single-process dashboard" in result.stderr
+    assert expected_error in result.stderr, failure
+    assert (
+        f"launchctl bootstrap {domain} {agents / f'{SINGLE_LABEL}.plist'}"
+        not in calls
+    )
 
 
 @pytest.mark.parametrize(
