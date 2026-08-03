@@ -8,7 +8,7 @@ import json
 import os
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
@@ -567,6 +567,8 @@ def freeze_report_evidence(
                 if real_holdings_input is not None
                 else {}
             ),
+            "simulate_rotation_pairs": getattr(report, "simulate_rotation_pairs", ()),
+            "real_rotation_pairs": getattr(report, "real_rotation_pairs", ()),
         },
     }
     return freeze_trend_evidence(data_dir, evidence)
@@ -998,6 +1000,240 @@ def lock_trend_execution_batch(
             concurrent, market=market, execution_date=execution_date
         )
     return payload
+
+
+def _valid_rotation_reservation(
+    payload: object,
+    *,
+    market: str,
+    account_key: str,
+    execution_date: str,
+    pair_index: int,
+    allocation_sha256: str,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("rotation reservation is invalid")
+    try:
+        reserved_at = datetime.fromisoformat(str(payload["reserved_at"]))
+    except (KeyError, ValueError):
+        raise ValueError("rotation reservation is invalid") from None
+    stored_allocation_sha256 = payload.get("allocation_sha256")
+    pair = payload.get("pair")
+    if (
+        payload.get("schema_version") != "open_trader.trend_review.rotation_plan.v1"
+        or payload.get("market") != market
+        or payload.get("account_key") != account_key
+        or payload.get("execution_date") != execution_date
+        or payload.get("pair_index") != pair_index
+        or reserved_at.tzinfo is None
+        or reserved_at.utcoffset() is None
+        or not isinstance(stored_allocation_sha256, str)
+        or len(stored_allocation_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in stored_allocation_sha256)
+        or stored_allocation_sha256 != allocation_sha256
+        or not _valid_rotation_pair(pair, pair_index)
+    ):
+        raise ValueError("rotation reservation is invalid")
+    return pair
+
+
+def _valid_rotation_pair(pair: object, pair_index: int) -> bool:
+    if (
+        isinstance(pair_index, bool)
+        or not isinstance(pair, dict)
+        or pair.get("pair_index") != pair_index
+    ):
+        return False
+    if any(
+        not isinstance(pair.get(field), str) or not pair[field].strip()
+        for field in (
+            "sell_symbol", "sell_name", "sell_futu_symbol", "buy_symbol",
+            "buy_name", "buy_futu_symbol", "reason",
+        )
+    ):
+        return False
+    try:
+        sell_strength = Decimal(str(pair.get("sell_global_strength")))
+        buy_strength = Decimal(str(pair.get("buy_global_strength")))
+        gap = Decimal(str(pair.get("strength_gap")))
+        weight = Decimal(str(pair.get("target_weight")))
+        amount = Decimal(str(pair.get("target_amount")))
+        atr = Decimal(str(pair.get("atr")))
+    except (InvalidOperation, ValueError):
+        return False
+    if (
+        not all(
+            value.is_finite()
+            for value in (sell_strength, buy_strength, gap, weight, amount, atr)
+        )
+        or not Decimal("0") <= sell_strength <= Decimal("100")
+        or not Decimal("0") <= buy_strength <= Decimal("100")
+        or gap != buy_strength - sell_strength
+        or gap < Decimal("20")
+        or not Decimal("0") < weight <= Decimal("1")
+        or amount <= 0
+        or atr <= 0
+        or pair["sell_symbol"] == pair["buy_symbol"]
+        or pair["sell_futu_symbol"] == pair["buy_futu_symbol"]
+        or pair["reason"] != "relative_rotation"
+    ):
+        return False
+    valid_sizes = all(
+        isinstance(pair.get(field), int)
+        and not isinstance(pair.get(field), bool)
+        and pair[field] > 0
+        for field in ("estimated_shares", "lot_size")
+    )
+    return valid_sizes and pair["estimated_shares"] % pair["lot_size"] == 0
+
+
+def reserve_rotation_pairs(
+    data_dir: Path,
+    *,
+    market: str,
+    account_key: str,
+    execution_date: str,
+    pairs: Sequence[Mapping[str, object]],
+    allocation_sha256: str,
+    reserved_at: str,
+) -> tuple[dict[str, object], ...]:
+    """Freeze at most two account-specific relative-rotation pairs."""
+    market = _market(market)
+    execution_date = date.fromisoformat(execution_date).isoformat()
+    if (
+        not account_key
+        or not account_key.startswith(("simulate-", "real-"))
+        or account_key in {"simulate-", "real-"}
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for character in account_key
+        )
+        or not isinstance(allocation_sha256, str)
+        or len(allocation_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in allocation_sha256)
+    ):
+        raise ValueError("rotation reservation facts are invalid")
+    try:
+        parsed_reserved_at = datetime.fromisoformat(reserved_at)
+    except ValueError:
+        raise ValueError("rotation reservation facts are invalid") from None
+    if parsed_reserved_at.tzinfo is None or parsed_reserved_at.utcoffset() is None:
+        raise ValueError("rotation reservation facts are invalid")
+    proposed: dict[int, dict[str, object]] = {}
+    proposed_symbols: set[str] = set()
+    for pair in pairs:
+        value = dict(pair)
+        pair_index = value.get("pair_index")
+        if (
+            isinstance(pair_index, bool)
+            or not isinstance(pair_index, int)
+            or pair_index not in {0, 1}
+            or pair_index in proposed
+            or not _valid_rotation_pair(value, pair_index)
+        ):
+            raise ValueError("rotation reservation facts are invalid")
+        pair_symbols = {str(value["sell_symbol"]), str(value["buy_symbol"])}
+        if proposed_symbols & pair_symbols:
+            raise ValueError("rotation reservation facts conflict")
+        proposed_symbols.update(pair_symbols)
+        proposed[pair_index] = value
+    root = (
+        data_dir
+        / "trend_review"
+        / "rotation_plans"
+        / market
+        / account_key
+        / execution_date
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    lock = os.open(root / ".reservation.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        reserved: dict[int, dict[str, object]] = {}
+        for pair_index in (0, 1):
+            path = root / f"{pair_index}.json"
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("rotation reservation is invalid") from exc
+                reserved[pair_index] = _valid_rotation_reservation(
+                    payload,
+                    market=market,
+                    account_key=account_key,
+                    execution_date=execution_date,
+                    pair_index=pair_index,
+                    allocation_sha256=allocation_sha256,
+                )
+        used_symbols = [
+            str(value[field])
+            for value in reserved.values()
+            for field in ("sell_symbol", "buy_symbol")
+        ]
+        if len(used_symbols) != len(set(used_symbols)):
+            raise ValueError("rotation reservation facts conflict")
+        unused_slots = [index for index in (0, 1) if index not in reserved]
+        if not unused_slots:
+            return tuple(reserved[index] for index in sorted(reserved))
+
+        def identity(value: Mapping[str, object]) -> tuple[object, ...]:
+            return tuple(
+                _json_value(value.get(field))
+                for field in (
+                    "sell_symbol", "sell_name", "sell_futu_symbol",
+                    "sell_global_strength", "buy_symbol", "buy_name",
+                    "buy_futu_symbol", "buy_global_strength", "strength_gap",
+                    "target_weight", "target_amount", "estimated_shares",
+                    "lot_size", "atr", "reason",
+                )
+            )
+
+        retained_identities = {identity(value) for value in reserved.values()}
+        remaining = [
+            value
+            for _, value in sorted(proposed.items())
+            if identity(value) not in retained_identities
+        ]
+        used = set(used_symbols)
+        for value in remaining:
+            if used & {str(value["sell_symbol"]), str(value["buy_symbol"])}:
+                raise ValueError("rotation reservation facts conflict")
+        for pair_index, original in zip(unused_slots, remaining):
+            path = root / f"{pair_index}.json"
+            pair = {**original, "pair_index": pair_index}
+            if not _valid_rotation_pair(pair, pair_index):
+                raise ValueError("rotation reservation facts are invalid")
+            payload = {
+                "schema_version": "open_trader.trend_review.rotation_plan.v1",
+                "market": market,
+                "account_key": account_key,
+                "execution_date": execution_date,
+                "pair_index": pair_index,
+                "allocation_sha256": allocation_sha256,
+                "reserved_at": reserved_at,
+                "pair": pair,
+            }
+            try:
+                _write_immutable(path, _canonical_json_bytes(payload))
+            except FileExistsError:
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("rotation reservation is invalid") from exc
+            reserved[pair_index] = _valid_rotation_reservation(
+                payload,
+                market=market,
+                account_key=account_key,
+                execution_date=execution_date,
+                pair_index=pair_index,
+                allocation_sha256=allocation_sha256,
+            )
+            used.update((str(pair["sell_symbol"]), str(pair["buy_symbol"])))
+        return tuple(reserved[index] for index in sorted(reserved))
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
 
 
 def _positive_positions(snapshot: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -5569,12 +5805,16 @@ def rebuild_trend_report_from_evidence(
         "price_fx_to_account_currency",
     }
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
     }:
         required.add("normal_cost_rate")
-    if strategy_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"}:
+    if strategy_version in {
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+    }:
         required.update({"kelly_rounds", "kelly_data_reason"})
-    if strategy_version in {"v4", "v5", "v6", "v7", "v8", "v9", "v10"}:
+    if strategy_version in {
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+    }:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
     if missing:
@@ -5587,6 +5827,7 @@ def rebuild_trend_report_from_evidence(
         CandidateInput,
         HoldingSnapshot,
         RealHoldingInput,
+        RotationPair,
         _finalize_market_report,
         _report_payload,
         build_report,
@@ -5747,6 +5988,9 @@ def rebuild_trend_report_from_evidence(
         "atr",
         "filter_price",
         "market_cap",
+        "global_strength",
+        "strength_prev_week",
+        "strength_prev_month",
     }
     candidates_raw = inputs["candidates"]
     if not isinstance(candidates_raw, list):
@@ -5776,7 +6020,10 @@ def rebuild_trend_report_from_evidence(
                 "missing original input: holding_snapshots"
             )
         values = dict(raw)
-        for field in ("filter_price", "market_cap", "strength"):
+        for field in (
+            "filter_price", "market_cap", "strength", "global_strength",
+            "strength_prev_week", "strength_prev_month",
+        ):
             values[field] = decimal_or_none(values.get(field))
         holding_snapshots[str(symbol)] = HoldingSnapshot(**values)
 
@@ -5865,7 +6112,10 @@ def rebuild_trend_report_from_evidence(
                     if not isinstance(raw_snapshot, Mapping):
                         raise ValueError
                     snapshot_values = dict(raw_snapshot)
-                    for field in ("filter_price", "market_cap", "strength"):
+                    for field in (
+                        "filter_price", "market_cap", "strength", "global_strength",
+                        "strength_prev_week", "strength_prev_month",
+                    ):
                         snapshot_values[field] = decimal_or_none(
                             snapshot_values.get(field)
                         )
@@ -5901,6 +6151,16 @@ def rebuild_trend_report_from_evidence(
             bars_by_symbol=real_bars,
             prior_state=real_prior_state,
             trend_excluded_symbols=tuple(real_excluded),
+            net_value=decimal_or_none(real_raw.get("net_value")) or Decimal("0"),
+            available_cash=(
+                decimal_or_none(real_raw.get("available_cash")) or Decimal("0")
+            ),
+            position_count=(
+                int(real_raw["position_count"])
+                if isinstance(real_raw.get("position_count"), int)
+                and not isinstance(real_raw.get("position_count"), bool)
+                else None
+            ),
         )
     process_version = str(evidence.get("process_version") or "")
     normalize_trend_strategy_snapshot(snapshot, str(inputs["market"]))
@@ -5915,7 +6175,7 @@ def rebuild_trend_report_from_evidence(
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
     } and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
@@ -5998,7 +6258,7 @@ def rebuild_trend_report_from_evidence(
         drawdown_summary=(
             inputs["drawdown_summary"]
             if strategy_version in {
-                "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
             }
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
@@ -6021,6 +6281,61 @@ def rebuild_trend_report_from_evidence(
             )
         report = _finalize_market_report(
             report, managed_symbols=managed_symbols
+        )
+    decimal_pair_fields = {
+        "sell_global_strength",
+        "buy_global_strength",
+        "strength_gap",
+        "target_weight",
+        "target_amount",
+        "atr",
+    }
+
+    def frozen_pairs(field: str) -> tuple[RotationPair, ...]:
+        raw_pairs = inputs.get(field, [])
+        if not isinstance(raw_pairs, list):
+            raise TrendReplayIncompleteError(f"invalid original input: {field}")
+        result: list[RotationPair] = []
+        pair_indices: set[int] = set()
+        used_symbols: set[str] = set()
+        for raw_pair in raw_pairs:
+            if not isinstance(raw_pair, Mapping):
+                raise TrendReplayIncompleteError(f"invalid original input: {field}")
+            values = dict(raw_pair)
+            pair_index = values.get("pair_index")
+            if (
+                isinstance(pair_index, bool)
+                or pair_index not in {0, 1}
+                or pair_index in pair_indices
+                or not _valid_rotation_pair(
+                values, pair_index
+                )
+            ):
+                raise TrendReplayIncompleteError(f"invalid original input: {field}")
+            pair_symbols = {
+                str(values["sell_symbol"]), str(values["buy_symbol"])
+            }
+            if used_symbols & pair_symbols:
+                raise TrendReplayIncompleteError(f"invalid original input: {field}")
+            pair_indices.add(pair_index)
+            used_symbols.update(pair_symbols)
+            result.append(
+                RotationPair(
+                    **{
+                        key: Decimal(str(value))
+                        if key in decimal_pair_fields
+                        else value
+                        for key, value in values.items()
+                    }
+                )
+            )
+        return tuple(result)
+
+    if "simulate_rotation_pairs" in inputs or "real_rotation_pairs" in inputs:
+        report = replace(
+            report,
+            simulate_rotation_pairs=frozen_pairs("simulate_rotation_pairs"),
+            real_rotation_pairs=frozen_pairs("real_rotation_pairs"),
         )
     payload = _report_payload(report)
     if market in {"US", "HK"}:

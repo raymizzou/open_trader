@@ -48,6 +48,8 @@ from .a_share_trend import (
     collect_industry_contexts,
     enrich_real_holding_input,
     evaluate_candidate,
+    favorite_candidate_ids,
+    freeze_report_rotation_pairs,
     load_futu_simulate_trend_account,
     load_industry_temperatures,
     load_real_holding_input,
@@ -991,6 +993,10 @@ def _attempt_market_report(
             for row in rows:
                 component_pools[_row_tm_id(row)].add(str(pool_id))
         component_ids = {_row_tm_id(row) for row in component_rows}
+        get_favorites = getattr(api, "get_favorites_tickers", None)
+        favorite_rows = get_favorites() if callable(get_favorites) else []
+        favorite_ids = favorite_candidate_ids(favorite_rows, market=market)
+        candidate_ids = component_ids | favorite_ids
 
         holding_ids: dict[str, int] = {}
         for position in account.positions:
@@ -1002,7 +1008,7 @@ def _attempt_market_report(
                 )
             except TrendAnimalsError:
                 continue
-        requested_ids = sorted(component_ids | set(holding_ids.values()))
+        requested_ids = sorted(candidate_ids | set(holding_ids.values()))
         billing = {
             _billing_field(row): row for row in api.get_snapshot_billing()
         }
@@ -1065,11 +1071,12 @@ def _attempt_market_report(
         start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         candidates = []
         bars_by_symbol: dict[str, object] = {}
-        for tm_id in sorted(component_ids):
+        for tm_id in sorted(candidate_ids):
             row = rows_by_id.get(tm_id)
             if row is None:
                 continue
             mapping_verified = False
+            futu_symbol: str | None = None
             try:
                 futu_symbol = from_trend_animals_symbol(
                     market, str(row.get("tickerSymbol", ""))
@@ -1163,7 +1170,7 @@ def _attempt_market_report(
         )
 
         candidate_pool_rows = [
-            rows_by_id[tm_id] for tm_id in sorted(component_ids)
+            rows_by_id[tm_id] for tm_id in sorted(candidate_ids)
             if tm_id in rows_by_id
         ]
         industry_contexts, industry_context_status, industry_facts = (
@@ -1270,6 +1277,7 @@ def _attempt_market_report(
             watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
+                f"getFavoritesTicker securities={len(favorite_ids)}",
                 *_component_api_facts(api, len(component_rows)),
                 *pool_resolution_facts,
                 f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
@@ -1350,6 +1358,7 @@ def _attempt_market_report(
             real_holdings=real_holdings,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
+        report = freeze_report_rotation_pairs(report, config.data_dir)
         previous_attention_rows = _previous_attention_rows(
             paths, current_as_of_date=as_of_date, market=market
         )
@@ -1364,6 +1373,7 @@ def _attempt_market_report(
             watch_events=watch_events,
             query={
                 "component_pool_ids": list(pool_ids),
+                "favorite_ids": sorted(favorite_ids),
                 "snapshot_fields": list(UNIFIED_TREND_FIELDS),
                 "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
                 "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
@@ -1376,6 +1386,7 @@ def _attempt_market_report(
             responses={
                 "update_status": update_rows,
                 "components": component_rows,
+                "favorites": favorite_rows,
                 "snapshots": snapshot_rows,
                 "real_snapshots": list(real_snapshot_rows.values()),
                 **(

@@ -37,6 +37,7 @@ from open_trader.a_share_trend import (
     load_futu_simulate_trend_account,
     load_protection_state,
     load_watch_events,
+    plan_rotation_pairs,
     render_trend_failure_text,
     render_trend_feishu_text,
     render_markdown,
@@ -304,6 +305,7 @@ def candidate(
     temperature_curr: str | None = "热",
     phase: str | None = "立夏",
     asset: str = "A股",
+    global_strength: str | None = None,
 ) -> CandidateInput:
     return CandidateInput(
         tm_id=int(symbol),
@@ -328,6 +330,9 @@ def candidate(
         temperature_prev=temperature_prev,
         temperature_curr=temperature_curr,
         phase=phase,
+        global_strength=(
+            None if global_strength is None else Decimal(global_strength)
+        ),
     )
 
 
@@ -407,6 +412,7 @@ def holding(
     temperature_curr: str | None = "热",
     phase: str | None = "立夏",
     days: int | None = None,
+    global_strength: str | None = None,
 ) -> HoldingSnapshot:
     return HoldingSnapshot(
         tm_id=int(symbol),
@@ -428,7 +434,294 @@ def holding(
         temperature_curr=temperature_curr,
         phase=phase,
         days=days,
+        global_strength=(
+            None if global_strength is None else Decimal(global_strength)
+        ),
     )
+
+
+def test_rotation_pairs_weakest_with_strongest_at_inclusive_twenty_points() -> None:
+    """A 20-point edge is actionable; 19.9 would not be."""
+    pairs = plan_rotation_pairs(
+        holdings=[
+            holding("100001", global_strength="10"),
+            holding("100002", global_strength="20"),
+            holding("100003", global_strength="80"),
+        ],
+        candidates=[
+            candidate("200001", global_strength="90"),
+            candidate("200002", global_strength="40"),
+        ],
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol, pair.strength_gap) for pair in pairs] == [
+        ("100001", "200001", Decimal("80")),
+        ("100002", "200002", Decimal("20")),
+    ]
+
+
+def test_rotation_pairs_reject_19_9_and_use_stable_unique_symbols() -> None:
+    pairs = plan_rotation_pairs(
+        holdings=[
+            holding("100002", global_strength="20"),
+            holding("100001", global_strength="20"),
+        ],
+        candidates=[
+            candidate("200002", global_strength="39.9"),
+            candidate("200001", global_strength="40"),
+            candidate("200001", global_strength="99"),
+            candidate("100001", global_strength="100"),
+        ],
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in pairs] == [
+        ("100001", "200001"),
+    ]
+    assert plan_rotation_pairs(
+        holdings=[holding("100001", global_strength="10")],
+        candidates=[candidate("200001", global_strength="90")],
+        entry_weight=Decimal("0.04"),
+        available_slots=1,
+        pair_slots=(0, 1),
+    ) == ()
+
+
+def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("0"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in held_symbols
+        ),
+        exceptions=(),
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[
+            candidate("200001", global_strength="90"),
+            candidate("200002", global_strength="40"),
+        ],
+        holding_snapshots={
+            symbol: holding(
+                symbol, global_strength=("10" if index == 0 else "20"),
+            )
+            for index, symbol in enumerate(held_symbols)
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.simulate_rotation_pairs] == [
+        ("100000", "200001"),
+        ("100001", "200002"),
+    ]
+    assert built.real_rotation_pairs == ()
+    payload = trend_module._report_payload(built)
+    assert [
+        (pair["sell_symbol"], pair["buy_symbol"])
+        for pair in payload["strategy_judgments"]["simulate_rotation_pairs"]
+    ] == [("100000", "200001"), ("100001", "200002")]
+
+
+def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("0"),
+            positions=tuple(
+                AccountPosition(
+                    symbol, symbol, "stock", Decimal("500"), Decimal("10"),
+                    Decimal("5000"),
+                )
+                for symbol in held_symbols
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("200001", global_strength="90")],
+        holding_snapshots={
+            symbol: holding(symbol, global_strength="10")
+            for symbol in held_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        kelly_data_reason="frozen Kelly inputs unavailable",
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert built.risk_summary["status"] == "paused"
+    assert built.simulate_rotation_pairs == ()
+
+
+def test_cold_start_without_allocation_never_plans_rotation() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("0"),
+            positions=tuple(
+                AccountPosition(
+                    symbol, symbol, "stock", Decimal("500"), Decimal("10"),
+                    Decimal("5000"),
+                )
+                for symbol in held_symbols
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("200001", global_strength="90")],
+        holding_snapshots={
+            symbol: holding(symbol, global_strength="10")
+            for symbol in held_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert strategy["strategy_version"] == "v10"
+    assert built.simulate_rotation_pairs == ()
+
+
+def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
+    simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
+    real_symbols = tuple(f"30{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in simulated_symbols
+        ),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in real_symbols
+        ),
+        holding_snapshots={
+            symbol: (
+                None
+                if symbol == real_symbols[-1]
+                else holding(symbol, global_strength="60")
+            )
+            for symbol in real_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in real_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in real_symbols
+            }
+        },
+        net_value=Decimal("50000"),
+        available_cash=Decimal("10000"),
+        position_count=10,
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[
+            candidate(real_symbols[-1], global_strength="100"),
+            candidate("200001", global_strength="90"),
+            candidate("200002", global_strength="40"),
+        ],
+        holding_snapshots={
+            symbol: holding(symbol, global_strength="10")
+            for symbol in simulated_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in simulated_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in simulated_symbols
+            }
+        },
+        real_holdings=real,
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert [pair.sell_symbol for pair in built.simulate_rotation_pairs] == [
+        "100000", "100001",
+    ]
+    assert [pair.buy_symbol for pair in built.simulate_rotation_pairs] == [
+        real_symbols[-1], "200001",
+    ]
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.real_rotation_pairs] == [
+        ("300000", "200001"),
+    ]
 
 
 def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
@@ -466,6 +759,35 @@ def allocation_for(
                 },
             },
         },
+    }
+
+
+def active_drawdown_for(
+    snapshot: Mapping[str, object], *, equity: str,
+) -> dict[str, object]:
+    market = str(snapshot["market"])
+    version = str(snapshot["strategy_version"])
+    return {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": market,
+        "strategy_id": snapshot["strategy_id"],
+        "strategy_version": version,
+        "kelly_sample_key": (
+            f"{market}|trend_animals_warm_to_hot/{market}/{version}|{version}"
+        ),
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": equity,
+        "high_water_mark": equity,
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-14T18:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
     }
 
 

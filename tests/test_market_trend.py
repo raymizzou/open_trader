@@ -18,6 +18,7 @@ from open_trader.a_share_trend import (
     write_protection_state,
 )
 from open_trader.daily_premarket import DailyPremarketConfig
+from open_trader.a_share_trend import favorite_candidate_ids
 from open_trader.market_trend import (
     MARKET_NOTIFICATION_LABELS,
     MARKET_SETTINGS,
@@ -783,6 +784,17 @@ def test_hk_etf_root_loads_unique_warm_to_hot_child() -> None:
         pool_id=707617,
         expected_date="2026-07-24",
     ) == ([security], 707900)
+
+
+def test_favorite_candidate_ids_only_add_deduplicated_security_rows() -> None:
+    favorites = [
+        {"tmId": 2, "tickerSymbol": "AAPL.US", "asset": "美股"},
+        {"tmId": 2, "tickerSymbol": "AAPL.US", "asset": "美股"},
+        {"tmId": 3, "tickerSymbol": "0700.HK", "asset": "港股"},
+        {"tmId": 622460, "tickerName": "美股", "asset": "美股"},
+    ]
+
+    assert favorite_candidate_ids(favorites, market="US") == {2}
 
 
 def test_hk_etf_root_keeps_resolved_child_when_current_members_are_empty() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import asdict, replace
@@ -31,6 +32,177 @@ from open_trader.strategy_drawdown import (
 )
 from open_trader.models import Market, TradeFill
 from open_trader.trend_industry_context import IndustryContext
+
+
+def test_rotation_reservations_keep_two_immutable_slots_across_revisions(
+    tmp_path: Path,
+) -> None:
+    def pair(index: int, sell: str, buy: str) -> dict[str, object]:
+        return {
+            "pair_index": index,
+            "sell_symbol": sell,
+            "sell_name": sell,
+            "sell_futu_symbol": f"US.{sell}",
+            "sell_global_strength": "10",
+            "buy_symbol": buy,
+            "buy_name": buy,
+            "buy_futu_symbol": f"US.{buy}",
+            "buy_global_strength": "90",
+            "strength_gap": "80",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 40,
+            "lot_size": 1,
+            "atr": "5",
+            "reason": "relative_rotation",
+        }
+
+    first = trend_review.reserve_rotation_pairs(
+        tmp_path,
+        market="US",
+        account_key="simulate-102",
+        execution_date="2026-08-04",
+        pairs=[
+            pair(0, "WEAK1", "STRONG1"),
+            pair(1, "WEAK2", "STRONG2"),
+        ],
+        allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:20:00+08:00",
+    )
+    revised = trend_review.reserve_rotation_pairs(
+        tmp_path,
+        market="US",
+        account_key="simulate-102",
+        execution_date="2026-08-04",
+        pairs=[pair(0, "OTHERSELL", "OTHERBUY")],
+        allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:30:00+08:00",
+    )
+    no_proposal = trend_review.reserve_rotation_pairs(
+        tmp_path, market="US", account_key="simulate-102",
+        execution_date="2026-08-04", pairs=[], allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:40:00+08:00",
+    )
+
+    assert [(pair["sell_symbol"], pair["buy_symbol"]) for pair in first] == [
+        ("WEAK1", "STRONG1"),
+        ("WEAK2", "STRONG2"),
+    ]
+    assert revised == first
+    assert no_proposal == first
+    stored = tmp_path / "trend_review/rotation_plans/US/simulate-102/2026-08-04/0.json"
+    payload = json.loads(stored.read_text(encoding="utf-8"))
+    assert payload["allocation_sha256"] == "a" * 64
+    assert "report_sha256" not in payload
+    with pytest.raises(ValueError, match="rotation reservation is invalid"):
+        trend_review.reserve_rotation_pairs(
+            tmp_path, market="US", account_key="simulate-102",
+            execution_date="2026-08-04", pairs=[], allocation_sha256="b" * 64,
+            reserved_at="2026-08-03T16:50:00+08:00",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("strength_gap", "NaN"),
+        ("strength_gap", "79"),
+        ("target_weight", "0"),
+        ("target_amount", "-1"),
+        ("estimated_shares", 0),
+        ("estimated_shares", 41),
+        ("atr", "0"),
+    ],
+)
+def test_rotation_reservation_rejects_malformed_sizing(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    pair = {
+        "pair_index": 0,
+        "sell_symbol": "WEAK",
+        "sell_name": "WEAK",
+        "sell_futu_symbol": "US.WEAK",
+        "sell_global_strength": "10",
+        "buy_symbol": "STRONG",
+        "buy_name": "STRONG",
+        "buy_futu_symbol": "US.STRONG",
+        "buy_global_strength": "90",
+        "strength_gap": "80",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 40,
+        "lot_size": 10,
+        "atr": "5",
+        "reason": "relative_rotation",
+    }
+    pair[field] = value
+
+    with pytest.raises(ValueError, match="rotation reservation facts are invalid"):
+        trend_review.reserve_rotation_pairs(
+            tmp_path,
+            market="US",
+            account_key="simulate-102",
+            execution_date="2026-08-04",
+            pairs=[pair],
+            allocation_sha256="a" * 64,
+            reserved_at="2026-08-03T16:20:00+08:00",
+        )
+
+
+def test_rotation_reservation_rejects_candidate_reuse_across_slots(
+    tmp_path: Path,
+) -> None:
+    def pair(index: int, sell: str) -> dict[str, object]:
+        return {
+            "pair_index": index, "sell_symbol": sell, "sell_name": sell,
+            "sell_futu_symbol": f"US.{sell}", "sell_global_strength": "10",
+            "buy_symbol": "STRONG", "buy_name": "STRONG",
+            "buy_futu_symbol": "US.STRONG", "buy_global_strength": "90",
+            "strength_gap": "80", "target_weight": "0.04",
+            "target_amount": "4000", "estimated_shares": 40,
+            "lot_size": 1, "atr": "5", "reason": "relative_rotation",
+        }
+
+    with pytest.raises(ValueError, match="rotation reservation facts conflict"):
+        trend_review.reserve_rotation_pairs(
+            tmp_path, market="US", account_key="simulate-102",
+            execution_date="2026-08-04",
+            pairs=[pair(0, "WEAK1"), pair(1, "WEAK2")],
+            allocation_sha256="a" * 64,
+            reserved_at="2026-08-03T16:20:00+08:00",
+        )
+
+
+def test_rotation_revision_fills_only_the_unused_slot(tmp_path: Path) -> None:
+    def pair(index: int, sell: str, buy: str) -> dict[str, object]:
+        return {
+            "pair_index": index, "sell_symbol": sell, "sell_name": sell,
+            "sell_futu_symbol": f"US.{sell}", "sell_global_strength": "10",
+            "buy_symbol": buy, "buy_name": buy,
+            "buy_futu_symbol": f"US.{buy}", "buy_global_strength": "90",
+            "strength_gap": "80", "target_weight": "0.04",
+            "target_amount": "4000", "estimated_shares": 40,
+            "lot_size": 1, "atr": "5", "reason": "relative_rotation",
+        }
+
+    first = trend_review.reserve_rotation_pairs(
+        tmp_path, market="US", account_key="simulate-102",
+        execution_date="2026-08-04", pairs=[pair(0, "WEAK1", "STRONG1")],
+        allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:20:00+08:00",
+    )
+    revised = trend_review.reserve_rotation_pairs(
+        tmp_path, market="US", account_key="simulate-102",
+        execution_date="2026-08-04", pairs=[pair(0, "WEAK2", "STRONG2")],
+        allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:30:00+08:00",
+    )
+
+    assert [item["pair_index"] for item in first] == [0]
+    assert [
+        (item["pair_index"], item["sell_symbol"], item["buy_symbol"])
+        for item in revised
+    ] == [(0, "WEAK1", "STRONG1"), (1, "WEAK2", "STRONG2")]
 
 
 def test_cn_historical_and_current_snapshots_normalize_without_cross_version_rewrite() -> None:
@@ -197,6 +369,25 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
             "metadata": {"market": "CN", "broker": "eastmoney"},
             "kelly_rounds": [],
             "kelly_data_reason": "",
+            "simulate_rotation_pairs": [{
+                "pair_index": 0,
+                "sell_symbol": "WEAK",
+                "sell_name": "WEAK",
+                "sell_futu_symbol": "SH.WEAK",
+                "sell_global_strength": "10",
+                "buy_symbol": "STRONG",
+                "buy_name": "STRONG",
+                "buy_futu_symbol": "SH.STRONG",
+                "buy_global_strength": "90",
+                "strength_gap": "80",
+                "target_weight": "0.04",
+                "target_amount": "4000",
+                "estimated_shares": 400,
+                "lot_size": 100,
+                "atr": "0.5",
+                "reason": "relative_rotation",
+            }],
+            "real_rotation_pairs": [],
         },
     }
 
@@ -205,6 +396,36 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
+    assert rebuilt["strategy_judgments"]["simulate_rotation_pairs"][0][
+        "buy_symbol"
+    ] == "STRONG"
+
+    bad_index = copy.deepcopy(evidence)
+    bad_index["rebuild_inputs"]["simulate_rotation_pairs"][0]["pair_index"] = 2
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="invalid original input: simulate_rotation_pairs",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(bad_index)
+
+    duplicate_symbol = copy.deepcopy(evidence)
+    second_pair = copy.deepcopy(
+        duplicate_symbol["rebuild_inputs"]["simulate_rotation_pairs"][0]
+    )
+    second_pair.update(
+        pair_index=1,
+        sell_symbol="WEAK2",
+        sell_name="WEAK2",
+        sell_futu_symbol="SH.WEAK2",
+    )
+    duplicate_symbol["rebuild_inputs"]["simulate_rotation_pairs"].append(
+        second_pair
+    )
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match="invalid original input: simulate_rotation_pairs",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(duplicate_symbol)
 
 
 def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
