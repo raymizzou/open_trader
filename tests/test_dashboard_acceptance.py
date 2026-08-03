@@ -55,7 +55,7 @@ def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
 
 def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -> None:
     ready = ReadinessCheck("PASS", "ready")
-    report = LiveReadinessReport(ready, ready, ready, ready, ready, 0, 0)
+    report = LiveReadinessReport(ready, ready, ready, ready, ready, ready, 0, 0)
     live = [
         row for row in scenario_results(live_report=report)
         if row.scenario_id.startswith("LIVE-")

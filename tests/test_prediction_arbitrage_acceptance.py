@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import URLError
 from urllib.request import Request
 
 import pytest
@@ -69,6 +70,9 @@ class PredictClient:
 
 
 class PolymarketClient:
+    def __init__(self) -> None:
+        self._client = SimpleNamespace()
+
     def preflight_report(self) -> dict[str, object]:
         return {
             "result": "PASS",
@@ -86,6 +90,8 @@ def readiness_report(tmp_path: Path, **overrides: object):
         "predict_source_factory": lambda _config, *, urlopen_fn: PredictSource(),
         "predict_client_factory": lambda _config, *, urlopen_fn: PredictClient(),
         "polymarket_client_factory": lambda _config: PolymarketClient(),
+        "browser_ready": True,
+        "browser_health_fn": lambda _url: True,
     }
     factories.update(overrides)
     return acceptance.run_live_readiness(config_path, **factories)
@@ -111,6 +117,10 @@ def test_readiness_report_distinguishes_all_no_submit_facts(tmp_path: Path) -> N
         "polymarket": {
             "source_account_preflight": {"status": "PASS", "detail": "Polymarket source, account, and no-submit preflight ready"},
         },
+        "browser": {
+            "status": "PASS",
+            "detail": "Playwright browser marker and dashboard health ready",
+        },
         "safety": {
             "zero_mutation_calls": 0,
             "zero_live_notifications": 0,
@@ -129,6 +139,7 @@ def test_missing_configuration_is_blocked_not_fixture_pass(tmp_path: Path) -> No
     assert report.predict_account.status == "BLOCKED"
     assert report.predict_preflight.status == "BLOCKED"
     assert report.polymarket.status == "BLOCKED"
+    assert report.browser.status == "BLOCKED"
 
 
 def test_auth_read_failure_is_fail_and_redacts_secret_text(tmp_path: Path) -> None:
@@ -156,3 +167,116 @@ def test_read_only_transport_rejects_order_endpoint_and_counts_no_delivery() -> 
 
     assert transport.mutation_calls == 1
     assert transport.live_notifications == 0
+
+
+@pytest.mark.parametrize("action", ("post_order", "redeem_positions", "notify"))
+def test_polymarket_mutation_or_notification_attempt_fails_closed(
+    tmp_path: Path, action: str
+) -> None:
+    class MutatingSdk:
+        def __getattr__(self, name: str):
+            if name != action:
+                raise AttributeError(name)
+
+            def mutate(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+
+            return mutate
+
+    class MutatingPolymarket(PolymarketClient):
+        def __init__(self) -> None:
+            self._client = MutatingSdk()
+
+        def preflight_report(self) -> dict[str, object]:
+            getattr(self._client, action)()
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+                "posted": False,
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: MutatingPolymarket(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.polymarket.status == "FAIL"
+    assert report.safety.status == "FAIL"
+    assert report.live_notifications == (1 if action == "notify" else 0)
+    assert report.mutation_calls == (0 if action == "notify" else 1)
+
+
+def test_polymarket_report_without_posted_attestation_fails_closed(tmp_path: Path) -> None:
+    class MissingPosted(PolymarketClient):
+        def preflight_report(self) -> dict[str, object]:
+            return {
+                "result": "PASS",
+                "account_reads": "pass",
+                "fok_pair_signed_not_submitted": "pass",
+            }
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: MissingPosted(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.polymarket.detail == "FAIL: Polymarket preflight did not attest no mutation"
+
+
+def test_network_unavailability_is_blocked_but_invalid_polymarket_result_fails(
+    tmp_path: Path,
+) -> None:
+    def unavailable_source(_config: object, *, urlopen_fn: object) -> object:
+        del urlopen_fn
+        raise URLError("network-sentinel")
+
+    report = readiness_report(tmp_path, predict_source_factory=unavailable_source)
+    assert report.status == "BLOCKED"
+    assert report.predict_market.status == "BLOCKED"
+
+    def unavailable_polymarket(_config: object) -> object:
+        raise URLError("polymarket-network-sentinel")
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=unavailable_polymarket,
+    )
+    assert report.status == "BLOCKED"
+    assert report.polymarket.status == "BLOCKED"
+
+    class InvalidPolymarket(PolymarketClient):
+        def preflight_report(self) -> dict[str, object]:
+            return {"result": "BLOCKED"}
+
+    report = readiness_report(
+        tmp_path,
+        polymarket_client_factory=lambda _config: InvalidPolymarket(),
+    )
+    assert report.status == "FAIL"
+    assert report.polymarket.status == "FAIL"
+
+
+def test_browser_marker_and_health_are_required_for_live_pass(tmp_path: Path) -> None:
+    report = readiness_report(tmp_path, browser_ready=False)
+    assert report.status == "BLOCKED"
+    assert report.browser.status == "BLOCKED"
+
+    report = readiness_report(
+        tmp_path,
+        browser_ready=True,
+        browser_health_fn=lambda _url: False,
+    )
+    assert report.status == "BLOCKED"
+    assert report.browser.detail == "BLOCKED: browser/dashboard health unavailable"
+
+
+def test_make_acceptance_passes_playwright_marker_before_live_registry() -> None:
+    makefile = Path(__file__).parents[1].joinpath("Makefile").read_text(encoding="utf-8")
+    playwright = makefile.index("npm exec playwright test")
+    registry = makefile.index("prediction_arbitrage_acceptance")
+
+    assert playwright < registry
+    assert "--browser-ready" in makefile[playwright:registry]

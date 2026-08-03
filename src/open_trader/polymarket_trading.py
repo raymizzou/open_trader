@@ -348,6 +348,14 @@ def _safe_error_code(exc: BaseException) -> str:
     name = type(exc).__name__.lower()
     if isinstance(exc, KeychainError):
         return exc.error_code
+    if isinstance(exc, PolymarketTradingError):
+        return exc.error_code
+    status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        if status in {401, 403}:
+            return "rejected"
+        if status == 429 or status >= 500:
+            return "network"
     if "timeout" in name:
         return "timeout"
     if "sign" in name:
@@ -621,7 +629,10 @@ class PolymarketTradingClient:
             if callable(gasless_method):
                 try:
                     gasless_ready = gasless_method() is True
-                except Exception:
+                except Exception as exc:
+                    code = _safe_error_code(exc)
+                    if code in {"network", "timeout", "unavailable"}:
+                        raise PolymarketTradingError(code) from None
                     gasless_ready = False
         merge_ready = merge_capable and gasless_ready
         return {
@@ -671,7 +682,10 @@ class PolymarketTradingClient:
                 and bool(nonce)
                 and nonce.isdigit()
             )
-        except Exception:
+        except Exception as exc:
+            code = _safe_error_code(exc)
+            if code in {"network", "timeout", "unavailable"}:
+                raise PolymarketTradingError(code) from None
             return False
 
     def _identity_summary(self) -> tuple[str, str]:
@@ -1060,7 +1074,9 @@ class PolymarketTradingClient:
         except PolymarketTradingError:
             raise
         except Exception as exc:
-            del exc
+            code = _safe_error_code(exc)
+            if code in {"network", "timeout", "unavailable"}:
+                raise PolymarketTradingError(code) from None
             raise PolymarketTradingError("market_probe_unavailable") from None
 
     def preflight_report(self) -> dict[str, object]:
@@ -1075,6 +1091,8 @@ class PolymarketTradingClient:
             "merge_capability": "unavailable",
             "relayer_readiness": "fail",
             "secret_scan": "pass",
+            "posted": False,
+            "error_code": "none",
             "result": "BLOCKED",
         }
         try:
@@ -1085,13 +1103,22 @@ class PolymarketTradingClient:
         report["signer_match"] = signer_match
         report["wallet_match"] = wallet_match
         if signer_match != "yes" or wallet_match != "yes":
+            report["error_code"] = "auth"
             return report
         try:
             account = self.account_snapshot()
-        except PolymarketTradingError:
+        except PolymarketTradingError as exc:
+            report["error_code"] = exc.error_code
             return report
         report["account_reads"] = "pass"
-        readiness = self.readiness_snapshot()
+        try:
+            readiness = self.readiness_snapshot()
+        except PolymarketTradingError as exc:
+            report["error_code"] = exc.error_code
+            return report
+        except Exception as exc:
+            report["error_code"] = _safe_error_code(exc)
+            return report
         report["merge_capability"] = (
             "present_not_invoked" if readiness.get("merge_capability") is True else "unavailable"
         )
@@ -1099,10 +1126,12 @@ class PolymarketTradingClient:
             "pass" if readiness.get("ready") is True else "fail"
         )
         if report["relayer_readiness"] != "pass":
+            report["error_code"] = "sdk_error"
             return report
         try:
             intent, tick_size = self._discover_probe()
-        except PolymarketTradingError:
+        except PolymarketTradingError as exc:
+            report["error_code"] = exc.error_code
             return report
         summary = self.no_submit_preflight(
             intent,
@@ -1117,6 +1146,8 @@ class PolymarketTradingClient:
             "fok_pair_signed_not_submitted"
         ]
         report["equal_requested_shares"] = summary["equal_requested_shares"]
+        report["posted"] = summary.get("posted", False)
+        report["error_code"] = summary.get("error_code", "sdk_error")
         if (
             report["sdk_version"] == "0.2.0"
             and

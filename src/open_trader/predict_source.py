@@ -220,7 +220,10 @@ class PredictSource:
                 if _http_status(exc) in {401, 403}:
                     self._set_status("ws", "auth_blocked", "auth_blocked")
                     return
-                self._mark_stale("ws")
+                if _is_transport_error(exc):
+                    self._mark_unavailable("ws")
+                else:
+                    self._mark_stale("ws")
                 self._ws_generation += 1
                 attempt += 1
                 await _maybe_await(self._sleep_fn(min(2 ** (attempt - 1), _MAX_BACKOFF_SECONDS)))
@@ -279,8 +282,12 @@ class PredictSource:
                 if status in {401, 403}:
                     self._set_status("rest", "auth_blocked", "auth_blocked")
                     return None
-                self._mark_stale("rest")
-                if status != 429 and not isinstance(exc, (OSError, URLError)):
+                transport_error = _is_transport_error(exc)
+                if transport_error:
+                    self._mark_unavailable("rest")
+                else:
+                    self._mark_stale("rest")
+                if status != 429 and not transport_error:
                     return None
                 if attempt == 5:
                     return None
@@ -347,6 +354,16 @@ class PredictSource:
         else:
             self._ws_status = "stale"
         self._failure_reason[source] = f"{source}_stale"
+
+    def _mark_unavailable(self, source: Literal["rest", "ws"]) -> None:
+        # Keep the existing stale status during reconnects; the explicit reason
+        # lets acceptance distinguish transport loss from malformed data.
+        self._books[source].clear()
+        if source == "rest":
+            self._rest_status = "stale"
+        else:
+            self._ws_status = "stale"
+        self._failure_reason[source] = "network_unavailable"
 
     def _mark_ready(self, source: Literal["rest", "ws"], *, at: datetime | None = None) -> None:
         if source == "rest":
@@ -526,6 +543,13 @@ def _http_status(exc: BaseException) -> int | None:
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     return status if isinstance(status, int) else None
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    status = _http_status(exc)
+    if status is not None:
+        return status == 429 or status >= 500
+    return isinstance(exc, (ConnectionError, OSError, TimeoutError, URLError))
 
 
 async def _maybe_await(value: object) -> None:

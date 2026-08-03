@@ -25,11 +25,13 @@ ifeq ($(SKIP_POLYMARKET_LIVE),1)
 	@echo "SKIPPED: Polymarket live acceptance by operator override"
 else
 	@status=0; \
+	BROWSER_READY_ARG=--browser-ready; \
 	cd "$(WORKTREE_ROOT)" && \
 	PYTHONPATH=src .venv/bin/python -m open_trader.prediction_arbitrage_acceptance \
 		--url "$(DASHBOARD_URL)" \
 		--expected-root "$(WORKTREE_ROOT)" \
-		--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json" || status=$$?; \
+		--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json" \
+		$$BROWSER_READY_ARG || status=$$?; \
 	if [ $$status -eq 2 ]; then echo BLOCKED; exit 2; fi; \
 	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
 endif

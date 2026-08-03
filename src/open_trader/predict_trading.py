@@ -34,6 +34,24 @@ PREDICT_REST_URL = "https://api.predict.fun"
 _TIMEOUT_SECONDS = 10.0
 
 
+def _preflight_error_code(exc: BaseException) -> str:
+    status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        if status in {401, 403}:
+            return "auth"
+        if status == 429 or status >= 500:
+            return "unavailable"
+        return "rejected"
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError, URLError)):
+        return "unavailable"
+    text = str(exc).lower()
+    if "auth" in text or "unauthor" in text or "forbidden" in text:
+        return "auth"
+    if "sign" in text:
+        return "signing"
+    return "rejected"
+
+
 @dataclass(frozen=True, slots=True)
 class PredictBuyQuote:
     market_id: str
@@ -172,8 +190,9 @@ class PredictTradingClient:
             market = self._market(market_id)
             self._order_body(self.quote_market_buy(market_id, token_id, quantity_wei), market)
             return PredictLegResult(True, "preflight")
-        except Exception:
-            return PredictLegResult(False, "rejected", error_code="rejected")
+        except Exception as exc:
+            error_code = _preflight_error_code(exc)
+            return PredictLegResult(False, "rejected", error_code=error_code)
 
     def submit_buy_once(self, market_id: str, token_id: str, quantity_wei: int) -> PredictLegResult:
         try:
