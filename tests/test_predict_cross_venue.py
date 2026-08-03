@@ -921,6 +921,12 @@ class FakeCrossVenueValidator:
             polymarket_close_at=pair.polymarket.close_at,
             polymarket_settlement_at=pair.polymarket.settlement_at,
             canonical_cutoff=datetime(2026, 1, 21, tzinfo=UTC) if approved else None,
+            direct_outcome_mapping={
+                "predict_yes": "YES",
+                "predict_no": "NO",
+                "polymarket_yes": "YES",
+                "polymarket_no": "NO",
+            } if approved else None,
         )
 
 
@@ -1024,6 +1030,48 @@ def monitor_gamma(condition_ids, *, closed: bool) -> list[dict[str, object]]:
         for condition_id, row in rows.items()
     }
     return [rows[condition_id] for condition_id in condition_ids if condition_id in rows]
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    (
+        None,
+        {
+            "predict_yes": "NO",
+            "predict_no": "YES",
+            "polymarket_yes": "YES",
+            "polymarket_no": "NO",
+        },
+    ),
+)
+def test_monitor_does_not_admit_validation_without_exact_direct_mapping(mapping) -> None:
+    class InvalidMappingValidator(FakeCrossVenueValidator):
+        def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+            return replace(super().validate(pair), direct_outcome_mapping=mapping)
+
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        validator = InvalidMappingValidator()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=validator,
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(validator.calls))
+        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
+        assert predict.subscriptions == []
+        assert polymarket.token_sets[-1] == ()
+        await monitor.stop()
+
+    asyncio.run(exercise())
 
 
 def test_monitor_validates_before_subscription_and_confirms_both_rest_books_concurrently() -> None:

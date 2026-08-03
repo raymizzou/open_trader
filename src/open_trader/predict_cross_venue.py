@@ -65,6 +65,12 @@ _RESULT_FIELDS = {
     "direct_outcome_mapping", "canonical_cutoff", "contract_shape", "divergent_states",
     "evidence", "uncertainties",
 }
+_DIRECT_OUTCOME_MAPPING = {
+    "predict_yes": "YES",
+    "predict_no": "NO",
+    "polymarket_yes": "YES",
+    "polymarket_no": "NO",
+}
 _CUTOFF_QUOTE = re.compile(
     r"\bat\s+(\d{2}:\d{2})\s+UTC\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
     re.IGNORECASE,
@@ -745,7 +751,7 @@ def _equivalence_validation(
             return _cross_venue_validation(pair, False, "IDENTITY_MISMATCH", prompt_version)
         if returned["rules_fingerprint"] != market.rules_fingerprint:
             return _cross_venue_validation(pair, False, "FINGERPRINT_MISMATCH", prompt_version)
-    direct = {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}
+    direct = _DIRECT_OUTCOME_MAPPING
     if structured["direct_outcome_mapping"] != direct:
         return _cross_venue_validation(pair, False, "OUTCOME_MAPPING_MISMATCH", prompt_version)
     cutoff = _canonical_cutoff(structured["canonical_cutoff"])
@@ -1047,6 +1053,7 @@ class PredictCrossVenueMonitor:
                 and validation.predict_fingerprint == pair.predict.rules_fingerprint
                 and validation.polymarket_fingerprint
                 == pair.polymarket.rules_fingerprint
+                and validation.direct_outcome_mapping == _DIRECT_OUTCOME_MAPPING
             ):
                 approved[pair_id] = replace(
                     pair, canonical_cutoff=validation.canonical_cutoff
