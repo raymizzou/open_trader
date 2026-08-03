@@ -1965,10 +1965,19 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     projected = dashboard_module._load_trend_reports(
-        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+        current_candidate_pool_ids={"CN": (622466, 697199)},
     )["eastmoney"]
     assert projected["allocation"] == payload["allocation"]
     assert projected["simulate_rotation_pairs"] == []
+    assert projected["current_strategy_version"] == "v11"
+    assert next(
+        row["value"]
+        for row in projected["current_strategy_parameter_rows"]
+        if row["name"] == "目标仓位"
+    ) == "账户净值的 6%"
 
     payload["allocation"]["daily_path"] = "data/trend_allocation/latest.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

@@ -2274,11 +2274,22 @@ def _project_broker_trend_report(
     )
     if not isinstance(frozen_parameter_rows, list):
         frozen_parameter_rows = []
+    allocation = payload.get("allocation")
+    current_allocation_reference = (
+        {
+            "daily_path": allocation["daily_path"],
+            "sha256": allocation["sha256"],
+            "snapshot": {"markets": allocation["markets"]},
+        }
+        if isinstance(allocation, dict)
+        else None
+    )
     current_strategy_snapshot = (
         live_trend_strategy_snapshot(
             market,
             str(strategy_snapshot.get("process_version") or ""),
             current_candidate_pool_ids,
+            allocation=current_allocation_reference,
         )
         if isinstance(strategy_snapshot, dict)
         and current_candidate_pool_ids
