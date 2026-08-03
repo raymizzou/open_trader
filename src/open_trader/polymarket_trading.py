@@ -241,6 +241,14 @@ def load_keychain_secret(
     """Read one secret from Keychain without including it in diagnostics."""
 
     _validate_keychain_account(account)
+    return _load_keychain_password(account, KEYCHAIN_SERVICE, run)
+
+
+def _load_keychain_password(
+    account: str,
+    service: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None,
+) -> str:
     runner = run or _run_security
     args = [
         SECURITY,
@@ -248,7 +256,7 @@ def load_keychain_secret(
         "-a",
         account,
         "-s",
-        KEYCHAIN_SERVICE,
+        service,
         "-w",
     ]
     try:
@@ -285,32 +293,7 @@ def load_predict_api_key(
 ) -> str:
     """Load the Predict API key without exposing it in failures."""
 
-    runner = run or _run_security
-    try:
-        completed = runner(
-            [
-                SECURITY,
-                "find-generic-password",
-                "-a",
-                PREDICT_API_KEY_ACCOUNT,
-                "-s",
-                PREDICT_KEYCHAIN_SERVICE,
-                "-w",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        value = getattr(completed, "stdout", "")
-    except Exception as exc:
-        del exc
-        raise KeychainError() from None
-    if not isinstance(value, str):
-        raise KeychainError("keychain_empty")
-    value = value.rstrip("\r\n")
-    if not value:
-        raise KeychainError("keychain_empty")
-    return value
+    return _load_keychain_password(PREDICT_API_KEY_ACCOUNT, PREDICT_KEYCHAIN_SERVICE, run)
 
 
 def load_predict_private_key(
@@ -319,32 +302,7 @@ def load_predict_private_key(
 ) -> str:
     """Load the Predict signer key without exposing it in failures."""
 
-    runner = run or _run_security
-    try:
-        completed = runner(
-            [
-                SECURITY,
-                "find-generic-password",
-                "-a",
-                PREDICT_PRIVATE_KEY_ACCOUNT,
-                "-s",
-                PREDICT_KEYCHAIN_SERVICE,
-                "-w",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        value = getattr(completed, "stdout", "")
-    except Exception as exc:
-        del exc
-        raise KeychainError() from None
-    if not isinstance(value, str):
-        raise KeychainError("keychain_empty")
-    value = value.rstrip("\r\n")
-    if not value:
-        raise KeychainError("keychain_empty")
-    return value
+    return _load_keychain_password(PREDICT_PRIVATE_KEY_ACCOUNT, PREDICT_KEYCHAIN_SERVICE, run)
 
 
 def _canonical_address(value: object, field: str) -> str:

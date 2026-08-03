@@ -29,6 +29,7 @@ class FakeResponse:
 
 
 class FakeBuilder:
+    last_order_input = None
     def sign_predict_account_message(self, message: str) -> str:
         assert message == "dynamic-message-sentinel"
         return "signature-sentinel"
@@ -39,6 +40,7 @@ class FakeBuilder:
 
     def build_order(self, strategy: str, input) -> dict[str, object]:
         assert strategy == "MARKET"
+        self.last_order_input = input
         return {"order": "sentinel"}
 
     def build_typed_data(self, order, **kwargs: object) -> dict[str, object]:
@@ -114,7 +116,7 @@ def test_preflight_signs_market_fok_without_order_request() -> None:
         return response_for(request)
 
     client, _ = make_client(urlopen_fn)
-    result = client.no_submit_buy_preflight("896", "yes-token", 10**18, fee_rate_bps=200)
+    result = client.no_submit_buy_preflight("896", "yes-token", 10**18)
     assert result.accepted is True
     assert result.status == "preflight"
     assert not any("/v1/orders" in request.full_url for request in requests)
@@ -128,30 +130,69 @@ def test_submit_posts_once_and_transport_error_is_ambiguous() -> None:
         return response_for(request)
 
     client, _ = make_client(urlopen_fn)
-    result = client.submit_buy_once("896", "yes-token", 10**18, fee_rate_bps=200)
+    result = client.submit_buy_once("896", "yes-token", 10**18)
     assert (result.accepted, result.status, result.order_id) == (True, "accepted", "order-hash")
     assert sum(request.full_url.endswith("/v1/orders") for request in requests) == 1
+    assert requests[-1].headers["Content-type"] == "application/json"
 
     failure_client, _ = make_client(lambda *args, **kwargs: (_ for _ in ()).throw(URLError("offline")))
-    assert failure_client.submit_buy_once("896", "yes-token", 10**18, fee_rate_bps=200).error_code == "ambiguous"
+    assert failure_client.submit_buy_once("896", "yes-token", 10**18).error_code == "ambiguous"
 
 
-def test_reconcile_requires_order_match_activity_and_position() -> None:
+def test_reconcile_returns_unknown_for_pending_order_with_preexisting_position() -> None:
     def urlopen_fn(request, **kwargs):
         if request.full_url.endswith("/v1/auth/message"):
             return FakeResponse({"message": "dynamic-message-sentinel"})
         if request.full_url.endswith("/v1/auth"):
             return FakeResponse({"token": "jwt-sentinel"})
         if request.full_url.endswith("/v1/orders/order-hash"):
-            return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token"}})
+            return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token", "signer": DEPOSIT, "status": "PENDING", "amountFilled": "1"}})
         if request.full_url.endswith("/v1/orders/matches"):
-            return FakeResponse({"data": {"matches": [{"orderHash": "order-hash", "transactionHash": "tx"}]}})
+            return FakeResponse({"data": {"matches": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
         if request.full_url.endswith("/v1/account/activity"):
-            return FakeResponse({"data": {"activities": [{"orderHash": "order-hash"}]}})
+            return FakeResponse({"data": {"activities": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
         if request.full_url.endswith("/v1/positions?marketId=896"):
-            return FakeResponse({"data": {"positions": [{"tokenId": "yes-token", "amount": "1"}]}})
+            return FakeResponse({"data": {"positions": [{"tokenId": "yes-token", "amount": "9", "amountDelta": "0"}]}})
         raise AssertionError(request.full_url)
 
     client, _ = make_client(urlopen_fn)
     result = client.reconcile_buy("896", "yes-token", "order-hash")
-    assert result == {"verified": True, "conclusively_absent": False, "status": "verified"}
+    assert result == {"verified": False, "conclusively_absent": False, "status": "unknown"}
+
+
+def test_reconcile_verifies_only_full_order_match_activity_and_position_agreement() -> None:
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders/order-hash"):
+            return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token", "signer": DEPOSIT, "status": "FILLED", "amountFilled": "1"}})
+        if request.full_url.endswith("/v1/orders/matches"):
+            return FakeResponse({"data": {"matches": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
+        if request.full_url.endswith("/v1/account/activity"):
+            return FakeResponse({"data": {"activities": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
+        if request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"data": {"positions": [{"tokenId": "yes-token", "amount": "1", "amountDelta": "1"}]}})
+        raise AssertionError(request.full_url)
+
+    client, _ = make_client(urlopen_fn)
+    assert client.reconcile_buy("896", "yes-token", "order-hash") == {"verified": True, "conclusively_absent": False, "status": "verified"}
+
+
+def test_book_parses_decimal_price_to_exact_wei() -> None:
+    from open_trader.predict_trading import _book
+
+    book = _book({"marketId": 896, "updateTimestampMs": 1, "asks": [["0.57", "1"]], "bids": []})
+    assert book.asks[0][0] == 570000000000000000
+
+
+def test_submit_uses_fresh_server_fee_rate() -> None:
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/markets/896"):
+            return FakeResponse({"data": {"feeRateBps": "201", "isNegRisk": False, "isYieldBearing": False}})
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+    assert client.submit_buy_once("896", "yes-token", 10**18).accepted is True
+    assert client._builder.last_order_input.fee_rate_bps == "201"

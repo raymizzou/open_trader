@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -96,6 +97,8 @@ class PredictTradingClient:
         if auth:
             headers["Authorization"] = f"Bearer {self._authenticate()}"
         encoded = json.dumps(data, separators=(",", ":")).encode() if data is not None else None
+        if encoded is not None:
+            headers["Content-Type"] = "application/json"
         request = Request(f"{PREDICT_REST_URL}{path}", data=encoded, headers=headers, method=method)
         try:
             with self._urlopen_fn(request, timeout=_TIMEOUT_SECONDS) as response:
@@ -163,21 +166,17 @@ class PredictTradingClient:
     def _order_body(self, quote: PredictBuyQuote, market: Mapping[str, object]) -> Mapping[str, object]:
         return {"data": {"pricePerShare": quote.price_per_share_wei, "strategy": "MARKET", "slippageBps": "0", "isFillOrKill": True, "isPostOnly": False, "reservedBalancePolicy": "REJECT_MARKET_ORDER", "isMinAmountOut": True, "selfTradePrevention": "CANCEL_MAKER", "order": _plain(self._signed_order(quote, market))}}
 
-    def no_submit_buy_preflight(self, market_id: str, token_id: str, quantity_wei: int, *, fee_rate_bps: int | None = None) -> PredictLegResult:
+    def no_submit_buy_preflight(self, market_id: str, token_id: str, quantity_wei: int) -> PredictLegResult:
         try:
             market = self._market(market_id)
-            if fee_rate_bps is not None:
-                market = {**market, "feeRateBps": fee_rate_bps}
             self._order_body(self.quote_market_buy(market_id, token_id, quantity_wei), market)
             return PredictLegResult(True, "preflight")
         except Exception:
             return PredictLegResult(False, "rejected", error_code="rejected")
 
-    def submit_buy_once(self, market_id: str, token_id: str, quantity_wei: int, *, fee_rate_bps: int | None = None) -> PredictLegResult:
+    def submit_buy_once(self, market_id: str, token_id: str, quantity_wei: int) -> PredictLegResult:
         try:
             market = self._market(market_id)
-            if fee_rate_bps is not None:
-                market = {**market, "feeRateBps": fee_rate_bps}
             response = self._json("/v1/orders", method="POST", data=self._order_body(self.quote_market_buy(market_id, token_id, quantity_wei), market), auth=True)
             row = _data(response)
             order_id = row.get("hash") or row.get("id")
@@ -195,13 +194,36 @@ class PredictTradingClient:
     def reconcile_buy(self, market_id: str, token_id: str, order_hash: str) -> Mapping[str, object]:
         try:
             order = _data(self._json(f"/v1/orders/{order_hash}", auth=True))
-            matches = _data(self._json("/v1/orders/matches", auth=True)).get("matches", ())
-            activity = _data(self._json("/v1/account/activity", auth=True)).get("activities", ())
-            positions = _data(self._json(f"/v1/positions?marketId={market_id}", auth=True)).get("positions", ())
-            identity = order.get("hash") == order_hash and str(order.get("tokenId")) == str(token_id) and str(order.get("marketId")) == str(market_id)
-            matched = any(str(_row(item).get("orderHash")) == order_hash for item in matches) and any(str(_row(item).get("orderHash")) == order_hash for item in activity)
-            positioned = any(str(_row(item).get("tokenId")) == str(token_id) and str(_row(item).get("amount", "0")) not in {"0", "0.0"} for item in positions)
-            return {"verified": identity and matched and positioned, "conclusively_absent": not identity and not matches and not activity and not positions, "status": "verified" if identity and matched and positioned else "unknown"}
+            matches = _rows(self._json("/v1/orders/matches", auth=True), "matches")
+            activity = _rows(self._json("/v1/account/activity", auth=True), "activities")
+            positions = _rows(self._json(f"/v1/positions?marketId={market_id}", auth=True), "positions")
+            identity = (
+                order.get("hash") == order_hash
+                and str(order.get("tokenId")) == str(token_id)
+                and str(order.get("marketId")) == str(market_id)
+                and str(order.get("signer", order.get("signerAddress", ""))).lower() == self._config.wallet_address.lower()
+            )
+            final = str(order.get("status", "")).upper() in {"FILLED", "MATCHED", "COMPLETED"}
+            order_amount = _number(order.get("amountFilled"))
+            matched = [row for row in matches if str(row.get("orderHash")) == order_hash]
+            events = [row for row in activity if str(row.get("orderHash")) == order_hash]
+            facts = [(_facts(match), _facts(event)) for match in matched for event in events]
+            agreed = next((match for match, event in facts if match is not None and match == event), None)
+            positioned = agreed is not None and any(
+                str(row.get("tokenId")) == str(token_id)
+                and _number(row.get("amount")) is not None
+                and _number(row.get("amount")) >= agreed[1]
+                and _number(row.get("amountDelta", row.get("delta"))) == agreed[1]
+                for row in positions
+            )
+            verified = identity and final and agreed is not None and order_amount == agreed[1] and positioned
+            absent = (
+                str(order.get("status", "")).upper() in {"NOT_FOUND", "ABSENT"}
+                and not matched
+                and not events
+                and not any(str(row.get("tokenId")) == str(token_id) for row in positions)
+            )
+            return {"verified": verified, "conclusively_absent": absent, "status": "verified" if verified else "absent" if absent else "unknown"}
         except Exception:
             return {"verified": False, "conclusively_absent": False, "status": "unknown"}
 
@@ -218,12 +240,32 @@ def _row(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _rows(payload: Mapping[str, object], name: str) -> tuple[Mapping[str, object], ...]:
+    value = _data(payload).get(name, ())
+    return tuple(_row(item) for item in value) if isinstance(value, list) else ()
+
+
+def _number(value: object) -> Decimal | None:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return number if number.is_finite() else None
+
+
+def _facts(row: Mapping[str, object]) -> tuple[str, Decimal, Decimal] | None:
+    transaction = row.get("transactionHash")
+    amount = _number(row.get("executedAmount"))
+    fee = _number(row.get("fee"))
+    return (str(transaction), amount, fee) if isinstance(transaction, str) and transaction and amount is not None and amount > 0 and fee is not None and fee >= 0 else None
+
+
 def _book(payload: Mapping[str, object]) -> Book:
     def levels(name: str) -> list[DepthLevel]:
         raw = payload.get(name, ())
         if not isinstance(raw, list):
             raise ValueError("invalid predict book")
-        return [DepthLevel((int(float(row[0]) * 10**18), int(float(row[1]) * 10**18))) for row in raw if isinstance(row, list) and len(row) == 2]
+        return [DepthLevel((int(Decimal(str(row[0])) * 10**18), int(Decimal(str(row[1])) * 10**18))) for row in raw if isinstance(row, list) and len(row) == 2]
     return Book(int(payload.get("marketId", 0)), int(payload.get("updateTimestampMs", 0)), levels("asks"), levels("bids"))
 
 
