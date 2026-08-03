@@ -3657,6 +3657,9 @@ console.log(JSON.stringify({
   naiveCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00"}),
   offsetCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00+08:00"}),
   validFractionalUtcCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00.123Z"}),
+  impossibleDateCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-02-30T23:59:00Z"}),
+  invalidLeapDayCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2100-02-29T23:59:00Z"}),
+  validLeapDayCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2096-02-29T23:59:00Z"}),
   invertedOutcomes:predictionPreviewIsComplete({...preview,buy_legs:[preview.buy_legs[0],{...preview.buy_legs[1],outcome:"YES"}]}),
   nonNumericFees:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],maximum_fee:"fee"},preview.buy_legs[1]]}),
   missingFeeAsset:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],fee_asset:undefined},preview.buy_legs[1]]}),
@@ -3683,6 +3686,9 @@ console.log(JSON.stringify({
         "naiveCutoff": False,
         "offsetCutoff": False,
         "validFractionalUtcCutoff": True,
+        "impossibleDateCutoff": False,
+        "invalidLeapDayCutoff": False,
+        "validLeapDayCutoff": True,
         "invertedOutcomes": False,
         "nonNumericFees": False,
         "missingFeeAsset": False,
@@ -3726,6 +3732,9 @@ console.log(JSON.stringify({
   uppercase:rendered("MANUAL_CONFIRM"),
   unknown:rendered("future_mode"),
   validFutureCutoff:renderedCutoff("2099-12-31T23:59:00.123Z").includes('data-action="participate"'),
+  impossibleDateCutoff:renderedCutoff("2099-02-30T23:59:00Z"),
+  invalidLeapDayCutoff:renderedCutoff("2100-02-29T23:59:00Z"),
+  validLeapDayCutoff:renderedCutoff("2096-02-29T23:59:00Z").includes('data-action="participate"'),
   expiredCutoff:renderedCutoff("2020-01-01T00:00:00Z"),
   dateOnlyCutoff:renderedCutoff("2099-12-31"),
   naiveCutoff:renderedCutoff("2099-12-31T23:59:00"),
@@ -3744,8 +3753,9 @@ console.log(JSON.stringify({
         assert 'data-action="participate"' not in rendered[mode]
         assert "执行模式未知" in rendered[mode]
     assert rendered["validFutureCutoff"] is True
-    for mode in ("expiredCutoff", "dateOnlyCutoff", "naiveCutoff", "offsetCutoff"):
+    for mode in ("expiredCutoff", "dateOnlyCutoff", "naiveCutoff", "offsetCutoff", "impossibleDateCutoff", "invalidLeapDayCutoff"):
         assert 'data-action="participate"' not in rendered[mode]
+    assert rendered["validLeapDayCutoff"] is True
 
 
 def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:

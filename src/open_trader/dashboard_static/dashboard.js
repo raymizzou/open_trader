@@ -2155,9 +2155,24 @@ function predictionHasValue(value) {
 }
 
 function predictionCanonicalUtcCutoff(value) {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) return null;
+  const match = typeof value === "string"
+    ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/.exec(value)
+    : null;
+  if (!match) return null;
   const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? timestamp : null;
+  if (!Number.isFinite(timestamp)) return null;
+  const date = new Date(timestamp);
+  const fraction = match[7] || "";
+  const milliseconds = Number(fraction.slice(0, 3).padEnd(3, "0") || "0");
+  return date.getUTCFullYear() === Number(match[1])
+    && date.getUTCMonth() + 1 === Number(match[2])
+    && date.getUTCDate() === Number(match[3])
+    && date.getUTCHours() === Number(match[4])
+    && date.getUTCMinutes() === Number(match[5])
+    && date.getUTCSeconds() === Number(match[6])
+    && date.getUTCMilliseconds() === milliseconds
+    ? timestamp
+    : null;
 }
 
 function predictionFutureCanonicalUtcCutoff(value) {
