@@ -6475,8 +6475,10 @@ def test_dashboard_account_poll_is_independent_and_conditional() -> None:
     output = run_dashboard_js(r'''
 const requests=[];
 const intervals=[];
-globalThis.window={setInterval(fn,ms){intervals.push({fn,ms});return intervals.length;},clearInterval(){},setTimeout(){return 1;},clearTimeout(){}};
-globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+const timers=[];
+let aborts=0;
+globalThis.window={setInterval(fn,ms){intervals.push({fn,ms});return intervals.length;},clearInterval(){},setTimeout(fn,ms){timers.push({fn,ms});return timers.length;},clearTimeout(){}};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){aborts+=1;}};
 globalThis.fetch=async(url, options={})=>{
   requests.push({url, headers: options.headers || {}});
   if (url === "/api/v1/account/snapshot") {
@@ -6486,6 +6488,7 @@ globalThis.fetch=async(url, options={})=>{
 };
 renderDashboard=()=>{};
 renderHoldings=()=>{};
+renderHeaderSummary=()=>{};renderSummary=()=>{};renderBrokerCards=()=>{};renderSourceStatusListIntoHeader=()=>{};renderConnectionPanel=()=>{};
 state.decisionDeepLinkRestored=true;
 await loadDashboard();
 scheduleAccountPolling();
@@ -6494,9 +6497,12 @@ const overlapRequests=requests.length;
 await Promise.resolve();
 await Promise.resolve();
 await intervals[0].fn();
+timers[0].fn();
 console.log(JSON.stringify({
   requests,
   interval:intervals[0].ms,
+  timeout:timers[0].ms,
+  aborts,
   overlapRequests,
   snapshot:state.accountSnapshot && state.accountSnapshot.status,
   etag:state.accountEtag,
@@ -6508,6 +6514,8 @@ console.log(JSON.stringify({
         "/api/dashboard", "/api/v1/account/snapshot", "/api/v1/account/snapshot",
     ]
     assert rendered["interval"] == 5000
+    assert rendered["timeout"] == 4000
+    assert rendered["aborts"] == 1
     assert rendered["overlapRequests"] == 2
     assert rendered["snapshot"] == "healthy"
     assert rendered["etag"] == '"etag-1"'
@@ -6536,6 +6544,7 @@ def test_dashboard_account_poll_state_transitions(
 globalThis.window={setTimeout(){return 1;},clearTimeout(){}};
 globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
 renderHoldings=()=>{};
+renderHeaderSummary=()=>{};renderSummary=()=>{};renderBrokerCards=()=>{};renderSourceStatusListIntoHeader=()=>{};renderConnectionPanel=()=>{};
 globalThis.fetch=async()=>({
   ok:scenario.status === 200,
   status:scenario.status,
@@ -6563,26 +6572,60 @@ def test_dashboard_account_poll_failure_and_304_preserve_snapshot_and_dashboard_
 globalThis.window={setTimeout(){return 1;},clearTimeout(){}};
 globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
 renderHoldings=()=>{};
+renderHeaderSummary=()=>{};renderSummary=()=>{};renderBrokerCards=()=>{};renderSourceStatusListIntoHeader=()=>{};renderConnectionPanel=()=>{};
 state.accountSnapshot={status:"healthy",stale:false,summary:{},broker_summaries:[],positions:[],cash_balances:[]};
 state.accountEtag='"kept"';
 let response={ok:false,status:503,headers:{get:()=>null},json:async()=>({})};
 globalThis.fetch=async()=>response;
 await loadAccountSnapshot();
 const failed={snapshot:state.accountSnapshot.status,etag:state.accountEtag,error:Boolean(state.accountError),enabled:accountActionsEnabled()};
+globalThis.fetch=async()=>{const error=new Error("offline");error.name="AbortError";throw error;};
+await loadAccountSnapshot();
+const aborted={snapshot:state.accountSnapshot.status,etag:state.accountEtag,error:Boolean(state.accountError),enabled:accountActionsEnabled()};
 response={ok:false,status:304,headers:{get:()=> '"kept"'},json:async()=>{throw new Error("304 must not parse")}};
+globalThis.fetch=async()=>response;
 await loadAccountSnapshot();
 const unchanged={snapshot:state.accountSnapshot.status,etag:state.accountEtag,error:Boolean(state.accountError),enabled:accountActionsEnabled()};
 state.dashboard={marker:"legacy"};
 globalThis.fetch=async()=>({ok:false,status:503});
 renderLoadError=(error)=>{state.dashboard=null;state.dashboardError=error;};
 await loadDashboard();
-console.log(JSON.stringify({failed,unchanged,dashboard:state.dashboard,account:state.accountSnapshot.status}));
+console.log(JSON.stringify({failed,aborted,unchanged,dashboard:state.dashboard,account:state.accountSnapshot.status}));
 ''')
     assert json.loads(output) == {
         "failed": {"snapshot": "healthy", "etag": '"kept"', "error": True, "enabled": False},
+        "aborted": {"snapshot": "healthy", "etag": '"kept"', "error": True, "enabled": False},
         "unchanged": {"snapshot": "healthy", "etag": '"kept"', "error": False, "enabled": True},
         "dashboard": None,
         "account": "healthy",
+    }
+
+
+def test_dashboard_account_poll_refreshes_account_panels_after_dashboard_first() -> None:
+    output = run_dashboard_js(r'''
+globalThis.window={setTimeout(){return 1;},clearTimeout(){}};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+const calls={header:0,summary:0,brokers:0,sources:0,connection:0,holdings:0};
+renderHeaderSummary=()=>{calls.header+=1;};
+renderSummary=()=>{calls.summary+=1;};
+renderBrokerCards=()=>{calls.brokers+=1;};
+renderSourceStatusListIntoHeader=()=>{calls.sources+=1;};
+renderConnectionPanel=()=>{calls.connection+=1;};
+renderHoldings=()=>{calls.holdings+=1;};
+renderWorkspaceChrome=()=>{};renderKellyLab=()=>{};renderDashboardViews=()=>{};renderTradeActions=()=>{};
+renderDashboard();
+Object.keys(calls).forEach((key)=>calls[key]=0);
+globalThis.fetch=async()=>({ok:true,status:200,headers:{get:()=> '"account"'},json:async()=>({status:"healthy",stale:false,summary:{},broker_summaries:[],positions:[],cash_balances:[]})});
+await loadAccountSnapshot();
+console.log(JSON.stringify(calls));
+''')
+    assert json.loads(output) == {
+        "header": 1,
+        "summary": 1,
+        "brokers": 1,
+        "sources": 1,
+        "connection": 1,
+        "holdings": 1,
     }
 
 

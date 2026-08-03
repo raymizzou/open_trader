@@ -953,7 +953,6 @@ async function loadAccountSnapshot() {
     });
     if (response.status === 304) {
       state.accountError = null;
-      renderHoldings();
       return;
     }
     if (!response.ok) {
@@ -968,6 +967,11 @@ async function loadAccountSnapshot() {
   } finally {
     window.clearTimeout(timeout);
     state.accountRequestInFlight = false;
+    renderHeaderSummary();
+    renderSummary();
+    renderBrokerCards();
+    renderSourceStatusListIntoHeader();
+    renderConnectionPanel();
     renderHoldings();
   }
 }
