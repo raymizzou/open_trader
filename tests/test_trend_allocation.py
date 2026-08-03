@@ -219,6 +219,81 @@ def test_allocation_once_writes_terminal_snapshot_status(tmp_path: Path, monkeyp
     } == status
 
 
+@pytest.mark.parametrize(
+    ("phase", "blocker", "corrupt"),
+    [
+        ("ready", None, None),
+        ("fallback", "offline", None),
+        ("holiday", None, None),
+        ("fallback", 123, {"blocker": 123}),
+        ("ready", None, {"latest_sha256": None}),
+    ],
+)
+def test_terminal_allocation_refreshes_runtime_status_without_rebuilding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+    blocker: object, corrupt: dict[str, object] | None,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+        trend_animals_api_key="test-key",
+    )
+    reference = write_allocation_snapshot(config.data_dir, snapshot())
+    write_allocation_snapshot(
+        config.data_dir, snapshot(roots=root_rows(cn=("99", "58.3"))), revision=True,
+    )
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    old_status = {
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "effective_mode": "execute",
+        "executor_host": "executor",
+        "local_host": "executor",
+        "pid": -1,
+        "working_directory": "/old/worktree",
+        "git_sha": "a" * 40,
+        "phase": phase,
+        "heartbeat_at": "2026-08-03T15:05:00+08:00",
+        "attempted_for": "2026-08-03",
+        "latest_daily_path": reference["daily_path"],
+        "latest_sha256": reference["sha256"],
+        "blocker": blocker,
+        "next_check_at": "2026-08-04T15:05:00+08:00",
+    }
+    old_status.update(corrupt or {})
+    status_path.write_text(json.dumps(old_status))
+
+    class StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(trend_allocation, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(trend_allocation, "_process_version", lambda _repo: "b" * 40)
+    monkeypatch.chdir(tmp_path)
+    expected_error = TrendAnimalsError if corrupt else StopLoop
+    with pytest.raises(expected_error, match="invalid" if corrupt else None):
+        trend_allocation.run_trend_allocation_controller(
+            config,
+            now_fn=lambda: datetime.fromisoformat("2026-08-03T16:21:00+08:00"),
+            sleep_fn=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
+            quote_factory=lambda **_kwargs: pytest.fail("terminal allocation fetched the calendar"),
+            api_factory=lambda **_kwargs: pytest.fail("terminal allocation was rebuilt"),
+        )
+
+    if corrupt:
+        return
+    status = json.loads(status_path.read_text())
+    assert status["phase"] == phase
+    assert status["attempted_for"] == "2026-08-03"
+    assert status["pid"] != -1
+    assert status["working_directory"] == str(tmp_path)
+    assert status["git_sha"] == "b" * 40
+    assert status["heartbeat_at"] == "2026-08-03T16:21:00+08:00"
+    assert status["latest_daily_path"] == reference["daily_path"]
+    assert status["latest_sha256"] == reference["sha256"]
+    assert status["blocker"] == blocker
+
+
 def test_allocation_reference_requires_current_terminal_attempt(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",

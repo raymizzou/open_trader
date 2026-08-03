@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-03
 
+- 资源排名任务重启后若当天已有终态快照，现在只刷新当前 PID、Git SHA 和心跳，不再访问富途或趋势动物，也不读取移动的最新指针或改写不可变快照；损坏的终态引用继续失败关闭，资源任务与市场控制器测试 169 个通过。
 - 修复资源排名成功时空的失败原因被报告冻结层误判为无效，导致 CN/HK/US 新报告拒绝同一份正常共享快照的问题；正常生产输入统一冻结为空字符串，已冻结报告仍拒绝空值，真实 `2026-08-03-r1` 快照直接验证通过，相关趋势报告与控制器测试 648 个通过。
 - 冻结 Account v1 快照契约，并把账户/报价的单写者统一重命名为 Account Sync Worker；运行命令改为 `account-sync-worker`，现有 launchd label、heartbeat/lock 文件及 JSON/CSV persistence 保持不变。本阶段不启动 Account API、不切换 Gateway 流量，也不改变 Dashboard、策略、报告或执行行为。
 - 修复 Dashboard 与账户同步 launchd 重装在旧 job 异步移除完成前立即 bootstrap 的启动竞态；安装器现在确认 label 已消失后再启动，并移除账户同步在 RunAtLoad 后多余的 `kickstart -k`，避免新进程被立即杀死和节流重启。本阶段不改变页面、策略、报告、执行或 worker 业务行为。
