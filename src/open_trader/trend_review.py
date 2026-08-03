@@ -6757,20 +6757,29 @@ def _merge_rotation_orders(
                 not in {"SUBMITTING", "SUBMITTED", "WAITING_SUBMIT", "ACTIVE"}
             ):
                 raise ValueError("conflicting rotation fill order identity")
+            execution_status = str(
+                order.get("status") or order.get("order_status") or ""
+            ).strip()
+            execution_fields: dict[str, object] = {
+                key: value
+                for key, value in order.items()
+                if key in {
+                    "report_sha256", "pair_key", "pair_index", "account_id",
+                    "execution_date", "opening_strategy_version",
+                    "opening_strategy_version_source", "closing_strategy_version",
+                    "strategy_snapshot", "exit_reason", "order_status", "status",
+                    "dealt_qty", "dealt_avg_price", "avg_price",
+                }
+            }
+            # `_completed_trades` gives `status` precedence over
+            # `order_status`; mirror the validated full-fill status into both
+            # aliases so a stale SUBMITTED row cannot hide the fill.
+            if execution_status:
+                execution_fields["status"] = execution_status
+                execution_fields["order_status"] = execution_status
             merged[index] = {
                 **existing,
-                **{
-                    key: value
-                    for key, value in order.items()
-                    if key in {
-                        "report_sha256", "pair_key", "pair_index", "account_id",
-                        "execution_date", "opening_strategy_version",
-                        "opening_strategy_version_source", "closing_strategy_version",
-                        "strategy_snapshot", "exit_reason",
-                        "order_status", "status", "dealt_qty", "dealt_avg_price",
-                        "avg_price",
-                    }
-                },
+                **execution_fields,
             }
             continue
         merged.append(order)

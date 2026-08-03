@@ -1248,7 +1248,18 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
     upgraded = trend_review._merge_rotation_orders(
         {"orders": [stale_status]}, tmp_path, "CN", "2026-07-20"
     )
-    assert upgraded["orders"][0]["order_status"] == "FILLED_ALL"
+    assert upgraded["orders"][0]["status"] == "FILLED_ALL"
+    prior_buy = {
+        "order_id": "prior-weak-buy", "code": "SH.WEAK", "trd_side": "BUY",
+        "qty": "1000", "dealt_qty": "1000", "order_status": "FILLED_ALL",
+    }
+    completed = trend_review._completed_trades([{
+        "date": "2026-07-20",
+        "orders": trend_review._merge_rotation_orders(
+            {"orders": [prior_buy, stale_status]}, tmp_path, "CN", "2026-07-20"
+        )["orders"],
+    }])
+    assert completed and completed[0]["symbol"] == "WEAK"
     conflicting = dict(client.orders[0])
     conflicting["dealt_qty"] = "999"
     with pytest.raises(ValueError, match="conflicting rotation fill order identity"):
