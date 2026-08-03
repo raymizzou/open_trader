@@ -1093,20 +1093,53 @@ class PredictionArbitrageStore:
         return isinstance(value, str) and bool(value.strip())
 
     @staticmethod
-    def _valid_decimal(value: object) -> bool:
+    def _valid_decimal(
+        value: object, *, allow_zero: bool = False, allow_negative: bool = False
+    ) -> bool:
         if isinstance(value, bool):
             return False
         try:
             amount = Decimal(str(value))
         except (InvalidOperation, ValueError):
             return False
-        return amount.is_finite() and amount > 0
+        if not amount.is_finite():
+            return False
+        if allow_negative:
+            return True
+        if allow_zero:
+            return amount >= 0
+        return amount > 0
+
+    @staticmethod
+    def _valid_timestamp(value: object) -> bool:
+        try:
+            _parse_timestamp(value)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _decimal_values_match(left: object, right: object) -> bool:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return False
+        try:
+            left_value = Decimal(str(left))
+            right_value = Decimal(str(right))
+        except (InvalidOperation, ValueError):
+            return False
+        return left_value.is_finite() and right_value.is_finite() and left_value == right_value
 
     @classmethod
     def _valid_cross_preview_candidate(cls, candidate: object) -> bool:
         return isinstance(candidate, Mapping) and all(
             cls._nonempty_string(candidate.get(field))
-            for field in ("market_id", "condition_id", "yes_token_id", "no_token_id")
+            for field in (
+                "market_id",
+                "condition_id",
+                "yes_token_id",
+                "no_token_id",
+                "rules_fingerprint",
+            )
         )
 
     @classmethod
@@ -1119,11 +1152,30 @@ class PredictionArbitrageStore:
             and leg.get("outcome") == outcome
             and all(
                 cls._nonempty_string(leg.get(field))
-                for field in ("market_id", "condition_id", "token_id")
+                for field in (
+                    "market_id",
+                    "condition_id",
+                    "token_id",
+                    "settlement_asset",
+                    "fee_asset",
+                )
             )
             and all(
                 cls._valid_decimal(leg.get(field))
-                for field in ("requested_quantity", "net_quantity", "max_price", "max_cost")
+                for field in (
+                    "requested_quantity",
+                    "net_quantity",
+                    "max_price",
+                    "max_cost",
+                )
+            )
+            and cls._valid_decimal(leg.get("maximum_fee"), allow_zero=True)
+            and cls._valid_decimal(leg.get("minimum_order_size"), allow_zero=True)
+            and cls._valid_timestamp(leg.get("book_timestamp"))
+            and "settlement_at" in leg
+            and (
+                leg.get("settlement_at") is None
+                or cls._valid_timestamp(leg.get("settlement_at"))
             )
         )
 
@@ -1151,11 +1203,38 @@ class PredictionArbitrageStore:
             and cls._valid_decimal(payload.get("annualized_yield"))
         ):
             return False
-        try:
-            _parse_timestamp(payload.get("canonical_cutoff"))
-        except ValueError:
+        if not cls._valid_timestamp(payload.get("canonical_cutoff")):
             return False
         if not isinstance(intent, Mapping) or intent.get("intent_type") != "cross_venue":
+            return False
+        if not (
+            intent.get("pair_id") == payload.get("pair_id")
+            and intent.get("direction") == payload.get("direction")
+            and intent.get("canonical_cutoff") == payload.get("canonical_cutoff")
+            and cls._valid_decimal(intent.get("quantity"))
+            and cls._valid_decimal(intent.get("calculable_gas"), allow_zero=True)
+            and cls._valid_decimal(intent.get("total_max_cost"))
+            and cls._valid_decimal(intent.get("maximum_fee"), allow_zero=True)
+            and cls._valid_decimal(intent.get("minimum_payout"))
+            and cls._valid_decimal(intent.get("minimum_profit"))
+            and cls._valid_decimal(intent.get("annualized_yield"))
+            and cls._valid_timestamp(intent.get("canonical_cutoff"))
+            and cls._valid_timestamp(intent.get("resolution_at"))
+            and intent.get("actionable") is True
+            and intent.get("quote_available") is True
+            and cls._decimal_values_match(
+                payload.get("total_max_cost"), intent.get("total_max_cost")
+            )
+            and cls._decimal_values_match(
+                payload.get("minimum_payout"), intent.get("minimum_payout")
+            )
+            and cls._decimal_values_match(
+                payload.get("minimum_profit"), intent.get("minimum_profit")
+            )
+            and cls._decimal_values_match(
+                payload.get("annualized_yield"), intent.get("annualized_yield")
+            )
+        ):
             return False
         legs = intent.get("legs")
         if not isinstance(legs, list) or len(legs) != 2:
@@ -1182,6 +1261,12 @@ class PredictionArbitrageStore:
             isinstance(approved_candidates, Mapping)
             and cls._valid_cross_preview_candidate(approved_candidates.get("predict.fun"))
             and cls._valid_cross_preview_candidate(approved_candidates.get("polymarket"))
+        ):
+            return False
+        if any(
+            approved_candidates[exchange].get("rules_fingerprint")
+            != rules_fingerprints.get(exchange)
+            for exchange in ("predict.fun", "polymarket")
         ):
             return False
         approval = payload.get("codex_approval")

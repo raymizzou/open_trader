@@ -53,6 +53,10 @@ def cross_preview_payload(
     total_max_cost: Decimal = Decimal("20.00"),
     net_quantity: Decimal = Decimal("5"),
 ) -> dict[str, object]:
+    canonical_cutoff = "2026-09-03T00:00:00Z"
+    resolution_at = "2026-09-03T12:00:00Z"
+    predict_book_timestamp = "2026-08-03T00:00:00Z"
+    polymarket_book_timestamp = "2026-08-03T00:00:01Z"
     return {
         "execution_id": f"execution:{market_id}",
         "opportunity_id": f"cross:{market_id}:PREDICT_YES_POLYMARKET_NO",
@@ -67,7 +71,7 @@ def cross_preview_payload(
         "minimum_payout": net_quantity,
         "minimum_profit": Decimal("0.50"),
         "annualized_yield": Decimal("0.16"),
-        "canonical_cutoff": "2026-09-03T00:00:00Z",
+        "canonical_cutoff": canonical_cutoff,
         "rules_fingerprints": {
             "predict.fun": "predict-fingerprint",
             "polymarket": "poly-fingerprint",
@@ -104,6 +108,19 @@ def cross_preview_payload(
         },
         "intent": {
             "intent_type": "cross_venue",
+            "pair_id": market_id,
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "quantity": net_quantity,
+            "calculable_gas": Decimal("0.10"),
+            "total_max_cost": total_max_cost,
+            "maximum_fee": Decimal("0.15"),
+            "minimum_payout": net_quantity,
+            "minimum_profit": Decimal("0.50"),
+            "annualized_yield": Decimal("0.16"),
+            "canonical_cutoff": canonical_cutoff,
+            "resolution_at": resolution_at,
+            "actionable": True,
+            "quote_available": True,
             "legs": [
                 {
                     "exchange": "predict.fun",
@@ -111,10 +128,16 @@ def cross_preview_payload(
                     "condition_id": "predict-condition",
                     "outcome": "YES",
                     "token_id": "predict-yes",
+                    "settlement_asset": "USDT",
                     "requested_quantity": net_quantity,
                     "net_quantity": net_quantity,
                     "max_price": Decimal("0.45"),
                     "max_cost": Decimal("2.25"),
+                    "maximum_fee": Decimal("0.05"),
+                    "fee_asset": "USDT",
+                    "book_timestamp": predict_book_timestamp,
+                    "settlement_at": resolution_at,
+                    "minimum_order_size": Decimal("1"),
                 },
                 {
                     "exchange": "polymarket",
@@ -122,10 +145,16 @@ def cross_preview_payload(
                     "condition_id": "poly-condition",
                     "outcome": "NO",
                     "token_id": "poly-no",
+                    "settlement_asset": "USDC",
                     "requested_quantity": net_quantity,
                     "net_quantity": net_quantity,
                     "max_price": Decimal("0.45"),
                     "max_cost": Decimal("2.25"),
+                    "maximum_fee": Decimal("0.05"),
+                    "fee_asset": "USDC",
+                    "book_timestamp": polymarket_book_timestamp,
+                    "settlement_at": resolution_at,
+                    "minimum_order_size": Decimal("1"),
                 },
             ],
         },
@@ -625,6 +654,21 @@ def test_cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving(
         ("minimum_payout", lambda payload: payload.pop("minimum_payout")),
         ("minimum_profit", lambda payload: payload.pop("minimum_profit")),
         ("annualized_yield", lambda payload: payload.pop("annualized_yield")),
+        ("intent_quantity", lambda payload: payload["intent"].pop("quantity")),
+        (
+            "intent_calculable_gas",
+            lambda payload: payload["intent"].pop("calculable_gas"),
+        ),
+        ("intent_maximum_fee", lambda payload: payload["intent"].pop("maximum_fee")),
+        (
+            "intent_resolution_at",
+            lambda payload: payload["intent"].pop("resolution_at"),
+        ),
+        ("intent_actionable", lambda payload: payload["intent"].pop("actionable")),
+        (
+            "intent_quote_available",
+            lambda payload: payload["intent"].pop("quote_available"),
+        ),
         (
             "intent_legs",
             lambda payload: payload["intent"].__setitem__("legs", payload["intent"]["legs"][:1]),

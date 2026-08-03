@@ -223,3 +223,113 @@ Result:
   - added regression coverage for incomplete expired cross payloads across the critical frozen-envelope parts
   - added regression coverage for candidate-ID-driven signal episode rotation
   - updated the existing execution notification fixture to the new persisted identity contract
+
+## Fix round 2 — re-review finding 1
+
+Review date: August 3, 2026
+
+### Remaining finding addressed
+
+1. `_valid_cross_preview_payload()` still accepted expired cross previews that were missing intent-side fields required by `_intent_from_payload()` for `CrossVenueIntent`, allowing the TTL bypass to remain open for incomplete frozen envelopes.
+
+### TDD red step for re-review round
+
+First red command after adding the new intent-envelope regressions:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_store.py \
+  -k 'cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving or expired_incomplete_cross_preview' -q
+```
+
+Red result:
+
+- `6 failed, 17 passed, 47 deselected`
+
+Observed intended failures:
+
+- expired cross previews still bypassed TTL when the frozen intent was missing `quantity`
+- expired cross previews still bypassed TTL when the frozen intent was missing `calculable_gas`
+- expired cross previews still bypassed TTL when the frozen intent was missing `maximum_fee`
+- expired cross previews still bypassed TTL when the frozen intent was missing `resolution_at`
+- expired cross previews still bypassed TTL when the frozen intent was missing `actionable`
+- expired cross previews still bypassed TTL when the frozen intent was missing `quote_available`
+
+### Re-review implementation details
+
+- `prediction_arbitrage_store.py`
+  - expanded the store-local cross-preview validator to require the full frozen intent envelope consumed by `_intent_from_payload()`
+  - validated intent-side `pair_id`, `direction`, `quantity`, `calculable_gas`, `total_max_cost`, `maximum_fee`, `minimum_payout`, `minimum_profit`, `annualized_yield`, `canonical_cutoff`, `resolution_at`, `actionable`, and `quote_available`
+  - validated each cross leg’s native exchange/market/condition/token/outcome plus settlement asset, requested/net quantity, max price/cost, maximum fee, fee asset, book timestamp, settlement-at field presence, and minimum order size
+  - rejected malformed and non-finite numeric values before the TTL bypass
+  - kept the check store-local and fail-closed, with no import back into execution code
+  - required the duplicated frozen envelope values relied on by reservation and execution (`pair_id`, `direction`, `canonical_cutoff`, `total_max_cost`, `minimum_payout`, `minimum_profit`, `annualized_yield`) to agree across the preview payload and intent payload
+- tests
+  - enriched the valid frozen cross-preview fixture to include the full Task 12 intent envelope and leg payload
+  - added explicit regressions for missing intent `quantity`, `calculable_gas`, `maximum_fee`, `resolution_at`, `actionable`, and `quote_available`
+
+### Re-review verification
+
+Focused store-only green rerun after the validator hardening:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_store.py \
+  -k 'cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving or expired_incomplete_cross_preview' -q
+```
+
+Result:
+
+- `23 passed, 47 deselected`
+
+Focused review-fix slice:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_predict_cross_venue.py \
+  -k 'expired_incomplete_cross_preview or cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving or candidate_identity_rotation or notifies_only_first_cross_stage_5_per_dedupe_identity' -q
+```
+
+Result:
+
+- `25 passed, 131 deselected, 1 warning`
+
+Compatibility check for the three execution-path regressions exposed by the stricter store gate:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py \
+  -k 'cross_preview_no_ttl_accepts_same_episode_better_prices_after_elapsed_window or cross_preview_canary_quantity_requests_smallest_and_freezes_exact_quantity' -q
+```
+
+Result:
+
+- `3 passed, 156 deselected, 1 warning`
+
+Task 12 focused slice:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py \
+  -k 'signal_episode or cross_preview or no_ttl or canary_quantity or preview_matches' -q
+```
+
+Result:
+
+- `35 passed, 280 deselected, 1 warning`
+
+Full affected backend suite:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_cross_venue.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py -q
+```
+
+Result:
+
+- `315 passed, 1 warning`
