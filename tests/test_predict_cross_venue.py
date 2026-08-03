@@ -311,6 +311,37 @@ def test_equivalence_rejects_opening_time_quote_as_cutoff_evidence(tmp_path: Pat
     assert result.reason == "CUTOFF_EVIDENCE_MISMATCH"
 
 
+def test_equivalence_rejects_ambiguous_opening_and_closing_time_quote(tmp_path: Path) -> None:
+    quote = (
+        "This market opens at 23:59 UTC on December 31, 2026 and closes at "
+        "00:00 UTC on January 1, 2027"
+    )
+    pair = explicit_pair()
+    pair = replace(
+        pair,
+        predict=replace(pair.predict, rules=quote),
+        polymarket=replace(pair.polymarket, rules=quote),
+    )
+    structured = {
+        **equivalence_result(pair),
+        "evidence": [
+            {"exchange": "predict.fun", "field": "cutoff", "quote": quote},
+            {"exchange": "polymarket", "field": "cutoff", "quote": quote},
+        ],
+    }
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=codex_jsonl(structured), stderr=""
+        ),
+    )
+
+    result = validator.validate(pair)
+
+    assert result.approved is False
+    assert result.reason == "CUTOFF_EVIDENCE_MISMATCH"
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [

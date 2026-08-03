@@ -668,7 +668,10 @@ def _canonical_cutoff(value: object) -> datetime | None:
 def _evidence_supports_cutoff(quote: object, cutoff: datetime) -> bool:
     if not isinstance(quote, str):
         return False
-    for match in _CUTOFF_QUOTE.finditer(quote):
+    matches = tuple(_CUTOFF_QUOTE.finditer(quote))
+    if len(matches) != 1:
+        return False
+    for match in matches:
         start = max(quote.rfind(mark, 0, match.start()) for mark in ".;\n") + 1
         ends = [quote.find(mark, match.end()) for mark in ".;\n"]
         end = min((position for position in ends if position >= 0), default=len(quote))
