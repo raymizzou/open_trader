@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Mapping
 from .account_sync_state import (
     ACCOUNT_STATE_VERSION,
     REQUIRED_BROKERS,
+    build_dashboard_projection,
     effective_source_status,
     is_valid_account_publication,
 )
@@ -28,20 +30,26 @@ class SnapshotResult:
 
 
 class PublicationUnavailable(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, worker_git_sha: str = "") -> None:
         self.code = code
+        self.worker_git_sha = worker_git_sha
 
 
 def load_account_snapshot(
     data_dir: Path, *, api_git_sha: str, now: datetime
 ) -> SnapshotResult:
+    worker_sha = ""
     try:
         account, quotes, worker_sha = _load_stable_publication(data_dir)
         if not _is_git_sha(api_git_sha) or api_git_sha != worker_sha:
             return _unavailable("account_release_mismatch", api_git_sha, worker_sha)
         return _build_snapshot(account, quotes, api_git_sha, worker_sha, now)
     except PublicationUnavailable as error:
-        return _unavailable(error.code, api_git_sha, "")
+        return _unavailable(
+            error.code,
+            api_git_sha,
+            error.worker_git_sha or worker_sha,
+        )
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -80,19 +88,32 @@ def _load_stable_publication(data_dir: Path) -> tuple[dict[str, object], dict[st
         account_first = _read_required(account_path, "account")
         quotes_first = _read_required(quotes_path, "quotes")
         heartbeat = _read_required(heartbeat_path, "heartbeat")
-        account_second = _read_required(account_path, "account")
-        quotes_second = _read_required(quotes_path, "quotes")
-        if account_first != account_second or quotes_first != quotes_second:
-            continue
-        account = _parse_account(account_first)
-        quotes = _parse_quotes(quotes_first)
         worker_sha = _worker_sha(heartbeat)
-        projection = account["dashboard_projection"]
-        assert isinstance(projection, dict)
-        if projection["quote_as_of"] != quotes["last_success_at"]:
-            continue
-        return account, quotes, worker_sha
-    raise PublicationUnavailable("account_publication_unstable")
+        try:
+            account_second = _read_required(account_path, "account")
+            quotes_second = _read_required(quotes_path, "quotes")
+            if account_first != account_second or quotes_first != quotes_second:
+                continue
+            account = _parse_account(account_first)
+            quotes = _parse_quotes(quotes_first)
+            projection = account["dashboard_projection"]
+            assert isinstance(projection, dict)
+            if projection["quote_as_of"] != quotes["last_success_at"]:
+                continue
+            brokers = account["brokers"]
+            assert isinstance(brokers, dict)
+            incomplete_refresh = (
+                quotes["status"] == "partial" and quotes["missing_count"] > 0
+            ) or (
+                quotes["status"] == "failed"
+                and not _has_complete_quote_coverage(brokers, quotes)
+            )
+            if not incomplete_refresh and not _projection_is_paired(account, quotes):
+                continue
+            return account, quotes, worker_sha
+        except PublicationUnavailable as error:
+            raise PublicationUnavailable(error.code, worker_sha) from error
+    raise PublicationUnavailable("account_publication_unstable", worker_sha)
 
 
 def _parse_account(raw: bytes) -> dict[str, object]:
@@ -138,9 +159,59 @@ def _parse_quotes(raw: bytes) -> dict[str, object]:
             not isinstance(symbol, str) or not isinstance(row, dict)
             for symbol, row in quotes["quotes"].items()
         )
+        or any(
+            count < 0
+            for count in (
+                quotes["requested_count"],
+                quotes["quote_count"],
+                quotes["missing_count"],
+            )
+        )
+        or quotes["quote_count"] + quotes["missing_count"]
+        != quotes["requested_count"]
+        or any(
+            not _is_valid_quote_row_payload(symbol, row)
+            for symbol, row in quotes["quotes"].items()
+        )
     ):
         raise PublicationUnavailable("quotes_publication_invalid")
     return quotes
+
+
+def _is_valid_quote_row_payload(symbol: object, row: object) -> bool:
+    if not isinstance(symbol, str) or not isinstance(row, dict):
+        return False
+    required = {
+        "market": str,
+        "symbol": str,
+        "status": str,
+        "last_price": str,
+        "price_session": str,
+        "price_time": str,
+        "fetched_at": str,
+        "stale": bool,
+    }
+    if any(
+        not isinstance(row.get(field), kind)
+        for field, kind in required.items()
+    ):
+        return False
+    if (
+        not row["market"]
+        or not row["symbol"]
+        or row["market"] + "." + row["symbol"] != symbol
+        or row["status"] not in {"ok", "missing_quote"}
+        or not _is_aware_timestamp(row["fetched_at"])
+        or (row["price_time"] and not _is_aware_timestamp(row["price_time"]))
+    ):
+        return False
+    if row["status"] == "ok":
+        try:
+            price = Decimal(row["last_price"])
+        except InvalidOperation:
+            return False
+        return price.is_finite() and price > 0
+    return not row["last_price"]
 
 
 def _worker_sha(raw: bytes) -> str:
@@ -207,6 +278,43 @@ def _unavailable(code: str, api_git_sha: str, worker_git_sha: str) -> SnapshotRe
         },
         None,
     )
+
+
+def _projection_is_paired(
+    account: Mapping[str, object], quotes: Mapping[str, object]
+) -> bool:
+    projection = account.get("dashboard_projection")
+    if not isinstance(projection, dict):
+        return False
+    generated_at = projection.get("generated_at")
+    if not isinstance(generated_at, str):
+        return False
+    try:
+        expected = build_dashboard_projection(
+            account,
+            quotes,
+            generated_at=generated_at,
+        )
+    except Exception:
+        return False
+    return _projection_contract_view(expected) == _projection_contract_view(projection)
+
+
+def _projection_contract_view(projection: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "generated_at": projection["generated_at"],
+        "quote_as_of": projection["quote_as_of"],
+        "summary": _public_summary(projection["summary"]),
+        "broker_summaries": [
+            _public_broker_summary(row) for row in projection["broker_summaries"]
+        ],
+        "broker_positions": [
+            _public_position(row) for row in projection["broker_positions"]
+        ],
+        "cash_details": [
+            _public_cash_balance(row) for row in projection["cash_details"]
+        ],
+    }
 
 
 def _build_snapshot(
@@ -416,12 +524,11 @@ def _has_complete_quote_coverage(
 
 def _is_valid_quote_row(row: object, market: str, symbol: str) -> bool:
     return (
-        isinstance(row, Mapping)
+        _is_valid_quote_row_payload(f"{market}.{symbol}", row)
+        and isinstance(row, Mapping)
         and row.get("market") == market
         and row.get("symbol") == symbol
         and row.get("status") == "ok"
-        and isinstance(row.get("last_price"), str)
-        and bool(row["last_price"])
     )
 
 

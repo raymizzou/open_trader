@@ -246,7 +246,12 @@ def test_snapshot_returns_contract_503_for_invalid_publication(
     assert result.payload == {
         "schema_version": 1,
         "status": "unavailable",
-        "release": {"api_git_sha": SHA, "worker_git_sha": ""},
+        "release": {
+            "api_git_sha": SHA,
+            "worker_git_sha": SHA
+            if code in {"account_publication_invalid", "account_schema_unsupported", "quotes_publication_invalid"}
+            else "",
+        },
         "errors": [{
             "code": code,
             "source": "account" if code.startswith("account_") else "quotes",
@@ -368,7 +373,7 @@ def test_snapshot_keeps_complete_partial_quotes_healthy(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "updates",
     [
-        {"status": "partial", "missing_count": 1},
+        {"status": "partial", "quote_count": 1, "missing_count": 1},
         {"status": "failed", "quotes": {}},
     ],
 )
@@ -416,6 +421,56 @@ def test_snapshot_classifies_malformed_quote_rows_as_invalid(tmp_path: Path) -> 
     assert result.status_code == 503
     assert result.etag is None
     assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+    assert result.payload["release"]["worker_git_sha"] == SHA
+
+
+def test_snapshot_rejects_nonfinite_quote_price(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    quotes_path = data_dir / "latest/quotes.json"
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    quotes["quotes"]["US.TEST0"]["last_price"] = "NaN"
+    write_json_atomic(quotes_path, quotes)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+
+
+def test_snapshot_rejects_negative_quote_count(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    _rewrite_json(data_dir / "latest/quotes.json", {"missing_count": -1})
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "quotes_publication_invalid"
+
+
+def test_snapshot_rejects_a_stable_phased_account_projection_pair(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    account_path = data_dir / "latest/account_sync_state.json"
+    quotes_path = data_dir / "latest/quotes.json"
+    account = json.loads(account_path.read_text(encoding="utf-8"))
+    account["brokers"]["futu"]["positions"][0]["symbol"] = "TEST2"
+    account["generation"] = "2026-08-03T12:00:05+08:00"
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    quotes["quotes"]["US.TEST2"] = dict(quotes["quotes"].pop("US.TEST0"))
+    quotes["quotes"]["US.TEST2"]["symbol"] = "TEST2"
+    write_json_atomic(account_path, account)
+    write_json_atomic(quotes_path, quotes)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 503
+    assert result.etag is None
+    assert result.payload["errors"][0]["code"] == "account_publication_unstable"
+    assert result.payload["release"]["worker_git_sha"] == SHA
 
 
 def test_snapshot_rejects_account_source_without_accepted_facts(tmp_path: Path) -> None:
@@ -444,6 +499,9 @@ def test_quote_age_alone_does_not_stale_a_successful_publication(tmp_path: Path)
     account["dashboard_projection"]["quote_as_of"] = old_quote
     quotes["last_success_at"] = old_quote
     quotes["fetched_at"] = old_quote
+    for row in account["dashboard_projection"]["broker_positions"]:
+        if row["broker"] in {"futu", "tiger"}:
+            row["price_as_of"] = old_quote
     for row in quotes["quotes"].values():
         row["price_time"] = old_quote
         row["fetched_at"] = old_quote
