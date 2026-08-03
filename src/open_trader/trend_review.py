@@ -3322,7 +3322,9 @@ def _validate_rotation_event(
         stem = path.stem
         valid_name = (
             stem == "terminal" if kind == "terminal" else
-            stem.startswith("pending-") if kind == "pending" else
+            (
+                stem.startswith("pending-") or stem.endswith("-pending")
+            ) if kind == "pending" else
             stem == "sell-filled" if kind in {"sell_fill", "sell_observation"} else
             stem == "buy-filled" if kind == "buy_fill" else
             "sell-attempt-" in stem if kind in {"sell_intent", "sell_result"} else
