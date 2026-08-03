@@ -869,22 +869,47 @@ class PredictionExecutionService:
     def _run_execution(self, execution_id: str, lock: tuple[threading.Lock, Any]) -> None:
         try:
             row = self.execution(execution_id)
-            intent = self._intent_from_payload(row.get("intent"))
-            if intent is None:
+            persisted_intent = self._intent_from_payload(row.get("intent"))
+            if persisted_intent is None:
                 self._finish_incident(execution_id, "invalid_persisted_intent")
                 return
+            cross_execution = isinstance(persisted_intent, CrossVenueIntent)
             self._transition(execution_id, "final_validating", {"phase": "final_validating"})
+            if cross_execution and self._cross_breaker_open:
+                self._finish_cross_rejected(
+                    execution_id, "cross_circuit_breaker_open", persisted_intent
+                )
+                return
             opportunity = self._fresh_opportunity(str(row.get("opportunity_id", "")))
             current_intent = self._intent_from_opportunity(opportunity)
             if opportunity is None or current_intent is None:
-                self._finish_rejected(execution_id, "opportunity_unavailable")
+                if cross_execution:
+                    self._finish_cross_rejected(
+                        execution_id, "opportunity_unavailable", persisted_intent
+                    )
+                else:
+                    self._finish_rejected(execution_id, "opportunity_unavailable")
+                return
+            if cross_execution and not isinstance(current_intent, CrossVenueIntent):
+                self._finish_cross_rejected(
+                    execution_id, "opportunity_changed", persisted_intent
+                )
+                return
+            if cross_execution and not self._cross_preview_matches(
+                row, opportunity, current_intent
+            ):
+                self._finish_cross_rejected(
+                    execution_id, "opportunity_changed", persisted_intent
+                )
                 return
             reason = self._validate_opportunity(opportunity, current_intent)
             account, volatile_reason = self._volatile_checks(current_intent)
             if reason is not None or account is None:
-                if isinstance(intent, CrossVenueIntent):
+                if cross_execution:
                     self._finish_cross_rejected(
-                        execution_id, reason or volatile_reason or "readiness_unavailable"
+                        execution_id,
+                        reason or volatile_reason or "readiness_unavailable",
+                        persisted_intent,
                     )
                     return
                 self._finish_rejected(
@@ -894,11 +919,10 @@ class PredictionExecutionService:
             # The intent is rebuilt from current server data; browser and stale
             # preview economics never reach the authenticated client.
             intent = current_intent
-            if isinstance(intent, CrossVenueIntent):
-                if not self._cross_preview_matches(row, opportunity, intent):
-                    self._finish_cross_rejected(execution_id, "opportunity_changed")
-                    return
-                self._finish_cross_rejected(execution_id, "cross_execution_not_enabled")
+            if cross_execution:
+                self._finish_cross_rejected(
+                    execution_id, "cross_execution_not_enabled", persisted_intent
+                )
                 return
             if isinstance(intent, ThresholdHedgeIntent):
                 self._run_threshold_execution(
@@ -1470,12 +1494,22 @@ class PredictionExecutionService:
         )
 
     def _fresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
-        source = (
-            self._cross_venue_monitor
-            if opportunity_id.startswith("cross:")
-            else self._monitor
-        )
+        cross_venue = opportunity_id.startswith("cross:")
+        source = self._cross_venue_monitor if cross_venue else self._monitor
         if source is None:
+            return None
+        if cross_venue:
+            refresh = getattr(source, "refresh_opportunity", None)
+            if not callable(refresh):
+                return None
+            try:
+                refreshed = _call(refresh, opportunity_id)
+            except Exception:
+                return None
+            if not isinstance(refreshed, Mapping):
+                return None
+            if str(refreshed.get("opportunity_id", refreshed.get("id", ""))) == opportunity_id:
+                return dict(refreshed)
             return None
         refreshed: object = None
         refresh_attempted = False
@@ -2564,7 +2598,50 @@ class PredictionExecutionService:
             return "codex_evidence_unavailable"
         if not isinstance(fingerprints, Mapping) or not all(str(fingerprints.get(exchange, "")).strip() for exchange in ("predict.fun", "polymarket")):
             return "rules_fingerprint_unavailable"
+        if not self._cross_venue_identity_matches(
+            opportunity, intent, fingerprints
+        ):
+            return "cross_venue_identity"
         return None
+
+    @staticmethod
+    def _cross_venue_identity_matches(
+        opportunity: Mapping[str, object],
+        intent: CrossVenueIntent,
+        fingerprints: Mapping[str, object],
+    ) -> bool:
+        expected_outcomes = {
+            "PREDICT_YES_POLYMARKET_NO": {
+                "predict.fun": "YES", "polymarket": "NO"
+            },
+            "POLYMARKET_YES_PREDICT_NO": {
+                "predict.fun": "NO", "polymarket": "YES"
+            },
+        }.get(intent.direction)
+        candidates = opportunity.get("approved_candidates")
+        if (
+            expected_outcomes is None
+            or opportunity.get("direction") != intent.direction
+            or not isinstance(candidates, Mapping)
+        ):
+            return False
+        legs = {leg.exchange: leg for leg in intent.legs}
+        for exchange in ("predict.fun", "polymarket"):
+            candidate = candidates.get(exchange)
+            leg = legs.get(exchange)
+            outcome = expected_outcomes[exchange]
+            if not isinstance(candidate, Mapping) or leg is None:
+                return False
+            token_key = "yes_token_id" if outcome == "YES" else "no_token_id"
+            if (
+                leg.outcome != outcome
+                or leg.market_id != candidate.get("market_id")
+                or leg.condition_id != candidate.get("condition_id")
+                or leg.token_id != candidate.get(token_key)
+                or candidate.get("rules_fingerprint") != fingerprints.get(exchange)
+            ):
+                return False
+        return True
 
     @staticmethod
     def _tick_size(opportunity: Mapping[str, object]) -> Decimal | None:
@@ -2601,6 +2678,7 @@ class PredictionExecutionService:
                 "canonical_cutoff": _timestamp(intent.canonical_cutoff),
                 "codex_approval": self._safe_mapping(approval) if isinstance(approval, Mapping) else {},
                 "rules_fingerprints": self._safe_mapping(opportunity.get("rules_fingerprints")) if isinstance(opportunity.get("rules_fingerprints"), Mapping) else {},
+                "approved_candidates": self._safe_mapping(opportunity.get("approved_candidates")) if isinstance(opportunity.get("approved_candidates"), Mapping) else {},
                 "balances": self._safe_mapping(account),
                 "unsettled": {
                     "current": format(current, "f"),
@@ -3143,16 +3221,64 @@ class PredictionExecutionService:
     def _finish_rejected(self, execution_id: str, reason: str) -> None:
         self._transition(execution_id, "both_rejected", {"phase": "validation_rejected", "reason": reason})
 
-    def _finish_cross_rejected(self, execution_id: str, reason: str) -> None:
-        evidence = {
-            "phase": "validation_rejected", "reason": reason, "submitted": False,
-            "positions": {"predict.fun": "0", "polymarket": "0"},
-        }
+    def _finish_cross_rejected(
+        self, execution_id: str, reason: str, intent: CrossVenueIntent
+    ) -> None:
+        evidence = self._cross_no_submit_evidence(intent)
+        if evidence is None:
+            self._transition(
+                execution_id,
+                "directional_incident",
+                {
+                    "phase": "validation_rejected",
+                    "reason": reason,
+                    "submitted": False,
+                    "account_proof": "unavailable",
+                },
+            )
+            self._cross_breaker_open = True
+            return
+        evidence.update(
+            {"phase": "validation_rejected", "reason": reason, "submitted": False}
+        )
         self._transition(execution_id, "both_rejected", evidence)
         try:
             self._store.release_cross_reservation(execution_id, reason="no_submit")
         except Exception:
             self._cross_breaker_open = True
+
+    def _cross_no_submit_evidence(
+        self, intent: CrossVenueIntent
+    ) -> dict[str, object] | None:
+        polymarket = self._fresh_account_snapshot()
+        predict = self._fresh_predict_account_snapshot()
+        if polymarket is None or predict is None:
+            return None
+        if (
+            self._order_ids(polymarket.get("open_order_ids"))
+            or self._order_ids(predict.get("open_orders"))
+            or polymarket.get("positions")
+            or predict.get("positions")
+        ):
+            return None
+        return {
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "account_proof": {
+                "expected_tokens": {
+                    leg.exchange: leg.token_id for leg in intent.legs
+                },
+                "predict.fun": {
+                    "checked_at": _timestamp(predict.get("checked_at")),
+                    "open_orders": [],
+                    "positions": [],
+                },
+                "polymarket": {
+                    "checked_at": _timestamp(polymarket.get("checked_at")),
+                    "open_orders": [],
+                    "positions": [],
+                },
+            },
+        }
 
     def _cross_preview_matches(
         self, preview: Mapping[str, object], opportunity: Mapping[str, object], intent: CrossVenueIntent
@@ -3175,6 +3301,8 @@ class PredictionExecutionService:
             and isinstance(new_approval, Mapping)
             and old_approval.get("cache_key") == new_approval.get("cache_key")
             and preview.get("rules_fingerprints") == opportunity.get("rules_fingerprints")
+            and preview.get("approved_candidates")
+            == opportunity.get("approved_candidates")
         )
 
     def _finish_incident(

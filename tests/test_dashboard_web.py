@@ -2537,8 +2537,11 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
             pass
 
     class FakeExecution:
+        instances: list["FakeExecution"] = []
+
         def __init__(self, **_: object) -> None:
-            pass
+            self.cross_monitor: object | None = None
+            self.instances.append(self)
 
         def reconcile_startup(self) -> dict[str, object]:
             return {"status": "ready"}
@@ -2548,6 +2551,9 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
 
         def notify_monitor_failure(self, *_: object) -> dict[str, object]:
             return {"status": "ignored"}
+
+        def set_cross_venue_monitor(self, monitor: object) -> None:
+            self.cross_monitor = monitor
 
         def close(self) -> None:
             order.append("execution.close")
@@ -2590,6 +2596,7 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
 
     assert order.index("polymarket.start") < order.index("cross.start") < order.index("server.serve")
     assert order.index("cross.stop") < order.index("polymarket.stop") < order.index("server.close")
+    assert isinstance(FakeExecution.instances[0].cross_monitor, dashboard_web._CrossVenueRuntime)
 
 
 def test_cross_venue_runtime_marshals_snapshot_onto_its_monitor_loop() -> None:
@@ -2609,12 +2616,22 @@ def test_cross_venue_runtime_marshals_snapshot_onto_its_monitor_loop() -> None:
             self.snapshot_threads.append(threading.get_ident())
             return {"status": "ready", "funnel": {}, "events": [], "opportunities": []}
 
+        async def refresh_opportunity(
+            self, opportunity_id: str
+        ) -> dict[str, object]:
+            self.snapshot_threads.append(threading.get_ident())
+            return {"opportunity_id": opportunity_id, "source": "rest"}
+
     monitor = FakeCrossMonitor()
     runtime = dashboard_web._CrossVenueRuntime(monitor)
     runtime.start()
     try:
         assert runtime.snapshot()["status"] == "ready"
         assert monitor.snapshot_threads == [runtime._thread.ident]  # type: ignore[union-attr]
+        assert runtime.refresh_opportunity("cross:pair:direction") == {
+            "opportunity_id": "cross:pair:direction", "source": "rest"
+        }
+        assert monitor.snapshot_threads[-1] == runtime._thread.ident  # type: ignore[union-attr]
     finally:
         runtime.stop()
 

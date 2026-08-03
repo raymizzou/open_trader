@@ -1893,6 +1893,36 @@ class _CrossVenueRuntime:
     async def _snapshot_on_loop(self) -> dict[str, object]:
         return self._monitor.snapshot()
 
+    def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        loop = self._loop
+        if (
+            loop is None
+            or loop.is_closed()
+            or self._thread is threading.current_thread()
+        ):
+            return None
+        coroutine = self._refresh_on_loop(opportunity_id)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception:
+            coroutine.close()
+            return None
+        try:
+            return future.result(timeout=15)
+        except Exception:
+            return None
+
+    async def _refresh_on_loop(
+        self, opportunity_id: str
+    ) -> dict[str, object] | None:
+        refresh = getattr(self._monitor, "refresh_opportunity", None)
+        if not callable(refresh):
+            return None
+        value = refresh(opportunity_id)
+        if inspect.isawaitable(value):
+            value = await value
+        return dict(value) if isinstance(value, Mapping) else None
+
     def stop(self) -> None:
         self._stop_requested.set()
         if self._thread is not None and self._thread is not threading.current_thread():
@@ -2034,11 +2064,15 @@ def serve_dashboard(
                     codex_model=codex_model,
                     predict_trading=predict_trading,
                 )
+            if cross_venue_monitor is not None and not isinstance(
+                cross_venue_monitor, _UnavailableCrossVenueMonitor
+            ):
+                cross_runtime = _CrossVenueRuntime(cross_venue_monitor)
             set_cross_venue_monitor = getattr(
                 prediction_execution, "set_cross_venue_monitor", None
             )
             if callable(set_cross_venue_monitor):
-                set_cross_venue_monitor(cross_venue_monitor)
+                set_cross_venue_monitor(cross_runtime or cross_venue_monitor)
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
             # Dashboard rather than aborting the existing portfolio surface.
@@ -2069,10 +2103,7 @@ def serve_dashboard(
                 pass
             else:
                 prediction_monitor.start()
-                if cross_venue_monitor is not None and not isinstance(
-                    cross_venue_monitor, _UnavailableCrossVenueMonitor
-                ):
-                    cross_runtime = _CrossVenueRuntime(cross_venue_monitor)
+                if cross_runtime is not None:
                     cross_runtime.start()
     server = create_dashboard_server(
         config=config,

@@ -966,6 +966,22 @@ class CrossVenueMonitor:
     def __init__(self, intent: CrossVenueIntent) -> None:
         self.intent = intent
         self.overrides: dict[str, object] = {}
+        self.refresh_calls = 0
+        self.available = True
+
+    def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        self.refresh_calls += 1
+        if not self.available:
+            return None
+        snapshot = self.snapshot()
+        return next(
+            (
+                dict(item)
+                for item in snapshot["opportunities"]  # type: ignore[index]
+                if item["opportunity_id"] == opportunity_id
+            ),
+            None,
+        )
 
     def snapshot(self) -> dict[str, object]:
         now = datetime.now(UTC)
@@ -973,10 +989,15 @@ class CrossVenueMonitor:
             "opportunity_id": f"cross:{self.intent.pair_id}:{self.intent.direction}",
             "market_type": "cross_venue_yes_no", "funnel_stage": 5,
             "actionable": True, "clear_signal": True, "intent": self.intent,
+            "direction": self.intent.direction,
             "confirmed_at": now, "confirmed_age_seconds": Decimal("1"),
             "canonical_cutoff": self.intent.canonical_cutoff,
             "codex_approval": {"decision": "APPROVE", "cache_key": "cross-cache", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "quote": "same rules"}, {"exchange": "polymarket", "quote": "same rules"}]},
             "rules_fingerprints": {"predict.fun": "predict-fingerprint", "polymarket": "poly-fingerprint"},
+            "approved_candidates": {
+                "predict.fun": {"market_id": "predict-market", "condition_id": "predict-condition", "yes_token_id": "predict-yes", "no_token_id": "predict-no", "rules_fingerprint": "predict-fingerprint"},
+                "polymarket": {"market_id": "poly-market", "condition_id": "poly-condition", "yes_token_id": "poly-yes", "no_token_id": "poly-no", "rules_fingerprint": "poly-fingerprint"},
+            },
         }
         opportunity.update(self.overrides)
         return {"opportunities": [opportunity]}
@@ -986,10 +1007,14 @@ class CrossPredictTrading:
     def __init__(self) -> None:
         self.account_calls = 0
         self.allowance_ready = True
+        self.account_available = True
+        self.positions: tuple[object, ...] = ()
 
     def account_snapshot(self) -> dict[str, object]:
         self.account_calls += 1
-        return {"wallet_address": "0xpredict", "available_usdt": "5", "allowance_ready": self.allowance_ready, "open_orders": (), "positions": (), "checked_at": datetime.now(UTC)}
+        if not self.account_available:
+            raise RuntimeError("account unavailable")
+        return {"wallet_address": "0xpredict", "available_usdt": "5", "allowance_ready": self.allowance_ready, "open_orders": (), "positions": self.positions, "checked_at": datetime.now(UTC)}
 
 
 def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, PredictionArbitrageStore, FakeTrading, CrossVenueMonitor, CrossPredictTrading]:
@@ -1070,6 +1095,144 @@ def test_cross_venue_confirmation_rechecks_fingerprint_before_no_submit_release(
     assert store.cross_unsettled_principal() == Decimal("0")
     assert trading.preflight_calls == 0
     assert trading.batch_calls == 0
+
+
+def test_cross_venue_confirmation_refreshes_and_releases_with_current_zero_position_proof(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    assert cross.refresh_calls == 1
+    cross.available = False
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-withdrawn")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+    execution = service.execution(str(accepted["execution_id"]))
+
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_unavailable"
+    assert execution["evidence"][-1]["positions"] == {
+        "predict.fun": "0", "polymarket": "0"
+    }
+    assert store.cross_unsettled_principal() == Decimal("0")
+    assert trading.preflight_calls == 0
+    assert predict.account_calls >= 2
+    assert cross.refresh_calls >= 2
+
+
+def test_cross_venue_confirmation_retains_reservation_without_current_account_proof(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    cross.available = False
+    predict.account_available = False
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-proof-unavailable")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    assert service.execution(str(accepted["execution_id"]))["state"] == "directional_incident"
+    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert service._cross_breaker_open is True
+
+
+def test_cross_venue_confirmation_rejects_when_cross_breaker_opens_after_preview(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    service._cross_breaker_open = True
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-breaker-confirm")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    execution = service.execution(str(accepted["execution_id"]))
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "cross_circuit_breaker_open"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_venue_refresh_rejects_changed_ceilings_without_cached_snapshot(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    changed_predict = replace(
+        cross.intent.legs[0], max_price=Decimal("0.46"), max_cost=Decimal("2.35")
+    )
+    cross.intent = replace(
+        cross.intent,
+        legs=(changed_predict, cross.intent.legs[1]),
+        total_max_cost=Decimal("4.75"),
+        minimum_profit=Decimal("0.25"),
+    )
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-ceiling-change")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    execution = service.execution(str(accepted["execution_id"]))
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_changed"
+    assert cross.refresh_calls >= 2
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_venue_confirmation_rejects_changed_approved_candidate_ids(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    cross.overrides["approved_candidates"] = {
+        "predict.fun": {"market_id": "predict-market", "condition_id": "predict-condition", "yes_token_id": "predict-changed", "no_token_id": "predict-no", "rules_fingerprint": "predict-fingerprint"},
+        "polymarket": {"market_id": "poly-market", "condition_id": "poly-condition", "yes_token_id": "poly-yes", "no_token_id": "poly-no", "rules_fingerprint": "poly-fingerprint"},
+    }
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-candidate-change")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    execution = service.execution(str(accepted["execution_id"]))
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_changed"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_venue_preview_does_not_fall_back_to_cached_snapshot(tmp_path: Path) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.refresh_opportunity = None  # type: ignore[method-assign]
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "rejected", "reason": "opportunity_unavailable"
+    }
+
+
+@pytest.mark.parametrize(
+    ("intent", "approved_candidates"),
+    [
+        (
+            lambda intent: replace(intent, direction="POLYMARKET_YES_PREDICT_NO"),
+            None,
+        ),
+        (
+            lambda intent: intent,
+            {
+                "predict.fun": {"market_id": "predict-market", "condition_id": "predict-condition", "yes_token_id": "predict-no", "no_token_id": "predict-yes", "rules_fingerprint": "predict-fingerprint"},
+                "polymarket": {"market_id": "poly-market", "condition_id": "poly-condition", "yes_token_id": "poly-yes", "no_token_id": "poly-no", "rules_fingerprint": "poly-fingerprint"},
+            },
+        ),
+        (lambda intent: intent, {}),
+    ],
+)
+def test_cross_venue_preview_requires_direction_and_approved_candidate_identity(
+    tmp_path: Path, intent: object, approved_candidates: object
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.intent = intent(cross.intent)  # type: ignore[operator]
+    if approved_candidates is not None:
+        cross.overrides["approved_candidates"] = approved_candidates
+
+    assert service.preview(
+        f"cross:public-pair:{cross.intent.direction}"
+    ) == {"state": "rejected", "reason": "cross_venue_identity"}
 
 
 def test_cross_venue_preview_respects_cross_only_breaker(tmp_path: Path) -> None:

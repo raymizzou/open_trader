@@ -26,6 +26,7 @@ from open_trader.predict_source import PredictBook, PredictMarket
 from open_trader.predict_trading import PredictBuyQuote
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 
 
 def predict_market(*, external_ids: tuple[str, ...]) -> PredictMarket:
@@ -1134,6 +1135,11 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
         }
         assert snapshot["opportunities"][0]["codex_approval"]["decision"] == "APPROVE"
         assert set(snapshot["opportunities"][0]["rules_fingerprints"]) == {"predict.fun", "polymarket"}
+        assert set(snapshot["opportunities"][0]["approved_candidates"]) == {
+            "predict.fun", "polymarket"
+        }
+        assert isinstance(snapshot["opportunities"][0]["confirmed_at"], datetime)
+        assert snapshot["opportunities"][0]["confirmed_age_seconds"] == Decimal("0")
         assert all(
             row["market_type"] == "cross_venue_yes_no"
             and row["execution_mode"] == "observe_only"
@@ -1142,10 +1148,21 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             for row in snapshot["opportunities"]
         )
 
+        opportunity_id = str(snapshot["opportunities"][0]["opportunity_id"])
+        validator_calls = len(validator.calls)
+        predict_list_calls = predict.list_calls
+        refreshed = await monitor.refresh_opportunity(opportunity_id)
+        assert refreshed is not None
+        assert refreshed["opportunity_id"] == opportunity_id
+        assert refreshed["confirmed_age_seconds"] == Decimal("0")
+        assert PredictionExecutionService._intent_from_payload(refreshed["intent"]) is not None
+        assert predict.list_calls == predict_list_calls + 1
+        assert len(validator.calls) == validator_calls
+
         await predict.queue.put(monitor_predict_book())
         await asyncio.sleep(0.01)
         assert len(validator.calls) == 2
-        assert polymarket.confirm_calls == 1
+        assert polymarket.confirm_calls == 2
         await monitor.stop()
 
     asyncio.run(exercise())

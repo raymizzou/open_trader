@@ -988,6 +988,82 @@ class PredictCrossVenueMonitor:
             }
         )
 
+    async def refresh_opportunity(
+        self, opportunity_id: str
+    ) -> dict[str, object] | None:
+        """Reconfirm one admitted opportunity from venue REST state only."""
+        cached = next(
+            (
+                opportunity
+                for opportunity in self._opportunities.values()
+                if opportunity.get("opportunity_id") == opportunity_id
+            ),
+            None,
+        )
+        if not isinstance(cached, Mapping) or self._source_status() != "ready":
+            return None
+        pair_id = cached.get("pair_id")
+        direction = cached.get("direction")
+        if not isinstance(pair_id, str) or not isinstance(direction, str):
+            return None
+        current = self._approved.get(pair_id)
+        validation = self._validations.get(pair_id)
+        if current is None or not self._approval_still_valid(current, validation):
+            return None
+        try:
+            markets = await self._predict.list_open_markets()
+            resolution = await asyncio.to_thread(
+                resolve_explicit_market_pairs,
+                markets,
+                gamma_lookup=self._gamma_lookup,
+                clob_lookup=self._clob_lookup,
+            )
+        except Exception:
+            return None
+        refreshed_pair = next(
+            (
+                pair
+                for pair in resolution.pairs
+                if pair.pair_id == pair_id and _valid_market_pair(pair)
+            ),
+            None,
+        )
+        if (
+            refreshed_pair is None
+            or not self._same_fingerprints(current, refreshed_pair)
+        ):
+            return None
+        refreshed_pair = replace(
+            refreshed_pair, canonical_cutoff=validation.canonical_cutoff
+        )
+        tokens = self._polymarket_tokens(refreshed_pair)
+        try:
+            predict_book, polymarket_books = await asyncio.gather(
+                self._predict.get_order_book(refreshed_pair.predict.market_id),
+                self._polymarket._confirm_cross_venue_books(tokens),
+            )
+        except Exception:
+            return None
+        if predict_book is None:
+            return None
+        intents = _build_cross_venue_intents(
+            refreshed_pair,
+            predict_book,
+            polymarket_books,
+            now=self._clock(),
+            require_annualized_gate=False,
+            predict_quote_fn=self._predict_quote_fn,
+        )
+        intent = next(
+            (candidate for candidate in intents if candidate.direction == direction),
+            None,
+        )
+        if intent is None:
+            return None
+        opportunity = self._opportunity_payload(refreshed_pair, intent, validation)
+        self._opportunities[(pair_id, direction)] = opportunity
+        return copy.deepcopy(opportunity)
+
     async def _run(self) -> None:
         slow_task: asyncio.Task[None] | None = None
         try:
@@ -1217,43 +1293,126 @@ class PredictCrossVenueMonitor:
                 self._close_opportunity(key)
         for intent in intents:
             validation = self._validations.get(pair.pair_id)
-            opportunity = {
-                "opportunity_id": f"cross:{pair.pair_id}:{intent.direction}",
-                "pair_id": pair.pair_id,
-                "question": _pair_question(current),
-                "predict_question": current.predict.question,
-                "polymarket_question": current.polymarket.question,
-                "direction": intent.direction,
-                "market_type": "cross_venue_yes_no",
-                "execution_mode": "observe_only",
-                "actionable": intent.actionable,
-                "clear_signal": intent.actionable,
-                "funnel_stage": 5 if intent.actionable else 4,
-                "quote_available": intent.quote_available,
-                "legs": [asdict(leg) for leg in intent.legs],
-                "quantity": intent.quantity,
-                "calculable_gas": intent.calculable_gas,
-                "total_max_cost": intent.total_max_cost,
-                "maximum_fee": intent.maximum_fee,
-                "minimum_payout": intent.minimum_payout,
-                "minimum_profit": intent.minimum_profit,
-                "annualized_yield": intent.annualized_yield,
-                "canonical_cutoff": intent.canonical_cutoff,
-                "resolution_at": intent.resolution_at,
-                "codex_approval": {
-                    "decision": "APPROVE" if validation and validation.approved else "REJECT",
-                    "cache_key": validation.cache_key if validation else "",
-                    "direct_outcome_mapping": dict(validation.direct_outcome_mapping or {}) if validation else {},
-                    "summary": validation.summary if validation else "",
-                    "evidence": [dict(item) for item in validation.evidence] if validation else [],
-                },
-                "rules_fingerprints": {
-                    "predict.fun": current.predict.rules_fingerprint,
-                    "polymarket": current.polymarket.rules_fingerprint,
-                },
-            }
+            opportunity = self._opportunity_payload(current, intent, validation)
             self._opportunities[(pair.pair_id, intent.direction)] = opportunity
             self._persist_observation(opportunity)
+
+    @staticmethod
+    def _approval_still_valid(
+        pair: ExplicitMarketPair, validation: CrossVenueValidation | None
+    ) -> bool:
+        return bool(
+            validation
+            and validation.approved
+            and validation.cache_key
+            and validation.direct_outcome_mapping == _DIRECT_OUTCOME_MAPPING
+            and validation.predict_fingerprint == pair.predict.rules_fingerprint
+            and validation.polymarket_fingerprint
+            == pair.polymarket.rules_fingerprint
+        )
+
+    def _opportunity_payload(
+        self,
+        pair: ExplicitMarketPair,
+        intent: CrossVenueIntent,
+        validation: CrossVenueValidation | None,
+    ) -> dict[str, object]:
+        confirmed_at = min(leg.book_timestamp for leg in intent.legs)
+        confirmed_age_seconds = max(
+            Decimal("0"),
+            Decimal(str((self._clock() - confirmed_at).total_seconds())),
+        )
+        return {
+            "opportunity_id": f"cross:{pair.pair_id}:{intent.direction}",
+            "pair_id": pair.pair_id,
+            "question": _pair_question(pair),
+            "predict_question": pair.predict.question,
+            "polymarket_question": pair.polymarket.question,
+            "direction": intent.direction,
+            "market_type": "cross_venue_yes_no",
+            "execution_mode": "observe_only",
+            "actionable": intent.actionable,
+            "clear_signal": intent.actionable,
+            "funnel_stage": 5 if intent.actionable else 4,
+            "quote_available": intent.quote_available,
+            "confirmed_at": confirmed_at,
+            "confirmed_age_seconds": confirmed_age_seconds,
+            "intent": self._intent_payload(intent),
+            "legs": [asdict(leg) for leg in intent.legs],
+            "quantity": intent.quantity,
+            "calculable_gas": intent.calculable_gas,
+            "total_max_cost": intent.total_max_cost,
+            "maximum_fee": intent.maximum_fee,
+            "minimum_payout": intent.minimum_payout,
+            "minimum_profit": intent.minimum_profit,
+            "annualized_yield": intent.annualized_yield,
+            "canonical_cutoff": intent.canonical_cutoff,
+            "resolution_at": intent.resolution_at,
+            "codex_approval": {
+                "decision": "APPROVE" if validation and validation.approved else "REJECT",
+                "cache_key": validation.cache_key if validation else "",
+                "direct_outcome_mapping": dict(validation.direct_outcome_mapping or {}) if validation else {},
+                "summary": validation.summary if validation else "",
+                "evidence": [dict(item) for item in validation.evidence] if validation else [],
+            },
+            "rules_fingerprints": {
+                "predict.fun": pair.predict.rules_fingerprint,
+                "polymarket": pair.polymarket.rules_fingerprint,
+            },
+            "approved_candidates": {
+                "predict.fun": self._candidate_identity(pair.predict),
+                "polymarket": self._candidate_identity(pair.polymarket),
+            },
+        }
+
+    @staticmethod
+    def _candidate_identity(market: VenueMarket) -> dict[str, str]:
+        return {
+            "market_id": market.market_id,
+            "condition_id": market.condition_id,
+            "yes_token_id": market.yes_token_id,
+            "no_token_id": market.no_token_id,
+            "rules_fingerprint": market.rules_fingerprint,
+        }
+
+    @staticmethod
+    def _intent_payload(intent: CrossVenueIntent) -> dict[str, object]:
+        legs: list[dict[str, object]] = []
+        for leg in intent.legs:
+            payload = asdict(leg)
+            for field in (
+                "requested_quantity",
+                "net_quantity",
+                "max_price",
+                "max_cost",
+                "maximum_fee",
+            ):
+                payload[field] = format(payload[field], "f")
+            payload["book_timestamp"] = leg.book_timestamp.isoformat()
+            if leg.settlement_at is not None:
+                payload["settlement_at"] = leg.settlement_at.isoformat()
+            legs.append(payload)
+        return {
+            "intent_type": "cross_venue",
+            "pair_id": intent.pair_id,
+            "direction": intent.direction,
+            "legs": legs,
+            "quantity": format(intent.quantity, "f"),
+            "calculable_gas": format(intent.calculable_gas, "f"),
+            "total_max_cost": format(intent.total_max_cost, "f"),
+            "maximum_fee": format(intent.maximum_fee, "f"),
+            "minimum_payout": format(intent.minimum_payout, "f"),
+            "minimum_profit": format(intent.minimum_profit, "f"),
+            "annualized_yield": (
+                format(intent.annualized_yield, "f")
+                if intent.annualized_yield is not None
+                else None
+            ),
+            "canonical_cutoff": intent.canonical_cutoff.isoformat(),
+            "resolution_at": intent.resolution_at.isoformat(),
+            "actionable": intent.actionable,
+            "quote_available": intent.quote_available,
+        }
 
     def _confirmation_done(
         self, pair_id: str, completed: asyncio.Task[None]
