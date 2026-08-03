@@ -1248,7 +1248,7 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
     upgraded = trend_review._merge_rotation_orders(
         {"orders": [stale_status]}, tmp_path, "CN", "2026-07-20"
     )
-    assert upgraded["orders"][0]["status"] == "FILLED_ALL"
+    assert upgraded["orders"][0]["status"] == "FILLED"
     prior_buy = {
         "order_id": "prior-weak-buy", "code": "SH.WEAK", "trd_side": "BUY",
         "qty": "1000", "dealt_qty": "1000", "order_status": "FILLED_ALL",
@@ -1367,6 +1367,14 @@ def test_relative_rotation_events_reject_incomplete_fill_sidecar(
     }
     (root / "sell-filled.json").write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="invalid relative rotation fact"):
+        trend_review._rotation_events(root)
+    payload["order"]["status"] = "FILLED"
+    payload["order"]["order_status"] = "FILLED_ALL"
+    (root / "sell-filled.json").write_text(json.dumps(payload), encoding="utf-8")
+    assert len(trend_review._rotation_events(root)) == 1
+    payload["order"]["status"] = "SUBMITTED"
+    with pytest.raises(ValueError, match="invalid relative rotation fact"):
+        (root / "sell-filled.json").write_text(json.dumps(payload), encoding="utf-8")
         trend_review._rotation_events(root)
 
 

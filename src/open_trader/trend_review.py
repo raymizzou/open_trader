@@ -1352,6 +1352,26 @@ def _rotation_exact_full_fill(
     return target, dealt
 
 
+def _normalized_rotation_order_status(order: Mapping[str, object]) -> str:
+    """Normalize broker status aliases and reject conflicting aliases."""
+    aliases: list[str] = []
+    for field in ("status", "order_status"):
+        raw = str(order.get(field) or "").strip().upper()
+        if not raw:
+            continue
+        aliases.append({
+            "FILLED_ALL": "FILLED",
+            "DEALT_ALL": "FILLED",
+            "FILLED_PART": "PARTIAL",
+            "CANCELLED_PART": "PARTIAL",
+            "CANCELLED_ALL": "CANCELLED",
+            "CANCELLED": "CANCELLED",
+        }.get(raw, raw))
+    if len(set(aliases)) > 1:
+        raise ValueError("conflicting broker order status aliases")
+    return aliases[0] if aliases else ""
+
+
 def _order_has_action_identity(
     order: Mapping[str, object], request: Mapping[str, object]
 ) -> bool:
@@ -3430,12 +3450,19 @@ def _validate_rotation_event(
         if not order_id or side != expected_side or (expected_code and order_code != expected_code):
             raise ValueError(label)
     if kind in {"sell_fill", "sell_observation", "buy_fill"}:
+        try:
+            normalized_order_status = (
+                _normalized_rotation_order_status(order)
+                if isinstance(order, Mapping)
+                else ""
+            )
+        except ValueError:
+            raise ValueError(label) from None
         if (
             str(payload.get("status") or "") != "filled"
             or not isinstance(request, Mapping)
             or not isinstance(order, Mapping)
-            or str(order.get("order_status", order.get("status", ""))).upper()
-            not in {"FILLED", "FILLED_ALL", "DEALT_ALL"}
+            or normalized_order_status != "FILLED"
         ):
             raise ValueError(label)
         try:
@@ -6734,21 +6761,11 @@ def _merge_rotation_orders(
             ):
                 raise ValueError("conflicting rotation fill order identity")
 
-            def normalized_status(order_row: Mapping[str, object]) -> str:
-                raw_status = str(
-                    order_row.get("order_status") or order_row.get("status") or ""
-                ).strip().upper()
-                return {
-                    "FILLED_ALL": "FILLED",
-                    "DEALT_ALL": "FILLED",
-                    "FILLED_PART": "PARTIAL",
-                    "CANCELLED_PART": "PARTIAL",
-                    "CANCELLED_ALL": "CANCELLED",
-                    "CANCELLED": "CANCELLED",
-                }.get(raw_status, raw_status)
-
-            existing_status = normalized_status(existing)
-            rotation_status = normalized_status(order)
+            try:
+                existing_status = _normalized_rotation_order_status(existing)
+                rotation_status = _normalized_rotation_order_status(order)
+            except ValueError as exc:
+                raise ValueError("conflicting rotation fill order identity") from exc
             if (
                 existing_status
                 and rotation_status
@@ -6757,9 +6774,7 @@ def _merge_rotation_orders(
                 not in {"SUBMITTING", "SUBMITTED", "WAITING_SUBMIT", "ACTIVE"}
             ):
                 raise ValueError("conflicting rotation fill order identity")
-            execution_status = str(
-                order.get("status") or order.get("order_status") or ""
-            ).strip()
+            execution_status = rotation_status
             execution_fields: dict[str, object] = {
                 key: value
                 for key, value in order.items()
