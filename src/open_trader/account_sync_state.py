@@ -15,7 +15,6 @@ from typing import Literal, Mapping, Sequence
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
-from . import pipeline
 from .portfolio import (
     PORTFOLIO_FIELDNAMES,
     PortfolioBuildError,
@@ -169,6 +168,8 @@ def _statement_candidate_from_run(
             for row in manifest
         ):
             return None
+        from . import pipeline
+
         candidate = BrokerAccountCandidate(
             broker=broker,
             source_kind="statement",

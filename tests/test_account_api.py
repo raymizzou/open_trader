@@ -260,6 +260,9 @@ print("\\n".join(sorted(sys.modules)))
         "open_trader.futu_account",
         "open_trader.tiger_account",
         "open_trader.futu_quote",
+        "open_trader.pipeline",
+        "open_trader.trend_review",
+        "open_trader.trend_kelly",
     ):
         assert forbidden not in loaded
 
