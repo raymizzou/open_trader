@@ -144,6 +144,10 @@ from .trend_market_controller import (
     load_trend_market_status,
     run_trend_market_controller,
 )
+from .trend_allocation import (
+    load_trend_allocation_status,
+    run_trend_allocation_controller,
+)
 from .strategy_drawdown import manual_unlock_strategy_drawdown
 from .drawdown_preflight import (
     DrawdownMarketInput,
@@ -545,6 +549,27 @@ def build_parser() -> argparse.ArgumentParser:
     trend_market_resolve.add_argument("--reason", required=True)
     trend_market_resolve.add_argument("--futu-order-id")
     trend_market_resolve.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+
+    trend_allocation = subparsers.add_parser(
+        "trend-allocation", help="Run and inspect the shared Trend Animals allocation"
+    )
+    trend_allocation_commands = trend_allocation.add_subparsers(
+        dest="trend_allocation_command", required=True
+    )
+    trend_allocation_run = trend_allocation_commands.add_parser("run")
+    trend_allocation_run.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_allocation_once = trend_allocation_commands.add_parser("once")
+    trend_allocation_once.add_argument("--date", dest="allocation_date", type=canonical_date, required=True)
+    trend_allocation_once.add_argument("--revision", action="store_true")
+    trend_allocation_once.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_allocation_status = trend_allocation_commands.add_parser("status")
+    trend_allocation_status.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
 
@@ -1558,6 +1583,43 @@ def main(argv: list[str] | None = None) -> int:
             print(f"masked_wallet: {payload.get('masked_wallet') or readiness.get('masked_address') or 'unknown'}")
             print(f"result: {'PASS' if status not in {'unavailable', 'error'} else 'BLOCKED'}")
             return 0 if status not in {"unavailable", "error"} else 2
+
+    if args.command == "trend-allocation":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if args.trend_allocation_command in {"run", "once"}:
+            try:
+                require_trend_executor(config, hostname_fn=socket.gethostname)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+        try:
+            if args.trend_allocation_command == "status":
+                result = load_trend_allocation_status(config)
+            else:
+                runtime = replace(
+                    config,
+                    repo=Path.cwd().resolve(),
+                    python=Path(sys.executable).resolve(),
+                )
+                result = run_trend_allocation_controller(
+                    runtime,
+                    once=args.trend_allocation_command == "once",
+                    allocation_date=(
+                        args.allocation_date
+                        if args.trend_allocation_command == "once"
+                        else None
+                    ),
+                    revision=(args.revision if args.trend_allocation_command == "once" else False),
+                )
+        except (FileNotFoundError, ValueError, RuntimeError, ZoneInfoNotFoundError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
 
     if args.command == "trend-market":
         if args.trend_market_command == "resolve":

@@ -68,6 +68,54 @@ def test_trend_market_parser_exposes_run_status_and_resolve() -> None:
     } == vars(resolve)
 
 
+def test_trend_allocation_parser_routes_once_revision_and_status() -> None:
+    parser = cli.build_parser()
+
+    once = parser.parse_args([
+        "trend-allocation", "once", "--date", "2026-08-03", "--revision",
+        "--config", "config/allocation.env",
+    ])
+    status = parser.parse_args([
+        "trend-allocation", "status", "--config", "config/allocation.env",
+    ])
+
+    assert (once.trend_allocation_command, once.allocation_date, once.revision) == (
+        "once", "2026-08-03", True,
+    )
+    assert once.config == Path("config/allocation.env")
+    assert status.trend_allocation_command == "status"
+
+
+def test_trend_allocation_run_does_not_accept_revision() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args(["trend-allocation", "run", "--revision"])
+    assert exc_info.value.code == 2
+
+
+def test_trend_allocation_once_rebases_runtime_and_enforces_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path)
+    calls: list[tuple[object, dict[str, object]]] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(cli, "load_env_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(
+        cli, "run_trend_allocation_controller",
+        lambda value, **kwargs: calls.append((value, kwargs)) or {"phase": "ready"},
+        raising=False,
+    )
+
+    assert cli.main([
+        "trend-allocation", "once", "--date", "2026-08-03", "--revision",
+    ]) == 0
+    runtime, kwargs = calls[0]
+    assert runtime.repo == tmp_path
+    assert runtime.python == Path(sys.executable).resolve()
+    assert kwargs == {"once": True, "allocation_date": "2026-08-03", "revision": True}
+    assert json.loads(capsys.readouterr().out) == {"phase": "ready"}
+
+
 @pytest.mark.parametrize(
     "argv",
     [

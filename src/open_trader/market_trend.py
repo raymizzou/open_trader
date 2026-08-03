@@ -22,6 +22,7 @@ from .a_share_trend import (
     INDUSTRY_STATE_FIELDS,
     UNIFIED_TREND_FIELDS,
     _balance,
+    _allocation_market_for,
     _billing_field,
     _billing_price,
     _component_api_facts,
@@ -47,6 +48,8 @@ from .a_share_trend import (
     collect_industry_contexts,
     enrich_real_holding_input,
     evaluate_candidate,
+    favorite_candidate_ids,
+    freeze_report_rotation_pairs,
     load_futu_simulate_trend_account,
     load_industry_temperatures,
     load_real_holding_input,
@@ -83,7 +86,7 @@ from .strategy_drawdown import observe_strategy_equity
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
-    "US": {"broker": "tiger", "currency": "HKD", "asset": "美股", "deadline": time(12)},
+    "US": {"broker": "tiger", "currency": "HKD", "asset": "美股", "deadline": time(19)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
 }
 MARKET_UPDATE_ASSETS = {
@@ -878,6 +881,7 @@ def _attempt_market_report(
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
     account_factory: Callable[..., object] | None = None,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> AShareTrendRunResult:
     market = _market(market)
     settings = MARKET_SETTINGS[market]
@@ -950,11 +954,13 @@ def _attempt_market_report(
             else config.trend_animals_hk_tm_ids
         )
         process_version = _process_version(config.repo)
+        allocation_market = _allocation_market_for(allocation_reference, market)
         strategy_snapshot = live_trend_strategy_snapshot(
             market,
             process_version,
             pool_ids,
             execution_date=execution_date,
+            allocation=allocation_reference,
         )
         strategy_version = str(strategy_snapshot["strategy_version"])
         shared_entry_discipline = _uses_shared_entry_discipline(
@@ -987,6 +993,10 @@ def _attempt_market_report(
             for row in rows:
                 component_pools[_row_tm_id(row)].add(str(pool_id))
         component_ids = {_row_tm_id(row) for row in component_rows}
+        get_favorites = getattr(api, "get_favorites_tickers", None)
+        favorite_rows = get_favorites() if callable(get_favorites) else []
+        favorite_ids = favorite_candidate_ids(favorite_rows, market=market)
+        candidate_ids = component_ids | favorite_ids
 
         holding_ids: dict[str, int] = {}
         for position in account.positions:
@@ -998,7 +1008,7 @@ def _attempt_market_report(
                 )
             except TrendAnimalsError:
                 continue
-        requested_ids = sorted(component_ids | set(holding_ids.values()))
+        requested_ids = sorted(candidate_ids | set(holding_ids.values()))
         billing = {
             _billing_field(row): row for row in api.get_snapshot_billing()
         }
@@ -1061,11 +1071,12 @@ def _attempt_market_report(
         start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         candidates = []
         bars_by_symbol: dict[str, object] = {}
-        for tm_id in sorted(component_ids):
+        for tm_id in sorted(candidate_ids):
             row = rows_by_id.get(tm_id)
             if row is None:
                 continue
             mapping_verified = False
+            futu_symbol: str | None = None
             try:
                 futu_symbol = from_trend_animals_symbol(
                     market, str(row.get("tickerSymbol", ""))
@@ -1159,7 +1170,7 @@ def _attempt_market_report(
         )
 
         candidate_pool_rows = [
-            rows_by_id[tm_id] for tm_id in sorted(component_ids)
+            rows_by_id[tm_id] for tm_id in sorted(candidate_ids)
             if tm_id in rows_by_id
         ]
         industry_contexts, industry_context_status, industry_facts = (
@@ -1266,6 +1277,7 @@ def _attempt_market_report(
             watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
+                f"getFavoritesTicker securities={len(favorite_ids)}",
                 *_component_api_facts(api, len(component_rows)),
                 *pool_resolution_facts,
                 f"getTickerSnapshot fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
@@ -1297,8 +1309,16 @@ def _attempt_market_report(
             generated_at=generated_at,
             market=market,
             lot_sizes=lot_sizes,
-            position_weight=Decimal("0.04"),
-            position_weight_source="fallback_4pct",
+            position_weight=Decimal(
+                str(allocation_market["entry_weight"])
+                if allocation_market is not None
+                else "0.04"
+            ),
+            position_weight_source=(
+                "trend_allocation_rank"
+                if allocation_market is not None
+                else "fallback_4pct"
+            ),
             price_fx_to_account_currency=Decimal("1"),
             process_version=process_version,
             candidate_pool_ids=pool_ids,
@@ -1336,8 +1356,10 @@ def _attempt_market_report(
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason or industry_data_reason,
             real_holdings=real_holdings,
+            allocation_reference=allocation_reference,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
+        report = freeze_report_rotation_pairs(report, config.data_dir)
         previous_attention_rows = _previous_attention_rows(
             paths, current_as_of_date=as_of_date, market=market
         )
@@ -1352,6 +1374,7 @@ def _attempt_market_report(
             watch_events=watch_events,
             query={
                 "component_pool_ids": list(pool_ids),
+                "favorite_ids": sorted(favorite_ids),
                 "snapshot_fields": list(UNIFIED_TREND_FIELDS),
                 "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
                 "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
@@ -1364,6 +1387,7 @@ def _attempt_market_report(
             responses={
                 "update_status": update_rows,
                 "components": component_rows,
+                "favorites": favorite_rows,
                 "snapshots": snapshot_rows,
                 "real_snapshots": list(real_snapshot_rows.values()),
                 **(
@@ -1473,6 +1497,7 @@ def run_market_trend_report(
     now_fn: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
     sleep_fn: Callable[[float], None] = sleep,
     attempt_fn: Callable[..., AShareTrendRunResult] = _attempt_market_report,
+    allocation_reference: Mapping[str, object] | None = None,
     **attempt_dependencies: object,
 ) -> AShareTrendRunResult:
     market = _market(market)
@@ -1485,6 +1510,9 @@ def run_market_trend_report(
     if not configured_ids:
         raise ValueError(f"Trend Animals {market} tmId list is required")
     with RunLock(paths.report_lock):
+        report_dependencies = dict(attempt_dependencies)
+        if allocation_reference is not None:
+            report_dependencies["allocation_reference"] = allocation_reference
         return _run_market_trend_retry(
             config=config,
             market=market,
@@ -1495,7 +1523,7 @@ def run_market_trend_report(
             sleep_fn=sleep_fn,
             attempt_fn=attempt_fn,
             paths=paths,
-            attempt_dependencies=attempt_dependencies,
+            attempt_dependencies=report_dependencies,
         )
 
 

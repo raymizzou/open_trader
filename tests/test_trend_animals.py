@@ -39,6 +39,27 @@ def secret_forms(secret: str) -> set[str]:
     }
 
 
+def test_get_favorites_tickers_uses_the_free_all_favorites_endpoint(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {
+            "tmId": 10001,
+            "asset": "A股",
+            "assetCategory": "大类",
+            "tickername": "A股",
+            "asOfDate": "2026-08-03",
+        }
+    ]
+    transport = FakeTransport({"getFavoritesTicker": success(rows)})
+    client = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=transport
+    )
+
+    assert client.get_favorites_tickers() == rows
+    assert transport.calls == [("getFavoritesTicker", {"apiKey": ["secret-value"]})]
+
+
 def test_paid_response_cache_uses_date_endpoint_and_sorted_params(
     tmp_path: Path,
 ) -> None:
@@ -1006,7 +1027,13 @@ def test_cached_response_that_contains_current_secret_is_rejected(tmp_path: Path
         cache_dir=tmp_path,
         transport=FakeTransport({"getComponentTicker": success(rows)}),
     ).get_components(tm_id=622466, expected_date="2026-07-14")
-    transport = FakeTransport({})
+    transport = FakeTransport(
+        {
+            "getFavoritesTicker": success(
+                [{"tmId": 10001, "echo": "secret-value"}]
+            )
+        }
+    )
     client = TrendAnimalsClient(
         api_key="secret-value", cache_dir=tmp_path, transport=transport
     )
@@ -1016,6 +1043,11 @@ def test_cached_response_that_contains_current_secret_is_rejected(tmp_path: Path
 
     assert "secret-value" not in str(exc_info.value)
     assert transport.calls == []
+
+    with pytest.raises(TrendAnimalsError, match="unsafe") as exc_info:
+        client.get_favorites_tickers()
+
+    assert "secret-value" not in str(exc_info.value)
 
 
 def test_secret_shaped_inputs_never_reach_paths_or_errors(tmp_path: Path) -> None:

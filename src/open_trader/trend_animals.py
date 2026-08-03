@@ -122,6 +122,9 @@ class TrendAnimalsClient:
     def get_snapshot_billing(self) -> list[dict[str, object]]:
         return self._get("getSnapshotColumnBilling", {})
 
+    def get_favorites_tickers(self) -> list[dict[str, object]]:
+        return self._get("getFavoritesTicker", {})
+
     def get_account_balance(self) -> Mapping[str, object]:
         rows = self._get("getAccountBalance", {"viewLevel": "summary"})
         if len(rows) != 1:

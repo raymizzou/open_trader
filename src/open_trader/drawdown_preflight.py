@@ -32,12 +32,15 @@ MARKET_TIMEZONES = {
 APPROVED_DRAWDOWN_PREDECESSORS = {
     ("CN", "v9"): ("trend_animals_warm_to_hot/CN/v8", "v8"),
     ("CN", "v10"): ("trend_animals_warm_to_hot/CN/v9", "v9"),
+    ("CN", "v11"): ("trend_animals_warm_to_hot/CN/v10", "v10"),
     ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
     ("US", "v7"): ("trend_animals_warm_to_hot/US/v6", "v6"),
     ("US", "v8"): ("trend_animals_warm_to_hot/US/v7", "v7"),
+    ("US", "v9"): ("trend_animals_warm_to_hot/US/v8", "v8"),
     ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
     ("HK", "v7"): ("trend_animals_warm_to_hot/HK/v6", "v6"),
     ("HK", "v8"): ("trend_animals_warm_to_hot/HK/v7", "v7"),
+    ("HK", "v9"): ("trend_animals_warm_to_hot/HK/v8", "v8"),
 }
 _DRAWDOWN_FAILURE_LABELS = {
     "baseline_unavailable": "历史基线不可用",

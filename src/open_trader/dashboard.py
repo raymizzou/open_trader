@@ -25,6 +25,7 @@ from .a_share_trend import (
     live_trend_strategy_snapshot,
     trend_api_cost_label,
     valid_serialized_account,
+    valid_frozen_report_contract,
     valid_v2_risk_contract,
     valid_v3_risk_contract,
     valid_v4_risk_contract,
@@ -83,7 +84,12 @@ from .technical_facts import (
     technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
 )
-from .trend_review import _report_hash, _validate_execution_batch
+from .trend_review import (
+    _report_hash,
+    _rotation_pair_key,
+    _validate_execution_batch,
+    _validate_rotation_event,
+)
 from .trend_market_controller import _valid_status
 from .strategy_drawdown import valid_drawdown_decision
 from .trend_api_stats import load_trend_api_stats
@@ -1972,6 +1978,7 @@ def _valid_trend_report_payload(
         and _valid_frozen_trend_facts(payload)
         and _valid_trend_risk_summary(payload)
         and _valid_option_attention(payload, market=market)
+        and valid_frozen_report_contract(payload)
         and as_of_date <= freshness_date <= execution_date
     ):
         return None
@@ -2355,6 +2362,20 @@ def _project_broker_trend_report(
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
+        "allocation": payload.get("allocation"),
+        "simulate_rotation_pairs": _project_simulated_rotation_pairs(
+            payload["strategy_judgments"].get("simulate_rotation_pairs", []),
+            data_dir=data_dir,
+            market=market,
+            execution_date=execution_date.isoformat(),
+            report_sha256=report_sha256,
+            account_id=metadata.get("simulate_acc_id"),
+        ) if payload.get("allocation") is not None else [],
+        "real_rotation_pairs": (
+            payload["strategy_judgments"].get("real_rotation_pairs", [])
+            if payload.get("allocation") is not None
+            else []
+        ),
         "industry_context_status": frozen_industry_context_status,
         "industry_contexts": frozen_industry_contexts,
         "strategy_parameter_rows": frozen_parameter_rows,
@@ -2868,6 +2889,74 @@ def _trend_action_executions(
         *revision_key,
     )
     return copy.deepcopy(cached)
+
+
+def _project_simulated_rotation_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    data_dir: Path,
+    market: str,
+    execution_date: str,
+    report_sha256: str,
+    account_id: object,
+) -> list[dict[str, Any]]:
+    projected = [{**pair, "execution_status": "待执行"} for pair in pairs]
+    if (
+        isinstance(account_id, bool)
+        or not isinstance(account_id, int)
+        or account_id <= 0
+    ):
+        return projected
+    terminal_labels = {
+        "complete": "完成",
+        "failed": "失败",
+        "partial": "部分完成",
+        "incomplete": "未完成",
+        "skipped": "跳过",
+        "missed": "错过执行日",
+    }
+    for pair, output in zip(pairs, projected):
+        pair_index = pair.get("pair_index")
+        if isinstance(pair_index, bool) or not isinstance(pair_index, int):
+            continue
+        pair_key = _rotation_pair_key(
+            market, account_id, execution_date, report_sha256, pair_index
+        )
+        root = (
+            data_dir / "trend_review" / "ledgers" / market / "rotations"
+            / execution_date / pair_key
+        )
+        events: list[dict[str, object]] = []
+        for path in sorted(root.glob("*.json")):
+            try:
+                event = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(event, dict):
+                    continue
+                _validate_rotation_event(event, path)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                continue
+            events.append(event)
+        terminal = next(
+            (
+                terminal_labels.get(str(event.get("status") or ""))
+                for event in events
+                if event.get("kind") == "terminal"
+            ),
+            None,
+        )
+        if terminal:
+            output["execution_status"] = terminal
+        elif any(event.get("kind") == "buy_fill" for event in events):
+            output["execution_status"] = "买入已成交"
+        elif any(event.get("kind") in {"buy_intent", "buy_result"} for event in events):
+            output["execution_status"] = "买入中"
+        elif any(event.get("kind") in {"sell_fill", "sell_observation"} for event in events):
+            output["execution_status"] = "卖出已成交"
+        elif any(event.get("kind") in {"sell_intent", "sell_result"} for event in events):
+            output["execution_status"] = "卖出中"
+        elif any(event.get("kind") == "pending" for event in events):
+            output["execution_status"] = "执行中"
+    return projected
 
 
 @lru_cache(maxsize=256)

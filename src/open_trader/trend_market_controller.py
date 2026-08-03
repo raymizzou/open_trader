@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
 from time import sleep
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ from .a_share_trend import (
     read_delivery_receipt,
     run_a_share_trend_report,
     valid_serialized_account,
+    valid_frozen_report_contract,
 )
 from .a_share_trend_watch import cn_session, watch_a_share_protection
 from .daily_premarket import (
@@ -41,6 +42,7 @@ from .kelly_order_execution import (
     FutuSimulateOrderExecutionClient,
 )
 from .market_trend import market_paths, run_market_trend_report
+from .trend_allocation import allocation_reference_for_report
 from .market_trend_watch import (
     MARKET_TIMEZONES,
     market_session,
@@ -67,6 +69,7 @@ from .trend_review import (
     benchmark_fact,
     build_trend_review_projection,
     capture_trend_review_close,
+    execute_relative_rotations,
     execute_trend_review_open,
     execute_trend_review_stop,
     load_trend_action_audit,
@@ -74,6 +77,7 @@ from .trend_review import (
     overheat_trim_progress,
     _preflight_open_actions,
     record_trend_review_missed_buys,
+    relative_rotations_completed,
     trend_action_futu_symbol,
 )
 
@@ -103,6 +107,7 @@ class ControllerCycle:
 class ReportTask:
     cycle: ControllerCycle
     completes_revision_request: bool
+    allocation_reference: Mapping[str, object] | None = None
 
 
 def _market(value: str) -> str:
@@ -470,6 +475,27 @@ def _valid_report(
         )
     ):
         return False
+    if not valid_frozen_report_contract(payload):
+        return False
+    allocation = payload.get("allocation")
+    if allocation is not None:
+        assert isinstance(allocation, Mapping)
+        try:
+            daily_path = PurePosixPath(str(allocation["daily_path"]))
+            daily = config.data_dir / daily_path.relative_to("data")
+            body = daily.read_bytes()
+            snapshot = json.loads(body)
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            return False
+        if (
+            hashlib.sha256(body).hexdigest() != allocation.get("sha256")
+            or not isinstance(snapshot, Mapping)
+            or any(
+                snapshot.get(key) != allocation.get(key)
+                for key in ("allocation_date", "generated_at", "roots", "markets")
+            )
+        ):
+            return False
     try:
         _preflight_open_actions(payload, market)
     except ValueError:
@@ -651,7 +677,11 @@ def _recovery_revision_for_report(
 
 
 def _generate_report(
-    config: DailyPremarketConfig, market: str, run_date: str, revision: bool
+    config: DailyPremarketConfig,
+    market: str,
+    run_date: str,
+    revision: bool,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> None:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     notifier = build_notifier(config)
@@ -661,6 +691,7 @@ def _generate_report(
             run_date=run_date,
             revision=revision,
             notifier=notifier,
+            allocation_reference=allocation_reference,
         )
         if market == "CN"
         else run_market_trend_report(
@@ -669,10 +700,34 @@ def _generate_report(
             run_date=run_date,
             revision=revision,
             notifier=notifier,
+            allocation_reference=allocation_reference,
         )
     )
     if result.status not in {"generated", "existing", "holiday"}:
         raise RuntimeError(f"{market} trend report generation returned {result.status}")
+
+
+def _allocation_reference_for_cycle(
+    config: DailyPremarketConfig,
+    *,
+    now: datetime,
+    quote_client: object,
+) -> Mapping[str, object] | None:
+    """Use the single Shanghai allocation decision; reports never produce one."""
+    if not config.trend_animals_api_key:
+        return None
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=ZoneInfo(config.timezone))
+    allocation_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    day = date.fromisoformat(allocation_date)
+    a_trading_days = quote_client.get_trading_days(
+        market="CN",
+        start=(day - timedelta(days=35)).isoformat(),
+        end=(day + timedelta(days=1)).isoformat(),
+    )
+    return allocation_reference_for_report(
+        config, allocation_date=allocation_date, a_trading_days=a_trading_days
+    )
 
 
 def _gate_futu_trade_context(
@@ -884,7 +939,8 @@ def _execute_locked_report(
         raise ValueError(f"invalid locked trend report: {locked_path}")
     judgments = locked_report["strategy_judgments"]
     actions = judgments["formal_actions"]
-    if not actions:
+    rotation_pairs = judgments.get("simulate_rotation_pairs", [])
+    if not actions and not rotation_pairs:
         return {
             "status": "unchanged",
             "market": market,
@@ -898,7 +954,7 @@ def _execute_locked_report(
         market=market,
         execution_date=execution_date,
         now=now,
-    )
+    ) if actions else 0
     sell_symbols = {
         trend_action_futu_symbol(locked_report, action, market)
         for action in actions
@@ -910,7 +966,7 @@ def _execute_locked_report(
         not in sell_symbols
         for action in actions
     )
-    if missed == eligible_buys == len(actions):
+    if actions and missed == eligible_buys == len(actions) and not rotation_pairs:
         return {
             "status": "missed_window",
             "market": market,
@@ -928,6 +984,12 @@ def _execute_locked_report(
                 and trend_action_futu_symbol(locked_report, action, market)
                 not in sell_symbols
             )
+        } | {
+            str(pair.get("buy_futu_symbol") or "")
+            for pair in rotation_pairs
+            if allow_new_buys
+            and isinstance(pair, Mapping)
+            and str(pair.get("buy_futu_symbol") or "")
         }
     )
     quote = quote_client
@@ -951,7 +1013,7 @@ def _execute_locked_report(
         client = _new_order_client(
             config, market, quote_client if quote_client is not None else quote
         )
-        execution = execute_trend_review_open(
+        ordinary = execute_trend_review_open(
             data_dir=config.data_dir,
             report=locked_report,
             client=client,
@@ -960,9 +1022,52 @@ def _execute_locked_report(
             now=now,
             quote_prices=prices,
         )
-        if allow_new_buys and execution.get("status") == "quote_unavailable":
+        if allow_new_buys and ordinary.get("status") == "quote_unavailable":
             raise RuntimeError("current quote unavailable for pending trend buy")
-        return execution
+        ordinary_complete = not actions or _execution_completed(
+            config,
+            ControllerCycle(
+                market=market,
+                as_of_date=as_of_date,
+                execution_date=execution_date,
+                report_run_date=str(locked_report.get("generated_at") or "")[:10],
+                session="execution",
+                market_open=True,
+                next_check_at=datetime.fromisoformat(now),
+            ),
+            include_rotations=False,
+        )
+        rotation = (
+            execute_relative_rotations(
+                data_dir=config.data_dir,
+                report=locked_report,
+                client=client,
+                market=market,
+                execution_date=execution_date,
+                now=now,
+                quote_prices=prices,
+            )
+            if allow_new_buys and rotation_pairs and ordinary_complete
+            else {
+                "status": "unchanged", "submitted_count": 0,
+                "artifact_paths": [],
+            }
+        )
+        return {
+            "status": (
+                rotation.get("status")
+                if rotation.get("status") != "unchanged"
+                else ordinary.get("status")
+            ),
+            "market": market,
+            "date": execution_date,
+            "submitted_count": int(ordinary.get("submitted_count") or 0)
+            + int(rotation.get("submitted_count") or 0),
+            "artifact_paths": [
+                *ordinary.get("artifact_paths", []),
+                *rotation.get("artifact_paths", []),
+            ],
+        }
     finally:
         if quote is not None and owns_quote:
             quote.close()
@@ -2328,6 +2433,7 @@ def _execution_completed(
     cycle: ControllerCycle,
     *,
     progress: Callable[[], None] | None = None,
+    include_rotations: bool = True,
 ) -> bool:
     if _legacy_cycle_cutover(config, cycle):
         return True
@@ -2356,7 +2462,12 @@ def _execution_completed(
     judgments = report["strategy_judgments"]
     actions = judgments["formal_actions"]
     if not actions:
-        return True
+        return not include_rotations or relative_rotations_completed(
+            config.data_dir,
+            report=report,
+            market=cycle.market,
+            execution_date=cycle.execution_date,
+        )
 
     sell_symbols = {
         trend_action_futu_symbol(report, action, cycle.market)
@@ -2453,7 +2564,12 @@ def _execution_completed(
         ):
             continue
         return False
-    return True
+    return not include_rotations or relative_rotations_completed(
+        config.data_dir,
+        report=report,
+        market=cycle.market,
+        execution_date=cycle.execution_date,
+    )
 
 
 def _durable_report_cycles(
@@ -2937,16 +3053,22 @@ def run_trend_market_controller(
                         if recovery_revision is not None
                         else revision_pending
                     )
-                    future = pool.submit(
-                        _generate_report,
+                    allocation_reference = _allocation_reference_for_cycle(
+                        config, now=now, quote_client=shared_quote()
+                    )
+                    report_args: tuple[object, ...] = (
                         config,
                         market,
                         work_cycle.report_run_date,
                         generator_revision,
                     )
+                    if config.trend_animals_api_key:
+                        report_args += (allocation_reference,)
+                    future = pool.submit(_generate_report, *report_args)
                     report_target = ReportTask(
                         cycle=work_cycle,
                         completes_revision_request=revision_pending,
+                        allocation_reference=allocation_reference,
                     )
 
                 if future is not None and (future.done() or once):
@@ -3022,13 +3144,18 @@ def run_trend_market_controller(
                         if isinstance(judgments, dict)
                         else None
                     )
+                    rotation_pairs = (
+                        judgments.get("simulate_rotation_pairs")
+                        if isinstance(judgments, dict)
+                        else None
+                    )
                     if (
                         _execution_completed(
                             config,
                             work_cycle,
                             progress=reconciliation_progress,
                         )
-                        and formal_actions
+                        and (formal_actions or rotation_pairs)
                     ):
                         execution = {
                             "status": "reconciled",

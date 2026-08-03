@@ -7,6 +7,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - 冻结 Account v1 快照契约，并把账户/报价的单写者统一重命名为 Account Sync Worker；运行命令改为 `account-sync-worker`，现有 launchd label、heartbeat/lock 文件及 JSON/CSV persistence 保持不变。本阶段不启动 Account API、不切换 Gateway 流量，也不改变 Dashboard、策略、报告或执行行为。
 - 修复 Dashboard 与账户同步 launchd 重装在旧 job 异步移除完成前立即 bootstrap 的启动竞态；安装器现在确认 label 已消失后再启动，并移除账户同步在 RunAtLoad 后多余的 `kickstart -k`，避免新进程被立即杀死和节流重启。本阶段不改变页面、策略、报告、执行或 worker 业务行为。
+- 新增收盘后的 `trend-allocation` 共享快照：以收藏夹 A股/ETF基金、港股/香港ETF、美股/美国ETF 六个根节点的全局强度统一排名，三个市场报告冻结同一路径与 SHA；新开仓按第 1/2/3 名使用 6%/4%/2%，不追加强制调仓或重置既有 Kelly、回撤历史。缺失或过期时整份沿用最近成功排名并标记 A 股交易日陈旧天数，冷启动失败关闭。
+- 满 10 个席位且强度差至少 20 时，每市场、账户、交易日最多冻结两组强弱轮换；模拟盘只在市价卖出全量成交并刷新账户后自动市价买入，实盘仅生成当日报告内的手动卖出后买入建议。分配任务在 A 股收盘后运行，CN/HK/US 控制器等待其当日终态再生成下一份报告。
+- 验证：聚焦行为套件 1,822 个通过，确定性三市场/轮换工作流 13 个通过，Trend Animals 分配与 API 回归 86 个通过；2026-08-03 实时只读快照成功冻结为 `data/trend_allocation/daily/2026-08-03.json`（SHA-256 `21527e48f75cc4b82d1722f10be07fca5b3541bc8f19f4175c35c1daf3037f83`），排名为港股第 1、美股第 2、A 股第 3，重复运行未覆盖该不可变文件。
 
 ## 2026-08-02
 

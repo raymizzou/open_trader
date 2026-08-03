@@ -43,6 +43,7 @@ from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 POSITION_FIELDNAMES = [
@@ -1920,6 +1921,70 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
         "estimated_api_cost"
     ]
     assert projected["audit"]["actual_api_cost"] == payload["actual_api_cost"]
+
+
+def test_dashboard_projects_only_valid_frozen_allocation_contract(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    roots = {
+        market: {
+            "stock": {"asset": stock, "tm_id": index * 10, "as_of_date": "2026-08-03", "global_strength": stock_strength},
+            "etf": {"asset": etf, "tm_id": index * 10 + 1, "as_of_date": "2026-08-03", "global_strength": etf_strength},
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (("CN", "A股", "ETF基金", "90", "80"), ("HK", "港股", "香港ETF", "70", "60"), ("US", "美股", "美国ETF", "50", "40")), 1
+        )
+    }
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03", generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40, roots=roots, previous=None,
+    )
+    payload = _dashboard_frozen_report_payload()
+    payload["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": "b" * 64,
+        "allocation_date": "2026-08-03", "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False, "stale_a_trading_days": 0, "failure_reason": "",
+        "roots": snapshot["roots"], "markets": snapshot["markets"],
+    }
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulate_rotation_pairs"] = []
+    judgments["real_rotation_pairs"] = []
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]
+    assert projected["allocation"] == payload["allocation"]
+    assert projected["simulate_rotation_pairs"] == []
+
+    payload["allocation"]["daily_path"] = "data/trend_allocation/latest.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]["available"] is False
+
+    historical = _dashboard_frozen_report_payload()
+    path.write_text(json.dumps(historical, ensure_ascii=False), encoding="utf-8")
+    historical_projected = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]
+    assert historical_projected["available"] is True
+    assert historical_projected["simulate_rotation_pairs"] == []
+    assert historical_projected["real_rotation_pairs"] == []
+
+    allocationless_pairs = _dashboard_frozen_report_payload()
+    judgments = allocationless_pairs["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulate_rotation_pairs"] = []
+    judgments["real_rotation_pairs"] = []
+    path.write_text(json.dumps(allocationless_pairs, ensure_ascii=False), encoding="utf-8")
+    assert dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]["available"] is False
 
 
 def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(

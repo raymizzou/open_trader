@@ -18,6 +18,7 @@ from open_trader.a_share_trend import (
     write_protection_state,
 )
 from open_trader.daily_premarket import DailyPremarketConfig
+from open_trader.a_share_trend import favorite_candidate_ids
 from open_trader.market_trend import (
     MARKET_NOTIFICATION_LABELS,
     MARKET_SETTINGS,
@@ -76,6 +77,24 @@ def unlock_live_drawdown(
         reason="first_activation",
         entry_eligible_from="2026-07-14",
     )
+
+
+def allocation_for(market: str, *, rank: int, entry_weight: str) -> dict[str, object]:
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": {
+            "markets": {
+                market: {
+                    "rank": rank,
+                    "score": "95.2",
+                    "score_source": "美国ETF",
+                    "entry_weight": entry_weight,
+                    "nominal_weight": {2: "0.40", 3: "0.20"}[rank],
+                },
+            },
+        },
+    }
 
 
 class DefaultSimAccountClient:
@@ -249,6 +268,29 @@ def test_live_market_strategy_snapshot_defaults_to_v8_with_exact_inheritance(
         }
         for version in ("v4", "v5", "v6", "v7", "v8")
     ]
+
+
+@pytest.mark.parametrize(
+    ("market", "rank", "weight", "pools"),
+    [
+        ("HK", 2, "0.04", (622494,)),
+        ("US", 3, "0.02", (622460,)),
+    ],
+)
+def test_allocation_market_v9_freezes_rank_weight(
+    market: str, rank: int, weight: str, pools: tuple[int, ...],
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        pools,
+        allocation=allocation_for(market, rank=rank, entry_weight=weight),
+    )
+
+    assert snapshot["strategy_version"] == "v9"
+    assert snapshot["parameters"]["target_weight"] == weight
+    assert snapshot["parameters"]["allocation_rank"] == rank
+    assert snapshot["parameters"]["min_strength"] == "95"
 
 
 def config(tmp_path: Path) -> DailyPremarketConfig:
@@ -744,6 +786,17 @@ def test_hk_etf_root_loads_unique_warm_to_hot_child() -> None:
     ) == ([security], 707900)
 
 
+def test_favorite_candidate_ids_only_add_deduplicated_security_rows() -> None:
+    favorites = [
+        {"tmId": 2, "tickerSymbol": "AAPL.US", "asset": "美股"},
+        {"tmId": 2, "tickerSymbol": "AAPL.US", "asset": "美股"},
+        {"tmId": 3, "tickerSymbol": "0700.HK", "asset": "港股"},
+        {"tmId": 622460, "tickerName": "美股", "asset": "美股"},
+    ]
+
+    assert favorite_candidate_ids(favorites, market="US") == {2}
+
+
 def test_hk_etf_root_keeps_resolved_child_when_current_members_are_empty() -> None:
     class Api:
         def get_components(
@@ -849,8 +902,8 @@ def test_market_report_keeps_retrying_after_old_ten_deadline(
     assert sleeps == [600.0, 600.0]
 
 
-def test_market_report_failure_owns_day_at_noon_deadline(tmp_path: Path) -> None:
-    now = datetime(2026, 7, 15, 12, 0, tzinfo=SHANGHAI)
+def test_market_report_failure_owns_day_at_19_shanghai_deadline(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 15, 19, 0, tzinfo=SHANGHAI)
     cfg = config(tmp_path)
     notifier = RecordingFeishu()
     result = run_market_trend_report(
@@ -1905,7 +1958,7 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
         market="US",
         run_date="2026-07-15",
         notifier=NullNotifier(),
-        now_fn=lambda: datetime(2026, 7, 15, 12, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
         sleep_fn=lambda seconds: None,
         api_factory=Api,
         quote_factory=Quote,
