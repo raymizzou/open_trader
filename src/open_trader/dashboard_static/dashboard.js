@@ -5529,6 +5529,8 @@ function renderSimulationAttribution(position, broker) {
 function renderAccountHoldingRow(row, {simulated = false} = {}) {
   const holding = row.holding;
   const display = row.display;
+  const enrichment = holding.enrichment_status === "unavailable"
+    ? '<span class="meta-text">关联不可用</span>' : "";
   const isSelected = !simulated && row.key === state.selectedHoldingKey;
   const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
   const pnlTone = pnlClass(display.unrealized_pnl_pct);
@@ -5552,7 +5554,7 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
   const cells = `<tr class="account-holding-row ${isSelected ? "active-row" : ""}" data-broker="${escapeHtml(row.broker)}" data-symbol="${escapeHtml(String(display.symbol || "").toUpperCase())}"${controllerFields}>
     <td class="account-holding-actions"><span class="account-mobile-label">明细</span>${detailActions}</td>
     <td class="account-holding-market"><span class="account-mobile-label">市场</span>${escapeHtml(formatPlain(display.market))}</td>
-    <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${attribution}</td>
+    <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${enrichment}${attribution}</td>
     <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.quantity))}</td>
     <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.cost_price))}</td>
     <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderAccountHoldingPrice(display)}</td>
@@ -7707,10 +7709,10 @@ async function postDashboardJson(url, payload) {
 }
 
 function holdingByKey(detailKey) {
-  return holdingByKeyFromRows(filteredHoldings(), detailKey)
-    || (state.accountSnapshot && Array.isArray(state.accountSnapshot.positions)
-      ? holdingByKeyFromRows(state.accountSnapshot.positions, detailKey)
-      : null);
+  return holdingByKeyFromRows(getHoldings(), detailKey)
+    || accountHoldingGroups().flatMap((group) => group.rows)
+      .find((row) => row.key === detailKey)?.holding
+    || null;
 }
 
 function holdingByKeyFromRows(rows, detailKey) {
@@ -8872,32 +8874,35 @@ function renderUsdMarketValue(holding) {
 }
 
 function getHoldings() {
-  return (state.accountSnapshot && Array.isArray(state.accountSnapshot.positions))
-    ? state.accountSnapshot.positions
+  return (state.dashboard && Array.isArray(state.dashboard.holdings))
+    ? state.dashboard.holdings
     : [];
 }
 
 function accountHoldingGroups() {
+  const legacyHoldings = Array.isArray(state.dashboard?.holdings) ? state.dashboard.holdings : [];
   const groups = Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
     const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
     const rows = (Array.isArray(state.accountSnapshot?.positions)
       ? state.accountSnapshot.positions : [])
       .filter((position) => brokerKey(position) === broker && isAccountHoldingPosition(position))
       .map((position, index) => {
-        const holding = {...position, brokers: broker};
+        const matches = position.instrument_id
+          ? legacyHoldings.filter((holding) => holding.instrument_id === position.instrument_id)
+          : [];
+        const enrichment = matches.length === 1 ? matches[0] : {};
+        const holding = {
+          ...enrichment, ...position, brokers: broker,
+          enrichment_status: matches.length === 1 ? "" : "unavailable",
+        };
         return {
-          key: accountHoldingKey(broker, holding, index), broker, holding,
+          key: String(position.position_id || ""), broker, holding,
           display: position, index,
         };
       });
     return {broker, profile, summary, rows};
   });
   return groups;
-}
-
-function accountHoldingKey(broker, holding, index) {
-  return [broker, holding.market || "", holding.symbol || "", index]
-    .map((part) => String(part)).join(":");
 }
 
 function numericValue(value) {
