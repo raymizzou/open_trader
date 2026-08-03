@@ -11,7 +11,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -24,7 +24,9 @@ from .polymarket_relation_discovery import (
 )
 from .polymarket_monitor import PolymarketMonitor
 from .predict_source import PredictBook, PredictMarket, PredictSource
+from .predict_trading import PredictBuyQuote
 from .prediction_arbitrage import (
+    MAX_NORMAL_COST,
     MIN_THRESHOLD_ANNUALIZED_YIELD,
     ThresholdOrderBook,
     _book_segments,
@@ -74,6 +76,8 @@ _CUTOFF_SEMANTICS = re.compile(
 _CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
 _HOT_HEALTH_POLL_SECONDS = 0.05
 CROSS_VENUE_DISCOVERY_SECONDS = 15 * 60
+_PREDICT_COLLATERAL_UNITS = Decimal(10**6)
+_PREDICT_SHARE_UNITS = Decimal(10**18)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +108,7 @@ class ExplicitMarketPair:
     pair_id: str
     predict: VenueMarket
     polymarket: VenueMarket
+    canonical_cutoff: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,12 +145,14 @@ class CrossVenueLeg:
     outcome: Literal["YES", "NO"]
     token_id: str
     settlement_asset: str
-    quantity: Decimal
+    requested_quantity: Decimal
+    net_quantity: Decimal
     max_price: Decimal
     max_cost: Decimal
     maximum_fee: Decimal
+    fee_asset: str
     book_timestamp: datetime
-    settlement_at: datetime
+    settlement_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,12 +161,16 @@ class CrossVenueIntent:
     direction: Direction
     legs: tuple[CrossVenueLeg, CrossVenueLeg]
     quantity: Decimal
+    calculable_gas: Decimal
     total_max_cost: Decimal
     maximum_fee: Decimal
     minimum_payout: Decimal
     minimum_profit: Decimal
-    annualized_yield: Decimal
-    resolution_at: datetime
+    annualized_yield: Decimal | None
+    canonical_cutoff: datetime | None
+    resolution_at: datetime | None
+    actionable: bool
+    quote_available: bool
 
 
 def build_cross_venue_intents(
@@ -168,11 +179,17 @@ def build_cross_venue_intents(
     polymarket_books: Mapping[str, ThresholdOrderBook],
     *,
     now: datetime,
+    predict_quote_fn: Callable[[str, str, int], PredictBuyQuote],
 ) -> tuple[CrossVenueIntent, ...]:
     """Return clear, equal-share intents for the two approved venue directions."""
 
     return _build_cross_venue_intents(
-        pair, predict_book, polymarket_books, now=now, require_annualized_gate=True
+        pair,
+        predict_book,
+        polymarket_books,
+        now=now,
+        require_annualized_gate=True,
+        predict_quote_fn=predict_quote_fn,
     )
 
 
@@ -183,6 +200,7 @@ def _build_cross_venue_intents(
     *,
     now: datetime,
     require_annualized_gate: bool,
+    predict_quote_fn: Callable[[str, str, int], PredictBuyQuote] | None,
 ) -> tuple[CrossVenueIntent, ...]:
 
     now = _fresh_datetime(now)
@@ -191,7 +209,7 @@ def _build_cross_venue_intents(
     predict_segments = _predict_segments(pair.predict, predict_book, now)
     if predict_segments is None or not isinstance(polymarket_books, Mapping):
         return ()
-    resolution_at = max(pair.predict.event_end_at, pair.polymarket.settlement_at)
+    canonical_cutoff = _fresh_datetime(pair.canonical_cutoff)
     intents: list[CrossVenueIntent] = []
     for direction, predict_outcome, polymarket_outcome in (
         ("PREDICT_YES_POLYMARKET_NO", "YES", "NO"),
@@ -209,71 +227,179 @@ def _build_cross_venue_intents(
         if polymarket_segments is None:
             continue
         predict_side = predict_segments[predict_outcome]
-        candidates = _protected_buy_candidates(
+        predict_candidates = _protected_buy_candidates(
             predict_side, pair.predict.tick_size
         )
         polymarket_candidates = _protected_buy_candidates(
             polymarket_segments, pair.polymarket.tick_size
         )
         minimum = max(pair.predict.minimum_order_size, pair.polymarket.minimum_order_size)
-        for quantity in sorted(candidates.keys() & polymarket_candidates.keys(), reverse=True):
-            if quantity < minimum:
+        observation: CrossVenueIntent | None = None
+        for requested_quantity in sorted(predict_candidates, reverse=True):
+            if requested_quantity < pair.predict.minimum_order_size:
                 continue
-            predict_price = _worst_price(predict_side, quantity)
-            polymarket_price = _worst_price(polymarket_segments, quantity)
-            if predict_price is None or polymarket_price is None:
+            source_predict_price = _worst_price(predict_side, requested_quantity)
+            if source_predict_price is None:
                 continue
-            predict_cost = candidates[quantity]
-            polymarket_cost = polymarket_candidates[quantity]
-            # ponytail: conservative payout-base ceiling; replace only when Predict exposes
-            # a deterministic pre-trade fee quote.
-            predict_fee = quantity * pair.predict.fee_rate_bps / Decimal("10000")
-            polymarket_fee = _fee(
-                quantity, pair.polymarket.fee_rate_bps / Decimal("10000"), polymarket_price
+            predict_quote = _predict_buy_quote(
+                predict_quote_fn,
+                market=pair.predict,
+                token_id=(
+                    pair.predict.yes_token_id
+                    if predict_outcome == "YES"
+                    else pair.predict.no_token_id
+                ),
+                requested_quantity=requested_quantity,
             )
-            total_max_cost = predict_cost + polymarket_cost
+            quote_available = predict_quote is not None
+            if predict_quote is None:
+                predict_price = source_predict_price
+                predict_fee = _fee(
+                    requested_quantity,
+                    pair.predict.fee_rate_bps / Decimal("10000"),
+                    predict_price,
+                )
+                predict_all_in_debit = (
+                    predict_candidates[requested_quantity] + predict_fee
+                )
+                net_quantity = requested_quantity
+            else:
+                (
+                    net_quantity,
+                    predict_price,
+                    predict_all_in_debit,
+                    predict_fee,
+                ) = predict_quote
+            if net_quantity < minimum:
+                continue
+            polymarket_cost = polymarket_candidates.get(net_quantity)
+            polymarket_price = _worst_price(polymarket_segments, net_quantity)
+            if (
+                polymarket_cost is None
+                or polymarket_price is None
+                or source_predict_price + polymarket_price >= Decimal("1")
+            ):
+                continue
+            polymarket_fee = _fee(
+                net_quantity,
+                pair.polymarket.fee_rate_bps / Decimal("10000"),
+                polymarket_price,
+            )
+            polymarket_all_in_debit = polymarket_cost + polymarket_fee
+            calculable_gas = Decimal("0")
+            total_max_cost = (
+                predict_all_in_debit + polymarket_all_in_debit + calculable_gas
+            )
             maximum_fee = predict_fee + polymarket_fee
-            minimum_payout = quantity
-            minimum_profit = minimum_payout - total_max_cost - maximum_fee
-            if total_max_cost + maximum_fee >= minimum_payout:
+            minimum_payout = net_quantity
+            minimum_profit = minimum_payout - total_max_cost
+            if minimum_profit <= 0:
                 continue
             legs = (
                 CrossVenueLeg(
                     exchange="predict.fun", market_id=pair.predict.market_id,
                     condition_id=pair.predict.condition_id, outcome=predict_outcome,
                     token_id=pair.predict.yes_token_id if predict_outcome == "YES" else pair.predict.no_token_id,
-                    settlement_asset=pair.predict.settlement_asset, quantity=quantity,
-                    max_price=predict_price, max_cost=predict_cost, maximum_fee=predict_fee,
+                    settlement_asset=pair.predict.settlement_asset,
+                    requested_quantity=requested_quantity, net_quantity=net_quantity,
+                    max_price=predict_price, max_cost=predict_all_in_debit,
+                    maximum_fee=predict_fee, fee_asset=pair.predict.settlement_asset,
                     book_timestamp=predict_book.source_timestamp, settlement_at=None,
                 ),
                 CrossVenueLeg(
                     exchange="polymarket", market_id=pair.polymarket.market_id,
                     condition_id=pair.polymarket.condition_id, outcome=polymarket_outcome,
                     token_id=token_id, settlement_asset=pair.polymarket.settlement_asset,
-                    quantity=quantity, max_price=polymarket_price, max_cost=polymarket_cost,
-                    maximum_fee=polymarket_fee, book_timestamp=polymarket_book.confirmed_at,
+                    requested_quantity=net_quantity, net_quantity=net_quantity,
+                    max_price=polymarket_price, max_cost=polymarket_all_in_debit,
+                    maximum_fee=polymarket_fee, fee_asset=pair.polymarket.settlement_asset,
+                    book_timestamp=polymarket_book.confirmed_at,
                     settlement_at=pair.polymarket.settlement_at,
                 ),
             )
-            annualized = simple_annualized_yield_from_values(
-                minimum_profit,
-                total_max_cost + maximum_fee,
-                now=now,
-                resolution_at=resolution_at,
+            annualized = (
+                simple_annualized_yield_from_values(
+                    minimum_profit,
+                    total_max_cost,
+                    now=now,
+                    resolution_at=canonical_cutoff,
+                )
+                if canonical_cutoff is not None
+                else None
             )
-            if annualized is None or (
-                require_annualized_gate
-                and annualized < MIN_THRESHOLD_ANNUALIZED_YIELD
-            ):
+            actionable = (
+                quote_available
+                and total_max_cost <= MAX_NORMAL_COST
+                and annualized is not None
+                and annualized >= MIN_THRESHOLD_ANNUALIZED_YIELD
+            )
+            intent = CrossVenueIntent(
+                pair_id=pair.pair_id, direction=direction, legs=legs,
+                quantity=net_quantity, calculable_gas=calculable_gas,
+                total_max_cost=total_max_cost,
+                maximum_fee=maximum_fee, minimum_payout=minimum_payout,
+                minimum_profit=minimum_profit, annualized_yield=annualized,
+                canonical_cutoff=canonical_cutoff, resolution_at=canonical_cutoff,
+                actionable=actionable, quote_available=quote_available,
+            )
+            if total_max_cost > MAX_NORMAL_COST:
+                observation = observation or intent
                 continue
-            intents.append(CrossVenueIntent(
-                pair_id=pair.pair_id, direction=direction, legs=legs, quantity=quantity,
-                total_max_cost=total_max_cost, maximum_fee=maximum_fee,
-                minimum_payout=minimum_payout, minimum_profit=minimum_profit,
-                annualized_yield=annualized, resolution_at=resolution_at,
-            ))
-            break
+            if actionable or not require_annualized_gate:
+                intents.append(intent)
+                break
+            observation = observation or intent
+        if not require_annualized_gate and observation is not None and not any(
+            intent.direction == direction for intent in intents
+        ):
+            intents.append(observation)
     return tuple(intents)
+
+
+def _predict_buy_quote(
+    quote_fn: Callable[[str, str, int], PredictBuyQuote] | None,
+    *,
+    market: VenueMarket,
+    token_id: str,
+    requested_quantity: Decimal,
+) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
+    if quote_fn is None:
+        return None
+    requested_units = requested_quantity * _PREDICT_SHARE_UNITS
+    if requested_units != requested_units.to_integral_value():
+        return None
+    try:
+        quote = quote_fn(market.market_id, token_id, int(requested_units))
+    except Exception:
+        return None
+    if (
+        not isinstance(quote, PredictBuyQuote)
+        or quote.market_id != market.market_id
+        or quote.token_id != token_id
+        or not all(
+            isinstance(value, int) and value > 0
+            for value in (
+                quote.price_per_share_wei,
+                quote.max_collateral_debit,
+                quote.minimum_redeemable_units,
+            )
+        )
+        or quote.minimum_redeemable_units > int(requested_units)
+    ):
+        return None
+    net_quantity = Decimal(quote.minimum_redeemable_units) / _PREDICT_SHARE_UNITS
+    max_price = Decimal(quote.price_per_share_wei) / _PREDICT_COLLATERAL_UNITS
+    max_debit = Decimal(quote.max_collateral_debit) / _PREDICT_COLLATERAL_UNITS
+    fee = max_debit - net_quantity * max_price
+    expected_fee = net_quantity * max_price * market.fee_rate_bps / Decimal("10000")
+    if (
+        net_quantity <= 0
+        or max_price <= 0
+        or fee < 0
+        or fee != expected_fee
+    ):
+        return None
+    return net_quantity, max_price, max_debit, fee
 
 
 def _fresh_datetime(value: object) -> datetime | None:
@@ -796,6 +922,7 @@ class PredictCrossVenueMonitor:
         validator: CodexCrossVenueEquivalenceValidator,
         gamma_lookup: Callable[..., Sequence[object]],
         clob_lookup: Callable[[str], object],
+        predict_quote_fn: Callable[[str, str, int], PredictBuyQuote] | None = None,
         store: PredictionArbitrageStore | None = None,
         ready_observer: Callable[[str, str], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -805,6 +932,7 @@ class PredictCrossVenueMonitor:
         self._validator = validator
         self._gamma_lookup = gamma_lookup
         self._clob_lookup = clob_lookup
+        self._predict_quote_fn = predict_quote_fn
         self._store = store
         self._ready_observer = ready_observer
         self._clock = clock
@@ -920,7 +1048,9 @@ class PredictCrossVenueMonitor:
                 and validation.polymarket_fingerprint
                 == pair.polymarket.rules_fingerprint
             ):
-                approved[pair_id] = pair
+                approved[pair_id] = replace(
+                    pair, canonical_cutoff=validation.canonical_cutoff
+                )
         self._set_approved(approved, prompt_version=prompt_version)
         self._status = self._source_status()
 
@@ -1010,6 +1140,7 @@ class PredictCrossVenueMonitor:
                 self._polymarket.cross_venue_books(tokens),
                 now=self._clock(),
                 require_annualized_gate=False,
+                predict_quote_fn=None,
             )
             local_directions = {intent.direction for intent in local}
             self._prune_pair_directions(pair.pair_id, local_directions)
@@ -1051,8 +1182,13 @@ class PredictCrossVenueMonitor:
         ):
             self._close_pair(pair.pair_id)
             return
-        intents = build_cross_venue_intents(
-            current, predict_book, polymarket_books, now=self._clock()
+        intents = _build_cross_venue_intents(
+            current,
+            predict_book,
+            polymarket_books,
+            now=self._clock(),
+            require_annualized_gate=False,
+            predict_quote_fn=self._predict_quote_fn,
         )
         if not intents:
             self._close_pair(pair.pair_id)
@@ -1072,14 +1208,18 @@ class PredictCrossVenueMonitor:
                 "market_type": "cross_venue_yes_no",
                 "execution_mode": "observe_only",
                 "actionable": False,
-                "clear_signal": True,
+                "clear_signal": intent.actionable,
+                "funnel_stage": 5 if intent.actionable else 4,
+                "quote_available": intent.quote_available,
                 "legs": [asdict(leg) for leg in intent.legs],
                 "quantity": intent.quantity,
+                "calculable_gas": intent.calculable_gas,
                 "total_max_cost": intent.total_max_cost,
                 "maximum_fee": intent.maximum_fee,
                 "minimum_payout": intent.minimum_payout,
                 "minimum_profit": intent.minimum_profit,
                 "annualized_yield": intent.annualized_yield,
+                "canonical_cutoff": intent.canonical_cutoff,
                 "resolution_at": intent.resolution_at,
             }
             self._opportunities[(pair.pair_id, intent.direction)] = opportunity
@@ -1129,6 +1269,7 @@ class PredictCrossVenueMonitor:
                     ),
                     now=self._clock(),
                     require_annualized_gate=False,
+                    predict_quote_fn=None,
                 )
             )
             self._prune_pair_directions(

@@ -23,6 +23,7 @@ from open_trader.predict_cross_venue import (
     resolve_explicit_market_pairs,
 )
 from open_trader.predict_source import PredictBook, PredictMarket
+from open_trader.predict_trading import PredictBuyQuote
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
@@ -412,6 +413,7 @@ def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> No
         predict_source=FakeCrossVenuePredict(()), polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(), gamma_lookup=lambda *args, **kwargs: [],
         clob_lookup=lambda condition_id: None,
+        predict_quote_fn=predict_quote(),
     )
     monitor._set_approved({pair.pair_id: pair})
     for variant in variants:
@@ -472,6 +474,7 @@ def cross_venue_pair() -> ExplicitMarketPair:
         pair_id=pair.pair_id,
         predict=replace(pair.predict, event_end_at=datetime(2026, 1, 11, tzinfo=UTC)),
         polymarket=replace(pair.polymarket, settlement_at=datetime(2026, 1, 21, tzinfo=UTC)),
+        canonical_cutoff=datetime(2026, 1, 21, tzinfo=UTC),
     )
 
 
@@ -507,27 +510,47 @@ def cross_venue_books() -> tuple[PredictBook, dict[str, ThresholdOrderBook]]:
     return predict, books
 
 
+def predict_quote(
+    *, net_quantity: Decimal | None = None, all_in_price: Decimal = Decimal("0.408")
+):
+    def quote(market_id: str, token_id: str, requested_units: int) -> PredictBuyQuote:
+        net_units = (
+            requested_units
+            if net_quantity is None
+            else int(net_quantity * Decimal(10**18))
+        )
+        debit = int(
+            Decimal(net_units) / Decimal(10**18) * all_in_price * Decimal(10**6)
+        )
+        return PredictBuyQuote(
+            market_id, token_id, 400_000, debit, net_units
+        )
+
+    return quote
+
+
 def test_cross_venue_intent_uses_decimal_depth_fees_later_settlement_and_venue_ids() -> None:
     pair = cross_venue_pair()
     predict, polymarket = cross_venue_books()
 
     intents = build_cross_venue_intents(
-        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
+        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(),
     )
 
     assert len(intents) == 1
     intent = intents[0]
     assert intent.direction == "PREDICT_YES_POLYMARKET_NO"
     assert intent.quantity == Decimal("10")
-    assert intent.total_max_cost == Decimal("9.20")
-    assert intent.maximum_fee == Decimal("0.24998")
+    assert intent.total_max_cost == Decimal("9.22998")
+    assert intent.maximum_fee == Decimal("0.12998")
     assert intent.minimum_payout == Decimal("10")
-    assert intent.minimum_profit == Decimal("0.55002")
+    assert intent.minimum_profit == Decimal("0.77002")
     assert intent.resolution_at == datetime(2026, 1, 21, tzinfo=UTC)
-    assert intent.annualized_yield == Decimal("0.55002") / Decimal("9.44998") * Decimal("365") / Decimal("20")
+    assert intent.annualized_yield == Decimal("0.77002") / Decimal("9.22998") * Decimal("365") / Decimal("20")
     assert [(leg.exchange, leg.outcome, leg.max_price, leg.max_cost, leg.maximum_fee) for leg in intent.legs] == [
-        ("predict.fun", "YES", Decimal("0.41"), Decimal("4.10"), Decimal("0.20")),
-        ("polymarket", "NO", Decimal("0.51"), Decimal("5.10"), Decimal("0.04998")),
+        ("predict.fun", "YES", Decimal("0.4"), Decimal("4.08"), Decimal("0.08")),
+        ("polymarket", "NO", Decimal("0.51"), Decimal("5.14998"), Decimal("0.04998")),
     ]
     assert [(leg.settlement_asset, leg.market_id, leg.condition_id, leg.token_id) for leg in intent.legs] == [
         ("USDT", "predict-market-1", "predict-native-condition-1", "predict-yes-1"),
@@ -535,7 +558,7 @@ def test_cross_venue_intent_uses_decimal_depth_fees_later_settlement_and_venue_i
     ]
     assert set(asdict(intent.legs[0])) == {
         "exchange", "market_id", "condition_id", "outcome", "token_id",
-        "settlement_asset", "quantity", "max_price", "max_cost", "maximum_fee",
+        "settlement_asset", "requested_quantity", "net_quantity", "max_price", "max_cost", "maximum_fee", "fee_asset",
         "book_timestamp", "settlement_at",
     }
 
@@ -555,7 +578,8 @@ def test_cross_venue_intent_calculates_only_the_polymarket_yes_predict_no_direct
     )
 
     intents = build_cross_venue_intents(
-        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
+        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(),
     )
 
     assert [intent.direction for intent in intents] == ["POLYMARKET_YES_PREDICT_NO"]
@@ -563,6 +587,207 @@ def test_cross_venue_intent_calculates_only_the_polymarket_yes_predict_no_direct
         ("predict.fun", "NO"),
         ("polymarket", "YES"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("predict_asks", "polymarket_token", "polymarket_asks", "direction"),
+    (
+        (
+            (BookLevel(Decimal("0.40"), Decimal("10")),),
+            "poly-no-1",
+            (BookLevel(Decimal("0.50"), Decimal("10")),),
+            "PREDICT_YES_POLYMARKET_NO",
+        ),
+        (
+            (BookLevel(Decimal("0.30"), Decimal("10")),),
+            "poly-yes-1",
+            (BookLevel(Decimal("0.50"), Decimal("10")),),
+            "POLYMARKET_YES_PREDICT_NO",
+        ),
+    ),
+)
+def test_cross_venue_intent_sizes_both_directions_to_predict_net_units(
+    predict_asks, polymarket_token, polymarket_asks, direction
+) -> None:
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+    predict = replace(
+        predict,
+        yes_asks=predict_asks if direction.startswith("PREDICT") else (BookLevel(Decimal("0.70"), Decimal("10")),),
+        no_asks=predict_asks if direction.startswith("POLYMARKET") else (BookLevel(Decimal("0.60"), Decimal("10")),),
+    )
+    polymarket[polymarket_token] = replace(
+        polymarket[polymarket_token],
+        asks=polymarket_asks,
+        bids=(BookLevel(Decimal("0.49"), Decimal("10")),),
+    )
+
+    intents = build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(net_quantity=Decimal("9")),
+    )
+
+    intent = next(item for item in intents if item.direction == direction)
+    assert intent.quantity == Decimal("9")
+    assert [leg.requested_quantity for leg in intent.legs] == [Decimal("10"), Decimal("9")]
+    assert [leg.net_quantity for leg in intent.legs] == [Decimal("9"), Decimal("9")]
+
+
+def test_cross_venue_keeps_positive_stage_four_observation_when_quote_is_unavailable() -> None:
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+
+    def unavailable_quote(*args: object) -> PredictBuyQuote:
+        raise RuntimeError("unavailable")
+
+    observation = predict_cross_venue._build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=unavailable_quote,
+    )
+
+    assert observation
+    assert observation[0].actionable is False
+    assert build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=unavailable_quote,
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    ("annualized", "actionable"),
+    ((Decimal("0.149999"), False), (Decimal("0.15"), True)),
+)
+def test_cross_venue_uses_the_inclusive_fifteen_percent_annualized_gate(
+    monkeypatch: pytest.MonkeyPatch, annualized: Decimal, actionable: bool
+) -> None:
+    monkeypatch.setattr(
+        predict_cross_venue,
+        "simple_annualized_yield_from_values",
+        lambda *args, **kwargs: annualized,
+    )
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+
+    observation = predict_cross_venue._build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=predict_quote(),
+    )
+    intents = build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(),
+    )
+
+    assert observation[0].actionable is actionable
+    assert bool(intents) is actionable
+
+
+def test_cross_venue_descends_when_largest_quote_exceeds_twenty_usdt() -> None:
+    pair = cross_venue_pair()
+    predict, polymarket = cross_venue_books()
+
+    def capped_quote(market_id: str, token_id: str, requested_units: int) -> PredictBuyQuote:
+        quantity = Decimal(requested_units) / Decimal(10**18)
+        all_in_price = Decimal("3") if quantity > Decimal("5") else Decimal("0.408")
+        return PredictBuyQuote(
+            market_id,
+            token_id,
+            400_000,
+            int(quantity * all_in_price * Decimal(10**6)),
+            requested_units,
+        )
+
+    intents = build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=capped_quote,
+    )
+
+    assert intents[0].quantity == Decimal("5")
+    assert intents[0].total_max_cost <= Decimal("20")
+
+
+def test_cross_venue_treats_usdt_and_pusd_as_one_to_one_without_fx() -> None:
+    pair = replace(
+        cross_venue_pair(),
+        polymarket=replace(cross_venue_pair().polymarket, settlement_asset="pUSD"),
+    )
+    predict, polymarket = cross_venue_books()
+
+    intent = build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(),
+    )[0]
+
+    assert [leg.settlement_asset for leg in intent.legs] == ["USDT", "pUSD"]
+    assert intent.total_max_cost == Decimal("9.22998")
+    assert intent.calculable_gas == Decimal("0")
+
+
+def test_cross_venue_rejects_fee_inclusive_zero_profit_quotes() -> None:
+    pair = replace(
+        cross_venue_pair(),
+        predict=replace(cross_venue_pair().predict, fee_rate_bps=Decimal("2500")),
+    )
+    predict, polymarket = cross_venue_books()
+
+    assert build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(all_in_price=Decimal("0.5")),
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "canonical_cutoff",
+    (None, datetime(2025, 12, 31, tzinfo=UTC)),
+)
+def test_cross_venue_missing_or_past_canonical_cutoff_is_observation_only(
+    canonical_cutoff: datetime | None,
+) -> None:
+    pair = replace(cross_venue_pair(), canonical_cutoff=canonical_cutoff)
+    predict, polymarket = cross_venue_books()
+
+    observation = predict_cross_venue._build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=predict_quote(),
+    )
+
+    assert observation[0].actionable is False
+    assert build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(),
+    ) == ()
 
 
 def test_cross_venue_intent_uses_shared_scalar_annualization_with_fee_inclusive_capital(monkeypatch) -> None:
@@ -585,11 +810,13 @@ def test_cross_venue_intent_uses_shared_scalar_annualization_with_fee_inclusive_
     predict, polymarket = cross_venue_books()
     now = datetime(2026, 1, 1, tzinfo=UTC)
 
-    intents = build_cross_venue_intents(pair, predict, polymarket, now=now)
+    intents = build_cross_venue_intents(
+        pair, predict, polymarket, now=now, predict_quote_fn=predict_quote()
+    )
 
     assert len(intents) == 1
     assert calls == [
-        (Decimal("0.55002"), Decimal("9.44998"), now, pair.polymarket.settlement_at)
+        (Decimal("0.77002"), Decimal("9.22998"), now, pair.canonical_cutoff)
     ]
 
 
@@ -599,7 +826,6 @@ def test_cross_venue_intent_uses_shared_scalar_annualization_with_fee_inclusive_
         lambda pair, predict, books: (replace(pair, predict=replace(pair.predict, minimum_order_size=Decimal("11"))), predict, books),
         lambda pair, predict, books: (replace(pair, predict=replace(pair.predict, tick_size=Decimal("0.03"))), predict, books),
         lambda pair, predict, books: (replace(pair, predict=replace(pair.predict, fee_rate_bps=Decimal("1000"))), predict, books),
-        lambda pair, predict, books: (replace(pair, polymarket=replace(pair.polymarket, settlement_at=datetime(2036, 1, 1, tzinfo=UTC))), predict, books),
         lambda pair, predict, books: (pair, replace(predict, received_at=datetime(2026, 1, 1, tzinfo=UTC) - timedelta(seconds=11)), books),
         lambda pair, predict, books: (pair, replace(predict, yes_asks=(BookLevel(0.40, Decimal("10")),)), books),
         lambda pair, predict, books: (pair, replace(predict, yes_asks=(BookLevel(Decimal("0.40"), Decimal("-1")),)), books),
@@ -613,7 +839,8 @@ def test_cross_venue_intent_fails_closed_for_invalid_depth_fees_and_freshness(mu
     pair, predict, polymarket = mutate(cross_venue_pair(), *cross_venue_books())
 
     assert build_cross_venue_intents(
-        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC)
+        pair, predict, polymarket, now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=predict_quote(),
     ) == ()
 
 
@@ -693,6 +920,7 @@ class FakeCrossVenueValidator:
             predict_event_end_at=pair.predict.event_end_at,
             polymarket_close_at=pair.polymarket.close_at,
             polymarket_settlement_at=pair.polymarket.settlement_at,
+            canonical_cutoff=datetime(2026, 1, 21, tzinfo=UTC) if approved else None,
         )
 
 
@@ -719,6 +947,18 @@ class FakeCrossVenuePolymarket:
             await self.predict_started.wait()
         await self.release.wait()
         return self.cross_venue_books(token_ids)
+
+
+def test_monitor_allows_task_six_to_defer_quote_wiring() -> None:
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=lambda *args, **kwargs: [],
+        clob_lookup=lambda condition_id: None,
+    )
+
+    assert monitor._predict_quote_fn is None
 
 
 class FakeCrossVenuePredict:
@@ -805,6 +1045,7 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             validator=validator,
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -868,6 +1109,7 @@ def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -
             validator=validator,
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -921,6 +1163,7 @@ def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             store=store,
             ready_observer=lambda opportunity_id, signal_id: notifications.append(
                 (opportunity_id, signal_id)
@@ -947,8 +1190,8 @@ def test_monitor_persists_and_notifies_one_cross_venue_observation_episode(
         assert signal["market_type"] == "cross_venue_yes_no"
         assert signal["execution_mode"] == "observe_only"
         assert signal["clear_signal"] is True
-        assert signal["trigger_total_max_cost"] == "9.50"
-        assert signal["trigger_minimum_profit"] == "0.2520000000"
+        assert signal["trigger_total_max_cost"] == "8.128000"
+        assert signal["trigger_minimum_profit"] == "1.872000"
         assert signal["legs"][0]["token_id"] == "predict-yes-1"
         assert signal["legs"][1]["token_id"] == "poly-no-1"
         assert signal["question"] == "Will the public test event resolve Yes?"
@@ -977,6 +1220,7 @@ def test_monitor_snapshot_closes_episode_when_books_age_without_another_update()
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: now[0],
         )
 
@@ -1006,6 +1250,7 @@ def test_monitor_missing_api_key_is_pending_and_has_zero_cross_subscriptions() -
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1052,6 +1297,7 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
             validator=validator,
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1116,6 +1362,7 @@ def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
                 for condition_id in ids
             ],
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1161,6 +1408,7 @@ def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
         monitor = PredictCrossVenueMonitor(
             predict_source=predict, polymarket_monitor=polymarket, validator=validator,
             gamma_lookup=monitor_gamma, clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1216,6 +1464,7 @@ def test_monitor_suspends_during_hidden_predict_reconnect_and_rearms_after_fresh
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1268,6 +1517,7 @@ def test_monitor_slow_codex_validation_does_not_pause_hot_books(
             validator=validator,
             gamma_lookup=monitor_gamma,
             clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
