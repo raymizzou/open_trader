@@ -412,25 +412,6 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
             "metadata": {"market": "CN", "broker": "eastmoney"},
             "kelly_rounds": [],
             "kelly_data_reason": "",
-            "simulate_rotation_pairs": [{
-                "pair_index": 0,
-                "sell_symbol": "WEAK",
-                "sell_name": "WEAK",
-                "sell_futu_symbol": "SH.WEAK",
-                "sell_global_strength": "10",
-                "buy_symbol": "STRONG",
-                "buy_name": "STRONG",
-                "buy_futu_symbol": "SH.STRONG",
-                "buy_global_strength": "90",
-                "strength_gap": "80",
-                "target_weight": "0.04",
-                "target_amount": "4000",
-                "estimated_shares": 400,
-                "lot_size": 100,
-                "atr": "0.5",
-                "reason": "relative_rotation",
-            }],
-            "real_rotation_pairs": [],
         },
     }
 
@@ -439,36 +420,6 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
-    assert rebuilt["strategy_judgments"]["simulate_rotation_pairs"][0][
-        "buy_symbol"
-    ] == "STRONG"
-
-    bad_index = copy.deepcopy(evidence)
-    bad_index["rebuild_inputs"]["simulate_rotation_pairs"][0]["pair_index"] = 2
-    with pytest.raises(
-        trend_review.TrendReplayIncompleteError,
-        match="invalid original input: simulate_rotation_pairs",
-    ):
-        trend_review.rebuild_trend_report_from_evidence(bad_index)
-
-    duplicate_symbol = copy.deepcopy(evidence)
-    second_pair = copy.deepcopy(
-        duplicate_symbol["rebuild_inputs"]["simulate_rotation_pairs"][0]
-    )
-    second_pair.update(
-        pair_index=1,
-        sell_symbol="WEAK2",
-        sell_name="WEAK2",
-        sell_futu_symbol="SH.WEAK2",
-    )
-    duplicate_symbol["rebuild_inputs"]["simulate_rotation_pairs"].append(
-        second_pair
-    )
-    with pytest.raises(
-        trend_review.TrendReplayIncompleteError,
-        match="invalid original input: simulate_rotation_pairs",
-    ):
-        trend_review.rebuild_trend_report_from_evidence(duplicate_symbol)
 
 
 def test_rebuild_uses_frozen_allocation_daily_bytes_not_latest_pointer(

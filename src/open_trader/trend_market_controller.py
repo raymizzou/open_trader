@@ -940,6 +940,14 @@ def _execute_locked_report(
     judgments = locked_report["strategy_judgments"]
     actions = judgments["formal_actions"]
     rotation_pairs = judgments.get("simulate_rotation_pairs", [])
+    if not actions and not rotation_pairs:
+        return {
+            "status": "unchanged",
+            "market": market,
+            "date": execution_date,
+            "submitted_count": 0,
+            "artifact_paths": [],
+        }
     missed = record_trend_review_missed_buys(
         data_dir=config.data_dir,
         report=locked_report,
