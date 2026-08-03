@@ -37,6 +37,7 @@ from .account_sync_state import (
     load_account_sync_state,
     project_account_sync_health,
 )
+from .account_snapshot import build_instrument_id
 from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
@@ -3844,6 +3845,9 @@ def _merge_holding(
     decision_plan_errors_by_market: dict[str, str],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
+    holding["instrument_id"] = build_instrument_id(
+        row.get("market", ""), row.get("asset_class", ""), row.get("symbol", "")
+    )
     key = _market_symbol_key(row)
     broker_details = (
         [_broker_detail_row(row) for row in positions_by_holding.get(key, [])]
