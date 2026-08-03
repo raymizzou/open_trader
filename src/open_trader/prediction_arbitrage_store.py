@@ -8,8 +8,11 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping
+
+from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
@@ -310,6 +313,15 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cross_execution_reservations (
+                execution_id TEXT PRIMARY KEY REFERENCES executions(execution_id),
+                amount TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'released')),
+                created_at TEXT NOT NULL,
+                released_at TEXT,
+                release_reason TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS execution_legs (
                 leg_id TEXT PRIMARY KEY,
                 execution_id TEXT NOT NULL REFERENCES executions(execution_id),
@@ -394,6 +406,9 @@ class PredictionArbitrageStore:
             version = 1
         if version < 2:
             connection.execute("PRAGMA user_version=2")
+            version = 2
+        if version < 3:
+            connection.execute("PRAGMA user_version=3")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -1041,6 +1056,43 @@ class PredictionArbitrageStore:
             )
         return preview_id
 
+    @staticmethod
+    def _reserved_cross_principal(connection: sqlite3.Connection) -> Decimal:
+        rows = connection.execute(
+            "SELECT amount FROM cross_execution_reservations WHERE state='reserved'"
+        ).fetchall()
+        return sum((Decimal(str(row["amount"])) for row in rows), Decimal("0"))
+
+    @staticmethod
+    def _cross_reservation_amount(payload: Mapping[str, object]) -> Decimal:
+        value = payload.get("total_max_cost")
+        if isinstance(value, bool):
+            raise ValueError("cross_unsettled_cost_invalid")
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("cross_unsettled_cost_invalid") from exc
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("cross_unsettled_cost_invalid")
+        return amount
+
+    def cross_unsettled_principal(self) -> Decimal:
+        with self._read_connection() as connection:
+            return self._reserved_cross_principal(connection)
+
+    def release_cross_reservation(self, execution_id: str, *, reason: str) -> None:
+        if reason not in {"no_submit", "both_rejected", "redeemed"}:
+            raise ValueError("unsupported cross reservation release reason")
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE cross_execution_reservations
+                SET state='released', released_at=?, release_reason=?
+                WHERE execution_id=? AND state='reserved'
+                """,
+                (_utc_now(), reason, str(execution_id)),
+            )
+
     def consume_preview_and_create_execution(
         self, preview_id: str, idempotency_key: str
     ) -> dict[str, object]:
@@ -1049,6 +1101,12 @@ class PredictionArbitrageStore:
             raise ValueError("idempotency_key is required")
         now = _parse_timestamp(_utc_now())
         with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM executions WHERE preview_id=?",
+                (preview_id,),
+            ).fetchone()
+            if existing is not None:
+                return self._execution_result(existing)
             existing = connection.execute(
                 "SELECT * FROM executions WHERE idempotency_key=?",
                 (key,),
@@ -1066,8 +1124,15 @@ class PredictionArbitrageStore:
             if now >= _parse_timestamp(preview["expires_at"]):
                 raise ValueError("preview_expired")
             payload = str(preview["payload"])
-            if _load_payload(payload).get("market_type") == "cross_venue_yes_no":
-                raise ValueError("cross_venue_observation_only")
+            preview_payload = _load_payload(payload)
+            cross_amount: Decimal | None = None
+            if preview_payload.get("market_type") == "cross_venue_yes_no":
+                cross_amount = self._cross_reservation_amount(preview_payload)
+                if (
+                    self._reserved_cross_principal(connection) + cross_amount
+                    > MAX_CROSS_UNSETTLED_PRINCIPAL
+                ):
+                    raise ValueError("cross_unsettled_cap")
             execution_id = _new_id()
             created = _canonical_timestamp(now)
             try:
@@ -1084,6 +1149,15 @@ class PredictionArbitrageStore:
                 if "one_nonterminal_execution" in str(exc):
                     raise ValueError("active execution already exists") from exc
                 raise
+            if cross_amount is not None:
+                connection.execute(
+                    """
+                    INSERT INTO cross_execution_reservations(
+                        execution_id, amount, state, created_at, released_at, release_reason
+                    ) VALUES (?, ?, 'reserved', ?, NULL, NULL)
+                    """,
+                    (execution_id, format(cross_amount, "f"), created),
+                )
             connection.execute(
                 "UPDATE previews SET consumed_at=? WHERE preview_id=? AND consumed_at IS NULL",
                 (created, preview_id),
