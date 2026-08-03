@@ -33,9 +33,7 @@ def market(**changes: object) -> dict[str, object]:
         "conditionId": "predict-condition",
         "question": "Will this test pass?",
         "description": "Resolves from the named source.",
-        "resolutionSource": "Predict Oracle",
-        "closesAt": "2026-12-31T00:00:00Z",
-        "settlementAt": "2027-01-01T00:00:00Z",
+        "categorySlug": "btc-year-end",
         "outcomes": [
             {"name": "YES", "onChainId": "predict-yes"},
             {"name": "NO", "onChainId": "predict-no"},
@@ -55,9 +53,21 @@ def market(**changes: object) -> dict[str, object]:
     return result
 
 
+def category(**changes: object) -> dict[str, object]:
+    result: dict[str, object] = {
+        "slug": "btc-year-end",
+        "startsAt": "2026-01-01T00:00:00Z",
+        "endsAt": "2026-12-31T23:59:00Z",
+        "resolutionProvider": "PREDICT_DOT_FUN",
+    }
+    result.update(changes)
+    return result
+
+
 def source_with_responses(
     responses: list[object],
     *,
+    categories: dict[str, object] | None = None,
     connector: object | None = None,
     key_loader: object = lambda: "predict-key-sentinel",
     sleep_fn: object = lambda seconds: None,
@@ -67,6 +77,11 @@ def source_with_responses(
 
     def opener(request: object, **kwargs: object) -> FakeResponse:
         requests.append(request)
+        path = request.full_url.removeprefix("https://api.predict.fun")
+        if path.startswith("/v1/categories/"):
+            slug = path.removeprefix("/v1/categories/")
+            payload = (categories or {}).get(slug, category(slug=slug))
+            return FakeResponse({"success": True, "data": payload})
         response = responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -83,6 +98,65 @@ def source_with_responses(
         ),
         requests,
     )
+
+
+def test_get_market_joins_category_timing_and_resolution_provider() -> None:
+    source, requests = source_with_responses([{"success": True, "data": market(id=896)}])
+
+    result = asyncio.run(source.get_market("896"))
+
+    assert result is not None
+    assert result.category_slug == "btc-year-end"
+    assert result.event_start_at == datetime(2026, 1, 1, tzinfo=UTC)
+    assert result.event_end_at == datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
+    assert result.resolution_provider == "PREDICT_DOT_FUN"
+    assert result.close_at is None
+    assert result.settlement_at is None
+    assert result.resolution_source == ""
+    assert [request.full_url.removeprefix("https://api.predict.fun") for request in requests] == [
+        "/v1/markets/896",
+        "/v1/categories/btc-year-end",
+    ]
+
+
+def test_category_request_is_reused_for_sibling_markets() -> None:
+    source, requests = source_with_responses(
+        [{"success": True, "data": [market(id=896), market(id=897)]}]
+    )
+
+    result = asyncio.run(source.list_open_markets())
+
+    assert [item.market_id for item in result] == ["896", "897"]
+    assert [request.full_url.removeprefix("https://api.predict.fun") for request in requests] == [
+        "/v1/markets?first=100&status=OPEN",
+        "/v1/categories/btc-year-end",
+    ]
+
+
+def test_missing_or_unparseable_category_timing_excludes_market() -> None:
+    missing, _ = source_with_responses(
+        [{"success": True, "data": market(id=896)}],
+        categories={"btc-year-end": category(endsAt=None)},
+    )
+    unparseable, _ = source_with_responses(
+        [{"success": True, "data": market(id=896)}],
+        categories={"btc-year-end": category(startsAt="not-a-date")},
+    )
+
+    assert asyncio.run(missing.get_market("896")) is None
+    assert asyncio.run(unparseable.get_market("896")) is None
+
+
+def test_empty_polymarket_ids_remain_empty_without_catalog_scan() -> None:
+    source, requests = source_with_responses(
+        [{"success": True, "data": market(id=896, polymarketConditionIds=[])}]
+    )
+
+    result = asyncio.run(source.get_market("896"))
+
+    assert result is not None
+    assert result.polymarket_condition_ids == ()
+    assert len(requests) == 2
 
 
 def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_markets() -> None:

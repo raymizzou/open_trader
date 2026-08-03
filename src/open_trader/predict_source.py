@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import websockets
@@ -33,17 +33,22 @@ class PredictMarket:
     condition_id: str
     question: str
     rules: str
-    resolution_source: str
-    close_at: datetime
-    settlement_at: datetime
-    yes_token_id: str
-    no_token_id: str
-    settlement_asset: str
-    minimum_order_size: Decimal
-    tick_size: Decimal
-    fee_rate_bps: Decimal
-    polymarket_condition_ids: tuple[str, ...]
-    rules_fingerprint: str
+    category_slug: str = ""
+    event_start_at: datetime | None = None
+    event_end_at: datetime | None = None
+    resolution_provider: str = ""
+    # Deprecated constructor compatibility for Task 2's migration.
+    resolution_source: str = ""
+    close_at: datetime | None = None
+    settlement_at: datetime | None = None
+    yes_token_id: str = ""
+    no_token_id: str = ""
+    settlement_asset: str = ""
+    minimum_order_size: Decimal = Decimal("0")
+    tick_size: Decimal = Decimal("0")
+    fee_rate_bps: Decimal = Decimal("0")
+    polymarket_condition_ids: tuple[str, ...] = ()
+    rules_fingerprint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +80,7 @@ class PredictSource:
         self._now_fn = now_fn
         self._sleep_fn = sleep_fn
         self._markets: dict[str, PredictMarket] = {}
+        self._categories: dict[str, dict[str, object]] = {}
         self._books: dict[str, dict[str, PredictBook]] = {"rest": {}, "ws": {}}
         self._versions: dict[str, dict[str, int]] = {"rest": {}, "ws": {}}
         self._rest_status = "unknown"
@@ -99,7 +105,9 @@ class PredictSource:
                 self._mark_stale("rest")
                 return ()
             for row in rows:
-                market = _normalise_market(row)
+                category_slug = _text(row.get("categorySlug")) if isinstance(row, dict) else ""
+                category = await self._category(category_slug) if category_slug else None
+                market = _normalise_market(row, category)
                 if market is not None:
                     self._markets[market.market_id] = market
                     markets.append(market)
@@ -113,12 +121,26 @@ class PredictSource:
         payload = await self._rest_json(f"/v1/markets/{market_id}")
         if payload is None:
             return None
-        market = _normalise_market(payload.get("data"))
+        row = payload.get("data")
+        category_slug = _text(row.get("categorySlug")) if isinstance(row, dict) else ""
+        category = await self._category(category_slug) if category_slug else None
+        market = _normalise_market(row, category)
         if market is None or market.market_id != str(market_id):
             self._mark_stale("rest")
             return None
         self._markets[market.market_id] = market
         return market
+
+    async def _category(self, slug: str) -> dict[str, object] | None:
+        cached = self._categories.get(slug)
+        if cached is not None:
+            return cached
+        payload = await self._rest_json(f"/v1/categories/{quote(slug, safe='')}")
+        row = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(row, dict) and row.get("slug") == slug:
+            self._categories[slug] = row
+            return row
+        return None
 
     async def get_order_book(self, market_id: str) -> PredictBook | None:
         market = self._markets.get(str(market_id)) or await self.get_market(str(market_id))
@@ -348,7 +370,9 @@ class PredictSource:
         self._failure_reason[source] = reason
 
 
-def _normalise_market(payload: object) -> PredictMarket | None:
+def _normalise_market(
+    payload: object, category: dict[str, object] | None
+) -> PredictMarket | None:
     if not isinstance(payload, dict):
         return None
     if (
@@ -356,16 +380,17 @@ def _normalise_market(payload: object) -> PredictMarket | None:
         or payload.get("isNegRisk") is not False
         or payload.get("isYieldBearing") is not False
         or payload.get("marketType") != "BINARY"
-        or payload.get("marketVariant", "STANDARD") != "STANDARD"
+        or payload.get("marketVariant", "DEFAULT") not in {"DEFAULT", "STANDARD"}
     ):
         return None
     market_id = _text(payload.get("id"))
     condition_id = _text(payload.get("conditionId"))
     question = _text(payload.get("question"))
     rules = _text(payload.get("description"))
-    resolution_source = _text(payload.get("resolutionSource"))
-    close_at = _datetime(payload.get("closesAt"))
-    settlement_at = _datetime(payload.get("settlementAt"))
+    category_slug = _text(payload.get("categorySlug"))
+    event_start_at = _datetime(category.get("startsAt")) if category else None
+    event_end_at = _datetime(category.get("endsAt")) if category else None
+    resolution_provider = _text(category.get("resolutionProvider")) if category else ""
     outcomes = payload.get("outcomes")
     tokens: dict[str, str] = {}
     if isinstance(outcomes, list):
@@ -387,9 +412,19 @@ def _normalise_market(payload: object) -> PredictMarket | None:
         else ()
     )
     if (
-        not all((market_id, condition_id, question, rules, resolution_source, settlement_asset))
-        or close_at is None
-        or settlement_at is None
+        not all(
+            (
+                market_id,
+                condition_id,
+                question,
+                rules,
+                category_slug,
+                resolution_provider,
+                settlement_asset,
+            )
+        )
+        or event_start_at is None
+        or event_end_at is None
         or set(tokens) != {"YES", "NO"}
         or minimum_order_size is None
         or minimum_order_size <= 0
@@ -400,17 +435,28 @@ def _normalise_market(payload: object) -> PredictMarket | None:
     ):
         return None
     tick_size = Decimal(1).scaleb(-precision)
+    fingerprint_input = {
+        "category_slug": category_slug,
+        "event_end_at": event_end_at.isoformat(),
+        "event_start_at": event_start_at.isoformat(),
+        "outcomes": sorted(tokens.items()),
+        "polymarket_condition_ids": polymarket_condition_ids,
+        "question": question,
+        "resolution_provider": resolution_provider,
+        "rules": rules,
+    }
     fingerprint = hashlib.sha256(
-        "\n".join((question, rules, resolution_source, close_at.isoformat(), settlement_at.isoformat())).encode()
+        json.dumps(fingerprint_input, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return PredictMarket(
         market_id=market_id,
         condition_id=condition_id,
         question=question,
         rules=rules,
-        resolution_source=resolution_source,
-        close_at=close_at,
-        settlement_at=settlement_at,
+        category_slug=category_slug,
+        event_start_at=event_start_at,
+        event_end_at=event_end_at,
+        resolution_provider=resolution_provider,
         yes_token_id=tokens["YES"],
         no_token_id=tokens["NO"],
         settlement_asset=settlement_asset,
