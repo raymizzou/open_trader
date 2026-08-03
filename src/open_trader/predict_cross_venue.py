@@ -7,6 +7,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -45,6 +46,9 @@ always settle identically. This is a contract audit, not a probability forecast.
 Return APPROVE only when both divergent states are impossible: Predict YES with
 Polymarket NO, and Polymarket YES with Predict NO. Return only direct polarity:
 Predict YES -> YES, Predict NO -> NO, Polymarket YES -> YES, Polymarket NO -> NO.
+Reject compound contracts (multiple propositions, conjunctive conditions, or
+contingent outcomes). Return contract_shape COMPOUND and decision REJECT for
+them; only a single binary proposition may return contract_shape BINARY.
 Derive one timezone-aware UTC canonical_cutoff from complete contract text; do
 not echo raw venue timestamps. Preserve each exchange, market ID, condition ID,
 and rules fingerprint exactly. Evidence quotes must appear verbatim in that
@@ -56,8 +60,13 @@ call tools, or use facts outside the supplied input. Return JSON only.
 _CODEX_SCHEMA = Path(__file__).with_name("schemas") / "cross_exchange_yes_no_equivalence.json"
 _RESULT_FIELDS = {
     "schema_version", "decision", "summary", "predict", "polymarket",
-    "direct_outcome_mapping", "canonical_cutoff", "divergent_states", "evidence", "uncertainties",
+    "direct_outcome_mapping", "canonical_cutoff", "contract_shape", "divergent_states",
+    "evidence", "uncertainties",
 }
+_CUTOFF_QUOTE = re.compile(
+    r"\bat\s+(\d{2}:\d{2})\s+UTC\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
+    re.IGNORECASE,
+)
 _CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
 _HOT_HEALTH_POLL_SECONDS = 0.05
 CROSS_VENUE_DISCOVERY_SECONDS = 15 * 60
@@ -568,6 +577,8 @@ def _valid_equivalence_result(value: object) -> bool:
         return False
     if not isinstance(value.get("canonical_cutoff"), str):
         return False
+    if value.get("contract_shape") not in {"BINARY", "COMPOUND"}:
+        return False
     states = value.get("divergent_states")
     if not isinstance(states, Mapping) or set(states) != {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}:
         return False
@@ -610,11 +621,14 @@ def _equivalence_validation(
     cutoff = _canonical_cutoff(structured["canonical_cutoff"])
     if cutoff is None:
         return _cross_venue_validation(pair, False, "CUTOFF_INVALID", prompt_version)
+    if structured["contract_shape"] != "BINARY":
+        return _cross_venue_validation(pair, False, "COMPOUND_CONTRACT", prompt_version)
     states = structured["divergent_states"]
     assert isinstance(states, Mapping)
     if any(bool(state["possible"]) for state in states.values() if isinstance(state, Mapping)):
         return _cross_venue_validation(pair, False, "DIVERGENT_STATE_POSSIBLE", prompt_version)
     evidence_exchanges: set[object] = set()
+    cutoff_evidence_exchanges: set[object] = set()
     for row in structured["evidence"]:
         assert isinstance(row, Mapping)
         exchange = row["exchange"]
@@ -622,8 +636,12 @@ def _equivalence_validation(
         if not row["quote"] or row["quote"] not in rules:
             return _cross_venue_validation(pair, False, "EVIDENCE_NOT_FOUND", prompt_version)
         evidence_exchanges.add(exchange)
+        if _evidence_supports_cutoff(row["quote"], cutoff):
+            cutoff_evidence_exchanges.add(exchange)
     if evidence_exchanges != {"predict.fun", "polymarket"}:
         return _cross_venue_validation(pair, False, "MISSING_EVIDENCE", prompt_version)
+    if cutoff_evidence_exchanges != {"predict.fun", "polymarket"}:
+        return _cross_venue_validation(pair, False, "CUTOFF_EVIDENCE_MISMATCH", prompt_version)
     if structured["uncertainties"]:
         return _cross_venue_validation(pair, False, "UNRESOLVED_UNCERTAINTY", prompt_version)
     return _cross_venue_validation(
@@ -641,6 +659,23 @@ def _canonical_cutoff(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is UTC else None
+
+
+def _evidence_supports_cutoff(quote: object, cutoff: datetime) -> bool:
+    if not isinstance(quote, str):
+        return False
+    if cutoff.isoformat().replace("+00:00", "Z") in quote:
+        return True
+    for time_text, date_text in _CUTOFF_QUOTE.findall(quote):
+        try:
+            quoted_cutoff = datetime.strptime(
+                f"{time_text} {date_text}", "%H:%M %B %d, %Y"
+            ).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if quoted_cutoff == cutoff:
+            return True
+    return False
 
 
 def _cross_venue_validation(
@@ -766,6 +801,7 @@ class PredictCrossVenueMonitor:
         self._hot_restart = asyncio.Event()
         self._confirmation_tasks: dict[str, asyncio.Task[None]] = {}
         self._approved: dict[str, ExplicitMarketPair] = {}
+        self._approved_prompt_version = ""
         self._predict_books: dict[str, PredictBook] = {}
         self._opportunities: dict[tuple[str, Direction], dict[str, object]] = {}
         self._arbitrage_pairs: set[str] = set()
@@ -852,12 +888,17 @@ class PredictCrossVenueMonitor:
         }
         self._matched_pairs = len({pair.pair_id for pair in resolution.pairs})
         self._monitored_pairs = len(eligible)
+        prompt_version = str(getattr(self._validator, "prompt_version", ""))
         approved = {
             pair_id: pair
             for pair_id, pair in self._approved.items()
-            if pair_id in eligible and self._same_fingerprints(pair, eligible[pair_id])
+            if (
+                self._approved_prompt_version == prompt_version
+                and pair_id in eligible
+                and self._same_fingerprints(pair, eligible[pair_id])
+            )
         }
-        self._set_approved(approved)
+        self._set_approved(approved, prompt_version=prompt_version)
         for pair_id, pair in eligible.items():
             if pair_id in approved:
                 continue
@@ -869,7 +910,7 @@ class PredictCrossVenueMonitor:
                 == pair.polymarket.rules_fingerprint
             ):
                 approved[pair_id] = pair
-        self._set_approved(approved)
+        self._set_approved(approved, prompt_version=prompt_version)
         self._status = self._source_status()
 
     async def _hot_while(self, slow_task: asyncio.Task[None]) -> None:
@@ -1116,11 +1157,12 @@ class PredictCrossVenueMonitor:
                 task.cancel()
 
     def _set_approved(
-        self, approved: Mapping[str, ExplicitMarketPair]
+        self, approved: Mapping[str, ExplicitMarketPair], *, prompt_version: str = ""
     ) -> None:
         replacement = dict(approved)
-        changed = replacement != self._approved
+        changed = replacement != self._approved or prompt_version != self._approved_prompt_version
         self._approved = replacement
+        self._approved_prompt_version = prompt_version
         self._drop_unapproved_state()
         self._publish_subscriptions()
         if changed:

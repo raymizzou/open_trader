@@ -176,6 +176,7 @@ def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
         "schema_version": 2,
         "decision": "APPROVE",
         "summary": "The supplied rules exclude both divergent settlement states.",
+        "contract_shape": "BINARY",
         "predict": {
             "exchange": "predict.fun",
             "market_id": pair.predict.market_id,
@@ -245,6 +246,43 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
     assert store.llm_usage_24h()["cache_hits"] == 1
 
 
+def test_equivalence_approval_accepts_one_minute_raw_metadata_difference(tmp_path: Path) -> None:
+    pair = explicit_pair()
+    pair = replace(
+        pair,
+        predict=replace(pair.predict, event_end_at=datetime(2026, 12, 31, 23, 58, tzinfo=UTC)),
+        polymarket=replace(pair.polymarket, close_at=datetime(2026, 12, 31, 23, 59, tzinfo=UTC)),
+    )
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=codex_jsonl(equivalence_result(pair)), stderr=""
+        ),
+    )
+
+    result = validator.validate(pair)
+
+    assert result.approved is True
+    assert result.canonical_cutoff == datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
+
+
+def test_equivalence_approval_accepts_twenty_nine_hour_raw_metadata_difference(tmp_path: Path) -> None:
+    pair = explicit_pair()
+    pair = replace(
+        pair,
+        predict=replace(pair.predict, event_end_at=datetime(2027, 1, 1, 23, 59, tzinfo=UTC)),
+        polymarket=replace(pair.polymarket, close_at=datetime(2027, 1, 3, 4, 59, tzinfo=UTC)),
+    )
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=codex_jsonl(equivalence_result(pair)), stderr=""
+        ),
+    )
+
+    assert validator.validate(pair).approved is True
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -254,6 +292,8 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
         (lambda value: {**value, "direct_outcome_mapping": {**value["direct_outcome_mapping"], "predict_yes": "NO"}}, "OUTCOME_MAPPING_MISMATCH"),
         (lambda value: {**value, "canonical_cutoff": "2026-12-31T23:59:00"}, "CUTOFF_INVALID"),
         (lambda value: {**value, "canonical_cutoff": "not-a-date"}, "CUTOFF_INVALID"),
+        (lambda value: {**value, "canonical_cutoff": "2027-01-01T00:00:00Z"}, "CUTOFF_EVIDENCE_MISMATCH"),
+        (lambda value: {**value, "contract_shape": "COMPOUND"}, "COMPOUND_CONTRACT"),
         (lambda value: {**value, "divergent_states": {**value["divergent_states"], "PREDICT_YES_POLYMARKET_NO": {"possible": True, "reason": "possible"}}}, "DIVERGENT_STATE_POSSIBLE"),
         (lambda value: {**value, "evidence": []}, "MISSING_EVIDENCE"),
         (lambda value: {**value, "evidence": [{"exchange": "predict.fun", "field": "rules", "quote": "not supplied"}, value["evidence"][1]]}, "EVIDENCE_NOT_FOUND"),
@@ -281,7 +321,7 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
 
     assert schema["properties"]["decision"]["enum"] == ["APPROVE", "REJECT"]
     assert schema["properties"]["schema_version"]["const"] == 2
-    assert {"predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
+    assert {"predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "contract_shape", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
     assert set(schema["$defs"]["venue_market"]["required"]) == {"exchange", "market_id", "condition_id", "rules_fingerprint"}
 
@@ -969,6 +1009,105 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
         await monitor.stop()
 
     assert predict_cross_venue.CROSS_VENUE_DISCOVERY_SECONDS == 15 * 60
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda market: replace(market, rules="changed rules"),
+        lambda market: replace(market, event_end_at=datetime(2026, 1, 11, tzinfo=UTC)),
+        lambda market: replace(market, yes_token_id="changed-token"),
+        lambda market: replace(market, polymarket_condition_ids=("changed-candidate",)),
+    ],
+)
+def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
+    monkeypatch: pytest.MonkeyPatch, mutate,
+) -> None:
+    async def exercise() -> None:
+        from open_trader import predict_cross_venue as module
+
+        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        original = monitor_predict_market(external_ids=("poly-condition",))
+        predict = FakeCrossVenuePredict((original,))
+        polymarket = FakeCrossVenuePolymarket()
+
+        class BlockingValidator(FakeCrossVenueValidator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.second_started = threading.Event()
+                self.release_second = threading.Event()
+
+            def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+                if self.calls:
+                    self.second_started.set()
+                    self.release_second.wait(timeout=1)
+                return super().validate(pair)
+
+        validator = BlockingValidator()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict, polymarket_monitor=polymarket, validator=validator,
+            gamma_lookup=lambda ids, **kwargs: [
+                {**polymarket_row(condition_id), "endDate": "2026-01-20T00:00:00Z", "resolutionDate": "2026-01-21T00:00:00Z"}
+                for condition_id in ids
+            ],
+            clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: len(validator.calls) == 1)
+        predict.markets = (mutate(original),)
+        await wait_until(validator.second_started.is_set)
+        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
+        validator.release_second.set()
+        await wait_until(lambda: len(validator.calls) == 2)
+        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        from open_trader import predict_cross_venue as module
+
+        monkeypatch.setattr(module, "CROSS_VENUE_DISCOVERY_SECONDS", 0.02)
+        predict = FakeCrossVenuePredict((monitor_predict_market(external_ids=("poly-condition",)),))
+        polymarket = FakeCrossVenuePolymarket()
+
+        class BlockingValidator(FakeCrossVenueValidator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prompt_version = "v1"
+                self.second_started = threading.Event()
+                self.release_second = threading.Event()
+
+            def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+                if self.calls:
+                    self.second_started.set()
+                    self.release_second.wait(timeout=1)
+                return super().validate(pair)
+
+        validator = BlockingValidator()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict, polymarket_monitor=polymarket, validator=validator,
+            gamma_lookup=monitor_gamma, clob_lookup=lambda condition_id: None,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: len(validator.calls) == 1)
+        validator.prompt_version = "v2"
+        await wait_until(validator.second_started.is_set)
+        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 0
+        validator.release_second.set()
+        await wait_until(lambda: len(validator.calls) == 2)
+        assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
+        await monitor.stop()
+
     asyncio.run(exercise())
 
 
