@@ -1013,33 +1013,22 @@ class CrossVenueMonitor:
         self.intent = intent
         self.overrides: dict[str, object] = {}
         self.refresh_calls = 0
+        self.refresh_requests: list[dict[str, object]] = []
+        self.refresh_intent_resolver: object | None = None
         self.available = True
 
-    def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
-        self.refresh_calls += 1
-        if not self.available:
-            return None
-        snapshot = self.snapshot()
-        return next(
-            (
-                dict(item)
-                for item in snapshot["opportunities"]  # type: ignore[index]
-                if item["opportunity_id"] == opportunity_id
-            ),
-            None,
-        )
-
-    def snapshot(self) -> dict[str, object]:
+    def _opportunity(self, intent: CrossVenueIntent) -> dict[str, object]:
         now = datetime.now(UTC)
         opportunity: dict[str, object] = {
-            "opportunity_id": f"cross:{self.intent.pair_id}:{self.intent.direction}",
-            "pair_id": self.intent.pair_id,
+            "opportunity_id": f"cross:{intent.pair_id}:{intent.direction}",
+            "pair_id": intent.pair_id,
             "market_type": "cross_venue_yes_no", "funnel_stage": 5,
             "execution_mode": "manual_confirm",
-            "actionable": True, "clear_signal": True, "intent": self.intent,
-            "direction": self.intent.direction,
+            "actionable": True, "clear_signal": True, "intent": intent,
+            "direction": intent.direction,
             "confirmed_at": now, "confirmed_age_seconds": Decimal("1"),
-            "canonical_cutoff": self.intent.canonical_cutoff,
+            "canonical_cutoff": intent.canonical_cutoff,
+            "signal_episode_id": "signal-episode-1",
             "codex_approval": {"decision": "APPROVE", "cache_key": "cross-cache", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "quote": "same rules"}, {"exchange": "polymarket", "quote": "same rules"}]},
             "rules_fingerprints": {"predict.fun": "predict-fingerprint", "polymarket": "poly-fingerprint"},
             "approved_candidates": {
@@ -1048,7 +1037,41 @@ class CrossVenueMonitor:
             },
         }
         opportunity.update(self.overrides)
-        return {"opportunities": [opportunity]}
+        return opportunity
+
+    def refresh_opportunity(
+        self,
+        opportunity_id: str,
+        *,
+        target_quantity: Decimal | None = None,
+        max_total_cost: Decimal | None = None,
+        prefer_smallest: bool = False,
+    ) -> dict[str, object] | None:
+        self.refresh_calls += 1
+        self.refresh_requests.append(
+            {
+                "opportunity_id": opportunity_id,
+                "target_quantity": target_quantity,
+                "max_total_cost": max_total_cost,
+                "prefer_smallest": prefer_smallest,
+            }
+        )
+        if not self.available:
+            return None
+        intent = self.intent
+        resolver = self.refresh_intent_resolver
+        if callable(resolver):
+            intent = resolver(
+                opportunity_id=opportunity_id,
+                target_quantity=target_quantity,
+                max_total_cost=max_total_cost,
+                prefer_smallest=prefer_smallest,
+            )
+        value = self._opportunity(intent)
+        return value if value["opportunity_id"] == opportunity_id else None
+
+    def snapshot(self) -> dict[str, object]:
+        return {"opportunities": [self._opportunity(self.intent)]}
 
 
 class CrossPolymarketTrading(FakeTrading):
@@ -1781,12 +1804,15 @@ def test_cross_venue_reconciliation_contains_independent_outcomes(
         assert evidence["reconciliation"]["polymarket"]["minimum_order_size"] == "1"
 
 
-def test_cross_venue_stage_five_preview_is_server_owned(tmp_path: Path) -> None:
+def test_cross_preview_is_server_owned_without_expires_at_or_countdown(
+    tmp_path: Path,
+) -> None:
     service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
 
     preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
 
     assert preview["market_type"] == "cross_venue_yes_no"
+    assert preview["signal_episode_id"] == "signal-episode-1"
     assert [leg["exchange"] for leg in preview["buy_legs"]] == ["predict.fun", "polymarket"]
     assert preview["net_quantity"] == "5"
     assert preview["maximum_total_cost"] == "4.70"
@@ -1800,6 +1826,7 @@ def test_cross_venue_stage_five_preview_is_server_owned(tmp_path: Path) -> None:
     assert preview["unsettled"]["limit"] == "100"
     assert preview["policy_limits"]["max_normal_cost"] == "20"
     assert preview["policy_limits"]["max_emergency_loss"] == "2"
+    assert "expires_at" not in preview
 
 
 def test_cross_venue_execution_mode_is_server_authority_for_preview_and_confirm(
@@ -1957,6 +1984,41 @@ def test_cross_venue_confirmation_rechecks_fingerprint_before_no_submit_release(
     assert trading.batch_calls == 0
 
 
+@pytest.mark.parametrize("elapsed_seconds", (11, 3600))
+def test_cross_preview_no_ttl_accepts_same_episode_better_prices_after_elapsed_window(
+    tmp_path: Path, elapsed_seconds: int
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    preview_id = str(preview["preview_id"])
+    with sqlite3.connect(service._store.path) as connection:  # type: ignore[attr-defined]
+        connection.execute(
+            "UPDATE previews SET expires_at=? WHERE preview_id=?",
+            (
+                (datetime.now(UTC) - timedelta(seconds=elapsed_seconds)).isoformat(),
+                preview_id,
+            ),
+        )
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(predict_leg, max_price=Decimal("0.44"), max_cost=Decimal("2.25")),
+            replace(polymarket_leg, max_price=Decimal("0.46"), max_cost=Decimal("2.35")),
+        ),
+        total_max_cost=Decimal("4.60"),
+        minimum_profit=Decimal("0.40"),
+        annualized_yield=Decimal("0.17"),
+    )
+
+    accepted = service.confirm(preview_id, f"cross-no-ttl-{elapsed_seconds}")
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    assert trading.cross_submit_calls == 1
+    assert predict.submit_calls == 1
+
+
 def test_cross_venue_confirmation_refreshes_and_releases_with_current_zero_position_proof(
     tmp_path: Path,
 ) -> None:
@@ -2035,6 +2097,116 @@ def test_cross_venue_refresh_rejects_changed_ceilings_without_cached_snapshot(
     assert execution["evidence"][-1]["reason"] == "opportunity_changed"
     assert cross.refresh_calls >= 2
     assert store.cross_unsettled_principal() == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda opportunity, intent: (
+            {**opportunity, "signal_episode_id": "signal-episode-2"},
+            intent,
+        ),
+        lambda opportunity, intent: (
+            opportunity,
+            replace(
+                intent,
+                legs=tuple(
+                    replace(leg, requested_quantity=Decimal("6"), net_quantity=Decimal("6"))
+                    for leg in intent.legs
+                ),
+                quantity=Decimal("6"),
+                minimum_payout=Decimal("6"),
+            ),
+        ),
+        lambda opportunity, intent: (
+            opportunity,
+            replace(
+                intent,
+                legs=(
+                    replace(intent.legs[0], max_cost=Decimal("2.31")),
+                    intent.legs[1],
+                ),
+                total_max_cost=Decimal("4.71"),
+                minimum_profit=Decimal("0.29"),
+            ),
+        ),
+        lambda opportunity, intent: (
+            opportunity,
+            replace(intent, annualized_yield=Decimal("0.149999")),
+        ),
+    ),
+)
+def test_cross_preview_matches_rejects_full_frozen_envelope_changes(
+    tmp_path: Path, mutate: object
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    preview = dict(service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO"))
+    preview.setdefault("signal_episode_id", "signal-episode-1")
+    live = cross.refresh_opportunity("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    assert live is not None
+    live_intent = service._intent_from_opportunity(live)
+    assert isinstance(live_intent, CrossVenueIntent)
+
+    mutated_live, mutated_intent = mutate(live, live_intent)  # type: ignore[operator]
+
+    assert not service._cross_preview_matches(preview, mutated_live, mutated_intent)
+
+
+def test_cross_preview_canary_quantity_requests_smallest_and_freezes_exact_quantity(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    small = cross.intent
+    predict_leg, polymarket_leg = small.legs
+    large = replace(
+        small,
+        legs=(
+            replace(
+                predict_leg,
+                requested_quantity=Decimal("10"),
+                net_quantity=Decimal("10"),
+                max_cost=Decimal("4.60"),
+            ),
+            replace(
+                polymarket_leg,
+                requested_quantity=Decimal("10"),
+                net_quantity=Decimal("10"),
+                max_cost=Decimal("4.80"),
+            ),
+        ),
+        quantity=Decimal("10"),
+        total_max_cost=Decimal("9.40"),
+        minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("0.60"),
+        annualized_yield=Decimal("0.16"),
+    )
+    cross.intent = large
+    cross.refresh_intent_resolver = lambda **kwargs: (
+        small
+        if kwargs.get("target_quantity") == Decimal("5")
+        or (
+            kwargs.get("target_quantity") is None
+            and kwargs.get("max_total_cost") == Decimal("5")
+            and kwargs.get("prefer_smallest") is True
+        )
+        else large
+    )
+
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    accepted = service.confirm(str(preview["preview_id"]), "cross-canary-quantity")
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert preview["net_quantity"] == "5"
+    assert cross.refresh_requests[0] == {
+        "opportunity_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
+        "target_quantity": None,
+        "max_total_cost": Decimal("5"),
+        "prefer_smallest": True,
+    }
+    assert cross.refresh_requests[1]["target_quantity"] == Decimal("5")
+    assert final["state"] == "holding_to_resolution"
+    assert predict.cross_entry_submit_orders[0]["requested_quantity"] == Decimal("5")
+    assert trading.cross_submitted_legs[0].net_quantity == Decimal("5")
 
 
 def test_cross_venue_confirmation_rejects_changed_approved_candidate_ids(

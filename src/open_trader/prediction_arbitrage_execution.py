@@ -217,7 +217,12 @@ class PredictionExecutionService:
     def preview(self, opportunity_id: str) -> dict[str, object]:
         """Freshly validate one server-issued opportunity and persist a preview."""
 
-        prepared = self._prepare_opportunity(str(opportunity_id))
+        cross_preview = str(opportunity_id).startswith("cross:")
+        prepared = self._prepare_opportunity(
+            str(opportunity_id),
+            cross_max_total_cost=Decimal("5") if cross_preview else None,
+            cross_prefer_smallest=cross_preview,
+        )
         if isinstance(prepared, dict):
             return prepared
         opportunity, intent, account = prepared
@@ -236,13 +241,19 @@ class PredictionExecutionService:
                 "id": preview_id,
                 "preview_id": preview_id,
                 "state": "previewed",
-                "expires_at": _timestamp(expires_at),
             }
         )
+        if not isinstance(intent, CrossVenueIntent):
+            result["expires_at"] = _timestamp(expires_at)
         return result
 
     def _prepare_opportunity(
-        self, opportunity_id: str
+        self,
+        opportunity_id: str,
+        *,
+        cross_target_quantity: Decimal | None = None,
+        cross_max_total_cost: Decimal | None = None,
+        cross_prefer_smallest: bool = False,
     ) -> tuple[dict[str, object], ExecutionIntent, dict[str, object]] | dict[str, object]:
         """Run the shared read-only admission checks used by preview and notify."""
 
@@ -260,7 +271,12 @@ class PredictionExecutionService:
             return {"state": "busy", "reason": "execution_lock"}
         self._release_global_lock(probe)
 
-        opportunity = self._fresh_opportunity(str(opportunity_id))
+        opportunity = self._fresh_opportunity(
+            str(opportunity_id),
+            target_quantity=cross_target_quantity,
+            max_total_cost=cross_max_total_cost,
+            prefer_smallest=cross_prefer_smallest,
+        )
         if (
             opportunity is not None
             and opportunity.get("market_type") == "cross_venue_yes_no"
@@ -1217,7 +1233,10 @@ class PredictionExecutionService:
                     execution_id, "cross_circuit_breaker_open", persisted_intent
                 )
                 return
-            opportunity = self._fresh_opportunity(str(row.get("opportunity_id", "")))
+            opportunity = self._fresh_opportunity(
+                str(row.get("opportunity_id", "")),
+                target_quantity=persisted_intent.quantity if cross_execution else None,
+            )
             current_intent = self._intent_from_opportunity(opportunity)
             if opportunity is None or current_intent is None:
                 if cross_execution:
@@ -2598,7 +2617,14 @@ class PredictionExecutionService:
             {"phase": "holding_to_resolution", "merge": "not_applicable", "quantity": known[0], "execution_proof": known[2]},
         )
 
-    def _fresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+    def _fresh_opportunity(
+        self,
+        opportunity_id: str,
+        *,
+        target_quantity: Decimal | None = None,
+        max_total_cost: Decimal | None = None,
+        prefer_smallest: bool = False,
+    ) -> dict[str, object] | None:
         cross_venue = opportunity_id.startswith("cross:")
         source = self._cross_venue_monitor if cross_venue else self._monitor
         if source is None:
@@ -2608,7 +2634,13 @@ class PredictionExecutionService:
             if not callable(refresh):
                 return None
             try:
-                refreshed = _call(refresh, opportunity_id)
+                refreshed = _call(
+                    refresh,
+                    opportunity_id,
+                    target_quantity=target_quantity,
+                    max_total_cost=max_total_cost,
+                    prefer_smallest=prefer_smallest,
+                )
             except Exception:
                 return None
             if not isinstance(refreshed, Mapping):
@@ -3790,6 +3822,7 @@ class PredictionExecutionService:
                 "execution_id": uuid.uuid4().hex,
                 "opportunity_id": str(opportunity.get("opportunity_id", "")),
                 "market_type": "cross_venue_yes_no",
+                "signal_episode_id": str(opportunity.get("signal_episode_id", "")),
                 "intent_type": "cross_venue",
                 "pair_id": intent.pair_id,
                 "direction": intent.direction,
@@ -3816,7 +3849,6 @@ class PredictionExecutionService:
                     "max_normal_cost": "20",
                     "max_emergency_loss": "2",
                 },
-                "expires_at": _timestamp(expires_at),
             }
         payload: dict[str, object] = {
             "opportunity_id": str(
@@ -4419,12 +4451,30 @@ class PredictionExecutionService:
         stored = self._intent_from_payload(preview.get("intent"))
         if not isinstance(stored, CrossVenueIntent):
             return False
+        if (
+            not str(preview.get("signal_episode_id", "")).strip()
+            or preview.get("signal_episode_id") != opportunity.get("signal_episode_id")
+        ):
+            return False
         if (stored.pair_id, stored.direction, stored.canonical_cutoff) != (intent.pair_id, intent.direction, intent.canonical_cutoff):
             return False
         if any(
             (old.exchange, old.market_id, old.condition_id, old.token_id, old.outcome) != (new.exchange, new.market_id, new.condition_id, new.token_id, new.outcome)
+            or new.requested_quantity != old.requested_quantity
+            or new.net_quantity != old.net_quantity
             or new.max_price > old.max_price
+            or new.max_cost > old.max_cost
             for old, new in zip(stored.legs, intent.legs, strict=True)
+        ):
+            return False
+        if (
+            stored.quantity != intent.quantity
+            or intent.total_max_cost > stored.total_max_cost
+            or intent.minimum_payout < stored.minimum_payout
+            or intent.minimum_profit < stored.minimum_profit
+            or stored.annualized_yield is None
+            or intent.annualized_yield is None
+            or intent.annualized_yield < stored.annualized_yield
         ):
             return False
         old_approval = preview.get("codex_approval")

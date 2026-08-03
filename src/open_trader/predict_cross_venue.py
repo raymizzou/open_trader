@@ -218,6 +218,9 @@ def build_cross_venue_intents(
     *,
     now: datetime,
     predict_quote_fn: Callable[[str, str, int], PredictBuyQuote],
+    target_quantity: Decimal | None = None,
+    max_total_cost: Decimal | None = None,
+    prefer_smallest: bool = False,
 ) -> tuple[CrossVenueIntent, ...]:
     """Return clear, equal-share intents for the two approved venue directions."""
 
@@ -228,6 +231,9 @@ def build_cross_venue_intents(
         now=now,
         require_annualized_gate=True,
         predict_quote_fn=predict_quote_fn,
+        target_quantity=target_quantity,
+        max_total_cost=max_total_cost,
+        prefer_smallest=prefer_smallest,
     )
 
 
@@ -239,6 +245,9 @@ def _build_cross_venue_intents(
     now: datetime,
     require_annualized_gate: bool,
     predict_quote_fn: Callable[[str, str, int], PredictBuyQuote] | None,
+    target_quantity: Decimal | None = None,
+    max_total_cost: Decimal | None = None,
+    prefer_smallest: bool = False,
 ) -> tuple[CrossVenueIntent, ...]:
 
     now = _fresh_datetime(now)
@@ -273,7 +282,12 @@ def _build_cross_venue_intents(
         )
         minimum = max(pair.predict.minimum_order_size, pair.polymarket.minimum_order_size)
         observation: CrossVenueIntent | None = None
-        for requested_quantity in sorted(predict_candidates, reverse=True):
+        requested_quantities = (
+            (target_quantity,)
+            if target_quantity is not None
+            else tuple(sorted(predict_candidates, reverse=not prefer_smallest))
+        )
+        for requested_quantity in requested_quantities:
             if requested_quantity < pair.predict.minimum_order_size:
                 continue
             source_predict_price = _worst_price(predict_side, requested_quantity)
@@ -308,6 +322,8 @@ def _build_cross_venue_intents(
                     predict_all_in_debit,
                     predict_fee,
                 ) = predict_quote
+            if target_quantity is not None and net_quantity != target_quantity:
+                continue
             if net_quantity < minimum:
                 continue
             polymarket_cost = polymarket_candidates.get(net_quantity)
@@ -328,6 +344,8 @@ def _build_cross_venue_intents(
             total_max_cost = (
                 predict_all_in_debit + polymarket_all_in_debit + calculable_gas
             )
+            if max_total_cost is not None and total_max_cost > max_total_cost:
+                continue
             maximum_fee = predict_fee + polymarket_fee
             minimum_payout = net_quantity
             minimum_profit = minimum_payout - total_max_cost
@@ -1003,6 +1021,7 @@ class PredictCrossVenueMonitor:
         self._approved_prompt_version = ""
         self._predict_books: dict[str, PredictBook] = {}
         self._opportunities: dict[tuple[str, Direction], dict[str, object]] = {}
+        self._signal_episodes: dict[str, str] = {}
         self._arbitrage_pairs: set[str] = set()
         self._matched_pairs = 0
         self._monitored_pairs = 0
@@ -1042,7 +1061,12 @@ class PredictCrossVenueMonitor:
         )
 
     async def refresh_opportunity(
-        self, opportunity_id: str
+        self,
+        opportunity_id: str,
+        *,
+        target_quantity: Decimal | None = None,
+        max_total_cost: Decimal | None = None,
+        prefer_smallest: bool = False,
     ) -> dict[str, object] | None:
         """Reconfirm one admitted opportunity from venue REST state only."""
         cached = next(
@@ -1106,6 +1130,9 @@ class PredictCrossVenueMonitor:
             now=self._clock(),
             require_annualized_gate=False,
             predict_quote_fn=self._predict_quote_fn,
+            target_quantity=target_quantity,
+            max_total_cost=max_total_cost,
+            prefer_smallest=prefer_smallest,
         )
         intent = next(
             (candidate for candidate in intents if candidate.direction == direction),
@@ -1114,6 +1141,7 @@ class PredictCrossVenueMonitor:
         if intent is None:
             return None
         opportunity = self._opportunity_payload(refreshed_pair, intent, validation)
+        self._attach_signal_episode_id(opportunity)
         self._opportunities[(pair_id, direction)] = opportunity
         return copy.deepcopy(opportunity)
 
@@ -1667,6 +1695,9 @@ class PredictCrossVenueMonitor:
                 ),
             }
         )
+        self._signal_episodes[opportunity_id] = signal_id
+        if isinstance(opportunity, dict):
+            opportunity["signal_episode_id"] = signal_id
         if (
             self._ready_observer is not None
             and notification_identity is not None
@@ -1689,11 +1720,31 @@ class PredictCrossVenueMonitor:
             return
         opportunity_id = str(opportunity.get("opportunity_id", "")).strip()
         if opportunity_id:
+            self._signal_episodes.pop(opportunity_id, None)
             self._store.close_signal(
                 opportunity_id,
                 ended_at=self._clock(),
                 reason="data_unavailable",
             )
+
+    def _attach_signal_episode_id(self, opportunity: dict[str, object]) -> None:
+        opportunity_id = str(opportunity.get("opportunity_id", "")).strip()
+        if not opportunity_id:
+            return
+        signal_id = self._signal_episodes.get(opportunity_id)
+        if not signal_id and self._store is not None:
+            signal_id = next(
+                (
+                    str(row["signal_id"])
+                    for row in self._store.open_signal_history()
+                    if row.get("market_id") == opportunity_id
+                ),
+                "",
+            )
+            if signal_id:
+                self._signal_episodes[opportunity_id] = signal_id
+        if signal_id:
+            opportunity["signal_episode_id"] = signal_id
 
     def _source_status(self, *, fallback: str = "ready") -> str:
         try:

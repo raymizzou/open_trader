@@ -1305,6 +1305,72 @@ def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -
     asyncio.run(exercise())
 
 
+def test_monitor_signal_episode_persists_refreshes_and_rotates_on_reopen(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        store = PredictionArbitrageStore(tmp_path / "data")
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
+            store=store,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+
+        first = next(
+            row
+            for row in monitor.snapshot()["opportunities"]
+            if row["direction"] == "PREDICT_YES_POLYMARKET_NO"
+        )
+        first_episode = first["signal_episode_id"]
+        assert isinstance(first_episode, str) and first_episode
+        assert next(
+            row["signal_id"]
+            for row in store.open_signal_history()
+            if row["market_id"] == first["opportunity_id"]
+        ) == first_episode
+
+        refreshed = await monitor.refresh_opportunity(str(first["opportunity_id"]))
+        assert refreshed is not None
+        assert refreshed["signal_episode_id"] == first_episode
+
+        polymarket.books = {}
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: monitor.snapshot()["opportunities"] == [])
+        assert store.signal(first_episode)["ended_at"] is not None  # type: ignore[index]
+
+        polymarket.books = monitor_polymarket_books()
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+
+        reopened = next(
+            row
+            for row in monitor.snapshot()["opportunities"]
+            if row["opportunity_id"] == first["opportunity_id"]
+        )
+        assert reopened["signal_episode_id"] != first_episode
+        refreshed_reopened = await monitor.refresh_opportunity(str(first["opportunity_id"]))
+        assert refreshed_reopened is not None
+        assert refreshed_reopened["signal_episode_id"] == reopened["signal_episode_id"]
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
     tmp_path: Path,
 ) -> None:

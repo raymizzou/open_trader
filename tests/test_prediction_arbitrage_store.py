@@ -57,6 +57,7 @@ def cross_preview_payload(
         "event_id": "cross-event-1",
         "market_id": market_id,
         "market_type": "cross_venue_yes_no",
+        "signal_episode_id": f"signal:{market_id}",
         "quantity": net_quantity,
         "total_max_cost": total_max_cost,
         "intent": {
@@ -509,6 +510,54 @@ def test_cross_preview_commits_one_execution_and_reservation_idempotently(
         assert connection.execute(
             "SELECT amount, state FROM cross_execution_reservations"
         ).fetchone() == ("20.00", "reserved")
+
+
+def test_cross_preview_no_ttl_keeps_legacy_expiry_and_consumes_valid_cross_payload(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    now = datetime.now(UTC)
+    legacy_id = db.create_preview(
+        preview_payload(),
+        expires_at=iso(now - timedelta(seconds=1)),
+    )
+    cross_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(now - timedelta(hours=1)),
+    )
+
+    with pytest.raises(ValueError, match="preview_expired"):
+        db.consume_preview_and_create_execution(legacy_id, "legacy")
+
+    execution = db.consume_preview_and_create_execution(cross_id, "cross")
+
+    assert execution["state"] == "validating"
+    assert db.consume_preview_and_create_execution(cross_id, "cross-again") == execution
+
+
+def test_cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(total_max_cost=Decimal("10.50"))
+    payload["signal_episode_id"] = ""
+    preview_id = db.create_preview(
+        payload,
+        expires_at=iso(datetime.now(UTC) - timedelta(hours=1)),
+    )
+
+    with pytest.raises(ValueError, match="cross_preview_invalid"):
+        db.consume_preview_and_create_execution(preview_id, "cross-invalid")
+
+    assert db.cross_unsettled_principal() == Decimal("0")
+    with sqlite3.connect(db.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM cross_execution_reservations"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_cross_principal_cap_is_atomic_across_store_instances(tmp_path: Path) -> None:

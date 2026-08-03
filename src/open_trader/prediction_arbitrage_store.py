@@ -1081,6 +1081,14 @@ class PredictionArbitrageStore:
             return self._reserved_cross_principal(connection)
 
     @staticmethod
+    def _valid_cross_preview_payload(payload: Mapping[str, object]) -> bool:
+        return bool(
+            str(payload.get("signal_episode_id", "")).strip()
+            and isinstance(payload.get("intent"), Mapping)
+            and payload["intent"].get("intent_type") == "cross_venue"
+        )
+
+    @staticmethod
     def _has_zero_cross_positions(evidence: Mapping[str, object]) -> bool:
         positions = evidence.get("positions")
         if not isinstance(positions, Mapping):
@@ -1313,18 +1321,20 @@ class PredictionArbitrageStore:
                 raise ValueError("preview_not_found")
             if preview["consumed_at"] is not None:
                 raise ValueError("preview_consumed")
-            if now >= _parse_timestamp(preview["expires_at"]):
-                raise ValueError("preview_expired")
             payload = str(preview["payload"])
             preview_payload = _load_payload(payload)
             cross_amount: Decimal | None = None
             if preview_payload.get("market_type") == "cross_venue_yes_no":
+                if not self._valid_cross_preview_payload(preview_payload):
+                    raise ValueError("cross_preview_invalid")
                 cross_amount = self._cross_reservation_amount(preview_payload)
                 if (
                     self._reserved_cross_principal(connection) + cross_amount
                     > MAX_CROSS_UNSETTLED_PRINCIPAL
                 ):
                     raise ValueError("cross_unsettled_cap")
+            elif now >= _parse_timestamp(preview["expires_at"]):
+                raise ValueError("preview_expired")
             execution_id = (
                 str(preview_payload["execution_id"])
                 if cross_amount is not None
