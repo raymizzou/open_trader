@@ -1080,10 +1080,81 @@ class PredictionArbitrageStore:
         with self._read_connection() as connection:
             return self._reserved_cross_principal(connection)
 
+    @staticmethod
+    def _has_zero_cross_positions(evidence: Mapping[str, object]) -> bool:
+        positions = evidence.get("positions")
+        if not isinstance(positions, Mapping):
+            return False
+        for venue in ("predict.fun", "polymarket"):
+            value = positions.get(venue)
+            if isinstance(value, bool):
+                return False
+            try:
+                amount = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                return False
+            if not amount.is_finite() or amount != 0:
+                return False
+        return True
+
+    @staticmethod
+    def _has_observed_redeemed_collateral(evidence: Mapping[str, object]) -> bool:
+        redemption = evidence.get("redemption")
+        if not isinstance(redemption, Mapping) or redemption.get("observed") is not True:
+            return False
+        collateral = redemption.get("redeemed_collateral")
+        if not isinstance(collateral, Mapping):
+            return False
+        for value in collateral.values():
+            if isinstance(value, bool):
+                continue
+            try:
+                amount = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                continue
+            if amount.is_finite() and amount > 0:
+                return True
+        return False
+
+    @classmethod
+    def _cross_release_is_proven(
+        cls, *, state: object, evidence: object, reason: str
+    ) -> bool:
+        if not isinstance(evidence, list):
+            return False
+        for item in reversed(evidence):
+            if not isinstance(item, Mapping) or not cls._has_zero_cross_positions(item):
+                continue
+            if reason == "no_submit":
+                if state == "both_rejected" and item.get("submitted") is False:
+                    return True
+            elif reason == "both_rejected":
+                if state == "both_rejected" and item.get("no_position_observed") is True:
+                    return True
+            elif reason == "redeemed":
+                if state == "complete" and cls._has_observed_redeemed_collateral(item):
+                    return True
+        return False
+
     def release_cross_reservation(self, execution_id: str, *, reason: str) -> None:
         if reason not in {"no_submit", "both_rejected", "redeemed"}:
             raise ValueError("unsupported cross reservation release reason")
         with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT reservation.state AS reservation_state, execution.state, execution.evidence
+                FROM cross_execution_reservations AS reservation
+                JOIN executions AS execution ON execution.execution_id=reservation.execution_id
+                WHERE reservation.execution_id=?
+                """,
+                (str(execution_id),),
+            ).fetchone()
+            if row is None or row["reservation_state"] == "released":
+                return
+            if not self._cross_release_is_proven(
+                state=row["state"], evidence=json.loads(str(row["evidence"])), reason=reason
+            ):
+                raise ValueError("cross reservation release proof missing")
             connection.execute(
                 """
                 UPDATE cross_execution_reservations

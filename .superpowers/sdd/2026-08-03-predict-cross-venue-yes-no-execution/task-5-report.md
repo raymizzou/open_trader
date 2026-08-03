@@ -71,3 +71,73 @@ tests against the committed implementation.
 ## Commit
 
 - `547f897 feat: reserve cross venue unsettled principal`
+
+## Fix round 1: fail-closed release proof and admitting cap race
+
+### Findings addressed
+
+- `release_cross_reservation` now reads the reservation, execution state, and
+  durable evidence in its existing immediate transaction before changing a
+  reserved row. A released row remains an idempotent no-op.
+- `no_submit` requires terminal `both_rejected`, `submitted: false`, and
+  numeric zero positions for both `predict.fun` and `polymarket`.
+- `both_rejected` requires terminal `both_rejected`, numeric zero positions
+  for both venues, and `no_position_observed: true`.
+- `redeemed` requires terminal `complete`, numeric zero positions for both
+  venues, `redemption.observed: true`, and a finite positive value in the
+  structured `redemption.redeemed_collateral` mapping.
+- Free-form strings such as `"proven_zero"` and `"observed"` are rejected;
+  failed proof leaves the reservation untouched.
+- The two-store race now starts at 80 principal and races two 20-cost
+  confirmations. Exactly one commits; the other observes the committed row and
+  fails with `cross_unsettled_cap`, leaving principal at 100.
+
+### RED
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_store.py -k 'cross or preview' -q
+```
+
+Output before the fix: `1 failed, 9 passed, 31 deselected in 0.22s`.
+The failure showed a `validating` execution could release its reservation by
+passing `reason="redeemed"` without any terminal state or structured proof.
+
+### GREEN
+
+Focused command:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_store.py -k 'cross or preview' -q
+```
+
+Output: `10 passed, 31 deselected in 0.15s`.
+
+Required full store command:
+
+```bash
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_store.py -q
+```
+
+Output: `41 passed in 0.31s`.
+
+### Self-review
+
+- Verified each allowed reason against execution state and structured evidence;
+  all other state/evidence combinations raise before the update.
+- Repeated approved release remains a no-op, while invalid proof rolls back and
+  retains capacity.
+- Reviewed the 80-plus-two-20 race: the existing `BEGIN IMMEDIATE` transaction
+  serializes the sum-and-insert, so the second store instance reads 100 and
+  cannot create a third reservation.
+- `git diff --check` passed. No credentials, venue payloads, live requests, or
+  order paths were added or invoked.
+
+### Concerns
+
+- The structured evidence keys documented above are now the narrow contract
+  the later execution/reconciliation task must emit before releasing capacity.
+- The worktree has no `ruff` executable; the required focused and full store
+  test suites passed.

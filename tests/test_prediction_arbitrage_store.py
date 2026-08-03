@@ -495,7 +495,7 @@ def test_cross_principal_cap_is_atomic_across_store_instances(tmp_path: Path) ->
     setup = store(tmp_path)
     now = datetime.now(UTC)
     seed_preview = setup.create_preview(
-        cross_preview_payload(total_max_cost=Decimal("90.00")),
+        cross_preview_payload(total_max_cost=Decimal("80.00")),
         expires_at=iso(now + timedelta(seconds=10)),
     )
     seed = setup.consume_preview_and_create_execution(seed_preview, "cross-seed")
@@ -527,14 +527,15 @@ def test_cross_principal_cap_is_atomic_across_store_instances(tmp_path: Path) ->
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(consume, (0, 1)))
 
-    assert all(isinstance(item, ValueError) for item in results)
-    assert all(str(item) == "cross_unsettled_cap" for item in results)
-    assert setup.cross_unsettled_principal() == Decimal("90.00")
+    assert sum(isinstance(item, dict) for item in results) == 1
+    assert sum(isinstance(item, ValueError) for item in results) == 1
+    assert next(str(item) for item in results if isinstance(item, ValueError)) == "cross_unsettled_cap"
+    assert setup.cross_unsettled_principal() == Decimal("100.00")
     with sqlite3.connect(setup.path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 2
         assert connection.execute(
             "SELECT COUNT(*) FROM cross_execution_reservations"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
 
 
 def test_cross_reservation_remains_until_an_allowed_final_release(tmp_path: Path) -> None:
@@ -561,10 +562,82 @@ def test_cross_reservation_remains_until_an_allowed_final_release(tmp_path: Path
     db.transition_execution(
         execution_id,
         state="both_rejected",
-        evidence={"positions": "proven_zero", "redemption": "observed"},
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "no_position_observed": True,
+        },
     )
     db.release_cross_reservation(execution_id, reason="both_rejected")
     db.release_cross_reservation(execution_id, reason="both_rejected")
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_reservation_rejects_unproven_release_reason(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-unproven")["execution_id"]
+    )
+
+    with pytest.raises(ValueError, match="proof"):
+        db.release_cross_reservation(execution_id, reason="redeemed")
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+    db.transition_execution(
+        execution_id,
+        state="both_rejected",
+        evidence={"positions": "proven_zero", "redemption": "observed"},
+    )
+    with pytest.raises(ValueError, match="proof"):
+        db.release_cross_reservation(execution_id, reason="both_rejected")
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_cross_reservation_releases_only_proven_no_submit_or_redemption(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    now = datetime.now(UTC)
+    no_submit_preview = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+    no_submit_execution = db.consume_preview_and_create_execution(
+        no_submit_preview, "cross-no-submit"
+    )
+    db.transition_execution(
+        str(no_submit_execution["execution_id"]),
+        state="both_rejected",
+        evidence={
+            "submitted": False,
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+        },
+    )
+    db.release_cross_reservation(str(no_submit_execution["execution_id"]), reason="no_submit")
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+    redeemed_preview = db.create_preview(
+        cross_preview_payload(market_id="cross-redeemed", total_max_cost=Decimal("10.50")),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+    redeemed_execution = db.consume_preview_and_create_execution(
+        redeemed_preview, "cross-redeemed"
+    )
+    db.transition_execution(
+        str(redeemed_execution["execution_id"]),
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "redemption": {
+                "observed": True,
+                "redeemed_collateral": {"predict.fun": "10.50"},
+            },
+        },
+    )
+    db.release_cross_reservation(str(redeemed_execution["execution_id"]), reason="redeemed")
     assert db.cross_unsettled_principal() == Decimal("0")
 
 
