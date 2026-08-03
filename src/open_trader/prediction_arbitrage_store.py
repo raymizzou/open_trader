@@ -1145,7 +1145,10 @@ class PredictionArbitrageStore:
 
     @classmethod
     def _has_observed_redeemed_collateral(
-        cls, evidence: Mapping[str, object], payload: Mapping[str, object]
+        cls,
+        evidence: Mapping[str, object],
+        payload: Mapping[str, object],
+        settlement_baseline: Mapping[str, object],
     ) -> bool:
         redemption = evidence.get("redemption")
         if not isinstance(redemption, Mapping) or redemption.get("observed") is not True:
@@ -1154,15 +1157,45 @@ class PredictionArbitrageStore:
         if not isinstance(winner, Mapping) or not cls._winner_matches_cross_payload(winner, payload):
             return False
         collateral = redemption.get("redeemed_collateral")
-        if not isinstance(collateral, Mapping):
+        completed_baseline = evidence.get("settlement_baseline")
+        if not isinstance(collateral, Mapping) or not isinstance(completed_baseline, Mapping):
             return False
         venue = str(winner["venue"])
         try:
             amount = Decimal(str(collateral.get(venue)))
             required = Decimal(str(winner["quantity"]))
+            prior = Decimal(str(settlement_baseline.get(venue)))
+            recorded = Decimal(str(completed_baseline.get(venue)))
         except (InvalidOperation, ValueError):
             return False
-        return amount.is_finite() and required.is_finite() and amount >= required > 0
+        return (
+            amount.is_finite()
+            and required.is_finite()
+            and prior.is_finite()
+            and recorded.is_finite()
+            and prior >= 0
+            and recorded == prior
+            and amount >= required > 0
+        )
+
+    @staticmethod
+    def _post_fill_settlement_baseline(evidence: list[object]) -> Mapping[str, object] | None:
+        for item in reversed(evidence):
+            if not isinstance(item, Mapping) or item.get("phase") != "holding_to_resolution":
+                continue
+            baseline = item.get("settlement_baseline")
+            if not isinstance(baseline, Mapping):
+                continue
+            try:
+                values = {
+                    venue: Decimal(str(baseline.get(venue)))
+                    for venue in ("polymarket", "predict.fun")
+                }
+            except (InvalidOperation, ValueError):
+                continue
+            if all(value.is_finite() and value >= 0 for value in values.values()):
+                return baseline
+        return None
 
     @classmethod
     def _cross_release_is_proven(
@@ -1170,6 +1203,7 @@ class PredictionArbitrageStore:
     ) -> bool:
         if not isinstance(evidence, list):
             return False
+        settlement_baseline = cls._post_fill_settlement_baseline(evidence)
         for item in reversed(evidence):
             if not isinstance(item, Mapping) or not cls._has_zero_cross_positions(item):
                 continue
@@ -1180,7 +1214,13 @@ class PredictionArbitrageStore:
                 if state == "both_rejected" and item.get("no_position_observed") is True:
                     return True
             elif reason == "redeemed":
-                if state == "complete" and cls._has_observed_redeemed_collateral(item, payload):
+                if (
+                    state == "complete"
+                    and settlement_baseline is not None
+                    and cls._has_observed_redeemed_collateral(
+                        item, payload, settlement_baseline
+                    )
+                ):
                     return True
         return False
 

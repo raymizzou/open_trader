@@ -1566,6 +1566,18 @@ class FakeRemediationPublicClient(FakePublicClient):
         )
 
 
+class CrossRemediationPublicClient:
+    def get_order_book(self, *, token_id: str) -> object:
+        assert token_id == "cross-no-token"
+        return SimpleNamespace(
+            asks=(SimpleNamespace(price=Decimal("0.18"), size=Decimal("5")),),
+            bids=(SimpleNamespace(price=Decimal("0.82"), size=Decimal("5")),),
+            min_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+            timestamp=datetime.now(UTC),
+        )
+
+
 class StaleRemediationPublicClient(FakeRemediationPublicClient):
     def get_order_book(self, *, token_id: str) -> object:
         book = super().get_order_book(token_id=token_id)
@@ -1658,6 +1670,36 @@ def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
     assert complete["quantity"] == Decimal("10")
     assert complete["amount"] == complete["max_spend"]
     assert complete["loss"] <= Decimal("2")
+    assert fake.post_calls == []
+
+
+def test_cross_remediation_options_bind_a_fresh_book_to_the_exact_leg() -> None:
+    adapter, fake = make_adapter()
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": Decimal("5")}
+    ]
+    fake.list_open_orders = lambda **kwargs: []  # type: ignore[method-assign]
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=fake,
+        public_client_factory=CrossRemediationPublicClient,
+    )
+    leg = cross_polymarket_leg()
+
+    buy = adapter.cross_remediation_option(
+        venue="polymarket", market_id=leg.market_id, condition_id=leg.condition_id,
+        token_id=leg.token_id, outcome=leg.outcome, side="BUY",
+        quantity=leg.net_quantity, maximum_fee=leg.maximum_fee,
+    )
+    sell = adapter.cross_remediation_option(
+        venue="polymarket", market_id=leg.market_id, condition_id=leg.condition_id,
+        token_id=leg.token_id, outcome=leg.outcome, side="SELL",
+        quantity=leg.net_quantity, maximum_fee=leg.maximum_fee,
+    )
+
+    assert buy["fresh"] is True
+    assert buy["option"]["max_spend"] == Decimal("0.95")
+    assert sell["fresh"] is True
+    assert sell["option"]["min_price"] == Decimal("0.82")
     assert fake.post_calls == []
 
 

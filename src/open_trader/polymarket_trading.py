@@ -2251,6 +2251,106 @@ class PolymarketTradingClient:
         except Exception:
             return {"fresh": False}
 
+    def cross_remediation_option(
+        self,
+        *,
+        venue: str,
+        market_id: str,
+        condition_id: str,
+        token_id: str,
+        outcome: str,
+        side: str,
+        quantity: Decimal,
+        maximum_fee: Decimal,
+    ) -> dict[str, object]:
+        """Return one current cross-venue completion or unwind option, never submit.
+
+        This is deliberately a narrow adapter callback rather than a second
+        venue abstraction.  The caller still chooses between this option and
+        the other venue's independently refreshed option.
+        """
+
+        if (
+            venue != "polymarket"
+            or not all(isinstance(value, str) and value.strip() for value in (market_id, condition_id, token_id, outcome))
+            or side not in {"BUY", "SELL"}
+            or self._positive_decimal(quantity) is None
+            or not isinstance(maximum_fee, Decimal)
+            or not maximum_fee.is_finite()
+            or maximum_fee < 0
+        ):
+            return {"fresh": False}
+        try:
+            account = self.account_snapshot()
+            account_stamp = _venue_timestamp(account.checked_at)
+            now = datetime.now(UTC)
+            if (
+                account_stamp is None
+                or account.open_order_ids
+                or (now - account_stamp).total_seconds() < 0
+                or (now - account_stamp).total_seconds() > REMEDIATION_BOOK_FRESHNESS_SECONDS
+            ):
+                return {"fresh": False}
+            if side == "BUY" and (
+                account.p_usd_balance <= 0 or account.p_usd_allowance <= 0
+            ):
+                return {"fresh": False}
+            if side == "SELL":
+                position = sum(
+                    (
+                        _decimal(row.get("size", row.get("quantity", row.get("shares")))) or Decimal("0")
+                        for row in account.positions
+                        if row.get("condition_id", row.get("conditionId")) == condition_id
+                        and row.get("token_id", row.get("tokenId", row.get("asset_id"))) == token_id
+                    ),
+                    Decimal("0"),
+                )
+                if position < quantity:
+                    return {"fresh": False}
+            book = self._public_client_factory().get_order_book(token_id=token_id)
+            stamp = _venue_timestamp(_field(book, "timestamp"))
+            now = datetime.now(UTC)
+            if (
+                stamp is None
+                or (now - stamp).total_seconds() < 0
+                or (now - stamp).total_seconds() > REMEDIATION_BOOK_FRESHNESS_SECONDS
+            ):
+                return {"fresh": False}
+            levels = _collect(_field(book, "asks" if side == "BUY" else "bids", ()))
+            valid: list[tuple[Decimal, Decimal]] = []
+            for row in levels:
+                price = _decimal(_field(row, "price"))
+                size = _decimal(_field(row, "size"))
+                if price is None or size is None or not (Decimal("0") < price <= Decimal("1")) or size < quantity:
+                    continue
+                valid.append((price, size))
+            if not valid:
+                return {"fresh": False}
+            price = min(valid, key=lambda item: item[0])[0] if side == "BUY" else max(valid, key=lambda item: item[0])[0]
+            option: dict[str, object] = {
+                "venue": venue,
+                "market_id": market_id,
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "outcome": outcome,
+                "side": side,
+                "quantity": quantity,
+                "executable_price": price,
+                "fee": maximum_fee,
+                "slippage": Decimal("0"),
+                "residual_dust": Decimal("0"),
+            }
+            if side == "BUY":
+                max_spend = quantity * price + maximum_fee
+                if max_spend > account.p_usd_balance or max_spend > account.p_usd_allowance:
+                    return {"fresh": False}
+                option["max_spend"] = max_spend
+            else:
+                option.update({"shares": quantity, "min_price": price})
+            return {"fresh": True, "checked_at": min(account_stamp, stamp), "option": option}
+        except Exception:
+            return {"fresh": False}
+
     def submit_remediation_once(self, order: dict[str, object]) -> LegResult:
         raw_leg = order.get("leg")
         if raw_leg not in ("YES", "NO"):

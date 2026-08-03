@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from urllib.error import URLError
@@ -208,3 +209,42 @@ def test_submit_uses_fresh_server_fee_rate() -> None:
     client, _ = make_client(urlopen_fn)
     assert client.submit_buy_once("896", "yes-token", 10**18).accepted is True
     assert client._builder.last_order_input.fee_rate_bps == "201"
+
+
+def test_cross_remediation_option_and_submit_bind_a_fresh_predict_buy_quote() -> None:
+    requests = []
+
+    def urlopen_fn(request, **kwargs):
+        requests.append(request)
+        if request.full_url.endswith("/v1/markets/896/orderbook"):
+            return FakeResponse(
+                {
+                    "data": {
+                        "marketId": 896,
+                        "updateTimestampMs": int(datetime.now(UTC).timestamp() * 1000),
+                        "asks": [["0.51", "3"]],
+                        "bids": [["0.50", "2"]],
+                    }
+                }
+            )
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+    quoted = client.cross_remediation_option(
+        venue="predict.fun", market_id="896", condition_id="predict-condition",
+        token_id="yes-token", outcome="YES", side="BUY", quantity=Decimal("1"),
+        maximum_fee=Decimal("0.05"),
+    )
+
+    assert quoted["fresh"] is True
+    option = quoted["option"]
+    assert option["max_spend"] == Decimal("1")
+    assert option["fee"] == Decimal("0")
+    assert not any(request.full_url.endswith("/v1/orders") for request in requests)
+
+    submitted = client.submit_cross_remediation_once(option)
+
+    assert (submitted.accepted, submitted.status, submitted.order_id) == (
+        True, "accepted", "order-hash",
+    )
+    assert sum(request.full_url.endswith("/v1/orders") for request in requests) == 1

@@ -647,9 +647,19 @@ def test_cross_reservation_releases_only_proven_no_submit_or_redemption(
     )
     db.transition_execution(
         str(redeemed_execution["execution_id"]),
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "5", "polymarket": "5"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        str(redeemed_execution["execution_id"]),
         state="complete",
         evidence={
             "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
             "redemption": {
                 "observed": True,
                 "winner": {
@@ -716,9 +726,19 @@ def test_cross_release_sweep_recovers_a_proven_complete_after_a_crash(
     )
     db.transition_execution(
         execution_id,
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "5", "polymarket": "5"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        execution_id,
         state="complete",
         evidence={
             "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
             "redemption": {
                 "observed": True,
                 "winner": {
@@ -739,6 +759,41 @@ def test_cross_release_sweep_recovers_a_proven_complete_after_a_crash(
     assert sweep() == (execution_id,)
     assert sweep() == ()
     assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_release_sweep_requires_the_persisted_post_fill_baseline(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-preorder-baseline")
+        ["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5", "polymarket": "0"},
+            },
+        },
+    )
+
+    assert db.release_proven_cross_completions() == ()
+    assert db.cross_unsettled_principal() == Decimal("10.50")
 
 
 def test_legacy_preview_execution_payload_has_no_cross_reservation(tmp_path: Path) -> None:

@@ -1017,6 +1017,11 @@ class CrossPolymarketTrading(FakeTrading):
         self.block_submit = False
         self.submit_results: list[ThresholdLegResult] = []
         self.reconcile_results: list[dict[str, object]] = []
+        self.balance_after_cross_submit: Decimal | None = None
+        self.cross_submitted_legs: list[CrossVenueLeg] = []
+        self.cross_remediation_options: dict[str, dict[str, object]] = {}
+        self.cross_remediation_option_calls: list[dict[str, object]] = []
+        self.cross_remediation_calls: list[dict[str, object]] = []
 
     def no_submit_cross_leg_preflight(self, leg: CrossVenueLeg) -> dict[str, object]:
         self.cross_preflight_calls += 1
@@ -1024,11 +1029,14 @@ class CrossPolymarketTrading(FakeTrading):
 
     def submit_cross_leg_once(self, leg: CrossVenueLeg) -> ThresholdLegResult:
         self.cross_submit_calls += 1
+        self.cross_submitted_legs.append(leg)
         self.submit_started.set()
         if self.submit_barrier is not None:
             self.submit_barrier.wait(timeout=2)
         if self.block_submit:
             assert self.submit_release.wait(timeout=2)
+        if self.balance_after_cross_submit is not None:
+            self.balance = self.balance_after_cross_submit
         if self.submit_results:
             return self.submit_results.pop(0)
         return ThresholdLegResult(
@@ -1053,6 +1061,19 @@ class CrossPolymarketTrading(FakeTrading):
             "execution_proof": {"verified": True, "venue": "polymarket"},
         }
 
+    def cross_remediation_option(self, **kwargs: object) -> dict[str, object]:
+        self.cross_remediation_option_calls.append(dict(kwargs))
+        side = str(kwargs.get("side", ""))
+        return dict(self.cross_remediation_options.get(side, {"fresh": False}))
+
+    def submit_remediation_once(self, order: dict[str, object]) -> LegResult:
+        self.cross_remediation_calls.append(dict(order))
+        return LegResult(
+            str(order.get("leg", "NO")), True, "filled", "cross-unwind-order",
+            Decimal(str(order.get("quantity", order.get("shares", "0")))),
+            ("cross-unwind-trade",), "none",
+        )
+
 
 class CrossPredictTrading:
     def __init__(self) -> None:
@@ -1071,6 +1092,10 @@ class CrossPredictTrading:
         self.block_submit = False
         self.submit_results: list[PredictLegResult] = []
         self.reconcile_results: list[dict[str, object]] = []
+        self.balance_after_cross_submit: Decimal | None = None
+        self.cross_remediation_options: dict[str, dict[str, object]] = {}
+        self.cross_remediation_option_calls: list[dict[str, object]] = []
+        self.default_filled_quantity = Decimal("5")
 
     def account_snapshot(self) -> dict[str, object]:
         self.account_calls += 1
@@ -1082,9 +1107,8 @@ class CrossPredictTrading:
         self, market_id: str, token_id: str, quantity_wei: int
     ) -> PredictLegResult:
         self.preflight_calls += 1
-        assert (market_id, token_id, quantity_wei) == (
-            "predict-market", "predict-yes", 5 * 10**18
-        )
+        assert (market_id, token_id) == ("predict-market", "predict-yes")
+        assert quantity_wei > 0
         return PredictLegResult(True, "preflight")
 
     def submit_buy_once(
@@ -1096,6 +1120,8 @@ class CrossPredictTrading:
             self.submit_barrier.wait(timeout=2)
         if self.block_submit:
             assert self.submit_release.wait(timeout=2)
+        if self.balance_after_cross_submit is not None:
+            self.balance = self.balance_after_cross_submit
         if self.submit_results:
             return self.submit_results.pop(0)
         return PredictLegResult(True, "filled", "predict-order")
@@ -1112,11 +1138,50 @@ class CrossPredictTrading:
             }
         return {
             "status": "verified", "verified": True,
-            "filled_quantity": Decimal("5"),
-            "position_quantity": Decimal("5"),
+            "filled_quantity": self.default_filled_quantity,
+            "position_quantity": self.default_filled_quantity,
             "minimum_order_size": self.minimum_order_size,
             "execution_proof": {"verified": True, "venue": "predict.fun"},
         }
+
+    def cross_remediation_option(self, **kwargs: object) -> dict[str, object]:
+        self.cross_remediation_option_calls.append(dict(kwargs))
+        side = str(kwargs.get("side", ""))
+        return dict(self.cross_remediation_options.get(side, {"fresh": False}))
+
+    def submit_cross_remediation_once(self, order: dict[str, object]) -> PredictLegResult:
+        self.submit_calls += 1
+        return PredictLegResult(True, "filled", "predict-remediation-order")
+
+
+def _fresh_cross_option(
+    leg: CrossVenueLeg,
+    *,
+    side: str,
+    price: Decimal,
+    fee: Decimal = Decimal("0"),
+    slippage: Decimal = Decimal("0"),
+    residual_dust: Decimal = Decimal("0"),
+) -> dict[str, object]:
+    option: dict[str, object] = {
+        "venue": leg.exchange,
+        "market_id": leg.market_id,
+        "condition_id": leg.condition_id,
+        "token_id": leg.token_id,
+        "outcome": leg.outcome,
+        "side": side,
+        "quantity": leg.net_quantity,
+        "executable_price": price,
+        "fee": fee,
+        "slippage": slippage,
+        "residual_dust": residual_dust,
+    }
+    if side == "BUY":
+        option["max_spend"] = leg.net_quantity * price + fee + slippage
+    else:
+        option["shares"] = leg.net_quantity
+        option["min_price"] = price
+    return {"fresh": True, "checked_at": datetime.now(UTC), "option": option}
 
 
 def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, PredictionArbitrageStore, CrossPolymarketTrading, CrossVenueMonitor, CrossPredictTrading]:
@@ -1171,7 +1236,7 @@ def test_cross_venue_submits_both_legs_concurrently_and_deduplicates_preview(
     assert final["state"] == "holding_to_resolution"
 
 
-def test_cross_venue_uses_one_bounded_completion_only_below_emergency_limit(
+def test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limit(
     tmp_path: Path,
 ) -> None:
     service, _store, _trading, cross, predict = _cross_service(tmp_path)
@@ -1185,15 +1250,17 @@ def test_cross_venue_uses_one_bounded_completion_only_below_emergency_limit(
     predict.submit_results.extend(
         (
             PredictLegResult(False, "rejected", "", "rejected"),
-            PredictLegResult(True, "filled", "predict-order"),
         )
+    )
+    predict.cross_remediation_options["BUY"] = _fresh_cross_option(
+        predict_leg, side="BUY", price=Decimal("0.18"), fee=Decimal("0.10")
     )
 
     _accepted, final = _cross_execution(service, idempotency_key="cross-bounded-completion")
 
     assert final["state"] == "holding_to_resolution"
     assert predict.submit_calls == 2
-    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.90"
+    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.00"
 
 
 def test_cross_venue_never_completes_an_opposite_partial_fill(
@@ -1241,6 +1308,132 @@ def test_cross_venue_never_completes_above_emergency_limit(
 
     assert final["state"] == "directional_incident"
     assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+
+
+def test_cross_holding_settlement_uses_post_fill_baseline_not_preorder_balance(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(predict_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+            replace(polymarket_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+        ),
+        quantity=Decimal("10"),
+        minimum_payout=Decimal("10"),
+    )
+    predict.default_filled_quantity = Decimal("10")
+    trading.balance = Decimal("100")
+    predict.balance = Decimal("100")
+    trading.balance_after_cross_submit = Decimal("90")
+    predict.balance_after_cross_submit = Decimal("90")
+
+    accepted, holding = _cross_execution(service, idempotency_key="cross-post-fill-baseline")
+
+    assert holding["state"] == "holding_to_resolution"
+    assert holding["evidence"][-1]["settlement_baseline"] == {
+        "polymarket": "90", "predict.fun": "90",
+    }
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "10", "redeemable": True, "outcome": "YES"},
+    )
+    assert service.reconcile_cross_holdings_once() == {
+        "complete": 0, "pending": 1, "unknown": 0,
+    }
+    predict.positions = ()
+    trading.balance = Decimal("100")
+    predict.balance = Decimal("100")
+
+    completed = service.reconcile_cross_holdings_once()
+
+    assert completed == {"complete": 1, "pending": 0, "unknown": 0}
+    assert service.execution(str(accepted["execution_id"]))["state"] == "complete"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_remediation_prefers_fresh_cheaper_polymarket_unwind_once(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.cross_remediation_options["BUY"] = _fresh_cross_option(
+        predict_leg, side="BUY", price=Decimal("0.20"), fee=Decimal("0.10"),
+    )
+    trading.cross_remediation_options["SELL"] = _fresh_cross_option(
+        polymarket_leg, side="SELL", price=Decimal("0.95"), fee=Decimal("0.05"),
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-cheaper-unwind")
+
+    assert final["state"] == "neutralized_incident"
+    assert [order["side"] for order in trading.cross_remediation_calls] == ["SELL"]
+    assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+    assert store.cross_unsettled_principal() == Decimal("4.70")
+
+
+def test_cross_remediation_completes_from_fresh_bound_option_within_limit(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, _predict = _cross_service(tmp_path)
+    _predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(cross.intent, calculable_gas=Decimal("0.10"))
+    trading.submit_results.append(
+        ThresholdLegResult(
+            "polymarket", "NO", "poly-condition", "poly-no", False,
+            "rejected", "", Decimal("0"), (), "rejected",
+        )
+    )
+    trading.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    trading.cross_remediation_options["BUY"] = _fresh_cross_option(
+        polymarket_leg,
+        side="BUY",
+        price=Decimal("0.18"),
+        fee=Decimal("0.05"),
+        residual_dust=Decimal("0.05"),
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-fresh-completion")
+
+    assert final["state"] == "holding_to_resolution"
+    assert trading.cross_submit_calls == 2
+    assert trading.cross_submitted_legs[-1].max_cost == Decimal("0.95")
+    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.10"
+
+
+@pytest.mark.parametrize("option_state", ("stale", "missing", "over_limit"))
+def test_cross_remediation_rejects_nonactionable_fresh_options_without_order(
+    tmp_path: Path, option_state: str,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(replace(predict_leg, max_cost=Decimal("1.00")), polymarket_leg),
+        total_max_cost=Decimal("3.40"),
+        minimum_profit=Decimal("1.60"),
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    if option_state == "stale":
+        option = _fresh_cross_option(predict_leg, side="BUY", price=Decimal("0.10"))
+        option["checked_at"] = datetime.now(UTC) - timedelta(seconds=11)
+        predict.cross_remediation_options["BUY"] = option
+    elif option_state == "over_limit":
+        predict.cross_remediation_options["BUY"] = _fresh_cross_option(
+            predict_leg, side="BUY", price=Decimal("0.50"),
+        )
+
+    _accepted, final = _cross_execution(service, idempotency_key=f"cross-no-remediation-{option_state}")
+
+    assert final["state"] == "directional_incident"
+    assert predict.submit_calls == 1
+    assert trading.cross_submit_calls == 1
     assert service._cross_breaker_open is True
 
 

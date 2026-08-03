@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -665,11 +665,11 @@ class PredictionExecutionService:
                 self._cross_redemption_unknown(execution_id, row, "winner_not_observed")
                 counts["unknown"] += 1
                 continue
-            before = self._cross_entry_balances(row.get("evidence"))
+            baseline = self._cross_settlement_baseline(row.get("evidence"))
             poly_after = _decimal(polymarket.get("p_usd_balance"))
             predict_after = _decimal(predict.get("available_usdt"))
             if (
-                before is None
+                baseline is None
                 or poly_after is None
                 or predict_after is None
             ):
@@ -677,8 +677,8 @@ class PredictionExecutionService:
                 counts["unknown"] += 1
                 continue
             redeemed = {
-                "polymarket": max(Decimal("0"), poly_after - before["polymarket"]),
-                "predict.fun": max(Decimal("0"), predict_after - before["predict.fun"]),
+                "polymarket": max(Decimal("0"), poly_after - baseline["polymarket"]),
+                "predict.fun": max(Decimal("0"), predict_after - baseline["predict.fun"]),
             }
             winner_venue = str(winner["venue"])
             winner_quantity = _decimal(winner.get("quantity"))
@@ -701,6 +701,9 @@ class PredictionExecutionService:
                         "redeemed_collateral": {
                             venue: format(amount, "f") for venue, amount in redeemed.items()
                         },
+                    },
+                    "settlement_baseline": {
+                        venue: format(amount, "f") for venue, amount in baseline.items()
                     },
                 },
             )
@@ -740,20 +743,19 @@ class PredictionExecutionService:
         return total
 
     @staticmethod
-    def _cross_entry_balances(evidence: object) -> dict[str, Decimal] | None:
+    def _cross_settlement_baseline(evidence: object) -> dict[str, Decimal] | None:
         if not isinstance(evidence, (list, tuple)):
             return None
         for item in reversed(evidence):
-            if not isinstance(item, Mapping):
+            if not isinstance(item, Mapping) or item.get("phase") != "holding_to_resolution":
                 continue
-            accounts = item.get("accounts")
-            if not isinstance(accounts, Mapping):
+            raw = item.get("settlement_baseline")
+            if not isinstance(raw, Mapping):
                 continue
             values: dict[str, Decimal] = {}
             for venue in ("polymarket", "predict.fun"):
-                account = accounts.get(venue)
-                balance = _decimal(account.get("available_balance")) if isinstance(account, Mapping) else None
-                if balance is None:
+                balance = _decimal(raw.get(venue))
+                if balance is None or balance < 0:
                     break
                 values[venue] = balance
             if len(values) == 2:
@@ -1696,6 +1698,20 @@ class PredictionExecutionService:
             "positions": {venue: format(quantity, "f") for venue, quantity in positions.items()},
             "reconciliation": reconciled,
         }
+        established = (
+            len(positions) == 2
+            and len(set(positions.values())) == 1
+            and next(iter(positions.values()), Decimal("0")) > 0
+        )
+        baseline = self._cross_post_fill_baseline() if established else None
+        if baseline is None:
+            evidence["settlement_baseline_status"] = (
+                "unavailable" if established else "positions_not_equal"
+            )
+        else:
+            evidence["settlement_baseline"] = {
+                venue: format(amount, "f") for venue, amount in baseline.items()
+            }
         if unhedged_units is not None and worst_case_loss is not None:
             evidence.update(
                 {
@@ -1710,6 +1726,25 @@ class PredictionExecutionService:
             )
         self._transition(execution_id, "holding_to_resolution", evidence)
 
+    def _cross_post_fill_baseline(self) -> dict[str, Decimal] | None:
+        """Persist balances after the two actual positions are proven.
+
+        The prior submission account snapshot remains audit evidence, but cannot
+        prove redemption because both purchases debit it before settlement.
+        """
+
+        polymarket = self._fresh_account_snapshot()
+        predict = self._fresh_predict_account_snapshot()
+        if polymarket is None or predict is None:
+            return None
+        values = {
+            "polymarket": _decimal(polymarket.get("p_usd_balance")),
+            "predict.fun": _decimal(predict.get("available_usdt")),
+        }
+        if any(value is None or value < 0 for value in values.values()):
+            return None
+        return {venue: value for venue, value in values.items() if value is not None}
+
     def _remediate_cross_missing_leg(
         self,
         execution_id: str,
@@ -1721,6 +1756,7 @@ class PredictionExecutionService:
     ) -> None:
         missing = predict_leg if missing_venue == "predict.fun" else polymarket_leg
         filled_venue = "polymarket" if missing_venue == "predict.fun" else "predict.fun"
+        filled = polymarket_leg if filled_venue == "polymarket" else predict_leg
         filled_quantity = _decimal(reconciled.get(filled_venue, {}).get("position_quantity"))
         if filled_quantity != intent.quantity:
             self._finish_cross_incident(
@@ -1733,47 +1769,77 @@ class PredictionExecutionService:
                 },
             )
             return
-        worst_case_loss = (
-            missing.max_cost + intent.calculable_gas
+        completion = self._fresh_cross_remediation_option(
+            intent, missing, side="BUY", kind="complete"
         )
-        if worst_case_loss > MAX_EMERGENCY_LOSS:
+        unwind = self._fresh_cross_remediation_option(
+            intent, filled, side="SELL", kind="unwind"
+        )
+        chosen = self._choose_cross_remediation_option(completion, unwind)
+        if chosen is None:
             self._finish_cross_incident(
                 execution_id,
-                "cross_remediation_over_limit",
+                "cross_remediation_no_safe_option",
                 evidence={
-                    "venue": missing_venue,
-                    "worst_case_loss": _safe_decimal(worst_case_loss),
+                    "missing_venue": missing_venue,
+                    "completion": self._safe_mapping(completion or {}),
+                    "unwind": self._safe_mapping(unwind or {}),
                     "reconciliation": reconciled,
                 },
             )
             return
+        worst_case_loss = chosen["worst_case_loss"]
         self._transition(
             execution_id,
             "remediating",
             {
-                "phase": "bounded_completion",
-                "venue": missing_venue,
+                "phase": "bounded_cross_remediation",
+                "action": chosen["kind"],
+                "venue": chosen["venue"],
                 "worst_case_loss": _safe_decimal(worst_case_loss),
             },
         )
-        result = self._submit_cross_leg_once(
-            missing_venue, predict_leg, polymarket_leg
+        result = self._submit_cross_remediation_once(
+            chosen, predict_leg=predict_leg, polymarket_leg=polymarket_leg
         )
         self._transition(
             execution_id,
             "remediating",
             {
-                "phase": "bounded_completion_result",
-                "venue": missing_venue,
-                "result": self._cross_leg_payload(missing, result),
+                "phase": "bounded_cross_remediation_result",
+                "action": chosen["kind"],
+                "venue": chosen["venue"],
+                "result": self._cross_leg_payload(chosen["leg"], result),
             },
         )
-        if self._cross_result_ambiguous(result):
+        if not self._cross_remediation_accepted(result, chosen["quantity"]):
             self._finish_cross_incident(
                 execution_id,
-                "cross_remediation_unknown",
-                evidence={"venue": missing_venue, "worst_case_loss": _safe_decimal(worst_case_loss)},
+                "cross_remediation_unverified",
+                evidence={
+                    "action": chosen["kind"],
+                    "venue": chosen["venue"],
+                    "worst_case_loss": _safe_decimal(worst_case_loss),
+                },
             )
+            return
+        if chosen["kind"] == "unwind":
+            if self._cross_unwind_is_proven(predict_leg, polymarket_leg):
+                self._finish_cross_neutralized(
+                    execution_id,
+                    "cross_unwind_confirmed",
+                    evidence={
+                        "action": "unwind",
+                        "venue": chosen["venue"],
+                        "worst_case_loss": _safe_decimal(worst_case_loss),
+                    },
+                )
+            else:
+                self._finish_cross_incident(
+                    execution_id,
+                    "cross_unwind_unverified",
+                    evidence={"venue": chosen["venue"], "worst_case_loss": _safe_decimal(worst_case_loss)},
+                )
             return
         repaired = dict(reconciled)
         repaired[missing_venue] = (
@@ -1807,6 +1873,209 @@ class PredictionExecutionService:
                 "worst_case_loss": _safe_decimal(worst_case_loss),
                 "reconciliation": repaired,
             },
+        )
+
+    def _fresh_cross_remediation_option(
+        self,
+        intent: CrossVenueIntent,
+        leg: CrossVenueLeg,
+        *,
+        side: str,
+        kind: str,
+    ) -> dict[str, object] | None:
+        collaborator = self._predict_trading if leg.exchange == "predict.fun" else self._trading
+        method = getattr(collaborator, "cross_remediation_option", None)
+        if not callable(method):
+            return None
+        try:
+            response = _call(
+                method,
+                venue=leg.exchange,
+                market_id=leg.market_id,
+                condition_id=leg.condition_id,
+                token_id=leg.token_id,
+                outcome=leg.outcome,
+                side=side,
+                quantity=leg.net_quantity,
+                maximum_fee=leg.maximum_fee,
+            )
+        except Exception:
+            return None
+        if not isinstance(response, Mapping) or response.get("fresh") is not True:
+            return None
+        age = _age_seconds(response.get("checked_at"))
+        raw = response.get("option")
+        if age is None or age > float(BOOK_FRESHNESS_SECONDS) or not isinstance(raw, Mapping):
+            return None
+        return self._normalise_cross_remediation_option(intent, leg, raw, side=side, kind=kind)
+
+    @staticmethod
+    def _normalise_cross_remediation_option(
+        intent: CrossVenueIntent,
+        leg: CrossVenueLeg,
+        raw: Mapping[str, object],
+        *,
+        side: str,
+        kind: str,
+    ) -> dict[str, object] | None:
+        if (
+            raw.get("venue") != leg.exchange
+            or raw.get("market_id") != leg.market_id
+            or raw.get("condition_id") != leg.condition_id
+            or raw.get("token_id") != leg.token_id
+            or raw.get("outcome") != leg.outcome
+            or raw.get("side") != side
+        ):
+            return None
+        quantity = _decimal(raw.get("quantity"))
+        price = _decimal(raw.get("executable_price"))
+        fee = _decimal(raw.get("fee"))
+        slippage = _decimal(raw.get("slippage"))
+        dust = _decimal(raw.get("residual_dust"))
+        gas = intent.calculable_gas
+        if (
+            quantity != leg.net_quantity
+            or price is None
+            or fee is None
+            or slippage is None
+            or dust is None
+            or not all(value.is_finite() and value >= 0 for value in (fee, slippage, dust, gas))
+            or price <= 0
+            or price > 1
+        ):
+            return None
+        option: dict[str, object] = {
+            "kind": kind,
+            "venue": leg.exchange,
+            "leg": leg,
+            "side": side,
+            "quantity": quantity,
+            "condition_id": leg.condition_id,
+            "market_id": leg.market_id,
+            "token_id": leg.token_id,
+            "outcome": leg.outcome,
+            "executable_price": price,
+            "fee": fee,
+            "slippage": slippage,
+            "residual_dust": dust,
+        }
+        if side == "BUY":
+            max_spend = _decimal(raw.get("max_spend"))
+            if max_spend is None or max_spend <= 0 or max_spend != quantity * price + fee + slippage:
+                return None
+            option["max_spend"] = max_spend
+            loss = max_spend + gas + dust
+        elif side == "SELL":
+            shares = _decimal(raw.get("shares"))
+            min_price = _decimal(raw.get("min_price"))
+            if shares != quantity or min_price != price:
+                return None
+            option.update({"shares": shares, "min_price": min_price})
+            loss = quantity * (Decimal("1") - price) + fee + slippage + gas + dust
+        else:
+            return None
+        if not loss.is_finite() or loss < 0:
+            return None
+        option["worst_case_loss"] = loss
+        return option
+
+    @staticmethod
+    def _choose_cross_remediation_option(
+        completion: Mapping[str, object] | None,
+        unwind: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        candidates: list[tuple[Decimal, int, dict[str, object]]] = []
+        for priority, candidate in enumerate((completion, unwind)):
+            if not isinstance(candidate, Mapping):
+                continue
+            loss = _decimal(candidate.get("worst_case_loss"))
+            if loss is None or loss > MAX_EMERGENCY_LOSS:
+                continue
+            candidates.append((loss, priority, dict(candidate)))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+    def _submit_cross_remediation_once(
+        self,
+        chosen: Mapping[str, object],
+        *,
+        predict_leg: CrossVenueLeg,
+        polymarket_leg: CrossVenueLeg,
+    ) -> object:
+        leg = chosen.get("leg")
+        side = chosen.get("side")
+        venue = chosen.get("venue")
+        if not isinstance(leg, CrossVenueLeg) or side not in {"BUY", "SELL"}:
+            return {"status": "blocked", "error_code": "invalid"}
+        if side == "SELL":
+            if venue != "polymarket":
+                return {"status": "blocked", "error_code": "unsupported"}
+            submit = getattr(self._trading, "submit_remediation_once", None)
+            order = dict(chosen)
+            order["leg"] = leg.outcome
+            return _call(submit, order) if callable(submit) else {"status": "blocked", "error_code": "unsupported"}
+        if venue == "polymarket":
+            max_spend = _decimal(chosen.get("max_spend"))
+            price = _decimal(chosen.get("executable_price"))
+            fee = _decimal(chosen.get("fee"))
+            if max_spend is None or price is None or fee is None:
+                return {"status": "blocked", "error_code": "invalid"}
+            bound = replace(leg, max_price=price, max_cost=max_spend, maximum_fee=fee)
+            preflight = getattr(self._trading, "no_submit_cross_leg_preflight", None)
+            submit = getattr(self._trading, "submit_cross_leg_once", None)
+            if not callable(preflight) or not callable(submit):
+                return {"status": "blocked", "error_code": "unsupported"}
+            try:
+                if not self._preflight_passed(_call(preflight, bound)):
+                    return {"status": "blocked", "error_code": "preflight"}
+                return _call(submit, bound)
+            except Exception:
+                return {"status": "ambiguous", "error_code": "ambiguous"}
+        if venue == "predict.fun":
+            submit = getattr(self._predict_trading, "submit_cross_remediation_once", None)
+            return _call(submit, dict(chosen)) if callable(submit) else {"status": "blocked", "error_code": "unsupported"}
+        return {"status": "blocked", "error_code": "unsupported"}
+
+    @staticmethod
+    def _cross_remediation_accepted(result: object, quantity: object) -> bool:
+        if PredictionExecutionService._cross_result_ambiguous(result):
+            return False
+        accepted = getattr(result, "accepted", result.get("accepted") if isinstance(result, Mapping) else False)
+        if accepted is not True:
+            return False
+        expected = _decimal(quantity)
+        filled = _decimal(getattr(result, "filled_quantity", result.get("filled_quantity") if isinstance(result, Mapping) else expected))
+        return expected is not None and (filled is None or filled == Decimal("0") or filled == expected)
+
+    def _cross_unwind_is_proven(
+        self, predict_leg: CrossVenueLeg, polymarket_leg: CrossVenueLeg
+    ) -> bool:
+        polymarket = self._fresh_account_snapshot()
+        predict = self._fresh_predict_account_snapshot()
+        if polymarket is None or predict is None:
+            return False
+        return (
+            self._cross_position_quantity(polymarket, polymarket_leg) == 0
+            and self._cross_position_quantity(predict, predict_leg) == 0
+        )
+
+    def _finish_cross_neutralized(
+        self,
+        execution_id: str,
+        reason: str,
+        *,
+        evidence: Mapping[str, object],
+    ) -> None:
+        self._cross_breaker_open = True
+        details = {"phase": "cross_incident", "reason": reason, **self._safe_mapping(evidence)}
+        incident_id = self._record_incident(
+            execution_id, reason, state="neutralized_incident", evidence=details
+        )
+        self._transition(
+            execution_id,
+            "neutralized_incident",
+            {**details, "breaker": "open", **({"incident_id": incident_id} if incident_id else {})},
         )
 
     def _finish_cross_incident(

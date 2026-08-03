@@ -186,6 +186,111 @@ class PredictTradingClient:
         except Exception:
             return PredictLegResult(False, "rejected", error_code="rejected")
 
+    def cross_remediation_option(
+        self,
+        *,
+        venue: str,
+        market_id: str,
+        condition_id: str,
+        token_id: str,
+        outcome: str,
+        side: str,
+        quantity: Decimal,
+        maximum_fee: Decimal,
+    ) -> dict[str, object]:
+        """Refresh one exact Predict BUY completion option without submitting."""
+
+        quantity_wei = _scaled_integer(quantity, 10**18)
+        if (
+            venue != "predict.fun"
+            or side != "BUY"
+            or not all(isinstance(value, str) and value.strip() for value in (market_id, condition_id, token_id, outcome))
+            or quantity_wei is None
+            or not isinstance(maximum_fee, Decimal)
+            or not maximum_fee.is_finite()
+            or maximum_fee < 0
+        ):
+            return {"fresh": False}
+        try:
+            # Read the actual book once and bind the exact resulting builder
+            # quote; a submit never silently re-quotes the approved option.
+            book_payload = _data(self._json(f"/v1/markets/{market_id}/orderbook", auth=True))
+            stamp_ms = book_payload.get("updateTimestampMs")
+            stamp = _book_timestamp(stamp_ms)
+            if stamp is None or (datetime.now(UTC) - stamp).total_seconds() < 0 or (datetime.now(UTC) - stamp).total_seconds() > 10:
+                return {"fresh": False}
+            amounts = self._builder.get_market_order_amounts(
+                MarketHelperInput(Side.BUY, quantity_wei, slippage_bps=0, is_min_amount_out=True),
+                _book(book_payload),
+            )
+            quote = PredictBuyQuote(
+                str(market_id), str(token_id), int(amounts.price_per_share),
+                int(amounts.maker_amount), int(amounts.taker_amount),
+            )
+            if quote.minimum_redeemable_units != quantity_wei:
+                return {"fresh": False}
+            price = Decimal(quote.price_per_share_wei) / Decimal(10**6)
+            max_spend = Decimal(quote.max_collateral_debit) / Decimal(10**6)
+            fee = max_spend - quantity * price
+            if price <= 0 or price > 1 or max_spend <= 0 or fee < 0 or fee > maximum_fee:
+                return {"fresh": False}
+            return {
+                "fresh": True,
+                "checked_at": stamp,
+                "option": {
+                    "venue": venue,
+                    "market_id": market_id,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": outcome,
+                    "side": "BUY",
+                    "quantity": quantity,
+                    "executable_price": price,
+                    "fee": fee,
+                    "slippage": Decimal("0"),
+                    "residual_dust": Decimal("0"),
+                    "max_spend": max_spend,
+                },
+            }
+        except Exception:
+            return {"fresh": False}
+
+    def submit_cross_remediation_once(self, order: Mapping[str, object]) -> PredictLegResult:
+        """Submit exactly the bound Predict BUY option, never a replacement quote."""
+
+        if (
+            order.get("venue") != "predict.fun"
+            or order.get("side") != "BUY"
+            or not isinstance(order.get("market_id"), str)
+            or not isinstance(order.get("token_id"), str)
+        ):
+            return PredictLegResult(False, "rejected", error_code="rejected")
+        quantity = _number(order.get("quantity"))
+        price = _number(order.get("executable_price"))
+        max_spend = _number(order.get("max_spend"))
+        if quantity is None or price is None or max_spend is None or quantity <= 0 or not (Decimal("0") < price <= Decimal("1")) or max_spend <= 0:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+        units = _scaled_integer(quantity, 10**18)
+        price_wei = _scaled_integer(price, 10**6)
+        debit = _scaled_integer(max_spend, 10**6)
+        if units is None or price_wei is None or debit is None:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+        try:
+            quote = PredictBuyQuote(
+                str(order["market_id"]), str(order["token_id"]), price_wei, debit, units
+            )
+            market = self._market(quote.market_id)
+            response = self._json(
+                "/v1/orders", method="POST", data=self._order_body(quote, market), auth=True
+            )
+            row = _data(response)
+            order_id = row.get("hash") or row.get("id")
+            return PredictLegResult(True, "accepted", str(order_id or ""))
+        except (HTTPError, URLError, OSError):
+            return PredictLegResult(False, "ambiguous", error_code="ambiguous")
+        except Exception:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+
     def account_snapshot(self) -> Mapping[str, object]:
         scope = ApprovalScope("TRADE", False, False, Side.BUY)
         checks = self._builder.check_approvals(self._builder.get_approval_steps(scope))
@@ -277,6 +382,26 @@ def _number(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return number if number.is_finite() else None
+
+
+def _scaled_integer(value: object, scale: int) -> int | None:
+    number = _number(value)
+    if number is None or number <= 0:
+        return None
+    scaled = number * Decimal(scale)
+    if scaled != scaled.to_integral_value():
+        return None
+    return int(scaled)
+
+
+def _book_timestamp(value: object) -> datetime | None:
+    try:
+        milliseconds = int(value)
+        if milliseconds <= 0:
+            return None
+        return datetime.fromtimestamp(milliseconds / 1000, UTC)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 def _facts(row: Mapping[str, object]) -> tuple[str, Decimal, Decimal] | None:
