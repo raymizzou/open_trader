@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 from typing import Mapping
+from zoneinfo import ZoneInfo
 
 from .account_sync_state import (
     ACCOUNT_STATE_VERSION,
@@ -23,6 +24,7 @@ _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 _FUTU_NAIVE_PRICE_TIME_RE = re.compile(
     r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\Z"
 )
+_US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -501,7 +503,7 @@ def _public_broker_summary(row: object) -> dict[str, object]:
 
 
 def _public_position(row: Mapping[str, str]) -> dict[str, str]:
-    return {
+    position = {
         key: row[key]
         for key in (
             "broker", "account_alias", "market", "asset_class", "symbol", "name", "currency",
@@ -511,6 +513,17 @@ def _public_position(row: Mapping[str, str]) -> dict[str, str]:
             "statement_id", "confidence", "notes",
         )
     }
+    position["price_as_of"] = _normalize_public_price_as_of(
+        position["market"], position["price_as_of"]
+    )
+    return position
+
+
+def _normalize_public_price_as_of(market: str, value: str) -> str:
+    if market != "US" or _FUTU_NAIVE_PRICE_TIME_RE.fullmatch(value) is None:
+        return value
+    parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f")
+    return parsed.replace(tzinfo=_US_MARKET_TIMEZONE).isoformat(timespec="milliseconds")
 
 
 def _public_cash_balance(row: object) -> dict[str, str]:

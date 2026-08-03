@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_account_api_launchd.sh"
@@ -66,6 +68,7 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
     state = tmp_path / "state"
     pending = tmp_path / "pending"
     launchctl = tmp_path / "launchctl"
+    lsof = tmp_path / "lsof"
     curl = tmp_path / "curl"
     expected_sha = _git_sha(repo)
     launchctl.write_text(
@@ -85,6 +88,15 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
         "esac\n",
         encoding="utf-8",
     )
+    lsof.write_text(
+        "#!/bin/sh\n"
+        "echo \"$*\" >> \"$FAKE_CALLS\"\n"
+        "case \"$*\" in\n"
+        "*'-d cwd -Fn'*) printf 'p4242\\nfcwd\\nn%s\\n' \"$FAKE_REPO\" ;;\n"
+        "*'-iTCP:8768 -sTCP:LISTEN -Fn'*) printf 'p4242\\nn127.0.0.1:8768\\n' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
     curl.write_text(
         "#!/bin/sh\n"
         "echo \"$*\" >> \"$FAKE_CALLS\"\n"
@@ -92,6 +104,7 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
+    lsof.chmod(0o755)
     curl.chmod(0o755)
     health = json.dumps(
         {
@@ -119,10 +132,12 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
         env={
             **os.environ,
             "LAUNCHCTL_BIN": str(launchctl),
+            "LSOF_BIN": str(lsof),
             "CURL_BIN": str(curl),
             "FAKE_CALLS": str(calls),
             "FAKE_STATE": str(state),
             "FAKE_PENDING": str(pending),
+            "FAKE_REPO": str(repo),
             "FAKE_HEALTH": health,
         },
     )
@@ -136,6 +151,8 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
         f"print {domain}/{LABEL}",
         f"bootstrap {domain} {agents / f'{LABEL}.plist'}",
         f"print {domain}/{LABEL}",
+        "-a -p 4242 -d cwd -Fn",
+        "-nP -a -p 4242 -iTCP:8768 -sTCP:LISTEN -Fn",
         "-fsS http://127.0.0.1:8768/healthz",
     ]
 
@@ -147,6 +164,7 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
     calls = tmp_path / "calls"
     state = tmp_path / "state"
     launchctl = tmp_path / "launchctl"
+    lsof = tmp_path / "lsof"
     curl = tmp_path / "curl"
     launchctl.write_text(
         "#!/bin/sh\n"
@@ -156,7 +174,9 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     curl.write_text("#!/bin/sh\nprintf '%s\\n' '{}'\n", encoding="utf-8")
+    lsof.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     launchctl.chmod(0o755)
+    lsof.chmod(0o755)
     curl.chmod(0o755)
 
     result = subprocess.run(
@@ -168,7 +188,7 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
         ],
         capture_output=True,
         text=True,
-        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl), "CURL_BIN": str(curl), "FAKE_CALLS": str(calls), "FAKE_STATE": str(state)},
+        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl), "LSOF_BIN": str(lsof), "CURL_BIN": str(curl), "FAKE_CALLS": str(calls), "FAKE_STATE": str(state)},
     )
 
     assert result.returncode == 1
@@ -177,6 +197,94 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
     assert calls.read_text(encoding="utf-8").splitlines().count(f"bootout {domain}") == 2
     assert "frontend-gateway" not in calls.read_text(encoding="utf-8")
     assert "account-sync" not in calls.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("bad_field", ["cwd", "listener"])
+def test_installer_rejects_matching_health_when_process_identity_is_not_exact(
+    tmp_path: Path, bad_field: str
+) -> None:
+    repo = _copy_repo(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    calls = tmp_path / "calls"
+    state = tmp_path / "state"
+    launchctl = tmp_path / "launchctl"
+    lsof = tmp_path / "lsof"
+    curl = tmp_path / "curl"
+    expected_sha = _git_sha(repo)
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "echo \"$*\" >> \"$FAKE_CALLS\"\n"
+        "case \"$1\" in\n"
+        "bootout) rm -f \"$FAKE_STATE\" ;;\n"
+        "bootstrap) : > \"$FAKE_STATE\" ;;\n"
+        "print)\n"
+        "  if [ -f \"$FAKE_STATE\" ]; then echo 'pid = 4242'; exit 0; fi\n"
+        "  echo 'Could not find service' >&2; exit 113 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    lsof.write_text(
+        "#!/bin/sh\n"
+        "echo \"$*\" >> \"$FAKE_CALLS\"\n"
+        "case \"$*\" in\n"
+        "*'-d cwd -Fn'*)\n"
+        "  if [ \"$FAKE_BAD_FIELD\" = cwd ]; then printf 'p4242\\nfcwd\\nn/tmp/wrong\\n'; else printf 'p4242\\nfcwd\\nn%s\\n' \"$FAKE_REPO\"; fi ;;\n"
+        "*'-iTCP:8768 -sTCP:LISTEN -Fn'*)\n"
+        "  if [ \"$FAKE_BAD_FIELD\" = listener ]; then printf 'p4242\\nn127.0.0.1:8768\\nn*:8768\\n'; else printf 'p4242\\nn127.0.0.1:8768\\n'; fi ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    curl.write_text(
+        "#!/bin/sh\n"
+        "echo \"$*\" >> \"$FAKE_CALLS\"\n"
+        "printf '%s\\n' \"$FAKE_HEALTH\"\n",
+        encoding="utf-8",
+    )
+    for path in (launchctl, lsof, curl):
+        path.chmod(0o755)
+    health = json.dumps(
+        {
+            "schema_version": "open_trader.account_api.health.v1",
+            "module": "account_api",
+            "status": "ok",
+            "mode": "shadow",
+            "pid": 4242,
+            "api_git_sha": expected_sha,
+            "worker_git_sha": expected_sha,
+            "release_match": True,
+        }
+    )
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/install_account_api_launchd.sh"),
+            "--repo-root", str(repo), "--runtime-root", str(tmp_path / "runtime"),
+            "--python", sys.executable, "--launch-agents-dir", str(agents),
+            "--wait-seconds", "1",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "LAUNCHCTL_BIN": str(launchctl),
+            "LSOF_BIN": str(lsof),
+            "CURL_BIN": str(curl),
+            "FAKE_CALLS": str(calls),
+            "FAKE_STATE": str(state),
+            "FAKE_REPO": str(repo),
+            "FAKE_BAD_FIELD": bad_field,
+            "FAKE_HEALTH": health,
+        },
+    )
+
+    assert result.returncode == 1
+    assert "Account API did not publish matching shadow health" in result.stderr
+    recorded = calls.read_text(encoding="utf-8")
+    assert "-a -p 4242 -d cwd -Fn" in recorded
+    if bad_field == "listener":
+        assert "-nP -a -p 4242 -iTCP:8768 -sTCP:LISTEN -Fn" in recorded
+    assert "http://127.0.0.1:8768/healthz" not in recorded
 
 
 def test_uninstaller_preserves_loaded_plist_then_is_idempotent(tmp_path: Path) -> None:
