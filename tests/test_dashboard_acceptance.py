@@ -1604,7 +1604,7 @@ def integrated_v4_payload(
         frozen_allocation = freeze_allocation_reference(allocation_reference)
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            {"CN": "v11", "HK": "v9", "US": "v9"}[market]
+            {"CN": "v12", "HK": "v10", "US": "v10"}[market]
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )
@@ -1692,6 +1692,8 @@ def integrated_v4_payload(
                 **({
                     "simulate_rotation_pairs": [],
                     "real_rotation_pairs": [],
+                    "simulate_rotation_comparisons": [],
+                    "real_rotation_comparisons": [],
                 } if current_live_versions else {}),
             },
             "risk_summary": risk_summary,
