@@ -38,6 +38,13 @@ class PublicationUnavailable(Exception):
         self.worker_git_sha = worker_git_sha
 
 
+def load_worker_git_sha(data_dir: Path) -> str:
+    try:
+        return _worker_sha(_read_bytes(data_dir / "account_sync/controller_status.json"))
+    except (OSError, PublicationUnavailable):
+        return ""
+
+
 def load_account_snapshot(
     data_dir: Path, *, api_git_sha: str, now: datetime
 ) -> SnapshotResult:

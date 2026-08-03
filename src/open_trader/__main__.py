@@ -9,6 +9,10 @@ def main(argv: list[str] | None = None) -> int:
         from .frontend_gateway import main as frontend_gateway_main
 
         return frontend_gateway_main(args[1:])
+    if args[:1] == ["account-api"]:
+        from .account_api import main as account_api_main
+
+        return account_api_main(args[1:])
     from .cli import main as cli_main
 
     return cli_main(args)

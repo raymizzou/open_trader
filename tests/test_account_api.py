@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 import hashlib
+from http import HTTPStatus
+from http.server import ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
 
 import pytest
 
+import open_trader.account_api as account_api
 import open_trader.account_snapshot as account_snapshot
 from open_trader.account_snapshot import load_account_snapshot
 from open_trader.account_sync_state import (
@@ -25,6 +35,23 @@ from open_trader.models import AssetClass, CashBalance, Market, Position
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 NOW = datetime.fromisoformat("2026-08-03T12:00:05+08:00")
+
+
+@contextmanager
+def _running(server: ThreadingHTTPServer):
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def _get_json(url: str) -> dict[str, object]:
+    with urllib.request.urlopen(url) as response:
+        return json.load(response)
 
 
 def _contract_sha(value: object) -> str:
@@ -133,6 +160,120 @@ def _write_publication(
             "blocker": None,
         },
     )
+
+
+def test_account_api_health_snapshot_etag_and_not_found(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+    )
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        health = _get_json(base + "/healthz")
+        assert health["module"] == "account_api"
+        assert health["mode"] == "shadow"
+        assert health["release_match"] is True
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+            payload = json.load(response)
+            etag = response.headers["ETag"]
+            assert response.headers.get("Access-Control-Allow-Origin") is None
+        request = urllib.request.Request(
+            base + "/api/v1/account/snapshot",
+            headers={"If-None-Match": etag},
+        )
+        with pytest.raises(urllib.error.HTTPError) as unchanged:
+            urllib.request.urlopen(request)
+        assert unchanged.value.code == HTTPStatus.NOT_MODIFIED
+        assert unchanged.value.read() == b""
+        assert payload["snapshot_generation"].removeprefix("sha256:") in etag
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(base + "/api/unknown")
+        assert missing.value.code == HTTPStatus.NOT_FOUND
+        assert json.load(missing.value)["code"] == "not_found"
+
+
+def test_account_api_health_is_live_without_a_matching_worker_release(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir, worker_sha="f" * 40)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+    )
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        assert _get_json(base + "/healthz")["release_match"] is False
+        with pytest.raises(urllib.error.HTTPError) as snapshot:
+            urllib.request.urlopen(base + "/api/v1/account/snapshot")
+        assert snapshot.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_account_api_rejects_non_loopback_listener(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        account_api.create_account_api(tmp_path, host="0.0.0.0", port=8768)
+
+
+def test_account_api_entrypoint_does_not_import_domain_adapters() -> None:
+    script = '''
+import runpy, sys
+sys.argv = ["open_trader", "account-api", "--help"]
+try:
+    runpy.run_module("open_trader", run_name="__main__")
+except SystemExit as error:
+    assert error.code == 0
+print("LOADED_MODULES")
+print("\\n".join(sorted(sys.modules)))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    loaded = completed.stdout.split("LOADED_MODULES\n", 1)[1].splitlines()
+    for forbidden in (
+        "open_trader.account_sync_worker",
+        "open_trader.frontend_gateway",
+        "open_trader.dashboard_web",
+        "open_trader.futu_account",
+        "open_trader.tiger_account",
+        "open_trader.futu_quote",
+    ):
+        assert forbidden not in loaded
+
+
+def test_account_api_cli_uses_only_the_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    observed: list[Path] = []
+    monkeypatch.setattr(account_api, "serve_account_api", observed.append)
+
+    assert account_api.main(["--data-dir", str(data_dir)]) == 0
+
+    assert observed == [data_dir]
 
 
 def _rewrite_json(path: Path, updates: dict[str, object]) -> None:
