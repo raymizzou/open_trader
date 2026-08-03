@@ -897,6 +897,26 @@ def allocation_for(
     }
 
 
+def test_freeze_allocation_reference_normalizes_success_reason() -> None:
+    allocation = allocation_for("US", rank=2, entry_weight="0.04")
+    allocation["failure_reason"] = None
+
+    frozen = trend_module.freeze_allocation_reference(allocation)
+
+    assert frozen is not None
+    assert frozen["failure_reason"] == ""
+
+
+def test_valid_frozen_allocation_rejects_null_success_reason() -> None:
+    frozen = trend_module.freeze_allocation_reference(
+        allocation_for("US", rank=2, entry_weight="0.04")
+    )
+    assert frozen is not None
+    frozen["failure_reason"] = None
+
+    assert not trend_module.valid_frozen_allocation(frozen)
+
+
 def active_drawdown_for(
     snapshot: Mapping[str, object], *, equity: str,
 ) -> dict[str, object]:

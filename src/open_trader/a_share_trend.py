@@ -735,13 +735,14 @@ def freeze_allocation_reference(
         _validate_snapshot(snapshot)
         reused = allocation.get("reused", False)
         stale_days = allocation.get("stale_a_trading_days", 0)
-        failure_reason = allocation.get("failure_reason", "")
+        failure_reason = allocation.get("failure_reason")
+        if failure_reason is None:
+            failure_reason = ""
         if (
             type(reused) is not bool
             or isinstance(stale_days, bool)
             or not isinstance(stale_days, int)
             or stale_days < 0
-            or failure_reason is None
         ):
             raise ValueError
         if not isinstance(failure_reason, str):
@@ -768,7 +769,7 @@ def valid_frozen_allocation(value: object) -> bool:
     if not isinstance(value, Mapping) or set(value) != {
         "daily_path", "sha256", "allocation_date", "generated_at", "reused",
         "stale_a_trading_days", "failure_reason", "roots", "markets",
-    }:
+    } or not isinstance(value.get("failure_reason"), str):
         return False
     snapshot = {
         "version": 1,
