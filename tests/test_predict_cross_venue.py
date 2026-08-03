@@ -199,8 +199,8 @@ def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
             "POLYMARKET_YES_PREDICT_NO": {"possible": False, "reason": "same rule"},
         },
         "evidence": [
-            {"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"},
-            {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"},
+            {"exchange": "predict.fun", "field": "cutoff", "quote": "This contract closes at 23:59 UTC on December 31, 2026"},
+            {"exchange": "polymarket", "field": "cutoff", "quote": "This contract closes at 23:59 UTC on December 31, 2026"},
         ],
         "uncertainties": [],
     }
@@ -283,6 +283,34 @@ def test_equivalence_approval_accepts_twenty_nine_hour_raw_metadata_difference(t
     assert validator.validate(pair).approved is True
 
 
+def test_equivalence_rejects_opening_time_quote_as_cutoff_evidence(tmp_path: Path) -> None:
+    opening = "the market opens at 23:59 UTC on December 31, 2026"
+    pair = explicit_pair()
+    pair = replace(
+        pair,
+        predict=replace(pair.predict, rules=opening),
+        polymarket=replace(pair.polymarket, rules=opening),
+    )
+    structured = {
+        **equivalence_result(pair),
+        "evidence": [
+            {"exchange": "predict.fun", "field": "cutoff", "quote": opening},
+            {"exchange": "polymarket", "field": "cutoff", "quote": opening},
+        ],
+    }
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=codex_jsonl(structured), stderr=""
+        ),
+    )
+
+    result = validator.validate(pair)
+
+    assert result.approved is False
+    assert result.reason == "CUTOFF_EVIDENCE_MISMATCH"
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -324,6 +352,11 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     assert {"predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "contract_shape", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
     assert set(schema["$defs"]["venue_market"]["required"]) == {"exchange", "market_id", "condition_id", "rules_fingerprint"}
+    assert any(
+        clause.get("if", {}).get("properties", {}).get("contract_shape", {}).get("const") == "COMPOUND"
+        and clause.get("then", {}).get("properties", {}).get("decision", {}).get("const") == "REJECT"
+        for clause in schema["allOf"]
+    )
 
 
 def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> None:
@@ -1063,6 +1096,8 @@ def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
         validator.release_second.set()
         await wait_until(lambda: len(validator.calls) == 2)
         assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
+        await asyncio.sleep(0.005)
+        assert len(validator.calls) == 2
         await monitor.stop()
 
     asyncio.run(exercise())
@@ -1106,6 +1141,8 @@ def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
         validator.release_second.set()
         await wait_until(lambda: len(validator.calls) == 2)
         assert monitor.snapshot()["funnel"]["codex_approved_pairs"] == 1
+        await asyncio.sleep(0.005)
+        assert len(validator.calls) == 2
         await monitor.stop()
 
     asyncio.run(exercise())

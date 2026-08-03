@@ -67,6 +67,10 @@ _CUTOFF_QUOTE = re.compile(
     r"\bat\s+(\d{2}:\d{2})\s+UTC\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
     re.IGNORECASE,
 )
+_CUTOFF_SEMANTICS = re.compile(
+    r"\b(?:cutoff|close(?:s|d|ing)?|end(?:s|ed|ing)?|deadline)\b",
+    re.IGNORECASE,
+)
 _CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
 _HOT_HEALTH_POLL_SECONDS = 0.05
 CROSS_VENUE_DISCOVERY_SECONDS = 15 * 60
@@ -636,7 +640,7 @@ def _equivalence_validation(
         if not row["quote"] or row["quote"] not in rules:
             return _cross_venue_validation(pair, False, "EVIDENCE_NOT_FOUND", prompt_version)
         evidence_exchanges.add(exchange)
-        if _evidence_supports_cutoff(row["quote"], cutoff):
+        if row["field"] == "cutoff" and _evidence_supports_cutoff(row["quote"], cutoff):
             cutoff_evidence_exchanges.add(exchange)
     if evidence_exchanges != {"predict.fun", "polymarket"}:
         return _cross_venue_validation(pair, False, "MISSING_EVIDENCE", prompt_version)
@@ -664,9 +668,13 @@ def _canonical_cutoff(value: object) -> datetime | None:
 def _evidence_supports_cutoff(quote: object, cutoff: datetime) -> bool:
     if not isinstance(quote, str):
         return False
-    if cutoff.isoformat().replace("+00:00", "Z") in quote:
-        return True
-    for time_text, date_text in _CUTOFF_QUOTE.findall(quote):
+    for match in _CUTOFF_QUOTE.finditer(quote):
+        start = max(quote.rfind(mark, 0, match.start()) for mark in ".;\n") + 1
+        ends = [quote.find(mark, match.end()) for mark in ".;\n"]
+        end = min((position for position in ends if position >= 0), default=len(quote))
+        if _CUTOFF_SEMANTICS.search(quote[start:end]) is None:
+            continue
+        time_text, date_text = match.groups()
         try:
             quoted_cutoff = datetime.strptime(
                 f"{time_text} {date_text}", "%H:%M %B %d, %Y"

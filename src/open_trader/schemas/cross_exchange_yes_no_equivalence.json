@@ -80,6 +80,14 @@
           "uncertainties": { "maxItems": 0 }
         }
       }
+    },
+    {
+      "if": { "properties": { "contract_shape": { "const": "COMPOUND" } } },
+      "then": {
+        "properties": {
+          "decision": { "const": "REJECT" }
+        }
+      }
     }
   ],
   "$defs": {
