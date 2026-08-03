@@ -2475,6 +2475,52 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     assert state["cross_venue"]["status"] == "degraded"
 
 
+def test_build_cross_venue_monitor_uses_fail_closed_server_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    created: list[dict[str, object]] = []
+
+    class FakeCrossVenueMonitor:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    class FakeExecution:
+        def notify_ready_opportunity(self, *_args: object) -> None:
+            return None
+
+        def reconcile_cross_holdings_once(self) -> None:
+            return None
+
+    monkeypatch.setattr(dashboard_web, "PredictSource", lambda _config: object())
+    monkeypatch.setattr(
+        dashboard_web,
+        "CodexCrossVenueEquivalenceValidator",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(dashboard_web, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
+
+    for raw, expected in (
+        (None, "observe_only"),
+        ("manual_confirm", "manual_confirm"),
+        ("invalid", "observe_only"),
+    ):
+        if raw is None:
+            monkeypatch.delenv("OPEN_TRADER_CROSS_EXECUTION_MODE", raising=False)
+        else:
+            monkeypatch.setenv("OPEN_TRADER_CROSS_EXECUTION_MODE", raw)
+        dashboard_web._build_cross_venue_monitor(
+            trading_config=type("Config", (), {"predict": object()})(),
+            prediction_monitor=object(),
+            store=object(),
+            execution=FakeExecution(),
+            codex_model="test-model",
+            predict_trading=object(),
+        )
+        assert created[-1]["execution_mode"] == expected
+
+
 def test_prediction_ids_cross_venue_reach_the_existing_preview_and_confirmation_routes(tmp_path: Path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
@@ -3605,6 +3651,10 @@ console.log(JSON.stringify({
   invalidMapping:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,direct_outcome_mapping:{...preview.codex_approval.direct_outcome_mapping,polymarket_no:"YES"}}}),
   invalidCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"not-a-date"}),
   expiredCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2020-01-01T00:00:00Z"}),
+  dateOnlyCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31"}),
+  naiveCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00"}),
+  offsetCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00+08:00"}),
+  validFractionalUtcCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00.123Z"}),
   invertedOutcomes:predictionPreviewIsComplete({...preview,buy_legs:[preview.buy_legs[0],{...preview.buy_legs[1],outcome:"YES"}]}),
   nonNumericFees:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],maximum_fee:"fee"},preview.buy_legs[1]]}),
   missingFeeAsset:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],fee_asset:undefined},preview.buy_legs[1]]}),
@@ -3627,6 +3677,10 @@ console.log(JSON.stringify({
         "invalidMapping": False,
         "invalidCutoff": False,
         "expiredCutoff": False,
+        "dateOnlyCutoff": False,
+        "naiveCutoff": False,
+        "offsetCutoff": False,
+        "validFractionalUtcCutoff": True,
         "invertedOutcomes": False,
         "nonNumericFees": False,
         "missingFeeAsset": False,

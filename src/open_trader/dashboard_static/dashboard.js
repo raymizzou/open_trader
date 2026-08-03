@@ -3301,7 +3301,9 @@ function predictionPreviewIsComplete(value) {
       return predictionHasValue(item) && Number.isFinite(number) && number >= 0;
     };
     const identity = (item) => typeof item === "string" && item.trim().length > 0;
-    const cutoffTimestamp = typeof preview.canonical_cutoff === "string"
+    const canonicalUtcCutoff = typeof preview.canonical_cutoff === "string"
+      && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(preview.canonical_cutoff);
+    const cutoffTimestamp = canonicalUtcCutoff
       ? Date.parse(preview.canonical_cutoff)
       : NaN;
     const expectedMapping = {

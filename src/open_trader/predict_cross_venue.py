@@ -37,6 +37,16 @@ from .prediction_arbitrage_store import PredictionArbitrageStore
 
 
 Direction = Literal["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"]
+CROSS_EXECUTION_MODES = frozenset({"observe_only", "manual_confirm"})
+
+
+def validate_cross_execution_mode(value: object) -> str:
+    """Return the server-owned cross execution mode, failing closed."""
+
+    mode = value.strip() if isinstance(value, str) else ""
+    return mode if mode in CROSS_EXECUTION_MODES else "observe_only"
+
+
 CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION = (
     "cross-exchange-yes-no-equivalence-v2"
 )
@@ -940,7 +950,7 @@ class CodexCrossVenueEquivalenceValidator:
 
 
 class PredictCrossVenueMonitor:
-    """One observation-only task for slow discovery and approved-pair books."""
+    """Slow discovery and approved-pair books under a server-owned policy."""
 
     def __init__(
         self,
@@ -954,6 +964,7 @@ class PredictCrossVenueMonitor:
         store: PredictionArbitrageStore | None = None,
         ready_observer: Callable[[str, str], object] | None = None,
         holding_reconciler: Callable[[], object] | None = None,
+        execution_mode: str = "observe_only",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._predict = predict_source
@@ -965,6 +976,7 @@ class PredictCrossVenueMonitor:
         self._store = store
         self._ready_observer = ready_observer
         self._holding_reconciler = holding_reconciler
+        self._execution_mode = validate_cross_execution_mode(execution_mode)
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
         self._hot_restart = asyncio.Event()
@@ -997,7 +1009,7 @@ class PredictCrossVenueMonitor:
         return copy.deepcopy(
             {
                 "status": self._status,
-                "mode": "observe_only",
+                "mode": self._execution_mode,
                 "funnel": {
                     "matched_pairs": self._matched_pairs,
                     "monitored_pairs": self._monitored_pairs,
@@ -1364,7 +1376,7 @@ class PredictCrossVenueMonitor:
             "polymarket_question": pair.polymarket.question,
             "direction": intent.direction,
             "market_type": "cross_venue_yes_no",
-            "execution_mode": "observe_only",
+            "execution_mode": self._execution_mode,
             "actionable": intent.actionable,
             "clear_signal": intent.actionable,
             "funnel_stage": 5 if intent.actionable else 4,

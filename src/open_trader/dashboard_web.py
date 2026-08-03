@@ -39,6 +39,7 @@ from .polymarket_relation_discovery import (
 from .predict_cross_venue import (
     CodexCrossVenueEquivalenceValidator,
     PredictCrossVenueMonitor,
+    validate_cross_execution_mode,
 )
 from .predict_source import PredictSource
 from .predict_trading import PredictTradingClient
@@ -2073,6 +2074,9 @@ def _build_cross_venue_monitor(
             store=store,
             ready_observer=execution.notify_ready_opportunity,
             holding_reconciler=execution.reconcile_cross_holdings_once,
+            execution_mode=validate_cross_execution_mode(
+                os.environ.get("OPEN_TRADER_CROSS_EXECUTION_MODE")
+            ),
         )
     except Exception:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")

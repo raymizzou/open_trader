@@ -1171,6 +1171,41 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
     asyncio.run(exercise())
 
 
+def test_monitor_explicit_manual_confirm_mode_is_emitted_by_real_monitor() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
+            execution_mode="manual_confirm",
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+
+        snapshot = monitor.snapshot()
+        assert snapshot["mode"] == "manual_confirm"
+        assert snapshot["opportunities"]
+        assert all(
+            row["execution_mode"] == "manual_confirm"
+            for row in snapshot["opportunities"]
+        )
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -> None:
     async def exercise() -> None:
         predict = FakeCrossVenuePredict(
