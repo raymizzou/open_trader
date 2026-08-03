@@ -1,7 +1,7 @@
 # Monthly Portfolio Import
 
 Run this once per month after placing the latest broker statement PDFs on disk.
-Statement parsing writes dated candidate artifacts; the account-sync controller
+Statement parsing writes dated candidate artifacts; the Account Sync Worker
 is the only process that publishes the accepted Dashboard portfolio and quote
 files.
 
@@ -21,7 +21,7 @@ Main candidate output:
 data/runs/<YYYY-MM>/portfolio.csv
 ```
 
-After reviewing the candidate and ensuring the controller is installed, inspect
+After reviewing the candidate and ensuring the Worker is installed, inspect
 the accepted publication with:
 
 ```bash
@@ -35,7 +35,7 @@ The production chain is:
 Futu account / Futu quotes / Tiger account
                    |
                    v
-      account-sync-controller (single PID)
+         account-sync-worker (single PID)
                    |
                    v
  account_sync_state.json / portfolio.csv / quotes.json
@@ -43,6 +43,11 @@ Futu account / Futu quotes / Tiger account
                    v
              Dashboard reads
 ```
+
+The Worker command is `account-sync-worker`. During R1 the stable launchd label
+`com.open-trader.account-sync-controller` and the persisted
+`controller_status.json` / `controller.lock` names retain their historical
+token; they are compatibility identifiers, not HTTP Controller roles.
 
 If a source fails, its last accepted holdings remain visible but are marked
 failed or stale. Account-dependent actions are paused until a later successful
@@ -212,11 +217,11 @@ at a stop loss, at a target, or only on watch.
 
 ## Live Account Configuration
 
-The sole controller reads Futu and Tiger using the existing OpenD and Tiger
-configuration. Keep credentials in their normal local configuration locations;
-the Dashboard and `account-sync-status` expose sanitized health only. To
-change the controller's Tiger configuration, update the configuration consumed
-by launchd and reinstall the same controller:
+The sole Account Sync Worker reads Futu and Tiger using the existing OpenD and
+Tiger configuration. Keep credentials in their normal local configuration
+locations; the Dashboard and `account-sync-status` expose sanitized health only. To
+change the Worker's Tiger configuration, update the configuration consumed by
+launchd and reinstall the same Worker:
 
 ```bash
 scripts/install_account_sync_launchd.sh --repo-root "$PWD"

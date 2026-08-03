@@ -15,7 +15,7 @@ Futu simulated orders from one explicitly designated executor host.
 
 - Import monthly broker statements into a normalized portfolio CSV.
 - Publish accepted Futu/Tiger account snapshots and quotes through one
-  account-sync controller.
+  Account Sync Worker.
 - Generate per-symbol premarket advice with TradingAgents and DeepSeek.
 - Preserve raw model output and normalized trader templates for auditability.
 - Extract K-line technical facts from TradingAgents advice/report output into
@@ -192,7 +192,7 @@ private key environment value.
 
 ## Common Workflows
 
-### Account and Quote Sync Controller
+### Account and Quote Sync Worker
 
 Account reads, quote reads, and publication have one owner. The production chain
 is:
@@ -201,7 +201,7 @@ is:
 Futu account / Futu quotes / Tiger account
                    |
                    v
-      account-sync-controller (single PID)
+         account-sync-worker (single PID)
                    |
                    v
  account_sync_state.json / portfolio.csv / quotes.json
@@ -210,13 +210,18 @@ Futu account / Futu quotes / Tiger account
              Dashboard reads
 ```
 
-Install or refresh the sole launchd controller and inspect the files it
+Install or refresh the sole launchd Worker and inspect the files it
 publishes:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m open_trader account-sync-status --data-dir data
 scripts/install_account_sync_launchd.sh --repo-root "$PWD"
 ```
+
+The Worker command is `account-sync-worker`. During R1 the stable launchd label
+`com.open-trader.account-sync-controller` and the persisted
+`controller_status.json` / `controller.lock` names retain their historical
+token; they are compatibility identifiers, not HTTP Controller roles.
 
 The Dashboard has no account or quote write path and no manual refresh action.
 It only projects `data/latest/account_sync_state.json`,
@@ -241,7 +246,7 @@ data/runs/<YYYY-MM>/portfolio.csv
 ```
 
 Statement imports create dated candidate artifacts. The sole account-sync
-controller is the only process that publishes the accepted aggregate
+Worker is the only process that publishes the accepted aggregate
 `data/latest/portfolio.csv` consumed by the Dashboard.
 
 ### Run Premarket Advice Manually
@@ -478,7 +483,7 @@ The watcher writes `data/runs/<YYYY-MM-DD>/<market>/t_signals.json` and promotes
 ratio, evidence, current status, and notification timeline. Alerts are
 deduplicated by signal cycle, and the workflow remains read-only.
 
-The account-sync controller refreshes the published quote snapshot. If a quote
+The Account Sync Worker refreshes the published quote snapshot. If a quote
 refresh fails, it keeps the last successful snapshot and the Dashboard shows a
 failure or stale warning instead of hiding the problem.
 
