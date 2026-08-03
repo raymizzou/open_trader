@@ -1967,6 +1967,25 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15),
     )["eastmoney"]["available"] is False
 
+    historical = _dashboard_frozen_report_payload()
+    path.write_text(json.dumps(historical, ensure_ascii=False), encoding="utf-8")
+    historical_projected = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]
+    assert historical_projected["available"] is True
+    assert historical_projected["simulate_rotation_pairs"] == []
+    assert historical_projected["real_rotation_pairs"] == []
+
+    allocationless_pairs = _dashboard_frozen_report_payload()
+    judgments = allocationless_pairs["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulate_rotation_pairs"] = []
+    judgments["real_rotation_pairs"] = []
+    path.write_text(json.dumps(allocationless_pairs, ensure_ascii=False), encoding="utf-8")
+    assert dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]["available"] is False
+
 
 def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(
     tmp_path: Path,

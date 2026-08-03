@@ -1840,6 +1840,11 @@ def test_valid_report_rejects_invalid_frozen_allocation_and_rotation_pair(
     malformed_hash = json.loads(json.dumps(report))
     malformed_hash["allocation"]["sha256"] = "c" * 64
     assert not controller._valid_report(config, "CN", "2026-07-20", path, malformed_hash)
+    allocationless_pairs = json.loads(json.dumps(report))
+    del allocationless_pairs["allocation"]
+    assert not controller._valid_report(
+        config, "CN", "2026-07-20", path, allocationless_pairs
+    )
 
 
 def test_execution_completion_distinguishes_partial_and_full_sell_goals(

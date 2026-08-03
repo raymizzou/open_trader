@@ -796,11 +796,16 @@ def valid_frozen_allocation(value: object) -> bool:
 def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     """Validate the allocation-era fields once for every frozen-report reader."""
     allocation = payload.get("allocation")
+    judgments = payload.get("strategy_judgments")
     if allocation is None:
+        if isinstance(judgments, Mapping) and any(
+            field in judgments
+            for field in ("simulate_rotation_pairs", "real_rotation_pairs")
+        ):
+            return False
         return True
     if not valid_frozen_allocation(allocation):
         return False
-    judgments = payload.get("strategy_judgments")
     if not isinstance(judgments, Mapping):
         return False
     try:
@@ -812,22 +817,33 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     candidates = judgments.get("top10_candidates")
     if not isinstance(holdings, list) or not isinstance(candidates, list):
         return False
-    holding_symbols = {
+    simulate_holding_symbols = {
         item.get("symbol")
         for item in holdings
         if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
     }
+    real_holdings = judgments.get("real_holding_decisions")
+    real_holding_symbols = {
+        item.get("symbol")
+        for item in real_holdings
+        if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+    } if isinstance(real_holdings, list) else set()
     candidate_symbols = {
         item.get("symbol")
         for item in candidates
         if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
     }
-    for field, mode in (
-        ("simulate_rotation_pairs", "automatic"),
-        ("real_rotation_pairs", "manual"),
+    for field, mode, holding_symbols in (
+        ("simulate_rotation_pairs", "automatic", simulate_holding_symbols),
+        ("real_rotation_pairs", "manual", real_holding_symbols),
     ):
         pairs = judgments.get(field)
         if not isinstance(pairs, list) or len(pairs) > 2:
+            return False
+        if field == "real_rotation_pairs" and pairs and (
+            judgments.get("real_holding_decisions_status") != "available"
+            or not isinstance(real_holdings, list)
+        ):
             return False
         seen_indices: set[int] = set()
         seen_symbols: set[str] = set()
@@ -5226,6 +5242,16 @@ def render_trend_feishu_text(
         f"账户状态：{status}",
         summary,
     ]
+    if cost_label := _serialized_api_cost_label(payload):
+        lines.append(cost_label)
+    _append_feishu_action_sections(
+        lines,
+        sells,
+        (),
+        (),
+        market=market,
+        current_exit_discipline=current_exit_discipline,
+    )
     allocation = payload.get("allocation")
     if allocation is not None:
         if not isinstance(allocation, Mapping):
@@ -5253,11 +5279,9 @@ def render_trend_feishu_text(
                 currency={"CN": "元", "HK": "港元", "US": "美元"}.get(market, ""),
             )
         )
-    if cost_label := _serialized_api_cost_label(payload):
-        lines.append(cost_label)
     _append_feishu_action_sections(
         lines,
-        sells,
+        (),
         buys,
         reviews,
         market=market,

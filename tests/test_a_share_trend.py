@@ -561,14 +561,48 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         for pair in payload["strategy_judgments"]["simulate_rotation_pairs"]
     ] == [("100000", "200001"), ("100001", "200002")]
     assert trend_module.valid_frozen_report_contract(payload)
+    valid_real_pair = json.loads(json.dumps(payload))
+    real_pair = copy.deepcopy(
+        valid_real_pair["strategy_judgments"]["simulate_rotation_pairs"][0]
+    )
+    real_pair.update(
+        sell_symbol="REAL",
+        sell_name="Real",
+        sell_futu_symbol="SH.REAL",
+        execution_mode="manual",
+    )
+    valid_real_pair["strategy_judgments"].update(
+        real_holding_decisions=[{"symbol": "REAL"}],
+        real_holding_decisions_status="available",
+        real_holding_decisions_source={},
+        real_rotation_pairs=[real_pair],
+    )
+    assert trend_module.valid_frozen_report_contract(valid_real_pair)
+
+    allocationless_pairs = json.loads(json.dumps(payload))
+    del allocationless_pairs["allocation"]
+    assert not trend_module.valid_frozen_report_contract(allocationless_pairs)
+    historical = json.loads(json.dumps(allocationless_pairs))
+    historical["strategy_judgments"].pop("simulate_rotation_pairs")
+    historical["strategy_judgments"].pop("real_rotation_pairs")
+    assert trend_module.valid_frozen_report_contract(historical)
+    assert "模拟盘自动轮换" not in render_markdown(
+        replace(built, allocation=None)
+    )
     markdown = render_markdown(built)
+    ordered_payload = json.loads(json.dumps(payload))
+    ordered_payload["strategy_judgments"]["formal_actions"] = [
+        {"action": "SELL_ALL", "symbol": "EXIT", "name": "Exit", "reason": "danger_signal"},
+        {"action": "BUY", "symbol": "ENTRY", "name": "Entry", "estimated_shares": 100, "target_amount": "1000"},
+    ]
     _, feishu = render_trend_feishu_text(
-        payload, broker_label="东方财富", market_label="A股"
+        ordered_payload, broker_label="东方财富", market_label="A股"
     )
     for text in (markdown, feishu):
         assert "市场资源排名" in text
         assert "模拟盘自动轮换" in text
         assert "MARKET 卖出全成后才买入" in text
+    assert feishu.index("\n卖出\n") < feishu.index("模拟盘自动轮换") < feishu.index("\n买入\n")
 
     invalid_payloads = []
     wrong_hash = json.loads(json.dumps(payload))
@@ -5774,6 +5808,57 @@ def test_frozen_base_artifact_is_idempotent(tmp_path: Path) -> None:
     assert markdown_path.read_text(encoding="utf-8") == original_markdown
     assert json_path.read_text(encoding="utf-8") == original_json
     assert json.loads(original_json)["execution_date"] == "2026-07-15"
+
+
+def test_receipt_recovery_preserves_frozen_allocation_and_rotation_payload(
+    tmp_path: Path,
+) -> None:
+    protection_state = {"schema_version": 1, "positions": {}}
+    frozen_payload = {
+        "allocation": {
+            "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+            "sha256": "b" * 64,
+        },
+        "strategy_judgments": {
+            "simulate_rotation_pairs": [{
+                "sell_symbol": "SIM", "buy_symbol": "BUY",
+                "execution_date": "2026-08-04", "execution_mode": "automatic",
+            }],
+            "real_rotation_pairs": [{
+                "sell_symbol": "REAL", "buy_symbol": "BUY",
+                "execution_date": "2026-08-04", "execution_mode": "manual",
+            }],
+        },
+        "protection_state": protection_state,
+    }
+    receipt_path = tmp_path / "delivery/2026-08-03.json"
+    trend_module._write_delivery_receipt(
+        receipt_path,
+        status="prepared",
+        generated_at="2026-08-03T16:20:00+08:00",
+        artifact_stem="2026-08-03",
+        markdown="frozen",
+        report_json=json.dumps(frozen_payload, ensure_ascii=False),
+        protection_state=protection_state,
+    )
+    latest = tmp_path / "trend_allocation/latest.json"
+    latest.parent.mkdir(parents=True)
+    latest.write_text(
+        json.dumps({"daily_path": "data/trend_allocation/daily/later.json"}),
+        encoding="utf-8",
+    )
+
+    recovered = trend_module.read_delivery_receipt(
+        receipt_path, artifact_stem="2026-08-03"
+    )
+    assert recovered is not None
+    assert json.loads(str(recovered["report_json"])) == frozen_payload
+    _, replayed_json = trend_module._freeze_receipt_report(
+        receipt=recovered,
+        reports_dir=tmp_path / "reports/trend_a_share",
+        artifact_stem="2026-08-03",
+    )
+    assert json.loads(replayed_json.read_text(encoding="utf-8")) == frozen_payload
 
 
 def test_frozen_revisions_choose_first_free_pair(tmp_path: Path) -> None:

@@ -2358,11 +2358,15 @@ def _project_broker_trend_report(
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
         "allocation": payload.get("allocation"),
-        "simulate_rotation_pairs": payload["strategy_judgments"].get(
-            "simulate_rotation_pairs", []
+        "simulate_rotation_pairs": (
+            payload["strategy_judgments"].get("simulate_rotation_pairs", [])
+            if payload.get("allocation") is not None
+            else []
         ),
-        "real_rotation_pairs": payload["strategy_judgments"].get(
-            "real_rotation_pairs", []
+        "real_rotation_pairs": (
+            payload["strategy_judgments"].get("real_rotation_pairs", [])
+            if payload.get("allocation") is not None
+            else []
         ),
         "industry_context_status": frozen_industry_context_status,
         "industry_contexts": frozen_industry_contexts,
