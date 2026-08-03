@@ -1526,6 +1526,56 @@ def test_relative_rotation_opening_version_recovers_prior_buy_fact_after_snapsho
     assert details == ("v10", "historical_discipline")
 
 
+def test_relative_rotation_sell_sidecar_persists_historical_opening_version(
+    tmp_path: Path,
+) -> None:
+    trend_review.freeze_discipline_fact(
+        tmp_path,
+        "CN",
+        "2026-07-19",
+        "100000",
+        [{
+            "order_id": "prior-buy",
+            "code": "SH.WEAK",
+            "trd_side": "BUY",
+            "qty": "1000",
+            "dealt_qty": "1000",
+            "dealt_avg_price": "7",
+            "order_status": "FILLED_ALL",
+            "remark": "ordinary:prior-buy",
+        }],
+        {"strategy_id": "trend_animals_warm_to_hot/CN/v10", "strategy_version": "v10"},
+    )
+
+    class Filled(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"], "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [item for item in self.positions if item["code"] != "SH.WEAK"]
+                self.cash = "6993"
+            return response
+
+    client = Filled(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    for minute in (30, 31):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20", now=f"2026-07-20T10:{minute}:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+    sell_fact = next(tmp_path.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/sell-filled.json"
+    ))
+    sell = json.loads(sell_fact.read_text(encoding="utf-8"))
+    assert (sell["opening_strategy_version"], sell["opening_strategy_version_source"]) == (
+        "v10", "historical_discipline"
+    )
+
+
 @pytest.mark.parametrize(
     ("positions", "source_date", "reason"),
     [
