@@ -824,7 +824,13 @@ def test_snapshot_accepts_futu_active_us_price_time(tmp_path: Path) -> None:
     futu_position = next(
         row for row in result.payload["positions"] if row["broker"] == "futu"
     )
-    assert futu_position["price_as_of"] == price_time
+    assert futu_position["price_as_of"] == "2026-08-03T04:18:41.889-04:00"
+    parsed_price_as_of = datetime.fromisoformat(futu_position["price_as_of"])
+    assert parsed_price_as_of.utcoffset() is not None
+    statement_position = next(
+        row for row in result.payload["positions"] if row["broker"] == "phillips"
+    )
+    assert statement_position["price_as_of"] == "2026-07-31"
 
 
 def test_snapshot_rejects_negative_quote_count(tmp_path: Path) -> None:
