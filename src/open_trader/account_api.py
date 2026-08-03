@@ -80,6 +80,8 @@ def create_account_api(
     runtime_metadata: Mapping[str, object] | None = None,
     mode: AccountApiMode = "shadow",
 ) -> ThreadingHTTPServer:
+    if mode not in ("shadow", "production"):
+        raise ValueError("mode must be shadow or production")
     try:
         if not ipaddress.ip_address(host).is_loopback:
             raise ValueError("host must be a loopback address")

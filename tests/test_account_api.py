@@ -252,6 +252,16 @@ def test_account_api_health_reports_selected_mode(tmp_path: Path) -> None:
             assert _get_json(base + "/healthz")["mode"] == mode
 
 
+def test_account_api_rejects_invalid_programmatic_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="mode"):
+        account_api.create_account_api(
+            tmp_path,
+            host="127.0.0.1",
+            port=0,
+            mode="prodution",  # type: ignore[arg-type]
+        )
+
+
 def test_account_api_rejects_non_loopback_listener(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="loopback"):
         account_api.create_account_api(tmp_path, host="0.0.0.0", port=8768)
