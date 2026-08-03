@@ -12379,11 +12379,12 @@ console.log("ok");
 
 def test_dashboard_renders_frozen_allocation_and_relative_rotation_hierarchy() -> None:
     output = run_dashboard_js(r'''
-const pair = (mode, sell, buy) => ({
+const pair = (mode, sell, buy, status = {}) => ({
   sell_symbol:sell, sell_name:"弱势标的", sell_global_strength:"41",
   buy_symbol:buy, buy_name:"强势标的", buy_global_strength:"81",
   strength_gap:"40", target_weight:"0.06", target_amount:"6000",
   estimated_shares:300, execution_date:"2026-08-04", execution_mode:mode,
+  ...status,
 });
 const base = {
   available:true, market:"CN", broker:"eastmoney", broker_label:"东方财富",
@@ -12412,8 +12413,14 @@ const report = {
       US:{rank:1,score:"82",score_source:"美国ETF",entry_weight:"0.06",nominal_weight:"0.60"},
     },
   },
-  simulate_rotation_pairs:[pair("automatic", "SIM-SELL", "SIM-BUY")],
-  real_rotation_pairs:[pair("manual", "REAL-SELL", "REAL-BUY")],
+  simulate_rotation_pairs:[
+    pair("automatic", "SIM-SELL", "SIM-BUY", {execution_status:"卖出已成交"}),
+    pair("automatic", "SIM-SELL-2", "SIM-BUY-2", {status:"等待账户刷新"}),
+  ],
+  real_rotation_pairs:[
+    pair("manual", "REAL-SELL", "REAL-BUY", {order_status:"人工复核中"}),
+    pair("manual", "REAL-SELL-2", "REAL-BUY-2"),
+  ],
 };
 const html = renderTrendReportWorkspace(report);
 const order = [
@@ -12426,15 +12433,22 @@ if (order.some((index) => index < 0)
 }
 for (const text of [
   "市场资源排名", "模拟盘自动", "实盘手动", "全局强度", "单仓基准 6%",
-  "10 席位名义仓位 60%", "沿用旧排名 · 2 个 A 股交易日", "2026-08-01",
+  "10 席位名义仓位 60%", "沿用旧排名 · 2 个 A 股交易日 · 原快照 2026-08-03", "2026-08-01",
   "生成 2026-08-03T16:20:00+08:00", "目标交易日 2026-08-04", "SHA abcdef123456",
   "SIM-SELL", "SIM-BUY", "REAL-SELL", "REAL-BUY", "差值 40",
   "目标金额 6,000", "预计数量 300 股", "MARKET 卖出全成后才买入",
+  "卖出已成交", "等待账户刷新", "人工复核中", "待人工执行",
+  "本次更新失败原因：上游短暂不可用",
+  "API 返回的全局比较值", "不是小程序收藏夹显示的收藏夹内排名分位",
 ]) {
   if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
 }
 if ((html.match(/class="trend-allocation-card"/g) || []).length !== 3) throw new Error(html);
 if ((html.match(/class="trend-rotation-group"/g) || []).length !== 2) throw new Error(html);
+if ((html.match(/<dt>执行状态<\/dt>/g) || []).length !== 4) throw new Error(html);
+const cardMarkets = [...html.matchAll(/class="trend-allocation-card" data-market="([A-Z]+)"/g)].map((match) => match[1]);
+if (cardMarkets.join(",") !== "US,HK,CN") throw new Error("wrong rank order: " + cardMarkets + "\n" + html);
+if (!html.includes('data-market="CN" data-current-report="true"') || !html.includes("第 3 名 · 当前报告")) throw new Error(html);
 if (!html.includes("ETF基金&lt;script&gt;") || html.includes("ETF基金<script>")) throw new Error(html);
 const historical = renderTrendReportWorkspace(base, true, true);
 if (historical.includes("trend-allocation-panel") || historical.includes("trend-rotation-panel")) {

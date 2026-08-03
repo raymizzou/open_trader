@@ -691,6 +691,9 @@ test('renders allocation and relative rotation in desktop and mobile report orde
   expect(await page.locator('.trend-allocation-cards').evaluate((node) => (
     getComputedStyle(node).gridTemplateColumns.split(' ').length
   ))).toBe(1);
+  expect(await page.locator('.trend-rotation-groups').evaluate((node) => (
+    getComputedStyle(node).gridTemplateColumns.split(' ').length
+  ))).toBe(1);
   const mobile = await page.evaluate(() => {
     const selectors = [
       '.trend-report-header', '.trend-allocation-panel', '.cn-trend-sell',
@@ -701,16 +704,20 @@ test('renders allocation and relative rotation in desktop and mobile report orde
       return [...node.parentElement!.children].indexOf(node);
     });
     const cards = [...document.querySelectorAll('.trend-allocation-card, .trend-rotation-pair')];
-    const button = document.querySelector('.trend-report-header button')!;
+    const controls = [...document.querySelectorAll(
+      '.trend-report-header button, .trend-allocation-panel button, .trend-rotation-panel button',
+    )];
     return {
       order,
       pageFits: document.documentElement.scrollWidth <= window.innerWidth,
       cardsFit: cards.every((node) => node.scrollWidth <= node.clientWidth),
-      touchHeight: button.getBoundingClientRect().height,
+      controlCount: controls.length,
+      controlsFit: controls.every((node) => node.getBoundingClientRect().height >= 44),
     };
   });
   expect(mobile.order.every((value, index) => index === 0 || mobile.order[index - 1] < value)).toBe(true);
   expect(mobile.pageFits).toBe(true);
   expect(mobile.cardsFit).toBe(true);
-  expect(mobile.touchHeight).toBeGreaterThanOrEqual(44);
+  expect(mobile.controlCount).toBeGreaterThan(0);
+  expect(mobile.controlsFit).toBe(true);
 });
