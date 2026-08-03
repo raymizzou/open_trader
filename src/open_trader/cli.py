@@ -145,6 +145,7 @@ from .trend_market_controller import (
     run_trend_market_controller,
 )
 from .trend_allocation import (
+    allocation_reference_for_report,
     load_trend_allocation_status,
     run_trend_allocation_controller,
 )
@@ -1701,6 +1702,33 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("drawdown preflight clock must be timezone-aware")
             occurred_at = now.isoformat(timespec="seconds")
             quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+            allocation = None
+            allocation_date = now.astimezone(
+                ZoneInfo("Asia/Shanghai")
+            ).date().isoformat()
+            allocation_status_path = (
+                config.data_dir / "trend_allocation/controller_status.json"
+            )
+            if allocation_status_path.is_file():
+                allocation_status = load_trend_allocation_status(config, now=now)
+                if (
+                    allocation_status.get("attempted_for") == allocation_date
+                    and allocation_status.get("phase")
+                    in {"ready", "fallback", "holiday"}
+                ):
+                    allocation_day = date.fromisoformat(allocation_date)
+                    allocation = allocation_reference_for_report(
+                        config,
+                        allocation_date=allocation_date,
+                        a_trading_days=quote.get_trading_days(
+                            market="CN",
+                            start=(allocation_day - timedelta(days=35)).isoformat(),
+                            end=(allocation_day + timedelta(days=1)).isoformat(),
+                        ),
+                    )
+            allocation_kwargs = (
+                {"allocation": allocation} if allocation is not None else {}
+            )
             inputs: dict[str, DrawdownMarketInput] = {}
             for market in ("CN", "HK", "US"):
                 pool_ids = {
@@ -1727,6 +1755,7 @@ def main(argv: list[str] | None = None) -> int:
                         accepted_git_sha,
                         pool_ids,
                         execution_date=entry_eligible_from,
+                        **allocation_kwargs,
                     )
                     inputs[market] = DrawdownMarketInput(
                         market=market,
@@ -1742,6 +1771,7 @@ def main(argv: list[str] | None = None) -> int:
                             accepted_git_sha,
                             pool_ids,
                             execution_date=now.date().isoformat(),
+                            **allocation_kwargs,
                         )
                     inputs[market] = DrawdownMarketInput(
                         market=market,
