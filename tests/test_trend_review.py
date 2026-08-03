@@ -211,6 +211,43 @@ def test_rotation_revision_fills_only_the_unused_slot(tmp_path: Path) -> None:
     ] == [(0, "WEAK1", "STRONG1"), (1, "WEAK2", "STRONG2")]
 
 
+def test_rotation_revision_discards_a_retained_pair_moved_to_another_slot(
+    tmp_path: Path,
+) -> None:
+    def pair(index: int, sell: str, buy: str) -> dict[str, object]:
+        return {
+            "pair_index": index, "sell_symbol": sell, "sell_name": sell,
+            "sell_futu_symbol": f"US.{sell}", "sell_global_strength": "10",
+            "buy_symbol": buy, "buy_name": buy,
+            "buy_futu_symbol": f"US.{buy}", "buy_global_strength": "90",
+            "strength_gap": "80", "target_weight": "0.04",
+            "target_amount": "4000", "estimated_shares": 40,
+            "lot_size": 1, "atr": "5", "reason": "relative_rotation",
+        }
+
+    trend_review.reserve_rotation_pairs(
+        tmp_path, market="US", account_key="simulate-102",
+        execution_date="2026-08-04", pairs=[pair(0, "WEAK1", "STRONG1")],
+        allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:20:00+08:00",
+    )
+    revised = trend_review.reserve_rotation_pairs(
+        tmp_path, market="US", account_key="simulate-102",
+        execution_date="2026-08-04",
+        pairs=[
+            pair(0, "WEAK2", "STRONG2"),
+            pair(1, "WEAK1", "STRONG1"),
+        ],
+        allocation_sha256="a" * 64,
+        reserved_at="2026-08-03T16:30:00+08:00",
+    )
+
+    assert [
+        (item["pair_index"], item["sell_symbol"], item["buy_symbol"])
+        for item in revised
+    ] == [(0, "WEAK1", "STRONG1"), (1, "WEAK2", "STRONG2")]
+
+
 def test_cn_historical_and_current_snapshots_normalize_without_cross_version_rewrite() -> None:
     old = live_trend_strategy_snapshot(
         "CN",

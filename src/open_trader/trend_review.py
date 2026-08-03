@@ -1177,9 +1177,8 @@ def reserve_rotation_pairs(
         if not unused_slots:
             return tuple(reserved[index] for index in sorted(reserved))
 
-        def identity(value: Mapping[str, object]) -> tuple[object, str, str]:
+        def identity(value: Mapping[str, object]) -> tuple[str, str]:
             return (
-                value.get("pair_index"),
                 str(value.get("sell_symbol") or ""),
                 str(value.get("buy_symbol") or ""),
             )
