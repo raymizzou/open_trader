@@ -300,3 +300,41 @@ def test_failure_marker_requires_delivery_and_recovery_is_not_normal_success(
         config, allocation_date="2026-08-03"
     )
     assert json.loads(marker.read_text())["recovered"] is True
+
+
+def test_recovery_aggregates_outstanding_failure_markers_into_one_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+    )
+    notifications = config.data_dir / "trend_allocation/notifications"
+    notifications.mkdir(parents=True)
+    markers = []
+    for allocation_date in ("2026-08-01", "2026-08-02"):
+        marker = notifications / f"{allocation_date}.json"
+        marker.write_text(json.dumps({
+            "allocation_date": allocation_date,
+            "reason": "offline",
+            "delivered": True,
+        }))
+        markers.append(marker)
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(trend_allocation, "build_notifier", lambda _config: object())
+    monkeypatch.setattr(
+        trend_allocation,
+        "send_notification_with_results",
+        lambda *args, **_kwargs: (calls.append(args) or [NotificationAttempt(channel="feishu", success=True)]),
+    )
+
+    assert trend_allocation._notify_allocation_recovery(
+        config, allocation_date="2026-08-03"
+    )
+    assert len(calls) == 1
+    assert "2026-08-01" in calls[0][2]
+    assert "2026-08-02" in calls[0][2]
+    assert all(json.loads(marker.read_text())["recovered"] is True for marker in markers)

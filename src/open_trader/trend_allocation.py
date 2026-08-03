@@ -131,7 +131,7 @@ def _notify_allocation_recovery(
     root = config.data_dir / "trend_allocation" / "notifications"
     if not root.exists():
         return False
-    changed = False
+    pending: list[tuple[Path, Mapping[str, object]]] = []
     for path in sorted(root.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -143,21 +143,30 @@ def _notify_allocation_recovery(
             or payload.get("recovered") is True
         ):
             continue
-        failed_date = str(payload.get("allocation_date") or path.stem)
-        try:
-            attempts = send_notification_with_results(
-                build_notifier(config), "趋势配置快照恢复",
-                f"{failed_date} 配置刷新阻塞已恢复；{allocation_date} 已生成新快照。",
-            )
-        except Exception:
-            continue
-        if not any(attempt.success for attempt in attempts):
-            continue
+        pending.append((path, payload))
+
+    if not pending:
+        return False
+
+    failed_dates = ", ".join(
+        str(payload.get("allocation_date") or path.stem)
+        for path, payload in pending
+    )
+    try:
+        attempts = send_notification_with_results(
+            build_notifier(config), "趋势配置快照恢复",
+            f"{failed_dates} 配置刷新阻塞已恢复；{allocation_date} 已生成新快照。",
+        )
+    except Exception:
+        return False
+    if not any(attempt.success for attempt in attempts):
+        return False
+
+    for path, payload in pending:
         updated = dict(payload)
         updated["recovered"] = True
         _write_json_atomic(path, updated)
-        changed = True
-    return changed
+    return True
 
 
 def load_trend_allocation_status(
