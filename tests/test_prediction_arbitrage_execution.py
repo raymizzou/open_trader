@@ -16,6 +16,7 @@ from open_trader.prediction_arbitrage import PairIntent, ThresholdHedgeIntent, T
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_title_translation import prediction_title_cache_key
+from open_trader.predict_cross_venue import CrossVenueIntent, CrossVenueLeg
 from open_trader.polymarket_trading import (
     AccountSnapshot,
     LegResult,
@@ -945,43 +946,139 @@ def test_notify_ready_opportunity_cross_venue_sends_without_prepare_or_trading(
     assert store.active_execution() is None
 
 
-def test_cross_venue_opportunities_cannot_be_previewed_or_confirmed(
-    tmp_path: Path,
-) -> None:
-    class CrossVenueMonitor(FakeMonitor):
-        def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
-            return {
-                "opportunity_id": opportunity_id,
-                "market_type": "cross_venue_yes_no",
-                "execution_mode": "observe_only",
-                "clear_signal": True,
-            }
+def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueIntent:
+    now = datetime.now(UTC)
+    return CrossVenueIntent(
+        pair_id="public-pair",
+        direction="PREDICT_YES_POLYMARKET_NO",
+        legs=(
+            CrossVenueLeg("predict.fun", "predict-market", "predict-condition", "YES", "predict-yes", "USDT", Decimal("5"), Decimal("5"), predict_price, Decimal("2.30"), Decimal("0.05"), "USDT", now, None),
+            CrossVenueLeg("polymarket", "poly-market", "poly-condition", "NO", "poly-no", "pUSD", Decimal("5"), Decimal("5"), Decimal("0.47"), Decimal("2.40"), Decimal("0.05"), "pUSD", now, now + timedelta(days=30)),
+        ),
+        quantity=Decimal("5"), calculable_gas=Decimal("0"), total_max_cost=Decimal("4.70"),
+        maximum_fee=Decimal("0.10"), minimum_payout=Decimal("5"), minimum_profit=Decimal("0.30"),
+        annualized_yield=Decimal("0.16"), canonical_cutoff=now + timedelta(days=30),
+        resolution_at=now + timedelta(days=30), actionable=True, quote_available=True,
+    )
 
+
+class CrossVenueMonitor:
+    def __init__(self, intent: CrossVenueIntent) -> None:
+        self.intent = intent
+        self.overrides: dict[str, object] = {}
+
+    def snapshot(self) -> dict[str, object]:
+        now = datetime.now(UTC)
+        opportunity: dict[str, object] = {
+            "opportunity_id": f"cross:{self.intent.pair_id}:{self.intent.direction}",
+            "market_type": "cross_venue_yes_no", "funnel_stage": 5,
+            "actionable": True, "clear_signal": True, "intent": self.intent,
+            "confirmed_at": now, "confirmed_age_seconds": Decimal("1"),
+            "canonical_cutoff": self.intent.canonical_cutoff,
+            "codex_approval": {"decision": "APPROVE", "cache_key": "cross-cache", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "quote": "same rules"}, {"exchange": "polymarket", "quote": "same rules"}]},
+            "rules_fingerprints": {"predict.fun": "predict-fingerprint", "polymarket": "poly-fingerprint"},
+        }
+        opportunity.update(self.overrides)
+        return {"opportunities": [opportunity]}
+
+
+class CrossPredictTrading:
+    def __init__(self) -> None:
+        self.account_calls = 0
+        self.allowance_ready = True
+
+    def account_snapshot(self) -> dict[str, object]:
+        self.account_calls += 1
+        return {"wallet_address": "0xpredict", "available_usdt": "5", "allowance_ready": self.allowance_ready, "open_orders": (), "positions": (), "checked_at": datetime.now(UTC)}
+
+
+def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, PredictionArbitrageStore, FakeTrading, CrossVenueMonitor, CrossPredictTrading]:
     store = PredictionArbitrageStore(tmp_path / "data")
     trading = FakeTrading()
+    cross = CrossVenueMonitor(_cross_intent())
+    predict = CrossPredictTrading()
     service = PredictionExecutionService(
-        store=store,
-        monitor=CrossVenueMonitor(_intent()),
-        trading=trading,
+        store=store, monitor=FakeMonitor(_intent()), trading=trading, predict_trading=predict,
         notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
         lock_path=tmp_path / "execution.lock",
     )
+    service.set_cross_venue_monitor(cross)
     assert service.reconcile_startup()["state"] == "ready"
+    return service, store, trading, cross, predict
+
+
+def test_cross_venue_stage_five_preview_is_server_owned(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
+
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert preview["market_type"] == "cross_venue_yes_no"
+    assert [leg["exchange"] for leg in preview["buy_legs"]] == ["predict.fun", "polymarket"]
+    assert preview["net_quantity"] == "5"
+    assert preview["maximum_total_cost"] == "4.70"
+    assert preview["minimum_payout"] == "5"
+    assert preview["minimum_profit"] == "0.30"
+    assert preview["annualized_yield"] >= "0.15"
+    assert preview["canonical_cutoff"].endswith("Z")
+    assert preview["codex_approval"]["decision"] == "APPROVE"
+    assert preview["balances"]["predict.fun"]["asset"] == "USDT"
+    assert preview["balances"]["polymarket"]["asset"] == "pUSD"
+    assert preview["unsettled"]["limit"] == "100"
+    assert preview["policy_limits"]["max_normal_cost"] == "20"
+    assert preview["policy_limits"]["max_emergency_loss"] == "2"
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (lambda cross, _trading, _predict: cross.overrides.update({"confirmed_age_seconds": Decimal("11")}), "books_stale"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, legs=(replace(cross.intent.legs[0], book_timestamp=datetime.now(UTC) - timedelta(seconds=11)), cross.intent.legs[1]))), "books_stale"),
+        (lambda cross, _trading, _predict: cross.overrides.update({"codex_approval": {"decision": "REJECT"}}), "codex_not_approved"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=None)), "canonical_cutoff_invalid"),
+        (lambda _cross, trading, _predict: setattr(trading, "balance", Decimal("1")), "account_insufficient"),
+        (lambda _cross, _trading, predict: setattr(predict, "allowance_ready", False), "account_insufficient"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, quote_available=False)), "opportunity_not_actionable"),
+    ],
+)
+def test_cross_venue_preview_fails_closed_on_current_admission_changes(
+    tmp_path: Path, change: object, reason: str
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    change(cross, trading, predict)  # type: ignore[operator]
 
     assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
-        "state": "rejected",
-        "reason": "cross_venue_observation_only",
+        "state": "rejected", "reason": reason
     }
-    preview_id = store.create_preview(
-        {"market_type": "cross_venue_yes_no", "clear_signal": True},
-        expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat(),
-    )
-    assert service.confirm(preview_id, "crafted-cross-preview") == {
-        "state": "rejected",
-        "reason": "cross_venue_observation_only",
+
+
+def test_cross_venue_confirmation_rechecks_fingerprint_before_no_submit_release(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    cross.overrides["rules_fingerprints"] = {
+        "predict.fun": "changed", "polymarket": "poly-fingerprint"
     }
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-fingerprint-change")
+    assert accepted["execution_id"] == preview["execution_id"]
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+    execution = service.execution(str(accepted["execution_id"]))
+
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_changed"
+    assert store.cross_unsettled_principal() == Decimal("0")
     assert trading.preflight_calls == 0
     assert trading.batch_calls == 0
+
+
+def test_cross_venue_preview_respects_cross_only_breaker(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
+    service._cross_breaker_open = True
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "locked", "reason": "cross_circuit_breaker_open"
+    }
 
 
 def test_standard_notification_uses_only_cached_title_translation(

@@ -946,6 +946,7 @@ class PredictCrossVenueMonitor:
         self._hot_restart = asyncio.Event()
         self._confirmation_tasks: dict[str, asyncio.Task[None]] = {}
         self._approved: dict[str, ExplicitMarketPair] = {}
+        self._validations: dict[str, CrossVenueValidation] = {}
         self._approved_prompt_version = ""
         self._predict_books: dict[str, PredictBook] = {}
         self._opportunities: dict[tuple[str, Direction], dict[str, object]] = {}
@@ -1043,7 +1044,14 @@ class PredictCrossVenueMonitor:
                 and self._same_fingerprints(pair, eligible[pair_id])
             )
         }
-        self._set_approved(approved, prompt_version=prompt_version)
+        validations = {
+            pair_id: validation
+            for pair_id, validation in self._validations.items()
+            if pair_id in approved and validation.approved
+        }
+        self._set_approved(
+            approved, prompt_version=prompt_version, validations=validations
+        )
         for pair_id, pair in eligible.items():
             if pair_id in approved:
                 continue
@@ -1058,7 +1066,10 @@ class PredictCrossVenueMonitor:
                 approved[pair_id] = replace(
                     pair, canonical_cutoff=validation.canonical_cutoff
                 )
-        self._set_approved(approved, prompt_version=prompt_version)
+                validations[pair_id] = validation
+        self._set_approved(
+            approved, prompt_version=prompt_version, validations=validations
+        )
         self._status = self._source_status()
 
     async def _hot_while(self, slow_task: asyncio.Task[None]) -> None:
@@ -1205,6 +1216,7 @@ class PredictCrossVenueMonitor:
             if key[0] == pair.pair_id and key[1] not in confirmed_directions:
                 self._close_opportunity(key)
         for intent in intents:
+            validation = self._validations.get(pair.pair_id)
             opportunity = {
                 "opportunity_id": f"cross:{pair.pair_id}:{intent.direction}",
                 "pair_id": pair.pair_id,
@@ -1214,7 +1226,7 @@ class PredictCrossVenueMonitor:
                 "direction": intent.direction,
                 "market_type": "cross_venue_yes_no",
                 "execution_mode": "observe_only",
-                "actionable": False,
+                "actionable": intent.actionable,
                 "clear_signal": intent.actionable,
                 "funnel_stage": 5 if intent.actionable else 4,
                 "quote_available": intent.quote_available,
@@ -1228,6 +1240,17 @@ class PredictCrossVenueMonitor:
                 "annualized_yield": intent.annualized_yield,
                 "canonical_cutoff": intent.canonical_cutoff,
                 "resolution_at": intent.resolution_at,
+                "codex_approval": {
+                    "decision": "APPROVE" if validation and validation.approved else "REJECT",
+                    "cache_key": validation.cache_key if validation else "",
+                    "direct_outcome_mapping": dict(validation.direct_outcome_mapping or {}) if validation else {},
+                    "summary": validation.summary if validation else "",
+                    "evidence": [dict(item) for item in validation.evidence] if validation else [],
+                },
+                "rules_fingerprints": {
+                    "predict.fun": current.predict.rules_fingerprint,
+                    "polymarket": current.polymarket.rules_fingerprint,
+                },
             }
             self._opportunities[(pair.pair_id, intent.direction)] = opportunity
             self._persist_observation(opportunity)
@@ -1316,11 +1339,17 @@ class PredictCrossVenueMonitor:
                 task.cancel()
 
     def _set_approved(
-        self, approved: Mapping[str, ExplicitMarketPair], *, prompt_version: str = ""
+        self, approved: Mapping[str, ExplicitMarketPair], *, prompt_version: str = "",
+        validations: Mapping[str, CrossVenueValidation] | None = None,
     ) -> None:
         replacement = dict(approved)
         changed = replacement != self._approved or prompt_version != self._approved_prompt_version
         self._approved = replacement
+        self._validations = {
+            pair_id: validation
+            for pair_id, validation in (validations or {}).items()
+            if pair_id in replacement
+        }
         self._approved_prompt_version = prompt_version
         self._drop_unapproved_state()
         self._publish_subscriptions()

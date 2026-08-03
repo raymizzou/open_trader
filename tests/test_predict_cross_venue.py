@@ -927,6 +927,12 @@ class FakeCrossVenueValidator:
                 "polymarket_yes": "YES",
                 "polymarket_no": "NO",
             } if approved else None,
+            summary="Equivalent binary contracts." if approved else "",
+            evidence=(
+                {"exchange": "predict.fun", "quote": "same resolution"},
+                {"exchange": "polymarket", "quote": "same resolution"},
+            ) if approved else (),
+            cache_key="cross-cache" if approved else "",
         )
 
 
@@ -1126,10 +1132,12 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             "PREDICT_YES_POLYMARKET_NO",
             "POLYMARKET_YES_PREDICT_NO",
         }
+        assert snapshot["opportunities"][0]["codex_approval"]["decision"] == "APPROVE"
+        assert set(snapshot["opportunities"][0]["rules_fingerprints"]) == {"predict.fun", "polymarket"}
         assert all(
             row["market_type"] == "cross_venue_yes_no"
             and row["execution_mode"] == "observe_only"
-            and row["actionable"] is False
+            and row["actionable"] is True
             and row["clear_signal"] is True
             for row in snapshot["opportunities"]
         )

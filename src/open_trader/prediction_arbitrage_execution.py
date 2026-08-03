@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -28,6 +29,7 @@ from .polymarket_trading import (
     ThresholdLegResult,
 )
 from .prediction_arbitrage import (
+    MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
     MAX_WALLET_BALANCE,
@@ -39,6 +41,7 @@ from .prediction_arbitrage import (
     ThresholdHedgeLeg,
     protected_buy_quantity,
 )
+from .predict_cross_venue import CrossVenueIntent, CrossVenueLeg
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
 
@@ -55,7 +58,7 @@ TERMINAL_STATES = {
     "merge_incident",
 }
 _PROCESS_LOCK = threading.Lock()
-ExecutionIntent = PairIntent | ThresholdHedgeIntent
+ExecutionIntent = PairIntent | ThresholdHedgeIntent | CrossVenueIntent
 
 
 def _utc_now() -> datetime:
@@ -141,10 +144,13 @@ class PredictionExecutionService:
         notifier: Notifier,
         lock_path: Path,
         dashboard_url: str = "http://127.0.0.1:8766/",
+        predict_trading: object | None = None,
     ) -> None:
         self._store = store
         self._monitor = monitor
         self._trading = trading
+        self._predict_trading = predict_trading
+        self._cross_venue_monitor: object | None = None
         self._notifier = notifier
         self._lock_path = Path(lock_path)
         self._dashboard_url = str(dashboard_url)
@@ -152,10 +158,14 @@ class PredictionExecutionService:
         # A newly constructed process has not reconciled its dedicated wallet;
         # only a clean startup/reset path may clear this lock.
         self._breaker_open = True
+        self._cross_breaker_open = False
         self._first_live_order_verified = False
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
+
+    def set_cross_venue_monitor(self, monitor: object) -> None:
+        self._cross_venue_monitor = monitor
 
     def preview(self, opportunity_id: str) -> dict[str, object]:
         """Freshly validate one server-issued opportunity and persist a preview."""
@@ -207,8 +217,9 @@ class PredictionExecutionService:
         if (
             opportunity is not None
             and opportunity.get("market_type") == "cross_venue_yes_no"
+            and self._cross_breaker_open
         ):
-            return {"state": "rejected", "reason": "cross_venue_observation_only"}
+            return {"state": "locked", "reason": "cross_circuit_breaker_open"}
         intent = self._intent_from_opportunity(opportunity)
         if opportunity is None or intent is None:
             return {"state": "rejected", "reason": "opportunity_unavailable"}
@@ -871,6 +882,11 @@ class PredictionExecutionService:
             reason = self._validate_opportunity(opportunity, current_intent)
             account, volatile_reason = self._volatile_checks(current_intent)
             if reason is not None or account is None:
+                if isinstance(intent, CrossVenueIntent):
+                    self._finish_cross_rejected(
+                        execution_id, reason or volatile_reason or "readiness_unavailable"
+                    )
+                    return
                 self._finish_rejected(
                     execution_id, reason or volatile_reason or "readiness_unavailable"
                 )
@@ -878,6 +894,12 @@ class PredictionExecutionService:
             # The intent is rebuilt from current server data; browser and stale
             # preview economics never reach the authenticated client.
             intent = current_intent
+            if isinstance(intent, CrossVenueIntent):
+                if not self._cross_preview_matches(row, opportunity, intent):
+                    self._finish_cross_rejected(execution_id, "opportunity_changed")
+                    return
+                self._finish_cross_rejected(execution_id, "cross_execution_not_enabled")
+                return
             if isinstance(intent, ThresholdHedgeIntent):
                 self._run_threshold_execution(
                     execution_id,
@@ -1448,10 +1470,17 @@ class PredictionExecutionService:
         )
 
     def _fresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        source = (
+            self._cross_venue_monitor
+            if opportunity_id.startswith("cross:")
+            else self._monitor
+        )
+        if source is None:
+            return None
         refreshed: object = None
         refresh_attempted = False
         for name in ("refresh_opportunity", "recheck_opportunity", "refresh_once", "refresh"):
-            refresh = getattr(self._monitor, name, None)
+            refresh = getattr(source, name, None)
             if not callable(refresh):
                 continue
             refresh_attempted = True
@@ -1463,7 +1492,7 @@ class PredictionExecutionService:
         if refresh_attempted and refreshed is None:
             return None
         if refreshed is None:
-            snapshot = getattr(self._monitor, "snapshot", None)
+            snapshot = getattr(source, "snapshot", None)
             if callable(snapshot):
                 try:
                     refreshed = _call(snapshot)
@@ -1479,7 +1508,7 @@ class PredictionExecutionService:
                         candidate.get("opportunity_id", candidate.get("id", ""))
                     ) == opportunity_id:
                         return dict(candidate)
-        opportunity = getattr(self._monitor, "opportunity", None)
+        opportunity = getattr(source, "opportunity", None)
         if callable(opportunity):
             try:
                 value = _call(opportunity, opportunity_id)
@@ -1505,6 +1534,8 @@ class PredictionExecutionService:
     def _volatile_checks(
         self, intent: ExecutionIntent
     ) -> tuple[dict[str, object] | None, str | None]:
+        if isinstance(intent, CrossVenueIntent):
+            return self._cross_volatile_checks(intent)
         if not self._notification_channels_ready():
             return None, "notification_config_unavailable"
         geoblock = getattr(self._trading, "geoblock_allowed", None)
@@ -1540,6 +1571,70 @@ class PredictionExecutionService:
         if not self._relayer_ready(require_merge=not isinstance(intent, ThresholdHedgeIntent)):
             return None, "relayer_unavailable"
         return account, None
+
+    def _cross_volatile_checks(
+        self, intent: CrossVenueIntent
+    ) -> tuple[dict[str, object] | None, str | None]:
+        if not self._notification_channels_ready():
+            return None, "notification_config_unavailable"
+        geoblock = getattr(self._trading, "geoblock_allowed", None)
+        try:
+            if not callable(geoblock) or _call(geoblock) is not True:
+                return None, "geoblock_blocked"
+        except Exception:
+            return None, "geoblock_unavailable"
+        polymarket = self._fresh_account_snapshot()
+        predict = self._fresh_predict_account_snapshot()
+        if polymarket is None or predict is None:
+            return None, "account_unavailable"
+        by_exchange = {leg.exchange: leg for leg in intent.legs}
+        poly_leg = by_exchange.get("polymarket")
+        predict_leg = by_exchange.get("predict.fun")
+        if poly_leg is None or predict_leg is None:
+            return None, "cross_venue_identity"
+        poly_balance = _decimal(polymarket.get("p_usd_balance"))
+        poly_allowance = _decimal(polymarket.get("p_usd_allowance"))
+        predict_balance = _decimal(predict.get("available_usdt"))
+        if (
+            not str(polymarket.get("wallet_address", "")).strip()
+            or not str(predict.get("wallet_address", "")).strip()
+            or poly_balance is None
+            or poly_allowance is None
+            or predict_balance is None
+            or poly_balance < poly_leg.max_cost
+            or poly_allowance < poly_leg.max_cost
+            or predict_balance < predict_leg.max_cost
+            or predict.get("allowance_ready") is not True
+        ):
+            return None, "account_insufficient"
+        return {
+            "predict.fun": {
+                "asset": "USDT", "wallet_address": str(predict["wallet_address"]),
+                "available_balance": predict_balance, "allowance_ready": True,
+            },
+            "polymarket": {
+                "asset": "pUSD", "wallet_address": str(polymarket["wallet_address"]),
+                "available_balance": poly_balance, "allowance": poly_allowance,
+            },
+        }, None
+
+    def _fresh_predict_account_snapshot(self) -> dict[str, object] | None:
+        if self._predict_trading is None:
+            return None
+        method = getattr(self._predict_trading, "account_snapshot", None)
+        try:
+            value = _call(method)
+        except Exception:
+            return None
+        if not isinstance(value, Mapping):
+            return None
+        snapshot = dict(value)
+        if not all(name in snapshot for name in ("wallet_address", "available_usdt", "allowance_ready", "open_orders", "positions", "checked_at")):
+            return None
+        age = _age_seconds(snapshot.get("checked_at"))
+        if age is None or age > 60 or not self._snapshot_collections_valid({"open_order_ids": snapshot["open_orders"], "positions": snapshot["positions"]}):
+            return None
+        return snapshot
 
     def _account_snapshot(self) -> dict[str, object] | None:
         method = getattr(self._trading, "account_snapshot", None)
@@ -2356,6 +2451,8 @@ class PredictionExecutionService:
     def _validate_opportunity(
         self, opportunity: Mapping[str, object], intent: ExecutionIntent
     ) -> str | None:
+        if isinstance(intent, CrossVenueIntent):
+            return self._validate_cross_venue_opportunity(opportunity, intent)
         if opportunity.get("actionable") is not True:
             return str(opportunity.get("eligibility_reason", "opportunity_not_actionable"))
         if "confirmed_age_seconds" not in opportunity or "confirmed_at" not in opportunity:
@@ -2416,6 +2513,59 @@ class PredictionExecutionService:
             return "cost_mismatch"
         return None
 
+    def _validate_cross_venue_opportunity(
+        self, opportunity: Mapping[str, object], intent: CrossVenueIntent
+    ) -> str | None:
+        if (
+            opportunity.get("market_type") != "cross_venue_yes_no"
+            or opportunity.get("funnel_stage") != 5
+            or opportunity.get("actionable") is not True
+            or opportunity.get("clear_signal") is not True
+            or intent.actionable is not True
+            or intent.quote_available is not True
+        ):
+            return "opportunity_not_actionable"
+        age = _decimal(opportunity.get("confirmed_age_seconds"))
+        if age is None or age > BOOK_FRESHNESS_SECONDS or _age_seconds(opportunity.get("confirmed_at")) is None:
+            return "books_stale"
+        if len(intent.legs) != 2 or tuple(leg.exchange for leg in intent.legs) != ("predict.fun", "polymarket"):
+            return "cross_venue_identity"
+        if any(
+            _age_seconds(leg.book_timestamp) is None
+            or _age_seconds(leg.book_timestamp) > float(BOOK_FRESHNESS_SECONDS)
+            for leg in intent.legs
+        ):
+            return "books_stale"
+        if intent.quantity <= 0 or any(leg.net_quantity != intent.quantity or leg.net_quantity <= 0 for leg in intent.legs):
+            return "order_amount_mismatch"
+        if {leg.outcome for leg in intent.legs} != {"YES", "NO"}:
+            return "outcome_identity"
+        if any(
+            not all(value.is_finite() and value > 0 for value in (leg.max_price, leg.max_cost, leg.maximum_fee))
+            for leg in intent.legs
+        ) or not all(value.is_finite() and value > 0 for value in (intent.total_max_cost, intent.maximum_fee, intent.minimum_payout)):
+            return "invalid_intent"
+        if sum((leg.max_cost for leg in intent.legs), Decimal("0")) != intent.total_max_cost:
+            return "cost_mismatch"
+        if intent.total_max_cost > MAX_NORMAL_COST or intent.minimum_profit <= 0:
+            return "cross_venue_economics"
+        if intent.annualized_yield is None or not intent.annualized_yield.is_finite() or intent.annualized_yield < MIN_THRESHOLD_ANNUALIZED_YIELD:
+            return "annualized_yield_below_minimum"
+        cutoff = intent.canonical_cutoff
+        if cutoff is None or cutoff.tzinfo is None or cutoff.astimezone(UTC) <= _utc_now():
+            return "canonical_cutoff_invalid"
+        approval = opportunity.get("codex_approval")
+        fingerprints = opportunity.get("rules_fingerprints")
+        if not isinstance(approval, Mapping) or approval.get("decision") != "APPROVE" or not str(approval.get("cache_key", "")).strip():
+            return "codex_not_approved"
+        direct = approval.get("direct_outcome_mapping")
+        evidence = approval.get("evidence")
+        if direct != {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"} or not isinstance(evidence, (list, tuple)) or not evidence:
+            return "codex_evidence_unavailable"
+        if not isinstance(fingerprints, Mapping) or not all(str(fingerprints.get(exchange, "")).strip() for exchange in ("predict.fun", "polymarket")):
+            return "rules_fingerprint_unavailable"
+        return None
+
     @staticmethod
     def _tick_size(opportunity: Mapping[str, object]) -> Decimal | None:
         value = _decimal(opportunity.get("tick_size"))
@@ -2429,6 +2579,40 @@ class PredictionExecutionService:
         account: Mapping[str, object],
         expires_at: datetime,
     ) -> dict[str, object]:
+        if isinstance(intent, CrossVenueIntent):
+            current = self._store.cross_unsettled_principal()
+            approval = opportunity.get("codex_approval")
+            return {
+                "execution_id": uuid.uuid4().hex,
+                "opportunity_id": str(opportunity.get("opportunity_id", "")),
+                "market_type": "cross_venue_yes_no",
+                "intent_type": "cross_venue",
+                "pair_id": intent.pair_id,
+                "direction": intent.direction,
+                "question": str(opportunity.get("question", "")),
+                "intent": self._intent_payload(intent),
+                "buy_legs": [self._cross_venue_leg_payload(leg) for leg in intent.legs],
+                "net_quantity": format(intent.quantity, "f"),
+                "total_max_cost": format(intent.total_max_cost, "f"),
+                "maximum_total_cost": format(intent.total_max_cost, "f"),
+                "minimum_payout": format(intent.minimum_payout, "f"),
+                "minimum_profit": format(intent.minimum_profit, "f"),
+                "annualized_yield": format(intent.annualized_yield or Decimal("0"), "f"),
+                "canonical_cutoff": _timestamp(intent.canonical_cutoff),
+                "codex_approval": self._safe_mapping(approval) if isinstance(approval, Mapping) else {},
+                "rules_fingerprints": self._safe_mapping(opportunity.get("rules_fingerprints")) if isinstance(opportunity.get("rules_fingerprints"), Mapping) else {},
+                "balances": self._safe_mapping(account),
+                "unsettled": {
+                    "current": format(current, "f"),
+                    "after": format(current + intent.total_max_cost, "f"),
+                    "limit": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f"),
+                },
+                "policy_limits": {
+                    "max_normal_cost": "20",
+                    "max_emergency_loss": "2",
+                },
+                "expires_at": _timestamp(expires_at),
+            }
         payload: dict[str, object] = {
             "opportunity_id": str(
                 opportunity.get("opportunity_id", opportunity.get("id", ""))
@@ -2509,7 +2693,37 @@ class PredictionExecutionService:
         }
 
     @staticmethod
+    def _cross_venue_leg_payload(leg: CrossVenueLeg) -> dict[str, object]:
+        return {
+            "exchange": leg.exchange, "market_id": leg.market_id,
+            "condition_id": leg.condition_id, "outcome": leg.outcome,
+            "token_id": leg.token_id, "settlement_asset": leg.settlement_asset,
+            "requested_quantity": format(leg.requested_quantity, "f"),
+            "net_quantity": format(leg.net_quantity, "f"),
+            "max_price": format(leg.max_price, "f"), "max_cost": format(leg.max_cost, "f"),
+            "maximum_fee": format(leg.maximum_fee, "f"), "fee_asset": leg.fee_asset,
+            "book_timestamp": _timestamp(leg.book_timestamp),
+            "settlement_at": _timestamp(leg.settlement_at) if leg.settlement_at else None,
+        }
+
+    @staticmethod
     def _intent_payload(intent: ExecutionIntent) -> dict[str, object]:
+        if isinstance(intent, CrossVenueIntent):
+            return {
+                "intent_type": "cross_venue", "pair_id": intent.pair_id,
+                "direction": intent.direction,
+                "legs": [PredictionExecutionService._cross_venue_leg_payload(leg) for leg in intent.legs],
+                "quantity": format(intent.quantity, "f"),
+                "calculable_gas": format(intent.calculable_gas, "f"),
+                "total_max_cost": format(intent.total_max_cost, "f"),
+                "maximum_fee": format(intent.maximum_fee, "f"),
+                "minimum_payout": format(intent.minimum_payout, "f"),
+                "minimum_profit": format(intent.minimum_profit, "f"),
+                "annualized_yield": format(intent.annualized_yield, "f") if intent.annualized_yield is not None else None,
+                "canonical_cutoff": _timestamp(intent.canonical_cutoff) if intent.canonical_cutoff else None,
+                "resolution_at": _timestamp(intent.resolution_at) if intent.resolution_at else None,
+                "actionable": intent.actionable, "quote_available": intent.quote_available,
+            }
         if isinstance(intent, ThresholdHedgeIntent):
             return {
                 "intent_type": "threshold_hedge",
@@ -2542,12 +2756,34 @@ class PredictionExecutionService:
 
     @staticmethod
     def _intent_from_payload(value: object) -> ExecutionIntent | None:
+        if isinstance(value, CrossVenueIntent):
+            return value
         if isinstance(value, ThresholdHedgeIntent):
             return value
         if isinstance(value, PairIntent):
             return value
         if not isinstance(value, Mapping):
             return None
+        if value.get("intent_type") == "cross_venue":
+            raw_legs = value.get("legs")
+            if not isinstance(raw_legs, (list, tuple)) or len(raw_legs) != 2:
+                return None
+            legs = tuple(PredictionExecutionService._cross_venue_leg_from_payload(item) for item in raw_legs)
+            if any(leg is None for leg in legs):
+                return None
+            decimal_names = ("quantity", "calculable_gas", "total_max_cost", "maximum_fee", "minimum_payout", "minimum_profit")
+            raw = {name: _decimal(value.get(name)) for name in decimal_names}
+            annualized = None if value.get("annualized_yield") is None else _decimal(value.get("annualized_yield"))
+            cutoff = PredictionExecutionService._datetime_from_payload(value.get("canonical_cutoff"))
+            resolution = PredictionExecutionService._datetime_from_payload(value.get("resolution_at"))
+            if any(item is None for item in raw.values()) or (value.get("annualized_yield") is not None and annualized is None) or cutoff is None or resolution is None:
+                return None
+            if not isinstance(value.get("pair_id"), str) or not isinstance(value.get("direction"), str) or value.get("actionable") is not True or value.get("quote_available") is not True:
+                return None
+            try:
+                return CrossVenueIntent(pair_id=value["pair_id"], direction=value["direction"], legs=legs, annualized_yield=annualized, canonical_cutoff=cutoff, resolution_at=resolution, actionable=True, quote_available=True, **raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
         if value.get("intent_type") == "threshold_hedge" or {
             "relation_id", "leg_a", "leg_b", "maximum_fee", "minimum_payout"
         } <= set(value):
@@ -2603,6 +2839,35 @@ class PredictionExecutionService:
             return None
         try:
             return ThresholdHedgeLeg(label=label, **{name: value[name] for name in names}, **parsed)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _datetime_from_payload(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else None
+
+    @staticmethod
+    def _cross_venue_leg_from_payload(value: object) -> CrossVenueLeg | None:
+        if isinstance(value, CrossVenueLeg):
+            return value
+        if not isinstance(value, Mapping) or value.get("exchange") not in {"predict.fun", "polymarket"} or value.get("outcome") not in {"YES", "NO"}:
+            return None
+        names = ("market_id", "condition_id", "token_id", "settlement_asset", "fee_asset")
+        if not all(isinstance(value.get(name), str) and value[name].strip() for name in names):
+            return None
+        decimals = {name: _decimal(value.get(name)) for name in ("requested_quantity", "net_quantity", "max_price", "max_cost", "maximum_fee")}
+        book_timestamp = PredictionExecutionService._datetime_from_payload(value.get("book_timestamp"))
+        settlement_at = None if value.get("settlement_at") is None else PredictionExecutionService._datetime_from_payload(value.get("settlement_at"))
+        if any(item is None for item in decimals.values()) or book_timestamp is None or (value.get("settlement_at") is not None and settlement_at is None):
+            return None
+        try:
+            return CrossVenueLeg(exchange=value["exchange"], outcome=value["outcome"], book_timestamp=book_timestamp, settlement_at=settlement_at, **{name: value[name] for name in names}, **decimals)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return None
 
@@ -2877,6 +3142,40 @@ class PredictionExecutionService:
 
     def _finish_rejected(self, execution_id: str, reason: str) -> None:
         self._transition(execution_id, "both_rejected", {"phase": "validation_rejected", "reason": reason})
+
+    def _finish_cross_rejected(self, execution_id: str, reason: str) -> None:
+        evidence = {
+            "phase": "validation_rejected", "reason": reason, "submitted": False,
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+        }
+        self._transition(execution_id, "both_rejected", evidence)
+        try:
+            self._store.release_cross_reservation(execution_id, reason="no_submit")
+        except Exception:
+            self._cross_breaker_open = True
+
+    def _cross_preview_matches(
+        self, preview: Mapping[str, object], opportunity: Mapping[str, object], intent: CrossVenueIntent
+    ) -> bool:
+        stored = self._intent_from_payload(preview.get("intent"))
+        if not isinstance(stored, CrossVenueIntent):
+            return False
+        if (stored.pair_id, stored.direction, stored.canonical_cutoff) != (intent.pair_id, intent.direction, intent.canonical_cutoff):
+            return False
+        if any(
+            (old.exchange, old.market_id, old.condition_id, old.token_id, old.outcome) != (new.exchange, new.market_id, new.condition_id, new.token_id, new.outcome)
+            or new.max_price > old.max_price
+            for old, new in zip(stored.legs, intent.legs, strict=True)
+        ):
+            return False
+        old_approval = preview.get("codex_approval")
+        new_approval = opportunity.get("codex_approval")
+        return (
+            isinstance(old_approval, Mapping)
+            and isinstance(new_approval, Mapping)
+            and old_approval.get("cache_key") == new_approval.get("cache_key")
+            and preview.get("rules_fingerprints") == opportunity.get("rules_fingerprints")
+        )
 
     def _finish_incident(
         self,

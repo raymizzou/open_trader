@@ -41,6 +41,7 @@ from .predict_cross_venue import (
     PredictCrossVenueMonitor,
 )
 from .predict_source import PredictSource
+from .predict_trading import PredictTradingClient
 
 # Keep the old module attribute for downstream test fakes while production
 # wiring uses the catalog result contract above.
@@ -1496,15 +1497,11 @@ def create_dashboard_server(
                     if path.endswith("/preview"):
                         self._require_prediction_schema(payload, {"opportunity_id"})
                         opportunity_id = self._required_prediction_string(payload, "opportunity_id")
-                        if opportunity_id.startswith("cross:"):
-                            raise ValueError("cross_venue_observation_only")
                         result = prediction_execution_service.preview(opportunity_id)
                     elif path.endswith("/executions"):
                         self._require_prediction_schema(payload, {"preview_id", "idempotency_key"})
                         preview_id = self._required_prediction_string(payload, "preview_id")
                         idempotency_key = self._required_prediction_string(payload, "idempotency_key")
-                        if preview_id.startswith("cross:"):
-                            raise ValueError("cross_venue_observation_only")
                         result = prediction_execution_service.confirm(preview_id, idempotency_key)
                     else:
                         self._require_prediction_schema(payload, {"incident_id"})
@@ -1932,10 +1929,13 @@ def _build_cross_venue_monitor(
     store: PredictionArbitrageStore,
     execution: PredictionExecutionService,
     codex_model: str,
+    predict_trading: object | None = None,
 ) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
     predict_config = getattr(trading_config, "predict", None)
     if predict_config is None:
         return _UnavailableCrossVenueMonitor("predict_not_configured")
+    if predict_trading is None:
+        return _UnavailableCrossVenueMonitor("predict_construction_failed")
     try:
         return PredictCrossVenueMonitor(
             predict_source=PredictSource(predict_config),
@@ -1943,6 +1943,7 @@ def _build_cross_venue_monitor(
             validator=CodexCrossVenueEquivalenceValidator(store, model=codex_model),
             gamma_lookup=_cross_venue_gamma_lookup,
             clob_lookup=_cross_venue_clob_lookup,
+            predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
             store=store,
             ready_observer=execution.notify_ready_opportunity,
         )
@@ -1984,6 +1985,7 @@ def serve_dashboard(
     prediction_monitor: object | None = None
     prediction_execution: object | None = None
     prediction_trading: object | None = None
+    predict_trading: object | None = None
     cross_runtime: _CrossVenueRuntime | None = None
     if config.prediction_config_path is not None:
         prediction_path = config.prediction_config_path.expanduser()
@@ -1991,6 +1993,10 @@ def serve_dashboard(
             prediction_store = PredictionArbitrageStore(config.data_dir)
             trading_config = load_trading_config(prediction_path)
             prediction_trading = PolymarketTradingClient.from_keychain(trading_config)
+            try:
+                predict_trading = PredictTradingClient.from_keychain(trading_config)
+            except Exception:
+                predict_trading = None
             codex_model = os.environ.get("OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol").strip()
             relation_validator = CodexRelationValidator(
                 prediction_store,
@@ -2011,6 +2017,7 @@ def serve_dashboard(
                 notifier=prediction_notifier or NullNotifier(),
                 lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
                 dashboard_url=resolved_public_url,
+                predict_trading=predict_trading,
             )
             prediction_monitor.set_ready_observer(
                 prediction_execution.notify_ready_opportunity
@@ -2025,7 +2032,13 @@ def serve_dashboard(
                     store=prediction_store,
                     execution=prediction_execution,
                     codex_model=codex_model,
+                    predict_trading=predict_trading,
                 )
+            set_cross_venue_monitor = getattr(
+                prediction_execution, "set_cross_venue_monitor", None
+            )
+            if callable(set_cross_venue_monitor):
+                set_cross_venue_monitor(cross_venue_monitor)
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
             # Dashboard rather than aborting the existing portfolio surface.
@@ -2034,7 +2047,7 @@ def serve_dashboard(
                     prediction_monitor.stop()
                 except Exception:
                     pass
-            for resource in (prediction_execution, prediction_trading, prediction_store):
+            for resource in (prediction_execution, prediction_trading, predict_trading, prediction_store):
                 close = getattr(resource, "close", None)
                 if callable(close):
                     try:
@@ -2088,7 +2101,7 @@ def serve_dashboard(
                 prediction_monitor.stop()
             except Exception:
                 pass
-        for resource in (prediction_execution, prediction_trading, prediction_store):
+        for resource in (prediction_execution, prediction_trading, predict_trading, prediction_store):
             close = getattr(resource, "close", None)
             if callable(close):
                 try:

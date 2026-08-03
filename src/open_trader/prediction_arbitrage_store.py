@@ -1204,7 +1204,13 @@ class PredictionArbitrageStore:
                     > MAX_CROSS_UNSETTLED_PRINCIPAL
                 ):
                     raise ValueError("cross_unsettled_cap")
-            execution_id = _new_id()
+            execution_id = (
+                str(preview_payload["execution_id"])
+                if cross_amount is not None
+                and isinstance(preview_payload.get("execution_id"), str)
+                and preview_payload["execution_id"].strip()
+                else _new_id()
+            )
             created = _canonical_timestamp(now)
             try:
                 connection.execute(

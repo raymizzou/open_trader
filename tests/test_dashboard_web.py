@@ -2431,6 +2431,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
         store=object(),
         execution=object(),
         codex_model="test-model",
+        predict_trading=object(),
     )
     state = dashboard_web._prediction_state_payload(
         store=None,
@@ -2446,7 +2447,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     assert state["cross_venue"]["status"] == "degraded"
 
 
-def test_prediction_cross_ids_are_rejected_by_server_before_execution(tmp_path: Path) -> None:
+def test_prediction_ids_cross_venue_reach_the_existing_preview_and_confirmation_routes(tmp_path: Path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
     class FakeExecution:
@@ -2490,11 +2491,12 @@ def test_prediction_cross_ids_are_rejected_by_server_before_execution(tmp_path: 
                 headers=headers,
                 method="POST",
             )
-            with pytest.raises(urllib.error.HTTPError) as error:
-                urllib.request.urlopen(request, timeout=5)
-            assert error.value.code == 400
-            assert json.loads(error.value.read().decode("utf-8"))["message"] == "cross_venue_observation_only"
-        assert execution.calls == []
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert response.status == 200
+        assert execution.calls == [
+            ("preview", "cross:pair-1:PREDICT_YES_POLYMARKET_NO"),
+            ("confirm", "cross:preview-1", "key-1"),
+        ]
     finally:
         server.shutdown()
         server.server_close()
