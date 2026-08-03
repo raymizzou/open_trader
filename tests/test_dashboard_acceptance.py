@@ -489,7 +489,7 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
-        "_account_sync_controller_errors",
+        "_account_sync_worker_errors",
         lambda *args, **kwargs: [],
     )
     monkeypatch.setattr(
@@ -5253,7 +5253,7 @@ def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accept
     errors = validate_dashboard_payload(payload, expected_cn=5)
 
     assert "账户同步状态异常" in errors
-    assert "账户同步控制器不可用" in errors
+    assert "账户同步 Worker 不可用" in errors
     assert "tiger 账户同步状态不是正常" in errors
     assert "phillips 账户同步状态不是正常" in errors
     assert "eastmoney 账户同步状态不是正常" in errors
@@ -5287,7 +5287,7 @@ def test_check_account_holdings_counts_only_actual_accepted_holdings() -> None:
     dashboard_acceptance._check_account_holdings(page, payload)
 
 
-def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
+def test_acceptance_rejects_missing_or_unhealthy_account_sync_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_dir = tmp_path / "data"
@@ -5295,9 +5295,9 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
         dashboard_acceptance, "_project_data_dir", lambda _root: data_dir
     )
     now = datetime.fromisoformat("2026-07-30T12:10:00+08:00")
-    assert dashboard_acceptance._account_sync_controller_errors(
+    assert dashboard_acceptance._account_sync_worker_errors(
         tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
-    ) == ["账户同步控制器状态缺失"]
+    ) == ["账户同步 Worker 状态缺失"]
 
     status_path = data_dir / "account_sync/controller_status.json"
     status_path.parent.mkdir(parents=True)
@@ -5308,7 +5308,7 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
         "heartbeat_at": "2026-07-30T12:00:00+08:00",
     }), encoding="utf-8")
 
-    errors = dashboard_acceptance._account_sync_controller_errors(
+    errors = dashboard_acceptance._account_sync_worker_errors(
         tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
     )
 
@@ -5316,7 +5316,7 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
         assert any(required in error for error in errors)
 
 
-def test_acceptance_reads_account_sync_controller_from_shared_project_data_dir(
+def test_acceptance_reads_account_sync_worker_from_shared_project_data_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worktree = tmp_path / "worktree"
@@ -5335,7 +5335,7 @@ def test_acceptance_reads_account_sync_controller_from_shared_project_data_dir(
         dashboard_acceptance, "_project_data_dir", lambda _root: shared_data
     )
 
-    assert dashboard_acceptance._account_sync_controller_errors(
+    assert dashboard_acceptance._account_sync_worker_errors(
         worktree, expected_root=worktree, expected_sha="accepted", now=now,
     ) == []
 

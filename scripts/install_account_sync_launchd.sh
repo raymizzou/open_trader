@@ -99,7 +99,7 @@ wait_agent_absent() {
   return 1
 }
 
-controller_status_matches() {
+worker_status_matches() {
   "$PYTHON_BIN" - "$@" <<'PY'
 from datetime import datetime
 import json
@@ -136,7 +136,7 @@ wait_ready() {
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
     output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1 || true)"
     pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
-    if [[ -n "$pid" ]] && controller_status_matches \
+    if [[ -n "$pid" ]] && worker_status_matches \
       "$STATUS_PATH" "$pid" "$REPO_ROOT" "$expected_sha" "$loaded_at"; then
       return 0
     fi
@@ -144,7 +144,7 @@ wait_ready() {
   done
   "$LAUNCHCTL_BIN" bootout "gui/$UID/$LABEL" 2>/dev/null || true
   wait_agent_absent || return 1
-  echo "account sync controller did not publish a matching fresh status" >&2
+  echo "account sync worker did not publish a matching fresh status" >&2
   return 1
 }
 

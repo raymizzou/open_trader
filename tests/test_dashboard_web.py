@@ -12738,7 +12738,7 @@ def test_dashboard_server_projects_accepted_files_without_side_effects(
     tmp_path,
     monkeypatch,
 ) -> None:
-    import open_trader.account_sync_controller as account_sync_controller
+    import open_trader.account_sync_worker as account_sync_worker
     import open_trader.dashboard_quotes as dashboard_quotes
     import open_trader.futu_account as futu_account
     import open_trader.tiger_account as tiger_account
@@ -12786,7 +12786,7 @@ def test_dashboard_server_projects_accepted_files_without_side_effects(
     before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in accepted_paths}
     monkeypatch.setattr(futu_account.FutuAccountClient, "__init__", unexpected_side_effect)
     monkeypatch.setattr(tiger_account.TigerAccountClient, "__init__", unexpected_side_effect)
-    monkeypatch.setattr(account_sync_controller, "AccountSyncController", unexpected_side_effect)
+    monkeypatch.setattr(account_sync_worker, "AccountSyncWorker", unexpected_side_effect)
     monkeypatch.setattr(
         dashboard_quotes.DashboardQuoteService,
         "refresh",

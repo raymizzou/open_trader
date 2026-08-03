@@ -367,7 +367,7 @@ def _account_sync_errors(payload: Mapping[str, Any]) -> list[str]:
         errors.append("账户同步状态异常")
     controller = account_sync.get("controller")
     if not isinstance(controller, Mapping) or controller.get("status") != "ok":
-        errors.append("账户同步控制器不可用")
+        errors.append("账户同步 Worker 不可用")
     brokers = account_sync.get("brokers")
     if not isinstance(brokers, Mapping):
         return [*errors, "账户同步券商状态缺失"]
@@ -411,39 +411,39 @@ def _is_accepted_dashboard_holding(row: Mapping[str, Any]) -> bool:
     return _is_dashboard_holding(normalized)
 
 
-def _account_sync_controller_errors(
+def _account_sync_worker_errors(
     root: Path, *, expected_root: Path, expected_sha: str, now: datetime | None = None,
 ) -> list[str]:
     path = _project_data_dir(root) / "account_sync/controller_status.json"
     try:
         controller = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return ["账户同步控制器状态缺失"]
+        return ["账户同步 Worker 状态缺失"]
     if not isinstance(controller, Mapping):
-        return ["账户同步控制器状态缺失"]
+        return ["账户同步 Worker 状态缺失"]
 
     errors: list[str] = []
     pid = controller.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        errors.append("账户同步控制器 PID 无效")
+        errors.append("账户同步 Worker PID 无效")
     else:
         try:
             os.kill(pid, 0)
         except OSError as exc:
-            errors.append(f"账户同步控制器 PID 不存活：{pid}（{exc}）")
+            errors.append(f"账户同步 Worker PID 不存活：{pid}（{exc}）")
     working_directory = controller.get("working_directory")
     if not isinstance(working_directory, str) or Path(working_directory).resolve() != expected_root.resolve():
-        errors.append("账户同步控制器工作目录不匹配")
+        errors.append("账户同步 Worker 工作目录不匹配")
     if controller.get("git_sha") != expected_sha:
-        errors.append("账户同步控制器 Git SHA 不匹配")
+        errors.append("账户同步 Worker Git SHA 不匹配")
     try:
         heartbeat = datetime.fromisoformat(str(controller.get("heartbeat_at") or ""))
         if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
             raise ValueError
         if abs((now or datetime.now().astimezone()) - heartbeat) > timedelta(minutes=2):
-            errors.append("账户同步控制器心跳不新鲜")
+            errors.append("账户同步 Worker 心跳不新鲜")
     except (TypeError, ValueError):
-        errors.append("账户同步控制器心跳无效")
+        errors.append("账户同步 Worker 心跳无效")
     return errors
 
 
@@ -4746,7 +4746,7 @@ def main(argv: list[str] | None = None) -> int:
         phillips_total, phillips_period = _latest_phillips_expectation(
             project_data_dir
         )
-        errors.extend(_account_sync_controller_errors(
+        errors.extend(_account_sync_worker_errors(
             args.expected_root, expected_root=args.expected_root, expected_sha=expected_sha,
         ))
         first = _fetch_payload(args.url)

@@ -1357,7 +1357,7 @@ def _write_published_account_state(
         ("stale", True, 0, "futu stale"),
         ("unknown", True, 0, "futu unknown"),
         ("ok", False, 0, "futu unknown"),
-        ("ok", True, 16, "controller stale"),
+        ("ok", True, 16, "account sync worker stale"),
     ],
 )
 def test_daily_runner_blocks_unhealthy_published_portfolio_before_premarket(

@@ -16,10 +16,10 @@ from open_trader.account_sync_state import (
     project_account_sync_health,
     write_json_atomic,
 )
-from open_trader.account_sync_controller import (
-    AccountSyncController,
-    AccountSyncControllerConfig,
-    run_account_sync_controller,
+from open_trader.account_sync_worker import (
+    AccountSyncWorker,
+    AccountSyncWorkerConfig,
+    run_account_sync_worker,
 )
 from open_trader.dashboard_quotes import DashboardQuoteService
 from open_trader.futu_quote import FutuQuoteError
@@ -33,30 +33,30 @@ class StopLoop(Exception):
 def test_sync_accounts_publishes_full_tiger_generation_before_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.account_sync_controller as controller_module
+    import open_trader.account_sync_worker as worker_module
 
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest" / "portfolio.csv"
     _seed_state(data_dir, {"tiger": _candidate("tiger", 8, "OLD")})
     all_14_symbols = {f"NEW{index}" for index in range(14)}
     tiger_candidate = _candidate("tiger", 14, "NEW")
-    _configure_sources(monkeypatch, controller_module, tiger_candidate=tiger_candidate)
+    _configure_sources(monkeypatch, worker_module, tiger_candidate=tiger_candidate)
     writes: list[Path] = []
-    real_portfolio_write = controller_module.write_portfolio_atomic
-    real_state_write = controller_module.write_json_atomic
+    real_portfolio_write = worker_module.write_portfolio_atomic
+    real_state_write = worker_module.write_json_atomic
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "write_portfolio_atomic",
         lambda path, rows: (writes.append(path), real_portfolio_write(path, rows))[1],
     )
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "write_json_atomic",
         lambda path, state: (writes.append(path), real_state_write(path, state))[1],
     )
 
-    controller = AccountSyncController(_config(data_dir, portfolio_path))
-    controller.sync_accounts_once()
+    worker = AccountSyncWorker(_config(data_dir, portfolio_path))
+    worker.sync_accounts_once()
 
     published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     assert published["brokers"]["tiger"]["summary"]["position_count"] == 14
@@ -71,13 +71,13 @@ def test_sync_accounts_publishes_full_tiger_generation_before_state(
     assert "OLD0" not in symbols
     assert writes.index(portfolio_path) < writes.index(data_dir / "latest/account_sync_state.json")
     assert all("restore" not in str(path) for path in writes)
-    assert not hasattr(controller_module, "_assert_preserves_other_brokers")
+    assert not hasattr(worker_module, "_assert_preserves_other_brokers")
 
 
 def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.account_sync_controller as controller_module
+    import open_trader.account_sync_worker as worker_module
 
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest" / "portfolio.csv"
@@ -94,17 +94,17 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
     clock = [0.0]
     _configure_sources(
         monkeypatch,
-        controller_module,
+        worker_module,
         futu_error=RuntimeError("Futu unavailable"),
         tiger_candidate=_candidate("tiger", 1, "TIGER"),
     )
-    controller = AccountSyncController(
+    worker = AccountSyncWorker(
         _config(data_dir, portfolio_path),
         clock=lambda: clock[0],
         now_text=lambda: "2026-07-30T12:00:00+08:00",
     )
 
-    controller.sync_accounts_once()
+    worker.sync_accounts_once()
 
     failed = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     futu_before = before["brokers"]["futu"]
@@ -124,23 +124,23 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
     assert health["status"] == "abnormal"
     assert health["reason"] == "broker_futu_failed"
 
-    reloaded = AccountSyncController(
+    reloaded = AccountSyncWorker(
         _config(data_dir, portfolio_path),
         clock=lambda: clock[0],
         now_text=lambda: "2026-07-30T12:00:00+08:00",
     )
     assert reloaded.sync_accounts_once()["status"] == "partial"
     assert load_account_sync_state(data_dir / "latest/account_sync_state.json") == failed
-    assert controller.sync_accounts_once()["status"] == "skipped"
+    assert worker.sync_accounts_once()["status"] == "skipped"
     assert load_account_sync_state(data_dir / "latest/account_sync_state.json") == failed
 
     clock[0] = 61.0
     _configure_sources(
         monkeypatch,
-        controller_module,
+        worker_module,
         tiger_candidate=_candidate("tiger", 1, "TIGER"),
     )
-    controller.sync_accounts_once()
+    worker.sync_accounts_once()
     recovered = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     assert recovered["brokers"]["futu"]["status"] == "ok"
     assert recovered["brokers"]["tiger"]["status"] == "ok"
@@ -151,7 +151,7 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
 def test_state_publication_failure_stops_without_false_source_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.account_sync_controller as controller_module
+    import open_trader.account_sync_worker as worker_module
 
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest" / "portfolio.csv"
@@ -160,8 +160,8 @@ def test_state_publication_failure_stops_without_false_source_failure(
     _seed_state(data_dir, {"futu": old_candidate})
     state_path = data_dir / "latest" / "account_sync_state.json"
     before = state_path.read_bytes()
-    _configure_sources(monkeypatch, controller_module, futu_candidate=new_candidate)
-    real_write = controller_module.write_json_atomic
+    _configure_sources(monkeypatch, worker_module, futu_candidate=new_candidate)
+    real_write = worker_module.write_json_atomic
     state_writes = 0
 
     def fail_state_write(path: Path, payload: object) -> None:
@@ -171,14 +171,14 @@ def test_state_publication_failure_stops_without_false_source_failure(
             raise OSError("state storage unavailable")
         real_write(path, payload)
 
-    monkeypatch.setattr(controller_module, "write_json_atomic", fail_state_write)
+    monkeypatch.setattr(worker_module, "write_json_atomic", fail_state_write)
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "record_source_failure",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("false source failure")),
     )
 
-    result = AccountSyncController(_config(data_dir, portfolio_path)).sync_accounts_once()
+    result = AccountSyncWorker(_config(data_dir, portfolio_path)).sync_accounts_once()
 
     assert result == {
         "status": "publication_failed",
@@ -188,13 +188,13 @@ def test_state_publication_failure_stops_without_false_source_failure(
     assert state_writes == 2
     assert state_path.read_bytes() == before
     assert _portfolio_symbols(portfolio_path) == {"NEW0"}
-    assert not hasattr(controller_module, "_verify_or_restore_portfolio")
+    assert not hasattr(worker_module, "_verify_or_restore_portfolio")
 
 
 def test_validation_failure_writes_diagnostic_without_replacing_accepted_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.account_sync_controller as controller_module
+    import open_trader.account_sync_worker as worker_module
 
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest" / "portfolio.csv"
@@ -203,9 +203,9 @@ def test_validation_failure_writes_diagnostic_without_replacing_accepted_data(
     invalid = BrokerAccountCandidate(
         **{**original.__dict__, "source_kind": "statement"}
     )
-    _configure_sources(monkeypatch, controller_module, futu_candidate=invalid)
+    _configure_sources(monkeypatch, worker_module, futu_candidate=invalid)
 
-    AccountSyncController(_config(data_dir, portfolio_path)).sync_accounts_once()
+    AccountSyncWorker(_config(data_dir, portfolio_path)).sync_accounts_once()
 
     published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     assert published["brokers"]["futu"]["positions"][0]["symbol"] == "OLD0"
@@ -217,7 +217,7 @@ def test_validation_failure_writes_diagnostic_without_replacing_accepted_data(
 def test_quote_failure_restores_published_quotes_without_mutating_account_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.account_sync_controller as controller_module
+    import open_trader.account_sync_worker as worker_module
 
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest" / "portfolio.csv"
@@ -242,14 +242,14 @@ def test_quote_failure_restores_published_quotes_without_mutating_account_state(
         raise FutuQuoteError("quote unavailable", error_type="quote_failed")
 
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "DashboardQuoteService",
         lambda config, **kwargs: DashboardQuoteService(
             config, client_factory=unavailable_client, **kwargs
         ),
     )
 
-    result = AccountSyncController(_config(data_dir, portfolio_path)).sync_quotes_once()
+    result = AccountSyncWorker(_config(data_dir, portfolio_path)).sync_quotes_once()
     payload = json.loads(quotes_path.read_text(encoding="utf-8"))
 
     assert result["status"] == "failed"
@@ -262,7 +262,7 @@ def test_quote_failure_restores_published_quotes_without_mutating_account_state(
 def test_account_failure_does_not_mutate_published_quotes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import open_trader.account_sync_controller as controller_module
+    import open_trader.account_sync_worker as worker_module
 
     data_dir = tmp_path / "data"
     portfolio_path = data_dir / "latest" / "portfolio.csv"
@@ -277,14 +277,14 @@ def test_account_failure_does_not_mutate_published_quotes(
         },
     )
     before = quotes_path.read_bytes()
-    _configure_sources(monkeypatch, controller_module, futu_error=RuntimeError("down"))
+    _configure_sources(monkeypatch, worker_module, futu_error=RuntimeError("down"))
 
-    AccountSyncController(_config(data_dir, portfolio_path)).sync_accounts_once()
+    AccountSyncWorker(_config(data_dir, portfolio_path)).sync_accounts_once()
 
     assert quotes_path.read_bytes() == before
 
 
-def test_run_account_sync_controller_runs_account_and_quote_on_their_cadences(
+def test_run_account_sync_worker_runs_account_and_quote_on_their_cadences(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = [0.0]
@@ -294,19 +294,19 @@ def test_run_account_sync_controller_runs_account_and_quote_on_their_cadences(
     heartbeat_attempts: list[float] = []
     config = _config(tmp_path / "data", tmp_path / "data/latest/portfolio.csv")
 
-    def sync_accounts(self: AccountSyncController) -> dict[str, object]:
+    def sync_accounts(self: AccountSyncWorker) -> dict[str, object]:
         events.append("account")
         account_attempts.append(clock[0])
         self._last_account_attempt = clock[0]
         return {"status": "failed"}
 
-    def sync_quotes(self: AccountSyncController) -> dict[str, object]:
+    def sync_quotes(self: AccountSyncWorker) -> dict[str, object]:
         events.append("quote")
         quote_attempts.append(clock[0])
         self._last_quote_attempt = clock[0]
         return {"status": "failed"}
 
-    def heartbeat(self: AccountSyncController, *, blocker: str | None = None) -> None:
+    def heartbeat(self: AccountSyncWorker, *, blocker: str | None = None) -> None:
         events.append("heartbeat")
         heartbeat_attempts.append(clock[0])
 
@@ -315,12 +315,12 @@ def test_run_account_sync_controller_runs_account_and_quote_on_their_cadences(
             raise StopLoop
         clock[0] += seconds
 
-    monkeypatch.setattr(AccountSyncController, "sync_accounts_once", sync_accounts)
-    monkeypatch.setattr(AccountSyncController, "sync_quotes_once", sync_quotes)
-    monkeypatch.setattr(AccountSyncController, "write_heartbeat", heartbeat)
+    monkeypatch.setattr(AccountSyncWorker, "sync_accounts_once", sync_accounts)
+    monkeypatch.setattr(AccountSyncWorker, "sync_quotes_once", sync_quotes)
+    monkeypatch.setattr(AccountSyncWorker, "write_heartbeat", heartbeat)
 
     with pytest.raises(StopLoop):
-        run_account_sync_controller(config, clock=lambda: clock[0], sleep_fn=advance)
+        run_account_sync_worker(config, clock=lambda: clock[0], sleep_fn=advance)
 
     assert events[:3] == ["account", "quote", "heartbeat"]
     assert account_attempts == [0.0, 60.0, 120.0]
@@ -328,34 +328,34 @@ def test_run_account_sync_controller_runs_account_and_quote_on_their_cadences(
     assert heartbeat_attempts == quote_attempts
 
 
-def test_run_account_sync_controller_refuses_a_second_lock_holder(
+def test_run_account_sync_worker_refuses_a_second_lock_holder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = _config(tmp_path / "data", tmp_path / "data/latest/portfolio.csv")
     lock_path = config.data_dir / "account_sync" / "controller.lock"
     lock_path.parent.mkdir(parents=True)
-    monkeypatch.setattr(AccountSyncController, "sync_accounts_once", pytest.fail)
-    monkeypatch.setattr(AccountSyncController, "sync_quotes_once", pytest.fail)
+    monkeypatch.setattr(AccountSyncWorker, "sync_accounts_once", pytest.fail)
+    monkeypatch.setattr(AccountSyncWorker, "sync_quotes_once", pytest.fail)
 
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert run_account_sync_controller(config, once=True) != 0
+        assert run_account_sync_worker(config, once=True) != 0
 
-    assert "已有同步控制器运行" in capsys.readouterr().err
+    assert "已有账户同步 Worker 运行" in capsys.readouterr().err
 
 
-def test_run_account_sync_controller_writes_independent_loop_results_and_heartbeat(
+def test_run_account_sync_worker_writes_independent_loop_results_and_heartbeat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path / "data", tmp_path / "data/latest/portfolio.csv")
     monkeypatch.setattr(
-        AccountSyncController, "sync_accounts_once", lambda self: {"status": "failed"}
+        AccountSyncWorker, "sync_accounts_once", lambda self: {"status": "failed"}
     )
     monkeypatch.setattr(
-        AccountSyncController, "sync_quotes_once", lambda self: {"status": "ok"}
+        AccountSyncWorker, "sync_quotes_once", lambda self: {"status": "ok"}
     )
 
-    assert run_account_sync_controller(config, once=True) == 0
+    assert run_account_sync_worker(config, once=True) == 0
     status = json.loads(
         (config.data_dir / "account_sync" / "controller_status.json").read_text(
             encoding="utf-8"
@@ -371,8 +371,8 @@ def test_run_account_sync_controller_writes_independent_loop_results_and_heartbe
     assert status["git_sha"]
 
 
-def _config(data_dir: Path, portfolio_path: Path) -> AccountSyncControllerConfig:
-    return AccountSyncControllerConfig(
+def _config(data_dir: Path, portfolio_path: Path) -> AccountSyncWorkerConfig:
+    return AccountSyncWorkerConfig(
         data_dir=data_dir,
         reports_dir=data_dir / "reports",
         portfolio_path=portfolio_path,
@@ -427,7 +427,7 @@ def _write_quote_portfolio(path: Path) -> None:
 
 def _configure_sources(
     monkeypatch: pytest.MonkeyPatch,
-    controller_module: object,
+    worker_module: object,
     *,
     futu_candidate: BrokerAccountCandidate | None = None,
     tiger_candidate: BrokerAccountCandidate | None = None,
@@ -455,21 +455,21 @@ def _configure_sources(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(controller_module, "FutuAccountClient", FutuClient)
-    monkeypatch.setattr(controller_module, "TigerAccountClient", TigerClient)
-    monkeypatch.setattr(controller_module, "load_tiger_account_config", lambda **_kwargs: object())
+    monkeypatch.setattr(worker_module, "FutuAccountClient", FutuClient)
+    monkeypatch.setattr(worker_module, "TigerAccountClient", TigerClient)
+    monkeypatch.setattr(worker_module, "load_tiger_account_config", lambda **_kwargs: object())
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "build_futu_account_candidate",
         lambda *_args, **_kwargs: futu_candidate or _candidate("futu", 1, "FUTU"),
     )
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "build_tiger_account_candidate",
         lambda *_args, **_kwargs: tiger_candidate or _candidate("tiger", 1, "TIGER"),
     )
     monkeypatch.setattr(
-        controller_module,
+        worker_module,
         "load_latest_statement_candidate",
         lambda _data_dir, broker: _candidate(broker, 1, broker.upper()),
     )

@@ -17,13 +17,14 @@ TEMPLATE = ROOT / "ops" / "launchd" / "com.open-trader.account-sync-controller.p
 LABEL = "com.open-trader.account-sync-controller"
 
 
-def test_template_runs_only_the_account_sync_controller() -> None:
+def test_template_runs_only_the_account_sync_worker() -> None:
     payload = plistlib.loads(TEMPLATE.read_bytes())
 
+    assert TEMPLATE.name == "com.open-trader.account-sync-controller.plist.template"
     assert payload["Label"] == LABEL
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] is True
-    assert ["-m", "open_trader", "account-sync-controller"] == payload[
+    assert ["-m", "open_trader", "account-sync-worker"] == payload[
         "ProgramArguments"
     ][
         payload["ProgramArguments"].index("-m") : payload["ProgramArguments"].index("-m") + 3
@@ -244,7 +245,7 @@ def test_installer_rejects_a_preinstall_status_without_kickstart_write(
     )
 
     assert result.returncode == 1
-    assert "account sync controller did not publish a matching fresh status" in result.stderr
+    assert "account sync worker did not publish a matching fresh status" in result.stderr
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "bootout",
         "print",

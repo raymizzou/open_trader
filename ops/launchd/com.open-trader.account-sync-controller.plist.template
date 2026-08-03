@@ -18,7 +18,7 @@
     <string>OPEN_TRADER_PYTHON</string>
     <string>-m</string>
     <string>open_trader</string>
-    <string>account-sync-controller</string>
+    <string>account-sync-worker</string>
     <string>--config</string>
     <string>OPEN_TRADER_DAILY_CONFIG</string>
     <string>--data-dir</string>

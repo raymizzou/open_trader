@@ -476,7 +476,7 @@ def require_published_portfolio(
     controller = health["controller"]
     assert isinstance(controller, dict)
     if controller.get("status") != "ok":
-        raise RuntimeError(f"account sync controller {controller.get('status', 'unknown')}")
+        raise RuntimeError(f"account sync worker {controller.get('status', 'unknown')}")
 
     brokers: set[str] = set()
     with portfolio_path.open(encoding="utf-8-sig", newline="") as handle:

@@ -28,9 +28,9 @@ from .a_share_trend import (
     load_futu_simulate_trend_account,
 )
 from .backtest import run_backtest
-from .account_sync_controller import (
-    AccountSyncControllerConfig,
-    run_account_sync_controller,
+from .account_sync_worker import (
+    AccountSyncWorkerConfig,
+    run_account_sync_worker,
 )
 from .account_sync_state import project_account_sync_health
 from .daily_premarket import (
@@ -840,27 +840,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch one market-data snapshot and exit",
     )
 
-    account_sync_controller = subparsers.add_parser(
-        "account-sync-controller", help="Run the sole account and quote publisher"
+    account_sync_worker = subparsers.add_parser(
+        "account-sync-worker", help="Run the sole account and quote publisher"
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    account_sync_controller.add_argument("--data-dir", type=Path, default=Path("data"))
-    account_sync_controller.add_argument("--reports-dir", type=Path, default=Path("reports"))
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument("--data-dir", type=Path, default=Path("data"))
+    account_sync_worker.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    account_sync_worker.add_argument(
         "--portfolio", type=Path, default=Path("data/latest/portfolio.csv")
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--account-interval-seconds", type=positive_float, default=60.0
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--quote-interval-seconds", type=positive_float, default=5.0
     )
-    account_sync_controller.add_argument("--once", action="store_true")
+    account_sync_worker.add_argument("--once", action="store_true")
 
     account_sync_status = subparsers.add_parser(
         "account-sync-status", help="Show accepted account-sync file health"
@@ -1323,10 +1323,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "account-sync-controller":
+    if args.command == "account-sync-worker":
         try:
             values = _read_env_file(args.config)
-            config = AccountSyncControllerConfig(
+            config = AccountSyncWorkerConfig(
                 data_dir=args.data_dir,
                 reports_dir=args.reports_dir,
                 portfolio_path=args.portfolio,
@@ -1339,27 +1339,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
             parser.error(str(exc))
-        return run_account_sync_controller(config, once=args.once)
+        return run_account_sync_worker(config, once=args.once)
 
     if args.command == "account-sync-status":
         state = _load_optional_json(args.data_dir / "latest" / "account_sync_state.json") or {}
-        controller = _load_optional_json(args.data_dir / "account_sync" / "controller_status.json") or {}
+        worker_document = _load_optional_json(
+            args.data_dir / "account_sync" / "controller_status.json"
+        ) or {}
         quotes = _load_optional_json(args.data_dir / "latest" / "quotes.json") or {}
         health = project_account_sync_health(
-            state, controller, quotes, now=datetime.now().astimezone()
+            state, worker_document, quotes, now=datetime.now().astimezone()
         )
         if args.json:
             print(json.dumps(health, ensure_ascii=False))
         else:
             print(f"status: {health['status']}")
             print(f"reason: {health['reason']}")
-            controller_status = health["controller"]
-            assert isinstance(controller_status, dict)
+            worker_status = health["controller"]
+            assert isinstance(worker_status, dict)
             print(
-                "controller: "
-                f"pid={controller_status.get('pid', '')} "
-                f"sha={controller_status.get('git_sha', '')} "
-                f"heartbeat={controller_status.get('heartbeat_at', '')}"
+                "worker: "
+                f"pid={worker_status.get('pid', '')} "
+                f"sha={worker_status.get('git_sha', '')} "
+                f"heartbeat={worker_status.get('heartbeat_at', '')}"
             )
             print(f"quotes: {health['quotes']['status']}")
             for broker, source in health["brokers"].items():
