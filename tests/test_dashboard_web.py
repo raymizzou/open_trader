@@ -39,7 +39,7 @@ def test_acceptance_gate_runs_prediction_playwright() -> None:
         encoding="utf-8"
     )
 
-    assert 'OPEN_TRADER_PYTHON="$(WORKTREE_ROOT)/.venv/bin/python"' in makefile
+    assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' in makefile
     normalized = " ".join(re.sub(r"\\\s*\n", " ", makefile).split())
     assert (
         "npm exec playwright test tests/e2e/prediction-market.spec.ts "
