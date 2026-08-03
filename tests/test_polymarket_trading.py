@@ -20,6 +20,7 @@ from open_trader.polymarket_trading import (
     KEYCHAIN_SERVICE,
     PREDICT_API_KEY_ACCOUNT,
     PREDICT_KEYCHAIN_SERVICE,
+    PREDICT_PRIVATE_KEY_ACCOUNT,
     PolymarketTradingClient,
     PredictConfig,
     ThresholdHedgeSubmission,
@@ -27,6 +28,7 @@ from open_trader.polymarket_trading import (
     TradingConfig,
     load_keychain_secret,
     load_predict_api_key,
+    load_predict_private_key,
     load_trading_config,
     store_keychain_secret,
     store_predict_api_key,
@@ -289,6 +291,33 @@ def test_load_predict_api_key_strips_value_and_redacts_failures() -> None:
     with pytest.raises(Exception) as exc_info:
         load_predict_api_key(run=unavailable)
     assert "key-sentinel" not in str(exc_info.value)
+
+
+def test_load_predict_private_key_uses_predict_keychain_and_redacts_failures() -> None:
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        calls.append(args)
+        return CompletedProcess(args, 0, "private-sentinel\n", "")
+
+    assert load_predict_private_key(run=run) == "private-sentinel"
+    assert calls == [[
+        "/usr/bin/security",
+        "find-generic-password",
+        "-a",
+        PREDICT_PRIVATE_KEY_ACCOUNT,
+        "-s",
+        PREDICT_KEYCHAIN_SERVICE,
+        "-w",
+    ]]
+    assert all("private-sentinel" not in arg for arg in calls[0])
+
+    def unavailable(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        raise CalledProcessError(1, args, stderr="private-sentinel")
+
+    with pytest.raises(Exception) as exc_info:
+        load_predict_private_key(run=unavailable)
+    assert "private-sentinel" not in str(exc_info.value)
 
 
 def test_predict_setup_preserves_polymarket_config_and_hides_api_key(

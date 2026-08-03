@@ -39,6 +39,7 @@ SECURITY = "/usr/bin/security"
 KEYCHAIN_SERVICE = "com.open-trader.polymarket"
 PREDICT_KEYCHAIN_SERVICE = "com.open-trader.predict"
 PREDICT_API_KEY_ACCOUNT = "api-key"
+PREDICT_PRIVATE_KEY_ACCOUNT = "privy-private-key"
 KEYCHAIN_ACCOUNTS = (
     "signing-private-key",
     "builder-key",
@@ -292,6 +293,40 @@ def load_predict_api_key(
                 "find-generic-password",
                 "-a",
                 PREDICT_API_KEY_ACCOUNT,
+                "-s",
+                PREDICT_KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        value = getattr(completed, "stdout", "")
+    except Exception as exc:
+        del exc
+        raise KeychainError() from None
+    if not isinstance(value, str):
+        raise KeychainError("keychain_empty")
+    value = value.rstrip("\r\n")
+    if not value:
+        raise KeychainError("keychain_empty")
+    return value
+
+
+def load_predict_private_key(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str:
+    """Load the Predict signer key without exposing it in failures."""
+
+    runner = run or _run_security
+    try:
+        completed = runner(
+            [
+                SECURITY,
+                "find-generic-password",
+                "-a",
+                PREDICT_PRIVATE_KEY_ACCOUNT,
                 "-s",
                 PREDICT_KEYCHAIN_SERVICE,
                 "-w",
@@ -2335,6 +2370,7 @@ __all__ = [
     "KEYCHAIN_ACCOUNTS",
     "KEYCHAIN_SERVICE",
     "PREDICT_API_KEY_ACCOUNT",
+    "PREDICT_PRIVATE_KEY_ACCOUNT",
     "PREDICT_KEYCHAIN_SERVICE",
     "KeychainError",
     "LegResult",
@@ -2347,6 +2383,7 @@ __all__ = [
     "TradingConfig",
     "load_keychain_secret",
     "load_predict_api_key",
+    "load_predict_private_key",
     "load_trading_config",
     "store_keychain_secret",
     "store_predict_api_key",
