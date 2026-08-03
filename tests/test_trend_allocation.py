@@ -67,6 +67,8 @@ def test_build_allocation_snapshot_uses_secondary_root_then_previous_order() -> 
     assert list(snapshot(roots=tied, previous=previous)["markets"]) == ["HK", "CN", "US"]
     with pytest.raises(TrendAnimalsError, match="tie"):
         snapshot(roots=tied)
+    with pytest.raises(TrendAnimalsError, match="schema|mapping"):
+        snapshot(roots=tied, previous={"markets": {"CN": {"rank": 1}}})
 
 
 @pytest.mark.parametrize(
@@ -145,6 +147,8 @@ def test_write_revisions_are_immutable_and_locked_batches_fail_closed(tmp_path: 
     batch.write_text(json.dumps({"report_path": str(report)}), encoding="utf-8")
     with pytest.raises(TrendAnimalsError, match="locked"):
         write_allocation_snapshot(tmp_path, snapshot(roots=root_rows(cn=("98", "58.3"))), revision=True)
+    with pytest.raises(TrendAnimalsError, match="locked"):
+        write_allocation_snapshot(tmp_path, changed, revision=True)
 
 
 def test_load_rejects_bad_pointer_hash_schema_and_returns_none_when_cold(tmp_path: Path) -> None:

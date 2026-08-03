@@ -143,11 +143,11 @@ def write_allocation_snapshot(
     if daily.exists() and daily.read_bytes() != body:
         if not revision:
             raise TrendAnimalsError("immutable allocation snapshot collision")
+        _assert_revision_is_unlocked(data_dir, allocation_date)
         existing_revision = _matching_revision(daily_root, allocation_date, body)
         if existing_revision is not None:
             daily = existing_revision
         else:
-            _assert_revision_is_unlocked(data_dir, allocation_date)
             daily = daily_root / f"{allocation_date}-r{_next_revision(daily_root, allocation_date)}.json"
     _create_immutable(daily, body)
     reference = {
@@ -294,6 +294,7 @@ def _rank_markets(
 
 
 def _previous_order(previous: Mapping[str, object]) -> list[str]:
+    _validate_snapshot(previous)
     if not isinstance(previous, Mapping) or not isinstance(previous.get("markets"), Mapping):
         raise TrendAnimalsError("previous allocation snapshot is invalid")
     markets = previous["markets"]
