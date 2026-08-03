@@ -3566,6 +3566,54 @@ console.log(JSON.stringify({
     assert "正在读取两腿结果" in rendered["reconciling"]
 
 
+def test_prediction_cross_preview_uses_production_contract_and_fails_closed() -> None:
+    output = run_dashboard_js(r'''
+const preview = {
+  state:"previewed", preview_id:"cross-preview-real", market_type:"cross_venue_yes_no",
+  question:"Will Bitcoin close above $100,000 on December 31, 2026?",
+  buy_legs:[
+    {exchange:"predict.fun",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",net_quantity:"5",max_price:"0.470",max_cost:"2.35",maximum_fee:"0.02"},
+    {exchange:"polymarket",outcome:"NO",token_id:"poly-no",settlement_asset:"pUSD",net_quantity:"5",max_price:"0.490",max_cost:"2.45",maximum_fee:"0.00"},
+  ],
+  net_quantity:"5", total_max_cost:"4.80", minimum_payout:"5.00", minimum_profit:"0.20",
+  annualized_yield:"0.201", canonical_cutoff:"2026-12-31T23:59:00Z",
+  codex_approval:{decision:"APPROVE",summary:"server approval",evidence:[
+    {exchange:"predict.fun",field:"cutoff",quote:"server predict cutoff"},
+    {exchange:"polymarket",field:"cutoff",quote:"server polymarket cutoff"},
+  ]},
+  balances:{
+    "predict.fun":{asset:"USDT",wallet_address:"0xcE23…f435",available_balance:"12.34",allowance_ready:true},
+    polymarket:{asset:"pUSD",wallet_address:"0x7A4E…91C2",available_balance:"50.00",allowance:"50.00"},
+  },
+  unsettled:{current:"35.20",after:"40.00",limit:"100"},
+  policy_limits:{max_normal_cost:"20",max_emergency_loss:"2"},
+};
+const html = predictionModalHtml("order", preview);
+console.log(JSON.stringify({
+  complete:predictionPreviewIsComplete(preview),
+  modal:html.includes('class="pm-modal"'),
+  legs:html.includes("Predict.fun · BUY YES") && html.includes("Polymarket · BUY NO"),
+  balances:html.includes("$12.34") && html.includes("$50.00"),
+  serverValues:["$100.00","$20.00","$2.00","+$0.20"].every((value)=>html.includes(value)),
+  missingLegs:predictionPreviewIsComplete({...preview,buy_legs:preview.buy_legs.slice(0,1)}),
+  missingBalances:predictionPreviewIsComplete({...preview,balances:undefined}),
+  missingPolicy:predictionPreviewIsComplete({...preview,policy_limits:{max_normal_cost:"20"}}),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "complete": True,
+        "modal": True,
+        "legs": True,
+        "balances": True,
+        "serverValues": True,
+        "missingLegs": False,
+        "missingBalances": False,
+        "missingPolicy": False,
+    }
+
+
 def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:
     output = run_dashboard_js(r'''
 console.log(predictionExecutionAlert({

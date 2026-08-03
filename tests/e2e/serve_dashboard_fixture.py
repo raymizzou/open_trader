@@ -425,24 +425,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({
                     "state": "previewed",
                     "preview_id": "cross-preview-fixture",
-                    "title": "Will Bitcoin close above $100,000 on December 31, 2026?",
+                    "execution_id": "cross-execution-fixture",
+                    "opportunity_id": "cross-opportunity-actionable-fixture",
+                    "question": "Will Bitcoin close above $100,000 on December 31, 2026?",
                     "market_type": "cross_venue_yes_no",
-                    "quantity": "5",
+                    "intent_type": "cross_venue",
+                    "pair_id": "cross-pair-fixture",
+                    "direction": "predict_yes_polymarket_no",
                     "net_quantity": "5",
-                    "legs": [
-                        {"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture", "settlement_asset": "USDT", "quantity": "5", "net_quantity": "5", "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02"},
-                        {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture", "settlement_asset": "pUSD", "quantity": "5", "net_quantity": "5", "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00"},
+                    "buy_legs": [
+                        {"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture", "settlement_asset": "USDT", "requested_quantity": "5", "net_quantity": "5", "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02", "fee_asset": "USDT"},
+                        {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture", "settlement_asset": "pUSD", "requested_quantity": "5", "net_quantity": "5", "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00", "fee_asset": "pUSD"},
                     ],
                     "total_max_cost": "4.80",
+                    "maximum_total_cost": "4.80",
                     "minimum_payout": "5.00",
                     "minimum_profit": "0.20",
                     "annualized_yield": "0.201",
                     "canonical_cutoff": "2026-12-31T23:59:00Z",
                     "codex_approval": {"decision": "APPROVE", "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。", "evidence": [{"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"}, {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2026"}]},
-                    "venue_balances": [{"exchange": "predict.fun", "wallet": "0xcE23…f435", "asset": "USDT", "available": "12.34"}, {"exchange": "polymarket", "wallet": "0x7A4E…91C2", "asset": "pUSD", "available": "50.00"}],
+                    "balances": {"predict.fun": {"asset": "USDT", "wallet_address": "0xcE23…f435", "available_balance": "12.34", "allowance_ready": True}, "polymarket": {"asset": "pUSD", "wallet_address": "0x7A4E…91C2", "available_balance": "50.00", "allowance": "50.00"}},
                     "unsettled": {"current": "35.20", "after": "40.00", "limit": "100"},
-                    "wallet_address": "0x7A4E1234567890ABCDEF91C2",
-                    "policy_limits": {"max_normal_cost": "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100", "max_wallet_balance": "65", "min_estimated_profit": "1"},
+                    "policy_limits": {"max_normal_cost": "20", "max_emergency_loss": "2"},
+                    "expires_at": "2026-08-03T12:00:00Z",
                 })
             else:
                 opportunity = dict(_prediction_payload("ready")["opportunities"][0])

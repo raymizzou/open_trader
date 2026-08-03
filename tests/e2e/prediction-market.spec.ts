@@ -105,10 +105,15 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   test('renders cross execution history, holding, dust, breaker, and redemption states', async ({ page }) => {
     await openPrediction(page, 'cross-submitting');
     await expect(page.locator('.pm-progress')).toContainText('正在提交');
+    await expect(page.locator('.pm-progress')).toContainText('分别结算/自动兑付');
+    await expect(page.locator('.pm-progress')).not.toContainText('自动合并');
     await openPrediction(page, 'cross-reconciling');
     await expect(page.locator('.pm-progress')).toContainText('正在读取两腿结果');
+    await expect(page.locator('.pm-progress')).toContainText('分别结算/自动兑付');
+    await expect(page.locator('.pm-progress')).not.toContainText('自动合并');
     await openPrediction(page, 'cross-holding');
     await expect(page.locator('.pm-alert')).toContainText('待兑付');
+    await expect(page.locator('.pm-alert')).not.toContainText('自动合并');
     await page.getByRole('button', { name: '交易与合并', exact: true }).click();
     const executions = page.locator('[data-prediction-history-panel]');
     for (const text of ['Predict.fun · YES', 'Polymarket · NO', 'submitting', 'reconciling', '待兑付']) {
