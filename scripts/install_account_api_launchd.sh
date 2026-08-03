@@ -129,8 +129,8 @@ process_cwd_matches() {
 
 loopback_listener_matches() {
   "$LSOF_BIN" -nP -a -p "$1" -iTCP:8768 -sTCP:LISTEN -Fn 2>/dev/null | awk '
-    $1 == "n127.0.0.1:8768" { found = 1 }
-    END { exit !found }
+    $1 ~ /^n/ { count += 1; if ($1 != "n127.0.0.1:8768") invalid = 1 }
+    END { exit !(count == 1 && !invalid) }
   '
 }
 

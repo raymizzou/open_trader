@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_account_api_launchd.sh"
@@ -197,7 +199,10 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
     assert "account-sync" not in calls.read_text(encoding="utf-8")
 
 
-def test_installer_rejects_matching_health_when_process_cwd_is_wrong(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bad_field", ["cwd", "listener"])
+def test_installer_rejects_matching_health_when_process_identity_is_not_exact(
+    tmp_path: Path, bad_field: str
+) -> None:
     repo = _copy_repo(tmp_path)
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
@@ -223,8 +228,10 @@ def test_installer_rejects_matching_health_when_process_cwd_is_wrong(tmp_path: P
         "#!/bin/sh\n"
         "echo \"$*\" >> \"$FAKE_CALLS\"\n"
         "case \"$*\" in\n"
-        "*'-d cwd -Fn'*) printf 'p4242\\nfcwd\\nn/tmp/wrong\\n' ;;\n"
-        "*'-iTCP:8768 -sTCP:LISTEN -Fn'*) printf 'p4242\\nn127.0.0.1:8768\\n' ;;\n"
+        "*'-d cwd -Fn'*)\n"
+        "  if [ \"$FAKE_BAD_FIELD\" = cwd ]; then printf 'p4242\\nfcwd\\nn/tmp/wrong\\n'; else printf 'p4242\\nfcwd\\nn%s\\n' \"$FAKE_REPO\"; fi ;;\n"
+        "*'-iTCP:8768 -sTCP:LISTEN -Fn'*)\n"
+        "  if [ \"$FAKE_BAD_FIELD\" = listener ]; then printf 'p4242\\nn127.0.0.1:8768\\nn*:8768\\n'; else printf 'p4242\\nn127.0.0.1:8768\\n'; fi ;;\n"
         "esac\n",
         encoding="utf-8",
     )
@@ -265,6 +272,8 @@ def test_installer_rejects_matching_health_when_process_cwd_is_wrong(tmp_path: P
             "CURL_BIN": str(curl),
             "FAKE_CALLS": str(calls),
             "FAKE_STATE": str(state),
+            "FAKE_REPO": str(repo),
+            "FAKE_BAD_FIELD": bad_field,
             "FAKE_HEALTH": health,
         },
     )
@@ -273,6 +282,8 @@ def test_installer_rejects_matching_health_when_process_cwd_is_wrong(tmp_path: P
     assert "Account API did not publish matching shadow health" in result.stderr
     recorded = calls.read_text(encoding="utf-8")
     assert "-a -p 4242 -d cwd -Fn" in recorded
+    if bad_field == "listener":
+        assert "-nP -a -p 4242 -iTCP:8768 -sTCP:LISTEN -Fn" in recorded
     assert "http://127.0.0.1:8768/healthz" not in recorded
 
 
