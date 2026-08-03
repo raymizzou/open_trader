@@ -2988,7 +2988,7 @@ def _check_trend_holding_tabs(
     )
 
     headings = (
-        "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+        "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业",
         "当前判断", "活动保护线", "持仓提示",
     )
     real_panel = section.locator('[data-trend-holding-panel="real"]')
