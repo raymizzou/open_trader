@@ -471,6 +471,78 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
         trend_review.rebuild_trend_report_from_evidence(duplicate_symbol)
 
 
+def test_rebuild_uses_frozen_allocation_daily_bytes_not_latest_pointer(
+    tmp_path: Path,
+) -> None:
+    roots = {
+        market: {
+            role: {
+                "asset": asset,
+                "tm_id": index * 10 + role_index,
+                "as_of_date": "2026-08-03",
+                "global_strength": strength,
+            }
+            for role_index, (role, asset, strength) in enumerate(
+                (("stock", stock, stock_strength), ("etf", etf, etf_strength))
+            )
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (
+                ("CN", "A股", "ETF基金", "90", "80"),
+                ("HK", "港股", "香港ETF", "70", "60"),
+                ("US", "美股", "美国ETF", "50", "40"),
+            ),
+            1,
+        )
+    }
+    snapshot = {
+        "version": 1,
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "generator_version": "trend-allocation-v1",
+        "git_sha": "a" * 40,
+        "roots": roots,
+        "markets": {
+            "CN": {"rank": 1, "score": "90", "score_source": "A股", "entry_weight": "0.06", "nominal_weight": "0.60"},
+            "HK": {"rank": 2, "score": "70", "score_source": "港股", "entry_weight": "0.04", "nominal_weight": "0.40"},
+            "US": {"rank": 3, "score": "50", "score_source": "美股", "entry_weight": "0.02", "nominal_weight": "0.20"},
+        },
+    }
+    body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    daily = tmp_path / "trend_allocation/daily/2026-08-03.json"
+    daily.parent.mkdir(parents=True)
+    daily.write_text(body, encoding="utf-8")
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "snapshot": snapshot,
+    }
+    strategy = trend_strategy_snapshot("CN", "oldsha", (622466, 697199))
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=AccountSnapshot("2026-07-16", True, Decimal("100000"), Decimal("100000"), (), ()),
+        candidates=(), holding_snapshots={}, bars_by_symbol={},
+        market="CN", process_version="oldsha", strategy_snapshot=strategy,
+        metadata={"process_version": "oldsha"},
+        allocation_reference=allocation,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path, report=report, candidates=(), holding_snapshots={},
+        bars_by_symbol={}, prior_state={"schema_version": 1, "positions": {}},
+        watch_events=(), query={}, responses={}, candidate_pool_ids=(622466, 697199),
+        lot_sizes={}, price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=(), option_attention_broker_label=None,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+    assert evidence["rebuild_inputs"]["allocation"]["daily_json"] == body
+    latest = tmp_path / "trend_allocation/latest.json"
+    latest.write_text(json.dumps({"daily_path": "data/trend_allocation/daily/later.json", "sha256": "0" * 64}), encoding="utf-8")
+
+    assert trend_review.rebuild_trend_report_from_evidence(evidence) == source
+
+
 def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
     strategy = trend_strategy_snapshot("US", "oldsha", (1,))
     real_input = RealHoldingInput(

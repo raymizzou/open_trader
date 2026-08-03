@@ -25,6 +25,7 @@ from .a_share_trend import (
     live_trend_strategy_snapshot,
     trend_api_cost_label,
     valid_serialized_account,
+    valid_frozen_report_contract,
     valid_v2_risk_contract,
     valid_v3_risk_contract,
     valid_v4_risk_contract,
@@ -1972,6 +1973,7 @@ def _valid_trend_report_payload(
         and _valid_frozen_trend_facts(payload)
         and _valid_trend_risk_summary(payload)
         and _valid_option_attention(payload, market=market)
+        and valid_frozen_report_contract(payload)
         and as_of_date <= freshness_date <= execution_date
     ):
         return None
@@ -2355,6 +2357,13 @@ def _project_broker_trend_report(
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
+        "allocation": payload.get("allocation"),
+        "simulate_rotation_pairs": payload["strategy_judgments"].get(
+            "simulate_rotation_pairs", []
+        ),
+        "real_rotation_pairs": payload["strategy_judgments"].get(
+            "real_rotation_pairs", []
+        ),
         "industry_context_status": frozen_industry_context_status,
         "industry_contexts": frozen_industry_contexts,
         "strategy_parameter_rows": frozen_parameter_rows,

@@ -716,6 +716,188 @@ def _allocation_market_for(
     }
 
 
+def freeze_allocation_reference(
+    allocation: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Freeze the immutable allocation fact; a moving latest pointer is never valid."""
+    if allocation is None:
+        return None
+    from .trend_allocation import _reference, _validate_snapshot
+
+    try:
+        daily_path, sha256 = _reference({
+            "daily_path": allocation.get("daily_path"),
+            "sha256": allocation.get("sha256"),
+        })
+        snapshot = allocation.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            raise ValueError
+        _validate_snapshot(snapshot)
+        reused = allocation.get("reused", False)
+        stale_days = allocation.get("stale_a_trading_days", 0)
+        failure_reason = allocation.get("failure_reason", "")
+        if (
+            type(reused) is not bool
+            or isinstance(stale_days, bool)
+            or not isinstance(stale_days, int)
+            or stale_days < 0
+            or failure_reason is None
+        ):
+            raise ValueError
+        if not isinstance(failure_reason, str):
+            raise ValueError
+        allocation_date = str(snapshot["allocation_date"])
+        if re.fullmatch(r"data/trend_allocation/daily/(\d{4}-\d{2}-\d{2})(?:-r[1-9]\d*)?\.json", daily_path).group(1) != allocation_date:  # type: ignore[union-attr]
+            raise ValueError
+    except Exception:
+        raise ValueError("allocation reference is invalid") from None
+    return {
+        "daily_path": daily_path,
+        "sha256": sha256,
+        "allocation_date": allocation_date,
+        "generated_at": str(snapshot["generated_at"]),
+        "reused": reused,
+        "stale_a_trading_days": stale_days,
+        "failure_reason": failure_reason,
+        "roots": dict(snapshot["roots"]),
+        "markets": dict(snapshot["markets"]),
+    }
+
+
+def valid_frozen_allocation(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "daily_path", "sha256", "allocation_date", "generated_at", "reused",
+        "stale_a_trading_days", "failure_reason", "roots", "markets",
+    }:
+        return False
+    snapshot = {
+        "version": 1,
+        "allocation_date": value.get("allocation_date"),
+        "generated_at": value.get("generated_at"),
+        "generator_version": "trend-allocation-v1",
+        "git_sha": "0" * 40,
+        "roots": value.get("roots"),
+        "markets": value.get("markets"),
+    }
+    try:
+        freeze_allocation_reference({
+            "daily_path": value.get("daily_path"),
+            "sha256": value.get("sha256"),
+            "snapshot": snapshot,
+            "reused": value.get("reused"),
+            "stale_a_trading_days": value.get("stale_a_trading_days"),
+            "failure_reason": value.get("failure_reason"),
+        })
+    except ValueError:
+        return False
+    return True
+
+
+def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
+    """Validate the allocation-era fields once for every frozen-report reader."""
+    allocation = payload.get("allocation")
+    if allocation is None:
+        return True
+    if not valid_frozen_allocation(allocation):
+        return False
+    judgments = payload.get("strategy_judgments")
+    if not isinstance(judgments, Mapping):
+        return False
+    try:
+        execution_date = str(payload["execution_date"])
+        date.fromisoformat(execution_date)
+    except (KeyError, TypeError, ValueError):
+        return False
+    holdings = judgments.get("holding_decisions")
+    candidates = judgments.get("top10_candidates")
+    if not isinstance(holdings, list) or not isinstance(candidates, list):
+        return False
+    holding_symbols = {
+        item.get("symbol")
+        for item in holdings
+        if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+    }
+    candidate_symbols = {
+        item.get("symbol")
+        for item in candidates
+        if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+    }
+    for field, mode in (
+        ("simulate_rotation_pairs", "automatic"),
+        ("real_rotation_pairs", "manual"),
+    ):
+        pairs = judgments.get(field)
+        if not isinstance(pairs, list) or len(pairs) > 2:
+            return False
+        seen_indices: set[int] = set()
+        seen_symbols: set[str] = set()
+        for pair in pairs:
+            if not isinstance(pair, Mapping):
+                return False
+            pair_index = pair.get("pair_index")
+            if (
+                isinstance(pair_index, bool)
+                or not isinstance(pair_index, int)
+                or pair_index not in {0, 1}
+                or pair_index in seen_indices
+                or pair.get("execution_mode") != mode
+                or pair.get("execution_date") != execution_date
+                or pair.get("reason") != "relative_rotation"
+            ):
+                return False
+            sell_symbol, buy_symbol = pair.get("sell_symbol"), pair.get("buy_symbol")
+            if (
+                not isinstance(sell_symbol, str)
+                or not isinstance(buy_symbol, str)
+                or any(
+                    not isinstance(pair.get(field), str)
+                    or not pair[field].strip()
+                    for field in (
+                        "sell_name", "sell_futu_symbol", "buy_name", "buy_futu_symbol",
+                    )
+                )
+                or sell_symbol not in holding_symbols
+                or buy_symbol not in candidate_symbols
+                or sell_symbol == buy_symbol
+                or {sell_symbol, buy_symbol} & seen_symbols
+            ):
+                return False
+            try:
+                sell_strength = Decimal(str(pair.get("sell_global_strength")))
+                buy_strength = Decimal(str(pair.get("buy_global_strength")))
+                gap = Decimal(str(pair.get("strength_gap")))
+                weight = Decimal(str(pair.get("target_weight")))
+                amount = Decimal(str(pair.get("target_amount")))
+                atr = Decimal(str(pair.get("atr")))
+                shares = pair.get("estimated_shares")
+                lot_size = pair.get("lot_size")
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if (
+                not all(value.is_finite() for value in (
+                    sell_strength, buy_strength, gap, weight, amount, atr,
+                ))
+                or not Decimal("0") <= sell_strength <= Decimal("100")
+                or not Decimal("0") <= buy_strength <= Decimal("100")
+                or gap != buy_strength - sell_strength
+                or gap < Decimal("20")
+                or not Decimal("0") < weight <= Decimal("1")
+                or amount <= 0
+                or atr <= 0
+                or isinstance(shares, bool)
+                or not isinstance(shares, int)
+                or shares <= 0
+                or isinstance(lot_size, bool)
+                or not isinstance(lot_size, int)
+                or lot_size <= 0
+                or shares % lot_size
+            ):
+                return False
+            seen_indices.add(pair_index)
+            seen_symbols.update((sell_symbol, buy_symbol))
+    return True
+
+
 def live_trend_strategy_snapshot(
     market: str,
     process_version: str,
@@ -1315,6 +1497,8 @@ class RotationPair:
     lot_size: int
     atr: Decimal
     reason: str = "relative_rotation"
+    execution_date: str = ""
+    execution_mode: str = "automatic"
 
 
 @dataclass(frozen=True)
@@ -1430,6 +1614,7 @@ class TrendReport:
     real_holdings_reason: str = ""
     real_holdings_source: dict[str, str] = field(default_factory=dict)
     real_protection_state: dict[str, object] | None = None
+    allocation: dict[str, object] | None = None
     simulate_rotation_pairs: tuple[RotationPair, ...] = ()
     real_rotation_pairs: tuple[RotationPair, ...] = ()
 
@@ -2811,7 +2996,7 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
         raise ValueError("rotation pairs require a frozen allocation snapshot")
 
     def frozen(
-        account_key: str, pairs: Sequence[RotationPair]
+        account_key: str, pairs: Sequence[RotationPair], execution_mode: str,
     ) -> tuple[RotationPair, ...]:
         values = reserve_rotation_pairs(
             data_dir,
@@ -2835,7 +3020,10 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
                 **{
                     key: Decimal(str(value)) if key in decimal_fields else value
                     for key, value in pair.items()
-                }
+                    if key not in {"execution_date", "execution_mode"}
+                },
+                execution_date=report.execution_date,
+                execution_mode=execution_mode,
             )
             for pair in values
         )
@@ -2849,12 +3037,17 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
     return replace(
         report,
         simulate_rotation_pairs=(
-            frozen(f"simulate-{simulate_acc_id}", report.simulate_rotation_pairs)
+            frozen(
+                f"simulate-{simulate_acc_id}", report.simulate_rotation_pairs,
+                "automatic",
+            )
             if isinstance(simulate_acc_id, int) and simulate_acc_id > 0
             else ()
         ),
         real_rotation_pairs=(
-            frozen(f"real-{real_broker}", report.real_rotation_pairs)
+            frozen(
+                f"real-{real_broker}", report.real_rotation_pairs, "manual"
+            )
             if real_broker
             else ()
         ),
@@ -4008,6 +4201,7 @@ def build_report(
     industry_context_status: Mapping[str, object] | None = None,
     estimated_api_cost_complete: bool = True,
     real_holdings: RealHoldingInput | None = None,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> TrendReport:
     symbol_mapping_required = (
         (metadata or {}).get("symbol_mapping_schema")
@@ -4354,6 +4548,7 @@ def build_report(
         and all(character in "0123456789abcdef" for character in allocation_sha256)
     )
 
+    frozen_allocation = freeze_allocation_reference(allocation_reference)
     simulate_rotation_pairs: tuple[RotationPair, ...] = ()
     if (
         rotation_enabled
@@ -4376,6 +4571,14 @@ def build_report(
             kelly_state=kelly_state,
             critical_data_reason=kelly_data_reason,
             require_mapping=symbol_mapping_required,
+        )
+        simulate_rotation_pairs = tuple(
+            replace(
+                pair,
+                execution_date=execution_date,
+                execution_mode="automatic",
+            )
+            for pair in simulate_rotation_pairs
         )
     real_rotation_pairs: tuple[RotationPair, ...] = ()
     if real_holdings is not None and real_holdings.status == "available":
@@ -4418,6 +4621,14 @@ def build_report(
                 kelly_state=kelly_state,
                 critical_data_reason=kelly_data_reason,
                 require_mapping=symbol_mapping_required,
+            )
+            real_rotation_pairs = tuple(
+                replace(
+                    pair,
+                    execution_date=execution_date,
+                    execution_mode="manual",
+                )
+                for pair in real_rotation_pairs
             )
 
     industry_concentration = tuple(
@@ -4538,6 +4749,7 @@ def build_report(
         real_holdings_reason=(real_holdings.reason if real_holdings is not None else ""),
         real_holdings_source=(dict(real_holdings.source) if real_holdings is not None else {}),
         real_protection_state=real_protection_state,
+        allocation=frozen_allocation,
         simulate_rotation_pairs=simulate_rotation_pairs,
         real_rotation_pairs=real_rotation_pairs,
     )
@@ -5014,6 +5226,33 @@ def render_trend_feishu_text(
         f"账户状态：{status}",
         summary,
     ]
+    allocation = payload.get("allocation")
+    if allocation is not None:
+        if not isinstance(allocation, Mapping):
+            raise ValueError("冻结配置无效")
+        lines.extend(
+            _allocation_markdown_lines(allocation, execution_date=execution_date)
+        )
+        lines.extend(
+            _rotation_markdown_lines(
+                [
+                    item for item in judgments.get("simulate_rotation_pairs", [])
+                    if isinstance(item, Mapping)
+                ],
+                title="模拟盘自动轮换",
+                currency={"CN": "元", "HK": "港元", "US": "美元"}.get(market, ""),
+            )
+        )
+        lines.extend(
+            _rotation_markdown_lines(
+                [
+                    item for item in judgments.get("real_rotation_pairs", [])
+                    if isinstance(item, Mapping)
+                ],
+                title="实盘手动轮换建议",
+                currency={"CN": "元", "HK": "港元", "US": "美元"}.get(market, ""),
+            )
+        )
     if cost_label := _serialized_api_cost_label(payload):
         lines.append(cost_label)
     _append_feishu_action_sections(
@@ -5122,6 +5361,62 @@ def _industry_structure_explanation(context: IndustryContext) -> str:
     return text + "该指标不是账户仓位或上涨概率。"
 
 
+def _allocation_markdown_lines(
+    allocation: Mapping[str, object], *, execution_date: str
+) -> list[str]:
+    if not valid_frozen_allocation(allocation):
+        raise ValueError("frozen allocation is invalid")
+    roots = allocation["roots"]
+    markets = allocation["markets"]
+    assert isinstance(roots, Mapping) and isinstance(markets, Mapping)
+    lines = ["", "## 市场资源排名", ""]
+    if allocation["reused"]:
+        lines.append(
+            f"沿用旧排名 · {allocation['stale_a_trading_days']} 个 A 股交易日"
+        )
+    for market, label in (("CN", "A股"), ("HK", "港股"), ("US", "美股")):
+        root = roots[market]
+        values = markets[market]
+        assert isinstance(root, Mapping) and isinstance(values, Mapping)
+        stock = root["stock"]
+        etf = root["etf"]
+        assert isinstance(stock, Mapping) and isinstance(etf, Mapping)
+        lines.append(
+            f"- {label} 第 {values['rank']}｜{stock['asset']} 全局强度 {stock['global_strength']}"
+            f"｜{etf['asset']} 全局强度 {etf['global_strength']}｜分数来源 {values['score_source']}"
+            f"｜单仓基准 {_money(Decimal(str(values['entry_weight'])) * Decimal('100'))}%"
+            f"｜10 席位名义仓位 {_money(Decimal(str(values['nominal_weight'])) * Decimal('100'))}%"
+            f"｜来源 {stock['as_of_date']}/{etf['as_of_date']}"
+        )
+    lines.append(
+        f"- 快照 {allocation['allocation_date']}｜生成 {allocation['generated_at']}"
+        f"｜目标交易日 {execution_date}｜SHA {str(allocation['sha256'])[:12]}"
+    )
+    if allocation["failure_reason"]:
+        lines.append(f"- 本次更新失败原因：{allocation['failure_reason']}")
+    return lines
+
+
+def _rotation_markdown_lines(
+    pairs: Sequence[RotationPair] | Sequence[Mapping[str, object]], *,
+    title: str,
+    currency: str,
+) -> list[str]:
+    lines = ["", f"## {title}", ""]
+    if not pairs:
+        return [*lines, "- 无。"]
+    for pair in pairs:
+        raw = asdict(pair) if isinstance(pair, RotationPair) else pair
+        lines.append(
+            f"- 全部卖出 {raw['sell_symbol']} {raw['sell_name']}（全局强度 {raw['sell_global_strength']}）"
+            f"，再买入 {raw['buy_symbol']} {raw['buy_name']}（全局强度 {raw['buy_global_strength']}）"
+            f"｜差值 {raw['strength_gap']}｜目标仓位 {_money(Decimal(str(raw['target_weight'])) * Decimal('100'))}%"
+            f"｜金额 {_money(Decimal(str(raw['target_amount'])))} {currency}｜约 {raw['estimated_shares']} 股"
+            f"｜MARKET 卖出全成后才买入｜目标交易日 {raw['execution_date']}｜不得跨日"
+        )
+    return lines
+
+
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     strategy_version = str(report.strategy_snapshot.get("strategy_version") or "")
@@ -5172,6 +5467,12 @@ def render_markdown(report: TrendReport) -> str:
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
         "｜".join(summary_counts),
     ]
+    if report.allocation is not None:
+        lines.extend(
+            _allocation_markdown_lines(
+                report.allocation, execution_date=report.execution_date
+            )
+        )
     if report.strategy_snapshot.get("strategy_version") in {
         "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
     }:
@@ -5258,6 +5559,22 @@ def render_markdown(report: TrendReport) -> str:
             lines.append(line)
     else:
         lines.append("- 无需卖出。")
+
+    if report.allocation is not None:
+        lines.extend(
+            _rotation_markdown_lines(
+                report.simulate_rotation_pairs,
+                title="模拟盘自动轮换",
+                currency=currency,
+            )
+        )
+        lines.extend(
+            _rotation_markdown_lines(
+                report.real_rotation_pairs,
+                title="实盘手动轮换建议",
+                currency=currency,
+            )
+        )
 
     buy_window = "09:30–10:00" if market == "CN" else "下个常规交易时段"
     lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
@@ -5660,7 +5977,11 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "top10_candidates": top10_candidates,
         "formal_actions": formal_actions,
     }
-    if report.simulate_rotation_pairs or report.real_rotation_pairs:
+    if (
+        report.allocation is not None
+        or report.simulate_rotation_pairs
+        or report.real_rotation_pairs
+    ):
         strategy_judgments.update(
             simulate_rotation_pairs=[
                 _json_value(asdict(pair)) for pair in report.simulate_rotation_pairs
@@ -5730,6 +6051,8 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "strategy_snapshot": _json_value(report.strategy_snapshot),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    if report.allocation is not None:
+        payload["allocation"] = dict(report.allocation)
     if report.drawdown_summary is not None:
         payload["drawdown_summary"] = _json_value(report.drawdown_summary)
     if not legacy_v1:
@@ -5742,6 +6065,8 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
             payload[key] = value
     if not formal_actions:
         payload["no_action"] = NO_ACTION_TEXT
+    if not valid_frozen_report_contract(payload):
+        raise ValueError("frozen report contract is invalid")
     return payload
 
 
@@ -7017,6 +7342,7 @@ def _attempt_report(
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
             real_holdings=real_holdings,
+            allocation_reference=allocation_reference,
         )
         report = freeze_report_rotation_pairs(report, config.data_dir)
         report = replace(

@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -509,6 +509,25 @@ def freeze_report_evidence(
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
     risk_summary = getattr(report, "risk_summary")
+    frozen_allocation = getattr(report, "allocation", None)
+    allocation_evidence: dict[str, object] | None = None
+    if frozen_allocation is not None:
+        from .a_share_trend import valid_frozen_allocation
+
+        if not valid_frozen_allocation(frozen_allocation):
+            raise ValueError("frozen allocation is invalid")
+        daily_path = PurePosixPath(str(frozen_allocation["daily_path"]))
+        try:
+            relative_path = daily_path.relative_to("data")
+            body = (data_dir / relative_path).read_bytes()
+        except (ValueError, OSError):
+            raise ValueError("frozen allocation evidence is unavailable") from None
+        if hashlib.sha256(body).hexdigest() != frozen_allocation["sha256"]:
+            raise ValueError("frozen allocation evidence hash mismatch")
+        allocation_evidence = {
+            "reference": dict(frozen_allocation),
+            "daily_json": body.decode("utf-8"),
+        }
     evidence = {
         "market": str(metadata.get("market") or "CN"),
         "report_id": getattr(report, "as_of_date"),
@@ -569,6 +588,11 @@ def freeze_report_evidence(
             ),
             "simulate_rotation_pairs": getattr(report, "simulate_rotation_pairs", ()),
             "real_rotation_pairs": getattr(report, "real_rotation_pairs", ()),
+            **(
+                {"allocation": allocation_evidence}
+                if allocation_evidence is not None
+                else {}
+            ),
         },
     }
     return freeze_trend_evidence(data_dir, evidence)
@@ -6211,6 +6235,37 @@ def rebuild_trend_report_from_evidence(
         raise TrendReplayIncompleteError(
             "invalid original input: estimated_api_cost_complete"
         )
+    allocation_reference = None
+    if "allocation" in inputs:
+        allocation_input = inputs["allocation"]
+        try:
+            if not isinstance(allocation_input, Mapping):
+                raise ValueError
+            frozen_reference = allocation_input.get("reference")
+            daily_json = allocation_input.get("daily_json")
+            if not isinstance(frozen_reference, Mapping) or not isinstance(daily_json, str):
+                raise ValueError
+            snapshot = json.loads(daily_json)
+            if not isinstance(snapshot, Mapping):
+                raise ValueError
+            if hashlib.sha256(daily_json.encode("utf-8")).hexdigest() != frozen_reference.get("sha256"):
+                raise ValueError
+            from .a_share_trend import freeze_allocation_reference
+
+            allocation_reference = {
+                "daily_path": frozen_reference.get("daily_path"),
+                "sha256": frozen_reference.get("sha256"),
+                "snapshot": snapshot,
+                "reused": frozen_reference.get("reused"),
+                "stale_a_trading_days": frozen_reference.get("stale_a_trading_days"),
+                "failure_reason": frozen_reference.get("failure_reason"),
+            }
+            if freeze_allocation_reference(allocation_reference) != dict(frozen_reference):
+                raise ValueError
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise TrendReplayIncompleteError(
+                "invalid original input: allocation"
+            ) from None
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -6263,6 +6318,7 @@ def rebuild_trend_report_from_evidence(
         ),
         estimated_api_cost_complete=estimated_api_cost_complete,
         real_holdings=real_holdings_input,
+        allocation_reference=allocation_reference,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:

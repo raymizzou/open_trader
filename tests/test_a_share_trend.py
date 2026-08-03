@@ -509,6 +509,7 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         "CN", "abc123", (622466, 697199),
         allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
     )
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -535,6 +536,7 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         },
         strategy_snapshot=strategy,
         drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
     )
 
     assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.simulate_rotation_pairs] == [
@@ -543,10 +545,73 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
     ]
     assert built.real_rotation_pairs == ()
     payload = trend_module._report_payload(built)
+    assert payload["allocation"] == {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation["snapshot"]["roots"],
+        "markets": allocation["snapshot"]["markets"],
+    }
     assert [
         (pair["sell_symbol"], pair["buy_symbol"])
         for pair in payload["strategy_judgments"]["simulate_rotation_pairs"]
     ] == [("100000", "200001"), ("100001", "200002")]
+    assert trend_module.valid_frozen_report_contract(payload)
+    markdown = render_markdown(built)
+    _, feishu = render_trend_feishu_text(
+        payload, broker_label="东方财富", market_label="A股"
+    )
+    for text in (markdown, feishu):
+        assert "市场资源排名" in text
+        assert "模拟盘自动轮换" in text
+        assert "MARKET 卖出全成后才买入" in text
+
+    invalid_payloads = []
+    wrong_hash = json.loads(json.dumps(payload))
+    wrong_hash["allocation"]["sha256"] = "A" * 64
+    invalid_payloads.append(wrong_hash)
+    moving_pointer = json.loads(json.dumps(payload))
+    moving_pointer["allocation"]["daily_path"] = "data/trend_allocation/latest.json"
+    invalid_payloads.append(moving_pointer)
+    missing_root_date = json.loads(json.dumps(payload))
+    del missing_root_date["allocation"]["roots"]["CN"]["stock"]["as_of_date"]
+    invalid_payloads.append(missing_root_date)
+    duplicate_rank = json.loads(json.dumps(payload))
+    duplicate_rank["allocation"]["markets"]["HK"]["rank"] = 2
+    invalid_payloads.append(duplicate_rank)
+    below_gap = json.loads(json.dumps(payload))
+    below_gap["strategy_judgments"]["simulate_rotation_pairs"][0]["strength_gap"] = "19.9"
+    invalid_payloads.append(below_gap)
+    too_many = json.loads(json.dumps(payload))
+    too_many["strategy_judgments"]["simulate_rotation_pairs"].append(
+        copy.deepcopy(too_many["strategy_judgments"]["simulate_rotation_pairs"][0])
+    )
+    invalid_payloads.append(too_many)
+    wrong_mode = json.loads(json.dumps(payload))
+    wrong_mode["strategy_judgments"]["simulate_rotation_pairs"][0]["execution_mode"] = "manual"
+    invalid_payloads.append(wrong_mode)
+    wrong_real_mode = json.loads(json.dumps(payload))
+    real_pair = copy.deepcopy(
+        wrong_real_mode["strategy_judgments"]["simulate_rotation_pairs"][0]
+    )
+    real_pair["execution_mode"] = "automatic"
+    wrong_real_mode["strategy_judgments"]["real_rotation_pairs"] = [real_pair]
+    invalid_payloads.append(wrong_real_mode)
+    wrong_date = json.loads(json.dumps(payload))
+    wrong_date["strategy_judgments"]["simulate_rotation_pairs"][0]["execution_date"] = "2026-07-16"
+    invalid_payloads.append(wrong_date)
+    absent_candidate = json.loads(json.dumps(payload))
+    absent_candidate["strategy_judgments"]["simulate_rotation_pairs"][0]["buy_symbol"] = "MISSING"
+    invalid_payloads.append(absent_candidate)
+
+    assert not any(
+        trend_module.valid_frozen_report_contract(invalid)
+        for invalid in invalid_payloads
+    )
 
 
 def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
@@ -745,18 +810,49 @@ def allocation_for(
     rank: int,
     entry_weight: str,
 ) -> dict[str, object]:
+    ranks = {market: rank}
+    for other_market in ("CN", "HK", "US"):
+        if other_market != market:
+            ranks[other_market] = ({1, 2, 3} - set(ranks.values())).pop()
+    strengths = {1: ("90", "80"), 2: ("70", "60"), 3: ("50", "40")}
+    assets = {
+        "CN": ("A股", "ETF基金"),
+        "HK": ("港股", "香港ETF"),
+        "US": ("美股", "美国ETF"),
+    }
+    roots = {
+        item: {
+            role: {
+                "asset": asset,
+                "tm_id": (market_index + 1) * 10 + role_index,
+                "as_of_date": "2026-08-03",
+                "global_strength": strengths[ranks[item]][role_index],
+            }
+            for role_index, (role, asset) in enumerate(
+                zip(("stock", "etf"), assets[item])
+            )
+        }
+        for market_index, item in enumerate(("CN", "HK", "US"))
+    }
     return {
         "daily_path": "data/trend_allocation/daily/2026-08-03.json",
         "sha256": "b" * 64,
         "snapshot": {
+            "version": 1,
+            "allocation_date": "2026-08-03",
+            "generated_at": "2026-08-03T16:18:00+08:00",
+            "generator_version": "trend-allocation-v1",
+            "git_sha": "a" * 40,
+            "roots": roots,
             "markets": {
-                market: {
-                    "rank": rank,
-                    "score": "95.2",
-                    "score_source": "美国ETF",
-                    "entry_weight": entry_weight,
-                    "nominal_weight": {1: "0.60", 2: "0.40", 3: "0.20"}[rank],
-                },
+                item: {
+                    "rank": ranks[item],
+                    "score": strengths[ranks[item]][0],
+                    "score_source": assets[item][0],
+                    "entry_weight": {1: "0.06", 2: "0.04", 3: "0.02"}[ranks[item]],
+                    "nominal_weight": {1: "0.60", 2: "0.40", 3: "0.20"}[ranks[item]],
+                }
+                for item in ("CN", "HK", "US")
             },
         },
     }

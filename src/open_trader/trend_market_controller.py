@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
 from time import sleep
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ from .a_share_trend import (
     read_delivery_receipt,
     run_a_share_trend_report,
     valid_serialized_account,
+    valid_frozen_report_contract,
 )
 from .a_share_trend_watch import cn_session, watch_a_share_protection
 from .daily_premarket import (
@@ -472,6 +473,27 @@ def _valid_report(
         )
     ):
         return False
+    if not valid_frozen_report_contract(payload):
+        return False
+    allocation = payload.get("allocation")
+    if allocation is not None:
+        assert isinstance(allocation, Mapping)
+        try:
+            daily_path = PurePosixPath(str(allocation["daily_path"]))
+            daily = config.data_dir / daily_path.relative_to("data")
+            body = daily.read_bytes()
+            snapshot = json.loads(body)
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            return False
+        if (
+            hashlib.sha256(body).hexdigest() != allocation.get("sha256")
+            or not isinstance(snapshot, Mapping)
+            or any(
+                snapshot.get(key) != allocation.get(key)
+                for key in ("allocation_date", "generated_at", "roots", "markets")
+            )
+        ):
+            return False
     try:
         _preflight_open_actions(payload, market)
     except ValueError:

@@ -1356,6 +1356,7 @@ def _attempt_market_report(
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason or industry_data_reason,
             real_holdings=real_holdings,
+            allocation_reference=allocation_reference,
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         report = freeze_report_rotation_pairs(report, config.data_dir)

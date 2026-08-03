@@ -38,6 +38,7 @@ from open_trader.trend_review import (
     trend_action_key,
     trend_attempt_remark,
 )
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 NOW = datetime.fromisoformat("2026-07-20T09:31:00+08:00")
@@ -1787,6 +1788,58 @@ def test_valid_report_accepts_only_strict_partial_sell_actions(tmp_path: Path) -
     assert not controller._valid_report(
         config, "CN", "2026-07-20", path, conflicting
     )
+
+
+def test_valid_report_rejects_invalid_frozen_allocation_and_rotation_pair(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    path, report = write_report(config)
+    roots = {
+        market: {
+            "stock": {"asset": stock, "tm_id": index * 10, "as_of_date": "2026-08-03", "global_strength": stock_strength},
+            "etf": {"asset": etf, "tm_id": index * 10 + 1, "as_of_date": "2026-08-03", "global_strength": etf_strength},
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (("CN", "A股", "ETF基金", "90", "80"), ("HK", "港股", "香港ETF", "70", "60"), ("US", "美股", "美国ETF", "50", "40")), 1
+        )
+    }
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03", generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40, roots=roots, previous=None,
+    )
+    daily = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    daily.parent.mkdir(parents=True)
+    body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    daily.write_text(body, encoding="utf-8")
+    report["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "allocation_date": "2026-08-03", "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False, "stale_a_trading_days": 0, "failure_reason": "",
+        "roots": snapshot["roots"], "markets": snapshot["markets"],
+    }
+    judgments = report["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["holding_decisions"] = [{"symbol": "WEAK"}]
+    judgments["top10_candidates"] = [{"symbol": "STRONG"}]
+    judgments["simulate_rotation_pairs"] = [{
+        "pair_index": 0, "sell_symbol": "WEAK", "sell_name": "Weak",
+        "sell_futu_symbol": "SH.WEAK", "sell_global_strength": "10",
+        "buy_symbol": "STRONG", "buy_name": "Strong", "buy_futu_symbol": "SH.STRONG",
+        "buy_global_strength": "90", "strength_gap": "80", "target_weight": "0.04",
+        "target_amount": "4000", "estimated_shares": 400, "lot_size": 100,
+        "atr": "0.5", "reason": "relative_rotation", "execution_date": "2026-07-20",
+        "execution_mode": "automatic",
+    }]
+    judgments["real_rotation_pairs"] = []
+
+    assert controller._valid_report(config, "CN", "2026-07-20", path, report)
+    malformed = json.loads(json.dumps(report))
+    malformed["strategy_judgments"]["simulate_rotation_pairs"][0]["strength_gap"] = "19.9"
+    assert not controller._valid_report(config, "CN", "2026-07-20", path, malformed)
+    malformed_hash = json.loads(json.dumps(report))
+    malformed_hash["allocation"]["sha256"] = "c" * 64
+    assert not controller._valid_report(config, "CN", "2026-07-20", path, malformed_hash)
 
 
 def test_execution_completion_distinguishes_partial_and_full_sell_goals(
