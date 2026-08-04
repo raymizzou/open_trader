@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-04
 
+- 修复 Trend allocation 守护进程重启后把当天已生成的合法不可变快照重新计算、最终触发同日快照碰撞的问题；合法终态会原样恢复，`waiting/retrying` 状态也会直接从当天快照恢复为 `ready`，不再访问富途或 Trend Animals。仅显式 `--revision` 允许重新生成，损坏的状态、指针或快照继续失败关闭。
 - 修复 Predict 实时验收把明确范围外的 NegRisk、收益型、非 YES/NO 等市场误报为脏数据并逐条请求分类的问题；范围外记录现在先行跳过，普通 YES/NO 仍严格校验。Live readiness 只读取首个合格标的及盘口，不再等待 4,101 条市场全量扫描；正常 watcher 仍保持全量发现。只读 guard 改为直接拦截 SDK 变更方法和底层链上发送，不再代理破坏有状态的本地签名；盘口按 SDK 要求保留普通价格/数量单位，避免二次放大。真实 REST/WebSocket、账户与签名未提交预检通过且零变更调用。
 - 跨场执行最终防护确认：确认弹窗不设 TTL、提交前强制当前盘口刷新；Predict 只允许精确买入授权并在成交/失败后清零，残留授权清理由人工确认触发且不搬运 USDT；BNB gas signer 与 Predict 账户分开展示并提示人工充值；首笔跨场 canary 上限保持 5 USDT；过期漏斗与成功空扫描都按事实展示，历史按执行阶段分组；验收允许完整空扫描通过但仍要求零授权、零清理、零订单、零转账/赎回和零真实通知。
 - #22 把辉立与东方财富结单上传迁到 Account Module：浏览器仅经 Gateway 调用 Account API，验证后的 PDF 以内容 hash 原子暂存为不可变 generation，Account Sync Worker 验证后才 promotion 并在快照发布 accepted generation；Trend 控制器异步、幂等消费对应成交事实，失败不再回滚 Account。Legacy 上传路由和同步 Trend 副作用已删除；真实隔离 runtime 验证两份实际结单均返回 `202 staged`、四券商同步正常、两份 generation promotion 且 Trend 重复消费安全。

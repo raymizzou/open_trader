@@ -294,6 +294,56 @@ def test_terminal_allocation_refreshes_runtime_status_without_rebuilding(
     assert status["blocker"] == blocker
 
 
+def test_existing_requested_day_snapshot_restores_ready_without_rebuilding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DailyPremarketConfig(
+        repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",
+        futu_host="127.0.0.1", futu_port=11111, data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports", logs_dir=tmp_path / "logs",
+        portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
+        trend_animals_api_key="test-key",
+    )
+    reference = write_allocation_snapshot(config.data_dir, snapshot())
+    daily = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    original = daily.read_bytes()
+    status_path = config.data_dir / "trend_allocation/controller_status.json"
+    status_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_allocation.status.v1",
+        "phase": "retrying",
+        "attempted_for": "2026-08-03",
+        "latest_daily_path": reference["daily_path"],
+        "latest_sha256": reference["sha256"],
+        "blocker": "immutable allocation snapshot collision",
+    }), encoding="utf-8")
+
+    class StopLoop(Exception):
+        pass
+
+    def unexpected_external_call(**_kwargs: object) -> object:
+        raise AssertionError("existing allocation triggered an external call")
+
+    monkeypatch.setattr(trend_allocation, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(trend_allocation, "_process_version", lambda _repo: "b" * 40)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(StopLoop):
+        trend_allocation.run_trend_allocation_controller(
+            config,
+            now_fn=lambda: datetime.fromisoformat("2026-08-03T16:19:00+08:00"),
+            sleep_fn=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
+            quote_factory=unexpected_external_call,
+            api_factory=unexpected_external_call,
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["phase"] == "ready"
+    assert status["attempted_for"] == "2026-08-03"
+    assert status["latest_daily_path"] == reference["daily_path"]
+    assert status["latest_sha256"] == reference["sha256"]
+    assert status["blocker"] is None
+    assert daily.read_bytes() == original
+
+
 def test_allocation_reference_requires_current_terminal_attempt(tmp_path: Path) -> None:
     config = DailyPremarketConfig(
         repo=tmp_path, python=tmp_path / "python", timezone="Asia/Shanghai", deadline="21:10",

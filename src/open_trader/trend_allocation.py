@@ -277,7 +277,6 @@ def run_trend_allocation_controller(
                 existing = _read_allocation_status(config.data_dir)
             if (
                 not once
-                and now.time() >= _ATTEMPT_AT
                 and existing is not None
                 and existing.get("attempted_for") == day
                 and existing.get("phase") in {"ready", "fallback", "holiday"}
@@ -301,6 +300,25 @@ def run_trend_allocation_controller(
                     next_check_at=now + timedelta(seconds=60),
                     process_version=process_version,
                 ))
+                sleep_fn(60)
+                continue
+            current = load_allocation_reference(
+                config.data_dir, allocation_date=day, a_trading_days=[],
+                status_failure_reason=None,
+            )
+            if not revision and current is not None and current["reused"] is False:
+                reference = {
+                    "daily_path": current["daily_path"],
+                    "sha256": current["sha256"],
+                }
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase="ready", attempted_for=day,
+                    reference=reference, blocker=None,
+                    next_check_at=now + timedelta(seconds=60),
+                    process_version=process_version,
+                ))
+                if once:
+                    return status
                 sleep_fn(60)
                 continue
             quote = quote_factory(host=config.futu_host, port=config.futu_port)
