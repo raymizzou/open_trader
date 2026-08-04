@@ -642,6 +642,41 @@ def test_predict_guard_preserves_builder_reads_and_signed_no_submit_construction
     assert calls == ["balance_of", "build_order"]
 
 
+@pytest.mark.parametrize("action", ("send_raw_transaction", "transact"))
+def test_predict_guard_blocks_nested_sdk_raw_transaction_sender(
+    tmp_path: Path, action: str
+) -> None:
+    sent: list[bytes] = []
+
+    class RawSendingBuilder(Builder):
+        def __init__(self) -> None:
+            self._web3 = SimpleNamespace(
+                eth=SimpleNamespace(**{action: lambda raw: sent.append(raw)})
+            )
+
+        def build_order(self) -> dict[str, str]:
+            getattr(self._web3.eth, action)(b"signed")
+            return {"signature": "unreachable"}
+
+    class RawSendingClient(PredictClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._builder = RawSendingBuilder()
+
+        def no_submit_buy_preflight(self, market_id: str, token_id: str, quantity_wei: int) -> SimpleNamespace:
+            self._builder.build_order()
+            return super().no_submit_buy_preflight(market_id, token_id, quantity_wei)
+
+    report = readiness_report(
+        tmp_path,
+        predict_client_factory=lambda _config, *, urlopen_fn: RawSendingClient(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.mutation_calls == 1
+    assert sent == []
+
+
 @pytest.mark.parametrize(
     "action",
     (

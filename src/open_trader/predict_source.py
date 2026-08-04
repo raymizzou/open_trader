@@ -93,7 +93,7 @@ class PredictSource:
         while True:
             query: dict[str, str] = {"first": "100", "status": "OPEN"}
             if cursor:
-                query["cursor"] = cursor
+                query["after"] = cursor
             payload = await self._rest_json("/v1/markets", query)
             if payload is None:
                 return ()
@@ -393,15 +393,18 @@ def _normalise_market(
         return None
     if (
         payload.get("tradingStatus") != "OPEN"
+        or payload.get("status") != "REGISTERED"
+        or payload.get("isVisible") is not True
         or payload.get("isNegRisk") is not False
         or payload.get("isYieldBearing") is not False
-        or payload.get("marketType") != "BINARY"
         or payload.get("marketVariant", "DEFAULT") not in {"DEFAULT", "STANDARD"}
     ):
         return None
     market_id = _text(payload.get("id"))
     market_slug = _text(payload.get("slug"))
     condition_id = _text(payload.get("conditionId"))
+    oracle_question_id = _text(payload.get("oracleQuestionId"))
+    resolver_address = _text(payload.get("resolverAddress"))
     question = _text(payload.get("question"))
     rules = _text(payload.get("description"))
     category_slug = _text(payload.get("categorySlug"))
@@ -417,9 +420,8 @@ def _normalise_market(
                 token = _text(outcome.get("onChainId")) or _text(outcome.get("tokenId"))
                 if name and token and name not in tokens:
                     tokens[name] = token
-    collateral = payload.get("collateralToken")
-    settlement_asset = _text(collateral.get("symbol")) if isinstance(collateral, dict) else ""
-    minimum_order_size = _decimal(payload.get("minimumOrderSize"))
+    settlement_asset = "USDT"
+    minimum_order_size = Decimal("0.01")
     precision = payload.get("decimalPrecision")
     fee_rate_bps = _decimal(payload.get("feeRateBps"))
     external_ids = payload.get("polymarketConditionIds")
@@ -433,6 +435,8 @@ def _normalise_market(
             (
                 market_id,
                 condition_id,
+                oracle_question_id,
+                resolver_address,
                 question,
                 rules,
                 category_slug,
@@ -444,8 +448,6 @@ def _normalise_market(
         or event_end_at is None
         or event_end_at <= event_start_at
         or set(tokens) != {"YES", "NO"}
-        or minimum_order_size is None
-        or minimum_order_size <= 0
         or not isinstance(precision, int)
         or precision < 0
         or fee_rate_bps is None

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from eth_account import Account
@@ -575,10 +576,28 @@ class PredictTradingClient:
 
     def reconcile_buy(self, market_id: str, token_id: str, order_hash: str) -> Mapping[str, object]:
         try:
-            order = _order_data(self._json(f"/v1/orders/{order_hash}", auth=True))
-            matches = _rows(self._json("/v1/orders/matches", auth=True), "matches")
-            activity = _rows(self._json("/v1/account/activity", auth=True), "activities")
-            positions = _rows(self._json(f"/v1/positions?marketId={market_id}", auth=True), "positions")
+            order_missing = False
+            try:
+                order = _order_data(self._json(f"/v1/orders/{order_hash}", auth=True))
+            except HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                order = {}
+                order_missing = True
+            order_list = (
+                _rows_exact(self._json("/v1/orders", auth=True), "orders")
+                if order_missing
+                else ()
+            )
+            matches = _rows_exact(
+                self._json(
+                    f"/v1/orders/matches?{urlencode({'orderHashes': order_hash})}",
+                    auth=True,
+                ),
+                "matches",
+            )
+            activity = _rows_exact(self._json("/v1/account/activity", auth=True), "activities")
+            positions = _rows_exact(self._json(f"/v1/positions?marketId={market_id}", auth=True), "positions")
             identity = (
                 order.get("hash") == order_hash
                 and str(order.get("tokenId")) == str(token_id)
@@ -628,17 +647,19 @@ class PredictTradingClient:
                 for row in positions
                 if _row_identity(row, market_id=market_id, token_id=token_id)
             ]
+            position_amounts = [_raw_units(row.get("amount")) for row in matching_positions]
+            if any(amount is None for amount in position_amounts):
+                raise ValueError("invalid Predict position amount")
             position_quantity = sum(
-                (
-                    _number(row.get("amount")) or Decimal("0")
-                    for row in matching_positions
-                ),
-                Decimal("0"),
+                (amount for amount in position_amounts if amount is not None), Decimal("0")
             )
             positioned = agreed is not None and position_quantity >= agreed[1]
             verified = identity and final and agreed is not None and order_amount == agreed[1] and positioned
             absent = (
-                str(order.get("status", "")).upper() in {"NOT_FOUND", "ABSENT"}
+                order_missing
+                and not any(
+                    _order_data(row).get("hash") == order_hash for row in order_list
+                )
                 and not matched
                 and not events
                 and not matching_positions
@@ -663,14 +684,7 @@ class PredictTradingClient:
                         },
                     }
                 )
-                try:
-                    minimum_order_size = _number(
-                        self._market(market_id).get("minimumOrderSize")
-                    )
-                except Exception:
-                    minimum_order_size = None
-                if minimum_order_size is not None and minimum_order_size > 0:
-                    result["minimum_order_size"] = minimum_order_size
+                result["minimum_order_size"] = Decimal("0.01")
             return result
         except Exception:
             return {"verified": False, "conclusively_absent": False, "status": "unknown"}
@@ -880,6 +894,17 @@ def _rows(payload: Mapping[str, object], name: str) -> tuple[Mapping[str, object
     return tuple(item for item in value if isinstance(item, Mapping)) if isinstance(value, list) else ()
 
 
+def _rows_exact(
+    payload: Mapping[str, object], name: str
+) -> tuple[Mapping[str, object], ...]:
+    value = payload.get("data", payload)
+    if isinstance(value, Mapping):
+        value = value.get(name)
+    if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+        raise ValueError("invalid Predict list response")
+    return tuple(value)
+
+
 def _number(value: object) -> Decimal | None:
     try:
         number = Decimal(str(value))
@@ -945,6 +970,7 @@ def _match_facts(
         value
         for value in participants
         if isinstance(value, Mapping)
+        and str(value.get("hash")) == order_hash
         and str(value.get("signer", "")).casefold() == signer.casefold()
         and str(_row(value.get("outcome")).get("onChainId")) == str(token_id)
     ]
@@ -964,7 +990,10 @@ def _activity_facts(
         return _facts(row) if str(legacy_hash) == order_hash else None
     if not _row_identity(row, market_id=market_id, token_id=token_id):
         return None
-    fee = _row(_row(row.get("order")).get("fee"))
+    order = _row(row.get("order"))
+    if str(order.get("hash")) != order_hash:
+        return None
+    fee = _row(order.get("fee"))
     if fee.get("type") != "COLLATERAL":
         return None
     return _execution_facts(row, fee.get("amount"))
@@ -975,7 +1004,7 @@ def _execution_facts(
 ) -> tuple[str, Decimal, Decimal] | None:
     transaction = row.get("transactionHash")
     amount = _number(row.get("amountFilled"))
-    fee = _number(fee_value)
+    fee = _raw_units(fee_value)
     if (
         not isinstance(transaction, str)
         or not transaction
@@ -986,6 +1015,12 @@ def _execution_facts(
     ):
         return None
     return transaction, amount, fee
+
+
+def _raw_units(value: object) -> Decimal | None:
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        return None
+    return Decimal(int(value)) / Decimal(PREDICT_BASE_UNITS)
 
 
 def _book(payload: Mapping[str, object]) -> Book:

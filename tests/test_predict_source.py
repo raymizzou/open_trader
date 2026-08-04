@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from urllib.error import HTTPError
 
+import pytest
+
 from open_trader.polymarket_trading import KeychainError, PredictConfig
 from open_trader.predict_source import PredictSource
 
@@ -30,6 +32,7 @@ class FakeResponse:
 def market(**changes: object) -> dict[str, object]:
     result: dict[str, object] = {
         "id": 123,
+        "title": "Will this test pass?",
         "conditionId": "predict-condition",
         "question": "Will this test pass?",
         "description": "Resolves from the named source.",
@@ -38,16 +41,22 @@ def market(**changes: object) -> dict[str, object]:
             {"name": "YES", "onChainId": "predict-yes"},
             {"name": "NO", "onChainId": "predict-no"},
         ],
-        "collateralToken": {"symbol": "USDT"},
-        "minimumOrderSize": "5",
         "decimalPrecision": 2,
         "feeRateBps": "200",
         "polymarketConditionIds": ["poly-condition"],
         "tradingStatus": "OPEN",
         "status": "REGISTERED",
-        "marketType": "BINARY",
+        "isVisible": True,
         "isNegRisk": False,
         "isYieldBearing": False,
+        "oracleQuestionId": "oracle-question",
+        "resolverAddress": "0x1111111111111111111111111111111111111111",
+        "spreadThreshold": "0.01",
+        "shareThreshold": "0.01",
+        "isBoosted": False,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "marketVariant": "DEFAULT",
+        "rewards": [],
     }
     result.update(changes)
     return result
@@ -161,6 +170,15 @@ def test_non_increasing_category_window_excludes_market() -> None:
     assert asyncio.run(reversed_window.get_market("896")) is None
 
 
+@pytest.mark.parametrize("field", ("oracleQuestionId", "resolverAddress"))
+def test_missing_official_market_identity_excludes_market(field: str) -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "data": market(id=896, **{field: None})}]
+    )
+
+    assert asyncio.run(source.get_market("896")) is None
+
+
 def test_official_default_variant_is_accepted() -> None:
     source, _ = source_with_responses(
         [{"success": True, "data": market(id=896, marketVariant="DEFAULT")}]
@@ -218,10 +236,29 @@ def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_m
     assert markets[0].condition_id == "predict-condition"
     assert markets[0].polymarket_condition_ids == ("poly-condition",)
     assert markets[0].tick_size == Decimal("0.01")
+    assert markets[0].minimum_order_size == Decimal("0.01")
+    assert markets[0].settlement_asset == "USDT"
     assert markets[0].fee_rate_bps == Decimal("200")
     assert all(request.full_url.startswith("https://api.predict.fun/") for request in requests)
     assert all(request.headers["X-api-key"] == "predict-key-sentinel" for request in requests)
     assert all(request.headers["User-agent"] == "open-trader/0.1" for request in requests)
+    market_urls = [request.full_url for request in requests if "/v1/markets?" in request.full_url]
+    assert market_urls == [
+        "https://api.predict.fun/v1/markets?first=100&status=OPEN",
+        "https://api.predict.fun/v1/markets?first=100&status=OPEN&after=next",
+    ]
+
+
+def test_list_open_markets_stops_on_repeated_cursor_without_requesting_a_third_page() -> None:
+    source, requests = source_with_responses(
+        [
+            {"success": True, "cursor": "repeat", "data": [market(id=123)]},
+            {"success": True, "cursor": "repeat", "data": [market(id=124)]},
+        ]
+    )
+
+    assert [item.market_id for item in asyncio.run(source.list_open_markets())] == ["123", "124"]
+    assert len([request for request in requests if "/v1/markets?" in request.full_url]) == 2
 
 
 def test_complete_yes_book_derives_no_asks_at_the_market_tick() -> None:

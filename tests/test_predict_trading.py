@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 from eth_account import Account
@@ -507,7 +507,7 @@ def test_reconcile_returns_unknown_for_pending_order_with_preexisting_position()
             return FakeResponse({"data": {"minimumOrderSize": "1"}})
         if request.full_url.endswith("/v1/orders/order-hash"):
             return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token", "signer": DEPOSIT, "status": "PENDING", "amountFilled": "1"}})
-        if request.full_url.endswith("/v1/orders/matches"):
+        if request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash"):
             return FakeResponse({"data": {"matches": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
         if request.full_url.endswith("/v1/account/activity"):
             return FakeResponse({"data": {"activities": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
@@ -545,7 +545,7 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                     },
                 }
             )
-        if request.full_url.endswith("/v1/orders/matches"):
+        if request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash"):
             return FakeResponse(
                 {
                     "success": True,
@@ -553,9 +553,10 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                         {
                             "market": {"id": 896},
                             "taker": {
+                                "hash": "order-hash",
                                 "signer": DEPOSIT,
                                 "outcome": {"onChainId": "yes-token"},
-                                "fee": {"amount": "0.02", "type": "COLLATERAL"},
+                                "fee": {"amount": "20000000000000000", "type": "COLLATERAL"},
                             },
                             "makers": [],
                             "amountFilled": "1",
@@ -574,7 +575,8 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                             "transactionHash": "tx",
                             "amountFilled": "1",
                             "order": {
-                                "fee": {"amount": "0.02", "type": "COLLATERAL"}
+                                "hash": "order-hash",
+                                "fee": {"amount": "20000000000000000", "type": "COLLATERAL"}
                             },
                             "market": {"id": 896},
                             "outcome": {"onChainId": "yes-token"},
@@ -591,7 +593,7 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                             "id": "position-id",
                             "market": {"id": 896},
                             "outcome": {"onChainId": "yes-token"},
-                            "amount": "1",
+                            "amount": "1000000000000000000",
                         }
                     ],
                 }
@@ -613,7 +615,83 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
             "trade_ids": ["tx"],
             "fee": Decimal("0.02"),
         },
-        "minimum_order_size": Decimal("1"),
+        "minimum_order_size": Decimal("0.01"),
+    }
+
+
+def test_reconcile_rejects_match_for_a_different_owned_order_hash() -> None:
+    calls: list[str] = []
+
+    def urlopen_fn(request, **kwargs):
+        calls.append(request.full_url)
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders/order-hash"):
+            return FakeResponse({"data": {"order": {"hash": "order-hash", "tokenId": "yes-token", "signer": DEPOSIT}, "marketId": 896, "status": "FILLED", "amountFilled": "1"}})
+        if "/v1/orders/matches" in request.full_url:
+            return FakeResponse({"data": [{"market": {"id": 896}, "taker": {"hash": "different-order", "signer": DEPOSIT, "outcome": {"onChainId": "yes-token"}, "fee": {"amount": "0", "type": "COLLATERAL"}}, "makers": [], "amountFilled": "1", "transactionHash": "tx"}]})
+        if request.full_url.endswith("/v1/account/activity"):
+            return FakeResponse({"data": [{"transactionHash": "tx", "amountFilled": "1", "order": {"hash": "order-hash", "fee": {"amount": "0", "type": "COLLATERAL"}}, "market": {"id": 896}, "outcome": {"onChainId": "yes-token"}}]})
+        if request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"data": [{"market": {"id": 896}, "outcome": {"onChainId": "yes-token"}, "amount": "1"}]})
+        raise AssertionError(request.full_url)
+
+    result = make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash")
+    assert result["verified"] is False
+    assert any(url.endswith("/v1/orders/matches?orderHashes=order-hash") for url in calls)
+
+
+def test_reconcile_404_requires_all_independent_reads_before_proving_absence() -> None:
+    calls: list[str] = []
+
+    def urlopen_fn(request, **kwargs):
+        calls.append(request.full_url)
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders/order-hash"):
+            raise HTTPError(request.full_url, 404, "not found", {}, None)
+        if request.full_url.endswith("/v1/orders") or request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash") or request.full_url.endswith("/v1/account/activity") or request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"data": []})
+        raise AssertionError(request.full_url)
+
+    result = make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash")
+    assert result == {"verified": False, "conclusively_absent": True, "status": "absent"}
+    assert any(url.endswith("/v1/orders") for url in calls)
+
+
+@pytest.mark.parametrize(
+    "malformed_path",
+    (
+        "/v1/orders",
+        "/v1/orders/matches?orderHashes=order-hash",
+        "/v1/account/activity",
+        "/v1/positions?marketId=896",
+    ),
+)
+def test_reconcile_404_keeps_unknown_when_an_independent_page_is_malformed(
+    malformed_path: str,
+) -> None:
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders/order-hash"):
+            raise HTTPError(request.full_url, 404, "not found", {}, None)
+        if request.full_url.endswith(malformed_path):
+            return FakeResponse({"data": {}})
+        if request.full_url.endswith("/v1/orders") or request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash") or request.full_url.endswith("/v1/account/activity") or request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"data": []})
+        raise AssertionError(request.full_url)
+
+    assert make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash") == {
+        "verified": False,
+        "conclusively_absent": False,
+        "status": "unknown",
     }
 
 
@@ -651,6 +729,13 @@ def test_book_parses_decimal_price_to_exact_wei() -> None:
 
     book = _book({"marketId": 896, "updateTimestampMs": 1, "asks": [["0.57", "1"]], "bids": []})
     assert book.asks[0][0] == 570000000000000000
+
+
+@pytest.mark.parametrize("value", ("1.5", "-1", " 1", "١"))
+def test_predict_raw_units_rejects_non_ascii_non_integer_strings(value: str) -> None:
+    from open_trader.predict_trading import _raw_units
+
+    assert _raw_units(value) is None
 
 
 def test_submit_uses_fresh_server_fee_rate() -> None:

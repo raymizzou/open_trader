@@ -399,7 +399,14 @@ class _PredictReadOnlyGuard(_PolymarketReadOnlyGuard):
     """Use the SDK proxy machinery while reporting Predict mutations separately."""
 
     _MUTATION_NAMES = _PolymarketReadOnlyGuard._MUTATION_NAMES | frozenset(
-        {"approval", "redemption", "submit_order", "submit_orders"}
+        {
+            "approval",
+            "redemption",
+            "send_raw_transaction",
+            "submit_order",
+            "submit_orders",
+            "transact",
+        }
     )
 
     def _kind(self, name: str) -> str | None:
