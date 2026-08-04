@@ -1147,9 +1147,11 @@ def _project_trend_money_items(
 def _project_trend_strength_fields(
     items: list[dict[str, Any]], snapshots: object,
 ) -> list[dict[str, Any]]:
-    by_symbol = (
-        snapshots if isinstance(snapshots, dict) else {}
-    )
+    by_symbol = snapshots if isinstance(snapshots, dict) else {
+        str(item.get("symbol") or ""): item
+        for item in snapshots
+        if isinstance(item, dict)
+    } if isinstance(snapshots, list) else {}
     projected: list[dict[str, Any]] = []
     for item in items:
         row = dict(item)

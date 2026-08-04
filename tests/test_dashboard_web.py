@@ -7864,6 +7864,7 @@ def test_dashboard_account_view_dom_at_375px() -> None:
         "market": "US", "market_label": "美股", "report_date": "2026-07-20",
         "data_date": "2026-07-17", "generated_at": "2026-07-18T09:00:00+08:00",
         "account_status": "已更新", "counts": {}, "audit": {},
+        "hold_actions": [{"action": "HOLD", "symbol": "AAPL", "name": "Apple"}],
         "artifact": "current.json", "report_sha256": "c" * 64,
         "strategy_version": "v-current",
     }
@@ -8036,6 +8037,19 @@ window.fetch=async (input)=>{{
         assert section.locator('[role="tab"][data-account-view][aria-selected="true"]').inner_text().strip() == "趋势报告"
         assert header.get_attribute("data-view-stable") == "yes"
         assert page.evaluate("document.activeElement.dataset.accountView") == "report"
+        section.locator('[data-trend-holding-view="simulate"]').click()
+        assert section.locator('[data-trend-holding-panel="simulate"]').is_visible()
+        assert section.locator('[data-trend-holding-panel="simulate"]').get_by_text(
+            "AAPL Apple", exact=True,
+        ).is_visible()
+        page.evaluate("renderHoldings()")
+        section = page.locator("#account-tiger")
+        assert section.locator(
+            '[data-trend-holding-view="simulate"]'
+        ).get_attribute("aria-selected") == "true"
+        assert section.locator('[data-trend-holding-panel="simulate"]').is_visible()
+        header = section.locator(".account-section-header")
+        header.evaluate("node => { node.dataset.viewStable = 'yes'; }")
         review_disclosure = section.locator("details.trend-review-disclosure")
         assert review_disclosure.count() == 1
         assert review_disclosure.get_attribute("class") == "trend-audit trend-review-disclosure"

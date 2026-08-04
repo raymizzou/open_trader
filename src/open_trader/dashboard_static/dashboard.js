@@ -5531,7 +5531,10 @@ function captureAccountDisclosureState(root, broker, view) {
     const key = accountDisclosureKey(section, details);
     if (key) states.set(key, details.open);
   });
-  return {scope, states};
+  const holdingView = section.querySelector(
+    '[data-trend-holding-view][aria-selected="true"]',
+  )?.dataset?.trendHoldingView || "";
+  return {scope, states, holdingView};
 }
 
 function restoreAccountDisclosureState(root, broker, view, snapshot) {
@@ -5543,6 +5546,10 @@ function restoreAccountDisclosureState(root, broker, view, snapshot) {
     const key = accountDisclosureKey(section, details);
     if (snapshot.states.has(key)) details.open = snapshot.states.get(key);
   });
+  const holdingTab = snapshot.holdingView
+    ? section.querySelector(`[data-trend-holding-view="${snapshot.holdingView}"]`)
+    : null;
+  if (holdingTab) handleTrendHoldingTab({target: holdingTab});
 }
 
 function renderAccountViewPanelOnly(broker) {
