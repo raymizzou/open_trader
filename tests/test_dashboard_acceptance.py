@@ -427,8 +427,8 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
-        "_latest_phillips_expectation",
-        lambda data_dir: (Decimal("1"), "2026-07"),
+        "_latest_phillips_period",
+        lambda data_dir: "2026-07",
     )
     listeners = {
         "http://127.0.0.1:8766": (123, worktree.resolve()),
@@ -6040,11 +6040,20 @@ def test_acceptance_parser_does_not_hardcode_mark_to_market_eastmoney_total() ->
     assert not hasattr(args, "wait_seconds")
 
 
-def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:
+def test_validate_dashboard_payload_checks_phillips_current_total() -> None:
     payload = valid_payload()
     payload["broker_summaries"] = [{
         "broker": "phillips", "detail_available": True,
-        "portfolio_value_hkd": "628554.05",
+        "portfolio_value_hkd": "159",
+    }]
+    payload["broker_positions"] = [{
+        "broker": "phillips",
+        "market_value_hkd": "100",
+        "current_valuation": {"market_value_hkd": "140"},
+    }]
+    payload["cash_details"] = [{
+        "broker": "phillips",
+        "cash_balance_hkd": "20",
     }]
     payload["source_statuses"] = [{
         "broker": "phillips", "display_text": "同步正常"
@@ -6053,16 +6062,15 @@ def test_validate_dashboard_payload_checks_latest_phillips_statement() -> None:
 
     errors = validate_dashboard_payload(
         payload, expected_cn=5,
-        expected_phillips_total=Decimal("628554.06"),
         expected_phillips_period="2026-07",
     )
 
-    assert "辉立总资产不匹配：628554.05 != 628554.06 HKD" in errors
+    assert "辉立总资产不匹配：159 != 160 HKD" in errors
     assert not any("行数" in error for error in errors)
 
 
-def test_latest_phillips_expectation_uses_newest_archived_pdf(
-    tmp_path, monkeypatch: pytest.MonkeyPatch,
+def test_latest_phillips_period_uses_newest_archived_statement(
+    tmp_path,
 ) -> None:
     old = tmp_path / "statements/phillips/2026-06-30/statement.pdf"
     latest = tmp_path / "statements/phillips/2026-07-10/statement.pdf"
@@ -6071,18 +6079,7 @@ def test_latest_phillips_expectation_uses_newest_archived_pdf(
     old.write_bytes(b"old")
     latest.write_bytes(b"latest")
 
-    def parse(_self, path, _month):
-        assert path == latest
-        return SimpleNamespace(
-            positions=[SimpleNamespace(currency="HKD", market_value=Decimal("100"))],
-            cash_balances=[SimpleNamespace(currency="HKD", cash_balance=Decimal("20"))],
-        )
-
-    monkeypatch.setattr("open_trader.parsers.phillips.PhillipsStatementParser.parse", parse)
-
-    assert dashboard_acceptance._latest_phillips_expectation(tmp_path) == (
-        Decimal("120"), "2026-07",
-    )
+    assert dashboard_acceptance._latest_phillips_period(tmp_path) == "2026-07"
 
 
 def test_validate_dashboard_payload_rejects_empty_phillips_account_card() -> None:
