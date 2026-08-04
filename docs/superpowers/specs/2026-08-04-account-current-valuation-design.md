@@ -1,6 +1,6 @@
 # Account Current Valuation Design
 
-**Status:** Approved design; implementation waits for Issue #21 to merge
+**Status:** Approved design; Issue #21 merged and implementation is planned
 **Date:** 2026-08-04
 
 ## Context
