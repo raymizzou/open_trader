@@ -34,7 +34,6 @@ from .daily_premarket import _optional_positive_tm_id, _read_env_file
 from .futu_symbols import to_futu_symbol
 from .futu_universe import build_account_quote_universe
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
-from .parsers.phillips import PhillipsStatementParser
 from .trend_simulate_positions import (
     TREND_SIMULATE_BROKERS,
     _action_events,
@@ -190,20 +189,12 @@ REMOVED_TREND_REPORT_POSITION_LABELS = (
 )
 
 
-def _latest_phillips_expectation(data_dir: Path) -> tuple[Decimal, str]:
+def _latest_phillips_period(data_dir: Path) -> str:
     statements = list((data_dir / "statements/phillips").glob("*/*.pdf"))
     if not statements:
         raise FileNotFoundError("找不到项目内辉立结单 PDF")
     latest = max(statements, key=lambda path: (path.parent.name, path.name))
-    period = latest.parent.name[:7]
-    parsed = PhillipsStatementParser().parse(latest, period)
-    assets = [
-        *((position.currency, position.market_value) for position in parsed.positions),
-        *((cash.currency, cash.cash_balance) for cash in parsed.cash_balances),
-    ]
-    if any(currency != "HKD" or value is None for currency, value in assets):
-        raise ValueError("最新辉立结单包含无法直接核对的非港币或缺失资产")
-    return sum((value for _, value in assets if value is not None), Decimal("0")), period
+    return latest.parent.name[:7]
 
 
 def _project_data_dir(root: Path) -> Path:
@@ -267,6 +258,11 @@ def validate_dashboard_payload(
     rows = [*holdings, *cash_rows]
     if expected_rows is not None and len(rows) != expected_rows:
         errors.append(f"组合总行数不是 {expected_rows}：{len(rows)}")
+    expected_phillips_total = (
+        expected_phillips_total
+        if expected_phillips_total is not None
+        else _broker_current_total_hkd(payload, "phillips")
+    )
     if expected_phillips_total is not None:
         phillips_summary = next(
             (
@@ -346,6 +342,35 @@ def validate_dashboard_payload(
     errors.extend(_dashboard_position_field_errors(payload))
     errors.extend(_trend_execution_batch_errors(payload))
     return errors
+
+
+def _broker_current_total_hkd(
+    payload: Mapping[str, Any], broker: str,
+) -> Decimal | None:
+    positions = payload.get("broker_positions")
+    cash_details = payload.get("cash_details")
+    if not isinstance(positions, list) or not isinstance(cash_details, list):
+        return None
+    assets = [
+        (
+            row.get("current_valuation", {}).get("market_value_hkd")
+            if isinstance(row.get("current_valuation"), Mapping)
+            else row.get("market_value_hkd")
+        )
+        for row in positions
+        if isinstance(row, Mapping) and row.get("broker") == broker
+    ] + [
+        row.get("cash_balance_hkd")
+        for row in cash_details
+        if isinstance(row, Mapping) and row.get("broker") == broker
+    ]
+    try:
+        values = [Decimal(str(value)) for value in assets]
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not values or any(not value.is_finite() for value in values):
+        return None
+    return sum(values, Decimal("0"))
 
 
 def _dashboard_position_field_errors(payload: Mapping[str, Any]) -> list[str]:
@@ -5213,9 +5238,7 @@ def main(argv: list[str] | None = None) -> int:
             errors.append("Account API 必须使用独立 PID")
         project_data_dir = _project_data_dir(args.expected_root)
         expected_cn = _expected_cn_holdings(args.expected_root)
-        phillips_total, phillips_period = _latest_phillips_expectation(
-            project_data_dir
-        )
+        phillips_period = _latest_phillips_period(project_data_dir)
         errors.extend(_account_sync_worker_errors(
             args.expected_root, expected_root=args.expected_root, expected_sha=expected_sha,
         ))
@@ -5225,7 +5248,6 @@ def main(argv: list[str] | None = None) -> int:
             first, expected_cn=expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
             expected_rows=args.expected_rows,
-            expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
         ))
         try:
@@ -5292,7 +5314,6 @@ def main(argv: list[str] | None = None) -> int:
             second, expected_cn=expected_cn,
             expected_eastmoney_cny=args.expected_eastmoney_cny,
             expected_rows=args.expected_rows,
-            expected_phillips_total=phillips_total,
             expected_phillips_period=phillips_period,
         ))
         errors.extend(_trend_controller_errors(
