@@ -168,6 +168,15 @@ def _write_publication(
     )
 
 
+def _set_accepted_statement_generation(
+    data_dir: Path, broker: str, generation: str
+) -> None:
+    path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["accepted_statement_generation"][broker] = generation
+    write_json_atomic(path, state)
+
+
 def test_account_api_health_snapshot_etag_and_not_found(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)
@@ -498,6 +507,213 @@ def test_account_api_production_accepts_marker_and_preserves_etag(
 
     assert response.value.code == HTTPStatus.NOT_MODIFIED
     assert response.value.read() == b""
+
+
+def test_account_api_statement_trade_facts_returns_only_public_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    generation = "sha256:" + "a" * 64
+    _write_publication(data_dir)
+    _set_accepted_statement_generation(data_dir, "phillips", generation)
+    monkeypatch.setattr(
+        "open_trader.statement_import.load_statement_trade_facts",
+        lambda *_args: (
+            {
+                "statement_period": "2026-07-31",
+                "trade_facts_cutoff_at": "2026-08-04T16:00:00+08:00",
+                "trade_facts_sha256": "sha256:" + "b" * 64,
+                "candidate_run": "candidate/runs/2026-07",
+                "manifest_path": "/private/statement/manifest.json",
+                "password": "secret",
+                "parser_detail": "parser internals",
+            },
+            [{"fill_id": "statement:phillips:buy-1"}],
+        ),
+    )
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
+            f"statements/phillips/{generation}/trade-facts",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+
+    assert payload == {
+        "schema_version": "open_trader.account.statement_trade_facts.v1",
+        "broker": "phillips",
+        "statement_generation": generation,
+        "statement_period": "2026-07-31",
+        "trade_facts_cutoff_at": "2026-08-04T16:00:00+08:00",
+        "trade_facts_sha256": "sha256:" + "b" * 64,
+        "facts": [{"fill_id": "statement:phillips:buy-1"}],
+    }
+    encoded = json.dumps(payload)
+    for private_value in (
+        "candidate/runs",
+        "/private/statement",
+        "secret",
+        "parser internals",
+    ):
+        assert private_value not in encoded
+
+
+def test_account_api_statement_trade_facts_shadow_rejects_production_marker(
+    tmp_path: Path,
+) -> None:
+    generation = "sha256:" + "a" * 64
+    server = account_api.create_account_api(
+        tmp_path / "data",
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+    )
+
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
+            f"statements/phillips/{generation}/trade-facts",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.load(rejected.value)["code"] == "account_api_shadow_only"
+
+
+@pytest.mark.parametrize(
+    ("broker", "generation"),
+    [
+        ("futu", "sha256:" + "a" * 64),
+        ("phillips", "not-a-generation"),
+    ],
+)
+def test_account_api_statement_trade_facts_rejects_malformed_request(
+    tmp_path: Path, broker: str, generation: str
+) -> None:
+    server = account_api.create_account_api(
+        tmp_path / "data",
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+
+    with _running(server):
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
+                f"statements/{broker}/{generation}/trade-facts"
+            )
+
+    assert rejected.value.code == HTTPStatus.BAD_REQUEST
+    assert json.load(rejected.value)["code"] == "invalid_statement_facts_request"
+
+
+def test_account_api_statement_trade_facts_rejects_replaced_generation_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    accepted_generation = "sha256:" + "a" * 64
+    requested_generation = "sha256:" + "b" * 64
+    _write_publication(data_dir)
+    _set_accepted_statement_generation(data_dir, "phillips", accepted_generation)
+    monkeypatch.setattr(
+        "open_trader.statement_import.load_statement_trade_facts",
+        lambda *_args: pytest.fail("must not read a replaced generation"),
+    )
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
+            f"statements/phillips/{requested_generation}/trade-facts",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.CONFLICT
+    assert json.load(rejected.value)["code"] == "accepted_statement_generation_changed"
+
+
+@pytest.mark.parametrize("publication_error", ["missing", "mutated", "hash-invalid"])
+def test_account_api_statement_trade_facts_rejects_invalid_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publication_error: str
+) -> None:
+    data_dir = tmp_path / "data"
+    generation = "sha256:" + "a" * 64
+    _write_publication(data_dir)
+    _set_accepted_statement_generation(data_dir, "phillips", generation)
+
+    def fail_load(*_args: object) -> None:
+        raise ValueError(f"{publication_error}: /private/statement.pdf secret parser detail")
+
+    monkeypatch.setattr("open_trader.statement_import.load_statement_trade_facts", fail_load)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
+            f"statements/phillips/{generation}/trade-facts",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    payload = json.load(rejected.value)
+    assert payload["code"] == "statement_facts_publication_invalid"
+    assert "/private/statement.pdf" not in json.dumps(payload)
+    assert "secret" not in json.dumps(payload)
+    assert "parser detail" not in json.dumps(payload)
 
 
 def test_account_api_stages_statement_command_with_202_in_production(

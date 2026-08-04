@@ -19,7 +19,12 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from .account_snapshot import load_account_snapshot, load_worker_git_sha
-from .account_sync_state import ACCOUNT_STALE_SECONDS, REQUIRED_BROKERS
+from .account_sync_state import (
+    ACCOUNT_STALE_SECONDS,
+    REQUIRED_BROKERS,
+    STATEMENT_BROKERS,
+    statement_generation_digest,
+)
 
 
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -152,6 +157,93 @@ def create_account_api(
                     self.end_headers()
                     return
                 self._send_json(result.payload, result.status_code, etag=result.etag)
+                return
+            prefix = "/api/v1/account/statements/"
+            parts = path.removeprefix(prefix).split("/")
+            if path.startswith(prefix) and len(parts) == 3 and parts[2] == "trade-facts":
+                broker, generation, _trade_facts = parts
+                if mode == "shadow" and self.headers.get(ACCOUNT_ROUTE_HEADER) == PRODUCTION_ROUTE_MARKER:
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "account_api_shadow_only",
+                            "message": "Account API is running in shadow mode",
+                        },
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                if broker not in STATEMENT_BROKERS or statement_generation_digest(generation) is None:
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "invalid_statement_facts_request",
+                            "message": "Invalid statement facts request",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                snapshot = load_account_snapshot(
+                    data_dir,
+                    api_git_sha=str(runtime["api_git_sha"]),
+                    now=datetime.now().astimezone(),
+                )
+                generations = snapshot.payload.get("accepted_statement_generation")
+                if snapshot.status_code != HTTPStatus.OK or not isinstance(generations, dict):
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "account_unavailable",
+                            "message": "Account snapshot is unavailable",
+                        },
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                if generations.get(broker) != generation:
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "accepted_statement_generation_changed",
+                            "message": "Accepted statement generation changed",
+                        },
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    from .statement_import import load_statement_trade_facts
+
+                    manifest, facts = load_statement_trade_facts(
+                        data_dir, broker, generation
+                    )
+                    statement_period = manifest["statement_period"]
+                    cutoff = manifest["trade_facts_cutoff_at"]
+                    facts_sha256 = manifest["trade_facts_sha256"]
+                    if (
+                        not isinstance(statement_period, str)
+                        or not isinstance(cutoff, str)
+                        or statement_generation_digest(facts_sha256) is None
+                    ):
+                        raise ValueError("invalid statement facts publication")
+                except (KeyError, TypeError, ValueError):
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "statement_facts_publication_invalid",
+                            "message": "Statement facts publication is invalid",
+                        },
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                self._send_json(
+                    {
+                        "schema_version": "open_trader.account.statement_trade_facts.v1",
+                        "broker": broker,
+                        "statement_generation": generation,
+                        "statement_period": statement_period,
+                        "trade_facts_cutoff_at": cutoff,
+                        "trade_facts_sha256": facts_sha256,
+                        "facts": facts,
+                    }
+                )
                 return
             self._send_json(
                 {
