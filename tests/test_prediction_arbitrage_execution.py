@@ -5,11 +5,13 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,7 +27,7 @@ from open_trader.polymarket_trading import (
     ThresholdHedgeSubmission,
     ThresholdLegResult,
 )
-from open_trader.predict_trading import PredictLegResult
+from open_trader.predict_trading import PredictLegResult, PredictTradingClient
 
 
 def _intent() -> PairIntent:
@@ -1652,6 +1654,65 @@ def test_cross_ambiguous_exact_approval_holds_reservation_and_opens_incident_wit
     incidents = store.histories("incidents")
     assert len(incidents) == 1
     assert incidents[0]["reason"] == "predict_allowance_approval_unverified"
+
+
+def test_cross_malformed_success_like_receipt_opens_approval_incident_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    sdk_calls: list[tuple[object, bool, int]] = []
+    step = SimpleNamespace(id="approval-step-buy", spender="0xspender")
+
+    def sdk_set_approval(
+        approval_step: object, *, approved: bool, amount: int
+    ) -> object:
+        sdk_calls.append((approval_step, approved, amount))
+        return SimpleNamespace(
+            success=True,
+            receipt={"status": 1.5, "transactionHash": "0xmalformed"},
+            cause=None,
+        )
+
+    adapter = PredictTradingClient.__new__(PredictTradingClient)
+    adapter._builder = SimpleNamespace(set_approval=sdk_set_approval)  # type: ignore[attr-defined]
+    adapter._approval_scope_for_market = lambda _market_id: object()  # type: ignore[method-assign]
+    adapter._approval_facts_for_scope = lambda _scope, *, exact_debit_wei: {  # type: ignore[method-assign]
+        "predict_account": predict.predict_account,
+        "gas_signer": predict.gas_signer,
+        "approval_step_id": predict.approval_step_id,
+        "approval_spender": step.spender,
+        "allowance": "0",
+        "allowance_raw": "0",
+        "allowance_breaker": False,
+        "exact_debit_wei": exact_debit_wei,
+    }
+    adapter._approval_step = lambda _scope: step  # type: ignore[method-assign]
+    adapter._raw_allowance = lambda _step: 2_300_000  # type: ignore[method-assign]
+
+    def malformed_approval(market_id: str, exact_debit_wei: int) -> Mapping[str, object]:
+        predict.call_log.append("set_allowance")
+        predict.approval_calls.append((market_id, exact_debit_wei))
+        result = adapter.set_exact_buy_allowance(market_id, exact_debit_wei)
+        if result.get("status") == "confirmed":
+            predict.allowance = str(Decimal(exact_debit_wei) / Decimal("1000000"))
+            predict.allowance_raw = str(exact_debit_wei)
+            predict.allowance_breaker = True
+        return result
+
+    predict.set_exact_buy_allowance = malformed_approval  # type: ignore[method-assign]
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-malformed-success-status"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert service._cross_breaker_open is True
+    assert sdk_calls == [(step, True, 2_300_000)]
+    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("4.80")
 
 
 def test_cross_post_approval_refresh_breach_clears_allowance_without_submit(

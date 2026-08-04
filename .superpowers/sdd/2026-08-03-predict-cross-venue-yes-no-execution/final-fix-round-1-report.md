@@ -332,3 +332,78 @@ source /Users/ray/projects/open_trader/.venv/bin/activate && PYTHONSAFEPATH=1 PY
 - Specification review: all three round-2 findings are covered; no acceptance, deployment, merge, push, screenshot, live notification, approval, order, transfer, redemption, or other live mutation was performed.
 - Missing or malformed Polymarket taker-fee evidence deliberately keeps a successfully reconciled holding at the 5-USDT canary cap; it does not make the holding itself unverified.
 - The existing `websockets.legacy` deprecation warning remains and was intentionally not addressed per scope.
+
+# Final Fix Round 3 — Strict Predict Receipt Status
+
+## Root cause and SDK contract
+
+The installed `predict_sdk` 0.2.0 waits for a Web3 transaction receipt and compares `receipt["status"]` directly with integer `1`. Web3 normalizes the RPC receipt status to an integer before the SDK returns it. The adapter therefore accepts only exact Python integers `0` and `1`; booleans, floats, `Decimal` values, strings, out-of-range integers, arbitrary numeric-looking objects, and missing or malformed values remain ambiguous.
+
+## TDD red/green evidence
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py::test_set_exact_buy_allowance_rejects_noncanonical_receipt_status_as_ambiguous tests/test_prediction_arbitrage_execution.py::test_cross_malformed_success_like_receipt_opens_approval_incident_without_submit
+```
+
+- Red: 14 failed, 3 passed, 1 warning in 3.16s. Broad `int()` coercion treated floats, `Decimal`, strings, booleans, and numeric-looking objects as conclusive; the production-shaped service case advanced to `holding_to_resolution` instead of opening an approval incident.
+- Green: 17 passed, 1 warning in 2.85s. Every noncanonical status is `receipt_ambiguous` with `possible_mutation=True`; the service holds the 4.80-USDT reservation, opens the breaker/incident, and submits zero venue legs.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py::test_set_exact_buy_allowance_uses_sdk_set_approval_and_proves_exact_post_read tests/test_predict_trading.py::test_set_exact_buy_allowance_only_clears_possible_mutation_for_proven_zero_failed_receipt
+```
+
+- Canonical boundary green: 7 passed, 1 warning in 0.54s. Exact integer `1` still requires the exact allowance post-read before confirmation; exact integer `0` remains conclusive only under the existing proven zero/unchanged allowance rules.
+
+## Focused and complete affected verification
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py tests/test_prediction_arbitrage_execution.py
+```
+
+- Focused result: 258 passed, 1 warning in 4.29s.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py tests/test_predict_cross_venue.py tests/test_polymarket_trading.py tests/test_prediction_arbitrage_execution.py tests/test_prediction_arbitrage_acceptance.py
+```
+
+- Complete owned affected result: 502 passed, 1 warning in 5.90s.
+- `tests/test_dashboard_web.py` was not run because round 3 changes no public field or Dashboard projection.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && python -m compileall -q src/open_trader/predict_trading.py && git diff --check
+```
+
+- Exit code: 0 with no output.
+
+## Direct no-submit readiness
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" python -m open_trader prediction-arb preflight --no-submit --config config/prediction_arbitrage.json
+```
+
+- Exit code: 0
+- Result: PASS
+- `sdk_version: 0.2.0`
+- `signer_match: yes`
+- `wallet_match: yes`
+- `geoblock: allowed`
+- `account_reads: pass`
+- `fok_pair_signed_not_submitted: pass`
+- `equal_requested_shares: pass`
+- `merge_capability: present_not_invoked`
+- `relayer_readiness: pass`
+- `secret_scan: pass`
+
+## Changed files in round 3
+
+- `src/open_trader/predict_trading.py`
+- `tests/test_predict_trading.py`
+- `tests/test_prediction_arbitrage_execution.py`
+- `.superpowers/sdd/2026-08-03-predict-cross-venue-yes-no-execution/final-fix-round-1-report.md`
+
+## Final review and concerns
+
+- Current phase: round 3 implementation and verification complete; no blocker.
+- The production change is limited to replacing broad numeric coercion with an exact type-and-value check.
+- No acceptance, deployment, merge, push, screenshot, approval, order, transfer, redemption, or other live mutation was performed.
+- The existing `websockets.legacy` deprecation warning remains and is outside this round's scope.

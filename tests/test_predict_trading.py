@@ -41,6 +41,11 @@ class RawResponse(FakeResponse):
         return b"not-json"
 
 
+class NumericLookingReceiptStatus:
+    def __int__(self) -> int:
+        return 1
+
+
 class FakeBuilder:
     last_order_input = None
 
@@ -692,6 +697,50 @@ def test_set_exact_buy_allowance_uses_sdk_set_approval_and_proves_exact_post_rea
     assert result["allowance_breaker"] is True
     assert "_approval_step" not in result
     assert not any(str(key).startswith("_") for key in result)
+    assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
+    assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "receipt_status",
+    (
+        1.0,
+        0.0,
+        1.5,
+        Decimal("1"),
+        Decimal("0"),
+        Decimal("1.5"),
+        "1",
+        "0",
+        "1.5",
+        "0x1",
+        "0x0",
+        2,
+        -1,
+        True,
+        False,
+        NumericLookingReceiptStatus(),
+    ),
+)
+def test_set_exact_buy_allowance_rejects_noncanonical_receipt_status_as_ambiguous(
+    receipt_status: object,
+) -> None:
+    client, _ = make_client(response_for)
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+    client._builder.allowance_after_approve = 2_400_000  # type: ignore[attr-defined]
+    client._builder.next_set_approval_result = SimpleNamespace(  # type: ignore[attr-defined]
+        success=True,
+        receipt={"status": receipt_status, "transactionHash": "0xmalformed"},
+        cause=None,
+    )
+
+    result = client.set_exact_buy_allowance("896", 2_400_000)
+
+    assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
+    assert result["success"] is False
+    assert result["error_code"] == "receipt_ambiguous"
+    assert result["possible_mutation"] is True
+    assert "transaction_status" not in result
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
     assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
 

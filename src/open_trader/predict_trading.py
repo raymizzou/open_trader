@@ -910,10 +910,7 @@ def _receipt_status(receipt: object) -> int | None:
         status = receipt.get("status")
     else:
         status = getattr(receipt, "status", None)
-    try:
-        return int(status) if status is not None else None
-    except (TypeError, ValueError):
-        return None
+    return status if type(status) is int and status in (0, 1) else None
 
 
 def _receipt_hash(receipt: object) -> str | None:
