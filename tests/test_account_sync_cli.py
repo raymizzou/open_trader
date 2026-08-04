@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
 from pathlib import Path
 
@@ -218,6 +219,50 @@ def test_status_returns_only_sanitized_account_error(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "account_unavailable\n"
+
+
+def test_status_sanitizes_malformed_nested_snapshot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            return io.BytesIO(
+                json.dumps({
+                    "schema_version": 1,
+                    "snapshot_generation": GENERATION,
+                    "account_generation": GENERATION,
+                    "generated_at": "2026-08-04T12:00:00+08:00",
+                    "quote_as_of": "2026-08-04T12:00:00+08:00",
+                    "status": "healthy",
+                    "stale": False,
+                    "sources": {},
+                    "release": {},
+                    "summary": {},
+                    "broker_summaries": [],
+                    "positions": [],
+                    "cash_balances": [],
+                    "errors": [],
+                    "accepted_statement_generation": {"phillips": "", "eastmoney": ""},
+                }).encode()
+            ).read(size)
+
+    monkeypatch.setattr(
+        "open_trader.account_http.urllib.request.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    assert cli.main(["account-sync-status", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "account_contract_invalid\n"
 
 
 def _snapshot(

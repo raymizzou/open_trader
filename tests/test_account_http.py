@@ -35,7 +35,28 @@ def _snapshot(*, status: str = "healthy") -> dict[str, object]:
         "quote_as_of": "2026-08-04T12:00:00+08:00",
         "status": status,
         "stale": status == "stale",
-        "sources": {},
+        "sources": {
+            "account": {
+                "status": "healthy",
+                "as_of": "2026-08-04T12:00:00+08:00",
+                "reason": None,
+                "brokers": {
+                    broker: {
+                        "source_kind": "live",
+                        "data_as_of": "2026-08-04T12:00:00+08:00",
+                        "last_success_at": "2026-08-04T12:00:00+08:00",
+                        "status": "healthy",
+                        "reason": None,
+                    }
+                    for broker in ("futu", "tiger", "phillips", "eastmoney")
+                },
+            },
+            "quotes": {
+                "status": "healthy",
+                "as_of": "2026-08-04T12:00:00+08:00",
+                "reason": None,
+            },
+        },
         "release": {},
         "summary": {},
         "broker_summaries": [],
@@ -124,6 +145,7 @@ def test_fetch_statement_facts_sends_marker_and_validates_contract(
         {**_snapshot(), "status": "unavailable"},
         {key: value for key, value in _snapshot().items() if key != "positions"},
         {**_snapshot(), "snapshot_generation": "not-a-generation"},
+        {**_snapshot(), "sources": {}},
         {**_snapshot(), "accepted_statement_generation": {"phillips": "bad", "eastmoney": ""}},
     ],
 )

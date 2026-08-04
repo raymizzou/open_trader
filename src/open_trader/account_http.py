@@ -8,7 +8,11 @@ import urllib.error
 import urllib.request
 
 from .account_api import ACCOUNT_ROUTE_HEADER, PRODUCTION_ROUTE_MARKER
-from .account_sync_state import STATEMENT_BROKERS, statement_generation_digest
+from .account_sync_state import (
+    REQUIRED_BROKERS,
+    STATEMENT_BROKERS,
+    statement_generation_digest,
+)
 
 
 DEFAULT_ACCOUNT_API_URL = "http://127.0.0.1:8768"
@@ -22,6 +26,12 @@ _SNAPSHOT_FIELDS = frozenset({
 _STATEMENT_FACTS_FIELDS = frozenset({
     "schema_version", "broker", "statement_generation", "statement_period",
     "trade_facts_cutoff_at", "trade_facts_sha256", "facts",
+})
+_SOURCES_FIELDS = frozenset({"account", "quotes"})
+_ACCOUNT_SOURCE_FIELDS = frozenset({"status", "as_of", "reason", "brokers"})
+_QUOTE_SOURCE_FIELDS = frozenset({"status", "as_of", "reason"})
+_BROKER_SOURCE_FIELDS = frozenset({
+    "source_kind", "data_as_of", "last_success_at", "status", "reason",
 })
 
 
@@ -104,6 +114,7 @@ def _is_valid_snapshot(payload: Mapping[str, object]) -> bool:
         or payload.get("stale") is not (payload.get("status") == "stale")
         or statement_generation_digest(payload.get("snapshot_generation")) is None
         or statement_generation_digest(payload.get("account_generation")) is None
+        or not _is_valid_sources(payload.get("sources"))
     ):
         return False
     generations = payload.get("accepted_statement_generation")
@@ -113,6 +124,41 @@ def _is_valid_snapshot(payload: Mapping[str, object]) -> bool:
         and all(
             generation == "" or statement_generation_digest(generation) is not None
             for generation in generations.values()
+        )
+    )
+
+
+def _is_valid_sources(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != _SOURCES_FIELDS:
+        return False
+    account = value.get("account")
+    quotes = value.get("quotes")
+    if (
+        not isinstance(account, Mapping)
+        or not isinstance(quotes, Mapping)
+        or set(account) != _ACCOUNT_SOURCE_FIELDS
+        or set(quotes) != _QUOTE_SOURCE_FIELDS
+        or not isinstance(account.get("status"), str)
+        or not isinstance(account.get("as_of"), str)
+        or not isinstance(account.get("reason"), (str, type(None)))
+        or not isinstance(quotes.get("status"), str)
+        or not isinstance(quotes.get("as_of"), str)
+        or not isinstance(quotes.get("reason"), (str, type(None)))
+    ):
+        return False
+    brokers = account.get("brokers")
+    return (
+        isinstance(brokers, Mapping)
+        and set(brokers) == set(REQUIRED_BROKERS)
+        and all(
+            isinstance(source, Mapping)
+            and set(source) == _BROKER_SOURCE_FIELDS
+            and all(
+                isinstance(source.get(field), str)
+                for field in _BROKER_SOURCE_FIELDS - {"reason"}
+            )
+            and isinstance(source.get("reason"), (str, type(None)))
+            for source in brokers.values()
         )
     )
 
