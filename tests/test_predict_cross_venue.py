@@ -2059,6 +2059,29 @@ def test_monitor_missing_api_key_is_pending_and_has_zero_cross_subscriptions() -
     asyncio.run(exercise())
 
 
+def test_funnel_clear_signal_counts_only_actionable_opportunity_pairs() -> None:
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=lambda *args, **kwargs: [],
+        clob_lookup=lambda condition_id: None,
+    )
+    monitor._status = "ready"
+    monitor._opportunities = {  # type: ignore[assignment]
+        ("stage-4-pair", "PREDICT_YES_POLYMARKET_NO"): {
+            "funnel_stage": 4,
+            "actionable": False,
+        },
+        ("stage-5-pair", "PREDICT_YES_POLYMARKET_NO"): {
+            "funnel_stage": 5,
+            "actionable": True,
+        },
+    }
+
+    assert monitor.snapshot()["funnel"]["clear_signal_pairs"] == 1
+
+
 def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

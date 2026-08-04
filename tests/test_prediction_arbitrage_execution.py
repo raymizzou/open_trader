@@ -1095,6 +1095,31 @@ def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueInte
     )
 
 
+def test_cross_holding_recognizes_canonical_predict_position() -> None:
+    leg = _cross_intent().legs[0]
+    snapshot = {
+        "positions": (
+            {
+                "market_id": leg.market_id,
+                "condition_id": leg.condition_id,
+                "token_id": leg.token_id,
+                "outcome": leg.outcome,
+                "quantity": "5",
+                "redeemable": True,
+            },
+        )
+    }
+
+    assert PredictionExecutionService._cross_position_quantity(snapshot, leg) == Decimal("5")
+    assert PredictionExecutionService._cross_redeemable_winner(snapshot, leg) == {
+        "venue": "predict.fun",
+        "condition_id": "predict-condition",
+        "outcome": "YES",
+        "token_id": "predict-yes",
+        "quantity": Decimal("5"),
+    }
+
+
 class CrossVenueMonitor:
     def __init__(self, intent: CrossVenueIntent) -> None:
         self.intent = intent

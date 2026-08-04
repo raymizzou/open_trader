@@ -108,6 +108,9 @@ class PredictSource:
                 if market is not None:
                     self._markets[market.market_id] = market
                     markets.append(market)
+                elif not _explicitly_out_of_scope(row, category):
+                    self._mark_stale("rest")
+                    return ()
             next_cursor = payload.get("cursor")
             if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
                 return tuple(markets)
@@ -487,6 +490,30 @@ def _normalise_market(
         polymarket_condition_ids=polymarket_condition_ids,
         rules_fingerprint=fingerprint,
     )
+
+
+def _explicitly_out_of_scope(
+    payload: object, category: dict[str, object] | None
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    candidate = dict(payload)
+    changed = False
+    for name in ("isNegRisk", "isYieldBearing"):
+        if candidate.get(name) is True:
+            candidate[name] = False
+            changed = True
+    if isinstance(candidate.get("tradingStatus"), str) and candidate["tradingStatus"] != "OPEN":
+        candidate["tradingStatus"] = "OPEN"
+        changed = True
+    if candidate.get("isVisible") is False:
+        candidate["isVisible"] = True
+        changed = True
+    variant = candidate.get("marketVariant")
+    if isinstance(variant, str) and variant and variant not in {"DEFAULT", "STANDARD"}:
+        candidate["marketVariant"] = "DEFAULT"
+        changed = True
+    return changed and _normalise_market(candidate, category) is not None
 
 
 def _levels(value: object, tick_size: Decimal, *, ascending: bool) -> tuple[BookLevel, ...]:

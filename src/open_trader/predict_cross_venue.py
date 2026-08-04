@@ -1088,7 +1088,11 @@ class PredictCrossVenueMonitor:
             "monitored_pairs": self._monitored_pairs,
             "codex_approved_pairs": len(self._approved),
             "arbitrage_space_pairs": len(self._arbitrage_pairs),
-            "clear_signal_pairs": len({pair_id for pair_id, _ in self._opportunities}),
+            "clear_signal_pairs": len({
+                pair_id
+                for (pair_id, _), opportunity in self._opportunities.items()
+                if opportunity.get("actionable") is True
+            }),
         }
 
     def _snapshot_funnel(self) -> dict[str, int]:

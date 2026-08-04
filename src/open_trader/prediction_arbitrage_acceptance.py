@@ -667,6 +667,8 @@ def _raise_source_status(source: object, channel: str) -> None:
         raise KeychainError("keychain_unavailable")
     if status == "unavailable" or reason == "network_unavailable":
         raise _ExternalUnavailable("external source unavailable")
+    if status == "stale" or reason in {"rest_stale", "ws_stale"}:
+        raise RuntimeError("invalid source data")
 
 
 def _predict_quantity(market: object) -> int:

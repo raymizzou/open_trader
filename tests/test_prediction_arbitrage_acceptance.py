@@ -238,6 +238,25 @@ def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     assert client.account_snapshot_calls == 1
 
 
+def test_invalid_predict_market_scan_fails_instead_of_passing_as_empty(
+    tmp_path: Path,
+) -> None:
+    class InvalidPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+        def snapshot(self) -> dict[str, object]:
+            return {"rest": "stale", "rest_reason": "rest_stale"}
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=lambda _config, *, urlopen_fn: InvalidPredictSource(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.predict_market.status == "FAIL"
+
+
 def test_empty_scan_uses_production_predict_client_for_safe_order_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

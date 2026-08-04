@@ -226,7 +226,7 @@ def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_m
     source, requests = source_with_responses(
         [
             {"success": True, "cursor": "next", "data": [market(), market(isNegRisk=True)]},
-            {"success": True, "cursor": None, "data": [market(id=124, outcomes=[{"name": "YES"}])]},
+            {"success": True, "cursor": None, "data": [market(id=124, tradingStatus="CLOSED")]},
         ]
     )
 
@@ -247,6 +247,48 @@ def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_m
         "https://api.predict.fun/v1/markets?first=100&status=OPEN",
         "https://api.predict.fun/v1/markets?first=100&status=OPEN&after=next",
     ]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"isNegRisk": True},
+        {"isYieldBearing": True},
+        {"tradingStatus": "CLOSED"},
+        {"isVisible": False},
+        {"marketVariant": "SPORTS"},
+    ),
+)
+def test_explicitly_out_of_scope_markets_are_a_healthy_empty_scan(
+    changes: dict[str, object],
+) -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "cursor": None, "data": [market(**changes)]}]
+    )
+
+    assert asyncio.run(source.list_open_markets()) == ()
+    assert source.snapshot()["rest"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("changes", "category_changes"),
+    (
+        ({"conditionId": None}, {}),
+        ({"feeRateBps": "bad"}, {}),
+        ({}, {"endsAt": "bad"}),
+    ),
+)
+def test_v1_claim_with_malformed_required_evidence_marks_source_stale(
+    changes: dict[str, object], category_changes: dict[str, object]
+) -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "cursor": None, "data": [market(**changes)]}],
+        categories={"btc-year-end": category(**category_changes)},
+    )
+
+    assert asyncio.run(source.list_open_markets()) == ()
+    assert source.snapshot()["rest"] == "stale"
+    assert source.snapshot()["rest_reason"] == "rest_stale"
 
 
 def test_list_open_markets_stops_on_repeated_cursor_without_requesting_a_third_page() -> None:

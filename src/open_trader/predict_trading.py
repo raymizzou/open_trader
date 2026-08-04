@@ -550,8 +550,8 @@ class PredictTradingClient:
             ApprovalScope("TRADE", False, False, Side.BUY),
             exact_debit_wei=0,
         )
-        open_orders = _rows(self._json("/v1/orders", auth=True), "orders")
-        positions = _rows(self._json("/v1/positions", auth=True), "positions")
+        open_orders = self._paged_rows("/v1/orders", "orders")
+        positions = _canonical_positions(self._paged_rows("/v1/positions", "positions"))
         allowance = _non_negative_int(facts["allowance_raw"], "allowance")
         minimum_top_up = _number(facts["minimum_top_up_bnb"]) or Decimal("0")
         return {
@@ -584,20 +584,18 @@ class PredictTradingClient:
                     raise
                 order = {}
                 order_missing = True
-            order_list = (
-                _rows_exact(self._json("/v1/orders", auth=True), "orders")
-                if order_missing
-                else ()
-            )
-            matches = _rows_exact(
-                self._json(
-                    f"/v1/orders/matches?{urlencode({'orderHashes': order_hash})}",
-                    auth=True,
-                ),
+            order_list = self._paged_rows("/v1/orders", "orders")
+            matches = self._paged_rows(
+                f"/v1/orders/matches?{urlencode({'orderHashes': order_hash})}",
                 "matches",
             )
-            activity = _rows_exact(self._json("/v1/account/activity", auth=True), "activities")
-            positions = _rows_exact(self._json(f"/v1/positions?marketId={market_id}", auth=True), "positions")
+            activity = self._paged_rows("/v1/account/activity", "activities")
+            positions = _canonical_positions(
+                self._paged_rows(
+                    f"/v1/positions?{urlencode({'marketId': market_id})}",
+                    "positions",
+                )
+            )
             identity = (
                 order.get("hash") == order_hash
                 and str(order.get("tokenId")) == str(token_id)
@@ -647,7 +645,7 @@ class PredictTradingClient:
                 for row in positions
                 if _row_identity(row, market_id=market_id, token_id=token_id)
             ]
-            position_amounts = [_raw_units(row.get("amount")) for row in matching_positions]
+            position_amounts = [_number(row.get("quantity")) for row in matching_positions]
             if any(amount is None for amount in position_amounts):
                 raise ValueError("invalid Predict position amount")
             position_quantity = sum(
@@ -689,8 +687,38 @@ class PredictTradingClient:
         except Exception:
             return {"verified": False, "conclusively_absent": False, "status": "unknown"}
 
+    def _paged_rows(
+        self, path: str, name: str
+    ) -> tuple[Mapping[str, object], ...]:
+        rows: list[Mapping[str, object]] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            page_path = path
+            if cursor is not None:
+                page_path += ("&" if "?" in path else "?") + urlencode({"after": cursor})
+            payload = self._json(page_path, auth=True)
+            rows.extend(_rows_exact(payload, name))
+            next_cursor = payload.get("cursor")
+            if next_cursor is None:
+                return tuple(rows)
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen
+            ):
+                raise ValueError("invalid Predict cursor")
+            seen.add(next_cursor)
+            cursor = next_cursor
+
     def redeemable_snapshot(self) -> Mapping[str, object]:
-        return {"wallet_address": self._config.wallet_address, "positions": _rows(self._json("/v1/positions", auth=True), "positions"), "checked_at": datetime.now(UTC)}
+        return {
+            "wallet_address": self._config.wallet_address,
+            "positions": _canonical_positions(
+                self._paged_rows("/v1/positions", "positions")
+            ),
+            "checked_at": datetime.now(UTC),
+        }
 
     def _approval_scope_for_market(self, market_id: str) -> ApprovalScope:
         market = self._market(market_id)
@@ -945,8 +973,8 @@ def _row_identity(
 ) -> bool:
     market = _row(row.get("market"))
     outcome = _row(row.get("outcome"))
-    row_market_id = market.get("id", row.get("marketId"))
-    row_token_id = outcome.get("onChainId", row.get("tokenId"))
+    row_market_id = market.get("id", row.get("marketId", row.get("market_id")))
+    row_token_id = outcome.get("onChainId", row.get("tokenId", row.get("token_id")))
     return str(row_market_id) == str(market_id) and str(row_token_id) == str(token_id)
 
 
@@ -991,8 +1019,6 @@ def _activity_facts(
     if not _row_identity(row, market_id=market_id, token_id=token_id):
         return None
     order = _row(row.get("order"))
-    if str(order.get("hash")) != order_hash:
-        return None
     fee = _row(order.get("fee"))
     if fee.get("type") != "COLLATERAL":
         return None
@@ -1021,6 +1047,45 @@ def _raw_units(value: object) -> Decimal | None:
     if not isinstance(value, str) or not value.isascii() or not value.isdigit():
         return None
     return Decimal(int(value)) / Decimal(PREDICT_BASE_UNITS)
+
+
+def _canonical_positions(
+    rows: tuple[Mapping[str, object], ...]
+) -> tuple[Mapping[str, object], ...]:
+    positions: list[Mapping[str, object]] = []
+    for row in rows:
+        market = _row(row.get("market"))
+        outcome = _row(row.get("outcome"))
+        market_id = market.get("id")
+        condition_id = market.get("conditionId")
+        token_id = outcome.get("onChainId")
+        outcome_name = outcome.get("name")
+        outcome_status = outcome.get("status")
+        quantity = _raw_units(row.get("amount"))
+        if (
+            market_id in (None, "")
+            or not isinstance(condition_id, str)
+            or not condition_id
+            or not isinstance(token_id, str)
+            or not token_id
+            or not isinstance(outcome_name, str)
+            or not outcome_name
+            or not isinstance(outcome_status, str)
+            or not outcome_status
+            or quantity is None
+        ):
+            raise ValueError("invalid Predict position")
+        positions.append(
+            {
+                "market_id": str(market_id),
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "outcome": outcome_name.upper(),
+                "quantity": format(quantity, "f"),
+                "redeemable": outcome_status.upper() == "WON",
+            }
+        )
+    return tuple(positions)
 
 
 def _book(payload: Mapping[str, object]) -> Book:

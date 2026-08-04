@@ -237,6 +237,10 @@ def response_for(request, **kwargs):
         return FakeResponse({"data": {"feeRateBps": "200", "isNegRisk": False, "isYieldBearing": False}})
     if request.full_url.endswith("/v1/markets/896/orderbook"):
         return FakeResponse({"data": {"marketId": 896, "updateTimestampMs": 1, "asks": [["0.51", "3"]], "bids": [["0.50", "2"]]}})
+    if request.get_method() == "GET" and request.full_url.endswith("/v1/orders"):
+        return FakeResponse({"success": True, "cursor": None, "data": []})
+    if request.get_method() == "GET" and request.full_url.endswith("/v1/positions"):
+        return FakeResponse({"success": True, "cursor": None, "data": []})
     return FakeResponse(
         {
             "success": True,
@@ -521,7 +525,10 @@ def test_reconcile_returns_unknown_for_pending_order_with_preexisting_position()
 
 
 def test_reconcile_verifies_only_full_order_match_activity_and_position_agreement() -> None:
+    calls: list[str] = []
+
     def urlopen_fn(request, **kwargs):
+        calls.append(request.full_url)
         if request.full_url.endswith("/v1/auth/message"):
             return FakeResponse({"message": "dynamic-message-sentinel"})
         if request.full_url.endswith("/v1/auth"):
@@ -545,7 +552,13 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                     },
                 }
             )
+        if request.full_url.endswith("/v1/orders"):
+            return FakeResponse({"success": True, "cursor": "orders-next", "data": []})
+        if request.full_url.endswith("/v1/orders?after=orders-next"):
+            return FakeResponse({"success": True, "cursor": None, "data": [{"order": {"hash": "order-hash"}}]})
         if request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash"):
+            return FakeResponse({"success": True, "cursor": "matches-next", "data": []})
+        if request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash&after=matches-next"):
             return FakeResponse(
                 {
                     "success": True,
@@ -566,6 +579,8 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                 }
             )
         if request.full_url.endswith("/v1/account/activity"):
+            return FakeResponse({"success": True, "cursor": "activity-next", "data": []})
+        if request.full_url.endswith("/v1/account/activity?after=activity-next"):
             return FakeResponse(
                 {
                     "success": True,
@@ -575,25 +590,26 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                             "transactionHash": "tx",
                             "amountFilled": "1",
                             "order": {
-                                "hash": "order-hash",
                                 "fee": {"amount": "20000000000000000", "type": "COLLATERAL"}
                             },
-                            "market": {"id": 896},
-                            "outcome": {"onChainId": "yes-token"},
+                                "market": {"id": 896, "conditionId": "predict-condition"},
+                                "outcome": {"onChainId": "yes-token", "name": "YES", "status": "OPEN"},
                         }
                     ],
                 }
             )
         if request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"success": True, "cursor": "positions-next", "data": []})
+        if request.full_url.endswith("/v1/positions?marketId=896&after=positions-next"):
             return FakeResponse(
                 {
                     "success": True,
                     "data": [
-                        {
-                            "id": "position-id",
-                            "market": {"id": 896},
-                            "outcome": {"onChainId": "yes-token"},
-                            "amount": "1000000000000000000",
+                            {
+                                "id": "position-id",
+                                "market": {"id": 896, "conditionId": "predict-condition"},
+                                "outcome": {"onChainId": "yes-token", "name": "YES", "status": "OPEN"},
+                                "amount": "1000000000000000000",
                         }
                     ],
                 }
@@ -617,6 +633,12 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
         },
         "minimum_order_size": Decimal("0.01"),
     }
+    assert {
+        "/v1/orders?after=orders-next",
+        "/v1/orders/matches?orderHashes=order-hash&after=matches-next",
+        "/v1/account/activity?after=activity-next",
+        "/v1/positions?marketId=896&after=positions-next",
+    }.issubset({url.removeprefix("https://api.predict.fun") for url in calls})
 
 
 def test_reconcile_rejects_match_for_a_different_owned_order_hash() -> None:
@@ -630,12 +652,14 @@ def test_reconcile_rejects_match_for_a_different_owned_order_hash() -> None:
             return FakeResponse({"token": "jwt-sentinel"})
         if request.full_url.endswith("/v1/orders/order-hash"):
             return FakeResponse({"data": {"order": {"hash": "order-hash", "tokenId": "yes-token", "signer": DEPOSIT}, "marketId": 896, "status": "FILLED", "amountFilled": "1"}})
+        if request.full_url.endswith("/v1/orders"):
+            return FakeResponse({"cursor": None, "data": [{"order": {"hash": "order-hash"}}]})
         if "/v1/orders/matches" in request.full_url:
             return FakeResponse({"data": [{"market": {"id": 896}, "taker": {"hash": "different-order", "signer": DEPOSIT, "outcome": {"onChainId": "yes-token"}, "fee": {"amount": "0", "type": "COLLATERAL"}}, "makers": [], "amountFilled": "1", "transactionHash": "tx"}]})
         if request.full_url.endswith("/v1/account/activity"):
-            return FakeResponse({"data": [{"transactionHash": "tx", "amountFilled": "1", "order": {"hash": "order-hash", "fee": {"amount": "0", "type": "COLLATERAL"}}, "market": {"id": 896}, "outcome": {"onChainId": "yes-token"}}]})
+            return FakeResponse({"data": [{"transactionHash": "tx", "amountFilled": "1", "order": {"fee": {"amount": "0", "type": "COLLATERAL"}}, "market": {"id": 896}, "outcome": {"onChainId": "yes-token"}}]})
         if request.full_url.endswith("/v1/positions?marketId=896"):
-            return FakeResponse({"data": [{"market": {"id": 896}, "outcome": {"onChainId": "yes-token"}, "amount": "1000000000000000000"}]})
+            return FakeResponse({"data": [{"market": {"id": 896, "conditionId": "predict-condition"}, "outcome": {"onChainId": "yes-token", "name": "YES", "status": "OPEN"}, "amount": "1000000000000000000"}]})
         raise AssertionError(request.full_url)
 
     result = make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash")
@@ -654,13 +678,71 @@ def test_reconcile_404_requires_all_independent_reads_before_proving_absence() -
             return FakeResponse({"token": "jwt-sentinel"})
         if request.full_url.endswith("/v1/orders/order-hash"):
             raise HTTPError(request.full_url, 404, "not found", {}, None)
-        if request.full_url.endswith("/v1/orders") or request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash") or request.full_url.endswith("/v1/account/activity") or request.full_url.endswith("/v1/positions?marketId=896"):
-            return FakeResponse({"data": []})
+        first_pages = {
+            "/v1/orders": "orders-next",
+            "/v1/orders/matches?orderHashes=order-hash": "matches-next",
+            "/v1/account/activity": "activity-next",
+            "/v1/positions?marketId=896": "positions-next",
+        }
+        path = request.full_url.removeprefix("https://api.predict.fun")
+        if path in first_pages:
+            return FakeResponse({"cursor": first_pages[path], "data": []})
+        if path in {
+            "/v1/orders?after=orders-next",
+            "/v1/orders/matches?orderHashes=order-hash&after=matches-next",
+            "/v1/account/activity?after=activity-next",
+            "/v1/positions?marketId=896&after=positions-next",
+        }:
+            return FakeResponse({"cursor": None, "data": []})
         raise AssertionError(request.full_url)
 
     result = make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash")
     assert result == {"verified": False, "conclusively_absent": True, "status": "absent"}
-    assert any(url.endswith("/v1/orders") for url in calls)
+    assert sum("after=" in url for url in calls) == 4
+
+
+def test_reconcile_repeated_cursor_is_unknown() -> None:
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders/order-hash"):
+            raise HTTPError(request.full_url, 404, "not found", {}, None)
+        if request.full_url.endswith("/v1/orders") or request.full_url.endswith("/v1/orders?after=repeat"):
+            return FakeResponse({"cursor": "repeat", "data": []})
+        if request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash") or request.full_url.endswith("/v1/account/activity") or request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"cursor": None, "data": []})
+        raise AssertionError(request.full_url)
+
+    assert make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash") == {
+        "verified": False,
+        "conclusively_absent": False,
+        "status": "unknown",
+    }
+
+
+def test_reconcile_404_late_order_evidence_prevents_absence() -> None:
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders/order-hash"):
+            raise HTTPError(request.full_url, 404, "not found", {}, None)
+        if request.full_url.endswith("/v1/orders"):
+            return FakeResponse({"cursor": "next", "data": []})
+        if request.full_url.endswith("/v1/orders?after=next"):
+            return FakeResponse({"cursor": None, "data": [{"order": {"hash": "order-hash"}}]})
+        if request.full_url.endswith("/v1/orders/matches?orderHashes=order-hash") or request.full_url.endswith("/v1/account/activity") or request.full_url.endswith("/v1/positions?marketId=896"):
+            return FakeResponse({"cursor": None, "data": []})
+        raise AssertionError(request.full_url)
+
+    assert make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash") == {
+        "verified": False,
+        "conclusively_absent": False,
+        "status": "unknown",
+    }
 
 
 @pytest.mark.parametrize(
@@ -699,9 +781,9 @@ def test_account_snapshot_reads_documented_direct_array_shapes() -> None:
     open_order = {"id": "order-id", "order": {"hash": "order-hash"}, "status": "OPEN"}
     position = {
         "id": "position-id",
-        "market": {"id": 896},
-        "outcome": {"onChainId": "yes-token"},
-        "amount": "1",
+        "market": {"id": 896, "conditionId": "predict-condition"},
+        "outcome": {"onChainId": "yes-token", "name": "YES", "status": "WON"},
+        "amount": "1000000000000000000",
     }
 
     def urlopen_fn(request, **kwargs):
@@ -721,7 +803,78 @@ def test_account_snapshot_reads_documented_direct_array_shapes() -> None:
     snapshot = client.account_snapshot()
 
     assert snapshot["open_orders"] == (open_order,)
-    assert snapshot["positions"] == (position,)
+    assert snapshot["positions"] == (
+        {
+            "market_id": "896",
+            "condition_id": "predict-condition",
+            "token_id": "yes-token",
+            "outcome": "YES",
+            "quantity": "1",
+            "redeemable": True,
+        },
+    )
+
+
+def test_redeemable_snapshot_normalizes_official_position_status() -> None:
+    positions = [
+        {
+            "market": {"id": 896, "conditionId": "predict-condition"},
+            "outcome": {"onChainId": "yes-token", "name": "YES", "status": "WON"},
+            "amount": "1000000000000000000",
+        },
+        {
+            "market": {"id": 896, "conditionId": "predict-condition"},
+            "outcome": {"onChainId": "no-token", "name": "NO", "status": "LOST"},
+            "amount": "2000000000000000000",
+        },
+    ]
+
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/positions"):
+            return FakeResponse({"cursor": None, "data": positions})
+        raise AssertionError(request.full_url)
+
+    snapshot = make_client(urlopen_fn)[0].redeemable_snapshot()
+
+    assert snapshot["positions"] == (
+        {
+            "market_id": "896", "condition_id": "predict-condition",
+            "token_id": "yes-token", "outcome": "YES", "quantity": "1",
+            "redeemable": True,
+        },
+        {
+            "market_id": "896", "condition_id": "predict-condition",
+            "token_id": "no-token", "outcome": "NO", "quantity": "2",
+            "redeemable": False,
+        },
+    )
+
+
+def test_account_snapshot_rejects_malformed_official_position() -> None:
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders"):
+            return FakeResponse({"cursor": None, "data": []})
+        if request.full_url.endswith("/v1/positions"):
+            return FakeResponse({"cursor": None, "data": [{
+                "market": {"id": 896, "conditionId": "predict-condition"},
+                "outcome": {"onChainId": "yes-token", "name": "YES", "status": "WON"},
+                "amount": "1.5",
+            }]})
+        raise AssertionError(request.full_url)
+
+    client, _ = make_client(urlopen_fn)
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="invalid Predict position"):
+        client.account_snapshot()
 
 
 def test_book_parses_decimal_price_to_exact_wei() -> None:
