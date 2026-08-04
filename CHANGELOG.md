@@ -15,6 +15,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Polymarket 预检现在由验收侧硬性拦截下单、赎回、其他变更和通知调用，并要求显式 `posted: false`；SDK 内部读取也通过代理 self 经过同一只读边界。Playwright 通过后写入带一次性 nonce、有效期、实际 `18766` fixture URL、`8766` review URL/healthz 和当前 Git SHA 的 handoff，registry 只消费一次匹配 nonce。
 - 修正验收只读边界对 SDK 底层 HTTP `request/send` 和本地 `create_market_order` 签名的误判：普通 GET/HEAD/OPTIONS 读取及未提交签名可以通过，通知、下单、撤单和赎回仍硬失败并计入安全计数。
 
+- #21 为 Account API 生产切换补齐验收与运维交接：浏览器经 `8766` 独立轮询带 ETag 的 `/api/v1/account/snapshot`，不再请求 `/api/quotes`；Legacy 继续提供其余模块，任一 owner 降级不覆盖另一方。验收会核对稳定 ID 关联、双上游健康、Worker/API 同一 SHA、listener/runtime 日志、ETag/304 与 API parity；Account API 启动日志同时记录候选 Git SHA 与源码洁净状态，浏览器取证后冻结 Legacy 与 Account 两个轮询，并从 Account 页面状态按标的匹配持仓和实时来源、识别 `healthy` 来源状态，不依赖 Legacy 快照或页面排序。Dashboard 风险校验从冻结参数读取资源排名目标仓位，允许第一名 6% 而不放宽 4% 组合风险预算；冻结报告投影校验复用 Dashboard 的双强度字段投影，历史执行缓存也会在同一 action 目录追加成交事件时立即失效，stack 安装失败关闭且不自动进入 single 模式。新增切换、逆向回滚、writer-lock 与 Account-only 故障恢复 runbook，并同步当前轮换比较、CN v12、HK/US v10 与预测市场历史窗口的验收夹具。最终状态仍以候选 SHA 的 `make acceptance` 和同 SHA 重部署证据为准。
 - Dashboard 冻结报告验收同步资源排名强度投影：报告快照中的大类内/全局强度现在与 API 动作列表按同一口径比对。
 - Dashboard 验收持仓表列定义同步到趋势强度可见性：实盘/模拟盘现在都校验“大类内强度”和“全局强度”两列，浏览器验收计数与实际页面一致。
 - 修复验收投影对旧报告缺少轮换比较字段的兼容读取，并同步 HK/US v10 资源排名夹具；预测监控的 7 日分布测试固定其测试时钟，完整 Dashboard 验收 310 个通过。

@@ -401,8 +401,25 @@ def _select_us_price(
     for index, session in enumerate(order):
         if price := prices[session]:
             current = active_order is not None and index == 0
-            return price, session, current, snapshot.update_time if current else ""
+            return (
+                price,
+                session,
+                current,
+                _normalize_futu_us_price_time(snapshot.update_time) if current else "",
+            )
     return None, "", False, ""
+
+
+def _normalize_futu_us_price_time(value: str) -> str:
+    if len(value) < 19 or value[10] not in {" ", "T"} or value[11:].count(":") < 2:
+        return value
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is not None:
+        return value
+    return parsed.isoformat(sep=" ", timespec="milliseconds")
 
 
 def _us_session_status(

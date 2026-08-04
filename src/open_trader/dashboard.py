@@ -37,6 +37,7 @@ from .account_sync_state import (
     load_account_sync_state,
     project_account_sync_health,
 )
+from .account_snapshot import build_instrument_id
 from .futu_symbols import to_futu_symbol
 
 from .decision_facts import (
@@ -1785,6 +1786,15 @@ def _valid_v2_risk_items(
     *,
     strategy_version: str = "v2",
 ) -> bool:
+    snapshot = payload.get("strategy_snapshot")
+    parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
+    target_weight_limit = PORTFOLIO_RISK_LIMIT
+    configured_target = parameters.get("target_weight") if isinstance(parameters, dict) else None
+    if configured_target is not None and not isinstance(configured_target, (dict, list)):
+        configured_limit = _dashboard_risk_decimal(configured_target)
+        if configured_limit is None or configured_limit <= 0 or configured_limit > 1:
+            return False
+        target_weight_limit = configured_limit
     portfolio_limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
     nav = (
         portfolio_limit / PORTFOLIO_RISK_LIMIT
@@ -1831,7 +1841,7 @@ def _valid_v2_risk_items(
             or normal_cost <= 0
             or target_weight is None
             or target_weight <= 0
-            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_weight > target_weight_limit
             or strategy_version in {
                 "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
             }
@@ -1892,7 +1902,7 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             and not zero_kelly_skip
-            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_weight > target_weight_limit
             or target_amount_raw is not None
             and target_amount is None
             or not isinstance(item.get("reason"), str)
@@ -2941,11 +2951,19 @@ def _trend_action_executions(
         / "actions"
         / execution_date
     )
+    revision_key = (-1, -1)
     try:
-        revision = root.stat()
-        revision_key = (revision.st_mtime_ns, revision.st_ctime_ns)
+        candidates = (root, *root.iterdir())
     except OSError:
-        revision_key = (-1, -1)
+        candidates = ()
+    for candidate in candidates:
+        try:
+            revision = candidate.stat()
+        except OSError:
+            continue
+        revision_key = max(
+            revision_key, (revision.st_mtime_ns, revision.st_ctime_ns)
+        )
     cached = _trend_action_executions_cached(
         str(data_dir.resolve()),
         market,
@@ -3844,6 +3862,9 @@ def _merge_holding(
     decision_plan_errors_by_market: dict[str, str],
 ) -> dict[str, Any]:
     holding: dict[str, Any] = dict(row)
+    holding["instrument_id"] = build_instrument_id(
+        row.get("market", ""), row.get("asset_class", ""), row.get("symbol", "")
+    )
     key = _market_symbol_key(row)
     broker_details = (
         [_broker_detail_row(row) for row in positions_by_holding.get(key, [])]

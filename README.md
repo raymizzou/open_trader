@@ -224,12 +224,17 @@ The Worker command is `account-sync-worker`. During R1 the stable launchd label
 token; they are compatibility identifiers, not HTTP Controller roles.
 
 ```text
-Account Sync Worker → raw Account publication → Account API shadow (127.0.0.1:8768)
+Account Sync Worker → raw Account publication → Account API (127.0.0.1:8768)
+                                                   ↓
+Browser → Frontend Gateway (127.0.0.1:8766) → /api/v1/account/snapshot
 ```
 
-The shadow API is a loopback-only, read-only operator process; browsers still
-use only Frontend Gateway. See the [Account API shadow runtime runbook](docs/operations/account-api-shadow-runtime.md)
-for install, inspection, parity, and rollback.
+The Account API is loopback-only and read-only. In production mode the browser
+uses the Gateway route above; Gateway does not fall back to Legacy when Account
+is unavailable. See the [Account API production cutover runbook](docs/operations/account-api-production-cutover.md)
+for the exact cutover, rollback, fault-injection, and acceptance sequence; the
+[shadow runtime reference](docs/operations/account-api-shadow-runtime.md) remains
+available for R2 parity work.
 
 The Dashboard has no account or quote write path and no manual refresh action.
 It only projects `data/latest/account_sync_state.json`,

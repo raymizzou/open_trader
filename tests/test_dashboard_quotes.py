@@ -193,14 +193,16 @@ def dashboard_config(tmp_path: Path) -> DashboardConfig:
     )
 
 
-def session_snapshot(**prices: str | None) -> DashboardQuoteSnapshot:
+def session_snapshot(
+    *, update_time: str = "2026-07-15 03:03:01.150", **prices: str | None
+) -> DashboardQuoteSnapshot:
     return DashboardQuoteSnapshot(
         futu_symbol="US.MSFT",
         last_price=Decimal(prices["last"]) if prices.get("last") else None,
         pre_price=Decimal(prices["pre"]) if prices.get("pre") else None,
         after_price=Decimal(prices["after"]) if prices.get("after") else None,
         overnight_price=Decimal(prices["overnight"]) if prices.get("overnight") else None,
-        update_time="2026-07-15 03:03:01.150",
+        update_time=update_time,
     )
 
 
@@ -234,6 +236,58 @@ def test_quote_service_selects_active_us_session_price(
     assert quote["price_time"] == "2026-07-15 03:03:01.150"
     assert quote["current_session_quote"] is True
     assert result.fallback_count == 0
+
+
+def test_quote_service_normalizes_active_us_price_time_to_milliseconds(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        update_time="2026-07-15 03:03:01",
+        last="61.23",
+        pre="60.73",
+        after="62.22",
+        overnight="61.50",
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+
+    assert result.quotes["US.MSFT"]["price_time"] == "2026-07-15 03:03:01.000"
+
+
+@pytest.mark.parametrize(
+    ("update_time", "expected_price_time"),
+    [
+        ("2026-07-15", "2026-07-15"),
+        ("not-a-timestamp", "not-a-timestamp"),
+        ("2026-07-15T03:03:01+00:00", "2026-07-15T03:03:01+00:00"),
+    ],
+)
+def test_quote_service_preserves_non_naive_futu_price_time(
+    tmp_path: Path, update_time: str, expected_price_time: str
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    snapshot = session_snapshot(
+        update_time=update_time,
+        last="61.23",
+        pre="60.73",
+        after="62.22",
+        overnight="61.50",
+    )
+    client = FakeQuoteClient(
+        {"US.MSFT": snapshot, "US.AAPL": snapshot},
+        {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
+    )
+
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+
+    assert result.quotes["US.MSFT"]["price_time"] == expected_price_time
 
 
 def test_quote_service_labels_active_session_fallback_without_fake_time(

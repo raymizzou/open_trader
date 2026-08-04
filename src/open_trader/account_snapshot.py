@@ -80,6 +80,22 @@ def _opaque_id(prefix: str, values: list[str]) -> str:
     ).hexdigest()
 
 
+def build_instrument_id(market: str, asset_class: str, symbol: str) -> str:
+    return _opaque_id("ins_", [
+        market.strip().upper(),
+        asset_class.strip().lower(),
+        symbol.strip().upper(),
+    ])
+
+
+def build_position_id(broker: str, account_alias: str, instrument_id: str) -> str:
+    return _opaque_id("pos_", [
+        broker.strip().lower(),
+        account_alias.strip(),
+        instrument_id,
+    ])
+
+
 def _read_bytes(path: Path) -> bytes:
     return path.read_bytes()
 
@@ -468,15 +484,13 @@ def _build_snapshot(
 
 def _position_row(row: Mapping[str, str]) -> dict[str, str]:
     position = _public_position(row)
-    instrument_id = _opaque_id("ins_", [
-        position["market"].strip().upper(),
-        position["asset_class"].strip().lower(),
-        position["symbol"].strip().upper(),
-    ])
+    instrument_id = build_instrument_id(
+        position["market"], position["asset_class"], position["symbol"]
+    )
     position["instrument_id"] = instrument_id
-    position["position_id"] = _opaque_id("pos_", [
-        position["broker"].strip().lower(), position["account_alias"].strip(), instrument_id,
-    ])
+    position["position_id"] = build_position_id(
+        position["broker"], position["account_alias"], instrument_id
+    )
     return position
 
 

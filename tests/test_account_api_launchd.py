@@ -18,7 +18,7 @@ TEMPLATE = ROOT / "ops" / "launchd" / "com.open-trader.account-api.plist.templat
 LABEL = "com.open-trader.account-api"
 
 
-def test_account_api_template_runs_only_fixed_shadow_command() -> None:
+def test_account_api_template_runs_mode_specific_command() -> None:
     payload = plistlib.loads(TEMPLATE.read_bytes())
 
     assert payload["Label"] == LABEL
@@ -27,6 +27,7 @@ def test_account_api_template_runs_only_fixed_shadow_command() -> None:
     assert payload["ProgramArguments"] == [
         "OPEN_TRADER_PYTHON", "-m", "open_trader", "account-api",
         "--data-dir", "OPEN_TRADER_DATA_DIR",
+        "--mode", "OPEN_TRADER_ACCOUNT_API_MODE",
     ]
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] is True
@@ -36,7 +37,7 @@ def test_account_api_template_runs_only_fixed_shadow_command() -> None:
     assert payload["StandardErrorPath"] == "OPEN_TRADER_REPO/logs/account_api/launchd.err.log"
 
 
-def test_account_api_installer_dry_run_renders_repo_and_runtime_paths(tmp_path: Path) -> None:
+def test_account_api_installer_dry_run_defaults_to_shadow(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
@@ -56,11 +57,51 @@ def test_account_api_installer_dry_run_renders_repo_and_runtime_paths(tmp_path: 
     assert payload["WorkingDirectory"] == str(ROOT)
     assert payload["EnvironmentVariables"]["PYTHONPATH"] == str(ROOT / "src")
     assert str(runtime / "data") in payload["ProgramArguments"]
+    assert payload["ProgramArguments"][-2:] == ["--mode", "shadow"]
     assert "frontend-gateway" not in result.stdout
     assert "account-sync-worker" not in result.stdout
 
 
-def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path: Path) -> None:
+def test_account_api_installer_dry_run_renders_explicit_production(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+
+    result = subprocess.run(
+        [
+            str(INSTALLER), "--dry-run", "--mode", "production",
+            "--repo-root", str(ROOT), "--runtime-root", str(runtime),
+            "--python", sys.executable, "--launch-agents-dir", str(agents),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert plistlib.loads(result.stdout.encode())["ProgramArguments"][-2:] == ["--mode", "production"]
+
+
+def test_account_api_installer_rejects_unknown_mode_before_launchd(tmp_path: Path) -> None:
+    calls = tmp_path / "calls"
+    launchctl = tmp_path / "launchctl"
+    launchctl.write_text("#!/bin/sh\necho called >> \"$FAKE_CALLS\"\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+
+    result = subprocess.run(
+        [str(INSTALLER), "--mode", "invalid", "--launch-agents-dir", str(tmp_path / "LaunchAgents")],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LAUNCHCTL_BIN": str(launchctl), "FAKE_CALLS": str(calls)},
+    )
+
+    assert result.returncode == 2
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize(("health_mode", "expect_success"), [("production", True), ("shadow", False)])
+def test_production_installer_accepts_only_matching_mode_health(
+    tmp_path: Path, health_mode: str, expect_success: bool
+) -> None:
     repo = _copy_repo(tmp_path)
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
@@ -111,7 +152,7 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
             "schema_version": "open_trader.account_api.health.v1",
             "module": "account_api",
             "status": "ok",
-            "mode": "shadow",
+            "mode": health_mode,
             "pid": 4242,
             "api_git_sha": expected_sha,
             "worker_git_sha": expected_sha,
@@ -124,9 +165,8 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
             str(repo / "scripts/install_account_api_launchd.sh"),
             "--repo-root", str(repo), "--runtime-root", str(tmp_path / "runtime"),
             "--python", sys.executable, "--launch-agents-dir", str(agents),
-            "--wait-seconds", "2",
+            "--wait-seconds", "2", "--mode", "production",
         ],
-        check=True,
         capture_output=True,
         text=True,
         env={
@@ -142,6 +182,12 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
         },
     )
 
+    if not expect_success:
+        assert result.returncode == 1
+        assert "Account API did not publish matching production health" in result.stderr
+        return
+
+    assert result.returncode == 0
     domain = f"gui/{os.getuid()}"
     assert result.stderr == ""
     assert f"installed launchd agent: {LABEL}" in result.stdout
@@ -157,7 +203,7 @@ def test_installer_waits_for_bootout_then_requires_exact_shadow_health(tmp_path:
     ]
 
 
-def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
+def test_production_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
     repo = _copy_repo(tmp_path)
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
@@ -184,7 +230,7 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
             str(repo / "scripts/install_account_api_launchd.sh"),
             "--repo-root", str(repo), "--runtime-root", str(tmp_path / "runtime"),
             "--python", sys.executable, "--launch-agents-dir", str(agents),
-            "--wait-seconds", "1",
+            "--wait-seconds", "1", "--mode", "production",
         ],
         capture_output=True,
         text=True,
@@ -192,7 +238,7 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 1
-    assert "Account API did not publish matching shadow health" in result.stderr
+    assert "Account API did not publish matching production health" in result.stderr
     domain = f"gui/{os.getuid()}/{LABEL}"
     assert calls.read_text(encoding="utf-8").splitlines().count(f"bootout {domain}") == 2
     assert "frontend-gateway" not in calls.read_text(encoding="utf-8")
@@ -200,7 +246,7 @@ def test_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("bad_field", ["cwd", "listener"])
-def test_installer_rejects_matching_health_when_process_identity_is_not_exact(
+def test_production_installer_rejects_matching_health_when_process_identity_is_not_exact(
     tmp_path: Path, bad_field: str
 ) -> None:
     repo = _copy_repo(tmp_path)
@@ -248,7 +294,7 @@ def test_installer_rejects_matching_health_when_process_identity_is_not_exact(
             "schema_version": "open_trader.account_api.health.v1",
             "module": "account_api",
             "status": "ok",
-            "mode": "shadow",
+            "mode": "production",
             "pid": 4242,
             "api_git_sha": expected_sha,
             "worker_git_sha": expected_sha,
@@ -261,7 +307,7 @@ def test_installer_rejects_matching_health_when_process_identity_is_not_exact(
             str(repo / "scripts/install_account_api_launchd.sh"),
             "--repo-root", str(repo), "--runtime-root", str(tmp_path / "runtime"),
             "--python", sys.executable, "--launch-agents-dir", str(agents),
-            "--wait-seconds", "1",
+            "--wait-seconds", "1", "--mode", "production",
         ],
         capture_output=True,
         text=True,
@@ -279,7 +325,7 @@ def test_installer_rejects_matching_health_when_process_identity_is_not_exact(
     )
 
     assert result.returncode == 1
-    assert "Account API did not publish matching shadow health" in result.stderr
+    assert "Account API did not publish matching production health" in result.stderr
     recorded = calls.read_text(encoding="utf-8")
     assert "-a -p 4242 -d cwd -Fn" in recorded
     if bad_field == "listener":

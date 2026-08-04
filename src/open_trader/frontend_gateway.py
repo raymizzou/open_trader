@@ -41,6 +41,8 @@ class FrontendGatewayConfig:
     static_dir: Path
     upstream_host: str = "127.0.0.1"
     upstream_port: int = 8767
+    account_upstream_host: str = "127.0.0.1"
+    account_upstream_port: int = 8768
     public_origin: str = "http://127.0.0.1:8766"
     upstream_timeout_seconds: float = 30.0
     max_request_body_bytes: int = 20 * 1024 * 1024
@@ -54,7 +56,12 @@ def create_frontend_gateway(
 ) -> ThreadingHTTPServer:
     _require_loopback(host, "host")
     _require_loopback(config.upstream_host, "upstream_host")
-    if not 0 <= port <= 65535 or not 1 <= config.upstream_port <= 65535:
+    _require_loopback(config.account_upstream_host, "account_upstream_host")
+    if not (
+        0 <= port <= 65535
+        and 1 <= config.upstream_port <= 65535
+        and 1 <= config.account_upstream_port <= 65535
+    ):
         raise ValueError("ports must be between 1 and 65535")
     if config.upstream_timeout_seconds <= 0:
         raise ValueError("upstream timeout must be positive")
@@ -64,6 +71,10 @@ def create_frontend_gateway(
     public_origin = _normalized_origin(config.public_origin)
     upstream_authority = _host_port(config.upstream_host, config.upstream_port)
     upstream_origin = f"http://{upstream_authority}"
+    account_upstream_authority = _host_port(
+        config.account_upstream_host, config.account_upstream_port
+    )
+    account_upstream_origin = f"http://{account_upstream_authority}"
     runtime = _runtime_metadata()
 
     class FrontendGatewayHandler(BaseHTTPRequestHandler):
@@ -74,12 +85,15 @@ def create_frontend_gateway(
                 self._send_file(config.static_dir / filename, content_type)
                 return
             if path == "/healthz":
+                legacy_upstream_status = self._legacy_upstream_status()
                 self._send_json(
                     {
                         "schema_version": "open_trader.frontend_gateway.health.v1",
                         "module": "frontend_gateway",
                         **runtime,
-                        "upstream_status": self._upstream_status(),
+                        "upstream_status": legacy_upstream_status,
+                        "legacy_upstream_status": legacy_upstream_status,
+                        "account_upstream_status": self._account_upstream_status(),
                     }
                 )
                 return
@@ -95,6 +109,33 @@ def create_frontend_gateway(
             self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
 
         def _proxy(self) -> None:
+            account_route = _is_account_snapshot_path(urlsplit(self.path).path)
+            (
+                target_host,
+                target_port,
+                target_authority,
+                target_origin,
+                unavailable_code,
+                unavailable_message,
+            ) = (
+                (
+                    config.account_upstream_host,
+                    config.account_upstream_port,
+                    account_upstream_authority,
+                    account_upstream_origin,
+                    "account_module_unavailable",
+                    "Account module is unavailable",
+                )
+                if account_route
+                else (
+                    config.upstream_host,
+                    config.upstream_port,
+                    upstream_authority,
+                    upstream_origin,
+                    "legacy_dashboard_unavailable",
+                    "Legacy Dashboard is unavailable",
+                )
+            )
             origin = self.headers.get("Origin", "")
             if self.command == "POST" and origin and origin != public_origin:
                 self._send_error(
@@ -114,10 +155,16 @@ def create_frontend_gateway(
                 self._send_error(status, "invalid_request_body", str(error))
                 return
 
-            request_headers = self._upstream_headers(body, origin)
+            request_headers = self._upstream_headers(
+                body,
+                origin,
+                authority=target_authority,
+                target_origin=target_origin,
+                account_route=account_route,
+            )
             connection = http.client.HTTPConnection(
-                config.upstream_host,
-                config.upstream_port,
+                target_host,
+                target_port,
                 timeout=config.upstream_timeout_seconds,
             )
             try:
@@ -135,8 +182,8 @@ def create_frontend_gateway(
             except (OSError, http.client.HTTPException, TimeoutError):
                 self._send_error(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    "legacy_dashboard_unavailable",
-                    "Legacy Dashboard is unavailable",
+                    unavailable_code,
+                    unavailable_message,
                 )
                 return
             finally:
@@ -170,27 +217,38 @@ def create_frontend_gateway(
                 raise ValueError("request body is incomplete")
             return body
 
-        def _upstream_headers(self, body: bytes, origin: str) -> dict[str, str]:
+        def _upstream_headers(
+            self,
+            body: bytes,
+            origin: str,
+            *,
+            authority: str,
+            target_origin: str,
+            account_route: bool,
+        ) -> dict[str, str]:
             excluded = _hop_by_hop_names(self.headers.items()) | {
                 "content-length",
                 "host",
+                "x-open-trader-account-route",
             }
             headers = {
                 name: value
                 for name, value in self.headers.items()
                 if name.lower() not in excluded
             }
-            headers["Host"] = upstream_authority
+            headers["Host"] = authority
             if origin == public_origin:
-                headers["Origin"] = upstream_origin
+                headers["Origin"] = target_origin
             referer = self.headers.get("Referer", "")
             if referer and _url_has_origin(referer, public_origin):
-                headers["Referer"] = upstream_origin + referer[len(public_origin) :]
+                headers["Referer"] = target_origin + referer[len(public_origin) :]
             if self.command == "POST":
                 headers["Content-Length"] = str(len(body))
+            if account_route:
+                headers["X-Open-Trader-Account-Route"] = "production"
             return headers
 
-        def _upstream_status(self) -> str:
+        def _legacy_upstream_status(self) -> str:
             connection = http.client.HTTPConnection(
                 config.upstream_host,
                 config.upstream_port,
@@ -201,6 +259,30 @@ def create_frontend_gateway(
                 response = connection.getresponse()
                 payload = json.loads(response.read().decode("utf-8"))
                 if response.status == HTTPStatus.OK and payload.get("module") == "legacy_dashboard":
+                    return "ok"
+            except (OSError, ValueError, http.client.HTTPException, TimeoutError):
+                pass
+            finally:
+                connection.close()
+            return "unavailable"
+
+        def _account_upstream_status(self) -> str:
+            connection = http.client.HTTPConnection(
+                config.account_upstream_host,
+                config.account_upstream_port,
+                timeout=config.upstream_timeout_seconds,
+            )
+            try:
+                connection.request(
+                    "GET", "/healthz", headers={"Host": account_upstream_authority}
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                if (
+                    response.status == HTTPStatus.OK
+                    and payload.get("module") == "account_api"
+                    and payload.get("mode") == "production"
+                ):
                     return "ok"
             except (OSError, ValueError, http.client.HTTPException, TimeoutError):
                 pass
@@ -270,6 +352,9 @@ def serve_frontend_gateway(
         "host": host,
         "port": server.server_address[1],
         "upstream": _host_port(config.upstream_host, config.upstream_port),
+        "account_upstream": _host_port(
+            config.account_upstream_host, config.account_upstream_port
+        ),
     }
     print(f"frontend_gateway_runtime: {json.dumps(runtime)}", flush=True)
     try:
@@ -284,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--upstream-host", default="127.0.0.1")
     parser.add_argument("--upstream-port", type=int, default=8767)
+    parser.add_argument("--account-upstream-host", default="127.0.0.1")
+    parser.add_argument("--account-upstream-port", type=int, default=8768)
     parser.add_argument("--public-origin", default="http://127.0.0.1:8766")
     parser.add_argument("--upstream-timeout", type=float, default=30.0)
     parser.add_argument(
@@ -297,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
             static_dir=args.static_dir,
             upstream_host=args.upstream_host,
             upstream_port=args.upstream_port,
+            account_upstream_host=args.account_upstream_host,
+            account_upstream_port=args.account_upstream_port,
             public_origin=args.public_origin,
             upstream_timeout_seconds=args.upstream_timeout,
         ),
@@ -308,6 +397,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def _is_api_path(path: str) -> bool:
     return path == "/api" or path.startswith("/api/")
+
+
+def _is_account_snapshot_path(path: str) -> bool:
+    return path == "/api/v1/account/snapshot"
 
 
 def _hop_by_hop_names(headers: object) -> set[str]:

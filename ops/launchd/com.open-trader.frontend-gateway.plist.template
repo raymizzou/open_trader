@@ -33,6 +33,10 @@
     <string>127.0.0.1</string>
     <string>--upstream-port</string>
     <string>8767</string>
+    <string>--account-upstream-host</string>
+    <string>127.0.0.1</string>
+    <string>--account-upstream-port</string>
+    <string>8768</string>
     <string>--public-origin</string>
     <string>http://127.0.0.1:8766</string>
     <string>--static-dir</string>

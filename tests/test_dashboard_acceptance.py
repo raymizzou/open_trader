@@ -35,6 +35,7 @@ from open_trader.dashboard_acceptance import (
     validate_quotes_payload,
 )
 from open_trader.strategy_drawdown import (
+    ALLOCATION_PROJECTION_VERSIONS,
     automatic_bootstrap_strategy_drawdown,
     strategy_parameter_hash,
 )
@@ -45,9 +46,8 @@ MISSING_FRESH = object()
 
 
 def test_dashboard_acceptance_allows_current_market_versions() -> None:
-    assert "v11" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["CN"]
-    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
-    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
+    for market, version in ALLOCATION_PROJECTION_VERSIONS.items():
+        assert version in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS[market]
 
 
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
@@ -74,9 +74,9 @@ def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -
 
 def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
-    registry = "python -m open_trader.prediction_arbitrage_acceptance"
+    registry = "open_trader.prediction_arbitrage_acceptance"
     assert registry in makefile
-    assert makefile.index(registry) < makefile.index("python -m open_trader.dashboard_acceptance")
+    assert makefile.index(registry) < makefile.index("open_trader.dashboard_acceptance")
     assert '--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json"' in makefile
 
 
@@ -157,7 +157,8 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
         'LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log'
         in makefile
     )
-    assert "test:\n\t.venv/bin/python -m pytest -q" in makefile
+    assert 'PYTHON_BIN ?=' in makefile
+    assert '"$(PYTHON_BIN)" -m pytest -q' in makefile
     assert "acceptance: test" not in makefile
     assert "EXPECTED_CN" not in makefile
     assert '--url "$(DASHBOARD_URL)"' in makefile
@@ -349,6 +350,7 @@ def _run_acceptance_main_with_reports(
     started_at = datetime.fromisoformat("2026-08-01T12:00:00+08:00")
     gateway_log = tmp_path / "gateway.log"
     legacy_log = tmp_path / "legacy.log"
+    account_log = tmp_path / "account.log"
     gateway_log.write_text(
         "frontend_gateway_runtime: "
         + json.dumps({
@@ -376,6 +378,18 @@ def _run_acceptance_main_with_reports(
             + "\n",
             encoding="utf-8",
         )
+    account_log.write_text(
+        "account_api_runtime: "
+        + json.dumps({
+            "pid": 789,
+            "git_sha": "accepted-sha",
+            "cwd": str(worktree.resolve()),
+            "source_state": "clean",
+            "started_at": "2026-08-01T12:00:01+08:00",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
     if log_read_error is not None:
         original_read_text = Path.read_text
 
@@ -396,6 +410,7 @@ def _run_acceptance_main_with_reports(
     listeners = {
         "http://127.0.0.1:8766": (123, worktree.resolve()),
         "http://127.0.0.1:8767": (legacy_pid, worktree.resolve()),
+        "http://127.0.0.1:8768": (789, worktree.resolve()),
     }
     health = {
         "http://127.0.0.1:8766": {
@@ -406,6 +421,7 @@ def _run_acceptance_main_with_reports(
                 pid=123,
             ),
             "upstream_status": "ok",
+            "account_upstream_status": "ok",
         },
         "http://127.0.0.1:8767": _runtime_health(
             worktree.resolve(),
@@ -413,6 +429,17 @@ def _run_acceptance_main_with_reports(
             schema="open_trader.legacy_dashboard.health.v1",
             pid=legacy_pid,
         ),
+        "http://127.0.0.1:8768": {
+            "schema_version": "open_trader.account_api.health.v1",
+            "module": "account_api",
+            "status": "ok",
+            "mode": "production",
+            "pid": 789,
+            "started_at": "2026-08-01T12:00:01+08:00",
+            "api_git_sha": "accepted-sha",
+            "worker_git_sha": "accepted-sha",
+            "release_match": True,
+        },
     }
     monkeypatch.setattr(dashboard_acceptance, "_listener", lambda url: listeners[url])
     monkeypatch.setattr(
@@ -447,6 +474,33 @@ def _run_acceptance_main_with_reports(
 
     monkeypatch.setattr(dashboard_acceptance, "_fetch_payload", fetch_payload)
     monkeypatch.setattr(dashboard_acceptance, "_fetch_quotes_payload", fetch_quotes)
+    account_snapshot = {
+        "schema_version": 1,
+        "snapshot_generation": "sha256:account",
+        "account_generation": "account-generation",
+        "generated_at": "2026-08-01T12:00:01+08:00",
+        "quote_as_of": "2026-08-01T12:00:01+08:00",
+        "status": "healthy",
+        "stale": False,
+        "sources": {},
+        "release": {"api_git_sha": "accepted-sha", "worker_git_sha": "accepted-sha"},
+        "summary": {},
+        "broker_summaries": [],
+        "positions": [],
+        "cash_balances": [],
+        "errors": [],
+    }
+    snapshots = iter(((200, account_snapshot, '"account"'), (304, None, '"account"')))
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_fetch_account_snapshot",
+        lambda url, **_kwargs: (record_public(url), next(snapshots))[1],
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "check_account_api_parity",
+        lambda *_args, **_kwargs: type("Parity", (), {"status": "PASS", "reason": "ok"})(),
+    )
     def health_payload(url: str, path: str) -> dict[str, object]:
         assert path == "/healthz"
         return health[url]
@@ -509,6 +563,7 @@ def _run_acceptance_main_with_reports(
         "--expected-root", str(worktree),
         "--log", str(gateway_log),
         "--legacy-log", str(legacy_log),
+        "--account-log", str(account_log),
     ])
     result = json.loads(capsys.readouterr().out)
     return status, result, browser_reports
@@ -624,8 +679,12 @@ def test_make_acceptance_wires_gateway_and_legacy_runtime_logs() -> None:
     assert "logs/frontend_gateway/launchd.out.log" in makefile
     assert "LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767" in makefile
     assert "logs/legacy_dashboard/launchd.out.log" in makefile
+    assert 'ACCOUNT_API_URL ?= http://127.0.0.1:8768' in makefile
+    assert 'ACCOUNT_API_LOG ?= $(WORKTREE_ROOT)/logs/account_api/launchd.out.log' in makefile
     assert '--legacy-url "$(LEGACY_DASHBOARD_URL)"' in makefile
     assert '--legacy-log "$(LEGACY_DASHBOARD_LOG)"' in makefile
+    assert '--account-url "$(ACCOUNT_API_URL)"' in makefile
+    assert '--account-log "$(ACCOUNT_API_LOG)"' in makefile
 
 
 def test_acceptance_main_rejects_same_gateway_and_legacy_pid(
@@ -858,9 +917,9 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
             }],
             "top10_candidates": [],
         },
-        "signal_snapshots": {
-            "holdings": {"EOG": {"phase": "立夏", "global_strength": "92.0"}},
-        },
+        "signal_snapshots": {"holdings": {"EOG": {
+            "phase": "立夏", "strength": "97.2", "global_strength": "95.6",
+        }}},
         "excluded": {},
         "industry_concentration": [],
         "data_sources": [],
@@ -876,8 +935,7 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
         "buy_actions": [],
         "hold_actions": [{
             "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
-            "phase": "立夏",
-            "global_strength": "92.0",
+            "phase": "立夏", "strength": "97.2", "global_strength": "95.6",
             "trend_report_state": "included",
             "option_anomaly": {
                 "available": False,
@@ -886,6 +944,8 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
             },
         }],
         "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 0, "buy": 0, "hold": 1, "review": 0},
         "audit": {
             "artifact": "2026-07-15.json",
@@ -971,6 +1031,8 @@ def test_acceptance_suppresses_partial_when_same_symbol_has_full_exit(
         "buy_actions": [],
         "hold_actions": [],
         "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 1, "buy": 0, "hold": 0, "review": 0},
         "audit": {
             "artifact": "2026-07-15.json",
@@ -1031,6 +1093,8 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
         "generated_at": "2026-07-15T20:00:00+08:00",
         "sell_actions": [], "buy_actions": [], "hold_actions": [],
         "review_actions": [review],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 0, "buy": 0, "hold": 0, "review": 1},
         "audit": {
             "artifact": artifact.name, "candidates": complete, "excluded": {},
@@ -1133,6 +1197,8 @@ def test_acceptance_accepts_actionable_buy_for_non_realtime_account(
         ],
         "hold_actions": [],
         "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
         "counts": {"sell": 0, "buy": 1, "hold": 0, "review": 0},
         "audit": {
             "artifact": artifact.name,
@@ -1463,10 +1529,17 @@ def test_acceptance_source_panel_uses_current_page_dashboard_payload() -> None:
 
     class DashboardPage:
         def evaluate(self, expression: str) -> object:
-            assert expression == "() => state.dashboard"
+            assert "state.accountSnapshot" in expression
             return current
 
     assert dashboard_acceptance._page_dashboard_payload(DashboardPage()) is current
+
+
+def test_account_api_healthy_source_uses_normal_source_copy() -> None:
+    assert dashboard_acceptance._expected_source_copy(
+        "tiger",
+        {"status": "healthy", "data_as_of": "2026-08-04T09:02:00+08:00"},
+    ) == "同步正常 · 09:02"
 
 
 def trend_controllers() -> dict[str, dict[str, object]]:
@@ -1584,7 +1657,7 @@ def integrated_v4_payload(
         frozen_allocation = freeze_allocation_reference(allocation_reference)
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            {"CN": "v12", "HK": "v10", "US": "v10"}[market]
+            ALLOCATION_PROJECTION_VERSIONS[market]
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )
@@ -1671,8 +1744,8 @@ def integrated_v4_payload(
                 "risk_skips": [],
                 **({
                     "simulate_rotation_pairs": [],
-                    "real_rotation_pairs": [],
                     "simulate_rotation_comparisons": [],
+                    "real_rotation_pairs": [],
                     "real_rotation_comparisons": [],
                 } if current_live_versions else {}),
             },
@@ -1725,6 +1798,8 @@ def integrated_v4_payload(
             "sell_actions": [],
             "hold_actions": [],
             "review_actions": [],
+            "simulate_rotation_comparisons": [],
+            "real_rotation_comparisons": [],
             "risk_skips": [],
             "risk_summary": {
                 **risk_summary,
@@ -3523,8 +3598,8 @@ class TabbedAccountLocator:
             '[data-trend-holding-panel="simulate"] .cn-trend-table thead th',
         }:
             return [
-                "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业",
-                "当前判断", "活动保护线", "持仓提示",
+                "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度",
+                "全局强度", "行业", "当前判断", "活动保护线", "持仓提示",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-report-header dd":
             report = self.page.reports[broker]
@@ -3746,7 +3821,7 @@ class TabbedAccountPage:
     def evaluate(
         self, expression: str, argument: object | None = None,
     ) -> bool | list[int] | list[dict[str, object]] | dict[str, object] | Mapping[str, object] | int | None:
-        if expression == "() => state.dashboard?.broker_positions ?? []":
+        if expression == "() => state.accountSnapshot?.positions ?? []":
             return self.broker_positions
         if expression == "broker => state.dashboard?.trend_controllers?.[broker] ?? null":
             return self.controllers.get(str(argument))
@@ -3915,7 +3990,7 @@ class TabbedAccountPage:
         return self.trend_broker != self.document_overflow_broker
 
     def wait_for_timeout(self, milliseconds: int) -> None:
-        assert milliseconds == 500
+        assert milliseconds in {500, dashboard_acceptance.ACCOUNT_POLL_PROOF_WAIT_MS}
 
     def wait_for_function(
         self, expression: str, *, arg: object, timeout: int,
@@ -4936,9 +5011,43 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             super().__init__(payload)
             self.name = name
             self.viewport_size = viewport
+            self._requests: list[object] = []
 
-        def on(self, *_args: object) -> None:
-            pass
+        def on(self, event: str, callback: object) -> None:
+            if event == "request":
+                class Request:
+                    def __init__(self, url: str, etag: str | None = None) -> None:
+                        self.url = url
+                        self.etag = etag
+
+                    def header_value(self, name: str) -> str | None:
+                        assert name == "if-none-match"
+                        return self.etag
+
+                for request in (
+                    Request("http://dashboard/api/dashboard"),
+                    Request("http://dashboard/api/v1/account/snapshot"),
+                    Request("http://dashboard/api/v1/account/snapshot", '"etag"'),
+                    Request("http://dashboard/api/v1/account/snapshot", '"etag"'),
+                ):
+                    self._requests.append(request)
+                    callback(request)  # type: ignore[operator]
+            if event == "response":
+                class Response:
+                    def __init__(self, status: int, request: object) -> None:
+                        self.url = "http://dashboard/api/v1/account/snapshot"
+                        self.status = status
+                        self.request = request
+
+                    def json(self) -> dict[str, object]:
+                        return {"schema_version": 1, "status": "healthy", "stale": False}
+
+                for response in (
+                    Response(200, self._requests[1]),
+                    Response(304, self._requests[2]),
+                    Response(304, self._requests[3]),
+                ):
+                    callback(response)  # type: ignore[operator]
 
         def goto(self, *_args: object, **_kwargs: object) -> None:
             visited.append(self.name)
@@ -4955,11 +5064,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def evaluate(
             self, expression: str, argument: object | None = None
         ) -> object:
-            if expression == "() => state.dashboard?.broker_positions ?? []":
+            if expression == "() => state.accountSnapshot?.positions ?? []":
                 return super().evaluate(expression, argument)
-            if expression == "() => state.dashboard":
+            if "const dashboard = state.dashboard" in expression:
                 return self.payload
             if "clearInterval(state.quoteIntervalId)" in expression:
+                assert "clearInterval(state.accountIntervalId)" in expression
                 polling_freezes.append(self.name)
                 return True
             if (
@@ -5238,32 +5348,36 @@ def test_check_controller_owned_rows_uses_current_page_projection() -> None:
     stale_position["last_price"] = "53.38"
     page_position = dict(stale_position)
     page_position["last_price"] = "53.40"
-    dom_values = dict(page_position)
+    other_position = _controller_position("02840")
+    dom_values = [dict(other_position), dict(page_position)]
 
     class Page:
         def evaluate(self, expression: str) -> list[dict[str, str]]:
             assert expression == (
-                "() => state.dashboard?.broker_positions ?? []"
+                "() => state.accountSnapshot?.positions ?? []"
             )
-            return [page_position]
+            return [page_position, other_position]
 
     class Row:
+        def __init__(self, index: int) -> None:
+            self.values = dom_values[index]
+
         def get_attribute(self, name: str) -> str:
             return {
                 "data-broker": "tiger",
-                "data-symbol": "DRAM",
+                "data-symbol": self.values["symbol"],
                 **{
-                    attribute: dom_values[field]
+                    attribute: self.values[field]
                     for field, attribute in dashboard_acceptance.CONTROLLER_DOM_FIELDS.items()
                 },
             }[name]
 
     class Rows:
         def count(self) -> int:
-            return 1
+            return 2
 
-        def nth(self, _index: int) -> Row:
-            return Row()
+        def nth(self, index: int) -> Row:
+            return Row(index)
 
     class Section:
         def locator(self, selector: str) -> Rows:
@@ -5273,7 +5387,7 @@ def test_check_controller_owned_rows_uses_current_page_projection() -> None:
     dashboard_acceptance._check_controller_owned_rows(
         Page(), Section(), "tiger"
     )
-    dom_values["last_price"] = stale_position["last_price"]
+    dom_values[1]["last_price"] = stale_position["last_price"]
     with pytest.raises(AssertionError, match="last_price"):
         dashboard_acceptance._check_controller_owned_rows(
             Page(), Section(), "tiger"
@@ -6649,6 +6763,205 @@ def test_acceptance_accepts_matching_gateway_health(tmp_path: Path) -> None:
         ),
         expected_upstream_status="ok",
     ) == []
+
+
+def test_account_api_acceptance_requires_production_health_with_matching_release(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "schema_version": "open_trader.account_api.health.v1",
+        "module": "account_api",
+        "status": "ok",
+        "mode": "production",
+        "pid": 123,
+        "started_at": "2026-08-01T12:00:01+08:00",
+        "api_git_sha": "accepted-sha",
+        "worker_git_sha": "accepted-sha",
+        "release_match": True,
+    }
+
+    assert dashboard_acceptance._account_runtime_health_errors(
+        payload,
+        pid=123,
+        expected_sha="accepted-sha",
+        process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    ) == []
+
+    payload["worker_git_sha"] = "old-sha"
+    assert any(
+        "Worker Git SHA" in error
+        for error in dashboard_acceptance._account_runtime_health_errors(
+            payload,
+            pid=123,
+            expected_sha="accepted-sha",
+            process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+        )
+    )
+
+    payload["mode"] = "shadow"
+    payload["worker_git_sha"] = "accepted-sha"
+    payload["release_match"] = True
+    errors = dashboard_acceptance._account_runtime_health_errors(
+        payload,
+        pid=123,
+        expected_sha="accepted-sha",
+        process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    )
+    assert any("mode 不匹配" in error for error in errors)
+
+    payload["mode"] = "production"
+    payload["release_match"] = False
+    errors = dashboard_acceptance._account_runtime_health_errors(
+        payload,
+        pid=123,
+        expected_sha="accepted-sha",
+        process_started_at=datetime.fromisoformat("2026-08-01T12:00:00+08:00"),
+    )
+    assert any("release_match 不匹配" in error for error in errors)
+
+
+def test_account_api_browser_requests_prove_conditional_polling_through_gateway() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    assert dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"account-v1"'),
+            (second_poll_request, account, '"account-v1"'),
+        ],
+        [
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (first_poll_request, account, 304, '"account-v1"', None),
+            (second_poll_request, account, 304, '"account-v1"', None),
+        ],
+        gateway,
+    ) == []
+
+
+def test_account_api_browser_requests_reject_legacy_quotes_after_cutover() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    quotes_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (quotes_request, gateway + "/api/quotes", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"account-v1"'),
+            (second_poll_request, account, '"account-v1"'),
+        ],
+        [
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (first_poll_request, account, 304, '"account-v1"', None),
+            (second_poll_request, account, 304, '"account-v1"', None),
+        ],
+        gateway,
+    )
+
+    assert errors == ["浏览器仍请求 Legacy /api/quotes"]
+
+
+def test_account_api_browser_pairs_conditional_request_with_its_response() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"first"'),
+            (second_poll_request, account, '"second"'),
+        ],
+        [
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (second_poll_request, account, 304, '"second"', None),
+            (object(), account, 200, '"third"', {"schema_version": 1, "status": "healthy", "stale": False}),
+        ],
+        gateway,
+        expected_sha=None,
+    )
+
+    assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+
+
+def test_account_api_browser_does_not_reuse_earlier_response_for_same_etag_request() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"same"'),
+            (second_poll_request, account, '"same"'),
+        ],
+        [
+            (initial_request, account, 200, None, {"schema_version": 1, "status": "healthy", "stale": False}),
+            (first_poll_request, account, 304, '"same"', None),
+            (first_poll_request, account, 304, '"same"', None),
+        ],
+        gateway,
+    )
+
+    assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+
+
+def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
+
+    assert "PYTHON_BIN ?=" in makefile
+    assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' in makefile
+
+
+def test_account_cutover_runbook_verifies_shared_interpreter_and_final_gate() -> None:
+    runbook = (
+        Path(__file__).parents[1]
+        / "docs/operations/account-api-production-cutover.md"
+    ).read_text(encoding="utf-8")
+
+    assert "command -v python3" in runbook
+    assert 'test -x "$OPEN_TRADER_PYTHON"' in runbook
+    assert "make acceptance" in runbook
+    assert ".venv/bin/python" not in runbook
+
+
+def test_account_api_gateway_request_injects_production_route_marker(tmp_path: Path) -> None:
+    from test_frontend_gateway import _gateway, _running, _Upstream, _write_static_files
+
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        request = dashboard_acceptance.Request(
+            base + "/api/v1/account/snapshot",
+            headers={"X-Open-Trader-Account-Route": "caller-value"},
+        )
+        with dashboard_acceptance.urlopen(request, timeout=5) as response:
+            response.read()
+
+    assert account.requests[0]["headers"]["X-Open-Trader-Account-Route"] == "production"
+    assert legacy.requests == []
 
 
 @pytest.mark.parametrize(

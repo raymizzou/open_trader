@@ -26,6 +26,7 @@ from open_trader.account_sync_state import (
     build_dashboard_projection,
     empty_account_sync_state,
 )
+from open_trader.account_snapshot import build_instrument_id
 from open_trader.decision_facts import (
     KLINE_FIELDS,
     MISSING_VALUE,
@@ -1733,6 +1734,32 @@ def _valid_v3_dashboard_trend_payload() -> dict[str, object]:
         }
     )
     return payload
+
+
+def test_dashboard_v10_risk_items_accept_ranked_six_percent_target() -> None:
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(snapshot, dict) and isinstance(judgments, dict)
+    snapshot["strategy_version"] = "v10"
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["target_weight"] = "0.06"
+    buy = judgments["formal_actions"][0]
+    skip = judgments["risk_skips"][0]
+    assert isinstance(buy, dict) and isinstance(skip, dict)
+    buy.update({"target_weight": "0.06", "target_amount": "6000"})
+    skip.update({"target_weight": "0.06", "target_amount": "6000"})
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary["kelly_phase"] = "cold_start"
+
+    assert dashboard_module._valid_v2_risk_items(
+        payload,
+        judgments,
+        summary,
+        strategy_version="v10",
+    )
 
 
 def test_dashboard_enforces_issue_4_and_kelly_contract_for_v3(tmp_path: Path) -> None:
@@ -4683,7 +4710,7 @@ def test_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
     assert len(state["trend_reports"]["tiger"]["actual_overlay"]["outside_positions"]) == 14
 
 
-def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
+def test_load_dashboard_state_holding_has_only_transitional_instrument_id(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -4696,11 +4723,25 @@ def test_load_dashboard_state_uses_portfolio_when_monthly_details_are_absent(
     assert state["summary"]["holding_count"] == 1
     holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
     assert "VIXY" in holdings_by_symbol
-    assert holdings_by_symbol["VIXY"]["broker_detail_count"] == 0
-    assert holdings_by_symbol["VIXY"]["broker_details"] == []
-    assert holdings_by_symbol["VIXY"]["trade_action"] == {"available": False, "error": ""}
-    assert "backtest" not in holdings_by_symbol["VIXY"]
-    assert "backtest_readiness" not in holdings_by_symbol["VIXY"]
+    for holding in state["holdings"]:
+        assert holding["instrument_id"] == build_instrument_id(
+            holding["market"], holding["asset_class"], holding["symbol"]
+        )
+        assert not {
+            "position_id",
+            "account_status",
+            "quantity",
+            "price",
+            "valuation",
+            "weight",
+            "account_release",
+        } & holding.keys()
+    holding = holdings_by_symbol["VIXY"]
+    assert holding["broker_detail_count"] == 0
+    assert holding["broker_details"] == []
+    assert holding["trade_action"] == {"available": False, "error": ""}
+    assert "backtest" not in holding
+    assert "backtest_readiness" not in holding
 
 
 def obsolete_load_dashboard_state_attaches_latest_backtest_result(

@@ -6,6 +6,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -181,6 +182,183 @@ def test_installer_waits_for_bootout_before_bootstrap_and_matching_status(
     assert bootstrap_count.read_text(encoding="utf-8").strip() == "1"
     assert f"installed launchd agent: {LABEL}" in result.stdout
     assert result.stderr == ""
+
+
+def test_installer_waits_for_writer_lock_release_before_bootstrap(tmp_path: Path) -> None:
+    repo = _copy_repo(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    status_path = runtime / "data/account_sync/controller_status.json"
+    lock_path = runtime / "data/account_sync/controller.lock"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    launchctl = bin_dir / "launchctl"
+    bootstrap_count = tmp_path / "bootstrap-count"
+    bootout = tmp_path / "bootout"
+    lock_acquired = tmp_path / "lock-acquired"
+    release_lock = tmp_path / "release-lock"
+    loaded = tmp_path / "loaded"
+    expected_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    locker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, sys, time\n"
+            "from pathlib import Path\n"
+            "lock, bootout, acquired, release = map(Path, sys.argv[1:])\n"
+            "while not bootout.exists(): time.sleep(.01)\n"
+            "lock.parent.mkdir(parents=True, exist_ok=True)\n"
+            "with lock.open('a+') as handle:\n"
+            "    fcntl.flock(handle, fcntl.LOCK_EX)\n"
+            "    acquired.touch()\n"
+            "    while not release.exists(): time.sleep(.01)\n"
+            "    fcntl.flock(handle, fcntl.LOCK_UN)\n",
+            str(lock_path),
+            str(bootout),
+            str(lock_acquired),
+            str(release_lock),
+        ]
+    )
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = bootout ]; then\n"
+        "  : > \"$FAKE_BOOTOUT\"\n"
+        "  while [ ! -f \"$FAKE_LOCK_ACQUIRED\" ]; do sleep 0.01; done\n"
+        "  rm -f \"$FAKE_LOADED\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = print ]; then\n"
+        "  if [ -f \"$FAKE_LOADED\" ]; then echo \"pid = $FAKE_LAUNCHD_PID\"; exit 0; fi\n"
+        "  echo 'Could not find service' >&2\n"
+        "  exit 113\n"
+        "fi\n"
+        "if [ \"$1\" = bootstrap ]; then\n"
+        "  : > \"$FAKE_BOOTSTRAP_COUNT\"\n"
+        "  : > \"$FAKE_LOADED\"\n"
+        "  $FAKE_PYTHON - \"$FAKE_STATUS_PATH\" \"$FAKE_LAUNCHD_PID\" \"$FAKE_REPO\" \"$FAKE_SHA\" <<'PY'\n"
+        "from datetime import datetime, timezone\n"
+        "import json\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "path, pid, repo, sha = sys.argv[1:]\n"
+        "Path(path).parent.mkdir(parents=True, exist_ok=True)\n"
+        "now = datetime.now(timezone.utc).isoformat()\n"
+        "Path(path).write_text(json.dumps({'schema_version': 'open_trader.account_sync.controller.v1', 'pid': int(pid), 'started_at': now, 'working_directory': repo, 'git_sha': sha, 'heartbeat_at': now, 'phase': 'idle', 'account_loop': {'status': 'ok'}, 'quote_loop': {'status': 'ok'}, 'blocker': None}), encoding='utf-8')\n"
+        "PY\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    installer = subprocess.Popen(
+        [
+            str(repo / "scripts/install_account_sync_launchd.sh"),
+            "--repo-root", str(repo), "--runtime-root", str(runtime),
+            "--python", sys.executable, "--launch-agents-dir", str(agents),
+            "--wait-seconds", "2",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={
+            **os.environ,
+            "LAUNCHCTL_BIN": str(launchctl),
+            "FAKE_BOOTSTRAP_COUNT": str(bootstrap_count),
+            "FAKE_BOOTOUT": str(bootout),
+            "FAKE_LOCK_ACQUIRED": str(lock_acquired),
+            "FAKE_LOADED": str(loaded),
+            "FAKE_STATUS_PATH": str(status_path),
+            "FAKE_LAUNCHD_PID": "4242",
+            "FAKE_PYTHON": sys.executable,
+            "FAKE_REPO": str(repo),
+            "FAKE_SHA": expected_sha,
+        },
+    )
+    try:
+        while not lock_acquired.exists():
+            time.sleep(0.01)
+        time.sleep(0.1)
+        assert not bootstrap_count.exists()
+        release_lock.touch()
+        stdout, stderr = installer.communicate(timeout=5)
+    finally:
+        release_lock.touch()
+        locker.terminate()
+        locker.wait(timeout=5)
+
+    assert installer.returncode == 0
+    assert f"installed launchd agent: {LABEL}" in stdout
+    assert stderr == ""
+    assert bootstrap_count.exists()
+
+
+def test_installer_fails_closed_when_writer_lock_stays_held(tmp_path: Path) -> None:
+    repo = _copy_repo(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    lock_path = runtime / "data/account_sync/controller.lock"
+    launchctl = tmp_path / "launchctl"
+    bootstrap_count = tmp_path / "bootstrap-count"
+    bootout = tmp_path / "bootout"
+    lock_acquired = tmp_path / "lock-acquired"
+    release_lock = tmp_path / "release-lock"
+    locker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, sys, time\n"
+            "from pathlib import Path\n"
+            "lock, bootout, acquired, release = map(Path, sys.argv[1:])\n"
+            "while not bootout.exists(): time.sleep(.01)\n"
+            "lock.parent.mkdir(parents=True, exist_ok=True)\n"
+            "with lock.open('a+') as handle:\n"
+            "    fcntl.flock(handle, fcntl.LOCK_EX)\n"
+            "    acquired.touch()\n"
+            "    while not release.exists(): time.sleep(.01)\n",
+            str(lock_path), str(bootout), str(lock_acquired), str(release_lock),
+        ]
+    )
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = bootout ]; then\n"
+        "  : > \"$FAKE_BOOTOUT\"\n"
+        "  while [ ! -f \"$FAKE_LOCK_ACQUIRED\" ]; do sleep 0.01; done\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = print ]; then echo 'Could not find service' >&2; exit 113; fi\n"
+        "if [ \"$1\" = bootstrap ]; then : > \"$FAKE_BOOTSTRAP_COUNT\"; fi\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    try:
+        result = subprocess.run(
+            [
+                str(repo / "scripts/install_account_sync_launchd.sh"),
+                "--repo-root", str(repo), "--runtime-root", str(runtime),
+                "--python", sys.executable, "--launch-agents-dir", str(agents),
+                "--wait-seconds", "1",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "LAUNCHCTL_BIN": str(launchctl),
+                "FAKE_BOOTSTRAP_COUNT": str(bootstrap_count),
+                "FAKE_BOOTOUT": str(bootout),
+                "FAKE_LOCK_ACQUIRED": str(lock_acquired),
+            },
+        )
+    finally:
+        release_lock.touch()
+        locker.terminate()
+        locker.wait(timeout=5)
+
+    assert result.returncode != 0
+    assert "account sync writer lock is still held" in result.stderr
+    assert not bootstrap_count.exists()
 
 
 def test_installer_rejects_a_preinstall_status_without_kickstart_write(

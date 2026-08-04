@@ -20,7 +20,11 @@ import pytest
 
 import open_trader.account_api as account_api
 import open_trader.account_snapshot as account_snapshot
-from open_trader.account_snapshot import load_account_snapshot
+from open_trader.account_snapshot import (
+    build_instrument_id,
+    build_position_id,
+    load_account_snapshot,
+)
 from open_trader.account_sync_state import (
     LIVE_BROKERS,
     REQUIRED_BROKERS,
@@ -226,6 +230,38 @@ def test_account_api_health_is_live_without_a_matching_worker_release(
         assert snapshot.value.code == HTTPStatus.SERVICE_UNAVAILABLE
 
 
+def test_account_api_health_reports_selected_mode(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    runtime_metadata = {
+        "pid": 321,
+        "started_at": "2026-08-03T12:00:00+08:00",
+        "cwd": "/tmp/open-trader",
+        "api_git_sha": SHA,
+    }
+    for mode in ("shadow", "production"):
+        server = account_api.create_account_api(
+            data_dir,
+            host="127.0.0.1",
+            port=0,
+            runtime_metadata=runtime_metadata,
+            **({} if mode == "shadow" else {"mode": mode}),
+        )
+        with _running(server):
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            assert _get_json(base + "/healthz")["mode"] == mode
+
+
+def test_account_api_rejects_invalid_programmatic_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="mode"):
+        account_api.create_account_api(
+            tmp_path,
+            host="127.0.0.1",
+            port=0,
+            mode="prodution",  # type: ignore[arg-type]
+        )
+
+
 def test_account_api_rejects_non_loopback_listener(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="loopback"):
         account_api.create_account_api(tmp_path, host="0.0.0.0", port=8768)
@@ -305,16 +341,148 @@ print("\\n".join(sorted(sys.modules)))
         assert forbidden not in loaded
 
 
-def test_account_api_cli_uses_only_the_data_dir(
+def test_account_api_cli_uses_data_dir_and_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
-    observed: list[Path] = []
-    monkeypatch.setattr(account_api, "serve_account_api", observed.append)
+    observed: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        account_api,
+        "serve_account_api",
+        lambda served_data_dir, *, mode: observed.append((served_data_dir, mode)),
+    )
 
     assert account_api.main(["--data-dir", str(data_dir)]) == 0
+    assert account_api.main(["--data-dir", str(data_dir), "--mode", "production"]) == 0
+    with pytest.raises(SystemExit, match="2"):
+        account_api.main(["--mode", "invalid"])
 
-    assert observed == [data_dir]
+    assert observed == [(data_dir, "shadow"), (data_dir, "production")]
+
+
+def test_account_api_runtime_metadata_proves_clean_candidate_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        account_api.subprocess,
+        "check_output",
+        lambda command, **_kwargs: SHA if "rev-parse" in command else "",
+    )
+
+    metadata = account_api._runtime_metadata()
+    started_at = metadata.pop("started_at")
+
+    assert datetime.fromisoformat(str(started_at)).tzinfo is not None
+    assert metadata == {
+        "pid": os.getpid(),
+        "cwd": str(tmp_path.resolve()),
+        "api_git_sha": SHA,
+        "git_sha": SHA,
+        "source_state": "clean",
+    }
+
+
+@pytest.mark.parametrize("mode", ["shadow", "production"])
+def test_account_api_allows_direct_snapshot_requests_in_both_modes(
+    tmp_path: Path, mode: str
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode=mode,
+    )
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
+            assert response.status == HTTPStatus.OK
+
+
+def test_account_api_shadow_rejects_production_marker_with_frozen_envelope(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+    )
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/snapshot",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.load(rejected.value) == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "release": {"api_git_sha": SHA, "worker_git_sha": SHA},
+        "errors": [{
+            "code": "account_api_shadow_only",
+            "source": "release",
+            "message": "Account API is running in shadow mode",
+            "retryable": True,
+        }],
+    }
+
+
+def test_account_api_production_accepts_marker_and_preserves_etag(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+    with _running(server):
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        request = urllib.request.Request(
+            base + "/api/v1/account/snapshot",
+            headers={"X-Open-Trader-Account-Route": "production"},
+        )
+        with urllib.request.urlopen(request) as response:
+            assert json.load(response)["schema_version"] == 1
+            etag = response.headers["ETag"]
+        unchanged = urllib.request.Request(
+            base + "/api/v1/account/snapshot",
+            headers={
+                "X-Open-Trader-Account-Route": "production",
+                "If-None-Match": etag,
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as response:
+            urllib.request.urlopen(unchanged)
+
+    assert response.value.code == HTTPStatus.NOT_MODIFIED
+    assert response.value.read() == b""
 
 
 def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
@@ -660,6 +828,42 @@ def test_snapshot_maps_current_publication_to_frozen_v1_contract(tmp_path: Path)
     visible.pop("snapshot_generation")
     assert result.payload["snapshot_generation"] == _contract_sha(visible)
     assert not ({"risk_flag", "actionable", "decision_plan"} & result.payload.keys())
+
+
+def test_public_stable_id_helpers_match_position_rows() -> None:
+    position = account_snapshot._position_row({
+        "broker": "FUTU",
+        "account_alias": "futu_main",
+        "market": "US",
+        "asset_class": "OPTION",
+        "symbol": "VIXY260821C22000",
+        "name": "VIXY option",
+        "currency": "USD",
+        "quantity": "1",
+        "cost_price": "1",
+        "cost_value": "1",
+        "last_price": "1",
+        "price_kind": "live",
+        "price_as_of": "2026-08-03T12:00:04+08:00",
+        "market_value": "1",
+        "market_value_usd": "1",
+        "market_value_hkd": "7.8",
+        "cost_value_hkd": "7.8",
+        "unrealized_pnl": "0",
+        "unrealized_pnl_pct": "0",
+        "account_weight_hkd": "1",
+        "portfolio_weight_hkd": "1",
+        "statement_id": "",
+        "confidence": "high",
+        "notes": "",
+    })
+
+    instrument_id = build_instrument_id("us", "OPTION", " vixy260821c22000 ")
+
+    assert instrument_id == position["instrument_id"]
+    assert build_position_id("FUTU", "futu_main", instrument_id) == position["position_id"]
+    assert instrument_id == build_instrument_id(" US ", " option ", " VIXY260821C22000 ")
+    assert instrument_id != build_instrument_id("us", "STOCK", " vixy260821c22000 ")
 
 
 def test_snapshot_whitelists_public_fields_and_requires_quote_publication_time(

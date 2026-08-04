@@ -2,6 +2,7 @@
 set -euo pipefail
 
 DRY_RUN=0
+MODE="shadow"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
@@ -13,12 +14,13 @@ WAIT_SECONDS="${ACCOUNT_API_LAUNCHD_WAIT_SECONDS:-30}"
 LABEL="com.open-trader.account-api"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--mode shadow|production] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
@@ -29,6 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
+[[ "$MODE" == "shadow" || "$MODE" == "production" ]] || { usage; exit 2; }
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
 RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" 2>/dev/null && pwd || printf '%s' "$RUNTIME_ROOT")"
@@ -48,6 +51,7 @@ render_plist() {
   sed \
     -e "s|OPEN_TRADER_PYTHON|$(sed_escape "$PYTHON_BIN")|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$(sed_escape "$DATA_DIR")|g" \
+    -e "s|OPEN_TRADER_ACCOUNT_API_MODE|$(sed_escape "$MODE")|g" \
     -e "s|OPEN_TRADER_REPO|$(sed_escape "$REPO_ROOT")|g" \
     "$TEMPLATE"
 }
@@ -101,14 +105,14 @@ health_matches() {
 import json
 import sys
 
-expected_pid, expected_sha, payload = sys.argv[1:]
+expected_pid, expected_sha, expected_mode, payload = sys.argv[1:]
 try:
     health = json.loads(payload)
     valid = (
         health.get("schema_version") == "open_trader.account_api.health.v1"
         and health.get("module") == "account_api"
         and health.get("status") == "ok"
-        and health.get("mode") == "shadow"
+        and health.get("mode") == expected_mode
         and health.get("pid") == int(expected_pid)
         and health.get("api_git_sha") == expected_sha
         and health.get("worker_git_sha") == expected_sha
@@ -117,7 +121,7 @@ try:
 except (TypeError, ValueError, json.JSONDecodeError):
     valid = False
 raise SystemExit(0 if valid else 1)
-' "$1" "$2" "$3"
+' "$1" "$2" "$3" "$4"
 }
 
 process_cwd_matches() {
@@ -143,14 +147,14 @@ wait_ready() {
     if [[ -n "$pid" ]] && process_cwd_matches "$pid" \
       && loopback_listener_matches "$pid" \
       && health="$("$CURL_BIN" -fsS http://127.0.0.1:8768/healthz 2>/dev/null)" \
-      && health_matches "$pid" "$expected_sha" "$health"; then
+      && health_matches "$pid" "$expected_sha" "$MODE" "$health"; then
       return 0
     fi
     sleep 1
   done
   bootout_if_loaded || true
   wait_agent_absent || return 1
-  echo "Account API did not publish matching shadow health" >&2
+  echo "Account API did not publish matching $MODE health" >&2
   return 1
 }
 

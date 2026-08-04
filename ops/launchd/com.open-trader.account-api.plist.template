@@ -19,6 +19,8 @@
     <string>account-api</string>
     <string>--data-dir</string>
     <string>OPEN_TRADER_DATA_DIR</string>
+    <string>--mode</string>
+    <string>OPEN_TRADER_ACCOUNT_API_MODE</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
