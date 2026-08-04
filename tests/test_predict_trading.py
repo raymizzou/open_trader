@@ -877,11 +877,11 @@ def test_account_snapshot_rejects_malformed_official_position() -> None:
         client.account_snapshot()
 
 
-def test_book_parses_decimal_price_to_exact_wei() -> None:
+def test_book_preserves_sdk_price_and_quantity_units() -> None:
     from open_trader.predict_trading import _book
 
     book = _book({"marketId": 896, "updateTimestampMs": 1, "asks": [["0.57", "1"]], "bids": []})
-    assert book.asks[0][0] == 570000000000000000
+    assert book.asks == [(0.57, 1.0)]
 
 
 @pytest.mark.parametrize("value", ("1.5", "-1", " 1", "١"))

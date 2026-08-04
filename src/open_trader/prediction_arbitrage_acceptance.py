@@ -425,49 +425,57 @@ class _PredictReadOnlyGuard(_PolymarketReadOnlyGuard):
 def _guard_predict_client(
     client: object, guard: _PredictReadOnlyGuard
 ) -> Iterator[None]:
-    """Install a reversible guard around the Predict client and nested builder."""
+    """Install reversible mutation guards without proxying stateful SDK reads/signing."""
 
     try:
         builder = getattr(client, "_builder")
-        setattr(client, "_builder", guard.wrap(builder))
     except Exception:
         raise RuntimeError("Predict read-only guard unavailable") from None
 
-    direct_replacements: list[tuple[str, bool, object]] = []
-    direct_names = set(guard._MUTATION_NAMES)
-    direct_names.update(name for name in dir(client) if guard._kind(name) == "mutation")
-    try:
-        for name in direct_names:
+    replacements: list[tuple[object, str, bool, object]] = []
+
+    def protect(target: object, *, include_missing: bool = False) -> None:
+        names = set(guard._MUTATION_NAMES)
+        names.update(name for name in dir(target) if guard._kind(name) == "mutation")
+        values = getattr(target, "__dict__", {})
+        for name in names:
             try:
-                previous = getattr(client, name)
+                getattr(target, name)
             except AttributeError:
-                had_previous = False
-                previous = None
-            else:
-                had_previous = True
+                if not include_missing:
+                    continue
+            had_own = isinstance(values, dict) and name in values
+            previous = values.get(name) if had_own else None
             setattr(
-                client,
+                target,
                 name,
                 lambda *args, _name=name, **kwargs: guard.violation(_name),
             )
-            direct_replacements.append((name, had_previous, previous))
-    except Exception:
-        for name, had_previous, previous in reversed(direct_replacements):
-            if had_previous:
-                setattr(client, name, previous)
+            replacements.append((target, name, had_own, previous))
+
+    def restore() -> None:
+        for target, name, had_own, previous in reversed(replacements):
+            if had_own:
+                setattr(target, name, previous)
             else:
-                delattr(client, name)
-        setattr(client, "_builder", builder)
+                delattr(target, name)
+
+    try:
+        protect(client, include_missing=True)
+        protect(builder)
+        web3 = getattr(builder, "_web3", None)
+        if web3 is not None:
+            protect(web3)
+            eth = getattr(web3, "eth", None)
+            if eth is not None:
+                protect(eth)
+    except Exception:
+        restore()
         raise RuntimeError("Predict read-only guard unavailable") from None
     try:
         yield
     finally:
-        for name, had_previous, previous in reversed(direct_replacements):
-            if had_previous:
-                setattr(client, name, previous)
-            else:
-                delattr(client, name)
-        setattr(client, "_builder", builder)
+        restore()
 
 
 @contextmanager

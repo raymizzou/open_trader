@@ -669,6 +669,39 @@ def test_predict_guard_preserves_builder_reads_and_signed_no_submit_construction
     assert calls == ["balance_of", "build_order"]
 
 
+def test_predict_guard_preserves_stateful_sdk_signing(tmp_path: Path) -> None:
+    class Signer:
+        signature = "local-signature"
+
+        def sign(self) -> str:
+            return object.__getattribute__(self, "signature")
+
+    class StatefulSigningBuilder(Builder):
+        def __init__(self) -> None:
+            self._signer = Signer()
+
+        def sign_predict_account_message(self, message: str) -> str:
+            assert message == "predict-message"
+            return self._signer.sign()
+
+    class StatefulSigningClient(PredictClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._builder = StatefulSigningBuilder()
+
+        def _authenticate(self) -> str:
+            assert self._builder.sign_predict_account_message("predict-message") == "local-signature"
+            return "jwt-fixture"
+
+    report = readiness_report(
+        tmp_path,
+        predict_client_factory=lambda _config, *, urlopen_fn: StatefulSigningClient(),
+    )
+
+    assert report.status == "PASS"
+    assert report.mutation_calls == 0
+
+
 @pytest.mark.parametrize("action", ("send_raw_transaction", "transact"))
 def test_predict_guard_blocks_nested_sdk_raw_transaction_sender(
     tmp_path: Path, action: str

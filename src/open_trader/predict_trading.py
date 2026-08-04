@@ -1094,7 +1094,16 @@ def _book(payload: Mapping[str, object]) -> Book:
         raw = payload.get(name, ())
         if not isinstance(raw, list):
             raise ValueError("invalid predict book")
-        return [DepthLevel((int(Decimal(str(row[0])) * PREDICT_BASE_UNITS), int(Decimal(str(row[1])) * PREDICT_BASE_UNITS))) for row in raw if isinstance(row, list) and len(row) == 2]
+        result: list[DepthLevel] = []
+        for row in raw:
+            if not isinstance(row, list) or len(row) != 2:
+                raise ValueError("invalid predict book")
+            price = _number(row[0])
+            quantity = _number(row[1])
+            if price is None or quantity is None or not 0 <= price <= 1 or quantity <= 0:
+                raise ValueError("invalid predict book")
+            result.append(DepthLevel((float(price), float(quantity))))
+        return result
 
     return Book(int(payload.get("marketId", 0)), int(payload.get("updateTimestampMs", 0)), levels("asks"), levels("bids"))
 
