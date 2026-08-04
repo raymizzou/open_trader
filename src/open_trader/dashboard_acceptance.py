@@ -4122,7 +4122,7 @@ def _expected_source_copy(broker: str, source: Mapping[str, object]) -> str:
     status = str(source.get("status") or "unknown").lower()
     live = broker in {"futu", "tiger"}
     time = _source_time_text(broker, source)
-    if status == "ok":
+    if status in {"ok", "healthy"}:
         return (
             f"同步正常{f' · {time}' if time else ''}"
             if live

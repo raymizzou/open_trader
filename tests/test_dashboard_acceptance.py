@@ -1556,6 +1556,13 @@ def test_acceptance_source_panel_uses_current_page_dashboard_payload() -> None:
     assert dashboard_acceptance._page_dashboard_payload(DashboardPage()) is current
 
 
+def test_account_api_healthy_source_uses_normal_source_copy() -> None:
+    assert dashboard_acceptance._expected_source_copy(
+        "tiger",
+        {"status": "healthy", "data_as_of": "2026-08-04T09:02:00+08:00"},
+    ) == "同步正常 · 09:02"
+
+
 def trend_controllers() -> dict[str, dict[str, object]]:
     return {
         broker: {
