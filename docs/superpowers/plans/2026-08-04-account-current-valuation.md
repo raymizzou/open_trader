@@ -18,7 +18,7 @@
 - HK/CN quote time comes from OpenD `update_time`, normalized with the market timezone; use refresh time only when it is absent.
 - Runtime may serve retained quotes as `200 stale` without a new hard age cap, but release acceptance requires one fresh complete OpenD refresh from the candidate Worker.
 - A newly accepted position may create a brief fail-closed `503` until its first quote cycle; the browser must keep the previous snapshot and recover automatically.
-- Do not change Gateway routing, Dashboard layout, Account polling, Trend strategy/report/allocation/execution behavior, cash valuation, or rollback topology.
+- Do not change Gateway routing, Dashboard layout, Account polling, Trend strategy/report/allocation/execution behavior, cash valuation, or rollback topology. The only Dashboard interaction change is the approved transient update highlight on the three existing valuation cells.
 - Do not add an abstraction layer. Reuse `FutuQuoteUniverse`, `DashboardQuoteService`, Account projection validation, existing `Decimal` money rounding, and the current browser row renderer.
 - Write each behavior test first, observe the named failure, implement only enough to pass, and commit at the end of each task.
 - Use the repository interpreter consistently:
@@ -485,14 +485,15 @@
 **Interfaces**
 
 - Consumes: real and simulated position objects returned by their existing endpoints.
-- Produces: existing Dashboard table cells and DOM controller attributes populated from `current_valuation` when present.
-- Preserves: flat-field fallback only when the object is completely absent; the `实时价` column label; no per-row OpenD badge, `/api/quotes` call, FX arithmetic, layout, interaction, or scroll/focus change.
+- Produces: existing Dashboard table cells and DOM controller attributes populated from `current_valuation` when present, plus a one-shot update class on the three valuation cells when an already-rendered accepted valuation changes.
+- Preserves: flat-field fallback only when the object is completely absent; the `实时价` column label; no per-row OpenD badge, `/api/quotes` call, FX arithmetic, layout, permanent copy, or scroll/focus change.
 
 **Files**
 
 - Modify: `src/open_trader/dashboard_static/dashboard.js:5378-5399`
 - Modify: `src/open_trader/dashboard_static/dashboard.js:5537-5586`
 - Modify: `src/open_trader/dashboard_static/dashboard.js:8897-8926`
+- Modify: `src/open_trader/dashboard_static/dashboard.css:2889-2899`
 - Modify: `src/open_trader/dashboard_acceptance.py:960-994`
 - Modify: `src/open_trader/dashboard_acceptance.py:1098-1210`
 - Modify: `src/open_trader/dashboard_acceptance.py:3153-3206`
@@ -503,6 +504,13 @@
 - [ ] **Step 1: Add failing renderer tests for preference and rollback fallback**
 
   Add one real row and one simulated row where nested values differ visibly from flat fixtures. Assert the DOM uses nested price, price kind/time, USD, and HKD. Add a second case with the object wholly absent and assert the existing flat display remains unchanged.
+
+  For a successful second payload, assert that a changed accepted valuation adds
+  the update class to `实时价`, `美元市值`, and `港元市值` only. Assert that first
+  load, an unchanged payload/`304`, a failed/`503` poll, a plain rerender, and a
+  cash or money-market row do not add it. The update marker is consumed by the
+  immediate render so switching to a previously hidden broker cannot replay an
+  old highlight.
 
   Add a polling regression where a valid Account snapshot is followed by the brief contract-shaped `503` caused by a newly accepted position, then a valid recovered snapshot. Assert the table keeps the previous rows during the failure and updates after recovery without losing scroll/focus state.
 
@@ -530,9 +538,10 @@
 
   Expected: rows still render flat values and acceptance does not reject missing/partial valuations.
 
-- [ ] **Step 4: Add one browser display projection helper**
+- [ ] **Step 4: Add one browser display projection helper and transient update marker**
 
-  Add no new class or state field:
+  Add no new class. Reuse the existing `state` object for one short-lived set of
+  changed position keys:
 
   ```javascript
   function accountPositionDisplay(position) {
@@ -549,7 +558,13 @@
   }
   ```
 
-  Use it only when constructing `display` in `accountHoldingGroups()` and `simulatedAccountRows()`. Keep enrichment, selection keys, table layout, and renderer unchanged. Do not calculate or infer missing child fields in JavaScript.
+  Use it only when constructing `display` in `accountHoldingGroups()` and `simulatedAccountRows()`. Before replacing a successful Account payload, compare complete valuation signatures by the existing stable position key; mark only keys present in both payloads whose accepted valuation changed. Consume the set in the immediate account render and apply one CSS class to the existing price, USD, and HKD cells. Do not mark the initial payload or preserve markers across unrelated rerenders.
+
+  Implement the effect with one CSS animation from the existing success tint to
+  the normal table background. Under `prefers-reduced-motion: reduce`, disable
+  the animation and background tint. Keep enrichment, selection keys, table
+  layout, and all text unchanged. Do not calculate or infer missing child fields
+  in JavaScript.
 
 - [ ] **Step 5: Project the same display fields in acceptance**
 
@@ -568,6 +583,7 @@
     tests/test_trend_simulate_positions.py
   git diff --check
   git add src/open_trader/dashboard_static/dashboard.js \
+    src/open_trader/dashboard_static/dashboard.css \
     src/open_trader/dashboard_acceptance.py \
     tests/test_dashboard_web.py tests/test_dashboard_acceptance.py
   git commit -m "fix: render authoritative holding valuations"

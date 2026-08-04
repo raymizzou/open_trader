@@ -46,8 +46,9 @@ cutover checkpoints.
 - No new quote endpoint, daemon, database, cache, queue, dependency, WebSocket,
   or configurable valuation engine.
 - No migration of Trend simulated positions into Account Module.
-- No Dashboard layout, interaction, strategy, report, allocation, execution,
-  refresh-cadence, or broker-adapter redesign.
+- No Dashboard layout, strategy, report, allocation, execution, refresh-cadence,
+  or broker-adapter redesign. The only interaction change is the approved
+  transient valuation-update highlight described below.
 - No change to cash-balance valuation.
 - No new valuation object or USD display value for `cash` or
   `money_market_fund` positions.
@@ -276,6 +277,15 @@ two display currencies.
 The existing Account-table column remains labelled `实时价`. No per-row OpenD
 badge is added. Provenance is enforced by the Account contract, accepted quote
 publication, quote time, and release acceptance rather than extra UI copy.
+
+When a successful Account poll replaces an already-rendered quoteable position
+with a different accepted `current_valuation`, the existing `实时价`, `美元市值`,
+and `港元市值` cells briefly fade from the existing success tint back to the
+normal table background. This is feedback that a new accepted valuation reached
+the page, not a data-source label. It does not run on first load, a `304`, a
+failed/`503` poll, tab or filter changes, or cash/money-market rows, and it is
+disabled by `prefers-reduced-motion`. No layout space, permanent copy, badge, or
+row height is added.
 
 ## Release And Rollback Sequence
 
