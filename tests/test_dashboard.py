@@ -143,9 +143,21 @@ def seed_accepted_account_sync(
     ]
     tiger["summary"] = {"position_count": tiger_position_count, "cash_count": 1}
     state["generation"] = accepted_at
+    quotes = {
+        f"US.ACCEPTED{index}": {
+            "market": "US",
+            "symbol": f"ACCEPTED{index}",
+            "status": "ok",
+            "last_price": "11",
+            "price_session": "regular",
+            "price_time": accepted_at,
+            "fetched_at": accepted_at,
+        }
+        for index in range(tiger_position_count)
+    }
     state["dashboard_projection"] = build_dashboard_projection(
         state,
-        {"status": "ok", "last_success_at": accepted_at, "stale": False, "quotes": {}},
+        {"status": "ok", "last_success_at": accepted_at, "stale": False, "quotes": quotes},
         generated_at=accepted_at,
     )
     path = config.data_dir / "latest" / "account_sync_state.json"

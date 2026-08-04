@@ -254,6 +254,13 @@ def test_simulated_positions_route_account_and_link_exact_filled_report(
         "market_value": "3340.80",
         "cost_value": "3320.82",
         "market_value_hkd": "26058.24",
+        "current_valuation": {
+            "price": "371.20",
+            "price_kind": "account_snapshot",
+            "price_as_of": "2026-07-18T12:34:56+08:00",
+            "market_value_usd": "3340.80",
+            "market_value_hkd": "26058.24",
+        },
         "account_weight": "33.41%",
         "portfolio_weight": "33.41%",
         "unrealized_pnl_pct": "0.60%",
@@ -264,6 +271,20 @@ def test_simulated_positions_route_account_and_link_exact_filled_report(
             "strategy_version": "v1",
             "report_sha256": _report_hash(report),
         },
+    }
+
+
+def test_simulated_position_publishes_complete_current_valuation(tmp_path: Path) -> None:
+    clients = FakeClientFactory(positions=[_position()])
+
+    payload = _service(tmp_path, clients).load("tiger")
+
+    assert payload["positions"][0]["current_valuation"] == {
+        "price": "371.20",
+        "price_kind": "account_snapshot",
+        "price_as_of": "2026-07-18T12:34:56+08:00",
+        "market_value_usd": "3340.80",
+        "market_value_hkd": "26058.24",
     }
 
 

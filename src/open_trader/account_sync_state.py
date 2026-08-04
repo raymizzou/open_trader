@@ -14,6 +14,8 @@ from typing import Literal, Mapping, Sequence
 
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
+from .futu_symbols import to_futu_symbol
+from .futu_universe import QUOTEABLE_ASSET_CLASSES, SUPPORTED_MARKETS
 from .models import AssetClass, CashBalance, Market, Position
 from .portfolio import (
     PORTFOLIO_FIELDNAMES,
@@ -530,25 +532,30 @@ def _dashboard_position_row(
     source: Mapping[str, object],
     source_rates: Mapping[tuple[str, str], Decimal],
     quote: Mapping[str, object] | None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     market_value = position.market_value
     last_price = position.last_price
     price_kind = "statement" if source["source_kind"] == "statement" else "account_snapshot"
     price_as_of = str(source["data_as_of"])
-    if source["source_kind"] == "live" and quote is not None:
+    quoteable = _is_quoteable_position(position)
+    if quoteable:
+        if quote is None or quote.get("status") != "ok":
+            raise PortfolioBuildError(f"quote missing for {position.market.value}.{position.symbol}")
         quote_price = _optional_quote_decimal(quote.get("last_price"))
-        if quote.get("status") == "ok" and quote_price is not None and quote_price > 0:
-            last_price = quote_price
-            market_value = quote_price * position.quantity * _position_multiplier(position)
-            session = str(quote.get("price_session") or "")
-            price_kind = session if session in PRICE_KINDS else "live"
-            price_as_of = str(quote.get("price_time") or quote.get("fetched_at") or "")
+        if quote_price is None or quote_price <= 0:
+            raise PortfolioBuildError(f"quote invalid for {position.market.value}.{position.symbol}")
+        last_price = quote_price
+        market_value = quote_price * position.quantity * _position_multiplier(position)
+        session = str(quote.get("price_session") or "")
+        price_kind = session if session in PRICE_KINDS else "live"
+        price_as_of = str(quote.get("price_time") or quote.get("fetched_at") or "")
     if market_value is None:
         raise PortfolioBuildError(f"market value missing for {position.symbol}")
     fx_rate = _dashboard_fx_rate(position, source, source_rates)
+    market_value_hkd = market_value * fx_rate
     cost_value = position.cost_value
     unrealized_pnl = market_value - cost_value if cost_value is not None else None
-    return {
+    row: dict[str, object] = {
         "broker": position.broker,
         "account_alias": position.account_alias,
         "market": position.market.value,
@@ -564,7 +571,7 @@ def _dashboard_position_row(
         "price_as_of": price_as_of,
         "market_value": money(market_value),
         "market_value_usd": money(market_value) if position.currency.upper() == "USD" else "",
-        "market_value_hkd": money(market_value * fx_rate),
+        "market_value_hkd": money(market_value_hkd),
         "cost_value_hkd": money(cost_value * fx_rate) if cost_value is not None else "",
         "unrealized_pnl": money(unrealized_pnl),
         "unrealized_pnl_pct": pct(
@@ -578,6 +585,48 @@ def _dashboard_position_row(
         "confidence": position.confidence,
         "notes": position.notes,
     }
+    if quoteable:
+        usd_to_hkd = _dashboard_usd_to_hkd(position, source, source_rates, fx_rate)
+        row["current_valuation"] = {
+            "price": number(last_price),
+            "price_kind": price_kind,
+            "price_as_of": price_as_of,
+            "market_value_usd": money(market_value_hkd / usd_to_hkd),
+            "market_value_hkd": money(market_value_hkd),
+        }
+    return row
+
+
+def _is_quoteable_position(position: Position) -> bool:
+    if position.market.value not in SUPPORTED_MARKETS:
+        return False
+    if position.asset_class.value not in QUOTEABLE_ASSET_CLASSES:
+        return False
+    if position.quantity == 0:
+        return False
+    try:
+        to_futu_symbol(position.market.value, position.symbol)
+    except ValueError:
+        return False
+    return True
+
+
+def _dashboard_usd_to_hkd(
+    position: Position,
+    source: Mapping[str, object],
+    source_rates: Mapping[tuple[str, str], Decimal],
+    native_rate: Decimal,
+) -> Decimal:
+    if position.currency.upper() == "USD":
+        return native_rate
+    rate = source_rates.get((position.account_alias, "USD"))
+    if rate is not None:
+        return rate
+    if source["source_kind"] == "statement":
+        return _STATEMENT_FX_TO_HKD["USD"]
+    raise PortfolioBuildError(
+        f"live USD FX missing for {position.broker}.{position.account_alias}"
+    )
 
 
 def _dashboard_cash_row(
@@ -1016,12 +1065,42 @@ def _is_valid_dashboard_position(value: object) -> bool:
         not isinstance(value.get(field), str) for field in DASHBOARD_POSITION_FIELDS
     ):
         return False
+    current_valuation = value.get("current_valuation")
+    if current_valuation is not None and not _is_valid_current_valuation(current_valuation):
+        return False
+    if isinstance(current_valuation, dict) and (
+        current_valuation["price"] != value["last_price"]
+        or current_valuation["price_kind"] != value["price_kind"]
+        or current_valuation["price_as_of"] != value["price_as_of"]
+        or current_valuation["market_value_hkd"] != value["market_value_hkd"]
+    ):
+        return False
     return (
         value["broker"] in REQUIRED_BROKERS
         and value["price_kind"] in PRICE_KINDS
         and _is_finite_decimal_text(value["market_value_hkd"])
         and _is_percent_text(value["account_weight_hkd"])
         and _is_percent_text(value["portfolio_weight_hkd"])
+    )
+
+
+def _is_valid_current_valuation(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if set(value) != {
+        "price", "price_kind", "price_as_of", "market_value_usd", "market_value_hkd"
+    }:
+        return False
+    if not all(isinstance(value.get(field), str) and value[field] for field in (
+        "price", "price_kind", "price_as_of", "market_value_usd", "market_value_hkd"
+    )):
+        return False
+    return (
+        value["price_kind"] in PRICE_KINDS
+        and _is_finite_decimal_text(value["price"])
+        and Decimal(value["price"]) > 0
+        and _is_finite_decimal_text(value["market_value_usd"])
+        and _is_finite_decimal_text(value["market_value_hkd"])
     )
 
 

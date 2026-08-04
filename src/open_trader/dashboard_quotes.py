@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal
 import json
@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from .account_sync_state import QUOTE_STALE_SECONDS
 from .dashboard import DashboardConfig
 from .futu_quote import DashboardQuoteSnapshot, FutuQuoteClient, FutuQuoteError
-from .futu_universe import FutuUniverseItem, load_futu_quote_universe
+from .futu_universe import FutuQuoteUniverse, FutuUniverseItem
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -140,9 +140,8 @@ class DashboardQuoteService:
     last_success_at: str = ""
     last_quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    def refresh(self) -> QuoteRefreshResult:
+    def refresh(self, universe: FutuQuoteUniverse) -> QuoteRefreshResult:
         fetched_at = _now_text()
-        universe = load_futu_quote_universe(self.config.portfolio_path)
         items_by_symbol = _items_by_sorted_symbol(universe.items)
         requested_symbols = list(items_by_symbol)
         us_symbols = [symbol for symbol in requested_symbols if symbol.startswith("US.")]
@@ -190,6 +189,8 @@ class DashboardQuoteService:
             missing_count = sum(
                 1 for quote in quotes.values() if quote["status"] == "missing_quote"
             )
+            diagnostic = _error_diagnostic(exc)
+            _add_skipped_diagnostic(diagnostic, universe)
             return QuoteRefreshResult(
                 status="failed",
                 requested_count=len(requested_symbols),
@@ -199,7 +200,7 @@ class DashboardQuoteService:
                 last_success_at=self.last_success_at,
                 stale=bool(retained_quotes),
                 quotes=quotes,
-                diagnostic=_error_diagnostic(exc),
+                diagnostic=diagnostic,
             )
         finally:
             if client is not None and hasattr(client, "close"):
@@ -274,6 +275,7 @@ class DashboardQuoteService:
             state_error,
             bool(reused_us_quotes),
         )
+        _add_skipped_diagnostic(diagnostic, universe)
         cacheable = not snapshot_errors and missing_count == 0 and state_error is None
         if cacheable:
             self.last_success_at = fetched_at
@@ -344,6 +346,8 @@ def _quote_row(
     price_time = ""
     if snapshot is not None:
         price = snapshot.last_price
+        if item.market in {"HK", "CN"}:
+            price_time = _normalize_market_price_time(snapshot.update_time)
         if item.futu_symbol.startswith("US.") and use_us_session:
             price, price_session, current_session_quote, price_time = (
                 _select_us_price(snapshot, market_state)
@@ -420,6 +424,20 @@ def _normalize_futu_us_price_time(value: str) -> str:
     if parsed.tzinfo is not None:
         return value
     return parsed.isoformat(sep=" ", timespec="milliseconds")
+
+
+def _normalize_market_price_time(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace(" ", "T", 1))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+    return parsed.isoformat(
+        timespec="milliseconds" if parsed.microsecond else "seconds"
+    )
 
 
 def _us_session_status(
@@ -539,3 +557,10 @@ def _error_diagnostic(error: FutuQuoteError) -> dict[str, Any]:
         "context_ok": error.context_ok,
         "snapshot_ok": error.snapshot_ok,
     }
+
+
+def _add_skipped_diagnostic(
+    diagnostic: dict[str, Any], universe: FutuQuoteUniverse,
+) -> None:
+    if universe.skipped:
+        diagnostic["skipped"] = [asdict(row) for row in universe.skipped]

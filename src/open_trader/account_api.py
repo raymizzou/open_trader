@@ -597,10 +597,18 @@ def _parity_broker_stale(source: object, *, now: datetime) -> bool | None:
 
 def _parity_position(value: object) -> dict[str, object]:
     position = _public_fields(value, _POSITION_FIELDS)
+    if isinstance(value, Mapping) and "current_valuation" in value:
+        valuation = value["current_valuation"]
+        if isinstance(valuation, Mapping):
+            position["current_valuation"] = dict(valuation)
     try:
         position["price_as_of"] = _normalize_parity_price_as_of(
             position["market"], position["price_as_of"]
         )
+        if isinstance(position.get("current_valuation"), Mapping):
+            position["current_valuation"]["price_as_of"] = _normalize_parity_price_as_of(
+                position["market"], position["current_valuation"]["price_as_of"]
+            )
         instrument_id = "ins_" + hashlib.sha256(json.dumps(
             [
                 str(position["market"]).strip().upper(),

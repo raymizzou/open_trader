@@ -7,6 +7,7 @@ const state = {
   accountEtag: "",
   accountError: null,
   accountRequestInFlight: false,
+  accountValuationUpdates: new Set(),
   accountIntervalId: null,
   marketFilter: "ALL",
   brokerFilter: "futu",
@@ -953,12 +954,17 @@ async function loadAccountSnapshot() {
     });
     if (response.status === 304) {
       state.accountError = null;
+      state.accountValuationUpdates.clear();
       return;
     }
     if (!response.ok) {
       throw new Error(`account snapshot ${response.status}`);
     }
     const payload = await response.json();
+    state.accountValuationUpdates = accountValuationUpdates(
+      state.accountSnapshot,
+      payload,
+    );
     state.accountSnapshot = payload;
     state.accountEtag = response.headers.get("ETag") || "";
     state.accountError = null;
@@ -973,6 +979,7 @@ async function loadAccountSnapshot() {
     renderSourceStatusListIntoHeader();
     renderConnectionPanel();
     renderHoldings();
+    state.accountValuationUpdates.clear();
   }
 }
 
@@ -5694,7 +5701,7 @@ function simulatedAccountRows(broker) {
   const positions = Array.isArray(payload.positions) ? payload.positions : [];
   return positions.map((position, index) => {
     const display = {
-      ...position,
+      ...accountPositionDisplay(position),
       total_quantity: position.quantity,
       avg_cost_price: position.cost_price,
     };
@@ -5706,6 +5713,60 @@ function simulatedAccountRows(broker) {
       index,
     };
   });
+}
+
+function accountPositionDisplay(position) {
+  const valuation = position?.current_valuation;
+  if (!valuation || typeof valuation !== "object") return position;
+  const fields = [
+    "price", "price_kind", "price_as_of", "market_value_usd", "market_value_hkd",
+  ];
+  if (fields.some((field) => !hasValue(valuation[field]))) return position;
+  return {
+    ...position,
+    last_price: valuation.price,
+    price_kind: valuation.price_kind,
+    price_as_of: valuation.price_as_of,
+    market_value_usd: valuation.market_value_usd,
+    market_value_hkd: valuation.market_value_hkd,
+  };
+}
+
+function accountValuationKey(position) {
+  return String(
+    position?.position_id
+      || [position?.broker, position?.account_alias, position?.market, position?.symbol].join(":"),
+  );
+}
+
+function accountValuationSignature(position) {
+  const valuation = position?.current_valuation;
+  if (!valuation || typeof valuation !== "object") return "";
+  return JSON.stringify([
+    valuation.price,
+    valuation.price_kind,
+    valuation.price_as_of,
+    valuation.market_value_usd,
+    valuation.market_value_hkd,
+  ]);
+}
+
+function accountValuationUpdates(previous, next) {
+  const updates = new Set();
+  if (!previous || !Array.isArray(previous.positions) || !Array.isArray(next?.positions)) {
+    return updates;
+  }
+  const previousByKey = new Map(
+    previous.positions.map((position) => [accountValuationKey(position), position]),
+  );
+  next.positions.forEach((position) => {
+    const before = previousByKey.get(accountValuationKey(position));
+    const signature = accountValuationSignature(position);
+    if (before && signature && accountValuationSignature(before) !== signature) {
+      updates.add(accountValuationKey(position));
+    }
+  });
+  return updates;
 }
 
 function renderSimulatedAccountView(broker) {
@@ -5853,6 +5914,8 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
   const isSelected = !simulated && row.key === state.selectedHoldingKey;
   const selectedDetail = isSelected ? normalizeHoldingDetailMode(state.selectedHoldingDetail) : "";
   const pnlTone = pnlClass(display.unrealized_pnl_pct);
+  const valuationClass = state.accountValuationUpdates.has(row.key)
+    ? " account-valuation-updated" : "";
   const detailActions = simulated ? "" : brokerSyncStatus(row.broker).unsafe
     ? '<span class="account-review-action">人工复核</span>'
     : `<button class="${escapeHtml(tSignalButtonClass(holding))}" type="button" data-detail-key="${escapeHtml(row.key)}" data-detail-mode="t_signal">做T</button>`;
@@ -5876,9 +5939,9 @@ function renderAccountHoldingRow(row, {simulated = false} = {}) {
     <td class="symbol-cell account-holding-symbol"><span class="account-mobile-label">标的</span><strong>${escapeHtml(formatPlain(display.symbol))}</strong><span class="meta-text">${escapeHtml(formatPlain(display.name))}</span>${enrichment}${attribution}</td>
     <td class="number-cell account-holding-quantity"><span class="account-mobile-label">数量</span>${escapeHtml(formatDisplayNumber(display.quantity))}</td>
     <td class="number-cell account-holding-cost"><span class="account-mobile-label">成本价</span>${escapeHtml(formatDisplayNumber(display.cost_price))}</td>
-    <td class="number-cell account-holding-price"><span class="account-mobile-label">实时价</span>${renderAccountHoldingPrice(display)}</td>
-    <td class="number-cell account-holding-usd-value"><span class="account-mobile-label">美元市值</span>${escapeHtml(hasValue(display.market_value_usd) ? formatMoney(display.market_value_usd, "USD") : "-")}</td>
-    <td class="number-cell account-holding-market-value"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
+    <td class="number-cell account-holding-price${valuationClass}"><span class="account-mobile-label">实时价</span>${renderAccountHoldingPrice(display)}</td>
+    <td class="number-cell account-holding-usd-value${valuationClass}"><span class="account-mobile-label">美元市值</span>${escapeHtml(hasValue(display.market_value_usd) ? formatMoney(display.market_value_usd, "USD") : "-")}</td>
+    <td class="number-cell account-holding-market-value${valuationClass}"><span class="account-mobile-label">港元市值</span>${escapeHtml(formatMoney(display.market_value_hkd, "HKD"))}</td>
     <td class="number-cell account-holding-account-weight"><span class="account-mobile-label">账户权重</span>${escapeHtml(formatPlain(display.account_weight_hkd))}</td>
     <td class="number-cell account-holding-portfolio-weight"><span class="account-mobile-label">组合权重</span>${escapeHtml(formatPlain(display.portfolio_weight_hkd))}</td>
     <td class="number-cell account-holding-pnl${pnlTone ? ` ${pnlTone}` : ""}"><span class="account-mobile-label">盈亏</span>${escapeHtml(formatSignedPnl(display.unrealized_pnl_pct))}</td>
@@ -9223,7 +9286,7 @@ function accountHoldingGroups() {
         };
         return {
           key: String(position.position_id || ""), broker, holding,
-          display: position, index,
+          display: accountPositionDisplay(position), index,
         };
       });
     return {broker, profile, summary, rows};

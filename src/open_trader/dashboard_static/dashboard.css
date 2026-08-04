@@ -2893,6 +2893,21 @@ table {
   width: 100%;
 }
 
+.account-valuation-updated {
+  animation: account-valuation-updated 1800ms ease-out 1;
+}
+
+@keyframes account-valuation-updated {
+  from { background: #e2f3e9; }
+  to { background: var(--surface); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .account-valuation-updated {
+    animation: none;
+  }
+}
+
 .account-mobile-label {
   display: none;
 }
