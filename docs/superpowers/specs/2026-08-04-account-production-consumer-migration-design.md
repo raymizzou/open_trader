@@ -2,7 +2,7 @@
 
 **Issue:** #23
 **Parent:** #18
-**Status:** Design approved; revised written spec pending review
+**Status:** Approved for implementation planning
 **Baseline:** `main@3bde68a9c1b30e4be9b73bc526b52303aea49500`
 
 ## Context
