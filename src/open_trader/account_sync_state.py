@@ -30,6 +30,7 @@ ACCOUNT_STATE_VERSION = 1
 REQUIRED_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 LIVE_BROKERS = ("futu", "tiger")
 STATEMENT_BROKERS = ("phillips", "eastmoney")
+STATEMENT_GENERATION_RE = re.compile(r"sha256:([0-9a-f]{64})\Z")
 ACCOUNT_STALE_SECONDS = 180
 QUOTE_STALE_SECONDS = 15
 CONTROLLER_STALE_SECONDS = 15
@@ -141,7 +142,7 @@ def load_latest_statement_candidate(
     data_dir: Path,
     broker: Literal["phillips", "eastmoney"],
 ) -> BrokerAccountCandidate | None:
-    if broker not in {"phillips", "eastmoney"}:
+    if broker not in STATEMENT_BROKERS:
         raise ValueError(f"unsupported statement broker: {broker}")
     runs_dir = data_dir / "runs"
     if not runs_dir.is_dir():
@@ -226,7 +227,7 @@ def accept_candidate(
         raise ValueError(f"invalid source_kind: {candidate.source_kind}")
     if statement_generation is not None and (
         candidate.broker not in STATEMENT_BROKERS
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", statement_generation) is None
+        or statement_generation_digest(statement_generation) is None
     ):
         raise ValueError("invalid statement generation")
     accepted = deepcopy(state) if _is_valid_state(state) else empty_account_sync_state()
@@ -1065,7 +1066,7 @@ def _is_valid_state(value: object) -> bool:
             not isinstance(generations[broker], str)
             or (
                 bool(generations[broker])
-                and re.fullmatch(r"sha256:[0-9a-f]{64}", generations[broker]) is None
+                and statement_generation_digest(generations[broker]) is None
             )
             for broker in STATEMENT_BROKERS
         )
@@ -1077,6 +1078,11 @@ def _is_valid_state(value: object) -> bool:
     return all(
         _is_valid_source(brokers[broker], broker) for broker in REQUIRED_BROKERS
     )
+
+
+def statement_generation_digest(value: object) -> str | None:
+    match = STATEMENT_GENERATION_RE.fullmatch(value) if isinstance(value, str) else None
+    return match.group(1) if match is not None else None
 
 
 def is_valid_account_publication(value: object) -> bool:

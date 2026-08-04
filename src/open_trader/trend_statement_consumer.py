@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .account_sync_state import load_account_sync_state
+from .account_snapshot import load_account_snapshot, load_worker_git_sha
+from .account_sync_state import STATEMENT_BROKERS
 from .daily_premarket import RunLock
 from .statement_import import load_statement_trade_facts
 from .trend_api_stats import (
@@ -25,7 +26,7 @@ def consume_accepted_statement_facts(
     broker: str,
     generated_at: str | None = None,
 ) -> dict[str, object]:
-    if broker not in {"phillips", "eastmoney"}:
+    if broker not in STATEMENT_BROKERS:
         raise ValueError(f"unsupported statement broker: {broker}")
     with RunLock(
         data_dir / "trend_statement_consumption/.stats.lock", wait=True
@@ -45,13 +46,26 @@ def _consume_accepted_statement_facts(
     broker: str,
     generated_at: str | None,
 ) -> dict[str, object]:
-    state = load_account_sync_state(
-        data_dir / "latest/account_sync_state.json"
+    snapshot = load_account_snapshot(
+        data_dir,
+        api_git_sha=load_worker_git_sha(data_dir),
+        now=(
+            datetime.fromisoformat(generated_at)
+            if generated_at is not None
+            else datetime.now().astimezone()
+        ),
     )
-    generations = state["accepted_statement_generation"]
-    assert isinstance(generations, dict)
+    generations = snapshot.payload.get("accepted_statement_generation")
+    account_generation = str(snapshot.payload.get("account_generation") or "")
+    if snapshot.status_code != 200 or not isinstance(generations, dict):
+        return {
+            "schema_version": CONSUMPTION_SCHEMA,
+            "status": "waiting_for_account_publication",
+            "broker": broker,
+            "statement_generation": "",
+            "account_generation": account_generation,
+        }
     statement_generation = str(generations[broker])
-    account_generation = str(state["generation"])
     if not statement_generation:
         return {
             "schema_version": CONSUMPTION_SCHEMA,
@@ -60,7 +74,6 @@ def _consume_accepted_statement_facts(
             "statement_generation": "",
             "account_generation": account_generation,
         }
-
     status_path = data_dir / "trend_statement_consumption" / f"{broker}.json"
     previous = _read_json(status_path)
     if (
@@ -81,6 +94,18 @@ def _consume_accepted_statement_facts(
         cutoff = manifest.get("trade_facts_cutoff_at")
         if not isinstance(statement_period, str) or not isinstance(cutoff, str):
             raise ValueError("statement trade facts contract is invalid")
+        if datetime.fromisoformat(consumed_at) < datetime.fromisoformat(cutoff):
+            waiting = {
+                "schema_version": CONSUMPTION_SCHEMA,
+                "status": "waiting_for_statement_cutoff",
+                "broker": broker,
+                "statement_generation": statement_generation,
+                "account_generation": account_generation,
+                "attempted_at": consumed_at,
+                "retry_after": cutoff,
+            }
+            _write_json_atomic(status_path, waiting)
+            return waiting
         payload = build_statement_actual_stats_payload(
             data_dir=data_dir,
             reports_dir=reports_dir,

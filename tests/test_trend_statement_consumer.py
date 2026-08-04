@@ -91,12 +91,29 @@ def test_trend_consumes_only_accepted_statement_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.statement_import as statement_import
+    import open_trader.trend_statement_consumer as consumer
+    from open_trader.account_snapshot import SnapshotResult
+    from open_trader.account_sync_state import load_account_sync_state
     from open_trader.trend_statement_consumer import (
         consume_accepted_statement_facts,
     )
 
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", StatementParser
+    )
+    monkeypatch.setattr(
+        consumer,
+        "load_account_snapshot",
+        lambda data_dir, **_kwargs: SnapshotResult(
+            200,
+            {
+                "accepted_statement_generation": load_account_sync_state(
+                    data_dir / "latest/account_sync_state.json"
+                )["accepted_statement_generation"],
+                "account_generation": "sha256:" + "c" * 64,
+            },
+            None,
+        ),
     )
     data_dir = tmp_path / "data"
     staged = StatementImportService(
@@ -144,4 +161,50 @@ def test_trend_consumes_only_accepted_statement_generation(
         )
     )
     assert status["statement_generation"] == staged["statement_generation"]
-    assert status["account_generation"] == "account-generation-after-promotion"
+    assert status["account_generation"] == "sha256:" + "c" * 64
+
+
+def test_trend_waits_for_same_day_market_close_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.trend_statement_consumer as consumer
+    from open_trader.account_snapshot import SnapshotResult
+
+    generation = "sha256:" + "a" * 64
+    monkeypatch.setattr(
+        consumer,
+        "load_account_snapshot",
+        lambda *_args, **_kwargs: SnapshotResult(
+            200,
+            {
+                "accepted_statement_generation": {
+                    "phillips": generation,
+                    "eastmoney": "",
+                },
+                "account_generation": "sha256:" + "c" * 64,
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        consumer,
+        "load_statement_trade_facts",
+        lambda *_args: (
+            {
+                "statement_period": "2026-08-04",
+                "trade_facts_cutoff_at": "2026-08-04T16:00:00+08:00",
+            },
+            [],
+        ),
+    )
+
+    result = consumer.consume_accepted_statement_facts(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        broker="phillips",
+        generated_at="2026-08-04T13:00:00+08:00",
+    )
+
+    assert result["status"] == "waiting_for_statement_cutoff"
+    assert result["retry_after"] == "2026-08-04T16:00:00+08:00"
+    assert not (tmp_path / "data/latest/trend_api_stats.json").exists()

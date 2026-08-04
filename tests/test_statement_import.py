@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -296,6 +297,71 @@ def test_worker_validation_rejects_tampered_generation(
         ).stage_pdf("phillips", PDF_BYTES)
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "trade_facts.json",
+        "candidate/runs/2026-07/extracted_positions.csv",
+    ],
+)
+def test_worker_validation_rejects_tampered_derived_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    import open_trader.statement_import as statement_import
+
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", FakePhillipsParser
+    )
+    data_dir = tmp_path / "data"
+    staged = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    ).stage_pdf("phillips", PDF_BYTES)
+    root = (
+        data_dir
+        / "account_statements/generations/phillips"
+        / staged["statement_generation"].removeprefix("sha256:")
+    )
+    artifact = root / relative_path
+    artifact.write_bytes(artifact.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="invalid statement generation"):
+        statement_import.load_staged_statement_candidate(data_dir, "phillips")
+
+
+def test_statement_generation_binds_derived_artifact_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.statement_import as statement_import
+
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", FakePhillipsParser
+    )
+    data_dir = tmp_path / "data"
+    staged = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    ).stage_pdf("phillips", PDF_BYTES)
+    root = (
+        data_dir
+        / "account_statements/generations/phillips"
+        / staged["statement_generation"].removeprefix("sha256:")
+    )
+    positions = root / "candidate/runs/2026-07/extracted_positions.csv"
+    positions.write_bytes(positions.read_bytes() + b"\n")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["candidate_sha256"] = statement_import._directory_sha256(
+        root / "candidate"
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid statement generation"):
+        statement_import.load_staged_statement_candidate(data_dir, "phillips")
+
+
 def test_stage_pdf_normalizes_unexpected_parser_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -312,3 +378,26 @@ def test_stage_pdf_normalizes_unexpected_parser_failure(
             data_dir=tmp_path / "data",
             eastmoney_password="secret",
         ).stage_pdf("phillips", PDF_BYTES)
+
+
+def test_same_day_trade_fact_cutoff_covers_market_close_sentinel() -> None:
+    from open_trader.statement_import import _statement_cutoff
+
+    staged_at = datetime.fromisoformat("2026-08-04T13:00:00+08:00")
+
+    assert _statement_cutoff(
+        "2026-08-04",
+        "phillips",
+        staged_at,
+        [{"filled_at": "2026-08-04T16:00:00+08:00"}],
+    ) == (
+        "2026-08-04T16:00:00+08:00"
+    )
+
+    with pytest.raises(ValueError, match="晚于结单日期"):
+        _statement_cutoff(
+            "2026-08-04",
+            "phillips",
+            staged_at,
+            [{"filled_at": "2026-08-05T16:00:00+08:00"}],
+        )

@@ -8,11 +8,14 @@ import json
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 from .account_sync_state import (
     BrokerAccountCandidate,
+    STATEMENT_BROKERS,
     load_latest_statement_candidate,
+    statement_generation_digest,
 )
 from .fx import StaticMonthEndFxProvider
 from .models import StatementTrade
@@ -40,19 +43,24 @@ class StatementImportService:
     ) -> None:
         self.data_dir = data_dir
         self.eastmoney_password = eastmoney_password
+        # ponytail: uploads are rare; split per broker only if this lock contends.
+        self._stage_lock = Lock()
 
     def stage_pdf(self, broker: str, body: bytes) -> dict[str, object]:
         if not body.startswith(b"%PDF-"):
             raise ValueError("请求正文必须是有效的 PDF")
         if len(body) > MAX_STATEMENT_BYTES:
             raise ValueError("PDF 不能超过 20 MiB")
+        with self._stage_lock:
+            return self._stage_pdf(broker, body)
+
+    def _stage_pdf(self, broker: str, body: bytes) -> dict[str, object]:
         parser = self._parser(broker)
-        digest = hashlib.sha256(body).hexdigest()
-        generation = f"sha256:{digest}"
+        content_sha256 = _content_sha256(body)
         generations = self.data_dir / "account_statements/generations" / broker
-        destination = generations / digest
-        if destination.is_dir():
-            return _staged_response(destination, broker, generation)
+        existing = _staged_for_content(generations, broker, content_sha256)
+        if existing is not None:
+            return existing
 
         generations.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix=".stage-", dir=generations) as name:
@@ -92,21 +100,25 @@ class StatementImportService:
                 ),
             )
             facts = [_trade_fill(trade, statement_period) for trade in parsed.trades]
-            (root / "trade_facts.json").write_text(
-                json.dumps(facts, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            facts_bytes = json.dumps(
+                facts, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            (root / "trade_facts.json").write_bytes(facts_bytes)
+            staged_at = datetime.now().astimezone()
+            candidate_sha256 = _directory_sha256(root / "candidate")
+            trade_facts_sha256 = _content_sha256(facts_bytes)
             manifest = {
                 "schema_version": STATEMENT_GENERATION_SCHEMA,
                 "status": "staged",
                 "broker": broker,
                 "statement_date": statement_date,
                 "statement_period": statement_period,
-                "statement_generation": generation,
-                "content_sha256": generation,
-                "staged_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "content_sha256": content_sha256,
+                "candidate_sha256": candidate_sha256,
+                "trade_facts_sha256": trade_facts_sha256,
+                "staged_at": staged_at.isoformat(timespec="seconds"),
                 "trade_facts_cutoff_at": _statement_cutoff(
-                    statement_date, broker
+                    statement_date, broker, staged_at, facts
                 ),
                 "positions": len(parsed.positions),
                 "cash": len(parsed.cash_balances),
@@ -114,15 +126,18 @@ class StatementImportService:
                 "trades": len(parsed.trades),
                 "candidate_run": str(imported.run_dir.relative_to(root)),
             }
+            generation = _statement_generation(manifest)
+            manifest["statement_generation"] = generation
             (root / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
                 encoding="utf-8",
             )
+            destination = generations / generation.removeprefix("sha256:")
             try:
                 root.rename(destination)
             except FileExistsError:
                 pass
-        return _staged_response(destination, broker, generation)
+            return _staged_response(destination, broker, generation)
 
     def _parser(self, broker: str) -> StatementParser:
         if broker == "phillips":
@@ -163,9 +178,53 @@ class StatementImportService:
 def _read_manifest(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _content_sha256(body: bytes) -> str:
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _directory_sha256(root: Path) -> str:
+    files = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    return _content_sha256(
+        json.dumps(files, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+
+
+def _statement_generation(manifest: dict[str, object]) -> str:
+    return _content_sha256(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
+def _staged_for_content(
+    generations: Path, broker: str, content_sha256: str
+) -> dict[str, object] | None:
+    if not generations.is_dir():
+        return None
+    # ponytail: generation counts are tiny; add an index only if this scan grows.
+    for root in generations.iterdir():
+        if not root.is_dir() or root.name.startswith(".stage-"):
+            continue
+        generation = f"sha256:{root.name}"
+        manifest, _candidate, _facts = _load_statement_generation(
+            root, broker, generation
+        )
+        if manifest.get("content_sha256") == content_sha256:
+            return dict(manifest)
+    return None
 
 
 def _staged_response(
@@ -183,7 +242,7 @@ def _staged_response(
 def load_staged_statement_candidate(
     data_dir: Path, broker: str
 ) -> tuple[BrokerAccountCandidate, str] | None:
-    if broker not in {"phillips", "eastmoney"}:
+    if broker not in STATEMENT_BROKERS:
         raise ValueError(f"unsupported statement broker: {broker}")
     generations = data_dir / "account_statements/generations" / broker
     if not generations.is_dir():
@@ -212,16 +271,16 @@ def load_staged_statement_candidate(
 def load_statement_trade_facts(
     data_dir: Path, broker: str, generation: str
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    if broker not in {"phillips", "eastmoney"}:
+    if broker not in STATEMENT_BROKERS:
         raise ValueError(f"unsupported statement broker: {broker}")
-    match = re.fullmatch(r"sha256:([0-9a-f]{64})", generation)
-    if match is None:
+    digest = statement_generation_digest(generation)
+    if digest is None:
         raise ValueError("invalid statement generation")
     root = (
         data_dir
         / "account_statements/generations"
         / broker
-        / match.group(1)
+        / digest
     )
     manifest, _candidate, facts = _load_statement_generation(
         root, broker, generation
@@ -237,25 +296,35 @@ def _load_statement_generation(
     list[dict[str, object]],
 ]:
     manifest = _read_manifest(root / "manifest.json")
+    content_sha256 = manifest.get("content_sha256") if manifest else None
+    candidate_sha256 = manifest.get("candidate_sha256") if manifest else None
+    trade_facts_sha256 = manifest.get("trade_facts_sha256") if manifest else None
+    unsigned_manifest = dict(manifest or {})
+    unsigned_manifest.pop("statement_generation", None)
     if (
         not root.is_dir()
         or manifest is None
         or manifest.get("schema_version") != STATEMENT_GENERATION_SCHEMA
         or manifest.get("broker") != broker
         or manifest.get("statement_generation") != generation
-        or manifest.get("content_sha256") != generation
-        or generation != f"sha256:{root.name}"
+        or statement_generation_digest(content_sha256) is None
+        or statement_generation_digest(candidate_sha256) is None
+        or statement_generation_digest(trade_facts_sha256) is None
+        or statement_generation_digest(generation) != root.name
+        or _statement_generation(unsigned_manifest) != generation
     ):
         raise ValueError(f"invalid statement generation: {root.name}")
     try:
         pdf = (root / "statement.pdf").read_bytes()
-        raw_facts = json.loads(
-            (root / "trade_facts.json").read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError) as error:
+        facts_bytes = (root / "trade_facts.json").read_bytes()
+        raw_facts = json.loads(facts_bytes)
+        observed_candidate_sha256 = _directory_sha256(root / "candidate")
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid statement generation: {root.name}") from error
     if (
-        hashlib.sha256(pdf).hexdigest() != root.name
+        _content_sha256(pdf) != content_sha256
+        or _content_sha256(facts_bytes) != trade_facts_sha256
+        or observed_candidate_sha256 != candidate_sha256
         or not isinstance(raw_facts, list)
         or any(not isinstance(fact, dict) for fact in raw_facts)
     ):
@@ -298,10 +367,27 @@ def _trade_fill(trade: StatementTrade, statement_period: str) -> dict[str, objec
     }
 
 
-def _statement_cutoff(statement_date: str, broker: str) -> str:
+def _statement_cutoff(
+    statement_date: str,
+    broker: str,
+    staged_at: datetime,
+    facts: list[dict[str, object]],
+) -> str:
     timezone = ZoneInfo(
         "Asia/Shanghai" if broker == "eastmoney" else "Asia/Hong_Kong"
     )
-    return datetime.combine(
+    end_of_day = datetime.combine(
         date.fromisoformat(statement_date), time(23, 59, 59), timezone
-    ).isoformat()
+    )
+    cutoff = min(end_of_day, staged_at.astimezone(timezone))
+    if facts:
+        fill_times = [
+            datetime.fromisoformat(str(fact["filled_at"])) for fact in facts
+        ]
+        if any(value.tzinfo is None or value.utcoffset() is None for value in fill_times):
+            raise ValueError("结单成交时间必须包含时区")
+        latest_fill = max(value.astimezone(timezone) for value in fill_times)
+        if latest_fill > end_of_day:
+            raise ValueError("结单成交时间晚于结单日期")
+        cutoff = max(cutoff, latest_fill)
+    return cutoff.isoformat()
