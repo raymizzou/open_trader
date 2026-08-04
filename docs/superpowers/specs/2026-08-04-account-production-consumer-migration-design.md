@@ -7,7 +7,7 @@
 
 ## Context
 
-Account API 与 Account Sync Worker 已成为同一 release 下的两个独立进程，浏览器也已通过 Frontend Gateway 读取 `GET /api/v1/account/snapshot`。但活跃生产代码仍有第二条 Account 读取路径：Legacy Dashboard、Trend statement consumer 与 runtime CLI 会直接读取 `account_sync_state.json`、Worker status、quotes、portfolio CSV 或 statement artifacts。Premarket 与 T-signal 也保留这些读取，但当前不需要继续运行，本阶段将停用其生产入口而不是迁移它们。
+Account API 与 Account Sync Worker 已成为同一 release 下的两个独立进程，浏览器也已通过 Frontend Gateway 读取 `GET /api/v1/account/snapshot`。但活跃生产代码仍有第二条 Account 读取路径：Legacy Dashboard、Trend report/statement consumers 与 runtime CLI 会直接读取 `account_sync_state.json`、Worker status、quotes、portfolio CSV、`data/runs/*/extracted_*.csv` 或 statement artifacts。Premarket 与 T-signal 也保留这些读取，但当前不需要继续运行，本阶段将停用其生产入口而不是迁移它们。
 
 这意味着 Account artifact 布局仍是跨 module interface，Legacy 仍拥有 Account projection，Account 也无法在 R5 中证明独立升级与回滚。本阶段删除这些活跃生产绕行路径；Account API 与 Account Sync Worker 之外，只有明确列出的 acceptance、forensics、offline migration 工具和已停用模块内的精确例外可以直接读取 Account runtime publications。
 
@@ -145,7 +145,7 @@ If a complete attempt is discarded and restarted, the new attempt may fetch a ne
 
 ### Trend report generation
 
-At the start of each report/revision attempt, the Trend worker fetches one snapshot. It selects the relevant real positions, exposure and weights from that mapping, then computes Trend-owned actions and risk verdicts. The published report records at least:
+At the start of each report/revision attempt, the Trend worker fetches one snapshot and passes that same mapping through every internal Trend Animals retry for the attempt. It selects the relevant real positions, exposure and weights from that mapping, then computes Trend-owned actions and risk verdicts. The published report records at least:
 
 ```json
 {
@@ -158,6 +158,8 @@ At the start of each report/revision attempt, the Trend worker fetches one snaps
 ```
 
 Trend must not fetch Account during a browser query, write Trend conclusions back to Account, or use Legacy/portfolio/raw-file fallback. Existing Futu simulation-account execution adapters remain Trend-owned broker adapters; they are not Account runtime publication reads and are outside this migration.
+
+The active real-holding projection becomes a pure conversion from the pinned Account response. Delete `broker_details.py` after its callers move to that conversion, and delete the test-only `load_market_account`, `load_trend_account` and `load_eastmoney_account` raw loaders rather than preserving compatibility paths.
 
 When required Account or quote sources are stale or unavailable, Trend may publish a truthful blocked report for operator visibility, but it must not publish an executable action or widen risk limits.
 
@@ -244,7 +246,8 @@ The current migration inventory is:
 | `t_signal_runner.py` | retain internal code as a dormant exception; remove the production CLI entrypoint and prove no watcher runs |
 | production branches in `cli.py` | migrate Account status to HTTP; remove Premarket/T-signal parsers and dispatch |
 | `trend_statement_consumer.py` | fetch snapshot and accepted trade facts over HTTP |
-| unused real-account readers in `market_trend.py` / `a_share_trend.py` | delete rather than preserve compatibility code |
+| `broker_details.py` and active `load_real_holding_input` callers | replace the runs-directory scan with a pure projection from the report attempt's pinned HTTP snapshot, then delete `broker_details.py` |
+| test-only raw loaders in `market_trend.py` / `a_share_trend.py` | delete `load_market_account`, `load_trend_account` and `load_eastmoney_account` rather than preserve compatibility code |
 
 The initial source allowlist is exact:
 
@@ -261,6 +264,7 @@ The audit covers at least these publication identities:
 - `latest/portfolio.csv` when used as Account input;
 - `latest/quotes.json`;
 - `account_sync/controller_status.json`;
+- `data/runs/*/extracted_positions.csv` and `extracted_cash.csv` when used as current Account input;
 - `account_statements/generations` and statement fact loaders;
 - imports of Account persistence/projection helpers from production consumers.
 
