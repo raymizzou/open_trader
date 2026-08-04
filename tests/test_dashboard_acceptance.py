@@ -365,6 +365,8 @@ def _run_acceptance_main_with_reports(
     controller_errors: list[str] | None = None,
     public_calls: list[str] | None = None,
     cutover_errors: dict[str, list[str]] | None = None,
+    legacy_payload: dict[str, object] | None = None,
+    legacy_check: object | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -490,6 +492,8 @@ def _run_acceptance_main_with_reports(
 
     def fetch_payload(url: str) -> dict[str, object]:
         record_public(url)
+        if url == "http://127.0.0.1:8767":
+            return dict(legacy_payload or {"reports_dir": str(report_dirs[0])})
         return next(payloads)
 
     def fetch_quotes(url: str) -> dict[str, object]:
@@ -528,7 +532,7 @@ def _run_acceptance_main_with_reports(
     monkeypatch.setattr(
         dashboard_acceptance,
         "_legacy_cutover_errors",
-        lambda *_args: cutover_errors.get("legacy", []),
+        legacy_check or (lambda *_args: cutover_errors.get("legacy", [])),
     )
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -539,6 +543,16 @@ def _run_acceptance_main_with_reports(
         dashboard_acceptance,
         "_account_statement_facts_errors",
         lambda *_args: cutover_errors.get("facts", []),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_account_snapshot_refresh_errors",
+        lambda *_args: cutover_errors.get("refresh", []),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_controlled_account_outage_errors",
+        lambda *_args: cutover_errors.get("outage", []),
     )
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -668,13 +682,44 @@ def test_acceptance_main_enforces_account_cutover_boundaries(
         cutover_errors={
             "legacy": ["legacy"],
             "facts": ["facts"],
+            "refresh": ["refresh"],
+            "outage": ["outage"],
             "disabled": ["disabled"],
             "trend": ["trend"],
         },
     )
 
     assert status == 1
-    assert {"legacy", "facts", "disabled", "trend"} <= set(result["errors"])
+    assert {
+        "legacy", "facts", "refresh", "outage", "disabled", "trend",
+    } <= set(result["errors"])
+
+
+def test_acceptance_main_checks_direct_legacy_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    checked: list[tuple[object, str]] = []
+
+    def legacy_check(payload: object, url: str) -> list[str]:
+        checked.append((payload, url))
+        return ["Legacy leak"] if isinstance(payload, dict) and "account_sync" in payload else []
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        legacy_payload={"account_sync": {}},
+        legacy_check=legacy_check,
+    )
+
+    assert status == 1
+    assert "Legacy leak" in result["errors"]
+    assert checked == [({"account_sync": {}}, "http://127.0.0.1:8767")]
 
 
 def test_acceptance_rejects_missing_legacy_listener(
@@ -800,7 +845,11 @@ def test_acceptance_business_checks_use_gateway_and_account_api(
 
     assert status == 0
     assert calls
-    assert set(calls) == {"http://127.0.0.1:8766", "http://127.0.0.1:8768"}
+    assert set(calls) == {
+        "http://127.0.0.1:8766",
+        "http://127.0.0.1:8767",
+        "http://127.0.0.1:8768",
+    }
 
 
 def test_acceptance_main_fails_when_reports_dir_changes_during_refresh(
@@ -7129,6 +7178,63 @@ def test_acceptance_rejects_enabled_premarket_or_t_signal_paths(
 
     assert any("launchd" in error for error in errors)
     assert any("run-premarket" in error for error in errors)
+
+
+def test_account_outage_isolation_fails_closed_and_restores_account() -> None:
+    calls: list[str] = []
+
+    def stop() -> None:
+        calls.append("stop")
+
+    def restore() -> None:
+        calls.append("restore")
+
+    def fetch(path: str) -> tuple[int, object]:
+        calls.append(path)
+        if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH:
+            return 503, {"code": "account_module_unavailable"}
+        return 200, {"holding_enrichment": []}
+
+    assert dashboard_acceptance._account_outage_isolation_errors(
+        "http://gateway.test", stop_account_api=stop, restore_account_api=restore,
+        fetch=fetch,
+    ) == []
+    assert calls == [
+        "stop",
+        dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH,
+        "/api/dashboard",
+        "/api/trend-reports/tiger/history",
+        "/api/prediction-arbitrage/state",
+        "restore",
+    ]
+
+
+def test_account_snapshot_refresh_rejects_unchanged_publication() -> None:
+    snapshot = {
+        "snapshot_generation": "sha256:first",
+        "account_generation": "sha256:account",
+    }
+
+    errors = dashboard_acceptance._account_snapshot_refresh_errors(
+        "http://account.test",
+        snapshot,
+        '"account-first"',
+        fetch=lambda _url: (200, snapshot, '"account-first"'),
+        wait=lambda _seconds: None,
+    )
+
+    assert errors == ["Account 快照刷新后未发布新的 generation 或 ETag"]
+    assert dashboard_acceptance._account_snapshot_refresh_errors(
+        "http://account.test",
+        snapshot,
+        '"account-first"',
+        fetch=lambda _url: (
+            200,
+            {**snapshot, "snapshot_generation": "sha256:second"},
+            '"account-second"',
+        ),
+        wait=lambda _seconds: None,
+    ) == []
 
 
 def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:

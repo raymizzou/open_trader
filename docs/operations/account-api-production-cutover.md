@@ -53,10 +53,18 @@ curl -fsS -H 'X-Open-Trader-Account-Route: production' \
 curl -fsS -H 'X-Open-Trader-Account-Route: production' \
   'http://127.0.0.1:8768/api/v1/account/statements/BROKER/GENERATION/trade-facts'
 
-# 3. Gateway, Legacy Dashboard, then active Trend controllers at CUTOVER_SHA.
+# 3. Gateway and Legacy Dashboard at CUTOVER_SHA.
 scripts/install_dashboard_launchd.sh --repo-root "$CUTOVER_ROOT"
 
-# 4. Disabled paths must stay absent. Do not run a Premarket/T-signal dry run.
+# 4. Restart all three active Trend controllers from the same checkout.
+scripts/install_daily_premarket_launchd.sh --trend-only --market CN \
+  --config "$CUTOVER_ROOT/config/daily_premarket.env"
+scripts/install_daily_premarket_launchd.sh --trend-only --market HK \
+  --config "$CUTOVER_ROOT/config/daily_premarket.env"
+scripts/install_daily_premarket_launchd.sh --trend-only --market US \
+  --config "$CUTOVER_ROOT/config/daily_premarket.env"
+
+# 5. Disabled paths must stay absent. Do not run a Premarket/T-signal dry run.
 launchctl list | rg 'com\.open-trader\.premarket(\.|$)' && exit 1 || true
 ps ax -o command= | rg 'run-premarket|run-daily-premarket|watch-t|daily_premarket|t_signal_runner' && exit 1 || true
 for command in run-premarket run-daily-premarket watch-t; do
@@ -79,6 +87,16 @@ launchctl print gui/$(id -u)/com.open-trader.account-sync-controller
 launchctl print gui/$(id -u)/com.open-trader.account-api
 launchctl print gui/$(id -u)/com.open-trader.frontend-gateway
 launchctl print gui/$(id -u)/com.open-trader.legacy-dashboard
+for market in cn hk us; do
+  market_upper="$(printf '%s' "$market" | tr '[:lower:]' '[:upper:]')"
+  launchctl print gui/$(id -u)/com.open-trader.trend-market-controller."$market"
+  rg '"working_directory"[[:space:]]*:[[:space:]]*"'"$CUTOVER_ROOT"'"' \
+    data/trend_controller/"$market_upper"/status.json
+  rg '"git_sha"[[:space:]]*:[[:space:]]*"'"$CUTOVER_SHA"'"' \
+    data/trend_controller/"$market_upper"/status.json
+  tail -n 100 "logs/daily_premarket/launchd-trend-controller-$market.out.log"
+  tail -n 100 "logs/daily_premarket/launchd-trend-controller-$market.err.log"
+done
 lsof -nP -iTCP:8766 -sTCP:LISTEN
 lsof -nP -iTCP:8767 -sTCP:LISTEN
 lsof -nP -iTCP:8768 -sTCP:LISTEN
@@ -143,8 +161,11 @@ unless the operator asks.
 
 Rollback #23 as one whole release to the retained prior accepted checkout:
 stop the candidate Account API, replace the Worker only after its writer lock
-is released, start the rollback Account API, then restart Gateway/Legacy/Trend
-from that same rollback SHA. Never pair #23 consumers with a #22 Account API,
-and never restore Legacy Account fields or raw-file reads as an incident
-workaround. Repeat the production snapshot/facts, runtime identity, disabled
-path and isolation proofs on the rollback release.
+is released, start the rollback Account API, restart Gateway and Legacy, then
+unload the three candidate Trend controller labels and install CN, HK and US
+controllers from that same rollback checkout. Prove each rollback controller's
+launchd label, `status.json` PID/cwd/Git SHA/heartbeat and fresh stdout/stderr
+logs before allowing it to generate a report. Never pair #23 consumers with a
+#22 Account API, and never restore Legacy Account fields or raw-file reads as
+an incident workaround. Repeat the production snapshot/facts, runtime identity,
+disabled-path and isolation proofs on the rollback release.

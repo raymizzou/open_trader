@@ -997,6 +997,118 @@ def _fetch_account_snapshot(
         raise
 
 
+def _account_snapshot_refresh_errors(
+    url: str,
+    previous: Mapping[str, Any],
+    previous_etag: str | None,
+    *,
+    fetch: Any = _fetch_account_snapshot,
+    wait: Any = time.sleep,
+) -> list[str]:
+    wait(ACCOUNT_POLL_PROOF_WAIT_MS / 1000)
+    status, refreshed, etag = fetch(url)
+    if status != 200 or not isinstance(refreshed, Mapping):
+        return [f"Account 快照刷新后 HTTP {status}，应为 200"]
+    if (
+        refreshed.get("snapshot_generation") == previous.get("snapshot_generation")
+        and etag == previous_etag
+    ):
+        return ["Account 快照刷新后未发布新的 generation 或 ETag"]
+    return []
+
+
+def _fetch_status_payload(url: str, path: str) -> tuple[int, object]:
+    request = Request(f"{url.rstrip('/')}{path}")
+    try:
+        with urlopen(request, timeout=DASHBOARD_API_TIMEOUT_SECONDS) as response:
+            try:
+                payload = json.load(response)
+            except json.JSONDecodeError:
+                payload = None
+            return response.status, payload
+    except HTTPError as error:
+        try:
+            payload = json.load(error)
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        return error.code, payload
+
+
+def _account_outage_isolation_errors(
+    gateway_url: str,
+    *,
+    stop_account_api: Any,
+    restore_account_api: Any,
+    fetch: Any,
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        stop_account_api()
+        status, payload = fetch(ACCOUNT_SNAPSHOT_PATH)
+        if not (
+            status == 503
+            and isinstance(payload, Mapping)
+            and payload.get("code") == "account_module_unavailable"
+        ):
+            errors.append("Account 故障时 Gateway 未返回 503 account_module_unavailable")
+        for path in (
+            "/api/dashboard",
+            "/api/trend-reports/tiger/history",
+            "/api/prediction-arbitrage/state",
+        ):
+            status, payload = fetch(path)
+            if status != 200:
+                errors.append(f"Account 故障时非 Account 路径不可用：{path} HTTP {status}")
+            elif path == "/api/dashboard" and (
+                not isinstance(payload, Mapping) or "holding_enrichment" not in payload
+            ):
+                errors.append("Account 故障时 Research 所在 Dashboard 数据不可读")
+    except (OSError, RuntimeError) as exc:
+        errors.append(f"Account 故障隔离检查失败：{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            restore_account_api()
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"Account API 恢复失败：{type(exc).__name__}: {exc}")
+    return errors
+
+
+def _controlled_account_outage_errors(
+    gateway_url: str, expected_root: Path,
+) -> list[str]:
+    def stop_account_api() -> None:
+        result = subprocess.run(
+            [
+                "launchctl", "bootout", f"gui/{os.getuid()}/com.open-trader.account-api",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("launchctl bootout Account API failed")
+
+    def restore_account_api() -> None:
+        result = subprocess.run(
+            [
+                str(expected_root / "scripts/install_account_api_launchd.sh"),
+                "--mode", "production", "--repo-root", str(expected_root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Account API restore failed")
+
+    return _account_outage_isolation_errors(
+        gateway_url,
+        stop_account_api=stop_account_api,
+        restore_account_api=restore_account_api,
+        fetch=lambda path: _fetch_status_payload(gateway_url, path),
+    )
+
+
 def _fetch_account_statement_facts(
     url: str, broker: str, generation: str,
 ) -> dict[str, Any]:
@@ -5416,9 +5528,10 @@ def main(argv: list[str] | None = None) -> int:
         ))
         first = _fetch_payload(args.url)
         first_reports_dir = _effective_reports_dir(first, process_cwd=legacy_cwd)
-        errors.extend(_legacy_cutover_errors(first, args.legacy_url))
+        legacy_payload = _fetch_payload(args.legacy_url)
+        errors.extend(_legacy_cutover_errors(legacy_payload, args.legacy_url))
         errors.extend(_published_trend_account_input_errors(first, first_reports_dir))
-        account_snapshot_status, account_snapshot, _account_snapshot_etag = (
+        account_snapshot_status, account_snapshot, account_snapshot_etag = (
             _fetch_account_snapshot(args.account_url)
         )
         if account_snapshot_status != 200 or account_snapshot is None:
@@ -5429,6 +5542,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             errors.extend(
                 _account_statement_facts_errors(account_snapshot, args.account_url)
+            )
+            errors.extend(
+                _account_snapshot_refresh_errors(
+                    args.account_url, account_snapshot, account_snapshot_etag,
+                )
             )
         try:
             account_ids = _configured_simulate_account_ids(args.expected_root)
@@ -5482,6 +5600,10 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append(
                         f"Gateway Account snapshot 条件请求 HTTP {conditional_status}"
                     )
+        if account_pid is not None and not account_errors:
+            errors.extend(_controlled_account_outage_errors(
+                args.url, args.expected_root,
+            ))
         parity = check_account_api_parity(project_data_dir, base_url=args.account_url)
         if parity.status != "PASS":
             errors.append(f"Account API parity {parity.status}: {parity.reason}")
