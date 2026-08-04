@@ -28,6 +28,7 @@ from .dashboard import DashboardConfig
 from .dashboard_quotes import DashboardQuoteService, load_published_quotes
 from .futu_account import FutuAccountClient, build_futu_account_candidate
 from .fx import DEFAULT_RATES_TO_HKD
+from .statement_import import load_staged_statement_candidate
 from .tiger_account import (
     TigerAccountClient,
     build_tiger_account_candidate,
@@ -96,10 +97,15 @@ class AccountSyncWorker:
         results: dict[str, object] = {}
         for broker in REQUIRED_BROKERS:
             try:
-                candidate = self._candidate_for(broker, attempted_at)
+                candidate, statement_generation = self._candidate_for(
+                    broker, attempted_at
+                )
                 self._write_diagnostic_candidate(attempted_at, candidate)
                 next_state = accept_candidate(
-                    state, candidate, attempted_at=attempted_at
+                    state,
+                    candidate,
+                    attempted_at=attempted_at,
+                    statement_generation=statement_generation,
                 )
                 portfolio_rows = accepted_portfolio_rows(next_state)
             except Exception as exc:
@@ -267,12 +273,15 @@ class AccountSyncWorker:
 
     def _candidate_for(
         self, broker: str, attempted_at: str
-    ) -> BrokerAccountCandidate:
+    ) -> tuple[BrokerAccountCandidate, str | None]:
         if broker in {"phillips", "eastmoney"}:
+            staged = load_staged_statement_candidate(self.config.data_dir, broker)
+            if staged is not None:
+                return staged
             candidate = load_latest_statement_candidate(self.config.data_dir, broker)
             if candidate is None:
                 raise ValueError(f"no valid {broker} statement candidate")
-            return candidate
+            return candidate, None
         if broker == "futu":
             client = FutuAccountClient(
                 host=self.config.futu_host,
@@ -284,7 +293,7 @@ class AccountSyncWorker:
                     run_date=attempted_at[:10],
                     data_as_of=attempted_at,
                     fallback_fx_to_hkd=DEFAULT_RATES_TO_HKD,
-                )
+                ), None
             finally:
                 client.close()
         tiger_config = load_tiger_account_config(
@@ -298,7 +307,7 @@ class AccountSyncWorker:
                 client.fetch_snapshot(),
                 run_date=attempted_at[:10],
                 data_as_of=attempted_at,
-            )
+            ), None
         finally:
             client.close()
 

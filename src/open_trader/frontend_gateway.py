@@ -109,7 +109,7 @@ def create_frontend_gateway(
             self._send_error(HTTPStatus.NOT_FOUND, "not_found", "Not found")
 
         def _proxy(self) -> None:
-            account_route = _is_account_snapshot_path(urlsplit(self.path).path)
+            account_route = _is_account_path(urlsplit(self.path).path)
             (
                 target_host,
                 target_port,
@@ -399,8 +399,10 @@ def _is_api_path(path: str) -> bool:
     return path == "/api" or path.startswith("/api/")
 
 
-def _is_account_snapshot_path(path: str) -> bool:
-    return path == "/api/v1/account/snapshot"
+def _is_account_path(path: str) -> bool:
+    if path == "/api/v1/account/snapshot":
+        return True
+    return path.startswith("/api/v1/account/statements/")
 
 
 def _hop_by_hop_names(headers: object) -> set[str]:

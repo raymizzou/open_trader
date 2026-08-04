@@ -5784,7 +5784,7 @@ async function uploadStatement(broker, file) {
   if (Number(file.size) > 20 * 1024 * 1024) {
     throw new Error("PDF 不能超过 20 MiB");
   }
-  const response = await fetch(`/api/statements/${encodeURIComponent(broker)}`, {
+  const response = await fetch(`/api/v1/account/statements/${encodeURIComponent(broker)}`, {
     method: "POST",
     headers: {"Content-Type": "application/pdf"},
     body: file,
@@ -5793,7 +5793,6 @@ async function uploadStatement(broker, file) {
   if (!response.ok || payload.status === "error") {
     throw new Error(payload.message || `上传失败 (${response.status})`);
   }
-  await loadDashboard();
   return payload;
 }
 
@@ -5806,12 +5805,10 @@ async function handleStatementFileSelection(event) {
   renderAccountHoldings();
   try {
     const payload = await uploadStatement(broker, file);
-    const statisticsMessage =
-      payload.statistics_status === "failed" ? " · 统计待重建" : "";
     state.statementUpload = {
       broker,
       busy: false,
-      message: `已导入 ${payload.statement_date} · 持仓 ${payload.positions}${statisticsMessage}`,
+      message: `已暂存 ${payload.statement_date} · 等待账户同步`,
       error: false,
     };
     setTimeout(() => {

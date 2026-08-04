@@ -21,6 +21,8 @@
     <string>OPEN_TRADER_DATA_DIR</string>
     <string>--mode</string>
     <string>OPEN_TRADER_ACCOUNT_API_MODE</string>
+    <string>--config</string>
+    <string>OPEN_TRADER_DAILY_CONFIG</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

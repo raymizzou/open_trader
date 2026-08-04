@@ -28,6 +28,7 @@ def test_account_api_template_runs_mode_specific_command() -> None:
         "OPEN_TRADER_PYTHON", "-m", "open_trader", "account-api",
         "--data-dir", "OPEN_TRADER_DATA_DIR",
         "--mode", "OPEN_TRADER_ACCOUNT_API_MODE",
+        "--config", "OPEN_TRADER_DAILY_CONFIG",
     ]
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] is True
@@ -57,7 +58,10 @@ def test_account_api_installer_dry_run_defaults_to_shadow(tmp_path: Path) -> Non
     assert payload["WorkingDirectory"] == str(ROOT)
     assert payload["EnvironmentVariables"]["PYTHONPATH"] == str(ROOT / "src")
     assert str(runtime / "data") in payload["ProgramArguments"]
-    assert payload["ProgramArguments"][-2:] == ["--mode", "shadow"]
+    assert ["--mode", "shadow"] == payload["ProgramArguments"][-4:-2]
+    assert payload["ProgramArguments"][-2:] == [
+        "--config", str(runtime / "config/daily_premarket.env")
+    ]
     assert "frontend-gateway" not in result.stdout
     assert "account-sync-worker" not in result.stdout
 
@@ -78,7 +82,8 @@ def test_account_api_installer_dry_run_renders_explicit_production(tmp_path: Pat
         text=True,
     )
 
-    assert plistlib.loads(result.stdout.encode())["ProgramArguments"][-2:] == ["--mode", "production"]
+    arguments = plistlib.loads(result.stdout.encode())["ProgramArguments"]
+    assert arguments[-4:-2] == ["--mode", "production"]
 
 
 def test_account_api_installer_rejects_unknown_mode_before_launchd(tmp_path: Path) -> None:

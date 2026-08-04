@@ -38,6 +38,7 @@ RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" 2>/dev/null && pwd || printf '%s' "$RUNTIME_R
 TEMPLATE="$REPO_ROOT/ops/launchd/$LABEL.plist.template"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 DATA_DIR="$RUNTIME_ROOT/data"
+DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
 OUT_LOG="$REPO_ROOT/logs/account_api/launchd.out.log"
 ERR_LOG="$REPO_ROOT/logs/account_api/launchd.err.log"
 
@@ -52,6 +53,7 @@ render_plist() {
     -e "s|OPEN_TRADER_PYTHON|$(sed_escape "$PYTHON_BIN")|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$(sed_escape "$DATA_DIR")|g" \
     -e "s|OPEN_TRADER_ACCOUNT_API_MODE|$(sed_escape "$MODE")|g" \
+    -e "s|OPEN_TRADER_DAILY_CONFIG|$(sed_escape "$DAILY_CONFIG")|g" \
     -e "s|OPEN_TRADER_REPO|$(sed_escape "$REPO_ROOT")|g" \
     "$TEMPLATE"
 }

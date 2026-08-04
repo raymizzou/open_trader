@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import csv
-from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal
-import importlib
 import json
 from pathlib import Path
 
@@ -15,15 +13,8 @@ from open_trader.models import (
     Market,
     Position,
     StatementTrade,
-    TradeFill,
 )
 from open_trader.parsers.base import ParseResult
-from open_trader.portfolio import PORTFOLIO_FIELDNAMES
-from open_trader.trend_api_stats import (
-    build_statement_actual_stats_payload,
-    load_trend_api_stats,
-    write_trend_api_stats,
-)
 
 
 PDF_BYTES = b"%PDF-1.7\nfake statement"
@@ -33,13 +24,14 @@ class FakePhillipsParser:
     broker = "phillips"
     parser_version = "test-1"
 
-    def __init__(self, statement_date: str = "2026-07-10") -> None:
+    def __init__(self, statement_date: str = "2026-07-12") -> None:
         self.detected_date = statement_date
+        self.quantity = Decimal("1")
 
-    def statement_date(self, path: Path) -> str:
+    def statement_date(self, _path: Path) -> str:
         return self.detected_date
 
-    def parse(self, path: Path, period: str) -> ParseResult:
+    def parse(self, _path: Path, period: str) -> ParseResult:
         statement_id = f"{period}-phillips"
         return ParseResult(
             statement_id=statement_id,
@@ -54,12 +46,12 @@ class FakePhillipsParser:
                     symbol="00700",
                     name="Tencent",
                     currency="HKD",
-                    quantity=Decimal("1"),
+                    quantity=self.quantity,
                     cost_price=Decimal("500"),
                     last_price=Decimal("510"),
-                    market_value=Decimal("510"),
-                    cost_value=Decimal("500"),
-                    unrealized_pnl=Decimal("10"),
+                    market_value=Decimal("510") * self.quantity,
+                    cost_value=Decimal("500") * self.quantity,
+                    unrealized_pnl=Decimal("10") * self.quantity,
                     confidence="high",
                     notes="",
                 )
@@ -76,7 +68,25 @@ class FakePhillipsParser:
                     notes="",
                 )
             ],
-            page_count=1,
+            trades=[
+                StatementTrade(
+                    statement_id=statement_id,
+                    broker="phillips",
+                    account_alias="phillips_main",
+                    market=Market.HK,
+                    symbol="00700",
+                    currency="HKD",
+                    side="buy",
+                    quantity=Decimal("1"),
+                    price=Decimal("500"),
+                    fee=Decimal("1"),
+                    costs_complete=True,
+                    traded_at="2026-07-10T16:00:00+08:00",
+                    reference="buy-1",
+                    execution_granularity="statement_trade_date",
+                    statement_sequence=1,
+                )
+            ],
         )
 
 
@@ -88,10 +98,10 @@ class FakeEastmoneyParser:
     def __init__(self, password: str) -> None:
         self.passwords.append(password)
 
-    def statement_date(self, path: Path) -> str:
-        return "2026-07-12"
+    def statement_date(self, _path: Path) -> str:
+        return "2026-07-31"
 
-    def parse(self, path: Path, period: str) -> ParseResult:
+    def parse(self, _path: Path, period: str) -> ParseResult:
         statement_id = f"{period}-eastmoney"
         return ParseResult(
             statement_id=statement_id,
@@ -108,318 +118,56 @@ class FakeEastmoneyParser:
                     notes="",
                 )
             ],
-            page_count=1,
         )
 
 
-class FakeFillOnlyParser:
-    broker = "phillips"
-    parser_version = "test-1"
-
-    def statement_date(self, path: Path) -> str:
-        return "2026-07-10"
-
-    def parse(self, path: Path, period: str) -> ParseResult:
-        return ParseResult(
-            statement_id=f"{period}-phillips",
-            broker="phillips",
-            fills=[
-                TradeFill(
-                    source_id="fill-1",
-                    source_order_id=None,
-                    broker="phillips",
-                    account_alias="phillips_main",
-                    market=Market.HK,
-                    symbol="00700",
-                    currency="HKD",
-                    side="SELL",
-                    quantity=Decimal("1"),
-                    price=Decimal("500"),
-                    fees=None,
-                    executed_at="2026-07-10",
-                )
-            ],
-        )
-
-
-class FakeTradePhillipsParser(FakePhillipsParser):
-    def __init__(self, statement_date: str = "2026-07-12") -> None:
-        super().__init__(statement_date)
-        self.sell_price = Decimal("12")
-        self.include_trades = True
-
-    def parse(self, path: Path, period: str) -> ParseResult:
-        parsed = super().parse(path, period)
-        if not self.include_trades:
-            return parsed
-        return replace(
-            parsed,
-            trades=[
-                StatementTrade(
-                    statement_id=parsed.statement_id,
-                    broker="phillips",
-                    account_alias="phillips_main",
-                    market=Market.HK,
-                    symbol="00700",
-                    currency="HKD",
-                    side="buy",
-                    quantity=Decimal("10"),
-                    price=Decimal("10"),
-                    fee=Decimal("1"),
-                    costs_complete=True,
-                    traded_at="2026-07-10T16:00:00+08:00",
-                    reference="buy-1",
-                    execution_granularity="statement_trade_date",
-                    statement_sequence=1,
-                ),
-                StatementTrade(
-                    statement_id=parsed.statement_id,
-                    broker="phillips",
-                    account_alias="phillips_main",
-                    market=Market.HK,
-                    symbol="00700",
-                    currency="HKD",
-                    side="sell",
-                    quantity=Decimal("10"),
-                    price=self.sell_price,
-                    fee=Decimal("1"),
-                    costs_complete=True,
-                    traded_at="2026-07-11T16:00:00+08:00",
-                    reference="sell-1",
-                    execution_granularity="statement_trade_date",
-                    statement_sequence=2,
-                ),
-            ],
-        )
-
-
-def write_hk_strategy_reports(reports_dir: Path) -> None:
-    directory = reports_dir / "trend_hk_phillips"
-    directory.mkdir(parents=True)
-    for execution_date, action in (
-        ("2026-07-10", "BUY"),
-        ("2026-07-11", "SELL_ALL"),
-    ):
-        (directory / f"{execution_date}.json").write_text(
-            json.dumps(
-                {
-                    "execution_date": execution_date,
-                    "metadata": {"market": "HK"},
-                    "strategy_snapshot": {
-                        "strategy_id": "trend_animals_warm_to_hot/HK/v4",
-                        "strategy_version": "v4",
-                        "parameters": {},
-                    },
-                    "strategy_judgments": {
-                        "formal_actions": [
-                            {"action": action, "symbol": "00700"}
-                        ]
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-
-
-def write_existing_portfolio(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-    row.update(
-        {
-            "sort_group": "2",
-            "market": "US",
-            "asset_class": "stock",
-            "symbol": "AAPL",
-            "currency": "USD",
-            "market_value": "100",
-            "cost_value": "80",
-            "fx_to_hkd": "7.8",
-            "brokers": "futu",
-            "risk_flag": "normal",
-        }
-    )
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES)
-        writer.writeheader()
-        writer.writerow(row)
-
-
-def test_import_pdf_archives_candidate_without_replacing_latest_portfolio(
-    tmp_path: Path,
-    monkeypatch,
+def test_stage_pdf_publishes_one_immutable_generation_without_current_or_trend_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
+    import open_trader.statement_import as statement_import
+
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", FakePhillipsParser
     )
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    sentinel = b"accepted portfolio must stay untouched\n"
-    portfolio_path.parent.mkdir(parents=True)
-    portfolio_path.write_bytes(sentinel)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        eastmoney_password="secret",
-    )
-
-    result = service.import_pdf("phillips", PDF_BYTES)
-
-    assert result == {
-        "status": "ok",
-        "broker": "phillips",
-        "statement_date": "2026-07-10",
-        "positions": 1,
-        "cash": 1,
-        "warnings": 0,
-        "trades": 0,
-        "statistics_status": "updated",
-        "actual_rounds": 0,
-        "statistics_cutoff_at": "2026-07-10T23:59:59+08:00",
-        "run_path": str(tmp_path / "data/runs/2026-07"),
-    }
-    assert (
-        tmp_path / "data/statements/phillips/2026-07-10/statement.pdf"
-    ).read_bytes() == PDF_BYTES
-    assert portfolio_path.read_bytes() == sentinel
-    assert (tmp_path / "data/runs/2026-07/extracted_positions.csv").is_file()
-    assert (tmp_path / "data/runs/2026-07/extracted_cash.csv").is_file()
-
-
-def test_import_pdf_rejects_fill_only_statement_and_preserves_portfolio(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    monkeypatch.setattr(
-        statement_import, "PhillipsStatementParser", FakeFillOnlyParser
-    )
-    portfolio_path = tmp_path / "data/latest/portfolio.csv"
-    portfolio_path.parent.mkdir(parents=True)
-    portfolio_path.write_bytes(b"accepted portfolio\n")
-    before = portfolio_path.read_bytes()
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        eastmoney_password="secret",
-    )
-
-    with pytest.raises(ValueError, match="没有可导入的持仓或现金"):
-        service.import_pdf("phillips", PDF_BYTES)
-
-    assert portfolio_path.read_bytes() == before
-    assert not (tmp_path / "data/statements").exists()
-
-
-def test_import_pdf_rejects_older_statement_and_preserves_current_data(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    current = FakePhillipsParser("2026-07-10")
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: current)
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        eastmoney_password="secret",
-    )
-    service.import_pdf("phillips", PDF_BYTES)
-    before_portfolio = portfolio_path.read_bytes()
-    before_archive = (
-        tmp_path / "data/statements/phillips/2026-07-10/statement.pdf"
-    ).read_bytes()
-    current.detected_date = "2026-07-09"
-
-    with pytest.raises(ValueError, match="早于当前结单"):
-        service.import_pdf("phillips", b"%PDF-1.7\nolder")
-
-    assert portfolio_path.read_bytes() == before_portfolio
-    assert (
-        tmp_path / "data/statements/phillips/2026-07-10/statement.pdf"
-    ).read_bytes() == before_archive
-    assert not (tmp_path / "data/statements/phillips/2026-07-09").exists()
-
-
-def test_latest_statement_period_uses_newest_statement_id_across_runs(
-    tmp_path: Path,
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
     data_dir = tmp_path / "data"
-    for run_name, statement_id in (
-        ("2026-07-16", "2026-07-10-phillips"),
-        ("2026-07", "2026-07-15-phillips"),
-    ):
-        path = data_dir / "runs" / run_name / "extracted_positions.csv"
-        path.parent.mkdir(parents=True)
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["statement_id", "broker"])
-            writer.writeheader()
-            writer.writerow({"statement_id": statement_id, "broker": "phillips"})
+    current = data_dir / "latest/account_sync_state.json"
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b"accepted-account-state\n")
     service = statement_import.StatementImportService(
         data_dir=data_dir,
         eastmoney_password="secret",
     )
 
-    assert service._latest_statement_period("phillips") == "2026-07-15"
+    first = service.stage_pdf("phillips", PDF_BYTES)
+    second = service.stage_pdf("phillips", PDF_BYTES)
 
-
-def test_latest_statement_period_ignores_fill_execution_date(tmp_path: Path) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    data_dir = tmp_path / "data"
-    path = data_dir / "runs/2026-07/extracted_fills.csv"
-    path.parent.mkdir(parents=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["broker", "executed_at"])
-        writer.writeheader()
-        writer.writerow({"broker": "phillips", "executed_at": "2026-07-15"})
-    positions = data_dir / "runs/2026-07/extracted_positions.csv"
-    with positions.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["broker", "statement_id"])
-        writer.writeheader()
-        writer.writerow(
-            {"broker": "phillips", "statement_id": "2026-07-10-phillips"}
-        )
-    service = statement_import.StatementImportService(
-        data_dir=data_dir,
-        eastmoney_password="secret",
+    assert first == second
+    assert first["status"] == "staged"
+    assert first["statement_generation"].startswith("sha256:")
+    generation = first["statement_generation"].removeprefix("sha256:")
+    root = data_dir / "account_statements/generations/phillips" / generation
+    assert (root / "statement.pdf").read_bytes() == PDF_BYTES
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["statement_generation"] == first["statement_generation"]
+    assert len(json.loads((root / "trade_facts.json").read_text(encoding="utf-8"))) == 1
+    assert (root / "candidate/runs/2026-07/extracted_positions.csv").is_file()
+    assert current.read_bytes() == b"accepted-account-state\n"
+    assert not (data_dir / "latest/trend_api_stats.json").exists()
+    assert [path.name for path in root.parent.iterdir()] == [generation]
+    candidate, promoted_generation = (
+        statement_import.load_staged_statement_candidate(data_dir, "phillips")
     )
+    assert promoted_generation == first["statement_generation"]
+    assert candidate.period == "2026-07-12"
+    assert candidate.positions[0].symbol == "00700"
 
-    assert service._latest_statement_period("phillips") == "2026-07-10"
 
-
-def test_import_pdf_restores_archive_when_pipeline_fails(
-    tmp_path: Path,
-    monkeypatch,
+def test_stage_pdf_rejects_older_period_without_mutating_newer_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    monkeypatch.setattr(
-        statement_import, "PhillipsStatementParser", FakePhillipsParser
-    )
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    archive = tmp_path / "data/statements/phillips/2026-07-10/statement.pdf"
-    archive.parent.mkdir(parents=True)
-    archive.write_bytes(b"old statement")
-    monkeypatch.setattr(
-        statement_import,
-        "run_uploaded_statement",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("pipeline failed")),
-    )
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        eastmoney_password="secret",
-    )
+    import open_trader.statement_import as statement_import
 
-    with pytest.raises(RuntimeError, match="pipeline failed"):
-        service.import_pdf("phillips", PDF_BYTES)
-
-    assert archive.read_bytes() == b"old statement"
-
-
-def test_import_pdf_restores_source_when_archive_backup_cleanup_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    parser = FakePhillipsParser()
+    parser = FakePhillipsParser("2026-07-12")
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", lambda: parser
     )
@@ -428,506 +176,228 @@ def test_import_pdf_restores_source_when_archive_backup_cleanup_fails(
         data_dir=data_dir,
         eastmoney_password="secret",
     )
-    service.import_pdf("phillips", PDF_BYTES)
-    archive = data_dir / "statements/phillips/2026-07-10/statement.pdf"
-    original_parse = parser.parse
+    accepted = service.stage_pdf("phillips", PDF_BYTES)
+    parser.detected_date = "2026-07-11"
 
-    def parse_corrected(path: Path, period: str) -> ParseResult:
-        parsed = original_parse(path, period)
-        return replace(
-            parsed,
-            positions=[
-                replace(parsed.positions[0], quantity=Decimal("2")),
-            ],
-        )
+    with pytest.raises(ValueError, match="早于当前结单"):
+        service.stage_pdf("phillips", b"%PDF-1.7\nolder statement")
 
-    monkeypatch.setattr(parser, "parse", parse_corrected)
-    original_unlink = Path.unlink
-
-    def fail_backup_unlink(
-        path: Path, missing_ok: bool = False
-    ) -> None:
-        if path.name.endswith(".backup"):
-            raise OSError("backup cleanup failed")
-        original_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", fail_backup_unlink)
-
-    with pytest.raises(OSError, match="backup cleanup failed"):
-        service.import_pdf("phillips", b"%PDF-1.7\ncorrected")
-
-    assert archive.read_bytes() == PDF_BYTES
-    rows = list(
-        csv.DictReader(
-            (data_dir / "runs/2026-07/extracted_positions.csv").open(
-                encoding="utf-8"
-            )
-        )
-    )
-    phillips_row = next(row for row in rows if row["broker"] == "phillips")
-    assert phillips_row["quantity"] == "1"
+    assert statement_import.load_staged_statement_candidate(
+        data_dir, "phillips"
+    )[1] == accepted["statement_generation"]
+    assert len(list((data_dir / "account_statements/generations/phillips").iterdir())) == 1
 
 
-def test_import_pdf_rejects_empty_parse_without_archiving(
-    tmp_path: Path,
-    monkeypatch,
+def test_same_period_correction_is_a_new_generation_and_latest_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
+    import open_trader.statement_import as statement_import
 
-    class EmptyParser(FakePhillipsParser):
-        def parse(self, path: Path, period: str) -> ParseResult:
-            return ParseResult(statement_id=f"{period}-phillips", broker="phillips")
-
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", EmptyParser)
+    parser = FakePhillipsParser()
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", lambda: parser
+    )
     service = statement_import.StatementImportService(
         data_dir=tmp_path / "data",
         eastmoney_password="secret",
     )
+    first = service.stage_pdf("phillips", PDF_BYTES)
+    parser.quantity = Decimal("2")
+    second = service.stage_pdf("phillips", b"%PDF-1.7\ncorrected")
 
-    with pytest.raises(ValueError, match="没有可导入"):
-        service.import_pdf("phillips", PDF_BYTES)
+    candidate, generation = statement_import.load_staged_statement_candidate(
+        tmp_path / "data", "phillips"
+    )
 
-    assert not (tmp_path / "data/statements").exists()
+    assert first["statement_generation"] != second["statement_generation"]
+    assert generation == second["statement_generation"]
+    assert candidate.positions[0].quantity == Decimal("2")
 
 
-def test_import_pdf_rejects_unsupported_broker(tmp_path: Path) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    service = statement_import.StatementImportService(
+@pytest.mark.parametrize(
+    ("broker", "body", "message"),
+    [
+        ("phillips", b"not a pdf", "有效的 PDF"),
+        ("unknown", PDF_BYTES, "不支持的券商"),
+    ],
+)
+def test_stage_pdf_rejects_malformed_input_without_artifacts(
+    tmp_path: Path,
+    broker: str,
+    body: bytes,
+    message: str,
+) -> None:
+    from open_trader.statement_import import StatementImportService
+
+    service = StatementImportService(
         data_dir=tmp_path / "data",
         eastmoney_password="secret",
     )
 
-    with pytest.raises(ValueError, match="不支持的券商"):
-        service.import_pdf("futu", PDF_BYTES)
+    with pytest.raises(ValueError, match=message):
+        service.stage_pdf(broker, body)
+
+    assert not (tmp_path / "data/account_statements").exists()
 
 
-def test_import_pdf_uses_eastmoney_password_month_archive_and_fixed_fx(
-    tmp_path: Path,
-    monkeypatch,
+def test_stage_pdf_requires_eastmoney_password_and_uses_month_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
+    import open_trader.statement_import as statement_import
+
     FakeEastmoneyParser.passwords.clear()
     monkeypatch.setattr(
         statement_import, "EastmoneyStatementParser", FakeEastmoneyParser
     )
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
+    data_dir = tmp_path / "data"
+    with pytest.raises(ValueError, match="未配置"):
+        statement_import.StatementImportService(
+            data_dir=data_dir,
+            eastmoney_password="",
+        ).stage_pdf("eastmoney", PDF_BYTES)
+
+    result = statement_import.StatementImportService(
+        data_dir=data_dir,
         eastmoney_password="local-secret",
-    )
+    ).stage_pdf("eastmoney", PDF_BYTES)
 
-    result = service.import_pdf("eastmoney", PDF_BYTES)
-
-    assert result["statement_date"] == "2026-07-12"
+    assert result["statement_period"] == "2026-07"
     assert FakeEastmoneyParser.passwords == ["local-secret"]
-    assert (
-        tmp_path / "data/statements/eastmoney/2026-07/statement.pdf"
-    ).read_bytes() == PDF_BYTES
-    eastmoney = next(
-        row
-        for row in csv.DictReader(
-            (tmp_path / "data/runs/2026-07/portfolio.csv").open(encoding="utf-8")
-        )
-        if row["brokers"] == "eastmoney"
-    )
-    assert eastmoney["fx_to_hkd"] == "1.08"
-    assert eastmoney["fx_date"] == "2026-07-12"
 
 
-def test_same_month_eastmoney_then_phillips_upload_keeps_both_brokers(
-    tmp_path: Path, monkeypatch
+def test_worker_validation_rejects_tampered_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    monkeypatch.setattr(
-        statement_import, "EastmoneyStatementParser", FakeEastmoneyParser
-    )
+    import open_trader.statement_import as statement_import
+
     monkeypatch.setattr(
         statement_import, "PhillipsStatementParser", FakePhillipsParser
     )
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        eastmoney_password="secret",
-    )
-
-    service.import_pdf("eastmoney", PDF_BYTES)
-    service.import_pdf("phillips", PDF_BYTES)
-
-    rows = list(
-        csv.DictReader((tmp_path / "data/runs/2026-07/portfolio.csv").open(encoding="utf-8"))
-    )
-    assert {row["brokers"] for row in rows} == {"eastmoney", "phillips"}
-
-
-def test_import_pdf_allows_same_date_replacement(tmp_path: Path, monkeypatch) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    monkeypatch.setattr(
-        statement_import, "PhillipsStatementParser", FakePhillipsParser
-    )
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        eastmoney_password="secret",
-    )
-    service.import_pdf("phillips", PDF_BYTES)
-    replacement = b"%PDF-1.7\ncorrected statement"
-
-    service.import_pdf("phillips", replacement)
-
-    assert (
-        tmp_path / "data/statements/phillips/2026-07-10/statement.pdf"
-    ).read_bytes() == replacement
-
-
-def test_statement_upload_immediately_rebuilds_actual_stats_and_is_idempotent(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    parser = FakeTradePhillipsParser()
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: parser)
-    reports_dir = tmp_path / "reports"
-    write_hk_strategy_reports(reports_dir)
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        reports_dir=reports_dir,
-        eastmoney_password="secret",
-    )
-
-    first = service.import_pdf("phillips", PDF_BYTES)
-    first_payload = load_trend_api_stats(tmp_path / "data")
-    second = service.import_pdf("phillips", PDF_BYTES)
-    second_payload = load_trend_api_stats(tmp_path / "data")
-
-    assert first["trades"] == 2
-    assert first["actual_rounds"] == 1
-    assert first["statistics_cutoff_at"] == "2026-07-12T23:59:59+08:00"
-    assert second["actual_rounds"] == 1
-    assert len(second_payload["fills"]) == 2
-    assert len(second_payload["rounds"]) == 1
-    assert second_payload["rounds"] == first_payload["rounds"]
-    actual = next(
-        stat
-        for stat in second_payload["stats"]
-        if stat["source"] == "actual"
-        and stat["market"] == "HK"
-        and stat["opening_strategy_version"] == "v4"
-    )
-    assert actual["eligible_sample_count"] == 1
-    assert actual["win_rate"] == "1"
-    assert actual["payoff_ratio_status"] == "no_losses"
-
-
-def test_corrected_statement_replaces_period_facts_instead_of_appending(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    parser = FakeTradePhillipsParser()
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: parser)
-    reports_dir = tmp_path / "reports"
-    write_hk_strategy_reports(reports_dir)
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        reports_dir=reports_dir,
-        eastmoney_password="secret",
-    )
-    service.import_pdf("phillips", PDF_BYTES)
-    parser.sell_price = Decimal("9")
-
-    service.import_pdf("phillips", b"%PDF-1.7\ncorrected")
-    payload = load_trend_api_stats(tmp_path / "data")
-
-    assert len(payload["fills"]) == 2
-    assert len(payload["rounds"]) == 1
-    assert payload["rounds"][0]["sell_notional"] == "90"
-    actual = next(
-        stat
-        for stat in payload["stats"]
-        if stat["source"] == "actual" and stat["market"] == "HK"
-    )
-    assert actual["eligible_sample_count"] == 1
-    assert actual["win_rate"] == "0"
-    assert actual["payoff_ratio_status"] == "no_wins"
-
-
-def test_new_statement_without_trades_keeps_samples_and_advances_source_cutoff(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    parser = FakeTradePhillipsParser()
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: parser)
-    reports_dir = tmp_path / "reports"
-    write_hk_strategy_reports(reports_dir)
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        reports_dir=reports_dir,
-        eastmoney_password="secret",
-    )
-    service.import_pdf("phillips", PDF_BYTES)
-    parser.detected_date = "2026-07-13"
-    parser.include_trades = False
-
-    result = service.import_pdf("phillips", b"%PDF-1.7\nno trades")
-    payload = load_trend_api_stats(tmp_path / "data")
-
-    assert result["trades"] == 0
-    assert result["statistics_cutoff_at"] == "2026-07-13T23:59:59+08:00"
-    assert len(payload["fills"]) == 2
-    assert len(payload["rounds"]) == 1
-    source = next(
-        source for source in payload["sources"] if source["broker"] == "phillips"
-    )
-    assert source["statistics_cutoff_at"] == "2026-07-13T23:59:59+08:00"
-
-
-def test_stats_write_failure_keeps_accepted_source_and_previous_stats(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    parser = FakeTradePhillipsParser()
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: parser)
-    reports_dir = tmp_path / "reports"
-    write_hk_strategy_reports(reports_dir)
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
     data_dir = tmp_path / "data"
-    service = statement_import.StatementImportService(
-        data_dir=data_dir,
-        reports_dir=reports_dir,
-        eastmoney_password="secret",
-    )
-    service.import_pdf("phillips", PDF_BYTES)
-    archive = data_dir / "statements/phillips/2026-07-12/statement.pdf"
-    stats_path = data_dir / "latest/trend_api_stats.json"
-    before_stats = stats_path.read_bytes()
-    original_parse = parser.parse
-
-    def parse_corrected(path: Path, period: str) -> ParseResult:
-        parsed = original_parse(path, period)
-        return replace(
-            parsed,
-            positions=[
-                replace(parsed.positions[0], quantity=Decimal("2")),
-            ],
-        )
-
-    monkeypatch.setattr(parser, "parse", parse_corrected)
-    parser.sell_price = Decimal("9")
-    monkeypatch.setattr(
-        statement_import,
-        "write_trend_api_stats",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stats failed")),
-    )
-
-    result = service.import_pdf("phillips", b"%PDF-1.7\ncorrected")
-
-    assert result["status"] == "ok"
-    assert result["statistics_status"] == "failed"
-    assert result["actual_rounds"] is None
-    assert result["statistics_cutoff_at"] is None
-    assert archive.read_bytes() == b"%PDF-1.7\ncorrected"
-    assert Path(result["run_path"]).is_dir()
-    assert stats_path.read_bytes() == before_stats
-    rows = list(
-        csv.DictReader(
-            (Path(result["run_path"]) / "extracted_positions.csv").open(
-                encoding="utf-8"
-            )
-        )
-    )
-    phillips_row = next(row for row in rows if row["broker"] == "phillips")
-    assert phillips_row["quantity"] == "2"
-
-
-def test_eastmoney_statistics_clock_failure_keeps_same_period_statement(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    monkeypatch.setattr(
-        statement_import, "EastmoneyStatementParser", FakeEastmoneyParser
-    )
-    data_dir = tmp_path / "data"
-    service = statement_import.StatementImportService(
+    staged = statement_import.StatementImportService(
         data_dir=data_dir,
         eastmoney_password="secret",
+    ).stage_pdf("phillips", PDF_BYTES)
+    generation = staged["statement_generation"].removeprefix("sha256:")
+    pdf = (
+        data_dir
+        / "account_statements/generations/phillips"
+        / generation
+        / "statement.pdf"
     )
-    service.import_pdf("eastmoney", PDF_BYTES)
-    archive = data_dir / "statements/eastmoney/2026-07/statement.pdf"
-    stats_path = data_dir / "latest/trend_api_stats.json"
-    before_stats = stats_path.read_bytes()
-    replacement = b"%PDF-1.7\nsame period replacement"
-    monkeypatch.setattr(
-        statement_import,
-        "build_statement_actual_stats_payload",
-        lambda **kwargs: (_ for _ in ()).throw(
-            ValueError("generated_at must not precede statistics_cutoff_at")
-        ),
-    )
+    pdf.write_bytes(b"%PDF-1.7\ntampered")
 
-    result = service.import_pdf("eastmoney", replacement)
+    with pytest.raises(ValueError, match="invalid statement generation"):
+        statement_import.load_staged_statement_candidate(data_dir, "phillips")
 
-    assert result["status"] == "ok"
-    assert result["broker"] == "eastmoney"
-    assert result["statistics_status"] == "failed"
-    assert result["actual_rounds"] is None
-    assert result["statistics_cutoff_at"] is None
-    assert Path(result["run_path"]).is_dir()
-    assert archive.read_bytes() == replacement
-    assert stats_path.read_bytes() == before_stats
+    with pytest.raises(ValueError, match="invalid statement generation"):
+        statement_import.StatementImportService(
+            data_dir=data_dir,
+            eastmoney_password="secret",
+        ).stage_pdf("phillips", PDF_BYTES)
 
 
-def test_same_day_statement_buy_and_sell_are_excluded_when_time_is_unavailable(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-
-    class SameDayParser(FakeTradePhillipsParser):
-        def parse(self, path: Path, period: str) -> ParseResult:
-            parsed = super().parse(path, period)
-            return replace(
-                parsed,
-                trades=[
-                    parsed.trades[0],
-                    replace(
-                        parsed.trades[1],
-                        traded_at="2026-07-10T16:00:00+08:00",
-                    ),
-                ],
-            )
-
-    parser = SameDayParser()
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: parser)
-    reports_dir = tmp_path / "reports"
-    report_dir = reports_dir / "trend_hk_phillips"
-    report_dir.mkdir(parents=True)
-    (report_dir / "2026-07-10.json").write_text(
-        json.dumps({
-            "execution_date": "2026-07-10",
-            "metadata": {"market": "HK"},
-            "strategy_snapshot": {
-                "strategy_id": "trend_animals_warm_to_hot/HK/v4",
-                "strategy_version": "v4",
-            },
-            "strategy_judgments": {"formal_actions": [
-                {"action": "BUY", "symbol": "00700"},
-                {"action": "SELL_ALL", "symbol": "00700"},
-            ]},
-        }),
-        encoding="utf-8",
-    )
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    service = statement_import.StatementImportService(
-        data_dir=tmp_path / "data",
-        reports_dir=reports_dir,
-        eastmoney_password="secret",
-    )
-
-    service.import_pdf("phillips", PDF_BYTES)
-    payload = load_trend_api_stats(tmp_path / "data")
-
-    assert {fill["attribution_status"] for fill in payload["fills"]} == {"ambiguous"}
-    assert {fill["exclusion_reason"] for fill in payload["fills"]} == {
-        "statement_trade_time_unavailable"
-    }
-    actual = next(
-        stat
-        for stat in payload["stats"]
-        if stat["source"] == "actual" and stat["market"] == "HK"
-    )
-    assert actual["eligible_sample_count"] == 0
-
-
-def test_statement_parse_failure_preserves_previous_stats_and_cutoff(
-    tmp_path: Path, monkeypatch
-) -> None:
-    statement_import = importlib.import_module("open_trader.statement_import")
-    parser = FakeTradePhillipsParser()
-    monkeypatch.setattr(statement_import, "PhillipsStatementParser", lambda: parser)
-    reports_dir = tmp_path / "reports"
-    write_hk_strategy_reports(reports_dir)
-    portfolio_path = tmp_path / "portfolio.csv"
-    write_existing_portfolio(portfolio_path)
-    data_dir = tmp_path / "data"
-    service = statement_import.StatementImportService(
-        data_dir=data_dir,
-        reports_dir=reports_dir,
-        eastmoney_password="secret",
-    )
-    service.import_pdf("phillips", PDF_BYTES)
-    before = (data_dir / "latest/trend_api_stats.json").read_bytes()
-    parser.parse = lambda path, period: (_ for _ in ()).throw(  # type: ignore[method-assign]
-        ValueError("辉立成交表格式无法识别")
-    )
-
-    with pytest.raises(ValueError, match="成交表格式无法识别"):
-        service.import_pdf("phillips", b"%PDF-1.7\nbroken")
-
-    assert (data_dir / "latest/trend_api_stats.json").read_bytes() == before
-    payload = load_trend_api_stats(data_dir)
-    source = next(
-        source for source in payload["sources"] if source["broker"] == "phillips"
-    )
-    assert source["statistics_cutoff_at"] == "2026-07-12T23:59:59+08:00"
-
-
-def test_overlapping_statement_period_moves_identical_source_fact_without_duplicate(
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "trade_facts.json",
+        "candidate/runs/2026-07/extracted_positions.csv",
+    ],
+)
+def test_worker_validation_rejects_tampered_derived_artifact(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
 ) -> None:
-    def source_fill(period: str) -> dict[str, object]:
-        return {
-            "fill_id": "statement:eastmoney:stable-trade",
-            "order_id": "statement:eastmoney:stable-trade",
-            "source": "actual",
-            "source_id": "actual:eastmoney:eastmoney_main",
-            "broker": "eastmoney",
-            "account_id": "eastmoney_main",
-            "market": "CN",
-            "symbol": "600000",
-            "currency": "CNY",
-            "side": "buy",
-            "quantity": "100",
-            "price": "10",
-            "fee": "5",
-            "costs_complete": True,
-            "filled_at": "2026-07-10T15:00:00+08:00",
-            "execution_granularity": "statement_trade_date",
-            "timestamp_semantics": "market_close_ordering_sentinel",
-            "statement_sequence": 1,
-            "statement_period": period,
-            "strategy_id": "",
-            "strategy_version": "",
-            "report_sha256": "",
-            "attribution_status": "outside_strategy",
-            "exclusion_reason": "no_matching_opening_strategy_action",
-        }
+    import open_trader.statement_import as statement_import
 
-    july = build_statement_actual_stats_payload(
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        broker="eastmoney",
-        statement_period="2026-07",
-        fills=[source_fill("2026-07")],
-        generated_at="2026-07-31T23:59:59+08:00",
-        statistics_cutoff_at="2026-07-31T23:59:59+08:00",
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", FakePhillipsParser
     )
-    write_trend_api_stats(tmp_path / "data", july)
+    data_dir = tmp_path / "data"
+    staged = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    ).stage_pdf("phillips", PDF_BYTES)
+    root = (
+        data_dir
+        / "account_statements/generations/phillips"
+        / staged["statement_generation"].removeprefix("sha256:")
+    )
+    artifact = root / relative_path
+    artifact.write_bytes(artifact.read_bytes() + b"\n")
 
-    august = build_statement_actual_stats_payload(
-        data_dir=tmp_path / "data",
-        reports_dir=tmp_path / "reports",
-        broker="eastmoney",
-        statement_period="2026-08",
-        fills=[source_fill("2026-08")],
-        generated_at="2026-08-31T23:59:59+08:00",
-        statistics_cutoff_at="2026-08-31T23:59:59+08:00",
+    with pytest.raises(ValueError, match="invalid statement generation"):
+        statement_import.load_staged_statement_candidate(data_dir, "phillips")
+
+
+def test_statement_generation_binds_derived_artifact_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.statement_import as statement_import
+
+    monkeypatch.setattr(
+        statement_import, "PhillipsStatementParser", FakePhillipsParser
+    )
+    data_dir = tmp_path / "data"
+    staged = statement_import.StatementImportService(
+        data_dir=data_dir,
+        eastmoney_password="secret",
+    ).stage_pdf("phillips", PDF_BYTES)
+    root = (
+        data_dir
+        / "account_statements/generations/phillips"
+        / staged["statement_generation"].removeprefix("sha256:")
+    )
+    positions = root / "candidate/runs/2026-07/extracted_positions.csv"
+    positions.write_bytes(positions.read_bytes() + b"\n")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["candidate_sha256"] = statement_import._directory_sha256(
+        root / "candidate"
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid statement generation"):
+        statement_import.load_staged_statement_candidate(data_dir, "phillips")
+
+
+def test_stage_pdf_normalizes_unexpected_parser_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.statement_import as statement_import
+
+    class BrokenParser:
+        def statement_date(self, _path: Path) -> str:
+            raise RuntimeError("pdf internals")
+
+    monkeypatch.setattr(statement_import, "PhillipsStatementParser", BrokenParser)
+
+    with pytest.raises(ValueError, match="辉立结单无法解析"):
+        statement_import.StatementImportService(
+            data_dir=tmp_path / "data",
+            eastmoney_password="secret",
+        ).stage_pdf("phillips", PDF_BYTES)
+
+
+def test_same_day_trade_fact_cutoff_covers_market_close_sentinel() -> None:
+    from open_trader.statement_import import _statement_cutoff
+
+    staged_at = datetime.fromisoformat("2026-08-04T13:00:00+08:00")
+
+    assert _statement_cutoff(
+        "2026-08-04",
+        "phillips",
+        staged_at,
+        [{"filled_at": "2026-08-04T16:00:00+08:00"}],
+    ) == (
+        "2026-08-04T16:00:00+08:00"
     )
 
-    assert len(august["fills"]) == 1
-    assert august["fills"][0]["statement_period"] == "2026-08"
+    with pytest.raises(ValueError, match="晚于结单日期"):
+        _statement_cutoff(
+            "2026-08-04",
+            "phillips",
+            staged_at,
+            [{"filled_at": "2026-08-05T16:00:00+08:00"}],
+        )

@@ -446,6 +446,15 @@ def _build_snapshot(
             "reason": "quotes_refresh_failed" if quotes_stale else None,
         },
     }
+    accepted_statement_generation = {
+        broker: str(generation)
+        for broker, generation in sorted(
+            dict(account.get("accepted_statement_generation") or {
+                "phillips": "",
+                "eastmoney": "",
+            }).items()
+        )
+    }
     account_generation = _sha256({
         "summary": summary,
         "broker_summaries": broker_summaries,
@@ -455,10 +464,12 @@ def _build_snapshot(
         "accepted_broker_data_as_of": {
             broker: brokers[broker]["data_as_of"] for broker in sorted(REQUIRED_BROKERS)
         },
+        "accepted_statement_generation": accepted_statement_generation,
     })
     payload_without_snapshot_generation = {
         "schema_version": 1,
         "account_generation": account_generation,
+        "accepted_statement_generation": accepted_statement_generation,
         "generated_at": projection["generated_at"],
         "quote_as_of": quote_as_of,
         "status": "stale" if stale else "healthy",
