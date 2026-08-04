@@ -5075,11 +5075,8 @@ def test_acceptance_open_report_layout_rejects_contract_drift(
 
 
 def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        dashboard_acceptance, "ACCEPTANCE_SCREENSHOT_DIR", tmp_path / "screenshots"
-    )
     payload = valid_payload()
     reports = payload["trend_reports"]
     visited: list[str] = []
@@ -5272,12 +5269,12 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         _simulate_payloads: object,
         _history_expectations: object,
         *,
-        screenshot_dir: Path,
+        screenshot_dir: Path | None = None,
     ) -> None:
         if state["fail_trend_account_views"]:
             raise AssertionError("controller unavailable")
         width = page.viewport_size["width"]
-        if width in {1440, 375}:
+        if screenshot_dir is not None and width in {1440, 375}:
             page.screenshot(
                 path=str(screenshot_dir / f"{width}-trend-review.png"),
                 full_page=True,
@@ -5287,13 +5284,14 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         page: Page,
         _payload: object,
         *,
-        screenshot_dir: Path,
+        screenshot_dir: Path | None = None,
     ) -> None:
         width = page.viewport_size["width"]
-        page.screenshot(
-            path=str(screenshot_dir / f"{width}-trend-report.png"),
-            full_page=True,
-        )
+        if screenshot_dir is not None:
+            page.screenshot(
+                path=str(screenshot_dir / f"{width}-trend-report.png"),
+                full_page=True,
+            )
 
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -5392,19 +5390,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         ] == list(VISUAL_CONTRACT_STYLES)
     assert geometry_evaluations == []
     assert buy_overflow_evaluations == []
-    screenshot_dir = dashboard_acceptance.ACCEPTANCE_SCREENSHOT_DIR
-    assert screenshots == [
-        ("wide_desktop", str(screenshot_dir / "wide_desktop-portfolio.png")),
-        ("wide_desktop", str(screenshot_dir / "1920-trend-report.png")),
-        ("desktop", str(screenshot_dir / "desktop-portfolio.png")),
-        ("desktop", str(screenshot_dir / "1440-trend-report.png")),
-        ("desktop", str(screenshot_dir / "1440-trend-review.png")),
-        ("tablet", str(screenshot_dir / "tablet-portfolio.png")),
-        ("tablet", str(screenshot_dir / "760-trend-report.png")),
-        ("mobile", str(screenshot_dir / "mobile-portfolio.png")),
-        ("mobile", str(screenshot_dir / "375-trend-report.png")),
-        ("mobile", str(screenshot_dir / "375-trend-review.png")),
-    ]
+    assert screenshots == []
 
     state["fail_trend_account_views"] = True
     screenshots.clear()

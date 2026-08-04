@@ -4857,7 +4857,6 @@ def _browser_check(
     except ImportError:
         return [], "Playwright 未安装"
     errors: list[str] = []
-    _prepare_acceptance_screenshots()
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
@@ -4927,12 +4926,6 @@ def _browser_check(
                     page_payload = _page_dashboard_payload(page)
                     _check_visual_contract(page)
                     _check_source_status_panel(page, page_payload)
-                    page.screenshot(
-                        path=str(
-                            ACCEPTANCE_SCREENSHOT_DIR / f"{name}-portfolio.png"
-                        ),
-                        full_page=True,
-                    )
                     if "看板数据加载失败" in page.locator("body").inner_text():
                         errors.append(f"{name}：页面显示看板数据加载失败")
                     try:
@@ -4948,7 +4941,6 @@ def _browser_check(
                             page,
                             payload,
                             reports_dir=reports_dir,
-                            screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
                         )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
@@ -4956,7 +4948,6 @@ def _browser_check(
                         _check_separated_trend_report_views(
                             page,
                             payload,
-                            screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
                         )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
@@ -4967,7 +4958,6 @@ def _browser_check(
                                 payload,
                                 _refresh_simulate_payloads(url, simulate_payloads),
                                 history_expectations,
-                                screenshot_dir=ACCEPTANCE_SCREENSHOT_DIR,
                             )
                         except Exception as exc:
                             errors.append(f"{name}：{type(exc).__name__}: {exc}")
