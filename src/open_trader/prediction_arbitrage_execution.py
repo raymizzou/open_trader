@@ -2195,6 +2195,8 @@ class PredictionExecutionService:
 
     @staticmethod
     def _proof_has_order_refs(proof: Mapping[str, object], venue: str) -> bool:
+        if proof.get("venue") != venue:
+            return False
         direct_orders = proof.get("order_ids")
         direct_trades = proof.get("trade_ids")
         if PredictionExecutionService._has_order_trade_refs(direct_orders, direct_trades):

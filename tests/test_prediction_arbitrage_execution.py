@@ -1852,6 +1852,46 @@ def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verif
                 }
             ),
         ),
+        (
+            "polymarket_direct_refs_with_predict_venue",
+            lambda trading, _cross, _predict: trading.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "predict.fun",
+                        "fee": Decimal("0.05"),
+                        "order_ids": ["poly-order"],
+                        "trade_ids": ["poly-trade"],
+                    },
+                }
+            ),
+        ),
+        (
+            "predict_direct_refs_with_polymarket_venue",
+            lambda _trading, _cross, predict: predict.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "polymarket",
+                        "fee": Decimal("0.05"),
+                        "order_ids": ["predict-order"],
+                        "trade_ids": ["predict-trade"],
+                    },
+                }
+            ),
+        ),
     ],
 )
 def test_cross_canary_cap_stays_five_after_non_graduating_outcomes(
