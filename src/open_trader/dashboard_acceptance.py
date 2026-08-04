@@ -1080,6 +1080,8 @@ def _account_outage_isolation_errors(
 def _controlled_account_outage_errors(
     gateway_url: str, expected_root: Path,
 ) -> list[str]:
+    runtime_root = _project_data_dir(expected_root).parent
+
     def stop_account_api() -> None:
         result = subprocess.run(
             [
@@ -1097,6 +1099,8 @@ def _controlled_account_outage_errors(
             [
                 str(expected_root / "scripts/install_account_api_launchd.sh"),
                 "--mode", "production", "--repo-root", str(expected_root),
+                "--runtime-root", str(runtime_root),
+                "--python", str(runtime_root / ".venv/bin/python"),
             ],
             capture_output=True,
             text=True,

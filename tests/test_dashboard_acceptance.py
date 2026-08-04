@@ -7222,6 +7222,47 @@ def test_account_outage_isolation_fails_closed_and_restores_account() -> None:
     ]
 
 
+def test_controlled_account_outage_restores_shared_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_root = tmp_path / "worktree"
+    runtime_root = tmp_path / "runtime"
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_project_data_dir",
+        lambda _root: runtime_root / "data",
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command) or SimpleNamespace(returncode=0)
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_fetch_status_payload",
+        lambda _url, path: (
+            (503, {"code": "account_module_unavailable"})
+            if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH
+            else (200, {"holding_enrichment": []})
+        ),
+    )
+
+    assert dashboard_acceptance._controlled_account_outage_errors(
+        "http://gateway.test", expected_root,
+    ) == []
+    assert commands[-1] == [
+        str(expected_root / "scripts/install_account_api_launchd.sh"),
+        "--mode", "production",
+        "--repo-root", str(expected_root),
+        "--runtime-root", str(runtime_root),
+        "--python", str(runtime_root / ".venv/bin/python"),
+    ]
+
+
 def test_account_snapshot_refresh_rejects_unchanged_publication() -> None:
     snapshot = {
         "snapshot_generation": "sha256:first",
