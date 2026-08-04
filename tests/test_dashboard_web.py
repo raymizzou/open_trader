@@ -1005,12 +1005,12 @@ def test_dashboard_statement_upload_is_right_aligned_and_desktop_only() -> None:
     assert "display: none;" in upload
 
 
-def test_dashboard_statement_upload_posts_pdf_and_reloads_dashboard() -> None:
+def test_dashboard_statement_upload_posts_to_account_and_reports_staged() -> None:
     output = run_dashboard_js(r'''
 const calls=[];
 globalThis.fetch=async (url, options) => {
   calls.push({url, method:options.method, contentType:options.headers["Content-Type"], body:options.body.name});
-  return {ok:true,status:200,json:async()=>({status:"ok",statement_date:"2026-07-10",positions:3})};
+  return {ok:true,status:202,json:async()=>({status:"staged",statement_date:"2026-07-10",statement_generation:"sha256:one",positions:3})};
 };
 let reloads=0;
 loadDashboard=async()=>{reloads+=1;};
@@ -1020,27 +1020,27 @@ console.log(JSON.stringify({calls,reloads,payload}));
     result = json.loads(output)
     assert result["calls"] == [
         {
-            "url": "/api/statements/phillips",
+            "url": "/api/v1/account/statements/phillips",
             "method": "POST",
             "contentType": "application/pdf",
             "body": "statement.pdf",
         }
     ]
-    assert result["reloads"] == 1
+    assert result["reloads"] == 0
     assert result["payload"]["positions"] == 3
 
 
-def test_dashboard_statement_upload_reports_deferred_statistics_without_failing() -> None:
+def test_dashboard_statement_upload_reports_staged_without_claiming_trend_update() -> None:
     output = run_dashboard_js(r'''
 state.statementUpload={broker:"",busy:false,message:"",error:false};
 globalThis.fetch=async()=>({
   ok:true,
-  status:200,
+  status:202,
   json:async()=>({
-    status:"ok",
+    status:"staged",
     statement_date:"2026-07-30",
     positions:12,
-    statistics_status:"failed",
+    statement_generation:"sha256:one",
   }),
 });
 loadDashboard=async()=>{};
@@ -1060,7 +1060,7 @@ console.log(JSON.stringify(state.statementUpload));
     assert json.loads(output) == {
         "broker": "eastmoney",
         "busy": False,
-        "message": "已导入 2026-07-30 · 持仓 12 · 统计待重建",
+        "message": "已暂存 2026-07-30 · 等待账户同步",
         "error": False,
     }
 
@@ -1771,22 +1771,6 @@ class FakeTrendSimulatePositionService:
     def load(self, broker: str) -> dict[str, Any]:
         self.calls.append(broker)
         return {"broker": broker, "positions": []}
-
-
-class FakeStatementImportService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, bytes]] = []
-
-    def import_pdf(self, broker: str, body: bytes) -> dict[str, Any]:
-        self.calls.append((broker, body))
-        return {
-            "status": "ok",
-            "broker": broker,
-            "statement_date": "2026-07-10",
-            "positions": 1,
-            "cash": 1,
-            "warnings": 0,
-        }
 
 
 class FakeBacktestPriceProvider:
@@ -13520,52 +13504,42 @@ def test_serve_dashboard_configures_simulate_accounts_once(
     assert "account_sync_service" not in server_kwargs
 
 
-def test_dashboard_server_imports_loopback_pdf_statement(tmp_path) -> None:
+def test_dashboard_server_has_no_legacy_statement_route(tmp_path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
     config = dashboard_config(tmp_path)
-    importer = FakeStatementImportService()
     server = create_dashboard_server(
         config=config,
         host="127.0.0.1",
         port=0,
-        statement_import_service=importer,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     try:
         host, port = server.server_address
-        payload = post_pdf(
+        request = urllib.request.Request(
             f"http://{host}:{port}/api/statements/phillips",
-            b"%PDF-1.7\nstatement",
+            data=b"%PDF-1.7\nstatement",
+            method="POST",
+            headers={"Content-Type": "application/pdf"},
         )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request, timeout=5)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
-    assert payload["statement_date"] == "2026-07-10"
-    assert importer.calls == [("phillips", b"%PDF-1.7\nstatement")]
+    assert rejected.value.code == 404
+    assert rejected.value.read() == b"not found"
 
 
-def test_dashboard_server_builds_candidate_only_statement_import_service(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+def test_dashboard_server_does_not_construct_statement_import_service(
+    tmp_path,
 ) -> None:
     from open_trader import dashboard_web
 
-    captured: dict[str, object] = {}
-
-    class CandidateOnlyStatementImportService:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
-
-        def import_pdf(self, broker: str, body: bytes) -> dict[str, object]:
-            return {"broker": broker}
-
-    monkeypatch.setattr(
-        dashboard_web, "StatementImportService", CandidateOnlyStatementImportService
-    )
     config = dashboard_config(tmp_path)
     server = dashboard_web.create_dashboard_server(
         config=config,
@@ -13573,112 +13547,9 @@ def test_dashboard_server_builds_candidate_only_statement_import_service(
         port=0,
     )
     try:
-        assert captured == {
-            "data_dir": config.data_dir,
-            "reports_dir": config.reports_dir,
-            "eastmoney_password": "",
-        }
+        assert not hasattr(dashboard_web, "StatementImportService")
     finally:
         server.server_close()
-
-
-def test_dashboard_server_returns_statement_parse_failure_reason(tmp_path) -> None:
-    from open_trader.dashboard_web import create_dashboard_server
-
-    class FailingStatementImportService:
-        def import_pdf(self, broker: str, body: bytes) -> dict[str, Any]:
-            raise ValueError("辉立成交表格式无法识别")
-
-    server = create_dashboard_server(
-        config=dashboard_config(tmp_path),
-        host="127.0.0.1",
-        port=0,
-        statement_import_service=FailingStatementImportService(),
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        host, port = server.server_address
-        status, payload = post_pdf_error(
-            f"http://{host}:{port}/api/statements/phillips",
-            b"%PDF-1.7\nbroken",
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert status == 400
-    assert payload["message"] == "辉立成交表格式无法识别"
-
-
-@pytest.mark.parametrize(
-    ("content_type", "body", "message"),
-    [
-        ("application/json", b"%PDF-1.7", "请求正文必须是 PDF"),
-        ("application/pdf", b"not a pdf", "请求正文必须是有效的 PDF"),
-    ],
-)
-def test_dashboard_server_rejects_invalid_statement_body(
-    tmp_path,
-    content_type: str,
-    body: bytes,
-    message: str,
-) -> None:
-    from open_trader.dashboard_web import create_dashboard_server
-
-    server = create_dashboard_server(
-        config=dashboard_config(tmp_path),
-        host="127.0.0.1",
-        port=0,
-        statement_import_service=FakeStatementImportService(),
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        host, port = server.server_address
-        status, payload = post_pdf_error(
-            f"http://{host}:{port}/api/statements/phillips",
-            body,
-            content_type=content_type,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert status == 400
-    assert payload["message"] == message
-
-
-def test_dashboard_server_rejects_statement_larger_than_twenty_mib(tmp_path) -> None:
-    from open_trader.dashboard_web import create_dashboard_server
-
-    server = create_dashboard_server(
-        config=dashboard_config(tmp_path),
-        host="127.0.0.1",
-        port=0,
-        statement_import_service=FakeStatementImportService(),
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    host, port = server.server_address
-    connection = http.client.HTTPConnection(host, port, timeout=5)
-    try:
-        connection.putrequest("POST", "/api/statements/phillips")
-        connection.putheader("Content-Type", "application/pdf")
-        connection.putheader("Content-Length", str(20 * 1024 * 1024 + 1))
-        connection.endheaders()
-        response = connection.getresponse()
-        payload = json.loads(response.read().decode("utf-8"))
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert response.status == 413
-    assert payload["message"] == "PDF 不能超过 20 MiB"
 
 
 @pytest.mark.parametrize(

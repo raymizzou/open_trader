@@ -63,7 +63,6 @@ from .prediction_title_translation import (
 )
 from .research_chat import ResearchChatError, ResearchChatService
 from .standard_strategies import strategy_catalog
-from .statement_import import StatementImportService
 from .strategy_backtest import (
     StandardBacktestRequest,
     run_standard_backtest,
@@ -80,7 +79,6 @@ STANDARD_BACKTEST_REQUEST_KEYS = {
     "initial_cash", "max_strategy_weight", "commission_bps", "slippage_bps",
 }
 MAX_JSON_BODY_BYTES = 1024 * 1024
-MAX_PDF_BODY_BYTES = 20 * 1024 * 1024
 
 
 class RequestBodyTooLargeError(Exception):
@@ -1337,9 +1335,7 @@ def create_dashboard_server(
     port: int,
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
-    statement_import_service: StatementImportService | None = None,
     trend_simulate_position_service: TrendSimulatePositionService | None = None,
-    eastmoney_password: str = "",
     prediction_store: PredictionArbitrageStore | None = None,
     prediction_monitor: object | None = None,
     cross_venue_monitor: PredictCrossVenueMonitor | None = None,
@@ -1349,12 +1345,6 @@ def create_dashboard_server(
     runtime_metadata: Mapping[str, object] | None = None,
 ) -> ThreadingHTTPServer:
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
-    import_service = statement_import_service or StatementImportService(
-        data_dir=config.data_dir,
-        reports_dir=config.reports_dir,
-        eastmoney_password=eastmoney_password,
-    )
-    portfolio_update_lock = threading.Lock()
     prediction_session = prediction_session_token or secrets.token_urlsafe(32)
     prediction_csrf = prediction_csrf_token or secrets.token_urlsafe(32)
     health_runtime = dict(
@@ -1511,18 +1501,6 @@ def create_dashboard_server(
                         incident_id = self._required_prediction_string(payload, "incident_id")
                         result = prediction_execution_service.reset_breaker(incident_id)
                     self._send_json(_prediction_safe_value(result))
-                    return
-                if path in {
-                    "/api/statements/phillips",
-                    "/api/statements/eastmoney",
-                }:
-                    if not _is_loopback_address(self.client_address[0]):
-                        raise PermissionError("结单上传仅允许从本机访问")
-                    broker = path.rsplit("/", 1)[-1]
-                    with portfolio_update_lock:
-                        self._send_json(
-                            import_service.import_pdf(broker, self._read_pdf_body())
-                        )
                     return
                 if path == "/api/research-chat/sessions":
                     payload = self._read_json_body()
@@ -1682,25 +1660,6 @@ def create_dashboard_server(
             if not isinstance(payload, dict):
                 raise ValueError("请求正文必须是有效的 JSON 对象")
             return payload
-
-        def _read_pdf_body(self) -> bytes:
-            if (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower() != "application/pdf":
-                raise ValueError("请求正文必须是 PDF")
-            raw_content_length = self.headers.get("Content-Length")
-            if raw_content_length is None:
-                raise ValueError("Content-Length 必须是非负整数")
-            try:
-                content_length = int(raw_content_length)
-            except ValueError as exc:
-                raise ValueError("Content-Length 必须是非负整数") from exc
-            if content_length < 0:
-                raise ValueError("Content-Length 必须是非负整数")
-            if content_length > MAX_PDF_BODY_BYTES:
-                raise RequestBodyTooLargeError("PDF 不能超过 20 MiB")
-            body = self.rfile.read(content_length)
-            if not body.startswith(b"%PDF-"):
-                raise ValueError("请求正文必须是有效的 PDF")
-            return body
 
         def _research_chat_session_id(self, path: str) -> str | None:
             parts = path.strip("/").split("/")
@@ -1955,7 +1914,6 @@ def serve_dashboard(
     *,
     host: str,
     port: int,
-    eastmoney_password: str = "",
     prediction_notifier: object | None = None,
     public_url: str = "",
     cross_venue_monitor: PredictCrossVenueMonitor | None = None,
@@ -2066,7 +2024,6 @@ def serve_dashboard(
         host=host,
         port=port,
         trend_simulate_position_service=trend_simulate_position_service,
-        eastmoney_password=eastmoney_password,
         prediction_store=prediction_store,
         prediction_monitor=prediction_monitor,
         cross_venue_monitor=cross_runtime or cross_venue_monitor,

@@ -80,6 +80,7 @@ from .trend_review import (
     relative_rotations_completed,
     trend_action_futu_symbol,
 )
+from .trend_statement_consumer import consume_accepted_statement_facts
 
 
 STATUS_SCHEMA = "open_trader.trend_controller.status.v1"
@@ -2899,6 +2900,17 @@ def run_trend_market_controller(
                 fixed_process_version=process_version,
             )
             _retry_pending_feishu_notifications(config)
+            statement_broker = {
+                "CN": "eastmoney",
+                "HK": "phillips",
+            }.get(market)
+            if statement_broker is not None:
+                consume_accepted_statement_facts(
+                    data_dir=config.data_dir,
+                    reports_dir=config.reports_dir,
+                    broker=statement_broker,
+                    generated_at=now.isoformat(timespec="seconds"),
+                )
             local = now.astimezone(TIMEZONES[market])
             local_session = (
                 cn_session(local)

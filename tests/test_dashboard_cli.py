@@ -38,13 +38,11 @@ def test_dashboard_main_delegates_to_server(
         *,
         host: str,
         port: int,
-        eastmoney_password: str,
         public_url: str,
     ) -> None:
         captured["config"] = config
         captured["host"] = host
         captured["port"] = port
-        captured["eastmoney_password"] = eastmoney_password
         captured["public_url"] = public_url
 
     monkeypatch.setattr(cli, "serve_dashboard", fake_serve_dashboard)
@@ -87,7 +85,6 @@ def test_dashboard_main_delegates_to_server(
     assert result == 0
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 9000
-    assert captured["eastmoney_password"] == "local-secret"
     assert captured["public_url"] == "http://127.0.0.1:8766/"
     config = captured["config"]
     assert isinstance(config, DashboardConfig)

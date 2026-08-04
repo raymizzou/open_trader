@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 import hashlib
+import http.client
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 import io
@@ -345,19 +346,33 @@ def test_account_api_cli_uses_data_dir_and_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
-    observed: list[tuple[Path, str]] = []
+    config = tmp_path / "daily.env"
+    config.write_text(
+        "OPEN_TRADER_EASTMONEY_PDF_PASSWORD=local-secret\n",
+        encoding="utf-8",
+    )
+    observed: list[tuple[Path, str, str]] = []
     monkeypatch.setattr(
         account_api,
         "serve_account_api",
-        lambda served_data_dir, *, mode: observed.append((served_data_dir, mode)),
+        lambda served_data_dir, *, mode, eastmoney_password: observed.append(
+            (served_data_dir, mode, eastmoney_password)
+        ),
     )
 
     assert account_api.main(["--data-dir", str(data_dir)]) == 0
-    assert account_api.main(["--data-dir", str(data_dir), "--mode", "production"]) == 0
+    assert account_api.main([
+        "--data-dir", str(data_dir),
+        "--mode", "production",
+        "--config", str(config),
+    ]) == 0
     with pytest.raises(SystemExit, match="2"):
         account_api.main(["--mode", "invalid"])
 
-    assert observed == [(data_dir, "shadow"), (data_dir, "production")]
+    assert observed == [
+        (data_dir, "shadow", ""),
+        (data_dir, "production", "local-secret"),
+    ]
 
 
 def test_account_api_runtime_metadata_proves_clean_candidate_source(
@@ -483,6 +498,152 @@ def test_account_api_production_accepts_marker_and_preserves_etag(
 
     assert response.value.code == HTTPStatus.NOT_MODIFIED
     assert response.value.read() == b""
+
+
+def test_account_api_stages_statement_command_with_202_in_production(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, bytes]] = []
+
+    class StatementService:
+        def stage_pdf(self, broker: str, body: bytes) -> dict[str, object]:
+            calls.append((broker, body))
+            return {
+                "schema_version": "open_trader.account.statement_generation.v1",
+                "status": "staged",
+                "broker": broker,
+                "statement_generation": "sha256:" + "a" * 64,
+            }
+
+    server = account_api.create_account_api(
+        tmp_path / "data",
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+        statement_service=StatementService(),
+    )
+    body = b"%PDF-1.7\nstatement"
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/statements/phillips",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/pdf"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+            status = response.status
+
+    assert status == HTTPStatus.ACCEPTED
+    assert payload["status"] == "staged"
+    assert payload["statement_generation"] == "sha256:" + "a" * 64
+    assert calls == [("phillips", body)]
+
+
+@pytest.mark.parametrize(
+    ("mode", "broker", "content_type", "body", "status", "code"),
+    [
+        ("shadow", "phillips", "application/pdf", b"%PDF-1.7\nx", 503, "account_api_shadow_only"),
+        ("production", "phillips", "application/json", b"%PDF-1.7\nx", 400, "invalid_statement_content_type"),
+        ("production", "phillips", "application/pdf", b"not a pdf", 400, "statement_rejected"),
+        ("production", "unknown", "application/pdf", b"%PDF-1.7\nx", 400, "statement_rejected"),
+    ],
+)
+def test_account_api_statement_command_fails_closed(
+    tmp_path: Path,
+    mode: str,
+    broker: str,
+    content_type: str,
+    body: bytes,
+    status: int,
+    code: str,
+) -> None:
+    server = account_api.create_account_api(
+        tmp_path / "data",
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode=mode,
+    )
+    with _running(server):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/statements/{broker}",
+            data=body,
+            method="POST",
+            headers={"Content-Type": content_type},
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request)
+
+    assert rejected.value.code == status
+    assert json.load(rejected.value)["code"] == code
+
+
+def test_account_api_rejects_oversized_statement_before_reading_body(
+    tmp_path: Path,
+) -> None:
+    server = account_api.create_account_api(
+        tmp_path / "data",
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+    with _running(server):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.putrequest(
+            "POST", "/api/v1/account/statements/phillips"
+        )
+        connection.putheader("Content-Type", "application/pdf")
+        connection.putheader("Content-Length", str(20 * 1024 * 1024 + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        payload = json.load(response)
+        connection.close()
+
+    assert response.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    assert payload["code"] == "statement_rejected"
+
+
+def test_snapshot_exposes_accepted_statement_generations_as_account_identity(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    before = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+    state_path = data_dir / "latest/account_sync_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["accepted_statement_generation"] = {
+        "phillips": "sha256:" + "a" * 64,
+        "eastmoney": "sha256:" + "b" * 64,
+    }
+    write_json_atomic(state_path, state)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.payload["accepted_statement_generation"] == {
+        "phillips": "sha256:" + "a" * 64,
+        "eastmoney": "sha256:" + "b" * 64,
+    }
+    assert result.payload["account_generation"] != before.payload["account_generation"]
 
 
 def test_live_parity_passes_against_raw_publication(tmp_path: Path) -> None:
@@ -822,6 +983,9 @@ def test_snapshot_maps_current_publication_to_frozen_v1_contract(tmp_path: Path)
             broker: result.payload["sources"]["account"]["brokers"][broker]["data_as_of"]
             for broker in sorted(REQUIRED_BROKERS)
         },
+        "accepted_statement_generation": result.payload[
+            "accepted_statement_generation"
+        ],
     }
     assert result.payload["account_generation"] == _contract_sha(account_input)
     visible = dict(result.payload)

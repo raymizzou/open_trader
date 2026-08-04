@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-04
+
+- #22 把辉立与东方财富结单上传迁到 Account Module：浏览器仅经 Gateway 调用 Account API，验证后的 PDF 以内容 hash 原子暂存为不可变 generation，Account Sync Worker 验证后才 promotion 并在快照发布 accepted generation；Trend 控制器异步、幂等消费对应成交事实，失败不再回滚 Account。Legacy 上传路由和同步 Trend 副作用已删除；真实隔离 runtime 验证两份实际结单均返回 `202 staged`、四券商同步正常、两份 generation promotion 且 Trend 重复消费安全。
+
 ## 2026-08-03
 
 - #21 为 Account API 生产切换补齐验收与运维交接：浏览器经 `8766` 独立轮询带 ETag 的 `/api/v1/account/snapshot`，不再请求 `/api/quotes`；Legacy 继续提供其余模块，任一 owner 降级不覆盖另一方。验收会核对稳定 ID 关联、双上游健康、Worker/API 同一 SHA、listener/runtime 日志、ETag/304 与 API parity；Account API 启动日志同时记录候选 Git SHA 与源码洁净状态，浏览器取证后冻结 Legacy 与 Account 两个轮询，并从 Account 页面状态按标的匹配持仓和实时来源、识别 `healthy` 来源状态，不依赖 Legacy 快照或页面排序。Dashboard 风险校验从冻结参数读取资源排名目标仓位，允许第一名 6% 而不放宽 4% 组合风险预算；冻结报告投影校验复用 Dashboard 的双强度字段投影，历史执行缓存也会在同一 action 目录追加成交事件时立即失效，stack 安装失败关闭且不自动进入 single 模式。新增切换、逆向回滚、writer-lock 与 Account-only 故障恢复 runbook，并同步当前轮换比较、CN v12、HK/US v10 与预测市场历史窗口的验收夹具。最终状态仍以候选 SHA 的 `make acceptance` 和同 SHA 重部署证据为准。

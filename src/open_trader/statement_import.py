@@ -3,23 +3,23 @@ from __future__ import annotations
 import csv
 from datetime import date, datetime, time
 from decimal import Decimal
+import hashlib
+import json
 from pathlib import Path
 import re
-from shutil import copyfile, copytree, rmtree
 from tempfile import TemporaryDirectory
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .account_sync_state import (
+    BrokerAccountCandidate,
+    load_latest_statement_candidate,
+)
 from .fx import StaticMonthEndFxProvider
 from .models import StatementTrade
 from .parsers.base import StatementParser
 from .parsers.eastmoney import EastmoneyStatementParser
 from .parsers.phillips import PhillipsStatementParser
 from .pipeline import run_uploaded_statement
-from .trend_api_stats import (
-    build_statement_actual_stats_payload,
-    write_trend_api_stats,
-)
 
 
 RATES_TO_HKD = {
@@ -27,6 +27,8 @@ RATES_TO_HKD = {
     "eastmoney": {"USD": Decimal("7.8"), "CNY": Decimal("1.08")},
 }
 STATEMENT_PERIOD = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)-")
+MAX_STATEMENT_BYTES = 20 * 1024 * 1024
+STATEMENT_GENERATION_SCHEMA = "open_trader.account.statement_generation.v1"
 
 
 class StatementImportService:
@@ -35,102 +37,92 @@ class StatementImportService:
         *,
         data_dir: Path,
         eastmoney_password: str,
-        reports_dir: Path | None = None,
     ) -> None:
         self.data_dir = data_dir
         self.eastmoney_password = eastmoney_password
-        self.reports_dir = reports_dir or data_dir
 
-    def import_pdf(self, broker: str, body: bytes) -> dict[str, object]:
+    def stage_pdf(self, broker: str, body: bytes) -> dict[str, object]:
+        if not body.startswith(b"%PDF-"):
+            raise ValueError("请求正文必须是有效的 PDF")
+        if len(body) > MAX_STATEMENT_BYTES:
+            raise ValueError("PDF 不能超过 20 MiB")
         parser = self._parser(broker)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix=".statement-upload-", dir=self.data_dir) as name:
-            uploaded = Path(name) / "statement.pdf"
+        digest = hashlib.sha256(body).hexdigest()
+        generation = f"sha256:{digest}"
+        generations = self.data_dir / "account_statements/generations" / broker
+        destination = generations / digest
+        if destination.is_dir():
+            return _staged_response(destination, broker, generation)
+
+        generations.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".stage-", dir=generations) as name:
+            root = Path(name)
+            uploaded = root / "statement.pdf"
             uploaded.write_bytes(body)
-            statement_date = parser.statement_date(uploaded)  # type: ignore[attr-defined]
-            parsed = parser.parse(uploaded, statement_date)
+            try:
+                statement_date = parser.statement_date(uploaded)  # type: ignore[attr-defined]
+                parsed = parser.parse(uploaded, statement_date)
+            except ValueError:
+                raise
+            except Exception as error:
+                label = {"phillips": "辉立", "eastmoney": "东方财富"}[broker]
+                raise ValueError(f"{label}结单无法解析") from error
             if not parsed.positions and not parsed.cash_balances:
                 raise ValueError(f"{broker} 结单没有可导入的持仓或现金")
-            current_period = self._latest_statement_period(broker)
-            if current_period and statement_date[: len(current_period)] < current_period:
-                raise ValueError(
-                    f"{statement_date} 早于当前结单 {current_period}，拒绝导入"
-                )
             statement_period = (
                 statement_date if broker == "phillips" else statement_date[:7]
             )
-            archive = self._archive_path(broker, statement_date)
-            run_snapshot = _snapshot_path(
-                self.data_dir / "runs" / statement_date[:7],
-                Path(name) / "rollback",
-                "run",
+            current_period = max(
+                self._latest_statement_period(broker),
+                self._latest_staged_period(broker),
             )
-            backup = _promote_archive(uploaded, archive)
+            if current_period and statement_period < current_period:
+                raise ValueError(
+                    f"{statement_period} 早于当前结单 {current_period}，拒绝导入"
+                )
+            imported = run_uploaded_statement(
+                statement_date=statement_date,
+                statement_path=uploaded,
+                parser=parser,
+                data_dir=root / "candidate",
+                fx_provider=StaticMonthEndFxProvider(
+                    statement_date[:7],
+                    RATES_TO_HKD[broker],
+                    fx_date=statement_date,
+                ),
+            )
+            facts = [_trade_fill(trade, statement_period) for trade in parsed.trades]
+            (root / "trade_facts.json").write_text(
+                json.dumps(facts, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            manifest = {
+                "schema_version": STATEMENT_GENERATION_SCHEMA,
+                "status": "staged",
+                "broker": broker,
+                "statement_date": statement_date,
+                "statement_period": statement_period,
+                "statement_generation": generation,
+                "content_sha256": generation,
+                "staged_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "trade_facts_cutoff_at": _statement_cutoff(
+                    statement_date, broker
+                ),
+                "positions": len(parsed.positions),
+                "cash": len(parsed.cash_balances),
+                "warnings": len(parsed.warnings),
+                "trades": len(parsed.trades),
+                "candidate_run": str(imported.run_dir.relative_to(root)),
+            }
+            (root / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
             try:
-                imported = run_uploaded_statement(
-                    statement_date=statement_date,
-                    statement_path=archive,
-                    parser=parser,
-                    data_dir=self.data_dir,
-                    fx_provider=StaticMonthEndFxProvider(
-                        statement_date[:7],
-                        RATES_TO_HKD[broker],
-                        fx_date=statement_date,
-                    ),
-                )
-                if backup is not None:
-                    backup.unlink()
-            except Exception:
-                try:
-                    _restore_archive(archive, backup)
-                finally:
-                    _restore_snapshot(run_snapshot)
-                raise
-            statistics_cutoff_at: str | None = None
-            try:
-                statistics_cutoff_at = _statement_cutoff(statement_date, broker)
-                generated_at = datetime.now().astimezone().isoformat(
-                    timespec="seconds"
-                )
-                stats = build_statement_actual_stats_payload(
-                    data_dir=self.data_dir,
-                    reports_dir=self.reports_dir,
-                    broker=broker,
-                    statement_period=statement_period,
-                    fills=[
-                        _trade_fill(trade, statement_period)
-                        for trade in parsed.trades
-                    ],
-                    generated_at=generated_at,
-                    statistics_cutoff_at=statistics_cutoff_at,
-                )
-                write_trend_api_stats(self.data_dir, stats)
-            except Exception:
-                stats = None
-        result = {
-            "status": "ok",
-            "broker": broker,
-            "statement_date": statement_date,
-            "positions": len(parsed.positions),
-            "cash": len(parsed.cash_balances),
-            "warnings": len(parsed.warnings),
-            "trades": len(parsed.trades),
-            "statistics_status": "updated" if stats is not None else "failed",
-            "actual_rounds": (
-                sum(
-                    round_["broker"] == broker
-                    and round_["attribution_status"] == "attributed"
-                    for round_ in stats["rounds"]
-                )
-                if stats is not None
-                else None
-            ),
-            "statistics_cutoff_at": statistics_cutoff_at if stats is not None else None,
-            "run_path": str(imported.run_dir),
-        }
-        if parsed.fills:
-            result["fills"] = len(parsed.fills)
-        return result
+                root.rename(destination)
+            except FileExistsError:
+                pass
+        return _staged_response(destination, broker, generation)
 
     def _parser(self, broker: str) -> StatementParser:
         if broker == "phillips":
@@ -140,10 +132,6 @@ class StatementImportService:
                 raise ValueError("未配置东方财富对账单密码")
             return EastmoneyStatementParser(self.eastmoney_password)
         raise ValueError(f"不支持的券商：{broker}")
-
-    def _archive_path(self, broker: str, statement_date: str) -> Path:
-        period = statement_date if broker == "phillips" else statement_date[:7]
-        return self.data_dir / "statements" / broker / period / "statement.pdf"
 
     def _latest_statement_period(self, broker: str) -> str:
         runs_dir = self.data_dir / "runs"
@@ -167,29 +155,115 @@ class StatementImportService:
                             periods.append(match.group(1))
         return max(periods) if periods else ""
 
+    def _latest_staged_period(self, broker: str) -> str:
+        staged = load_staged_statement_candidate(self.data_dir, broker)
+        return staged[0].period if staged is not None else ""
 
-def _promote_archive(source: Path, destination: Path) -> Path | None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / f".statement.{uuid4().hex}.tmp"
-    backup = destination.parent / f".statement.{uuid4().hex}.backup"
-    copyfile(source, temporary)
-    had_previous = destination.exists()
+
+def _read_manifest(path: Path) -> dict[str, object] | None:
     try:
-        if had_previous:
-            destination.rename(backup)
-        temporary.replace(destination)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        if had_previous and backup.exists():
-            backup.rename(destination)
-        raise
-    return backup if had_previous else None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
-def _restore_archive(destination: Path, backup: Path | None) -> None:
-    destination.unlink(missing_ok=True)
-    if backup is not None and backup.exists():
-        backup.rename(destination)
+def _staged_response(
+    root: Path, broker: str, generation: str
+) -> dict[str, object]:
+    try:
+        manifest, _candidate, _facts = _load_statement_generation(
+            root, broker, generation
+        )
+    except ValueError as error:
+        raise ValueError("invalid statement generation") from error
+    return dict(manifest)
+
+
+def load_staged_statement_candidate(
+    data_dir: Path, broker: str
+) -> tuple[BrokerAccountCandidate, str] | None:
+    if broker not in {"phillips", "eastmoney"}:
+        raise ValueError(f"unsupported statement broker: {broker}")
+    generations = data_dir / "account_statements/generations" / broker
+    if not generations.is_dir():
+        return None
+    candidates: list[tuple[str, str, int, BrokerAccountCandidate, str]] = []
+    for root in generations.iterdir():
+        if not root.is_dir() or root.name.startswith(".stage-"):
+            continue
+        generation = f"sha256:{root.name}"
+        manifest, candidate, _facts = _load_statement_generation(
+            root, broker, generation
+        )
+        period = manifest.get("statement_period")
+        staged_at = manifest.get("staged_at")
+        if not isinstance(period, str) or not isinstance(staged_at, str):
+            raise ValueError(f"invalid statement generation: {root.name}")
+        candidates.append(
+            (period, staged_at, root.stat().st_mtime_ns, candidate, generation)
+        )
+    if not candidates:
+        return None
+    selected = max(candidates, key=lambda item: item[:3])
+    return selected[3], selected[4]
+
+
+def load_statement_trade_facts(
+    data_dir: Path, broker: str, generation: str
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    if broker not in {"phillips", "eastmoney"}:
+        raise ValueError(f"unsupported statement broker: {broker}")
+    match = re.fullmatch(r"sha256:([0-9a-f]{64})", generation)
+    if match is None:
+        raise ValueError("invalid statement generation")
+    root = (
+        data_dir
+        / "account_statements/generations"
+        / broker
+        / match.group(1)
+    )
+    manifest, _candidate, facts = _load_statement_generation(
+        root, broker, generation
+    )
+    return manifest, facts
+
+
+def _load_statement_generation(
+    root: Path, broker: str, generation: str
+) -> tuple[
+    dict[str, object],
+    BrokerAccountCandidate,
+    list[dict[str, object]],
+]:
+    manifest = _read_manifest(root / "manifest.json")
+    if (
+        not root.is_dir()
+        or manifest is None
+        or manifest.get("schema_version") != STATEMENT_GENERATION_SCHEMA
+        or manifest.get("broker") != broker
+        or manifest.get("statement_generation") != generation
+        or manifest.get("content_sha256") != generation
+        or generation != f"sha256:{root.name}"
+    ):
+        raise ValueError(f"invalid statement generation: {root.name}")
+    try:
+        pdf = (root / "statement.pdf").read_bytes()
+        raw_facts = json.loads(
+            (root / "trade_facts.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid statement generation: {root.name}") from error
+    if (
+        hashlib.sha256(pdf).hexdigest() != root.name
+        or not isinstance(raw_facts, list)
+        or any(not isinstance(fact, dict) for fact in raw_facts)
+    ):
+        raise ValueError(f"invalid statement generation: {root.name}")
+    candidate = load_latest_statement_candidate(root / "candidate", broker)
+    if candidate is None or candidate.period != manifest.get("statement_period"):
+        raise ValueError(f"invalid statement generation: {root.name}")
+    return manifest, candidate, [dict(fact) for fact in raw_facts]
 
 
 def _trade_fill(trade: StatementTrade, statement_period: str) -> dict[str, object]:
@@ -231,32 +305,3 @@ def _statement_cutoff(statement_date: str, broker: str) -> str:
     return datetime.combine(
         date.fromisoformat(statement_date), time(23, 59, 59), timezone
     ).isoformat()
-
-
-def _snapshot_path(
-    path: Path, backup_root: Path, label: str
-) -> tuple[Path, Path | None, bool]:
-    if not path.exists():
-        return path, None, False
-    backup = backup_root / label
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_dir():
-        copytree(path, backup)
-        return path, backup, True
-    copyfile(path, backup)
-    return path, backup, False
-
-
-def _restore_snapshot(snapshot: tuple[Path, Path | None, bool]) -> None:
-    path, backup, is_directory = snapshot
-    if path.is_dir():
-        rmtree(path)
-    else:
-        path.unlink(missing_ok=True)
-    if backup is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if is_directory:
-        copytree(backup, path)
-    else:
-        copyfile(backup, path)

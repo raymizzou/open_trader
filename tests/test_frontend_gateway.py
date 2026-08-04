@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import http.client
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -287,6 +288,39 @@ def test_gateway_marks_and_rewrites_account_requests_without_legacy_authority(
     assert headers["X-Open-Trader-Account-Route"] == "production"
     assert headers["Origin"] == account_origin
     assert headers["Referer"] == account_origin + "/dashboard"
+    assert legacy.requests == []
+
+
+def test_gateway_transparently_routes_statement_command_to_account(
+    tmp_path: Path,
+) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    account.response_status = HTTPStatus.ACCEPTED
+    account.response_body = b'{"status":"staged","statement_generation":"sha256:one"}'
+    body = b"%PDF-1.7\nstatement"
+    with _running(legacy), _running(account), _gateway(
+        tmp_path / "static", legacy.server_address[1], account.server_address[1]
+    ) as base:
+        request = urllib.request.Request(
+            base + "/api/v1/account/statements/phillips",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/pdf",
+                "Origin": "http://127.0.0.1:8766",
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+            status = response.status
+
+    assert status == HTTPStatus.ACCEPTED
+    assert payload["statement_generation"] == "sha256:one"
+    assert account.requests[0]["path"] == "/api/v1/account/statements/phillips"
+    assert account.requests[0]["body"] == body
+    assert account.requests[0]["headers"]["X-Open-Trader-Account-Route"] == "production"
     assert legacy.requests == []
 
 

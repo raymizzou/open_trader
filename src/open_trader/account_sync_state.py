@@ -29,6 +29,7 @@ from .portfolio import (
 ACCOUNT_STATE_VERSION = 1
 REQUIRED_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
 LIVE_BROKERS = ("futu", "tiger")
+STATEMENT_BROKERS = ("phillips", "eastmoney")
 ACCOUNT_STALE_SECONDS = 180
 QUOTE_STALE_SECONDS = 15
 CONTROLLER_STALE_SECONDS = 15
@@ -105,6 +106,9 @@ def empty_account_sync_state() -> dict[str, object]:
     return {
         "version": ACCOUNT_STATE_VERSION,
         "generation": "",
+        "accepted_statement_generation": {
+            broker: "" for broker in STATEMENT_BROKERS
+        },
         "brokers": {broker: _empty_source(broker) for broker in REQUIRED_BROKERS},
         "dashboard_projection": {},
     }
@@ -118,6 +122,10 @@ def load_account_sync_state(path: Path) -> dict[str, object]:
     if not _is_valid_state(payload):
         return empty_account_sync_state()
     normalized = deepcopy(payload)
+    normalized.setdefault(
+        "accepted_statement_generation",
+        {broker: "" for broker in STATEMENT_BROKERS},
+    )
     normalized["dashboard_projection"] = dashboard_projection_from_state(payload) or {}
     return normalized
 
@@ -210,12 +218,22 @@ def accept_candidate(
     candidate: BrokerAccountCandidate,
     *,
     attempted_at: str,
+    statement_generation: str | None = None,
 ) -> dict[str, object]:
     if candidate.broker not in REQUIRED_BROKERS:
         raise ValueError(f"unknown broker: {candidate.broker}")
     if candidate.source_kind != _source_kind_for_broker(candidate.broker):
         raise ValueError(f"invalid source_kind: {candidate.source_kind}")
+    if statement_generation is not None and (
+        candidate.broker not in STATEMENT_BROKERS
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", statement_generation) is None
+    ):
+        raise ValueError("invalid statement generation")
     accepted = deepcopy(state) if _is_valid_state(state) else empty_account_sync_state()
+    accepted.setdefault(
+        "accepted_statement_generation",
+        {broker: "" for broker in STATEMENT_BROKERS},
+    )
     brokers = accepted["brokers"]
     assert isinstance(brokers, dict)
     brokers[candidate.broker] = {
@@ -232,6 +250,10 @@ def accept_candidate(
         "summary": deepcopy(candidate.summary),
     }
     accepted["generation"] = attempted_at
+    if statement_generation is not None:
+        accepted["accepted_statement_generation"][candidate.broker] = (
+            statement_generation
+        )
     return accepted
 
 
@@ -1034,6 +1056,20 @@ def _is_valid_state(value: object) -> bool:
     if not isinstance(value, dict) or value.get("version") != ACCOUNT_STATE_VERSION:
         return False
     if not isinstance(value.get("generation"), str):
+        return False
+    generations = value.get("accepted_statement_generation")
+    if generations is not None and (
+        not isinstance(generations, dict)
+        or set(generations) != set(STATEMENT_BROKERS)
+        or any(
+            not isinstance(generations[broker], str)
+            or (
+                bool(generations[broker])
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", generations[broker]) is None
+            )
+            for broker in STATEMENT_BROKERS
+        )
+    ):
         return False
     brokers = value.get("brokers")
     if not isinstance(brokers, dict) or set(brokers) != set(REQUIRED_BROKERS):

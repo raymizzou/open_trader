@@ -61,6 +61,7 @@ _SNAPSHOT_FIELDS = frozenset({
     "schema_version", "snapshot_generation", "account_generation", "generated_at",
     "quote_as_of", "status", "stale", "sources", "release", "summary",
     "broker_summaries", "positions", "cash_balances", "errors",
+    "accepted_statement_generation",
 })
 
 
@@ -79,6 +80,8 @@ def create_account_api(
     port: int,
     runtime_metadata: Mapping[str, object] | None = None,
     mode: AccountApiMode = "shadow",
+    statement_service: object | None = None,
+    eastmoney_password: str = "",
 ) -> ThreadingHTTPServer:
     if mode not in ("shadow", "production"):
         raise ValueError("mode must be shadow or production")
@@ -88,6 +91,13 @@ def create_account_api(
     except ValueError as error:
         raise ValueError("host must be a loopback address") from error
     runtime = dict(runtime_metadata) if runtime_metadata is not None else _runtime_metadata()
+    if mode == "production" and statement_service is None:
+        from .statement_import import StatementImportService
+
+        statement_service = StatementImportService(
+            data_dir=data_dir,
+            eastmoney_password=eastmoney_password,
+        )
 
     class AccountApiHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -152,6 +162,75 @@ def create_account_api(
                 HTTPStatus.NOT_FOUND,
             )
 
+        def do_POST(self) -> None:
+            path = urlsplit(self.path).path
+            prefix = "/api/v1/account/statements/"
+            broker = path.removeprefix(prefix)
+            if not path.startswith(prefix) or not broker or "/" in broker:
+                self._send_json(
+                    {
+                        "schema_version": "open_trader.account_api.error.v1",
+                        "code": "not_found",
+                        "message": "Not found",
+                    },
+                    HTTPStatus.NOT_FOUND,
+                )
+                return
+            if mode != "production":
+                self._send_json(
+                    {
+                        "schema_version": "open_trader.account_api.error.v1",
+                        "code": "account_api_shadow_only",
+                        "message": "Account API is running in shadow mode",
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            if self.headers.get_content_type() != "application/pdf":
+                self._send_json(
+                    {
+                        "schema_version": "open_trader.account_api.error.v1",
+                        "code": "invalid_statement_content_type",
+                        "message": "请求正文必须是 PDF",
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                body = self._read_statement_body()
+                if statement_service is None:
+                    raise ValueError("statement service is unavailable")
+                stage_pdf = getattr(statement_service, "stage_pdf")
+                payload = stage_pdf(broker, body)
+            except ValueError as error:
+                status = (
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+                    if str(error) == "PDF 不能超过 20 MiB"
+                    else HTTPStatus.BAD_REQUEST
+                )
+                self._send_json(
+                    {
+                        "schema_version": "open_trader.account_api.error.v1",
+                        "code": "statement_rejected",
+                        "message": str(error),
+                    },
+                    status,
+                )
+                return
+            self._send_json(payload, HTTPStatus.ACCEPTED)
+
+        def _read_statement_body(self) -> bytes:
+            raw_lengths = self.headers.get_all("Content-Length", [])
+            if len(raw_lengths) != 1 or not raw_lengths[0].isdigit():
+                raise ValueError("Content-Length 必须是非负整数")
+            length = int(raw_lengths[0])
+            if length > 20 * 1024 * 1024:
+                raise ValueError("PDF 不能超过 20 MiB")
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError("请求正文不完整")
+            return body
+
         def _send_json(
             self,
             payload: dict[str, object],
@@ -183,10 +262,21 @@ def create_account_api(
     return server
 
 
-def serve_account_api(data_dir: Path, *, mode: AccountApiMode = "shadow") -> None:
+def serve_account_api(
+    data_dir: Path,
+    *,
+    mode: AccountApiMode = "shadow",
+    eastmoney_password: str = "",
+) -> None:
     host = "127.0.0.1"
     port = 8768
-    server = create_account_api(data_dir, host=host, port=port, mode=mode)
+    server = create_account_api(
+        data_dir,
+        host=host,
+        port=port,
+        mode=mode,
+        eastmoney_password=eastmoney_password,
+    )
     runtime = {
         "schema_version": "open_trader.account_api.runtime.v1",
         "module": "account_api",
@@ -209,9 +299,39 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open-trader account-api")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--mode", choices=("shadow", "production"), default="shadow")
+    parser.add_argument("--config", type=Path)
     args = parser.parse_args(argv)
-    serve_account_api(args.data_dir, mode=args.mode)
+    password = (
+        _read_env_value(args.config, "OPEN_TRADER_EASTMONEY_PDF_PASSWORD")
+        if args.config is not None
+        else ""
+    )
+    serve_account_api(
+        args.data_dir,
+        mode=args.mode,
+        eastmoney_password=password,
+    )
     return 0
+
+
+def _read_env_value(path: Path, key: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == key:
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            return value
+    return ""
 
 
 def check_account_api_parity(
@@ -351,6 +471,18 @@ def _raw_parity_projection(
             (str(source["last_success_at"]) for source in source_brokers.values()),
             key=datetime.fromisoformat,
         )
+        accepted_statement_generation = dict(
+            account.get("accepted_statement_generation")
+            or {"phillips": "", "eastmoney": ""}
+        )
+        if (
+            set(accepted_statement_generation) != {"phillips", "eastmoney"}
+            or any(
+                not isinstance(value, str)
+                for value in accepted_statement_generation.values()
+            )
+        ):
+            return None
     except (KeyError, TypeError, ValueError):
         return None
     account_generation = _parity_sha({
@@ -363,6 +495,7 @@ def _raw_parity_projection(
             broker: source_brokers[broker]["data_as_of"]
             for broker in sorted(source_brokers)
         },
+        "accepted_statement_generation": accepted_statement_generation,
     })
     broker_stale: dict[str, bool] = {}
     for broker in REQUIRED_BROKERS:
@@ -423,6 +556,7 @@ def _raw_parity_projection(
         "account_as_of": accepted_account_as_of,
         "source_brokers": source_brokers,
         "account_generation": account_generation,
+        "accepted_statement_generation": accepted_statement_generation,
         "status": "stale" if stale else "healthy",
         "stale": stale,
         "sources": sources,
@@ -541,7 +675,14 @@ def _compare_parity_payload(
         return "sources_mismatch"
     if payload.get("errors") != expected["errors"]:
         return "errors_mismatch"
-    for field in ("generated_at", "quote_as_of", "summary", "broker_summaries", "cash_balances"):
+    for field in (
+        "generated_at",
+        "quote_as_of",
+        "summary",
+        "broker_summaries",
+        "cash_balances",
+        "accepted_statement_generation",
+    ):
         expected_value = expected[field]
         observed = payload.get(field)
         if observed != expected_value:

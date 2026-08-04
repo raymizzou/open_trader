@@ -2761,9 +2761,6 @@ def main(argv: list[str] | None = None) -> int:
             config,
             host=args.host,
             port=args.port,
-            eastmoney_password=config_values.get(
-                "OPEN_TRADER_EASTMONEY_PDF_PASSWORD", ""
-            ).strip(),
             public_url=args.public_url,
             **(
                 {"prediction_notifier": prediction_notifier}

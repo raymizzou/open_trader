@@ -214,6 +214,88 @@ def test_validation_failure_writes_diagnostic_without_replacing_accepted_data(
     assert len(diagnostics) == 1
 
 
+def test_worker_promotes_staged_statement_generation_with_account_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    _seed_state(
+        data_dir,
+        {
+            broker: _candidate(broker, 1, broker.upper())
+            for broker in ("futu", "tiger", "phillips", "eastmoney")
+        },
+    )
+    _configure_sources(monkeypatch, worker_module)
+    promoted = _candidate("phillips", 1, "PROMOTED")
+    generation = "sha256:" + "a" * 64
+    monkeypatch.setattr(
+        worker_module,
+        "load_staged_statement_candidate",
+        lambda _data_dir, broker: (promoted, generation)
+        if broker == "phillips"
+        else None,
+    )
+
+    result = AccountSyncWorker(_config(data_dir, portfolio_path)).sync_accounts_once()
+
+    state = load_account_sync_state(data_dir / "latest/account_sync_state.json")
+    assert result["brokers"]["phillips"] == {"status": "ok"}
+    assert state["accepted_statement_generation"] == {
+        "phillips": generation,
+        "eastmoney": "",
+    }
+    assert state["brokers"]["phillips"]["positions"][0]["symbol"] == "PROMOTED0"
+
+
+def test_statement_promotion_failure_keeps_generation_unaccepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+
+    data_dir = tmp_path / "data"
+    state_path = data_dir / "latest/account_sync_state.json"
+    portfolio_path = data_dir / "latest/portfolio.csv"
+    _seed_state(
+        data_dir,
+        {
+            broker: _candidate(broker, 1, broker.upper())
+            for broker in ("futu", "tiger", "phillips", "eastmoney")
+        },
+    )
+    _configure_sources(monkeypatch, worker_module)
+    generation = "sha256:" + "a" * 64
+    monkeypatch.setattr(
+        worker_module,
+        "load_staged_statement_candidate",
+        lambda _data_dir, broker: (_candidate("phillips", 1, "NEW"), generation)
+        if broker == "phillips"
+        else None,
+    )
+    real_write = worker_module.write_json_atomic
+
+    def fail_promotion(path: Path, payload: object) -> None:
+        if (
+            path == state_path
+            and isinstance(payload, dict)
+            and payload.get("accepted_statement_generation", {}).get("phillips")
+            == generation
+        ):
+            raise OSError("state storage unavailable")
+        real_write(path, payload)
+
+    monkeypatch.setattr(worker_module, "write_json_atomic", fail_promotion)
+
+    result = AccountSyncWorker(_config(data_dir, portfolio_path)).sync_accounts_once()
+
+    state = load_account_sync_state(state_path)
+    assert result["status"] == "publication_failed"
+    assert result["blocker"] == "account_state_publish_failed: phillips"
+    assert state["accepted_statement_generation"]["phillips"] == ""
+
+
 def test_quote_failure_restores_published_quotes_without_mutating_account_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
