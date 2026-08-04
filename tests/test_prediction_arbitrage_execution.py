@@ -1016,6 +1016,67 @@ def test_cross_venue_notification_failure_keeps_signal_actionable(
     assert signal["ended_at"] is None
 
 
+def test_gas_notification_only_for_blocked_stage_5_signal_episode(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    predict.gas_ready = False
+    predict.minimum_top_up_bnb = "0.02"
+
+    assert feishu.calls == 0
+    signal_id = _cross_venue_notification_signal(store)
+
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "sent", "signal_id": signal_id, "reason": "insufficient_bnb"}
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "ignored", "reason": "already_sent"}
+    assert feishu.calls == 1
+    assert "BNB" in feishu.messages[-1][1]
+    assert "0.02" in feishu.messages[-1][1]
+
+    store.close_signal(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
+        ended_at=datetime.now(UTC),
+        reason="episode_rotated",
+    )
+    new_signal_id = store.upsert_signal(
+        {
+            **store.signal(signal_id),  # type: ignore[arg-type]
+            "ended_at": None,
+            "ended_reason": None,
+            "notification_state": "pending",
+            "notification_attempts": 0,
+        }
+    )
+    assert new_signal_id != signal_id
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", new_signal_id
+    ) == {"state": "sent", "signal_id": new_signal_id, "reason": "insufficient_bnb"}
+    assert feishu.calls == 2
+
+
+def test_allowance_incident_notifies_once_per_generation(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    predict.allowance = "2.4"
+    predict.clear_results.extend(
+        [
+            {"status": "failed", "market_id": "predict-market", "allowance": "2.4"},
+            {"status": "failed", "market_id": "predict-market", "allowance": "2.4"},
+        ]
+    )
+
+    first = service.cleanup_predict_allowance(confirm=True)
+    second = service.cleanup_predict_allowance(confirm=True)
+
+    assert first == {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+    assert second == {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+    assert feishu.calls == 1
+
+
 def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueIntent:
     now = datetime.now(UTC)
     return CrossVenueIntent(
@@ -2523,7 +2584,7 @@ def test_cross_venue_intent_payload_accepts_expired_exact_cutoff_for_holding() -
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=None)), "canonical_cutoff_invalid"),
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=datetime(2020, 1, 1, tzinfo=UTC))), "canonical_cutoff_invalid"),
         (lambda _cross, trading, _predict: setattr(trading, "balance", Decimal("1")), "account_insufficient"),
-        (lambda _cross, _trading, predict: setattr(predict, "allowance_breaker", True), "account_insufficient"),
+        (lambda _cross, _trading, predict: setattr(predict, "allowance_breaker", True), "residual_predict_allowance"),
         (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, quote_available=False)), "opportunity_not_actionable"),
     ],
 )

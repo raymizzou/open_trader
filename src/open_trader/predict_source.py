@@ -33,6 +33,7 @@ class PredictMarket:
     condition_id: str
     question: str
     rules: str
+    market_slug: str = ""
     category_slug: str = ""
     event_start_at: datetime | None = None
     event_end_at: datetime | None = None
@@ -397,6 +398,7 @@ def _normalise_market(
     ):
         return None
     market_id = _text(payload.get("id"))
+    market_slug = _text(payload.get("slug"))
     condition_id = _text(payload.get("conditionId"))
     question = _text(payload.get("question"))
     rules = _text(payload.get("description"))
@@ -467,6 +469,7 @@ def _normalise_market(
         condition_id=condition_id,
         question=question,
         rules=rules,
+        market_slug=market_slug,
         category_slug=category_slug,
         event_start_at=event_start_at,
         event_end_at=event_end_at,

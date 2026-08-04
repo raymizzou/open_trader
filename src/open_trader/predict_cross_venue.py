@@ -137,6 +137,8 @@ class VenueMarket:
     condition_id: str
     question: str
     rules: str
+    market_slug: str = ""
+    event_slug: str = ""
     resolution_source: str = ""
     close_at: datetime | None = None
     settlement_at: datetime | None = None
@@ -613,6 +615,7 @@ def _predict_market(market: PredictMarket) -> VenueMarket:
         condition_id=market.condition_id,
         question=market.question,
         rules=market.rules,
+        market_slug=market.market_slug,
         yes_token_id=market.yes_token_id,
         no_token_id=market.no_token_id,
         settlement_asset=market.settlement_asset,
@@ -656,6 +659,7 @@ def _polymarket_market(row: object, condition_id: str) -> VenueMarket | None:
     rules = fields[3]
     return VenueMarket(
         exchange="polymarket", market_id=fields[0], condition_id=condition_id,
+        event_slug=_text(_value(row, "eventSlug", "event_slug", "slug")),
         question=fields[2], rules=rules, resolution_source=fields[4],
         close_at=close_at, settlement_at=settlement_at, yes_token_id=fields[5],
         no_token_id=fields[6], settlement_asset=fields[7], minimum_order_size=minimum,
@@ -715,6 +719,10 @@ def _datetime(value: object) -> datetime | None:
         return None
 
 
+def _isoformat(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def _decimal(value: object) -> Decimal | None:
     try:
         result = Decimal(str(value))
@@ -746,6 +754,7 @@ def _equivalence_market_payload(market: VenueMarket) -> dict[str, str]:
             "condition_id": market.condition_id, "question": market.question,
             "rules": market.rules, "rules_fingerprint": market.rules_fingerprint,
             "yes_token_id": market.yes_token_id, "no_token_id": market.no_token_id,
+            "market_slug": market.market_slug,
             "category_slug": market.category_slug,
             "event_start_at": market.event_start_at.isoformat(),
             "event_end_at": market.event_end_at.isoformat(),
@@ -758,6 +767,7 @@ def _equivalence_market_payload(market: VenueMarket) -> dict[str, str]:
         "close_at": market.close_at.isoformat(), "settlement_at": market.settlement_at.isoformat(),
         "yes_token_id": market.yes_token_id, "no_token_id": market.no_token_id,
         "rules_fingerprint": market.rules_fingerprint,
+        "event_slug": market.event_slug,
     }
 
 
@@ -1040,6 +1050,10 @@ class PredictCrossVenueMonitor:
         self._monitored_pairs = 0
         self._status = "pending"
         self._predict_generation: int | None = None
+        self._last_success_funnel: dict[str, int] | None = None
+        self._funnel_last_success_at: datetime | None = None
+        self._stale_at: datetime | None = None
+        self._empty_state = ""
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -1055,23 +1069,39 @@ class PredictCrossVenueMonitor:
         await self._suspend_hot(status=self._source_status())
 
     def snapshot(self) -> dict[str, object]:
+        funnel = self._snapshot_funnel()
         return copy.deepcopy(
             {
                 "status": self._status,
                 "mode": self._execution_mode,
-                "funnel": {
-                    "matched_pairs": self._matched_pairs,
-                    "monitored_pairs": self._monitored_pairs,
-                    "codex_approved_pairs": len(self._approved),
-                    "arbitrage_space_pairs": len(self._arbitrage_pairs),
-                    "clear_signal_pairs": len(
-                        {pair_id for pair_id, _ in self._opportunities}
-                    ),
-                },
+                "funnel": funnel,
+                "funnel_last_success_at": _isoformat(self._funnel_last_success_at),
+                "stale_at": _isoformat(self._stale_at),
+                **({"empty_state": self._empty_state} if self._empty_state else {}),
                 "opportunities": list(self._opportunities.values()),
                 "events": [],
             }
         )
+
+    def _current_funnel(self) -> dict[str, int]:
+        return {
+            "matched_pairs": self._matched_pairs,
+            "monitored_pairs": self._monitored_pairs,
+            "codex_approved_pairs": len(self._approved),
+            "arbitrage_space_pairs": len(self._arbitrage_pairs),
+            "clear_signal_pairs": len({pair_id for pair_id, _ in self._opportunities}),
+        }
+
+    def _snapshot_funnel(self) -> dict[str, int]:
+        current = self._current_funnel()
+        if self._status == "ready":
+            self._last_success_funnel = dict(current)
+            self._funnel_last_success_at = self._clock()
+            self._stale_at = None
+            return current
+        if self._last_success_funnel is None:
+            return current
+        return {**self._last_success_funnel, "clear_signal_pairs": 0}
 
     async def refresh_opportunity(
         self,
@@ -1194,9 +1224,11 @@ class PredictCrossVenueMonitor:
                 clob_lookup=self._clob_lookup,
             )
         except Exception:
-            self._matched_pairs = 0
-            self._monitored_pairs = 0
-            self._set_approved({})
+            if self._last_success_funnel is None:
+                self._matched_pairs = 0
+                self._monitored_pairs = 0
+                self._set_approved({})
+            self._empty_state = ""
             await self._suspend_hot(status=self._source_status())
             await self._reconcile_holdings()
             return
@@ -1242,6 +1274,11 @@ class PredictCrossVenueMonitor:
             approved, prompt_version=prompt_version, validations=validations
         )
         self._status = self._source_status()
+        self._empty_state = (
+            "complete_scan_no_v1_market"
+            if self._status == "ready" and not markets and not eligible
+            else ""
+        )
         await self._reconcile_holdings()
 
     async def _reconcile_holdings(self) -> None:
@@ -1471,13 +1508,21 @@ class PredictCrossVenueMonitor:
 
     @staticmethod
     def _candidate_identity(market: VenueMarket) -> dict[str, str]:
-        return {
+        result = {
             "market_id": market.market_id,
             "condition_id": market.condition_id,
             "yes_token_id": market.yes_token_id,
             "no_token_id": market.no_token_id,
             "rules_fingerprint": market.rules_fingerprint,
         }
+        url = (
+            _official_market_url("predict.fun", market.market_slug)
+            if market.exchange == "predict.fun"
+            else _official_market_url("polymarket", market.event_slug)
+        )
+        if url:
+            result["market_url"] = url
+        return result
 
     @staticmethod
     def _intent_payload(intent: CrossVenueIntent) -> dict[str, object]:
@@ -1534,6 +1579,8 @@ class PredictCrossVenueMonitor:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._status = status
+        if status != "ready" and self._stale_at is None:
+            self._stale_at = self._clock()
 
     def _maintain_open_opportunities(self) -> None:
         status = self._source_status()
@@ -1815,3 +1862,13 @@ def _pair_question(pair: ExplicitMarketPair) -> str:
         if pair.predict.question == pair.polymarket.question
         else f"{pair.predict.question} / {pair.polymarket.question}"
     )
+
+
+def _official_market_url(exchange: str, slug: str) -> str:
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug or "") is None:
+        return ""
+    if exchange == "predict.fun":
+        return f"https://predict.fun/market/{slug}"
+    if exchange == "polymarket":
+        return f"https://polymarket.com/event/{slug}"
+    return ""

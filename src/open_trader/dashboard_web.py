@@ -716,10 +716,19 @@ def _prediction_predict_account_ready(snapshot: Mapping[str, object]) -> bool:
     return (
         snapshot.get("scope_ready") is True
         and snapshot.get("gas_ready") is True
+        and _prediction_decimal(snapshot.get("minimum_top_up_bnb")) <= 0
         and snapshot.get("allowance_breaker") is False
         and snapshot.get("allowance") not in (None, "")
         and snapshot.get("available_usdt") not in (None, "")
     )
+
+
+def _prediction_decimal(value: object) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+    return parsed if parsed.is_finite() else Decimal("0")
 
 
 def _prediction_venues_payload(
@@ -730,6 +739,7 @@ def _prediction_venues_payload(
     masked_wallet: str,
     breaker_open: bool,
     execution: object | None,
+    active_execution: Mapping[str, object] | None,
     cross_venue_monitor: object | None,
     cross_venue: Mapping[str, object],
 ) -> list[dict[str, object]]:
@@ -768,15 +778,62 @@ def _prediction_venues_payload(
     predict_reason = source_snapshot.get("reason") or cross_venue.get("reason")
     cross_breaker_open = bool(getattr(execution, "_cross_breaker_open", True))
     predict_account_ready = _prediction_predict_account_ready(predict_account)
+    residual_allowance = _prediction_decimal(predict_account.get("allowance"))
+    gas_top_up = _prediction_decimal(predict_account.get("minimum_top_up_bnb"))
     if predict_rest == "pending" or predict_ws == "pending":
         predict_mode = "API Key 待分配"
         predict_reason = predict_reason or "api_key_pending"
+    elif residual_allowance > 0 and active_execution is None:
+        predict_mode = "熔断只读"
+        predict_reason = predict_reason or "residual_predict_allowance"
     else:
         predict_mode = "可以交易" if predict_account_ready and not breaker_open and not cross_breaker_open else "只读"
+        if gas_top_up > 0 and predict_reason in (None, ""):
+            predict_reason = "insufficient_bnb"
         if predict_reason in (None, "") and not predict_account_ready and getattr(execution, "_predict_trading", None) is not None:
             predict_reason = "predict_account_unavailable"
         if predict_reason in (None, "") and predict_rest not in {"ready", "unknown"}:
             predict_reason = f"predict_{predict_rest}"
+    predict_payload: dict[str, object] = {
+        "venue": "predict.fun",
+        "rest": predict_rest,
+        "ws": predict_ws,
+        "wallet": predict_wallet,
+        "balance": {
+            "asset": source_snapshot.get("settlement_asset", "USDT"),
+            "value": predict_account.get("available_usdt", source_snapshot.get("balance")),
+        },
+        "mode": predict_mode,
+        "last_success": source_snapshot.get("last_success"),
+        "reason": predict_reason,
+    }
+    if predict_account:
+        predict_payload.update(
+            {
+                "account": {
+                    "role": "Predict Account · USDT/持仓/Allowance",
+                    "address": _prediction_mask_wallet(
+                        predict_account.get("predict_account")
+                        or predict_account.get("wallet_address")
+                        or predict_wallet
+                    ),
+                    "available_usdt": predict_account.get("available_usdt"),
+                    "allowance": predict_account.get("allowance"),
+                },
+                "gas": {
+                    "role": "Privy signer · BNB Gas",
+                    "address": _prediction_mask_wallet(predict_account.get("gas_signer")),
+                    "bnb_balance": predict_account.get("bnb_balance"),
+                    "required_bnb": predict_account.get("required_bnb"),
+                    "minimum_top_up": predict_account.get("minimum_top_up_bnb", "0"),
+                },
+                "reservation": {
+                    "reserved_usdt": predict_account.get("reserved_usdt"),
+                    "unsettled_usdt": predict_account.get("unsettled_usdt"),
+                },
+                "canary": predict_account.get("canary_mode"),
+            }
+        )
     return [
         {
             "venue": "polymarket",
@@ -791,19 +848,7 @@ def _prediction_venues_payload(
             "last_success": snapshot.get("heartbeat_at"),
             "reason": poly_reason,
         },
-        {
-            "venue": "predict.fun",
-            "rest": predict_rest,
-            "ws": predict_ws,
-            "wallet": predict_wallet,
-            "balance": {
-                "asset": source_snapshot.get("settlement_asset", "USDT"),
-                "value": predict_account.get("available_usdt", source_snapshot.get("balance")),
-            },
-            "mode": predict_mode,
-            "last_success": source_snapshot.get("last_success"),
-            "reason": predict_reason,
-        },
+        predict_payload,
     ]
 
 
@@ -1000,6 +1045,7 @@ def _prediction_state_payload(
         masked_wallet=masked_wallet,
         breaker_open=breaker_open,
         execution=execution,
+        active_execution=active,
         cross_venue_monitor=cross_venue_monitor,
         cross_venue=cross_venue,
     )

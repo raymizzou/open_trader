@@ -474,7 +474,17 @@ class PredictionExecutionService:
 
         prepared = self._prepare_opportunity(opportunity_id)
         if isinstance(prepared, dict):
-            return {"state": "failed", "reason": prepared.get("reason", "not_ready")}
+            reason = str(prepared.get("reason", "not_ready"))
+            if reason == "insufficient_bnb":
+                fresh = self._fresh_opportunity(opportunity_id)
+                if (
+                    not isinstance(fresh, Mapping)
+                    or cross_venue_notification_dedupe_identity(fresh)
+                    != signal.get("notification_dedupe_identity")
+                ):
+                    return {"state": "failed", "reason": "opportunity_changed"}
+                return self._notify_cross_gas_blocked_signal(signal_id, signal)
+            return {"state": "failed", "reason": reason}
         opportunity, intent, _account = prepared
         if not isinstance(intent, CrossVenueIntent):
             return {"state": "failed", "reason": "unsupported_intent"}
@@ -487,6 +497,51 @@ class PredictionExecutionService:
         return self._notify_yes_no_signal(
             signal_id, signal, rendered_signal={**opportunity, "signal_id": signal_id}
         )
+
+    def _notify_cross_gas_blocked_signal(
+        self, signal_id: str, signal: Mapping[str, object]
+    ) -> dict[str, object]:
+        reservation = self._store.reserve_notification_attempt(
+            signal_id, max_attempts=3, lease_seconds=60.0
+        )
+        state = reservation.get("state")
+        if state in {"missing", "closed"}:
+            return {"state": "ignored", "reason": "signal_closed" if state == "closed" else "signal_unavailable"}
+        if state == "sent":
+            return {"state": "ignored", "reason": "already_sent"}
+        if state == "in_flight":
+            return {"state": "ignored", "reason": "notification_in_flight"}
+        if state == "exhausted":
+            return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+        lease_id = reservation.get("lease_id")
+        if not isinstance(lease_id, str):
+            return {"state": "failed", "reason": "notification_state_unavailable"}
+        account = self._fresh_predict_account_snapshot() or {}
+        top_up = str(account.get("minimum_top_up_bnb", ""))
+        required = str(account.get("required_bnb", ""))
+        balance = str(account.get("bnb_balance", ""))
+        message = "\n".join(
+            (
+                "Predict stage-5 signal blocked by BNB gas.",
+                f"BNB balance: {balance}",
+                f"Required BNB: {required}",
+                f"Minimum manual top-up: {top_up}",
+                f"机会编号：{signal_id}",
+                f"Dashboard：{self._dashboard_url}",
+            )
+        )
+        try:
+            sent = self._deliver_feishu_notification("Predict BNB gas top-up required", message)
+        except Exception:
+            sent = False
+        completion = self._store.complete_notification_attempt(
+            signal_id, lease_id, success=sent, error_code="delivery_failed"
+        )
+        if completion.get("state") == "sent":
+            return {"state": "sent", "signal_id": signal_id, "reason": "insufficient_bnb"}
+        if completion.get("state") == "closed":
+            return {"state": "ignored", "reason": "signal_closed"}
+        return {"state": "failed", "reason": "notification_failed"}
 
     def _notify_yes_no_signal(
         self,
@@ -3162,6 +3217,11 @@ class PredictionExecutionService:
         poly_balance = _decimal(polymarket.get("p_usd_balance"))
         poly_allowance = _decimal(polymarket.get("p_usd_allowance"))
         predict_balance = _decimal(predict.get("available_usdt"))
+        minimum_top_up = _decimal(predict.get("minimum_top_up_bnb")) or Decimal("0")
+        if predict.get("gas_ready") is not True or minimum_top_up > 0:
+            return None, "insufficient_bnb"
+        if predict.get("allowance_breaker") is True:
+            return None, "residual_predict_allowance"
         if (
             not str(polymarket.get("wallet_address", "")).strip()
             or not str(predict.get("wallet_address", "")).strip()
@@ -3171,7 +3231,8 @@ class PredictionExecutionService:
             or poly_balance < poly_leg.max_cost
             or poly_allowance < poly_leg.max_cost
             or predict_balance < predict_leg.max_cost
-            or not _predict_account_snapshot_ready(predict)
+            or predict.get("scope_ready") is not True
+            or predict.get("allowance") in (None, "")
         ):
             return None, "account_insufficient"
         return {
@@ -3337,6 +3398,13 @@ class PredictionExecutionService:
         state: str = "directional_incident",
     ) -> str | None:
         if not execution_id:
+            existing = self._store.unacknowledged_incident()
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("reason") == reason
+            ):
+                incident_id = existing.get("incident_id")
+                return str(incident_id) if incident_id else None
             attempts = self._notify_incident(reason)
             recovery = getattr(self._store, "create_recovery_execution", None)
             if not callable(recovery):

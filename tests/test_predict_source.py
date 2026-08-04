@@ -101,11 +101,14 @@ def source_with_responses(
 
 
 def test_get_market_joins_category_timing_and_resolution_provider() -> None:
-    source, requests = source_with_responses([{"success": True, "data": market(id=896)}])
+    source, requests = source_with_responses(
+        [{"success": True, "data": market(id=896, slug="btc-year-end-896")}]
+    )
 
     result = asyncio.run(source.get_market("896"))
 
     assert result is not None
+    assert result.market_slug == "btc-year-end-896"
     assert result.category_slug == "btc-year-end"
     assert result.event_start_at == datetime(2026, 1, 1, tzinfo=UTC)
     assert result.event_end_at == datetime(2026, 12, 31, 23, 59, tzinfo=UTC)

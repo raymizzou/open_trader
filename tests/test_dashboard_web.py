@@ -2248,6 +2248,21 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
             "mode": "可以交易",
             "last_success": None,
             "reason": None,
+            "account": {
+                "role": "Predict Account · USDT/持仓/Allowance",
+                "address": "0xcE23…f435",
+                "available_usdt": "7.50",
+                "allowance": "0",
+            },
+            "gas": {
+                "role": "Privy signer · BNB Gas",
+                "address": "",
+                "bnb_balance": None,
+                "required_bnb": None,
+                "minimum_top_up": "0",
+            },
+            "reservation": {"reserved_usdt": None, "unsettled_usdt": None},
+            "canary": None,
         },
     ]
     assert state["cross_venue"]["funnel"] == {
@@ -2352,6 +2367,103 @@ def test_prediction_state_payload_accepts_legacy_predict_allowance_ready_fallbac
     )
 
     assert state["venues"][1]["mode"] == "可以交易"
+
+
+def test_predict_account_projection_labels_account_gas_and_masks_addresses() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": "2026-08-02T01:00:00Z",
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictSource:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "wallet": "0xcE2300000000000000000000000000000000f435",
+                "rest": "ready",
+                "ws": "ready",
+            }
+
+    class FakeCrossMonitor:
+        _predict = FakePredictSource()
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "mode": "manual_confirm",
+                "funnel": {
+                    "matched_pairs": 0,
+                    "monitored_pairs": 0,
+                    "codex_approved_pairs": 0,
+                    "arbitrage_space_pairs": 0,
+                    "clear_signal_pairs": 0,
+                },
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xcE2300000000000000000000000000000000f435",
+                "predict_account": "0xcE2300000000000000000000000000000000f435",
+                "gas_signer": "0xA71000000000000000000000000000000000Aa71",
+                "available_usdt": "123456.789",
+                "allowance": "0",
+                "bnb_balance": "0.031",
+                "required_bnb": "0.003",
+                "minimum_top_up_bnb": "0",
+                "reserved_usdt": "4.70",
+                "unsettled_usdt": "35.20",
+                "canary_mode": "first_fill_5_usdt",
+                "scope_ready": True,
+                "gas_ready": True,
+                "allowance_breaker": False,
+                "open_orders": [],
+                "positions": [],
+                "checked_at": datetime.now(timezone.utc),
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = FakePredictTrading()
+
+    state = _prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=FakeCrossMonitor(),
+        execution=FakeExecution(),
+        csrf_token="csrf",
+    )
+    predict = state["venues"][1]
+
+    assert predict["account"]["role"] == "Predict Account · USDT/持仓/Allowance"
+    assert predict["gas"]["role"] == "Privy signer · BNB Gas"
+    assert predict["account"]["address"] == "0xcE23…f435"
+    assert predict["gas"]["address"] == "0xA710…Aa71"
+    assert predict["account"]["allowance"] == "0"
+    assert predict["account"]["available_usdt"] == "123456.789"
+    assert predict["gas"]["bnb_balance"] == "0.031"
+    assert predict["gas"]["required_bnb"] == "0.003"
+    assert predict["gas"]["minimum_top_up"] == "0"
+    assert predict["reservation"] == {"reserved_usdt": "4.70", "unsettled_usdt": "35.20"}
+    assert predict["canary"] == "first_fill_5_usdt"
+    assert predict["mode"] == "可以交易"
+    assert "0xcE2300000000000000000000000000000000f435" not in repr(state["venues"])
+    assert "0xA71000000000000000000000000000000000Aa71" not in repr(state["venues"])
 
 
 def test_prediction_venue_pending_predict_does_not_degrade_polymarket() -> None:

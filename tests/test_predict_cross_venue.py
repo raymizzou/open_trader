@@ -16,6 +16,8 @@ import open_trader.predict_cross_venue as predict_cross_venue
 from open_trader.predict_cross_venue import (
     CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
     CodexCrossVenueEquivalenceValidator,
+    CrossVenueIntent,
+    CrossVenueLeg,
     CrossVenueValidation,
     ExplicitMarketPair,
     PredictCrossVenueMonitor,
@@ -1303,6 +1305,205 @@ def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -
         await monitor.stop()
 
     asyncio.run(exercise())
+
+
+def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None:
+    async def exercise() -> None:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        predict = FakeCrossVenuePredict(
+            (
+                monitor_predict_market(external_ids=("poly-condition",)),
+                rejected_predict_market(),
+            )
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
+            clock=lambda: now,
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: len(monitor.snapshot()["opportunities"]) == 2)
+        healthy = monitor.snapshot()
+        assert healthy["funnel"] == {
+            "matched_pairs": 2,
+            "monitored_pairs": 2,
+            "codex_approved_pairs": 1,
+            "arbitrage_space_pairs": 1,
+            "clear_signal_pairs": 1,
+        }
+
+        now = datetime(2026, 1, 1, 0, 0, 7, tzinfo=UTC)
+        predict.health["ws"] = "stale"
+        predict.ws_generation += 1
+        await monitor._observe_source_health()
+        stale = monitor.snapshot()
+
+        assert stale["status"] == "degraded"
+        assert stale["funnel"] == {
+            "matched_pairs": 2,
+            "monitored_pairs": 2,
+            "codex_approved_pairs": 1,
+            "arbitrage_space_pairs": 1,
+            "clear_signal_pairs": 0,
+        }
+        assert stale["funnel_last_success_at"] == "2026-01-01T00:00:00+00:00"
+        assert stale["stale_at"] == "2026-01-01T00:00:07+00:00"
+        assert all(row.get("actionable") is not True for row in stale["opportunities"])
+        assert await monitor.refresh_opportunity(
+            "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+        ) is None
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_complete_empty_scan_no_v1_market_is_ready_not_blocked() -> None:
+    async def exercise() -> None:
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            clob_lookup=lambda condition_id: None,
+            predict_quote_fn=predict_quote(),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: monitor.snapshot()["status"] == "ready")
+        snapshot = monitor.snapshot()
+
+        assert snapshot["funnel"] == {
+            "matched_pairs": 0,
+            "monitored_pairs": 0,
+            "codex_approved_pairs": 0,
+            "arbitrage_space_pairs": 0,
+            "clear_signal_pairs": 0,
+        }
+        assert snapshot["empty_state"] == "complete_scan_no_v1_market"
+        assert snapshot.get("blocker") in (None, "")
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_official_market_url_uses_only_validated_api_slugs() -> None:
+    base_pair = resolve_explicit_market_pairs(
+        (monitor_predict_market(external_ids=("poly-condition",)),),
+        gamma_lookup=lambda condition_ids, **kwargs: [
+            {
+                **polymarket_row("poly-condition"),
+                "eventSlug": "btc-above-100k",
+            }
+        ],
+        clob_lookup=lambda condition_id: None,
+    ).pairs[0]
+    pair = ExplicitMarketPair(
+        pair_id="public-pair",
+        predict=replace(base_pair.predict, market_slug="btc-year-end"),
+        polymarket=base_pair.polymarket,
+    )
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=monitor_gamma,
+        clob_lookup=lambda condition_id: None,
+        predict_quote_fn=predict_quote(),
+    )
+    intent = _build_stage_four_intent(pair)
+
+    opportunity = monitor._opportunity_payload(
+        pair,
+        intent,
+        FakeCrossVenueValidator().validate(pair),
+    )
+
+    assert opportunity["approved_candidates"]["predict.fun"]["market_url"] == (
+        "https://predict.fun/market/btc-year-end"
+    )
+    assert opportunity["approved_candidates"]["polymarket"]["market_url"] == (
+        "https://polymarket.com/event/btc-above-100k"
+    )
+    assert opportunity["approved_candidates"]["predict.fun"]["condition_id"] == (
+        "predict-native-condition-1"
+    )
+
+
+def test_official_market_url_omits_missing_or_unsafe_slugs() -> None:
+    base_pair = resolve_explicit_market_pairs(
+        (monitor_predict_market(external_ids=("poly-condition",)),),
+        gamma_lookup=lambda condition_ids, **kwargs: [
+            {
+                **polymarket_row("poly-condition"),
+                "eventSlug": "https://evil.test/event",
+            }
+        ],
+        clob_lookup=lambda condition_id: None,
+    ).pairs[0]
+    pair = ExplicitMarketPair(
+        pair_id="public-pair",
+        predict=replace(base_pair.predict, market_slug="../unsafe"),
+        polymarket=base_pair.polymarket,
+    )
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=monitor_gamma,
+        clob_lookup=lambda condition_id: None,
+        predict_quote_fn=predict_quote(),
+    )
+    opportunity = monitor._opportunity_payload(
+        pair,
+        _build_stage_four_intent(pair),
+        FakeCrossVenueValidator().validate(pair),
+    )
+
+    assert "market_url" not in opportunity["approved_candidates"]["predict.fun"]
+    assert "market_url" not in opportunity["approved_candidates"]["polymarket"]
+
+
+def _build_stage_four_intent(pair: ExplicitMarketPair) -> CrossVenueIntent:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    return CrossVenueIntent(
+        pair_id=pair.pair_id,
+        direction="PREDICT_YES_POLYMARKET_NO",
+        legs=(
+            CrossVenueLeg(
+                "predict.fun", pair.predict.market_id, pair.predict.condition_id,
+                "YES", pair.predict.yes_token_id, "USDT", Decimal("5"), Decimal("5"),
+                Decimal("0.45"), Decimal("2.30"), Decimal("0.05"), "USDT", now, None,
+                Decimal("1"),
+            ),
+            CrossVenueLeg(
+                "polymarket", pair.polymarket.market_id, pair.polymarket.condition_id,
+                "NO", pair.polymarket.no_token_id, "pUSD", Decimal("5"), Decimal("5"),
+                Decimal("0.47"), Decimal("2.40"), Decimal("0.05"), "pUSD", now,
+                now + timedelta(days=30), Decimal("1"),
+            ),
+        ),
+        quantity=Decimal("5"),
+        calculable_gas=Decimal("0"),
+        total_max_cost=Decimal("4.70"),
+        maximum_fee=Decimal("0.10"),
+        minimum_payout=Decimal("5"),
+        minimum_profit=Decimal("0.30"),
+        annualized_yield=Decimal("0.16"),
+        canonical_cutoff=now + timedelta(days=30),
+        resolution_at=now + timedelta(days=30),
+        actionable=False,
+        quote_available=True,
+    )
 
 
 def test_monitor_signal_episode_persists_refreshes_and_rotates_on_reopen(
