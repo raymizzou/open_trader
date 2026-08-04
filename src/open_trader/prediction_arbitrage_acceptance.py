@@ -19,8 +19,6 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from predict_sdk import ApprovalScope, Side
-
 from .polymarket_trading import (
     KeychainError,
     PolymarketTradingError,
@@ -55,6 +53,8 @@ LIVE_SCENARIO_IDS = frozenset({"LIVE-01", "LIVE-02", "LIVE-03"})
 _READY = "PASS"
 _BLOCKED = "BLOCKED"
 _FAILED = "FAIL"
+_NOT_APPLICABLE = "NOT_APPLICABLE"
+_NO_PREDICT_MARKET = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +93,7 @@ class LiveReadinessReport:
                 self.browser,
                 self.safety,
             )
+            if check.status != _NOT_APPLICABLE
         )
         if _FAILED in statuses:
             return _FAILED
@@ -214,6 +215,14 @@ class _PolymarketReadOnlyGuard:
             "redeem_positions",
             "split_position",
             "execute_transaction",
+            "approve",
+            "set_approval",
+            "clear_approval",
+            "cleanup",
+            "cleanup_allowance",
+            "transfer",
+            "transfer_usdt",
+            "withdraw",
             "delete",
             "delete_json",
             "put",
@@ -239,6 +248,12 @@ class _PolymarketReadOnlyGuard:
                 "redeem_",
                 "split_",
                 "execute_",
+                "approve_",
+                "set_",
+                "clear_",
+                "cleanup_",
+                "transfer_",
+                "withdraw_",
                 "delete_",
                 "put_",
                 "patch_",
@@ -477,6 +492,10 @@ def _ready(detail: str) -> ReadinessCheck:
     return ReadinessCheck(_READY, detail)
 
 
+def _not_applicable(detail: str) -> ReadinessCheck:
+    return ReadinessCheck(_NOT_APPLICABLE, detail)
+
+
 def _http_status(exc: BaseException) -> int | None:
     code = getattr(exc, "code", None)
     if isinstance(code, int):
@@ -533,7 +552,7 @@ async def _predict_market_book(source: object, *, timeout: float) -> object:
     markets = await asyncio.wait_for(source.list_open_markets(), timeout=timeout)  # type: ignore[attr-defined]
     if not markets:
         _raise_source_status(source, "rest")
-        raise RuntimeError
+        return _NO_PREDICT_MARKET
     market = markets[0]
     book = await asyncio.wait_for(source.get_order_book(market.market_id), timeout=timeout)  # type: ignore[attr-defined]
     if book is None:
@@ -573,24 +592,39 @@ def _predict_quantity(market: object) -> int:
     return int(quantity)
 
 
-def _predict_account_check(client: object) -> ReadinessCheck:
+def _predict_account_check(client: object, market: object | None) -> ReadinessCheck:
     try:
         jwt = client._authenticate()  # type: ignore[attr-defined]
-        builder = client._builder  # type: ignore[attr-defined]
-        checks = builder.check_approvals(
-            builder.get_approval_steps(ApprovalScope("TRADE", False, False, Side.BUY))
-        )
-        balance = Decimal(str(builder.balance_of("USDT")))
+        if market is _NO_PREDICT_MARKET:
+            balance = Decimal(str(client._builder.balance_of("USDT")))  # type: ignore[attr-defined]
+            facts: Mapping[str, object] = {"available_usdt": balance, "allowance": 0, "scope_ready": True}
+        elif market is None:
+            return _blocked("Predict market/account readiness unavailable")
+        else:
+            facts = client.approval_facts(  # type: ignore[attr-defined]
+                market.market_id, exact_debit_wei=0
+            )
     except KeychainError:
         return _blocked("Predict Keychain environment unavailable")
     except Exception as exc:
         if _is_external_unavailable(exc):
             return _blocked("Predict account environment unavailable")
         return _failed("predict account read failed")
-    if not isinstance(jwt, str) or not jwt or not balance.is_finite() or balance < 0:
+    try:
+        balance = Decimal(str(facts["available_usdt"]))
+        allowance = Decimal(str(facts["allowance"]))
+    except (KeyError, InvalidOperation, ValueError):
         return _failed("predict account read failed")
-    if not all(getattr(check, "satisfied", False) is True for check in checks):
-        return _failed("predict allowance unavailable")
+    if (
+        not isinstance(jwt, str)
+        or not jwt
+        or facts.get("scope_ready") is not True
+        or not balance.is_finite()
+        or balance < 0
+        or not allowance.is_finite()
+        or allowance < 0
+    ):
+        return _failed("predict account read failed")
     return _ready("Predict JWT, balance, and allowance ready")
 
 
@@ -699,7 +733,11 @@ def run_live_readiness(
     try:
         source = predict_source_factory(config.predict, urlopen_fn=transport)
         market = asyncio.run(_predict_market_book(source, timeout=timeout))
-        predict_market = _ready("Predict REST and WebSocket market/book ready")
+        predict_market = (
+            _ready("Predict market scan complete; no open V1 market")
+            if market is _NO_PREDICT_MARKET
+            else _ready("Predict REST and WebSocket market/book ready")
+        )
     except KeychainError:
         predict_market = _blocked("Predict Keychain environment unavailable")
     except Exception as exc:
@@ -721,8 +759,10 @@ def run_live_readiness(
             else _failed("predict account read failed")
         )
     else:
-        predict_account = _predict_account_check(predict_client)
-    if market is None or predict_client is None:
+        predict_account = _predict_account_check(predict_client, market)
+    if market is _NO_PREDICT_MARKET:
+        predict_preflight = _not_applicable("Predict signed-order construction not applicable; no open V1 market")
+    elif market is None or predict_client is None:
         predict_preflight = _blocked("Predict market/account readiness unavailable")
     elif predict_account.status != _READY:
         predict_preflight = _blocked("Predict account readiness unavailable")

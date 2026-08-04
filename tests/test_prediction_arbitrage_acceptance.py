@@ -61,6 +61,17 @@ class Builder:
 class PredictClient:
     _builder = Builder()
 
+    def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
+        assert (market_id, exact_debit_wei) == ("predict-market", 0)
+        return {
+            "predict_account": CONFIG.predict.wallet_address if CONFIG.predict else "",
+            "available_usdt": "10",
+            "allowance": "0",
+            "scope_ready": True,
+            "approval_scope": {"operation": "TRADE", "side": "BUY"},
+            "minimum_top_up_bnb": "0",
+        }
+
     def _authenticate(self) -> str:
         return "jwt-sentinel"
 
@@ -169,6 +180,47 @@ def test_readiness_report_distinguishes_all_no_submit_facts(tmp_path: Path) -> N
     }
 
 
+def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
+    tmp_path: Path,
+) -> None:
+    class EmptyPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=lambda _config, *, urlopen_fn: EmptyPredictSource(),
+    )
+
+    assert report.status == "PASS"
+    assert report.predict_market.status == "PASS"
+    assert report.predict_preflight.status == "NOT_APPLICABLE"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
+def test_predict_account_readiness_uses_exact_approval_facts_not_satisfied_flag(
+    tmp_path: Path,
+) -> None:
+    class LegacyUnsatisfiedBuilder(Builder):
+        def check_approvals(self, steps: tuple[object, ...]) -> tuple[SimpleNamespace, ...]:
+            del steps
+            return (SimpleNamespace(satisfied=False),)
+
+    class ExactFactsPredictClient(PredictClient):
+        _builder = LegacyUnsatisfiedBuilder()
+
+    report = readiness_report(
+        tmp_path,
+        predict_client_factory=lambda _config, *, urlopen_fn: ExactFactsPredictClient(),
+    )
+
+    assert report.status == "PASS"
+    assert report.predict_account.status == "PASS"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
 def test_missing_configuration_is_blocked_not_fixture_pass(tmp_path: Path) -> None:
     report = acceptance.run_live_readiness(tmp_path / "missing.json")
 
@@ -197,17 +249,39 @@ def test_auth_read_failure_is_fail_and_redacts_secret_text(tmp_path: Path) -> No
     assert "sentinel" not in rendered
 
 
-def test_read_only_transport_rejects_order_endpoint_and_counts_no_delivery() -> None:
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/v1/approvals",
+        "/v1/cleanup",
+        "/v1/orders",
+        "/v1/transfers",
+        "/v1/redemptions",
+    ),
+)
+def test_read_only_transport_rejects_mutation_endpoint_and_counts_no_delivery(
+    path: str,
+) -> None:
     transport = acceptance.ReadOnlyTransport(lambda request, **kwargs: object())
 
     with pytest.raises(RuntimeError, match="mutation prohibited"):
-        transport(Request("https://api.predict.fun/v1/orders", method="POST"), timeout=1)
+        transport(Request(f"https://api.predict.fun{path}", method="POST"), timeout=1)
 
     assert transport.mutation_calls == 1
     assert transport.live_notifications == 0
 
 
-@pytest.mark.parametrize("action", ("post_order", "redeem_positions", "notify"))
+@pytest.mark.parametrize(
+    "action",
+    (
+        "set_approval",
+        "cleanup_allowance",
+        "post_order",
+        "transfer_usdt",
+        "redeem_positions",
+        "send_notification",
+    ),
+)
 def test_polymarket_mutation_or_notification_attempt_fails_closed(
     tmp_path: Path, action: str
 ) -> None:
@@ -242,11 +316,21 @@ def test_polymarket_mutation_or_notification_attempt_fails_closed(
     assert report.status == "FAIL"
     assert report.polymarket.status == "FAIL"
     assert report.safety.status == "FAIL"
-    assert report.live_notifications == (1 if action == "notify" else 0)
-    assert report.mutation_calls == (0 if action == "notify" else 1)
+    assert report.live_notifications == (1 if action == "send_notification" else 0)
+    assert report.mutation_calls == (0 if action == "send_notification" else 1)
 
 
-@pytest.mark.parametrize("action", ("post_order", "redeem_positions", "notify"))
+@pytest.mark.parametrize(
+    "action",
+    (
+        "set_approval",
+        "cleanup_allowance",
+        "post_order",
+        "transfer_usdt",
+        "redeem_positions",
+        "send_notification",
+    ),
+)
 def test_polymarket_guard_blocks_mutation_through_raw_nested_sdk_internals(
     tmp_path: Path, action: str
 ) -> None:
@@ -286,8 +370,8 @@ def test_polymarket_guard_blocks_mutation_through_raw_nested_sdk_internals(
 
     assert report.status == "FAIL"
     assert report.safety.status == "FAIL"
-    assert report.live_notifications == (1 if action == "notify" else 0)
-    assert report.mutation_calls == (0 if action == "notify" else 1)
+    assert report.live_notifications == (1 if action == "send_notification" else 0)
+    assert report.mutation_calls == (0 if action == "send_notification" else 1)
 
 
 def test_polymarket_guard_blocks_read_method_using_raw_nested_transport(
