@@ -116,17 +116,17 @@ symbol.
 
 ## Price Precedence
 
-For a quoteable position, one source supplies all price-dependent fields:
+For a quoteable position, one quote source supplies all current
+price-dependent fields:
 
 1. a valid accepted quote from the current OpenD refresh;
-2. the last accepted quote retained by the existing quote publication;
-3. the accepted broker account snapshot or statement position.
+2. the last accepted quote retained by the existing quote publication.
 
 A valid OpenD quote wins regardless of the position's broker source kind. Its
 price, session kind, and quote time replace the position's displayed
 `last_price`, `price_kind`, and `price_as_of`; native market value is recalculated
-with the existing quantity and instrument-multiplier rules. A fallback keeps
-its truthful `account_snapshot` or `statement` kind and original timestamp.
+with the existing quantity and instrument-multiplier rules. Non-quoteable
+positions keep their truthful accepted `account_snapshot` or `statement` facts.
 
 Unknown, non-finite, zero, or negative quote prices do not overwrite an
 accepted value. Zero is never used to mean unavailable.
@@ -203,9 +203,11 @@ valuation while Account totals use another.
 
 - If a current quote refresh fails, the existing retained quote publication
   and Account stale rules remain authoritative.
-- If a required OpenD quote is unavailable but an accepted account or statement
-  fallback exists, the row remains complete with its fallback `price_kind` and
-  the Account quote source is stale with a stable reason.
+- If a required OpenD quote is unavailable but a previously accepted quote
+  exists, the existing retained-publication path serves it as stale.
+- If no accepted quote exists for a required instrument, Account v1 keeps its
+  frozen fail-closed behavior and returns `503`; an account snapshot or
+  statement price is not promoted to a current quote.
 - If an in-scope position lacks a valid selected price, native value, required
   FX, or either converted value, the Worker does not replace the last accepted
   complete Account projection.
@@ -278,7 +280,7 @@ Focused automated checks must prove:
   matching positions;
 - a valid OpenD quote overrides statement price and updates dependent Account
   values, summaries, weights, and P/L consistently;
-- invalid/missing quotes retain truthful fallback or stale behavior and never
+- invalid/missing quotes retain an accepted quote or fail closed and never
   produce zero or partial valuation objects;
 - all real US/HK/CN non-cash positions publish complete USD and HKD equivalents;
 - existing flat v1 fields keep their types and semantics;
