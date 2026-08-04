@@ -12,7 +12,8 @@ STATEMENT_GENERATION = "sha256:" + "b" * 64
 
 
 class _Response:
-    def __init__(self, payload: object) -> None:
+    def __init__(self, payload: object, *, status: int = 200) -> None:
+        self.status = status
         self._body = io.BytesIO(json.dumps(payload).encode())
 
     def __enter__(self) -> _Response:
@@ -76,6 +77,21 @@ def test_fetch_snapshot_sends_production_marker_and_validates_v1_envelope(
     request, timeout = calls[0]
     assert request.get_header("X-open-trader-account-route") == "production"
     assert timeout == 1.25
+
+
+@pytest.mark.parametrize("status", [201, 202])
+def test_fetch_snapshot_rejects_non_200_even_with_valid_envelope(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    from open_trader.account_http import AccountHttpError, fetch_account_snapshot
+
+    monkeypatch.setattr(
+        "open_trader.account_http.urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(_snapshot(), status=status),
+    )
+
+    with pytest.raises(AccountHttpError, match="^account_unavailable$"):
+        fetch_account_snapshot("http://account", 1)
 
 
 def test_fetch_statement_facts_sends_marker_and_validates_contract(
@@ -173,6 +189,8 @@ def test_fetch_snapshot_sanitizes_transport_and_http_failures(
         fetch_account_snapshot("http://account", 1)
     assert raised.value.code == "account_unavailable"
     assert str(raised.value) == "account_unavailable"
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
 
 
 def test_fetch_statement_facts_preserves_only_generation_conflict(
@@ -193,6 +211,8 @@ def test_fetch_statement_facts_preserves_only_generation_conflict(
         fetch_statement_trade_facts("http://account", "phillips", STATEMENT_GENERATION, 1)
     assert raised.value.code == "accepted_statement_generation_changed"
     assert str(raised.value) == "accepted_statement_generation_changed"
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
 
 
 @pytest.mark.parametrize("timeout", [0, -1])

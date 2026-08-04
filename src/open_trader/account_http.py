@@ -65,13 +65,20 @@ def _get_json(url: str, timeout_seconds: float) -> dict[str, object]:
     request = urllib.request.Request(
         url, headers={ACCOUNT_ROUTE_HEADER: PRODUCTION_ROUTE_MARKER}
     )
+    error_code: str | None = None
+    payload: object = None
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            payload = json.load(response)
+            if getattr(response, "status", None) != 200:
+                error_code = "account_unavailable"
+            else:
+                payload = json.load(response)
     except urllib.error.HTTPError as error:
-        raise AccountHttpError(_safe_http_error_code(error)) from None
+        error_code = _safe_http_error_code(error)
     except (OSError, TimeoutError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
-        raise AccountHttpError("account_unavailable") from None
+        error_code = "account_unavailable"
+    if error_code is not None:
+        raise AccountHttpError(error_code)
     if not isinstance(payload, dict):
         raise AccountHttpError("account_contract_invalid")
     return payload
