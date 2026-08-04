@@ -7169,7 +7169,7 @@ def test_acceptance_rejects_enabled_premarket_or_t_signal_paths(
         if command[:2] == ["launchctl", "list"]:
             return Result(0, "-\t0\tcom.open-trader.premarket\n")
         if command[:2] == ["ps", "ax"]:
-            return Result(0)
+            return Result(0, "python -m open_trader.daily_premarket\n")
         return Result(0)
 
     monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
@@ -7177,7 +7177,34 @@ def test_acceptance_rejects_enabled_premarket_or_t_signal_paths(
     errors = dashboard_acceptance._disabled_workflow_errors(tmp_path)
 
     assert any("launchd" in error for error in errors)
+    assert any("进程" in error for error in errors)
     assert any("run-premarket" in error for error in errors)
+
+
+def test_acceptance_allows_trend_controller_config_path_for_disabled_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def run(command: list[str], **_kwargs: object) -> Result:
+        if command[:2] == ["launchctl", "list"]:
+            return Result(0)
+        if command[:2] == ["ps", "ax"]:
+            return Result(
+                0,
+                "open_trader trend-market run --config "
+                "/repo/config/daily_premarket.env\n",
+            )
+        return Result(2)
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
+
+    assert dashboard_acceptance._disabled_workflow_errors(tmp_path) == []
 
 
 def test_account_outage_isolation_fails_closed_and_restores_account() -> None:

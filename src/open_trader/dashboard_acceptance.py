@@ -67,6 +67,10 @@ TREND_REPORT_DIRECTORIES = {
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
+DISABLED_WORKFLOW_PROCESS_PATTERN = re.compile(
+    r"(?:^|\s)(?:run-premarket|run-daily-premarket|watch-t|"
+    r"-m\s+open_trader\.(?:daily_premarket|t_signal_runner))(?=\s|$)"
+)
 TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
@@ -1248,10 +1252,7 @@ def _disabled_workflow_errors(expected_root: Path) -> list[str]:
         )
         if processes.returncode != 0:
             errors.append("无法读取 Premarket/T-signal 进程")
-        elif re.search(
-            r"(?:run-premarket|run-daily-premarket|watch-t|daily_premarket|t_signal_runner)",
-            processes.stdout,
-        ):
+        elif DISABLED_WORKFLOW_PROCESS_PATTERN.search(processes.stdout):
             errors.append("已禁用 Premarket/T-signal 进程仍在运行")
     except OSError as exc:
         errors.append(f"已禁用工作流检查失败：{type(exc).__name__}")

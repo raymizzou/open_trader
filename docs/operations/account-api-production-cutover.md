@@ -66,7 +66,7 @@ scripts/install_daily_premarket_launchd.sh --trend-only --market US \
 
 # 5. Disabled paths must stay absent. Do not run a Premarket/T-signal dry run.
 launchctl list | rg 'com\.open-trader\.premarket(\.|$)' && exit 1 || true
-ps ax -o command= | rg 'run-premarket|run-daily-premarket|watch-t|daily_premarket|t_signal_runner' && exit 1 || true
+ps ax -o command= | rg '(^|[[:space:]])(run-premarket|run-daily-premarket|watch-t|-m[[:space:]]+open_trader\.(daily_premarket|t_signal_runner))([[:space:]]|$)' && exit 1 || true
 for command in run-premarket run-daily-premarket watch-t; do
   PYTHONSAFEPATH=1 "$OPEN_TRADER_PYTHON" -m open_trader "$command" --help
   test $? -eq 2
