@@ -125,6 +125,9 @@ def test_trend_allocation_once_rebases_runtime_and_enforces_executor(
         ["watch-trend-market", "--market", "HK"],
         ["trend-review", "open", "--market", "CN", "--date", "2026-07-20"],
         ["trend-review", "close", "--market", "US", "--date", "2026-07-20"],
+        ["run-premarket", "--date", "2026-07-20"],
+        ["run-daily-premarket", "--date", "2026-07-20", "--market", "US"],
+        ["watch-t", "--date", "2026-07-20", "--market", "US"],
     ],
 )
 def test_removed_trend_operational_commands_are_rejected(argv: list[str]) -> None:
@@ -132,6 +135,27 @@ def test_removed_trend_operational_commands_are_rejected(argv: list[str]) -> Non
         cli.build_parser().parse_args(argv)
 
     assert exc_info.value.code == 2
+
+
+def test_disabled_premarket_and_t_signal_production_paths_are_absent() -> None:
+    root = Path(__file__).parents[1]
+    cli_source = (root / "src/open_trader/cli.py").read_text()
+    install_script = (root / "scripts/install_daily_premarket_launchd.sh").read_text()
+    uninstall_script = (root / "scripts/uninstall_daily_premarket_launchd.sh").read_text()
+    current_installer = install_script.split("for label in", 1)[0]
+
+    for command in ("run-premarket", "run-daily-premarket", "watch-t"):
+        assert command not in cli_source
+    for label in (
+        "com.open-trader.premarket",
+        "com.open-trader.premarket.hk",
+        "com.open-trader.premarket.us",
+    ):
+        assert f'stop_label "$label"' in install_script
+        assert label not in current_installer
+        assert f'remove_label "{label}"' in uninstall_script
+    assert "com.open-trader.t-signal" not in install_script
+    assert "com.open-trader.t-signal" not in uninstall_script
 
 
 def test_trend_market_run_routes_checkout_and_preserves_shared_paths(
