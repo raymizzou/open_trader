@@ -2567,6 +2567,17 @@ def _check_trend_artifact_projection(
         "hold_actions": holds,
         "review_actions": reviews,
     }
+    frozen_signals = payload.get("signal_snapshots")
+    frozen_signals = frozen_signals if isinstance(frozen_signals, Mapping) else {}
+    expected_actions["buy_actions"] = _project_trend_strength_fields(
+        expected_actions["buy_actions"], frozen_signals.get("candidates")
+    )
+    expected_actions["sell_actions"] = _project_trend_strength_fields(
+        expected_actions["sell_actions"], frozen_signals.get("holdings")
+    )
+    expected_actions["hold_actions"] = _project_trend_strength_fields(
+        expected_actions["hold_actions"], frozen_signals.get("holdings")
+    )
     assert all(
         isinstance(projected := report.get(key), list)
         and all(isinstance(item, Mapping) for item in projected)
@@ -2582,7 +2593,7 @@ def _check_trend_artifact_projection(
     ), f"{broker} 冻结报告动作与 API 投影不一致"
     for key in ("simulate_rotation_comparisons", "real_rotation_comparisons"):
         expected = judgments.get(key, [])
-        assert isinstance(expected, list) and report.get(key) == expected, (
+        assert isinstance(expected, list) and report.get(key, []) == expected, (
             f"{broker} 冻结报告轮换比较与 API 投影不一致：{key}"
         )
     assert report.get("counts") == {

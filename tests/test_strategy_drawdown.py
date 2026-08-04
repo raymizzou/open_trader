@@ -10,6 +10,9 @@ import pytest
 from open_trader.a_share_trend import live_trend_strategy_snapshot
 from open_trader.strategy_drawdown import (
     ALLOCATION_PROJECTION_PARAMETER_HASHES,
+    ALLOCATION_PROJECTION_COMPATIBILITY_REVISION,
+    _parameter_compatibility_event_id,
+    _valid_parameter_compatibility_event,
     UNIFIED_TREND_V5_COMPATIBILITY_REVISION,
     UNIFIED_TREND_V5_PARAMETER_HASHES,
     automatic_bootstrap_strategy_drawdown,
@@ -20,6 +23,30 @@ from open_trader.strategy_drawdown import (
     valid_drawdown_decision,
     valid_strategy_parameter_audit_identity,
 )
+
+
+@pytest.mark.parametrize("market,version", [("CN", "v11"), ("HK", "v9"), ("US", "v9")])
+def test_legacy_allocation_compatibility_event_remains_readable(
+    market: str, version: str,
+) -> None:
+    key = (market, f"trend_animals_warm_to_hot/{market}/{version}", version)
+    old_hash, new_hash = ALLOCATION_PROJECTION_PARAMETER_HASHES[market]
+    event = {
+        "event_id": _parameter_compatibility_event_id(
+            key, old_hash, new_hash, ALLOCATION_PROJECTION_COMPATIBILITY_REVISION,
+        ),
+        "event_type": "parameter_compatibility",
+        "market": market,
+        "strategy_id": key[1],
+        "strategy_version": version,
+        "actor": "pytest",
+        "occurred_at": "2026-08-03T08:00:00+08:00",
+        "old_parameter_hash": old_hash,
+        "new_parameter_hash": new_hash,
+        "compatibility_revision": ALLOCATION_PROJECTION_COMPATIBILITY_REVISION,
+        "accepted_git_sha": "a" * 40,
+    }
+    assert _valid_parameter_compatibility_event(event)
 
 
 def bootstrap(
