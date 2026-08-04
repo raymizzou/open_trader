@@ -162,7 +162,18 @@ def create_account_api(
             parts = path.removeprefix(prefix).split("/")
             if path.startswith(prefix) and len(parts) == 3 and parts[2] == "trade-facts":
                 broker, generation, _trade_facts = parts
-                if mode == "shadow" and self.headers.get(ACCOUNT_ROUTE_HEADER) == PRODUCTION_ROUTE_MARKER:
+                if broker not in STATEMENT_BROKERS or statement_generation_digest(generation) is None:
+                    self._send_json(
+                        {
+                            "schema_version": "open_trader.account_api.error.v1",
+                            "code": "invalid_statement_facts_request",
+                            "message": "Invalid statement facts request",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                route_marker = self.headers.get(ACCOUNT_ROUTE_HEADER)
+                if mode == "shadow" and route_marker == PRODUCTION_ROUTE_MARKER:
                     self._send_json(
                         {
                             "schema_version": "open_trader.account_api.error.v1",
@@ -172,14 +183,14 @@ def create_account_api(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                     )
                     return
-                if broker not in STATEMENT_BROKERS or statement_generation_digest(generation) is None:
+                if mode == "production" and route_marker != PRODUCTION_ROUTE_MARKER:
                     self._send_json(
                         {
                             "schema_version": "open_trader.account_api.error.v1",
-                            "code": "invalid_statement_facts_request",
-                            "message": "Invalid statement facts request",
+                            "code": "account_api_route_required",
+                            "message": "Production route marker required",
                         },
-                        HTTPStatus.BAD_REQUEST,
+                        HTTPStatus.SERVICE_UNAVAILABLE,
                     )
                     return
                 snapshot = load_account_snapshot(

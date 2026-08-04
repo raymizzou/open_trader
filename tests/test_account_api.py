@@ -572,6 +572,52 @@ def test_account_api_statement_trade_facts_returns_only_public_contract(
         assert private_value not in encoded
 
 
+def test_account_api_statement_trade_facts_production_requires_route_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    generation = "sha256:" + "a" * 64
+    _write_publication(data_dir)
+    _set_accepted_statement_generation(data_dir, "phillips", generation)
+    monkeypatch.setattr(
+        "open_trader.statement_import.load_statement_trade_facts",
+        lambda *_args: (
+            {
+                "statement_period": "2026-07-31",
+                "trade_facts_cutoff_at": "2026-08-04T16:00:00+08:00",
+                "trade_facts_sha256": "sha256:" + "b" * 64,
+            },
+            [],
+        ),
+    )
+    server = account_api.create_account_api(
+        data_dir,
+        host="127.0.0.1",
+        port=0,
+        runtime_metadata={
+            "pid": 321,
+            "started_at": "2026-08-03T12:00:00+08:00",
+            "cwd": "/tmp/open-trader",
+            "api_git_sha": SHA,
+        },
+        mode="production",
+    )
+
+    with _running(server):
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_address[1]}/api/v1/account/"
+                f"statements/phillips/{generation}/trade-facts"
+            )
+
+    assert rejected.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.load(rejected.value) == {
+        "schema_version": "open_trader.account_api.error.v1",
+        "code": "account_api_route_required",
+        "message": "Production route marker required",
+    }
+
+
 def test_account_api_statement_trade_facts_shadow_rejects_production_marker(
     tmp_path: Path,
 ) -> None:
