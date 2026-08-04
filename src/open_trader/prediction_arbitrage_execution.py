@@ -2197,30 +2197,37 @@ class PredictionExecutionService:
     def _proof_has_order_refs(proof: Mapping[str, object], venue: str) -> bool:
         direct_orders = proof.get("order_ids")
         direct_trades = proof.get("trade_ids")
-        if (
-            isinstance(direct_orders, (list, tuple))
-            and isinstance(direct_trades, (list, tuple))
-            and any(isinstance(item, str) and item.strip() for item in direct_orders)
-            and any(isinstance(item, str) and item.strip() for item in direct_trades)
-        ):
+        if PredictionExecutionService._has_order_trade_refs(direct_orders, direct_trades):
             return True
         matched = proof.get("matched_refs")
         if not isinstance(matched, Mapping):
             return False
-        candidates = (matched.get(venue), *matched.values())
-        for candidate in candidates:
-            if not isinstance(candidate, Mapping):
+        candidate = matched.get(venue)
+        if not isinstance(candidate, Mapping):
+            return False
+        if PredictionExecutionService._has_order_trade_refs(
+            candidate.get("order_ids"),
+            candidate.get("trade_ids"),
+        ):
+            return True
+        for nested in candidate.values():
+            if not isinstance(nested, Mapping):
                 continue
-            orders = candidate.get("order_ids")
-            trades = candidate.get("trade_ids")
-            if (
-                isinstance(orders, (list, tuple))
-                and isinstance(trades, (list, tuple))
-                and any(isinstance(item, str) and item.strip() for item in orders)
-                and any(isinstance(item, str) and item.strip() for item in trades)
+            if PredictionExecutionService._has_order_trade_refs(
+                nested.get("order_ids"),
+                nested.get("trade_ids"),
             ):
                 return True
         return False
+
+    @staticmethod
+    def _has_order_trade_refs(orders: object, trades: object) -> bool:
+        return (
+            isinstance(orders, (list, tuple))
+            and isinstance(trades, (list, tuple))
+            and any(isinstance(item, str) and item.strip() for item in orders)
+            and any(isinstance(item, str) and item.strip() for item in trades)
+        )
 
     def _cross_post_fill_baseline(self) -> dict[str, Decimal] | None:
         """Persist balances after the two actual positions are proven.

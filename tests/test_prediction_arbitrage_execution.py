@@ -1804,6 +1804,54 @@ def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verif
                 setattr(predict, "omit_canary_fee_proof", True),
             ),
         ),
+        (
+            "polymarket_refs_only_under_predict_key",
+            lambda trading, _cross, _predict: trading.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "polymarket",
+                        "fee": Decimal("0.05"),
+                        "matched_refs": {
+                            "predict.fun": {
+                                "order_ids": ["predict-order"],
+                                "trade_ids": ["predict-trade"],
+                            }
+                        },
+                    },
+                }
+            ),
+        ),
+        (
+            "predict_refs_only_under_polymarket_key",
+            lambda _trading, _cross, predict: predict.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "predict.fun",
+                        "fee": Decimal("0.05"),
+                        "matched_refs": {
+                            "polymarket": {
+                                "order_ids": ["poly-order"],
+                                "trade_ids": ["poly-trade"],
+                            }
+                        },
+                    },
+                }
+            ),
+        ),
     ],
 )
 def test_cross_canary_cap_stays_five_after_non_graduating_outcomes(

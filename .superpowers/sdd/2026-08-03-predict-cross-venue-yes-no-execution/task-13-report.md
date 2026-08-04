@@ -160,3 +160,61 @@ Both exited 0.
 - The only warning remains the existing `websockets.legacy` deprecation warning from the test environment.
 - No live approval/order/transfer was run.
 - `make acceptance` was not run per instruction.
+
+## Fix round 2/5
+
+### Reviewer finding addressed
+
+- `_proof_has_order_refs()` no longer accepts refs from any `matched_refs` entry. Direct proof refs still count, but matched refs must now be under the requested venue key; nested outcome/leg refs are accepted only inside that venue-bound entry. Wrong-venue refs no longer graduate the first cross canary.
+
+### Round 2 TDD evidence
+
+Focused red command:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py -k 'cross_canary' -q
+```
+
+Red result before fix:
+
+```text
+2 failed, 7 passed, 173 deselected, 1 warning in 3.20s
+```
+
+Focused green after fix:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_prediction_arbitrage_execution.py -k 'cross_canary' -q
+
+9 passed, 173 deselected, 1 warning in 3.15s
+```
+
+Full affected green:
+
+```text
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m pytest \
+  tests/test_predict_trading.py \
+  tests/test_prediction_arbitrage_store.py \
+  tests/test_prediction_arbitrage_execution.py \
+  tests/test_dashboard_web.py -q
+
+614 passed, 1 warning in 48.60s
+```
+
+Extra checks:
+
+```text
+git diff --check
+PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m py_compile \
+  src/open_trader/prediction_arbitrage_execution.py src/open_trader/dashboard_web.py
+```
+
+Both exited 0.
+
+### Round 2 concerns
+
+- The only warning remains the existing `websockets.legacy` deprecation warning from the test environment.
+- No live approval/order/transfer was run.
+- `make acceptance` was not run per instruction.
