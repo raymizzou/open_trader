@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import importlib
 import json
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pytest
 
 import open_trader.account_sync_worker as worker_module
+import open_trader.account_api as account_api
 import open_trader.cli as cli
 import open_trader.dashboard_quotes as quotes_module
+from open_trader.account_http import (
+    AccountHttpError,
+    DEFAULT_ACCOUNT_API_URL,
+    DEFAULT_ACCOUNT_TIMEOUT_SECONDS,
+)
 from open_trader.account_sync_worker import AccountSyncWorkerConfig
-from open_trader.account_sync_state import empty_account_sync_state
 from open_trader.cli import build_parser
+
+
+GENERATION = "sha256:" + "a" * 64
 
 
 def test_parser_exposes_only_account_sync_commands() -> None:
@@ -30,8 +36,17 @@ def test_parser_exposes_only_account_sync_commands() -> None:
     assert worker.account_interval_seconds == 60.0
     assert worker.quote_interval_seconds == 5.0
     assert worker.once is True
-    assert status.data_dir == Path("data")
+    assert status.account_url == DEFAULT_ACCOUNT_API_URL
     assert status.json is True
+
+    overridden = parser.parse_args(
+        ["account-sync-status", "--account-url", "http://127.0.0.1:9876"]
+    )
+    assert overridden.account_url == "http://127.0.0.1:9876"
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["account-sync-status", "--data-dir", "data"])
+    assert exc_info.value.code == 2
 
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(["account-sync-controller"])
@@ -111,79 +126,129 @@ def test_worker_uses_only_futu_connection_env_values(
     assert captured["once"] is True
 
 
-def test_status_reads_only_published_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("status", "account_status", "quote_status", "reason"),
+    [
+        ("healthy", "healthy", "healthy", None),
+        ("stale", "stale", "healthy", "broker_refresh_failed"),
+    ],
+)
+def test_status_projects_one_account_snapshot_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+    account_status: str,
+    quote_status: str,
+    reason: str | None,
 ) -> None:
-    now = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
-    data_dir = tmp_path / "data"
-    state = empty_account_sync_state()
-    state["generation"] = now
-    brokers = state["brokers"]
-    assert isinstance(brokers, dict)
-    for broker in brokers.values():
-        assert isinstance(broker, dict)
-        broker.update(
-            status="ok",
-            attempted_at=now,
-            last_success_at=now,
-            data_as_of=now,
-            period="2026-07",
+    calls: list[tuple[str, float]] = []
+
+    def fetch(url: str, timeout: float) -> dict[str, object]:
+        calls.append((url, timeout))
+        return _snapshot(
+            status=status,
+            account_status=account_status,
+            quote_status=quote_status,
+            reason=reason,
         )
-    _write_json(data_dir / "latest/account_sync_state.json", state)
-    _write_json(
-        data_dir / "latest/quotes.json",
-        {"status": "ok", "last_success_at": now, "stale": False, "quotes": {}},
-    )
-    _write_json(
-        data_dir / "account_sync/controller_status.json",
-        {
-            "schema_version": "open_trader.account_sync.controller.v1",
-            "pid": 4321,
-            "started_at": now,
-            "working_directory": "/repo",
-            "git_sha": "abc123",
-            "heartbeat_at": now,
-            "phase": "idle",
-            "account_loop": {"status": "ok"},
-            "quote_loop": {"status": "ok"},
-            "blocker": None,
+
+    _forbid_non_account_reads(monkeypatch)
+    monkeypatch.setattr(cli, "fetch_account_snapshot", fetch)
+
+    assert cli.main(["account-sync-status", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": status,
+        "reason": reason,
+        "snapshot_generation": GENERATION,
+        "account_generation": GENERATION,
+        "quotes": {"status": quote_status},
+        "brokers": {
+            "futu": {"status": account_status},
+            "tiger": {"status": "healthy"},
+            "phillips": {"status": "healthy"},
+            "eastmoney": {"status": "healthy"},
         },
+    }
+    assert calls == [(DEFAULT_ACCOUNT_API_URL, DEFAULT_ACCOUNT_TIMEOUT_SECONDS)]
+
+
+def test_status_human_output_labels_stale_truthfully(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _forbid_non_account_reads(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "fetch_account_snapshot",
+        lambda *_args: _snapshot(
+            status="stale",
+            account_status="healthy",
+            quote_status="stale",
+            reason=None,
+        ),
     )
 
+    assert cli.main(["account-sync-status", "--account-url", "http://account"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "status: stale",
+        "reason: ",
+        f"snapshot_generation: {GENERATION}",
+        f"account_generation: {GENERATION}",
+        "quotes: stale",
+        "futu: healthy",
+        "tiger: healthy",
+        "phillips: healthy",
+        "eastmoney: healthy",
+    ]
+
+
+def test_status_returns_only_sanitized_account_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _forbid_non_account_reads(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "fetch_account_snapshot",
+        lambda *_args: (_ for _ in ()).throw(AccountHttpError("account_unavailable")),
+    )
+
+    assert cli.main(["account-sync-status", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "account_unavailable\n"
+
+
+def _snapshot(
+    *, status: str, account_status: str, quote_status: str, reason: str | None
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "snapshot_generation": GENERATION,
+        "account_generation": GENERATION,
+        "sources": {
+            "account": {
+                "status": account_status,
+                "reason": reason,
+                "brokers": {
+                    "futu": {"status": account_status},
+                    "tiger": {"status": "healthy"},
+                    "phillips": {"status": "healthy"},
+                    "eastmoney": {"status": "healthy"},
+                },
+            },
+            "quotes": {"status": quote_status},
+        },
+    }
+
+
+def _forbid_non_account_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(*_args: object, **_kwargs: object) -> object:
-        pytest.fail("account-sync-status must not construct a live client")
+        pytest.fail("account-sync-status must only read the Account snapshot")
 
     monkeypatch.setattr(worker_module, "FutuAccountClient", fail)
     monkeypatch.setattr(worker_module, "TigerAccountClient", fail)
     monkeypatch.setattr(quotes_module, "FutuQuoteClient", fail)
-
-    assert cli.main(["account-sync-status", "--data-dir", str(data_dir), "--json"]) == 0
-
-    payload = json.loads(capsys.readouterr().out)
-    assert set(payload) == {
-        "status",
-        "label",
-        "reason",
-        "portfolio_generation",
-        "controller",
-        "quotes",
-        "brokers",
-    }
-    assert payload["controller"] == {
-        "status": "ok",
-        "pid": 4321,
-        "git_sha": "abc123",
-        "heartbeat_at": now,
-    }
-    assert payload["quotes"] == {"status": "ok"}
-    assert {broker: value["status"] for broker, value in payload["brokers"].items()} == {
-        "futu": "ok",
-        "tiger": "ok",
-        "phillips": "ok",
-        "eastmoney": "ok",
-    }
-
-
-def _write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(account_api, "load_account_snapshot", fail)
+    monkeypatch.setattr(cli, "_load_optional_json", fail)

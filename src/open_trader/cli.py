@@ -32,7 +32,12 @@ from .account_sync_worker import (
     AccountSyncWorkerConfig,
     run_account_sync_worker,
 )
-from .account_sync_state import project_account_sync_health
+from .account_http import (
+    AccountHttpError,
+    DEFAULT_ACCOUNT_API_URL,
+    DEFAULT_ACCOUNT_TIMEOUT_SECONDS,
+    fetch_account_snapshot,
+)
 from .daily_premarket import (
     DailyPremarketRunner,
     _optional_positive_tm_id,
@@ -889,9 +894,9 @@ def build_parser() -> argparse.ArgumentParser:
     account_sync_worker.add_argument("--once", action="store_true")
 
     account_sync_status = subparsers.add_parser(
-        "account-sync-status", help="Show accepted account-sync file health"
+        "account-sync-status", help="Show Account snapshot health"
     )
-    account_sync_status.add_argument("--data-dir", type=Path, default=Path("data"))
+    account_sync_status.add_argument("--account-url", default=DEFAULT_ACCOUNT_API_URL)
     account_sync_status.add_argument("--json", action="store_true")
 
     kelly_parser = subparsers.add_parser(
@@ -1345,6 +1350,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _account_status_projection(snapshot: dict[str, object]) -> dict[str, object]:
+    sources = snapshot["sources"]
+    assert isinstance(sources, dict)
+    account = sources["account"]
+    quotes = sources["quotes"]
+    assert isinstance(account, dict) and isinstance(quotes, dict)
+    brokers = account["brokers"]
+    assert isinstance(brokers, dict)
+    return {
+        "status": snapshot["status"],
+        "reason": account["reason"],
+        "snapshot_generation": snapshot["snapshot_generation"],
+        "account_generation": snapshot["account_generation"],
+        "quotes": {"status": quotes["status"]},
+        "brokers": {
+            broker: {"status": source["status"]}
+            for broker, source in brokers.items()
+            if isinstance(source, dict)
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1368,27 +1395,20 @@ def main(argv: list[str] | None = None) -> int:
         return run_account_sync_worker(config, once=args.once)
 
     if args.command == "account-sync-status":
-        state = _load_optional_json(args.data_dir / "latest" / "account_sync_state.json") or {}
-        worker_document = _load_optional_json(
-            args.data_dir / "account_sync" / "controller_status.json"
-        ) or {}
-        quotes = _load_optional_json(args.data_dir / "latest" / "quotes.json") or {}
-        health = project_account_sync_health(
-            state, worker_document, quotes, now=datetime.now().astimezone()
-        )
+        try:
+            health = _account_status_projection(
+                fetch_account_snapshot(args.account_url, DEFAULT_ACCOUNT_TIMEOUT_SECONDS)
+            )
+        except AccountHttpError as error:
+            print(error.code, file=sys.stderr)
+            return 1
         if args.json:
             print(json.dumps(health, ensure_ascii=False))
         else:
             print(f"status: {health['status']}")
-            print(f"reason: {health['reason']}")
-            worker_status = health["controller"]
-            assert isinstance(worker_status, dict)
-            print(
-                "worker: "
-                f"pid={worker_status.get('pid', '')} "
-                f"sha={worker_status.get('git_sha', '')} "
-                f"heartbeat={worker_status.get('heartbeat_at', '')}"
-            )
+            print(f"reason: {health['reason'] or ''}")
+            print(f"snapshot_generation: {health['snapshot_generation']}")
+            print(f"account_generation: {health['account_generation']}")
             print(f"quotes: {health['quotes']['status']}")
             for broker, source in health["brokers"].items():
                 print(f"{broker}: {source['status']}")
