@@ -313,15 +313,17 @@ class PredictSource:
         if not isinstance(payload, dict) or str(payload.get("marketId")) != market.market_id:
             self._mark_stale(source)
             return None
-        version = payload.get("version")
         previous = self._versions[source].get(market.market_id)
-        if not isinstance(version, int) or (
-            previous is not None
-            and (version < previous or (source == "ws" and version == previous))
+        timestamp_ms = payload.get("updateTimestampMs")
+        sequence = payload.get("version") if source == "ws" else timestamp_ms
+        if (
+            type(sequence) is not int
+            or previous is not None
+            and (sequence < previous or source == "ws" and sequence == previous)
         ):
             self._mark_stale(source)
             return None
-        timestamp = _timestamp(payload.get("updateTimestampMs"))
+        timestamp = _timestamp(timestamp_ms)
         asks = _levels(payload.get("asks"), market.tick_size, ascending=True)
         bids = _levels(payload.get("bids"), market.tick_size, ascending=False)
         if timestamp is None or not asks or not bids:
@@ -343,7 +345,7 @@ class PredictSource:
             source_timestamp=timestamp,
             received_at=self._now_fn(),
         )
-        self._versions[source][market.market_id] = version
+        self._versions[source][market.market_id] = sequence
         self._books[source][market.market_id] = book
         self._mark_ready(source, at=book.received_at)
         return book
@@ -504,7 +506,7 @@ def _levels(value: object, tick_size: Decimal, *, ascending: bool) -> tuple[Book
 
 
 def _timestamp(value: object) -> datetime | None:
-    if not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         return None
     return datetime.fromtimestamp(value / 1000, UTC)
 

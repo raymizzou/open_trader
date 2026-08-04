@@ -1303,7 +1303,7 @@ class CrossPredictTrading:
         snapshot = {
             "wallet_address": "0xpredict",
             "available_usdt": str(self.balance),
-            "available_usdt_raw": str(int(self.balance * Decimal("1000000"))),
+            "available_usdt_raw": str(int(self.balance * Decimal(10**18))),
             "open_orders": (),
             "positions": self.positions,
             "checked_at": datetime.now(UTC),
@@ -1343,7 +1343,7 @@ class CrossPredictTrading:
                 Decimal(self.allowance) != 0 or Decimal(self.allowance_raw) != 0
             )
             return result
-        self.allowance = str(Decimal(exact_debit_wei) / Decimal("1000000"))
+        self.allowance = str(Decimal(exact_debit_wei) / Decimal(10**18))
         self.allowance_raw = str(exact_debit_wei)
         self.allowance_breaker = exact_debit_wei != 0
         return {
@@ -1523,7 +1523,9 @@ def test_cross_exact_allowance_wraps_current_dual_rest_refresh_before_submit(
     _accepted, final = _cross_execution(service, idempotency_key="cross-exact-allowance")
 
     assert final["state"] == "holding_to_resolution"
-    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
     assert predict.clear_calls == ["predict-market"]
     set_allowance = cross.call_log.index("set_allowance")
     refreshes = [index for index, item in enumerate(cross.call_log) if item == "refresh"]
@@ -1619,7 +1621,9 @@ def test_cross_exact_approval_failure_posts_neither_venue(
 
     assert final["state"] == "both_rejected"
     assert final["evidence"][-1]["status_text"] == "未下单"
-    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
     assert predict.clear_calls == []
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
     assert store.cross_unsettled_principal() == Decimal("0")
@@ -1647,7 +1651,9 @@ def test_cross_ambiguous_exact_approval_holds_reservation_and_opens_incident_wit
     assert final["state"] == "directional_incident"
     assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
     assert service._cross_breaker_open is True
-    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
     assert predict.clear_calls == []
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
     assert store.cross_unsettled_principal() == Decimal("4.80")
@@ -1687,14 +1693,14 @@ def test_cross_malformed_success_like_receipt_opens_approval_incident_without_su
         "exact_debit_wei": exact_debit_wei,
     }
     adapter._approval_step = lambda _scope: step  # type: ignore[method-assign]
-    adapter._raw_allowance = lambda _step: 2_300_000  # type: ignore[method-assign]
+    adapter._raw_allowance = lambda _step: 2_300_000_000_000_000_000  # type: ignore[method-assign]
 
     def malformed_approval(market_id: str, exact_debit_wei: int) -> Mapping[str, object]:
         predict.call_log.append("set_allowance")
         predict.approval_calls.append((market_id, exact_debit_wei))
         result = adapter.set_exact_buy_allowance(market_id, exact_debit_wei)
         if result.get("status") == "confirmed":
-            predict.allowance = str(Decimal(exact_debit_wei) / Decimal("1000000"))
+            predict.allowance = str(Decimal(exact_debit_wei) / Decimal(10**18))
             predict.allowance_raw = str(exact_debit_wei)
             predict.allowance_breaker = True
         return result
@@ -1708,8 +1714,10 @@ def test_cross_malformed_success_like_receipt_opens_approval_incident_without_su
     assert final["state"] == "directional_incident"
     assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
     assert service._cross_breaker_open is True
-    assert sdk_calls == [(step, True, 2_300_000)]
-    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert sdk_calls == [(step, True, 2_300_000_000_000_000_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
     assert predict.clear_calls == []
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
     assert store.cross_unsettled_principal() == Decimal("4.80")
@@ -1740,7 +1748,9 @@ def test_cross_post_approval_refresh_breach_clears_allowance_without_submit(
 
     assert final["state"] == "both_rejected"
     assert final["evidence"][-1]["status_text"] == "未下单 · 授权已清零"
-    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
     assert predict.clear_calls == ["predict-market"]
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
 
@@ -1804,7 +1814,9 @@ def test_cross_confirmed_approval_with_unverified_post_read_opens_incident_witho
     assert final["state"] == "directional_incident"
     assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
     assert service._cross_breaker_open is True
-    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
     assert predict.clear_calls == []
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
     assert store.cross_unsettled_principal() == Decimal("4.80")
@@ -1822,7 +1834,7 @@ def test_cross_exact_approval_rejects_mismatched_raw_post_read_without_submit(
             "status": "confirmed",
             "market_id": "predict-market",
             "allowance": "2.3",
-            "allowance_raw": "2299999",
+            "allowance_raw": "2299999999999999999",
             "transaction_hash": "0xapprove",
         }
     )

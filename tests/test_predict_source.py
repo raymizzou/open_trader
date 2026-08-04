@@ -232,7 +232,6 @@ def test_complete_yes_book_derives_no_asks_at_the_market_tick() -> None:
                 "success": True,
                 "data": {
                     "marketId": 123,
-                    "version": 1,
                     "updateTimestampMs": 1788048000000,
                     "asks": [["0.51", "3"]],
                     "bids": [["0.50", "2"], ["0.45", "4"]],
@@ -252,7 +251,7 @@ def test_complete_yes_book_derives_no_asks_at_the_market_tick() -> None:
     assert book.source_timestamp == datetime.fromtimestamp(1788048000, UTC)
 
 
-def test_out_of_order_book_is_dropped_and_marks_source_stale() -> None:
+def test_older_rest_book_timestamp_is_dropped_and_marks_source_stale() -> None:
     source, _ = source_with_responses(
         [
             {"success": True, "data": market()},
@@ -260,8 +259,7 @@ def test_out_of_order_book_is_dropped_and_marks_source_stale() -> None:
                 "success": True,
                 "data": {
                     "marketId": 123,
-                    "version": 2,
-                    "updateTimestampMs": 1788048000000,
+                    "updateTimestampMs": 1788048001000,
                     "asks": [["0.51", "3"]],
                     "bids": [["0.50", "2"]],
                 },
@@ -270,7 +268,6 @@ def test_out_of_order_book_is_dropped_and_marks_source_stale() -> None:
                 "success": True,
                 "data": {
                     "marketId": 123,
-                    "version": 1,
                     "updateTimestampMs": 1788048000000,
                     "asks": [["0.51", "3"]],
                     "bids": [["0.50", "2"]],
@@ -284,11 +281,10 @@ def test_out_of_order_book_is_dropped_and_marks_source_stale() -> None:
     assert source.snapshot()["rest"] == "stale"
 
 
-def test_repeated_rest_snapshot_version_refreshes_the_confirmed_book() -> None:
+def test_repeated_rest_snapshot_timestamp_refreshes_the_confirmed_book() -> None:
     received = [datetime(2026, 8, 2, tzinfo=UTC)]
     snapshot = {
         "marketId": 123,
-        "version": 2,
         "updateTimestampMs": 1788048000000,
         "asks": [["0.51", "3"]],
         "bids": [["0.50", "2"]],
@@ -493,6 +489,33 @@ def test_stream_reconnect_accepts_a_fresh_lower_version_snapshot() -> None:
     }.items() <= snapshot.items() for snapshot in reconnect_snapshots] == [True]
     assert source.snapshot()["ws"] == "ready"
     assert source.snapshot()["ws_generation"] == 1
+
+
+def test_websocket_drops_duplicate_and_rollback_versions() -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "data": market()}],
+        connector=lambda *args, **kwargs: FakeWebSocket(
+            [
+                book_message(2, 1788048000000),
+                book_message(2, 1788048001000),
+                book_message(1, 1788048002000),
+                book_message(3, 1788048003000),
+            ]
+        ),
+    )
+
+    async def collect_two() -> tuple[object, object]:
+        stream = source.stream_books(("123",))
+        try:
+            return await anext(stream), await anext(stream)
+        finally:
+            await stream.aclose()
+
+    first, second = asyncio.run(collect_two())
+
+    assert first.source_timestamp == datetime.fromtimestamp(1788048000, UTC)
+    assert second.source_timestamp == datetime.fromtimestamp(1788048003, UTC)
+    assert source.snapshot()["ws"] == "ready"
 
 
 def test_non_finite_book_prices_are_dropped_without_raising() -> None:

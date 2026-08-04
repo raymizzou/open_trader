@@ -24,7 +24,7 @@ from .polymarket_relation_discovery import (
 )
 from .polymarket_monitor import PolymarketMonitor
 from .predict_source import PredictBook, PredictMarket, PredictSource
-from .predict_trading import PredictBuyQuote
+from .predict_trading import PREDICT_BASE_UNITS, PredictBuyQuote
 from .prediction_arbitrage import (
     MAX_NORMAL_COST,
     MIN_THRESHOLD_ANNUALIZED_YIELD,
@@ -95,8 +95,6 @@ _CUTOFF_SEMANTICS = re.compile(
 _CROSS_VENUE_BOOK_FRESHNESS_SECONDS = 10
 _HOT_HEALTH_POLL_SECONDS = 0.05
 CROSS_VENUE_DISCOVERY_SECONDS = 15 * 60
-_PREDICT_COLLATERAL_UNITS = Decimal(10**6)
-_PREDICT_SHARE_UNITS = Decimal(10**18)
 
 
 def cross_venue_notification_dedupe_identity(
@@ -439,7 +437,7 @@ def _predict_buy_quote(
 ) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
     if quote_fn is None:
         return None
-    requested_units = requested_quantity * _PREDICT_SHARE_UNITS
+    requested_units = requested_quantity * Decimal(PREDICT_BASE_UNITS)
     if requested_units != requested_units.to_integral_value():
         return None
     try:
@@ -461,9 +459,9 @@ def _predict_buy_quote(
         or quote.minimum_redeemable_units > int(requested_units)
     ):
         return None
-    net_quantity = Decimal(quote.minimum_redeemable_units) / _PREDICT_SHARE_UNITS
-    max_price = Decimal(quote.price_per_share_wei) / _PREDICT_COLLATERAL_UNITS
-    max_debit = Decimal(quote.max_collateral_debit) / _PREDICT_COLLATERAL_UNITS
+    net_quantity = Decimal(quote.minimum_redeemable_units) / Decimal(PREDICT_BASE_UNITS)
+    max_price = Decimal(quote.price_per_share_wei) / Decimal(PREDICT_BASE_UNITS)
+    max_debit = Decimal(quote.max_collateral_debit) / Decimal(PREDICT_BASE_UNITS)
     fee = max_debit - net_quantity * max_price
     expected_fee = net_quantity * max_price * market.fee_rate_bps / Decimal("10000")
     if (

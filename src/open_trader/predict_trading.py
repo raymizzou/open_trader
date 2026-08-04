@@ -32,6 +32,8 @@ from .polymarket_trading import (
 
 
 PREDICT_REST_URL = "https://api.predict.fun"
+PREDICT_DECIMALS = 18
+PREDICT_BASE_UNITS = 10**PREDICT_DECIMALS
 _TIMEOUT_SECONDS = 10.0
 
 
@@ -107,7 +109,10 @@ class PredictTradingClient:
             builder = sdk_builder(
                 ChainId.BNB_MAINNET,
                 private_key,
-                OrderBuilderOptions(predict_account=config.predict.wallet_address),
+                OrderBuilderOptions(
+                    precision=PREDICT_DECIMALS,
+                    predict_account=config.predict.wallet_address,
+                ),
             )
             gas_signer = Account.from_key(private_key).address
         except Exception as exc:
@@ -232,10 +237,10 @@ class PredictTradingClient:
         max_cost = _number(order.get("max_cost"))
         maximum_fee = _number(order.get("maximum_fee"))
         calculable_gas = _number(order.get("calculable_gas"))
-        requested_units = _scaled_integer(requested, 10**18)
-        net_units = _scaled_integer(net, 10**18)
-        price_units = _scaled_integer(max_price, 10**6)
-        cost_units = _scaled_integer(max_cost, 10**6)
+        requested_units = _scaled_integer(requested, PREDICT_BASE_UNITS)
+        net_units = _scaled_integer(net, PREDICT_BASE_UNITS)
+        price_units = _scaled_integer(max_price, PREDICT_BASE_UNITS)
+        cost_units = _scaled_integer(max_cost, PREDICT_BASE_UNITS)
         if (
             requested is None
             or net is None
@@ -290,9 +295,9 @@ class PredictTradingClient:
             )
             if quote.minimum_redeemable_units != net_units:
                 return PredictLegResult(False, "rejected", error_code="rejected")
-            price = Decimal(quote.price_per_share_wei) / Decimal(10**6)
-            debit = Decimal(quote.max_collateral_debit) / Decimal(10**6)
-            fee = debit - (Decimal(net_units) / Decimal(10**18)) * price
+            price = Decimal(quote.price_per_share_wei) / Decimal(PREDICT_BASE_UNITS)
+            debit = Decimal(quote.max_collateral_debit) / Decimal(PREDICT_BASE_UNITS)
+            fee = debit - (Decimal(net_units) / Decimal(PREDICT_BASE_UNITS)) * price
             if (
                 price <= 0
                 or price > max_price
@@ -337,7 +342,7 @@ class PredictTradingClient:
     ) -> dict[str, object]:
         """Refresh one exact Predict BUY completion option without submitting."""
 
-        quantity_wei = _scaled_integer(quantity, 10**18)
+        quantity_wei = _scaled_integer(quantity, PREDICT_BASE_UNITS)
         if (
             venue != "predict.fun"
             or side != "BUY"
@@ -366,8 +371,8 @@ class PredictTradingClient:
             )
             if quote.minimum_redeemable_units != quantity_wei:
                 return {"fresh": False}
-            price = Decimal(quote.price_per_share_wei) / Decimal(10**6)
-            max_spend = Decimal(quote.max_collateral_debit) / Decimal(10**6)
+            price = Decimal(quote.price_per_share_wei) / Decimal(PREDICT_BASE_UNITS)
+            max_spend = Decimal(quote.max_collateral_debit) / Decimal(PREDICT_BASE_UNITS)
             fee = max_spend - quantity * price
             if price <= 0 or price > 1 or max_spend <= 0 or fee < 0 or fee > maximum_fee:
                 return {"fresh": False}
@@ -407,9 +412,9 @@ class PredictTradingClient:
         max_spend = _number(order.get("max_spend"))
         if quantity is None or price is None or max_spend is None or quantity <= 0 or not (Decimal("0") < price <= Decimal("1")) or max_spend <= 0:
             return PredictLegResult(False, "rejected", error_code="rejected")
-        units = _scaled_integer(quantity, 10**18)
-        price_wei = _scaled_integer(price, 10**6)
-        debit = _scaled_integer(max_spend, 10**6)
+        units = _scaled_integer(quantity, PREDICT_BASE_UNITS)
+        price_wei = _scaled_integer(price, PREDICT_BASE_UNITS)
+        debit = _scaled_integer(max_spend, PREDICT_BASE_UNITS)
         if units is None or price_wei is None or debit is None:
             return PredictLegResult(False, "rejected", error_code="rejected")
         try:
@@ -444,10 +449,18 @@ class PredictTradingClient:
             payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
             if not isinstance(payload, Mapping):
                 raise ValueError("invalid predict response")
-            order_id = _data(payload).get("hash") or _data(payload).get("id")
-            if not isinstance(order_id, str) or not order_id:
+            data = _data(payload)
+            order_id = data.get("orderId")
+            order_hash = data.get("orderHash")
+            if (
+                payload.get("success") is not True
+                or not isinstance(order_id, str)
+                or not order_id
+                or not isinstance(order_hash, str)
+                or not order_hash
+            ):
                 raise ValueError("invalid predict order response")
-            return PredictLegResult(True, "accepted", order_id)
+            return PredictLegResult(True, "accepted", order_hash)
         except Exception:
             return PredictLegResult(False, "ambiguous", error_code="ambiguous")
 
@@ -536,8 +549,8 @@ class PredictTradingClient:
             ApprovalScope("TRADE", False, False, Side.BUY),
             exact_debit_wei=0,
         )
-        open_orders = _data(self._json("/v1/orders", auth=True)).get("orders", ())
-        positions = _data(self._json("/v1/positions", auth=True)).get("positions", ())
+        open_orders = _rows(self._json("/v1/orders", auth=True), "orders")
+        positions = _rows(self._json("/v1/positions", auth=True), "positions")
         allowance = _non_negative_int(facts["allowance_raw"], "allowance")
         minimum_top_up = _number(facts["minimum_top_up_bnb"]) or Decimal("0")
         return {
@@ -562,7 +575,7 @@ class PredictTradingClient:
 
     def reconcile_buy(self, market_id: str, token_id: str, order_hash: str) -> Mapping[str, object]:
         try:
-            order = _data(self._json(f"/v1/orders/{order_hash}", auth=True))
+            order = _order_data(self._json(f"/v1/orders/{order_hash}", auth=True))
             matches = _rows(self._json("/v1/orders/matches", auth=True), "matches")
             activity = _rows(self._json("/v1/account/activity", auth=True), "activities")
             positions = _rows(self._json(f"/v1/positions?marketId={market_id}", auth=True), "positions")
@@ -574,9 +587,34 @@ class PredictTradingClient:
             )
             final = str(order.get("status", "")).upper() in {"FILLED", "MATCHED", "COMPLETED"}
             order_amount = _number(order.get("amountFilled"))
-            matched = [row for row in matches if str(row.get("orderHash")) == order_hash]
-            events = [row for row in activity if str(row.get("orderHash")) == order_hash]
-            facts = [(_facts(match), _facts(event)) for match in matched for event in events]
+            matched = [
+                fact
+                for row in matches
+                if (
+                    fact := _match_facts(
+                        row,
+                        order_hash=order_hash,
+                        market_id=market_id,
+                        token_id=token_id,
+                        signer=self._config.wallet_address,
+                    )
+                )
+                is not None
+            ]
+            events = [
+                fact
+                for row in activity
+                if (
+                    fact := _activity_facts(
+                        row,
+                        order_hash=order_hash,
+                        market_id=market_id,
+                        token_id=token_id,
+                    )
+                )
+                is not None
+            ]
+            facts = [(match, event) for match in matched for event in events]
             agreed = next((match for match, event in facts if match is not None and match == event), None)
             trade_ids = list(
                 dict.fromkeys(
@@ -585,25 +623,25 @@ class PredictTradingClient:
                     if match is not None and match == event
                 )
             )
+            matching_positions = [
+                row
+                for row in positions
+                if _row_identity(row, market_id=market_id, token_id=token_id)
+            ]
             position_quantity = sum(
                 (
                     _number(row.get("amount")) or Decimal("0")
-                    for row in positions
-                    if str(row.get("tokenId")) == str(token_id)
+                    for row in matching_positions
                 ),
                 Decimal("0"),
             )
-            positioned = agreed is not None and position_quantity >= agreed[1] and any(
-                str(row.get("tokenId")) == str(token_id)
-                and _number(row.get("amountDelta", row.get("delta"))) == agreed[1]
-                for row in positions
-            )
+            positioned = agreed is not None and position_quantity >= agreed[1]
             verified = identity and final and agreed is not None and order_amount == agreed[1] and positioned
             absent = (
                 str(order.get("status", "")).upper() in {"NOT_FOUND", "ABSENT"}
                 and not matched
                 and not events
-                and not any(str(row.get("tokenId")) == str(token_id) for row in positions)
+                and not matching_positions
             )
             result = {
                 "verified": verified,
@@ -638,7 +676,7 @@ class PredictTradingClient:
             return {"verified": False, "conclusively_absent": False, "status": "unknown"}
 
     def redeemable_snapshot(self) -> Mapping[str, object]:
-        return {"wallet_address": self._config.wallet_address, "positions": _data(self._json("/v1/positions", auth=True)).get("positions", ()), "checked_at": datetime.now(UTC)}
+        return {"wallet_address": self._config.wallet_address, "positions": _rows(self._json("/v1/positions", auth=True), "positions"), "checked_at": datetime.now(UTC)}
 
     def _approval_scope_for_market(self, market_id: str) -> ApprovalScope:
         market = self._market(market_id)
@@ -823,13 +861,23 @@ def _data(payload: Mapping[str, object]) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _order_data(payload: Mapping[str, object]) -> Mapping[str, object]:
+    data = _data(payload)
+    nested = data.get("order")
+    if nested is None:
+        return data
+    return {**data, **nested} if isinstance(nested, Mapping) else {}
+
+
 def _row(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
 def _rows(payload: Mapping[str, object], name: str) -> tuple[Mapping[str, object], ...]:
-    value = _data(payload).get(name, ())
-    return tuple(_row(item) for item in value) if isinstance(value, list) else ()
+    value = payload.get("data", payload)
+    if isinstance(value, Mapping):
+        value = value.get(name, ())
+    return tuple(item for item in value if isinstance(item, Mapping)) if isinstance(value, list) else ()
 
 
 def _number(value: object) -> Decimal | None:
@@ -867,12 +915,85 @@ def _facts(row: Mapping[str, object]) -> tuple[str, Decimal, Decimal] | None:
     return (str(transaction), amount, fee) if isinstance(transaction, str) and transaction and amount is not None and amount > 0 and fee is not None and fee >= 0 else None
 
 
+def _row_identity(
+    row: Mapping[str, object], *, market_id: str, token_id: str
+) -> bool:
+    market = _row(row.get("market"))
+    outcome = _row(row.get("outcome"))
+    row_market_id = market.get("id", row.get("marketId"))
+    row_token_id = outcome.get("onChainId", row.get("tokenId"))
+    return str(row_market_id) == str(market_id) and str(row_token_id) == str(token_id)
+
+
+def _match_facts(
+    row: Mapping[str, object],
+    *,
+    order_hash: str,
+    market_id: str,
+    token_id: str,
+    signer: str,
+) -> tuple[str, Decimal, Decimal] | None:
+    legacy_hash = row.get("orderHash")
+    if legacy_hash is not None:
+        return _facts(row) if str(legacy_hash) == order_hash else None
+    if str(_row(row.get("market")).get("id")) != str(market_id):
+        return None
+    participants = [row.get("taker"), *(
+        row.get("makers") if isinstance(row.get("makers"), list) else ()
+    )]
+    owned = [
+        value
+        for value in participants
+        if isinstance(value, Mapping)
+        and str(value.get("signer", "")).casefold() == signer.casefold()
+        and str(_row(value.get("outcome")).get("onChainId")) == str(token_id)
+    ]
+    if len(owned) != 1:
+        return None
+    fee = _row(owned[0].get("fee"))
+    if fee.get("type") != "COLLATERAL":
+        return None
+    return _execution_facts(row, fee.get("amount"))
+
+
+def _activity_facts(
+    row: Mapping[str, object], *, order_hash: str, market_id: str, token_id: str
+) -> tuple[str, Decimal, Decimal] | None:
+    legacy_hash = row.get("orderHash")
+    if legacy_hash is not None:
+        return _facts(row) if str(legacy_hash) == order_hash else None
+    if not _row_identity(row, market_id=market_id, token_id=token_id):
+        return None
+    fee = _row(_row(row.get("order")).get("fee"))
+    if fee.get("type") != "COLLATERAL":
+        return None
+    return _execution_facts(row, fee.get("amount"))
+
+
+def _execution_facts(
+    row: Mapping[str, object], fee_value: object
+) -> tuple[str, Decimal, Decimal] | None:
+    transaction = row.get("transactionHash")
+    amount = _number(row.get("amountFilled"))
+    fee = _number(fee_value)
+    if (
+        not isinstance(transaction, str)
+        or not transaction
+        or amount is None
+        or amount <= 0
+        or fee is None
+        or fee < 0
+    ):
+        return None
+    return transaction, amount, fee
+
+
 def _book(payload: Mapping[str, object]) -> Book:
     def levels(name: str) -> list[DepthLevel]:
         raw = payload.get(name, ())
         if not isinstance(raw, list):
             raise ValueError("invalid predict book")
-        return [DepthLevel((int(Decimal(str(row[0])) * 10**18), int(Decimal(str(row[1])) * 10**18))) for row in raw if isinstance(row, list) and len(row) == 2]
+        return [DepthLevel((int(Decimal(str(row[0])) * PREDICT_BASE_UNITS), int(Decimal(str(row[1])) * PREDICT_BASE_UNITS))) for row in raw if isinstance(row, list) and len(row) == 2]
 
     return Book(int(payload.get("marketId", 0)), int(payload.get("updateTimestampMs", 0)), levels("asks"), levels("bids"))
 
@@ -896,12 +1017,13 @@ def _bnb_wei_string(value: int) -> str:
 
 
 def _usdt_string(value: int) -> str:
-    return _decimal_string(Decimal(value) / Decimal(10**6))
+    return _decimal_string(Decimal(value) / Decimal(PREDICT_BASE_UNITS))
 
 
 def _decimal_string(value: Decimal) -> str:
     text = format(value, "f")
-    text = text.rstrip("0").rstrip(".")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 
@@ -932,7 +1054,7 @@ def _receipt_error_code(result: object) -> str:
 
 
 def _has_active_execution(open_orders: object) -> bool:
-    return isinstance(open_orders, list) and len(open_orders) > 0
+    return isinstance(open_orders, (list, tuple)) and len(open_orders) > 0
 
 
 def _plain(value: object) -> object:

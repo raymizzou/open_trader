@@ -50,6 +50,7 @@ from .predict_cross_venue import (
     cross_venue_notification_dedupe_identity,
     parse_canonical_cutoff,
 )
+from .predict_trading import PREDICT_BASE_UNITS
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
 
@@ -2101,7 +2102,7 @@ class PredictionExecutionService:
 
     @staticmethod
     def _predict_debit_base_units(amount: Decimal) -> int | None:
-        units = amount * Decimal("1000000")
+        units = amount * Decimal(PREDICT_BASE_UNITS)
         if units != units.to_integral_value():
             return None
         return int(units)
@@ -2121,7 +2122,7 @@ class PredictionExecutionService:
         if str(result.get("status", "")).lower() != "confirmed":
             return None, result.get("possible_mutation") is True
         snapshot = self._fresh_predict_account_snapshot()
-        expected = Decimal(exact_debit_wei) / Decimal("1000000")
+        expected = Decimal(exact_debit_wei) / Decimal(PREDICT_BASE_UNITS)
         if (
             snapshot is None
             or _decimal(snapshot.get("allowance")) != expected
@@ -3308,7 +3309,7 @@ class PredictionExecutionService:
         predict_allowance = _decimal(predict.get("allowance"))
         predict_allowance_raw = _decimal(predict.get("allowance_raw"))
         expected_predict_allowance = (
-            Decimal(expected_predict_allowance_raw) / Decimal("1000000")
+            Decimal(expected_predict_allowance_raw) / Decimal(PREDICT_BASE_UNITS)
         )
         minimum_top_up = _decimal(predict.get("minimum_top_up_bnb")) or Decimal("0")
         if predict.get("gas_ready") is not True or minimum_top_up > 0:

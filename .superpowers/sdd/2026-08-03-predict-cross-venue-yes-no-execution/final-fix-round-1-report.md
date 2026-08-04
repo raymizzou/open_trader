@@ -166,7 +166,7 @@ PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m open_trader pred
 
 - Exit code: 0
 - Result: PASS
-- `sdk_version: 0.2.0`
+- `sdk_version: 0.0.22`
 - `signer_match: yes`
 - `wallet_match: yes`
 - `geoblock: allowed`
@@ -303,7 +303,7 @@ source /Users/ray/projects/open_trader/.venv/bin/activate && PYTHONSAFEPATH=1 PY
 
 - Exit code: 0
 - Result: PASS
-- `sdk_version: 0.2.0`
+- `sdk_version: 0.0.22`
 - `signer_match: yes`
 - `wallet_match: yes`
 - `geoblock: allowed`
@@ -337,7 +337,7 @@ source /Users/ray/projects/open_trader/.venv/bin/activate && PYTHONSAFEPATH=1 PY
 
 ## Root cause and SDK contract
 
-The installed `predict_sdk` 0.2.0 waits for a Web3 transaction receipt and compares `receipt["status"]` directly with integer `1`. Web3 normalizes the RPC receipt status to an integer before the SDK returns it. The adapter therefore accepts only exact Python integers `0` and `1`; booleans, floats, `Decimal` values, strings, out-of-range integers, arbitrary numeric-looking objects, and missing or malformed values remain ambiguous.
+The installed `predict_sdk` 0.0.22 waits for a Web3 transaction receipt and compares `receipt["status"]` directly with integer `1`. Web3 normalizes the RPC receipt status to an integer before the SDK returns it. The adapter therefore accepts only exact Python integers `0` and `1`; booleans, floats, `Decimal` values, strings, out-of-range integers, arbitrary numeric-looking objects, and missing or malformed values remain ambiguous.
 
 ## TDD red/green evidence
 
@@ -383,7 +383,7 @@ source /Users/ray/projects/open_trader/.venv/bin/activate && PYTHONSAFEPATH=1 PY
 
 - Exit code: 0
 - Result: PASS
-- `sdk_version: 0.2.0`
+- `sdk_version: 0.0.22`
 - `signer_match: yes`
 - `wallet_match: yes`
 - `geoblock: allowed`

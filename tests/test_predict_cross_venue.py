@@ -571,10 +571,10 @@ def predict_quote(
             else int(net_quantity * Decimal(10**18))
         )
         debit = int(
-            Decimal(net_units) / Decimal(10**18) * all_in_price * Decimal(10**6)
+            Decimal(net_units) / Decimal(10**18) * all_in_price * Decimal(10**18)
         )
         return PredictBuyQuote(
-            market_id, token_id, 400_000, debit, net_units
+            market_id, token_id, 400_000_000_000_000_000, debit, net_units
         )
 
     return quote
@@ -762,8 +762,8 @@ def test_cross_venue_descends_when_largest_quote_exceeds_twenty_usdt() -> None:
         return PredictBuyQuote(
             market_id,
             token_id,
-            400_000,
-            int(quantity * all_in_price * Decimal(10**6)),
+            400_000_000_000_000_000,
+            int(quantity * all_in_price * Decimal(10**18)),
             requested_units,
         )
 
@@ -835,8 +835,8 @@ def test_cross_venue_gas_reserve_pushes_total_over_twenty_cap() -> None:
         return PredictBuyQuote(
             market_id,
             token_id,
-            490_000,
-            int(requested * Decimal("0.50225") * Decimal(10**6)),
+            490_000_000_000_000_000,
+            int(requested * Decimal("0.50225") * Decimal(10**18)),
             requested_units,
         )
 
@@ -870,7 +870,11 @@ def test_cross_venue_gas_reserve_rejects_exact_zero_profit() -> None:
 
     def quote(market_id: str, token_id: str, requested_units: int) -> PredictBuyQuote:
         return PredictBuyQuote(
-            market_id, token_id, 490_000, 4_900_000, requested_units
+            market_id,
+            token_id,
+            490_000_000_000_000_000,
+            4_900_000_000_000_000_000,
+            requested_units,
         )
 
     assert build_cross_venue_intents(

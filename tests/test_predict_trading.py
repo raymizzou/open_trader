@@ -50,12 +50,12 @@ class FakeBuilder:
     last_order_input = None
 
     def __init__(self) -> None:
-        self.price_per_share = 1000000
-        self.max_collateral_debit = 1000000
+        self.price_per_share = 1_000_000_000_000_000_000
+        self.max_collateral_debit = 1_000_000_000_000_000_000
         self.quote_calls = 0
         self.balance_of_calls: list[tuple[str, str | None]] = []
-        self.allowance_value: object = 1000000
-        self.usdt_balance: object = 5000000
+        self.allowance_value: object = 1_000_000_000_000_000_000
+        self.usdt_balance: object = 5_000_000_000_000_000_000
         self.gas_estimate = 1200000
         self.gas_price_wei = 1000000000
         self.bnb_balance_wei: object = 4000000000000000
@@ -136,7 +136,7 @@ class FakeBuilder:
         return self.usdt_balance
 
     def allowance(self, **kwargs: object) -> str:
-        return "1000000"
+        return "1000000000000000000"
 
     def get_approval_steps(self, scope) -> list[object]:
         self.last_scope = scope
@@ -237,7 +237,17 @@ def response_for(request, **kwargs):
         return FakeResponse({"data": {"feeRateBps": "200", "isNegRisk": False, "isYieldBearing": False}})
     if request.full_url.endswith("/v1/markets/896/orderbook"):
         return FakeResponse({"data": {"marketId": 896, "updateTimestampMs": 1, "asks": [["0.51", "3"]], "bids": [["0.50", "2"]]}})
-    return FakeResponse({"id": "order-id", "hash": "order-hash"}, status=201)
+    return FakeResponse(
+        {
+            "success": True,
+            "data": {
+                "code": "MATCHED",
+                "orderId": "order-id",
+                "orderHash": "order-hash",
+            },
+        },
+        status=201,
+    )
 
 
 def test_auth_uses_dynamic_message_and_redacted_headers() -> None:
@@ -289,8 +299,8 @@ def test_cross_entry_rejects_a_moved_quote_above_approved_ceiling_without_post()
         return response_for(request)
 
     client, _ = make_client(urlopen_fn)
-    client._builder.price_per_share = 510000  # type: ignore[attr-defined]
-    client._builder.max_collateral_debit = 510000  # type: ignore[attr-defined]
+    client._builder.price_per_share = 510_000_000_000_000_000  # type: ignore[attr-defined]
+    client._builder.max_collateral_debit = 510_000_000_000_000_000  # type: ignore[attr-defined]
     order = {
         "execution_id": "cross-entry-1",
         "idempotency_key": "cross-entry-1",
@@ -357,6 +367,41 @@ def test_cross_entry_posts_only_the_preflight_bound_order() -> None:
     ) == 1
 
 
+def test_cross_entry_accepts_official_eighteen_decimal_sdk_quote() -> None:
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/markets/896/orderbook"):
+            return FakeResponse(
+                {"data": {"marketId": 896, "updateTimestampMs": now_ms, "asks": [["0.50", "3"]], "bids": [["0.49", "2"]]}}
+            )
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+    client._builder.price_per_share = 500_000_000_000_000_000  # type: ignore[attr-defined]
+    client._builder.max_collateral_debit = 500_000_000_000_000_000  # type: ignore[attr-defined]
+
+    result = client.no_submit_cross_buy_preflight(
+        {
+            "execution_id": "official-eighteen-decimal",
+            "idempotency_key": "official-eighteen-decimal",
+            "venue": "predict.fun",
+            "market_id": "896",
+            "condition_id": "predict-condition",
+            "token_id": "yes-token",
+            "outcome": "YES",
+            "requested_quantity": Decimal("1"),
+            "net_quantity": Decimal("1"),
+            "max_price": Decimal("0.5"),
+            "max_cost": Decimal("0.5"),
+            "maximum_fee": Decimal("0"),
+            "calculable_gas": Decimal("0.10"),
+        }
+    )
+
+    assert result.accepted is True
+
+
 def test_cross_entry_rejects_unknown_zero_gas_without_post() -> None:
     requests = []
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
@@ -417,7 +462,13 @@ def test_submit_posts_once_and_transport_error_is_ambiguous() -> None:
 
 @pytest.mark.parametrize(
     "order_response",
-    (RawResponse(None), FakeResponse([]), FakeResponse({"data": {}})),
+    (
+        RawResponse(None),
+        FakeResponse([]),
+        FakeResponse({"data": {}}),
+        FakeResponse({"success": True, "data": {"orderId": "order-id"}}),
+        FakeResponse({"success": True, "data": {"orderHash": "order-hash"}}),
+    ),
 )
 def test_predict_post_response_failures_are_ambiguous_after_single_attempt(
     order_response: FakeResponse,
@@ -478,13 +529,73 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
         if request.full_url.endswith("/v1/markets/896"):
             return FakeResponse({"data": {"minimumOrderSize": "1"}})
         if request.full_url.endswith("/v1/orders/order-hash"):
-            return FakeResponse({"data": {"hash": "order-hash", "marketId": "896", "tokenId": "yes-token", "signer": DEPOSIT, "status": "FILLED", "amountFilled": "1"}})
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "order": {
+                            "hash": "order-hash",
+                            "tokenId": "yes-token",
+                            "signer": DEPOSIT,
+                        },
+                        "id": "order-id",
+                        "marketId": 896,
+                        "status": "FILLED",
+                        "amountFilled": "1",
+                    },
+                }
+            )
         if request.full_url.endswith("/v1/orders/matches"):
-            return FakeResponse({"data": {"matches": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        {
+                            "market": {"id": 896},
+                            "taker": {
+                                "signer": DEPOSIT,
+                                "outcome": {"onChainId": "yes-token"},
+                                "fee": {"amount": "0.02", "type": "COLLATERAL"},
+                            },
+                            "makers": [],
+                            "amountFilled": "1",
+                            "transactionHash": "tx",
+                        }
+                    ],
+                }
+            )
         if request.full_url.endswith("/v1/account/activity"):
-            return FakeResponse({"data": {"activities": [{"orderHash": "order-hash", "transactionHash": "tx", "executedAmount": "1", "fee": "2"}]}})
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        {
+                            "name": "MATCH",
+                            "transactionHash": "tx",
+                            "amountFilled": "1",
+                            "order": {
+                                "fee": {"amount": "0.02", "type": "COLLATERAL"}
+                            },
+                            "market": {"id": 896},
+                            "outcome": {"onChainId": "yes-token"},
+                        }
+                    ],
+                }
+            )
         if request.full_url.endswith("/v1/positions?marketId=896"):
-            return FakeResponse({"data": {"positions": [{"tokenId": "yes-token", "amount": "1", "amountDelta": "1"}]}})
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        {
+                            "id": "position-id",
+                            "market": {"id": 896},
+                            "outcome": {"onChainId": "yes-token"},
+                            "amount": "1",
+                        }
+                    ],
+                }
+            )
         raise AssertionError(request.full_url)
 
     client, _ = make_client(urlopen_fn)
@@ -494,16 +605,45 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
         "status": "verified",
         "filled_quantity": Decimal("1"),
         "position_quantity": Decimal("1"),
-        "actual_fee": Decimal("2"),
+        "actual_fee": Decimal("0.02"),
         "execution_proof": {
             "verified": True,
             "venue": "predict.fun",
             "order_ids": ["order-hash"],
             "trade_ids": ["tx"],
-            "fee": Decimal("2"),
+            "fee": Decimal("0.02"),
         },
         "minimum_order_size": Decimal("1"),
     }
+
+
+def test_account_snapshot_reads_documented_direct_array_shapes() -> None:
+    open_order = {"id": "order-id", "order": {"hash": "order-hash"}, "status": "OPEN"}
+    position = {
+        "id": "position-id",
+        "market": {"id": 896},
+        "outcome": {"onChainId": "yes-token"},
+        "amount": "1",
+    }
+
+    def urlopen_fn(request, **kwargs):
+        if request.full_url.endswith("/v1/auth/message"):
+            return FakeResponse({"message": "dynamic-message-sentinel"})
+        if request.full_url.endswith("/v1/auth"):
+            return FakeResponse({"token": "jwt-sentinel"})
+        if request.full_url.endswith("/v1/orders"):
+            return FakeResponse({"success": True, "cursor": None, "data": [open_order]})
+        if request.full_url.endswith("/v1/positions"):
+            return FakeResponse({"success": True, "cursor": None, "data": [position]})
+        raise AssertionError(request.full_url)
+
+    client, _ = make_client(urlopen_fn)
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+
+    snapshot = client.account_snapshot()
+
+    assert snapshot["open_orders"] == (open_order,)
+    assert snapshot["positions"] == (position,)
 
 
 def test_book_parses_decimal_price_to_exact_wei() -> None:
@@ -567,7 +707,7 @@ def test_approval_facts_report_predict_account_owner_allowance_and_gas() -> None
     client, _ = make_client(response_for)
     client._builder.allowance_value = 0  # type: ignore[attr-defined]
 
-    facts = client.approval_facts("896", exact_debit_wei=2_400_000)
+    facts = client.approval_facts("896", exact_debit_wei=2_400_000_000_000_000_000)
 
     assert facts["predict_account"] == DEPOSIT
     assert facts["gas_signer"] == PRIVY_SIGNER
@@ -592,25 +732,40 @@ def test_approval_facts_report_predict_account_owner_allowance_and_gas() -> None
 
 def test_real_adapter_reports_human_usdt_and_raw_post_approval_units() -> None:
     client, _ = make_client(response_for)
-    client._builder.allowance_value = 2_400_000  # type: ignore[attr-defined]
+    client._builder.allowance_value = 2_400_000_000_000_000_000  # type: ignore[attr-defined]
 
-    facts = client.approval_facts("896", exact_debit_wei=2_400_000)
+    facts = client.approval_facts("896", exact_debit_wei=2_400_000_000_000_000_000)
 
     assert facts["available_usdt"] == "5"
-    assert facts["available_usdt_raw"] == "5000000"
+    assert facts["available_usdt_raw"] == "5000000000000000000"
     assert facts["allowance"] == "2.4"
-    assert facts["allowance_raw"] == "2400000"
+    assert facts["allowance_raw"] == "2400000000000000000"
     assert facts["allowance_breaker"] is True
-    assert facts["exact_debit_wei"] == 2_400_000
+    assert facts["exact_debit_wei"] == 2_400_000_000_000_000_000
 
     client._builder.allowance_value = 0  # type: ignore[attr-defined]
-    client._builder.allowance_after_approve = 2_400_000  # type: ignore[attr-defined]
-    result = client.set_exact_buy_allowance("896", 2_400_000)
+    client._builder.allowance_after_approve = 2_400_000_000_000_000_000  # type: ignore[attr-defined]
+    result = client.set_exact_buy_allowance("896", 2_400_000_000_000_000_000)
 
     assert result["allowance"] == "2.4"
-    assert result["allowance_raw"] == "2400000"
+    assert result["allowance_raw"] == "2400000000000000000"
     assert result["allowance_breaker"] is True
-    assert result["exact_debit_wei"] == 2_400_000
+    assert result["exact_debit_wei"] == 2_400_000_000_000_000_000
+
+
+def test_account_facts_preserve_integer_zeros_and_fractional_trailing_zeros() -> None:
+    client, _ = make_client(response_for)
+    client._builder.usdt_balance = 10_000_000_000_000_000_000  # type: ignore[attr-defined]
+    client._builder.allowance_value = 20_000_000_000_000_000_000  # type: ignore[attr-defined]
+    client._builder.bnb_balance_wei = 10_000_000_000_000_000_000  # type: ignore[attr-defined]
+
+    facts = client.approval_facts(
+        "896", exact_debit_wei=2_400_000_000_000_000_000
+    )
+
+    assert facts["available_usdt"] == "10"
+    assert facts["allowance"] == "20"
+    assert facts["bnb_balance"] == "10"
 
 
 @pytest.mark.parametrize(
@@ -646,7 +801,7 @@ def test_approval_facts_fail_closed_on_malformed_scope_or_balances(
     client._builder.bnb_balance_wei = bnb_balance_wei  # type: ignore[attr-defined]
 
     with pytest.raises(RuntimeError, match=error):
-        client.approval_facts("896", exact_debit_wei=2_400_000)
+        client.approval_facts("896", exact_debit_wei=2_400_000_000_000_000_000)
 
 
 def test_account_snapshot_removes_allowance_ready_and_marks_residual_allowance_as_breaker() -> None:
@@ -662,12 +817,12 @@ def test_account_snapshot_removes_allowance_ready_and_marks_residual_allowance_a
     assert clean["scope_ready"] is True
     assert clean["gas_ready"] is True
 
-    client._builder.allowance_value = 2_400_000  # type: ignore[attr-defined]
+    client._builder.allowance_value = 2_400_000_000_000_000_000  # type: ignore[attr-defined]
     residual = client.account_snapshot()
 
     assert residual["allowance_breaker"] is True
     assert residual["allowance"] == "2.4"
-    assert residual["allowance_raw"] == "2400000"
+    assert residual["allowance_raw"] == "2400000000000000000"
 
 
 def test_account_snapshot_marks_low_signer_bnb_read_only_without_breaker() -> None:
@@ -685,15 +840,19 @@ def test_account_snapshot_marks_low_signer_bnb_read_only_without_breaker() -> No
 def test_set_exact_buy_allowance_uses_sdk_set_approval_and_proves_exact_post_read() -> None:
     client, _ = make_client(response_for)
     client._builder.allowance_value = 0  # type: ignore[attr-defined]
-    client._builder.allowance_after_approve = 2_400_000  # type: ignore[attr-defined]
+    client._builder.allowance_after_approve = 2_400_000_000_000_000_000  # type: ignore[attr-defined]
 
-    result = client.set_exact_buy_allowance("896", 2_400_000)
+    result = client.set_exact_buy_allowance("896", 2_400_000_000_000_000_000)
 
     step, approved, amount = client._builder.set_approval_calls[0]  # type: ignore[attr-defined]
-    assert (step.id, approved, amount) == ("ERC20_ALLOWANCE:CTF_EXCHANGE", True, 2_400_000)
+    assert (step.id, approved, amount) == (
+        "ERC20_ALLOWANCE:CTF_EXCHANGE",
+        True,
+        2_400_000_000_000_000_000,
+    )
     assert result["success"] is True
     assert result["allowance"] == "2.4"
-    assert result["allowance_raw"] == "2400000"
+    assert result["allowance_raw"] == "2400000000000000000"
     assert result["allowance_breaker"] is True
     assert "_approval_step" not in result
     assert not any(str(key).startswith("_") for key in result)
@@ -727,14 +886,14 @@ def test_set_exact_buy_allowance_rejects_noncanonical_receipt_status_as_ambiguou
 ) -> None:
     client, _ = make_client(response_for)
     client._builder.allowance_value = 0  # type: ignore[attr-defined]
-    client._builder.allowance_after_approve = 2_400_000  # type: ignore[attr-defined]
+    client._builder.allowance_after_approve = 2_400_000_000_000_000_000  # type: ignore[attr-defined]
     client._builder.next_set_approval_result = SimpleNamespace(  # type: ignore[attr-defined]
         success=True,
         receipt={"status": receipt_status, "transactionHash": "0xmalformed"},
         cause=None,
     )
 
-    result = client.set_exact_buy_allowance("896", 2_400_000)
+    result = client.set_exact_buy_allowance("896", 2_400_000_000_000_000_000)
 
     assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
     assert result["success"] is False
@@ -750,7 +909,7 @@ def test_set_exact_buy_allowance_marks_builder_exception_as_possible_mutation() 
     client._builder.allowance_value = 0  # type: ignore[attr-defined]
     client._builder.set_approval_error = RuntimeError("transport-sentinel")  # type: ignore[attr-defined]
 
-    result = client.set_exact_buy_allowance("896", 2_400_000)
+    result = client.set_exact_buy_allowance("896", 2_400_000_000_000_000_000)
 
     assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
     assert result["success"] is False
@@ -764,7 +923,7 @@ def test_set_exact_buy_allowance_marks_unverifiable_post_read_as_possible_mutati
     client._builder.allowance_value = 0  # type: ignore[attr-defined]
     client._builder.allowance_after_approve = ValueError("rpc-sentinel")  # type: ignore[attr-defined]
 
-    result = client.set_exact_buy_allowance("896", 2_400_000)
+    result = client.set_exact_buy_allowance("896", 2_400_000_000_000_000_000)
 
     assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
     assert result["success"] is False
@@ -794,7 +953,7 @@ def test_set_exact_buy_allowance_only_clears_possible_mutation_for_proven_zero_f
     client._builder.allowance_after_approve = post_allowance  # type: ignore[attr-defined]
     client._builder.next_set_approval_result = set_result  # type: ignore[attr-defined]
 
-    result = client.set_exact_buy_allowance("896", 2_400_000)
+    result = client.set_exact_buy_allowance("896", 2_400_000_000_000_000_000)
 
     assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
     assert result["success"] is False
@@ -803,7 +962,7 @@ def test_set_exact_buy_allowance_only_clears_possible_mutation_for_proven_zero_f
 
 def test_clear_buy_allowance_uses_sdk_revoke_and_proves_zero_post_read() -> None:
     client, _ = make_client(response_for)
-    client._builder.allowance_value = 2_400_000  # type: ignore[attr-defined]
+    client._builder.allowance_value = 2_400_000_000_000_000_000  # type: ignore[attr-defined]
     client._builder.allowance_after_clear = 0  # type: ignore[attr-defined]
 
     result = client.clear_buy_allowance("896")
@@ -825,7 +984,7 @@ def test_clear_buy_allowance_uses_sdk_revoke_and_proves_zero_post_read() -> None
     [
         ("set_exact_buy_allowance", SimpleNamespace(success=False, receipt={"status": 0, "transactionHash": bytes.fromhex("34" * 32)}, cause=None), 0, "receipt_failed"),
         ("set_exact_buy_allowance", SimpleNamespace(success=True, receipt={"status": 1, "transactionHash": bytes.fromhex("35" * 32)}, cause=None), 7, "allowance_mismatch"),
-        ("clear_buy_allowance", SimpleNamespace(success=False, receipt=None, cause=None), 2_400_000, "receipt_ambiguous"),
+        ("clear_buy_allowance", SimpleNamespace(success=False, receipt=None, cause=None), 2_400_000_000_000_000_000, "receipt_ambiguous"),
         ("clear_buy_allowance", SimpleNamespace(success=True, receipt={"status": 1, "transactionHash": bytes.fromhex("36" * 32)}, cause=None), 1, "allowance_mismatch"),
     ],
 )
@@ -836,12 +995,12 @@ def test_allowance_mutations_return_redacted_failures_on_receipt_or_post_read_am
     error_code: str,
 ) -> None:
     client, _ = make_client(response_for)
-    client._builder.allowance_value = 2_400_000 if method_name == "clear_buy_allowance" else 0  # type: ignore[attr-defined]
+    client._builder.allowance_value = 2_400_000_000_000_000_000 if method_name == "clear_buy_allowance" else 0  # type: ignore[attr-defined]
     client._builder.allowance_after_approve = post_allowance  # type: ignore[attr-defined]
     client._builder.allowance_after_clear = post_allowance  # type: ignore[attr-defined]
     client._builder.next_set_approval_result = set_result  # type: ignore[attr-defined]
 
-    result = getattr(client, method_name)("896", 2_400_000) if method_name == "set_exact_buy_allowance" else getattr(client, method_name)("896")
+    result = getattr(client, method_name)("896", 2_400_000_000_000_000_000) if method_name == "set_exact_buy_allowance" else getattr(client, method_name)("896")
 
     assert result["success"] is False
     assert result["error_code"] == error_code

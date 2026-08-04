@@ -17,6 +17,7 @@ from open_trader.polymarket_trading import (
     PredictConfig,
     TradingConfig,
 )
+from open_trader.predict_trading import PredictTradingClient
 
 
 CONFIG = TradingConfig(
@@ -70,7 +71,7 @@ class PredictClient:
             "predict_account": CONFIG.predict.wallet_address if CONFIG.predict else "",
             "gas_signer": CONFIG.signer_address,
             "available_usdt": "10",
-            "available_usdt_raw": "10000000",
+            "available_usdt_raw": "10000000000000000000",
             "allowance": "0",
             "allowance_raw": "0",
             "allowance_breaker": False,
@@ -235,6 +236,81 @@ def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     assert report.mutation_calls == 0
     assert report.live_notifications == 0
     assert client.account_snapshot_calls == 1
+
+
+def test_empty_scan_uses_production_predict_client_for_safe_order_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    class JsonResponse:
+        def __init__(self, payload: object) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode()
+
+        def __enter__(self) -> "JsonResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def opener(request: Request, **kwargs: object) -> object:
+        del kwargs
+        requests.append((request.get_method(), request.full_url))
+        if request.full_url.endswith("/v1/orders"):
+            return JsonResponse({"success": True, "cursor": None, "data": []})
+        if request.full_url.endswith("/v1/positions"):
+            return JsonResponse({"success": True, "cursor": None, "data": []})
+        raise AssertionError(request.full_url)
+
+    transport = acceptance.ReadOnlyTransport(opener)
+    monkeypatch.setattr(acceptance, "ReadOnlyTransport", lambda: transport)
+
+    class EmptyPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+    def production_client(_config: object, *, urlopen_fn: object) -> PredictTradingClient:
+        assert urlopen_fn is transport
+        client = PredictTradingClient(
+            CONFIG.predict,
+            SimpleNamespace(),
+            "api-key-fixture",
+            gas_signer=CONFIG.signer_address,
+            urlopen_fn=urlopen_fn,
+        )
+        client._jwt = "jwt-fixture"
+        client._approval_facts_for_scope = lambda _scope, *, exact_debit_wei: {  # type: ignore[method-assign]
+            "predict_account": CONFIG.predict.wallet_address,
+            "gas_signer": CONFIG.signer_address,
+            "available_usdt": "10",
+            "available_usdt_raw": "10000000000000000000",
+            "allowance": "0",
+            "allowance_raw": "0",
+            "allowance_breaker": False,
+            "scope_ready": True,
+            "approval_scope": {"operation": "TRADE", "side": "BUY"},
+            "bnb_balance": "0.002",
+            "required_bnb": "0.001",
+            "minimum_top_up_bnb": "0",
+            "exact_debit_wei": exact_debit_wei,
+        }
+        return client
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=lambda _config, *, urlopen_fn: EmptyPredictSource(),
+        predict_client_factory=production_client,
+    )
+
+    assert report.status == "PASS"
+    assert report.mutation_calls == 0
+    assert requests == [
+        ("GET", "https://api.predict.fun/v1/orders"),
+        ("GET", "https://api.predict.fun/v1/positions"),
+    ]
 
 
 def test_predict_account_readiness_uses_exact_approval_facts_not_satisfied_flag(

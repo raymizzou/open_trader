@@ -28,7 +28,7 @@ from .polymarket_trading import (
     load_trading_config,
 )
 from .predict_source import PredictSource
-from .predict_trading import PredictTradingClient
+from .predict_trading import PREDICT_BASE_UNITS, PredictTradingClient
 
 
 SCENARIO_IDS = (
@@ -131,7 +131,7 @@ class ReadOnlyTransport:
     def __call__(self, request: Request, **kwargs: object) -> object:
         path = urlparse(request.full_url).path
         method = request.get_method().upper()
-        if path == "/v1/orders" or (method != "GET" and not (method == "POST" and path == "/v1/auth")):
+        if method != "GET" and not (method == "POST" and path == "/v1/auth"):
             self.mutation_calls += 1
             raise RuntimeError("mutation prohibited")
         return self._opener(request, **kwargs)
@@ -717,10 +717,10 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
         or not gas_signer
         or facts.get("scope_ready") is not True
         or facts.get("allowance_breaker") is not False
-        or balance * Decimal("1000000") != balance_raw
+        or balance * Decimal(PREDICT_BASE_UNITS) != balance_raw
         or allowance != 0
         or allowance_raw != 0
-        or allowance * Decimal("1000000") != allowance_raw
+        or allowance * Decimal(PREDICT_BASE_UNITS) != allowance_raw
     ):
         return _failed("predict account read failed")
     wallet_address = facts.get("wallet_address")
