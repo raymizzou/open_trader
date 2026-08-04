@@ -291,7 +291,7 @@ def test_v1_claim_with_malformed_required_evidence_marks_source_stale(
     assert source.snapshot()["rest_reason"] == "rest_stale"
 
 
-def test_list_open_markets_stops_on_repeated_cursor_without_requesting_a_third_page() -> None:
+def test_list_open_markets_rejects_repeated_cursor_without_returning_partial_markets() -> None:
     source, requests = source_with_responses(
         [
             {"success": True, "cursor": "repeat", "data": [market(id=123)]},
@@ -299,8 +299,21 @@ def test_list_open_markets_stops_on_repeated_cursor_without_requesting_a_third_p
         ]
     )
 
-    assert [item.market_id for item in asyncio.run(source.list_open_markets())] == ["123", "124"]
+    assert asyncio.run(source.list_open_markets()) == ()
     assert len([request for request in requests if "/v1/markets?" in request.full_url]) == 2
+    assert source.snapshot()["rest"] == "stale"
+    assert source.snapshot()["rest_reason"] == "rest_stale"
+
+
+@pytest.mark.parametrize("cursor", ("", 0, False, [], {}))
+def test_list_open_markets_rejects_invalid_cursor(cursor: object) -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "cursor": cursor, "data": [market(id=123)]}]
+    )
+
+    assert asyncio.run(source.list_open_markets()) == ()
+    assert source.snapshot()["rest"] == "stale"
+    assert source.snapshot()["rest_reason"] == "rest_stale"
 
 
 def test_complete_yes_book_derives_no_asks_at_the_market_tick() -> None:

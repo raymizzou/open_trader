@@ -1070,8 +1070,6 @@ def _canonical_positions(
             or not token_id
             or not isinstance(outcome_name, str)
             or not outcome_name
-            or not isinstance(outcome_status, str)
-            or not outcome_status
             or quantity is None
         ):
             raise ValueError("invalid Predict position")
@@ -1082,7 +1080,10 @@ def _canonical_positions(
                 "token_id": token_id,
                 "outcome": outcome_name.upper(),
                 "quantity": format(quantity, "f"),
-                "redeemable": outcome_status.upper() == "WON",
+                "redeemable": (
+                    isinstance(outcome_status, str)
+                    and outcome_status.upper() == "WON"
+                ),
             }
         )
     return tuple(positions)

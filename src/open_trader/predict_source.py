@@ -112,8 +112,15 @@ class PredictSource:
                     self._mark_stale("rest")
                     return ()
             next_cursor = payload.get("cursor")
-            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+            if next_cursor is None:
                 return tuple(markets)
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen_cursors
+            ):
+                self._mark_stale("rest")
+                return ()
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 

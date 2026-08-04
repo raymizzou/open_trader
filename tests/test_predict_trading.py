@@ -593,7 +593,7 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                                 "fee": {"amount": "20000000000000000", "type": "COLLATERAL"}
                             },
                                 "market": {"id": 896, "conditionId": "predict-condition"},
-                                "outcome": {"onChainId": "yes-token", "name": "YES", "status": "OPEN"},
+                                "outcome": {"onChainId": "yes-token", "name": "YES"},
                         }
                     ],
                 }
@@ -608,7 +608,7 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
                             {
                                 "id": "position-id",
                                 "market": {"id": 896, "conditionId": "predict-condition"},
-                                "outcome": {"onChainId": "yes-token", "name": "YES", "status": "OPEN"},
+                                "outcome": {"onChainId": "yes-token", "name": "YES"},
                                 "amount": "1000000000000000000",
                         }
                     ],
@@ -782,7 +782,7 @@ def test_account_snapshot_reads_documented_direct_array_shapes() -> None:
     position = {
         "id": "position-id",
         "market": {"id": 896, "conditionId": "predict-condition"},
-        "outcome": {"onChainId": "yes-token", "name": "YES", "status": "WON"},
+        "outcome": {"onChainId": "yes-token", "name": "YES"},
         "amount": "1000000000000000000",
     }
 
@@ -810,7 +810,7 @@ def test_account_snapshot_reads_documented_direct_array_shapes() -> None:
             "token_id": "yes-token",
             "outcome": "YES",
             "quantity": "1",
-            "redeemable": True,
+            "redeemable": False,
         },
     )
 
