@@ -1786,6 +1786,15 @@ def _valid_v2_risk_items(
     *,
     strategy_version: str = "v2",
 ) -> bool:
+    snapshot = payload.get("strategy_snapshot")
+    parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
+    target_weight_limit = PORTFOLIO_RISK_LIMIT
+    configured_target = parameters.get("target_weight") if isinstance(parameters, dict) else None
+    if configured_target is not None and not isinstance(configured_target, (dict, list)):
+        configured_limit = _dashboard_risk_decimal(configured_target)
+        if configured_limit is None or configured_limit <= 0 or configured_limit > 1:
+            return False
+        target_weight_limit = configured_limit
     portfolio_limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
     nav = (
         portfolio_limit / PORTFOLIO_RISK_LIMIT
@@ -1832,7 +1841,7 @@ def _valid_v2_risk_items(
             or normal_cost <= 0
             or target_weight is None
             or target_weight <= 0
-            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_weight > target_weight_limit
             or strategy_version in {
                 "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
             }
@@ -1893,7 +1902,7 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             and not zero_kelly_skip
-            or target_weight > PORTFOLIO_RISK_LIMIT
+            or target_weight > target_weight_limit
             or target_amount_raw is not None
             and target_amount is None
             or not isinstance(item.get("reason"), str)

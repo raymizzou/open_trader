@@ -5362,32 +5362,36 @@ def test_check_controller_owned_rows_uses_current_page_projection() -> None:
     stale_position["last_price"] = "53.38"
     page_position = dict(stale_position)
     page_position["last_price"] = "53.40"
-    dom_values = dict(page_position)
+    other_position = _controller_position("02840")
+    dom_values = [dict(other_position), dict(page_position)]
 
     class Page:
         def evaluate(self, expression: str) -> list[dict[str, str]]:
             assert expression == (
                 "() => state.dashboard?.broker_positions ?? []"
             )
-            return [page_position]
+            return [page_position, other_position]
 
     class Row:
+        def __init__(self, index: int) -> None:
+            self.values = dom_values[index]
+
         def get_attribute(self, name: str) -> str:
             return {
                 "data-broker": "tiger",
-                "data-symbol": "DRAM",
+                "data-symbol": self.values["symbol"],
                 **{
-                    attribute: dom_values[field]
+                    attribute: self.values[field]
                     for field, attribute in dashboard_acceptance.CONTROLLER_DOM_FIELDS.items()
                 },
             }[name]
 
     class Rows:
         def count(self) -> int:
-            return 1
+            return 2
 
-        def nth(self, _index: int) -> Row:
-            return Row()
+        def nth(self, index: int) -> Row:
+            return Row(index)
 
     class Section:
         def locator(self, selector: str) -> Rows:
@@ -5397,7 +5401,7 @@ def test_check_controller_owned_rows_uses_current_page_projection() -> None:
     dashboard_acceptance._check_controller_owned_rows(
         Page(), Section(), "tiger"
     )
-    dom_values["last_price"] = stale_position["last_price"]
+    dom_values[1]["last_price"] = stale_position["last_price"]
     with pytest.raises(AssertionError, match="last_price"):
         dashboard_acceptance._check_controller_owned_rows(
             Page(), Section(), "tiger"

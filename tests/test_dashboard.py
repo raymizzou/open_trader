@@ -1736,6 +1736,32 @@ def _valid_v3_dashboard_trend_payload() -> dict[str, object]:
     return payload
 
 
+def test_dashboard_v10_risk_items_accept_ranked_six_percent_target() -> None:
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(snapshot, dict) and isinstance(judgments, dict)
+    snapshot["strategy_version"] = "v10"
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["target_weight"] = "0.06"
+    buy = judgments["formal_actions"][0]
+    skip = judgments["risk_skips"][0]
+    assert isinstance(buy, dict) and isinstance(skip, dict)
+    buy.update({"target_weight": "0.06", "target_amount": "6000"})
+    skip.update({"target_weight": "0.06", "target_amount": "6000"})
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary["kelly_phase"] = "cold_start"
+
+    assert dashboard_module._valid_v2_risk_items(
+        payload,
+        judgments,
+        summary,
+        strategy_version="v10",
+    )
+
+
 def test_dashboard_enforces_issue_4_and_kelly_contract_for_v3(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     path = config.reports_dir / "trend_a_share/2026-07-15.json"

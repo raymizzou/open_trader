@@ -3151,13 +3151,34 @@ def _check_controller_owned_rows(page: Any, section: Any, broker: str) -> None:
         return
     rows = section.locator(".account-holding-row:visible")
     assert rows.count() == len(expected), f"{broker} 控制器持仓行数与 DOM 不一致"
-    for index, expected_row in enumerate(expected):
-        row = rows.nth(index)
+    unmatched = [rows.nth(index) for index in range(rows.count())]
+    for expected_row in expected:
+        symbol = str(expected_row.get("symbol", "")).upper()
+        index = next(
+            (
+                index for index, row in enumerate(unmatched)
+                if row.get_attribute("data-broker") == broker
+                and row.get_attribute("data-symbol") == symbol
+                and all(
+                    row.get_attribute(attribute) == expected_row[field]
+                    for field, attribute in CONTROLLER_DOM_FIELDS.items()
+                )
+            ),
+            None,
+        )
+        if index is None:
+            index = next(
+                (
+                    index for index, row in enumerate(unmatched)
+                    if row.get_attribute("data-broker") == broker
+                    and row.get_attribute("data-symbol") == symbol
+                ),
+                None,
+            )
+        assert index is not None, f"{broker} DOM 持仓标的不一致"
+        row = unmatched.pop(index)
         assert row.get_attribute("data-broker") == broker, (
             f"{broker} DOM 持仓券商字段不一致"
-        )
-        assert row.get_attribute("data-symbol") == str(expected_row.get("symbol", "")).upper(), (
-            f"{broker} DOM 持仓标的不一致"
         )
         for field, attribute in CONTROLLER_DOM_FIELDS.items():
             assert row.get_attribute(attribute) == expected_row[field], (
