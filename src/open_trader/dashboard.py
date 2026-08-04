@@ -3911,32 +3911,14 @@ def _current_advice_source_hash(row: dict[str, str] | None) -> str:
     return source_hash(market_report)
 
 
-
-
-def _optional_decimal(value: str) -> Decimal | None:
-    text = value.strip()
-    if not text:
-        return None
+def _is_dashboard_holding(row: Mapping[str, str]) -> bool:
+    """Keep cash rows out of module holding counts without Account projection."""
+    market = row.get("market", "").strip().upper()
+    asset_class = row.get("asset_class", "").strip().lower()
+    if market == "CASH" or asset_class in {"cash", "money_market_fund"}:
+        return False
     try:
-        parsed = Decimal(text.replace(",", ""))
+        quantity = Decimal(row.get("total_quantity", "").replace(",", ""))
     except (InvalidOperation, ValueError):
-        return None
-    return parsed if parsed.is_finite() else None
-
-
-def _money_text(value: Decimal) -> str:
-    return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-
-def _pct_text(value: Decimal | None) -> str:
-    if value is None:
-        return ""
-    return (
-        f"{(value * Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}%"
-    )
-
-
-def _ratio(numerator: Decimal, denominator: Decimal) -> Decimal | None:
-    if denominator == Decimal("0"):
-        return None
-    return numerator / denominator
+        return True
+    return not quantity.is_finite() or quantity != Decimal("0")

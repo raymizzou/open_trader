@@ -57,3 +57,15 @@ After implementation:
   fetch during dashboard load.
 - `python -m py_compile src/open_trader/dashboard.py src/open_trader/dashboard_web.py`
   and `git diff --check` passed after the helper cleanup.
+
+## Formal review fix round 2
+
+- Restored `_is_dashboard_holding` as a small module-row predicate: cash and
+  money-market rows are excluded; all other non-zero or unparseable quantity
+  rows remain countable. This preserves the acceptance checker dependency
+  without reintroducing any Account projection helper tree.
+- Removed the remaining zero-caller Account summary helpers
+  `_optional_decimal`, `_money_text`, `_pct_text`, and `_ratio`.
+- `pytest tests/test_dashboard.py -q` → `220 passed in 0.76s`; the Dashboard
+  Web suite collected and ran after the restored import. `py_compile` and
+  `git diff --check` passed.
