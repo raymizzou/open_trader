@@ -31,7 +31,6 @@ from .dashboard import (
     load_dashboard_state,
     load_trend_report_history,
 )
-from .dashboard_quotes import SHANGHAI_TZ, load_published_quotes
 from .futu_quote import FutuQuoteClient
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_relation_discovery import (
@@ -1236,15 +1235,6 @@ def build_dashboard_payload(
     return load_dashboard_state(config).to_dict()
 
 
-def build_quotes_payload(
-    config: DashboardConfig,
-) -> dict[str, object]:
-    return load_published_quotes(
-        config.data_dir / "latest" / "quotes.json",
-        now=datetime.now(SHANGHAI_TZ),
-    )
-
-
 def build_backtest_run_payload(
     config: DashboardConfig,
     request: dict[str, Any],
@@ -1407,12 +1397,6 @@ def create_dashboard_server(
             if path == "/api/backtests/options":
                 try:
                     self._send_json(build_standard_backtest_options_payload(config))
-                except Exception as exc:
-                    self._send_error_json(exc)
-                return
-            if path == "/api/quotes":
-                try:
-                    self._send_json(build_quotes_payload(config))
                 except Exception as exc:
                     self._send_error_json(exc)
                 return

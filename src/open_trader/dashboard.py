@@ -31,12 +31,6 @@ from .a_share_trend import (
     valid_v4_risk_contract,
 )
 from .backtest_prices import normalize_backtest_symbol
-from .account_sync_state import (
-    accepted_portfolio_rows,
-    dashboard_projection_from_state,
-    load_account_sync_state,
-    project_account_sync_health,
-)
 from .account_snapshot import build_instrument_id
 from .futu_symbols import to_futu_symbol
 
@@ -211,85 +205,33 @@ class DashboardConfig:
 @dataclass(frozen=True)
 class DashboardState:
     config: DashboardConfig
-    broker_detail_month: str
-    detail_available: bool
-    summary: dict[str, Any]
-    holdings: list[dict[str, Any]]
-    broker_summaries: list[dict[str, Any]]
-    source_statuses: list[dict[str, str]]
-    cash_rows: list[dict[str, str]]
-    broker_positions: list[dict[str, str]]
-    cash_details: list[dict[str, str]]
     trade_actions: list[dict[str, str]]
+    holding_enrichment: list[dict[str, Any]]
     kelly_lab: dict[str, Any]
     backtest_universe: dict[str, list[dict[str, str]]]
     trend_reports: dict[str, dict[str, Any]]
     trend_reviews: dict[str, dict[str, Any]]
     trend_controllers: dict[str, dict[str, object]]
-    account_sync: dict[str, object]
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "portfolio_path": str(self.config.portfolio_path),
             "data_dir": str(self.config.data_dir),
             "reports_dir": str(self.config.reports_dir),
             "poll_seconds": self.config.poll_seconds,
             "futu_host": self.config.futu_host,
             "futu_port": self.config.futu_port,
-            "broker_detail_month": self.broker_detail_month,
-            "detail_available": self.detail_available,
-            "summary": self.summary,
-            "holdings": self.holdings,
-            "broker_summaries": self.broker_summaries,
-            "source_statuses": self.source_statuses,
-            "cash_rows": self.cash_rows,
-            "broker_positions": self.broker_positions,
-            "cash_details": self.cash_details,
             "trade_actions": self.trade_actions,
+            "holding_enrichment": self.holding_enrichment,
             "kelly_lab": self.kelly_lab,
             "backtest_universe": self.backtest_universe,
             "trend_reports": self.trend_reports,
             "trend_reviews": self.trend_reviews,
             "trend_controllers": self.trend_controllers,
-            "account_sync": self.account_sync,
         }
 
 
 def load_dashboard_state(config: DashboardConfig) -> DashboardState:
-    account_state = load_account_sync_state(
-        config.data_dir / "latest" / "account_sync_state.json"
-    )
-    dashboard_projection = dashboard_projection_from_state(account_state)
-    legacy_portfolio_fallback = not account_state["generation"]
-    portfolio_rows = (
-        accepted_portfolio_rows(account_state)
-        if account_state["generation"]
-        else _read_csv_rows(config.portfolio_path)
-    )
-    raw_broker_positions, raw_cash_details = _accepted_broker_details(account_state)
-    broker_positions = (
-        [dict(row) for row in dashboard_projection["broker_positions"]]
-        if dashboard_projection is not None
-        else raw_broker_positions if legacy_portfolio_fallback else []
-    )
-    cash_details = (
-        [dict(row) for row in dashboard_projection["cash_details"]]
-        if dashboard_projection is not None
-        else [_cash_detail_row(row) for row in raw_cash_details]
-        if legacy_portfolio_fallback
-        else []
-    )
-    detail_month = _accepted_statement_period(account_state)
-    now = datetime.now(SHANGHAI)
-    quotes = _load_published_quotes(config.data_dir / "latest" / "quotes.json", now=now)
-    account_sync = project_account_sync_health(
-        account_state,
-        _read_json_mapping(config.data_dir / "account_sync" / "controller_status.json"),
-        quotes,
-        now=now,
-    )
-    holding_rows = [row for row in portfolio_rows if _is_dashboard_holding(row)]
-    holding_markets = _markets_from_rows(holding_rows)
+    holding_markets = {"CN", "HK", "US"}
     trade_actions, _ = _latest_rows_for_markets(
         data_dir=config.data_dir,
         filename="trade_actions.csv",
@@ -338,7 +280,6 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     kelly_lab, kelly_experiments_by_holding = _load_dashboard_kelly_lab(
         config.data_dir
     )
-    positions_by_holding = _group_by_market_symbol(raw_broker_positions)
     agent_reports_by_holding = _latest_by_market_symbol(trading_advice)
     strategies_by_holding = _latest_by_market_symbol(trading_plan)
     premarket_actions_by_holding = _latest_by_market_symbol(premarket_actions)
@@ -346,12 +287,16 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
     decision_plans_by_holding, decision_plan_errors_by_market = (
         _latest_decision_plans_for_markets(config.data_dir, holding_markets)
     )
-    cash_rows = [row for row in portfolio_rows if _is_cash_like_row(row)]
-    holdings = [
+    holding_rows = _module_holding_rows(
+        trading_advice,
+        trading_plan,
+        premarket_actions,
+        trade_actions,
+    )
+    holding_enrichment = [
         _merge_holding(
             row,
             config.data_dir,
-            positions_by_holding,
             agent_reports_by_holding,
             strategies_by_holding,
             premarket_actions_by_holding,
@@ -370,41 +315,19 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
         for row in holding_rows
     ]
     backtest_universe = _build_backtest_universe(
-        holding_rows,
+        [],
         _read_csv_rows(config.data_dir / "latest" / "watchlist.csv"),
     )
 
     return DashboardState(
         config=config,
-        broker_detail_month=detail_month,
-        detail_available=bool(detail_month),
-        summary=(
-            dict(dashboard_projection["summary"])
-            if dashboard_projection is not None
-            else _build_summary(portfolio_rows, holding_rows)
-            if legacy_portfolio_fallback
-            else _empty_dashboard_summary()
-        ),
-        holdings=holdings,
-        broker_summaries=(
-            [dict(row) for row in dashboard_projection["broker_summaries"]]
-            if dashboard_projection is not None
-            else _build_broker_summaries(portfolio_rows, broker_positions, cash_details)
-            if legacy_portfolio_fallback
-            else []
-        ),
-        source_statuses=_build_source_statuses(account_sync),
-        cash_rows=cash_rows,
-        broker_positions=broker_positions,
-        cash_details=cash_details,
         trade_actions=trade_actions,
+        holding_enrichment=holding_enrichment,
         kelly_lab=kelly_lab,
         backtest_universe=backtest_universe,
         trend_reports=_load_trend_reports(
             config.data_dir,
             config.reports_dir,
-            broker_positions=raw_broker_positions,
-            cash_details=raw_cash_details,
             current_candidate_pool_ids={
                 market: config.trend_candidate_pool_ids(market)
                 for market in ("CN", "US", "HK")
@@ -415,14 +338,7 @@ def load_dashboard_state(config: DashboardConfig) -> DashboardState:
             config.data_dir,
             executor_host=config.trend_executor_host,
         ),
-        account_sync=account_sync,
     )
-
-
-def _load_published_quotes(path: Path, *, now: datetime) -> dict[str, object]:
-    from .dashboard_quotes import load_published_quotes
-
-    return load_published_quotes(path, now=now)
 
 
 def _empty_dashboard_summary() -> dict[str, Any]:
@@ -795,14 +711,8 @@ def _load_trend_reports(
     *,
     today: date | None = None,
     now: datetime | None = None,
-    broker_positions: list[dict[str, str]] | None = None,
-    cash_details: list[dict[str, str]] | None = None,
     current_candidate_pool_ids: Mapping[str, tuple[int, ...]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    if broker_positions is None or cash_details is None:
-        broker_positions, cash_details = _accepted_broker_details(
-            load_account_sync_state(data_dir / "latest" / "account_sync_state.json")
-        )
     reports = {
         broker: _load_broker_trend_report(
             data_dir=data_dir,
@@ -815,8 +725,6 @@ def _load_trend_reports(
             report_date=(
                 today or _trend_market_date(market, now=now)
             ).isoformat(),
-            broker_positions=broker_positions,
-            cash_details=cash_details,
             current_candidate_pool_ids=(current_candidate_pool_ids or {}).get(market, ()),
         )
         for broker, (market, market_label, broker_label, directory, buy_window)
@@ -952,9 +860,6 @@ def load_historical_trend_report(
         generated_at,
         _,
     ) = selected
-    broker_positions, cash_details = _accepted_broker_details(
-        load_account_sync_state(config.data_dir / "latest" / "account_sync_state.json")
-    )
     return _project_broker_trend_report(
         selected=(
             path,
@@ -972,8 +877,6 @@ def load_historical_trend_report(
         broker_label=broker_label,
         buy_window=buy_window,
         report_date=_shanghai_date().isoformat(),
-        broker_positions=broker_positions,
-        cash_details=cash_details,
         current_candidate_pool_ids=config.trend_candidate_pool_ids(market),
         historical=True,
     )
@@ -2025,8 +1928,6 @@ def _load_broker_trend_report(
     broker_label: str,
     buy_window: str,
     report_date: str,
-    broker_positions: list[dict[str, str]],
-    cash_details: list[dict[str, str]],
     current_candidate_pool_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     unavailable = {
@@ -2053,8 +1954,6 @@ def _load_broker_trend_report(
         broker_label=broker_label,
         buy_window=buy_window,
         report_date=report_date,
-        broker_positions=broker_positions,
-        cash_details=cash_details,
         current_candidate_pool_ids=current_candidate_pool_ids,
         use_execution_batch=True,
     )
@@ -2071,8 +1970,6 @@ def _project_broker_trend_report(
     broker_label: str,
     buy_window: str,
     report_date: str,
-    broker_positions: list[dict[str, str]] | None = None,
-    cash_details: list[dict[str, str]] | None = None,
     current_candidate_pool_ids: tuple[int, ...] = (),
     use_execution_batch: bool = False,
     historical: bool = False,
@@ -2348,17 +2245,6 @@ def _project_broker_trend_report(
         if current_strategy_snapshot
         else None
     )
-    actual_overlay = _project_trend_actual_overlay(
-        broker=broker,
-        market=market,
-        sell_actions=sell_actions,
-        buy_actions=buy_actions,
-        hold_actions=hold_actions,
-        review_actions=review_actions,
-        risk_skips=risk_skips,
-        broker_positions=broker_positions or [],
-        cash_details=cash_details or [],
-    )
     real_status = payload["strategy_judgments"].get(
         "real_holding_decisions_status"
     )
@@ -2456,7 +2342,7 @@ def _project_broker_trend_report(
         "industry_context_status": frozen_industry_context_status,
         "industry_contexts": frozen_industry_contexts,
         "strategy_parameter_rows": frozen_parameter_rows,
-        "actual_overlay": actual_overlay,
+        "actual_overlay": {},
         "hold_actions": hold_actions,
         "review_actions": review_actions,
         "counts": {
@@ -3649,6 +3535,27 @@ def _latest_by_market_symbol(
     return keyed
 
 
+def _module_holding_rows(*artifact_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    rows: dict[tuple[str, str], dict[str, str]] = {}
+    for artifact in artifact_rows:
+        for row in artifact:
+            key = _market_symbol_key(row)
+            if key is None or key[0] not in {"CN", "HK", "US"}:
+                continue
+            merged = dict(rows.get(key, {}))
+            merged.update({key: value for key, value in row.items() if value})
+            asset_class = str(merged.get("asset_class") or "").strip().lower()
+            if asset_class in {"", "unknown"}:
+                asset_class = detect_asset_class(
+                    key[1], str(merged.get("name") or "")
+                ).value
+            if asset_class not in {AssetClass.STOCK.value, AssetClass.ETF.value}:
+                continue
+            merged["market"], merged["symbol"], merged["asset_class"] = (*key, asset_class)
+            rows[key] = merged
+    return [rows[key] for key in sorted(rows)]
+
+
 def _market_symbol_key(row: dict[str, str]) -> tuple[str, str] | None:
     market = row.get("market", "").strip().upper()
     symbol = row.get("symbol", "").strip().upper()
@@ -3847,7 +3754,6 @@ def _decision_plan_detail(
 def _merge_holding(
     row: dict[str, str],
     data_dir: Path,
-    positions_by_holding: dict[tuple[str, str], list[dict[str, str]]],
     agent_reports_by_holding: dict[tuple[str, str], dict[str, str]],
     strategies_by_holding: dict[tuple[str, str], dict[str, str]],
     premarket_actions_by_holding: dict[tuple[str, str], dict[str, str]],
@@ -3868,13 +3774,6 @@ def _merge_holding(
         row.get("market", ""), row.get("asset_class", ""), row.get("symbol", "")
     )
     key = _market_symbol_key(row)
-    broker_details = (
-        [_broker_detail_row(row) for row in positions_by_holding.get(key, [])]
-        if key is not None
-        else []
-    )
-    holding["broker_detail_count"] = len(broker_details)
-    holding["broker_details"] = broker_details
     agent_report = agent_reports_by_holding.get(key) if key is not None else None
     strategy = strategies_by_holding.get(key) if key is not None else None
     premarket_action = premarket_actions_by_holding.get(key) if key is not None else None

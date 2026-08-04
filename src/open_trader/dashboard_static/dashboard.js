@@ -8974,13 +8974,13 @@ function renderUsdMarketValue(holding) {
 }
 
 function getHoldings() {
-  return (state.dashboard && Array.isArray(state.dashboard.holdings))
-    ? state.dashboard.holdings
+  return (state.dashboard && Array.isArray(state.dashboard.holding_enrichment))
+    ? state.dashboard.holding_enrichment
     : [];
 }
 
 function accountHoldingGroups() {
-  const legacyHoldings = Array.isArray(state.dashboard?.holdings) ? state.dashboard.holdings : [];
+  const legacyHoldings = Array.isArray(state.dashboard?.holding_enrichment) ? state.dashboard.holding_enrichment : [];
   const groups = Object.entries(ACCOUNT_STRATEGY_PROFILES).map(([broker, profile]) => {
     const summary = brokerSummaries().find((item) => brokerKey(item) === broker) || {broker};
     const rows = (Array.isArray(state.accountSnapshot?.positions)

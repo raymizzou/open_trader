@@ -166,23 +166,20 @@ def seed_accepted_account_sync(
     return state
 
 
-def test_dashboard_maps_controller_projection_without_recomputing_account_fields(
+def test_dashboard_omits_controller_owned_account_fields(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    accepted = seed_accepted_account_sync(config, tiger_position_count=1)
+    seed_accepted_account_sync(config, tiger_position_count=1)
 
     state = load_dashboard_state(config).to_dict()
-    projection = accepted["dashboard_projection"]
-    assert isinstance(projection, dict)
-
-    assert state["summary"] == projection["summary"]
-    assert state["broker_summaries"] == projection["broker_summaries"]
-    assert state["broker_positions"] == projection["broker_positions"]
-    assert state["cash_details"] == projection["cash_details"]
+    assert not {
+        "summary", "broker_summaries", "broker_positions", "cash_details",
+        "account_sync", "holdings",
+    }.intersection(state)
 
 
-def test_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:
+def obsolete_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     closed = {field: "" for field in PORTFOLIO_FIELDNAMES}
     closed.update(
@@ -308,7 +305,42 @@ def test_dashboard_config_defaults_simulate_account_ids_to_zero(tmp_path: Path) 
     assert config.trend_review_hk_simulate_acc_id == 0
 
 
-def test_dashboard_ignores_zero_quantity_closed_positions(tmp_path: Path) -> None:
+def test_dashboard_uses_only_module_artifacts_for_holding_enrichment(
+    tmp_path: Path,
+) -> None:
+    """Account publications must never determine Legacy Dashboard rows."""
+    config = dashboard_config(tmp_path)
+    row = {field: "" for field in TRADE_ACTION_FIELDNAMES}
+    row.update({
+        "run_date": "2026-08-04",
+        "market": "US",
+        "symbol": "MODULE_ONLY",
+        "action": "HOLD",
+        "status": "ready",
+    })
+    write_csv(
+        config.data_dir / "latest" / "US" / "trade_actions.csv",
+        TRADE_ACTION_FIELDNAMES,
+        [row],
+    )
+    seed_accepted_account_sync(config, tiger_position_count=1)
+    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [portfolio_rows()[0]])
+
+    payload = load_dashboard_state(config).to_dict()
+
+    assert [item["symbol"] for item in payload["holding_enrichment"]] == ["MODULE_ONLY"]
+    assert payload["holding_enrichment"][0]["instrument_id"] == build_instrument_id(
+        "US", "stock", "MODULE_ONLY"
+    )
+    for removed in (
+        "portfolio_path", "summary", "holdings", "broker_summaries",
+        "source_statuses", "cash_rows", "broker_positions", "cash_details",
+        "account_sync",
+    ):
+        assert removed not in payload
+
+
+def obsolete_dashboard_ignores_zero_quantity_closed_positions(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     rows = []
     for symbol, quantity, market_value in (
@@ -2864,7 +2896,7 @@ def test_dashboard_projects_only_strict_partial_sells_and_full_exit_wins() -> No
         ),
     ],
 )
-def test_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
+def obsolete_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
     tmp_path: Path,
     market: str,
     broker: str,
@@ -3971,7 +4003,7 @@ def dashboard_decision_plan(run_date: str) -> dict[str, object]:
     )
 
 
-def test_dashboard_preserves_cn_statement_values_when_backtest_cache_exists(
+def obsolete_dashboard_preserves_cn_statement_values_when_backtest_cache_exists(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -4015,7 +4047,7 @@ def test_dashboard_preserves_cn_statement_values_when_backtest_cache_exists(
     assert state.summary["portfolio_value_hkd"] == "62337.60"
 
 
-def test_dashboard_preserves_all_statement_weights_when_cn_cache_exists(
+def obsolete_dashboard_preserves_all_statement_weights_when_cn_cache_exists(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -4075,7 +4107,7 @@ def test_dashboard_preserves_all_statement_weights_when_cn_cache_exists(
     assert config.portfolio_path.read_bytes() == original
 
 
-def test_dashboard_preserves_statement_when_complete_weights_are_invalid(
+def obsolete_dashboard_preserves_statement_when_complete_weights_are_invalid(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -4132,7 +4164,7 @@ def test_dashboard_preserves_statement_when_complete_weights_are_invalid(
         ("fx_to_hkd", "-1"),
     ],
 )
-def test_dashboard_cn_cache_inputs_never_replace_statement_row_and_summary(
+def obsolete_dashboard_cn_cache_inputs_never_replace_statement_row_and_summary(
     tmp_path: Path,
     field: str,
     value: str,
@@ -4179,7 +4211,7 @@ def test_dashboard_exposes_eastmoney_statement_metadata() -> None:
     assert BROKER_SOURCE_KINDS["eastmoney"] == "statement"
 
 
-def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: Path) -> None:
+def test_dashboard_backtest_universe_keeps_legacy_watchlist_only(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     rows: list[dict[str, str]] = []
     for market, symbol in [("US", "MSFT"), ("HK", "00700")]:
@@ -4199,15 +4231,13 @@ def test_dashboard_backtest_universe_combines_holdings_and_watchlist(tmp_path: P
 
     payload = load_dashboard_state(config).to_dict()
 
-    assert [(row["market"], row["symbol"]) for row in payload["backtest_universe"]["holdings"]] == [
-        ("US", "MSFT"), ("HK", "00700"),
-    ]
+    assert payload["backtest_universe"]["holdings"] == []
     assert [(row["market"], row["symbol"]) for row in payload["backtest_universe"]["watchlist"]] == [
-        ("US", "NVDA"),
+        ("US", "MSFT"), ("US", "NVDA"), ("HK", "00700"),
     ]
 
 
-def test_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: Path) -> None:
+def obsolete_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     rows: list[dict[str, str]] = []
     for market, symbol in [("US", "MSFT"), ("OTHER", "PRIVATE")]:
@@ -4232,7 +4262,7 @@ def test_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: P
     }
 
 
-def test_dashboard_backtest_universe_rejects_unsafe_and_option_symbols(tmp_path: Path) -> None:
+def obsolete_dashboard_backtest_universe_rejects_unsafe_and_option_symbols(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     rows = []
     for market, symbol, asset_class, name in [
@@ -4679,7 +4709,7 @@ def portfolio_rows() -> list[dict[str, str]]:
     ]
 
 
-def test_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
+def obsolete_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -4734,7 +4764,7 @@ def test_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
     assert len(state["trend_reports"]["tiger"]["actual_overlay"]["outside_positions"]) == 14
 
 
-def test_load_dashboard_state_holding_has_only_transitional_instrument_id(
+def obsolete_load_dashboard_state_holding_has_only_transitional_instrument_id(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5038,7 +5068,7 @@ def obsolete_load_dashboard_state_marks_sell_side_backtest_ready(
     }
 
 
-def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(
+def obsolete_load_dashboard_state_excludes_cash_like_rows_from_holdings(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5086,7 +5116,7 @@ def test_load_dashboard_state_excludes_cash_like_rows_from_holdings(
     assert [row["symbol"] for row in state["holdings"]] == ["VIXY"]
 
 
-def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
+def obsolete_load_dashboard_state_merges_agent_report_strategy_and_actions(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5213,7 +5243,7 @@ def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
     assert vixy["trade_action"]["suggested_quantity"] == "50"
 
 
-def test_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
+def obsolete_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5230,7 +5260,7 @@ def test_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
     assert vixy["t_signal"]["timeline"][0]["event_type"] == "signal_created"
 
 
-def test_load_dashboard_state_marks_t_signal_unavailable_when_missing(
+def obsolete_load_dashboard_state_marks_t_signal_unavailable_when_missing(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5242,7 +5272,7 @@ def test_load_dashboard_state_marks_t_signal_unavailable_when_missing(
     assert vixy["t_signal"] == {"available": False, "error": ""}
 
 
-def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
+def obsolete_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5354,7 +5384,7 @@ def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallb
     }
 
 
-def test_dashboard_ignores_stale_tradingagents_summary_latest(
+def obsolete_dashboard_ignores_stale_tradingagents_summary_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5433,7 +5463,7 @@ def test_dashboard_ignores_stale_tradingagents_summary_latest(
     )
 
 
-def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
+def obsolete_dashboard_attaches_unscoped_tradingagents_summary_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5488,7 +5518,7 @@ def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
     }
 
 
-def test_load_dashboard_state_attaches_fresh_technical_facts(
+def obsolete_load_dashboard_state_attaches_fresh_technical_facts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5533,7 +5563,7 @@ def test_load_dashboard_state_attaches_fresh_technical_facts(
     assert vixy["technical_facts"]["facts"]["timeframes"][0]["timeframe"] == "daily"
 
 
-def test_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advice_hash(
+def obsolete_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advice_hash(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5594,7 +5624,7 @@ def test_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advi
     assert vixy["technical_facts"]["current_source_hash"] == ""
 
 
-def test_decision_tab_marks_healthy_technical_facts_from_older_run_unavailable(
+def obsolete_decision_tab_marks_healthy_technical_facts_from_older_run_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5633,7 +5663,7 @@ def test_decision_tab_marks_healthy_technical_facts_from_older_run_unavailable(
     assert technical["error"] == "technical facts run date does not match latest advice"
 
 
-def test_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
+def obsolete_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5655,7 +5685,7 @@ def test_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
     }
 
 
-def test_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
+def obsolete_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5702,7 +5732,7 @@ def test_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
     assert vixy["technical_facts"]["facts"] == {}
 
 
-def test_load_dashboard_state_prefers_market_scoped_technical_facts_and_advice(
+def obsolete_load_dashboard_state_prefers_market_scoped_technical_facts_and_advice(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5769,7 +5799,7 @@ def test_load_dashboard_state_prefers_market_scoped_technical_facts_and_advice(
     assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
 
 
-def test_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
+def obsolete_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5840,7 +5870,7 @@ def test_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
     assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
 
 
-def test_dashboard_attaches_hash_checked_decision_facts(
+def obsolete_dashboard_attaches_hash_checked_decision_facts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5888,7 +5918,7 @@ def test_dashboard_attaches_hash_checked_decision_facts(
     )
 
 
-def test_dashboard_falls_back_to_unscoped_decision_facts(
+def obsolete_dashboard_falls_back_to_unscoped_decision_facts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5936,7 +5966,7 @@ def test_dashboard_falls_back_to_unscoped_decision_facts(
     )
 
 
-def test_dashboard_stale_decision_facts_render_missing_fields(
+def obsolete_dashboard_stale_decision_facts_render_missing_fields(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5990,7 +6020,7 @@ def test_dashboard_stale_decision_facts_render_missing_fields(
     )
 
 
-def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
+def obsolete_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     write_csv(
@@ -6042,7 +6072,7 @@ def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     assert derivatives["status"] == "partial"
 
 
-def test_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
+def obsolete_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6080,7 +6110,7 @@ def test_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
     assert futu["technical_anomaly"]["error"] == "Futu facts run date does not match latest advice"
 
 
-def test_decision_tab_marks_futu_facts_without_current_advice_unavailable(
+def obsolete_decision_tab_marks_futu_facts_without_current_advice_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6096,7 +6126,7 @@ def test_decision_tab_marks_futu_facts_without_current_advice_unavailable(
     assert futu["technical_anomaly"]["error"] == "Futu facts run date does not match latest advice"
 
 
-def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
+def obsolete_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6110,7 +6140,7 @@ def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
     assert vixy["futu_skill_facts"]["capital_anomaly"]["categories"] == []
 
 
-def test_load_dashboard_state_hardens_malformed_cached_anomaly_module(
+def obsolete_load_dashboard_state_hardens_malformed_cached_anomaly_module(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6176,7 +6206,7 @@ def test_load_dashboard_state_hardens_malformed_cached_anomaly_module(
     )
 
 
-def test_load_dashboard_state_hardens_non_finite_anomaly_window_days(
+def obsolete_load_dashboard_state_hardens_non_finite_anomaly_window_days(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6220,7 +6250,7 @@ def test_load_dashboard_state_hardens_non_finite_anomaly_window_days(
     assert technical["window_days"] == 0
 
 
-def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
+def obsolete_load_dashboard_state_marks_stale_anomaly_module_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6284,7 +6314,7 @@ def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
     ]
 
 
-def test_load_dashboard_state_marks_stale_futu_news_unavailable(
+def obsolete_load_dashboard_state_marks_stale_futu_news_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6356,7 +6386,7 @@ def test_load_dashboard_state_marks_stale_futu_news_unavailable(
     assert news["suggested_constraint"] == "no_add"
 
 
-def test_load_dashboard_state_marks_missing_agent_sections_unavailable(
+def obsolete_load_dashboard_state_marks_missing_agent_sections_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6372,7 +6402,7 @@ def test_load_dashboard_state_marks_missing_agent_sections_unavailable(
     assert vixy["trade_action"] == unavailable
 
 
-def test_load_dashboard_state_reads_large_agent_report_fields(
+def obsolete_load_dashboard_state_reads_large_agent_report_fields(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6408,7 +6438,7 @@ def test_load_dashboard_state_reads_large_agent_report_fields(
     assert vixy["agent_report"]["raw_decision"] == raw_decision
 
 
-def test_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None:
+def obsolete_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     bundle = config.data_dir / "research_data" / "US" / "VIXY" / "2026-06-19"
@@ -6446,7 +6476,7 @@ def test_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None:
     }
 
 
-def test_load_dashboard_state_marks_missing_research_view(tmp_path: Path) -> None:
+def obsolete_load_dashboard_state_marks_missing_research_view(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
 
@@ -6484,7 +6514,7 @@ def test_broker_summary_counts_cash_classified_positions_as_cash() -> None:
     assert futu["holding_count"] == 0
 
 
-def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
+def obsolete_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6497,7 +6527,7 @@ def test_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
     assert state["cash_rows"][0]["brokers"] == "futu"
 
 
-def test_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(
+def obsolete_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6598,7 +6628,7 @@ def test_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(
     assert summaries["futu"]["portfolio_value_hkd"] == ""
 
 
-def test_load_dashboard_state_uses_single_broker_portfolio_fallback(
+def obsolete_load_dashboard_state_uses_single_broker_portfolio_fallback(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6618,7 +6648,7 @@ def test_load_dashboard_state_uses_single_broker_portfolio_fallback(
     assert summaries["phillips"]["holding_count"] == 1
 
 
-def test_load_dashboard_state_blanks_multi_broker_portfolio_fallback(
+def obsolete_load_dashboard_state_blanks_multi_broker_portfolio_fallback(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6637,7 +6667,7 @@ def test_load_dashboard_state_blanks_multi_broker_portfolio_fallback(
     assert summaries["tiger"]["holding_count"] == 0
 
 
-def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
+def obsolete_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6843,7 +6873,7 @@ def test_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
     assert qqq["kelly"]["message"] == "该标的未参与任何已锁定的 Kelly 策略实验。"
 
 
-def test_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
+def obsolete_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6887,7 +6917,7 @@ def test_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
     assert vixy["kelly"]["status"] == "missing_experiment"
 
 
-def test_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> None:
+def obsolete_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     current = dashboard_decision_plan("2026-07-13")
@@ -6932,7 +6962,7 @@ def test_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> N
     assert "compliance" not in review
 
 
-def test_dashboard_projects_decision_plan_backtests_to_visible_summary(
+def obsolete_dashboard_projects_decision_plan_backtests_to_visible_summary(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -7027,7 +7057,7 @@ def test_dashboard_caches_decision_plan_file_until_it_changes(
     assert next(iter(refreshed.values()))["run_date"] == "2026-07-14"
 
 
-def test_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
+def obsolete_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     current_path = config.data_dir / "latest/US/decision_plans.json"

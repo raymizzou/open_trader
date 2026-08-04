@@ -5024,7 +5024,7 @@ console.log(JSON.stringify(accountHoldingGroups().map((group) => ({
 
 def test_dashboard_account_group_keeps_controller_values_when_quotes_conflict() -> None:
     output = run_dashboard_js(r'''
-state.dashboard = {holdings: [{instrument_id:"ins-qqq", market:"US", symbol:"QQQ", strategy:"趋势"}]};
+state.dashboard = {holding_enrichment: [{instrument_id:"ins-qqq", market:"US", symbol:"QQQ", strategy:"趋势"}]};
 state.accountSnapshot = {status:"healthy",stale:false,
   broker_summaries: [{broker:"tiger", portfolio_value_hkd:"99999"}],
   positions: [{
@@ -6754,7 +6754,7 @@ console.log(JSON.stringify({failed,aborted,unchanged,dashboard:state.dashboard,a
 
 def test_dashboard_stable_id_joins_only_unique_legacy_instrument_enrichment() -> None:
     output = run_dashboard_js(r'''
-state.dashboard = {holdings:[
+state.dashboard = {holding_enrichment:[
   {instrument_id:"ins-match",symbol:"QQQ",strategy:"唯一关联"},
   {instrument_id:"ins-duplicate",symbol:"QQQ",strategy:"不应关联"},
   {instrument_id:"ins-duplicate",symbol:"QQQ",strategy:"不应关联"},
@@ -9898,7 +9898,7 @@ def obsolete_dashboard_backtest_filter_limits_holdings_and_ignores_cash_view() -
     output = run_dashboard_js(
         r"""
 state.dashboard = {
-  holdings: [
+  holding_enrichment: [
     {
       market: "US",
       symbol: "READY",
@@ -9989,7 +9989,7 @@ def obsolete_dashboard_backtest_filter_buttons_show_current_scope_counts() -> No
     output = run_dashboard_js(
         r"""
 state.dashboard = {
-  holdings: [
+  holding_enrichment: [
     {
       market: "US",
       symbol: "READY",
@@ -11628,7 +11628,7 @@ elements["research-chat-context-note"] = { textContent: "" };
 elements["research-chat-context-list"] = { innerHTML: "" };
 elements["research-chat-input"] = { value: "", focus() {} };
 state.dashboard = {
-  holdings: [
+  holding_enrichment: [
     {
       market: "US",
       symbol: "AAA",
@@ -11650,11 +11650,11 @@ state.dashboard = {
 state.marketFilter = "ALL";
 state.brokerFilter = "ALL";
 postDashboardJson = () => new Promise(() => {});
-openResearchChat(holdingKey(state.dashboard.holdings[0]));
+openResearchChat(holdingKey(state.dashboard.holding_enrichment[0]));
 if (!state.researchChat.busy) {
   throw new Error("available chat should be busy while context request is pending");
 }
-await openResearchChat(holdingKey(state.dashboard.holdings[1]));
+await openResearchChat(holdingKey(state.dashboard.holding_enrichment[1]));
 if (state.researchChat.busy) {
   throw new Error("missing context chat should clear busy state");
 }
@@ -11769,7 +11769,7 @@ state.dashboard = {
     holding_weight_hkd: "162.00%",
     holding_count: 5,
   },
-  holdings: [
+  holding_enrichment: [
     {
       market: "HK",
       symbol: "00700",
@@ -12037,7 +12037,7 @@ state.dashboard = {
         {broker: "phillips", market: "HK", symbol: "00700", quantity: "100", cost_price: "150.00", last_price: "159.82", price_kind: "statement", market_value_hkd: "15982.00", account_weight_hkd: "2.00%", portfolio_weight_hkd: "3.25%", unrealized_pnl_pct: "2.00%"},
   ],
 };
-for (const holding of state.dashboard.holdings) holding.instrument_id = "ins-" + holding.market + "-" + holding.symbol;
+for (const holding of state.dashboard.holding_enrichment) holding.instrument_id = "ins-" + holding.market + "-" + holding.symbol;
 state.accountSnapshot = {
   status: "healthy", stale: false, summary: state.dashboard.summary,
   broker_summaries: state.dashboard.broker_summaries, cash_balances: state.dashboard.cash_details,
@@ -12149,12 +12149,12 @@ for (const retired of ['data-detail-mode="decision"', "TradingAgents", "交易�
 if (!elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
   throw new Error("active BUY_T/SELL_T signals should pulse the t signal button: " + elements["holdings-body"].innerHTML);
 }
-state.dashboard.holdings[1].t_signal.session_phase = "closed";
+state.dashboard.holding_enrichment[1].t_signal.session_phase = "closed";
 renderHoldings();
 if (elements["holdings-body"].innerHTML.includes("t-signal-button-active")) {
   throw new Error("non-regular t signals should not pulse the t signal button: " + elements["holdings-body"].innerHTML);
 }
-state.dashboard.holdings[1].t_signal.session_phase = "regular";
+state.dashboard.holding_enrichment[1].t_signal.session_phase = "regular";
 renderHoldings();
 const renderedHoldings = elements["holdings-body"].innerHTML;
 let renderedRowCount = 0;
@@ -12200,7 +12200,7 @@ for (const unexpected of ["小T", "大T", "状态机", ">session_phase<", "已�
     throw new Error("t signal detail should not render ambiguous wording " + unexpected);
   }
 }
-state.dashboard.holdings.push({
+state.dashboard.holding_enrichment.push({
   market: "JP",
   symbol: "7203",
   name: "Toyota",
@@ -12213,7 +12213,7 @@ state.dashboard.holdings.push({
   portfolio_weight_hkd: "1.50%",
   unrealized_pnl_pct: "0.00%",
 });
-state.dashboard.holdings.at(-1).instrument_id = "ins-JP-7203";
+state.dashboard.holding_enrichment.at(-1).instrument_id = "ins-JP-7203";
 state.accountSnapshot.positions.push({broker: "phillips", account_alias:"main", market: "JP", asset_class:"stock", symbol: "7203", name: "Toyota", quantity: "1", position_id:"pos-jp", instrument_id:"ins-JP-7203", cost_price: "3000", last_price: "300", price_kind: "statement", market_value_hkd: "300.00", account_weight_hkd: "0.25%", portfolio_weight_hkd: "1.50%", unrealized_pnl_pct: "0.00%"});
 state.selectedHoldingKey = "";
 selectBroker("phillips");
@@ -12720,29 +12720,25 @@ def test_build_dashboard_payload_returns_json_safe_state(tmp_path) -> None:
     payload = build_dashboard_payload(config)
 
     json.dumps(payload)
-    assert payload["summary"]["holding_count"] == 1
-    assert len(payload["holdings"]) == 1
-    assert payload["holdings"][0]["symbol"] == "VIXY"
+    assert "summary" not in payload
+    assert payload["holding_enrichment"] == []
 
 
-def test_build_quotes_payload_reads_published_quotes_file(tmp_path) -> None:
-    from open_trader.dashboard_web import build_quotes_payload
+def test_dashboard_server_removes_quotes_endpoint(tmp_path) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
 
     config = dashboard_config(tmp_path)
-    payload_path = config.data_dir / "latest" / "quotes.json"
-    seeded = {
-        "status": "ok",
-        "last_success_at": datetime.now().astimezone().isoformat(),
-        "stale": False,
-        "quotes": {"US.MSFT": {"last_price": "500"}},
-    }
-    payload_path.parent.mkdir(parents=True)
-    payload_path.write_text(json.dumps(seeded), encoding="utf-8")
-
-    payload = build_quotes_payload(config)
-
-    json.dumps(payload)
-    assert payload == seeded
+    server = create_dashboard_server(config, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        status, _, _ = read_text_error(f"http://{host}:{port}/api/quotes")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert status == 404
 
 
 def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> None:
@@ -12804,7 +12800,7 @@ def test_dashboard_server_runs_backtest_api_and_refreshes_payload(tmp_path) -> N
     assert payload["backtest"]["run_id"] == "2026-06-18-US-VIXY-trading-plan"
     assert payload["backtest"]["adapter"] == "backtrader"
     assert payload["backtest"]["metrics"]["trade_count"] == "2"
-    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in dashboard_payload["holding_enrichment"] if row["symbol"] == "VIXY")
     assert "backtest" not in vixy
     assert "backtest_readiness" not in vixy
 
@@ -13133,7 +13129,7 @@ def test_dashboard_server_runs_sell_side_backtest_from_current_position(tmp_path
     assert payload["backtest"]["metrics"]["trade_count"] == "1"
     assert payload["backtest"]["trades"][0]["side"] == "SELL"
     assert payload["backtest"]["trades"][0]["reason"] == "target_1"
-    vixy = next(row for row in dashboard_payload["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in dashboard_payload["holding_enrichment"] if row["symbol"] == "VIXY")
     assert "backtest" not in vixy
     assert "backtest_readiness" not in vixy
 
@@ -13402,16 +13398,16 @@ def test_dashboard_server_projects_accepted_files_without_side_effects(
     try:
         host, port = server.server_address
         dashboard_payload = read_json(f"http://{host}:{port}/api/dashboard")
-        quotes_payload = read_json(f"http://{host}:{port}/api/quotes")
+        quotes_status, _, _ = read_text_error(f"http://{host}:{port}/api/quotes")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert dashboard_payload["account_sync"]["status"] == "ok"
-    assert len(dashboard_payload["broker_positions"]) == 14
-    assert quotes_payload == seeded_quotes_payload
+    assert "account_sync" not in dashboard_payload
+    assert "broker_positions" not in dashboard_payload
+    assert quotes_status == 404
     assert {
         path: (path.read_bytes(), path.stat().st_mtime_ns) for path in accepted_paths
     } == before
@@ -13434,7 +13430,6 @@ def test_dashboard_http_loads_only_requested_simulated_account(tmp_path) -> None
     host, port = server.server_address
     try:
         read_json(f"http://{host}:{port}/api/dashboard")
-        read_json(f"http://{host}:{port}/api/quotes")
         assert calls == []
         status, _, _ = read_text_error(
             f"http://{host}:{port}/api/trend-simulate-positions/tiger/positions"
@@ -13826,7 +13821,7 @@ def test_dashboard_server_returns_json_error_for_bad_research_chat_create_body(
     assert payload["status"] == "error"
     assert payload["error_type"] == error_type
     assert payload["message"] == expected_message
-    assert dashboard_payload["summary"]["holding_count"] == 1
+    assert "summary" not in dashboard_payload
 
 
 def test_dashboard_server_returns_404_for_invalid_research_chat_get_subroute(
@@ -13939,7 +13934,7 @@ def test_dashboard_server_returns_json_500_when_research_chat_service_raises(
     }
 
 
-def test_dashboard_server_projects_unknown_when_quotes_file_is_missing(
+def test_dashboard_server_returns_404_when_quotes_file_is_missing(
     tmp_path,
 ) -> None:
     from open_trader.dashboard_web import create_dashboard_server
@@ -13956,19 +13951,14 @@ def test_dashboard_server_projects_unknown_when_quotes_file_is_missing(
 
     try:
         host, port = server.server_address
-        payload = read_json(f"http://{host}:{port}/api/quotes")
+        status, _, _ = read_text_error(f"http://{host}:{port}/api/quotes")
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    assert payload == {
-        "status": "unknown",
-        "last_success_at": "",
-        "stale": False,
-        "quotes": {},
-    }
+    assert status == 404
 
 
 def test_dashboard_server_returns_json_500_when_dashboard_payload_raises(
