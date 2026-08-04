@@ -69,7 +69,7 @@ def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -
     registry = "open_trader.prediction_arbitrage_acceptance"
     assert registry in makefile
     assert makefile.index(registry) < makefile.index("open_trader.dashboard_acceptance")
-    assert '--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json"' in makefile
+    assert '--config "$(REPOSITORY_ROOT)/config/prediction_arbitrage.json"' in makefile
 
 
 @pytest.mark.parametrize(("result", "available"), (("PASS", True), ("BLOCKED", False)))

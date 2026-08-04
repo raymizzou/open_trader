@@ -32,7 +32,7 @@ else
 	PYTHONPATH=src "$(PYTHON_BIN)" -m open_trader.prediction_arbitrage_acceptance \
 		--url "$(DASHBOARD_URL)" \
 		--expected-root "$(WORKTREE_ROOT)" \
-		--config "$(WORKTREE_ROOT)/config/prediction_arbitrage.json" || status=$$?; \
+		--config "$(REPOSITORY_ROOT)/config/prediction_arbitrage.json" || status=$$?; \
 	if [ $$status -eq 2 ]; then echo BLOCKED; exit 2; fi; \
 	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
 endif
