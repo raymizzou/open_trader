@@ -656,8 +656,16 @@ def _runtime_metadata() -> dict[str, object]:
         api_git_sha = subprocess.check_output(
             ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
         ).strip()
+        source_status = subprocess.check_output(
+            [
+                "git", "-C", str(cwd), "status", "--porcelain",
+                "--untracked-files=all", "--", "src/open_trader",
+            ],
+            text=True,
+        ).strip()
     except (OSError, subprocess.CalledProcessError):
         api_git_sha = ""
+        source_status = "unavailable"
     if _GIT_SHA_RE.fullmatch(api_git_sha) is None:
         api_git_sha = ""
     return {
@@ -665,4 +673,6 @@ def _runtime_metadata() -> dict[str, object]:
         "started_at": datetime.now().astimezone().isoformat(),
         "cwd": str(cwd),
         "api_git_sha": api_git_sha,
+        "git_sha": api_git_sha,
+        "source_state": "clean" if not source_status else "dirty",
     }

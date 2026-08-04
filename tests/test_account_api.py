@@ -360,6 +360,29 @@ def test_account_api_cli_uses_data_dir_and_mode(
     assert observed == [(data_dir, "shadow"), (data_dir, "production")]
 
 
+def test_account_api_runtime_metadata_proves_clean_candidate_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        account_api.subprocess,
+        "check_output",
+        lambda command, **_kwargs: SHA if "rev-parse" in command else "",
+    )
+
+    metadata = account_api._runtime_metadata()
+    started_at = metadata.pop("started_at")
+
+    assert datetime.fromisoformat(str(started_at)).tzinfo is not None
+    assert metadata == {
+        "pid": os.getpid(),
+        "cwd": str(tmp_path.resolve()),
+        "api_git_sha": SHA,
+        "git_sha": SHA,
+        "source_state": "clean",
+    }
+
+
 @pytest.mark.parametrize("mode", ["shadow", "production"])
 def test_account_api_allows_direct_snapshot_requests_in_both_modes(
     tmp_path: Path, mode: str
