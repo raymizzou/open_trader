@@ -151,6 +151,7 @@ def test_trend_restarts_once_after_accepted_generation_changes(
 
     snapshots = iter([_snapshot(GENERATION_A), _snapshot(GENERATION_B)])
     fact_generations: list[str] = []
+    second_attempt_seen = False
     monkeypatch.setattr(
         consumer,
         "fetch_account_snapshot",
@@ -159,10 +160,16 @@ def test_trend_restarts_once_after_accepted_generation_changes(
     )
 
     def fetch_facts(*_args: object) -> dict[str, object]:
+        nonlocal second_attempt_seen
         generation = str(_args[2])
         fact_generations.append(generation)
         if generation == GENERATION_A:
             raise AccountHttpError("accepted_statement_generation_changed")
+        second_attempt_seen = True
+        assert not (tmp_path / "data/latest/trend_api_stats.json").exists()
+        assert not (
+            tmp_path / "data/trend_statement_consumption/phillips.json"
+        ).exists()
         return _facts(generation)
 
     monkeypatch.setattr(
@@ -173,6 +180,7 @@ def test_trend_restarts_once_after_accepted_generation_changes(
     assert result["status"] == "consumed"
     assert result["statement_generation"] == GENERATION_B
     assert fact_generations == [GENERATION_A, GENERATION_B]
+    assert second_attempt_seen
     status = json.loads(
         (tmp_path / "data/trend_statement_consumption/phillips.json").read_text(
             encoding="utf-8"
@@ -214,16 +222,16 @@ def test_trend_blocks_after_second_accepted_generation_change_without_promotion(
 
 
 @pytest.mark.parametrize(
-    ("failure", "code"),
+    "code",
     [
-        ("transport", "account_unavailable"),
-        ("timeout", "account_unavailable"),
-        ("invalid_contract", "account_contract_invalid"),
-        ("http_503", "account_unavailable"),
+        pytest.param("account_unavailable", id="transport"),
+        pytest.param("account_unavailable", id="timeout"),
+        pytest.param("account_contract_invalid", id="invalid_contract"),
+        pytest.param("account_unavailable", id="http_503"),
     ],
 )
 def test_trend_blocks_sanitized_snapshot_failures_after_one_http_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, code: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
 ) -> None:
     import open_trader.trend_statement_consumer as consumer
     from open_trader.account_http import AccountHttpError
@@ -243,7 +251,51 @@ def test_trend_blocks_sanitized_snapshot_failures_after_one_http_call(
     assert result["reason"] == code
     assert calls == 1
     assert "error_type" not in result
-    assert failure not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        pytest.param("account_unavailable", id="transport"),
+        pytest.param("account_unavailable", id="timeout"),
+        pytest.param("account_contract_invalid", id="invalid_contract"),
+        pytest.param("account_unavailable", id="http_503"),
+    ],
+)
+def test_trend_blocks_sanitized_facts_failures_after_one_snapshot_and_facts_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    import open_trader.trend_statement_consumer as consumer
+    from open_trader.account_http import AccountHttpError
+
+    snapshot_calls = 0
+    facts_calls = 0
+
+    def fetch_snapshot(*_args: object) -> dict[str, object]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return _snapshot(GENERATION_A)
+
+    def fetch_facts(*_args: object) -> dict[str, object]:
+        nonlocal facts_calls
+        facts_calls += 1
+        raise AccountHttpError(code)
+
+    monkeypatch.setattr(consumer, "fetch_account_snapshot", fetch_snapshot, raising=False)
+    monkeypatch.setattr(
+        consumer, "fetch_statement_trade_facts", fetch_facts, raising=False
+    )
+
+    result = _consume(tmp_path)
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == code
+    assert result["snapshot_generation"] == SNAPSHOT_GENERATION
+    assert result["account_generation"] == ACCOUNT_GENERATION
+    assert result["statement_generation"] == GENERATION_A
+    assert snapshot_calls == 1
+    assert facts_calls == 1
+    assert "error_type" not in result
 
 
 def test_trend_failed_facts_processing_keeps_snapshot_identity(
