@@ -2,7 +2,7 @@
 
 WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
-PYTHON_BIN ?= $(if $(OPEN_TRADER_PYTHON),$(OPEN_TRADER_PYTHON),$(WORKTREE_ROOT)/.venv/bin/python)
+PYTHON_BIN ?= $(if $(OPEN_TRADER_PYTHON),$(OPEN_TRADER_PYTHON),$(REPOSITORY_ROOT)/.venv/bin/python)
 
 DASHBOARD_URL ?= http://127.0.0.1:8766
 DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log

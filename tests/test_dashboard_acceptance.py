@@ -7253,7 +7253,10 @@ def test_account_snapshot_refresh_rejects_unchanged_publication() -> None:
 def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
 
-    assert "PYTHON_BIN ?=" in makefile
+    assert (
+        "PYTHON_BIN ?= $(if $(OPEN_TRADER_PYTHON),$(OPEN_TRADER_PYTHON),"
+        "$(REPOSITORY_ROOT)/.venv/bin/python)"
+    ) in makefile
     assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' in makefile
 
 
