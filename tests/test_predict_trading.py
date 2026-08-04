@@ -70,6 +70,7 @@ class FakeBuilder:
             receipt={"status": 1, "transactionHash": bytes.fromhex("12" * 32)},
             cause=None,
         )
+        self.set_approval_error: Exception | None = None
         self.allowance_after_approve = None
         self.allowance_after_clear = None
         self.approval_gas_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
@@ -138,6 +139,8 @@ class FakeBuilder:
 
     def set_approval(self, step: object, *, approved: bool = True, amount: int = 0) -> object:
         self.set_approval_calls.append((step, approved, amount if approved else None))
+        if self.set_approval_error is not None:
+            raise self.set_approval_error
         if approved and self.allowance_after_approve is not None:
             self.allowance_value = self.allowance_after_approve
         if not approved and self.allowance_after_clear is not None:
@@ -691,6 +694,62 @@ def test_set_exact_buy_allowance_uses_sdk_set_approval_and_proves_exact_post_rea
     assert not any(str(key).startswith("_") for key in result)
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
     assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
+
+
+def test_set_exact_buy_allowance_marks_builder_exception_as_possible_mutation() -> None:
+    client, _ = make_client(response_for)
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+    client._builder.set_approval_error = RuntimeError("transport-sentinel")  # type: ignore[attr-defined]
+
+    result = client.set_exact_buy_allowance("896", 2_400_000)
+
+    assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
+    assert result["success"] is False
+    assert result["error_code"] == "receipt_ambiguous"
+    assert result["possible_mutation"] is True
+    assert "transport-sentinel" not in json.dumps(result, default=str)
+
+
+def test_set_exact_buy_allowance_marks_unverifiable_post_read_as_possible_mutation() -> None:
+    client, _ = make_client(response_for)
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+    client._builder.allowance_after_approve = ValueError("rpc-sentinel")  # type: ignore[attr-defined]
+
+    result = client.set_exact_buy_allowance("896", 2_400_000)
+
+    assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
+    assert result["success"] is False
+    assert result["error_code"] == "receipt_ambiguous"
+    assert result["possible_mutation"] is True
+    assert "rpc-sentinel" not in json.dumps(result, default=str)
+
+
+@pytest.mark.parametrize(
+    ("set_result", "post_allowance", "possible_mutation"),
+    [
+        (SimpleNamespace(success=False, receipt=None, cause=None), 0, True),
+        (SimpleNamespace(success=False, receipt={"status": "unknown"}, cause=None), 0, True),
+        (SimpleNamespace(success=False, receipt={"transactionHash": "0xambiguous"}, cause=None), 0, True),
+        (SimpleNamespace(success=False, receipt={"status": 1, "transactionHash": "0xsubmitted"}, cause=None), 0, True),
+        (SimpleNamespace(success=False, receipt={"status": 0, "transactionHash": "0xfailed"}, cause=None), 0, False),
+        (SimpleNamespace(success=False, receipt={"status": 0, "transactionHash": "0xfailed"}, cause=None), 1, True),
+    ],
+)
+def test_set_exact_buy_allowance_only_clears_possible_mutation_for_proven_zero_failed_receipt(
+    set_result: object,
+    post_allowance: int,
+    possible_mutation: bool,
+) -> None:
+    client, _ = make_client(response_for)
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+    client._builder.allowance_after_approve = post_allowance  # type: ignore[attr-defined]
+    client._builder.next_set_approval_result = set_result  # type: ignore[attr-defined]
+
+    result = client.set_exact_buy_allowance("896", 2_400_000)
+
+    assert len(client._builder.set_approval_calls) == 1  # type: ignore[attr-defined]
+    assert result["success"] is False
+    assert result["possible_mutation"] is possible_mutation
 
 
 def test_clear_buy_allowance_uses_sdk_revoke_and_proves_zero_post_read() -> None:

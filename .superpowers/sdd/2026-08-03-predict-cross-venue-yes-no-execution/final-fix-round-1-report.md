@@ -195,3 +195,140 @@ PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" .venv/bin/python -m open_trader pred
 - The existing `websockets.legacy` dependency deprecation warning appeared throughout and was intentionally not addressed per scope.
 - No Dashboard source or test was changed; its complete projection suite was run because the public Predict balance/allowance fields changed semantics.
 - No acceptance, deployment, merge, push, screenshot, notification, order submission, approval, transfer, redemption, or other live mutation was performed.
+
+---
+
+# Final whole-branch fix round 2/5
+
+Date: 2026-08-04
+
+Phase: implementation and final verification complete with no blocker; this report is included in the pending round-2 commit.
+
+## Result
+
+Addressed exactly the three open Important findings:
+
+- A. Canary graduation now consumes the real adapter shapes: Predict direct order/trade refs and Polymarket direct `matched_refs`. Each venue must prove its identity, verified order and trade refs, agreeing actual/proof fee, and `filled_quantity == position_quantity == exact intent quantity`. Dust, residual, and remediation holdings cannot graduate because only the exact full two-leg path supplies the expected quantity. Polymarket reconciliation derives `actual_fee` and proof `fee` only from independently matched `TAKER` trade rows with validated size, price, and fee rate. It uses the documented `C * feeRate * p * (1-p)` fee curve (`https://docs.polymarket.com/trading/fees`); missing or malformed fee evidence leaves those fields absent and therefore retains the 5-USDT canary cap. It never substitutes `maximum_fee` for actual fee.
+- B. The reversible Predict SDK guard now covers installed `convert_positions(_async)` and `run_approvals(_async)` surfaces in addition to inherited cancel, merge, redeem, split, and set prefixes. Existing make/build/sign/check/balance/get/validate and signed-no-submit reads remain allowed.
+- C. Once `builder.set_approval` starts, an exception, ambiguous/malformed/unknown receipt, non-conclusive transaction status, allowance mismatch, or failed post-read returns `possible_mutation=true`. Only pre-call rejection or status-0 failure with independently re-read initial-zero/post-zero allowance is conclusively non-mutating. The execution service opens the breaker/incident, retains the reservation, and submits neither venue for possible mutation.
+
+Installed `predict_sdk.order_builder.OrderBuilder` public mutation surface inspected in the pinned environment:
+
+- `cancel_orders`, `cancel_orders_async`
+- `convert_positions`, `convert_positions_async`
+- `merge_positions`, `merge_positions_async`
+- `redeem_positions`, `redeem_positions_async`
+- `run_approvals`, `run_approvals_async`
+- `set_approval`, `set_approval_async`, `set_approvals`, `set_approvals_async`
+- `set_ctf_exchange_allowance`, `set_ctf_exchange_allowance_async`
+- `set_ctf_exchange_approval`, `set_ctf_exchange_approval_async`
+- `set_neg_risk_adapter_approval`, `set_neg_risk_adapter_approval_async`
+- `split_positions`, `split_positions_async`
+
+## TDD red/green evidence
+
+### Real canary proof and Polymarket fee evidence
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_polymarket_trading.py::test_cross_leg_reconciliation_uses_order_trade_and_position_proof tests/test_polymarket_trading.py::test_cross_leg_reconciliation_does_not_invent_actual_fee_without_trade_fee_evidence tests/test_prediction_arbitrage_execution.py::test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verified 'tests/test_prediction_arbitrage_execution.py::test_cross_canary_cap_stays_five_after_non_graduating_outcomes[equal_but_below_expected_quantity-<lambda>]' 'tests/test_prediction_arbitrage_execution.py::test_cross_canary_cap_stays_five_after_non_graduating_outcomes[fee_disagreement-<lambda>]'
+```
+
+- Red: 3 failed, 2 passed, 1 warning in 1.75s. Failures exposed absent real Polymarket fee, rejection of direct adapter `matched_refs`, and acceptance of disagreeing fees.
+- Green: 5 passed, 1 warning in 0.97s.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_polymarket_trading.py::test_cross_leg_reconciliation_does_not_invent_actual_fee_without_trade_fee_evidence
+```
+
+- Red: 1 failed, 1 warning in 1.24s when fee rate/price existed but the matched row did not prove the account was the taker.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_polymarket_trading.py::test_cross_leg_reconciliation_uses_order_trade_and_position_proof tests/test_polymarket_trading.py::test_cross_leg_reconciliation_does_not_invent_actual_fee_without_trade_fee_evidence
+```
+
+- Green: 2 passed, 1 warning in 0.93s.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_prediction_arbitrage_execution.py::test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verified tests/test_prediction_arbitrage_execution.py::test_cross_canary_requires_each_adapter_quantity_to_equal_the_exact_intent tests/test_prediction_arbitrage_execution.py::test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limit tests/test_prediction_arbitrage_execution.py::test_cross_remediation_completes_from_fresh_bound_option_within_limit tests/test_prediction_arbitrage_execution.py::test_cross_venue_reconciliation_contains_independent_outcomes
+```
+
+- Green boundary sweep: 15 passed, 1 warning in 1.37s. This includes all four per-venue fill/position inequalities plus dust and remediation non-graduation.
+
+### Installed Predict SDK mutation guard
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q 'tests/test_prediction_arbitrage_acceptance.py::test_predict_guard_blocks_client_and_nested_builder_mutations_without_real_call[builder-convert_positions]' 'tests/test_prediction_arbitrage_acceptance.py::test_predict_guard_blocks_client_and_nested_builder_mutations_without_real_call[builder-convert_positions_async]' 'tests/test_prediction_arbitrage_acceptance.py::test_predict_guard_blocks_client_and_nested_builder_mutations_without_real_call[builder-run_approvals]' 'tests/test_prediction_arbitrage_acceptance.py::test_predict_guard_blocks_client_and_nested_builder_mutations_without_real_call[builder-run_approvals_async]'
+```
+
+- Red: 4 failed, 1 warning in 0.74s; readiness incorrectly passed and the underlying sentinels ran.
+- Green: 4 passed, 1 warning in 0.43s; each case records one blocked mutation attempt, zero real calls, and restores the original nested builder.
+- The complete parametrization also covers installed cancel/merge/redeem/split/set variants plus existing nested transfer/redemption and direct client submit attempts.
+
+### Ambiguous exact approval
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py::test_set_exact_buy_allowance_marks_builder_exception_as_possible_mutation tests/test_predict_trading.py::test_set_exact_buy_allowance_only_clears_possible_mutation_for_proven_zero_failed_receipt tests/test_prediction_arbitrage_execution.py::test_cross_ambiguous_exact_approval_holds_reservation_and_opens_incident_without_submit
+```
+
+- Red: 8 failed, 1 warning in 1.22s.
+- Green: 8 passed, 1 warning in 0.75s.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py::test_set_exact_buy_allowance_marks_unverifiable_post_read_as_possible_mutation
+```
+
+- Red: 1 failed, 1 warning in 0.49s because a non-`RuntimeError` RPC post-read failure escaped the adapter.
+- Green: 1 passed, 1 warning in 0.42s; the result is redacted and marked possible mutation after exactly one SDK approval call.
+
+## Complete affected verification
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && pytest -q tests/test_predict_trading.py tests/test_predict_cross_venue.py tests/test_polymarket_trading.py tests/test_prediction_arbitrage_execution.py tests/test_prediction_arbitrage_acceptance.py
+```
+
+- Final rerun: 485 passed, 1 warning in 6.49s.
+- `tests/test_dashboard_web.py` was not run in round 2 because no Dashboard projection or public account field changed.
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && python -m compileall -q src/open_trader/predict_trading.py src/open_trader/polymarket_trading.py src/open_trader/prediction_arbitrage_execution.py src/open_trader/prediction_arbitrage_acceptance.py && git diff --check
+```
+
+- Exit code: 0 with no output.
+
+## Direct no-submit readiness
+
+```bash
+source /Users/ray/projects/open_trader/.venv/bin/activate && PYTHONSAFEPATH=1 PYTHONPATH="$PWD:$PWD/src" python -m open_trader prediction-arb preflight --no-submit --config config/prediction_arbitrage.json
+```
+
+- Exit code: 0
+- Result: PASS
+- `sdk_version: 0.2.0`
+- `signer_match: yes`
+- `wallet_match: yes`
+- `geoblock: allowed`
+- `account_reads: pass`
+- `fok_pair_signed_not_submitted: pass`
+- `equal_requested_shares: pass`
+- `merge_capability: present_not_invoked`
+- `relayer_readiness: pass`
+- `secret_scan: pass`
+
+## Changed files in round 2
+
+- `src/open_trader/polymarket_trading.py`
+- `src/open_trader/predict_trading.py`
+- `src/open_trader/prediction_arbitrage_acceptance.py`
+- `src/open_trader/prediction_arbitrage_execution.py`
+- `tests/test_polymarket_trading.py`
+- `tests/test_predict_trading.py`
+- `tests/test_prediction_arbitrage_acceptance.py`
+- `tests/test_prediction_arbitrage_execution.py`
+- `.superpowers/sdd/2026-08-03-predict-cross-venue-yes-no-execution/final-fix-round-1-report.md`
+
+## Final review and concerns
+
+- Standards review: no documented-standard violation or material code smell found. The changes extend existing adapters, guard proxy, execution state machine, and evidence rather than adding a parallel subsystem.
+- Specification review: all three round-2 findings are covered; no acceptance, deployment, merge, push, screenshot, live notification, approval, order, transfer, redemption, or other live mutation was performed.
+- Missing or malformed Polymarket taker-fee evidence deliberately keeps a successfully reconciled holding at the 5-USDT canary cap; it does not make the holding itself unverified.
+- The existing `websockets.legacy` deprecation warning remains and was intentionally not addressed per scope.

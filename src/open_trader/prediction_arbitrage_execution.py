@@ -1971,6 +1971,7 @@ class PredictionExecutionService:
                 execution_id,
                 positions=positions,
                 reconciled=reconciled,
+                expected_quantity=expected,
                 predict_market_id=predict_leg.market_id,
             )
             return
@@ -2115,8 +2116,10 @@ class PredictionExecutionService:
             result = _call(method, market_id, exact_debit_wei)
         except Exception:
             return None, False
-        if not isinstance(result, Mapping) or str(result.get("status", "")).lower() != "confirmed":
-            return None, False
+        if not isinstance(result, Mapping):
+            return None, True
+        if str(result.get("status", "")).lower() != "confirmed":
+            return None, result.get("possible_mutation") is True
         snapshot = self._fresh_predict_account_snapshot()
         expected = Decimal(exact_debit_wei) / Decimal("1000000")
         if (
@@ -2244,6 +2247,7 @@ class PredictionExecutionService:
         unhedged_units: Decimal | None = None,
         worst_case_loss: Decimal | None = None,
         remediation_worst_case_loss: Decimal | None = None,
+        expected_quantity: Decimal | None = None,
         predict_market_id: str = "",
     ) -> None:
         cleanup = self._clear_predict_allowance_zero(predict_market_id)
@@ -2290,7 +2294,10 @@ class PredictionExecutionService:
             cleanup.get("zero_verified") is True
             and established
             and baseline is not None
-            and self._cross_canary_reconciliation_verified(reconciled)
+            and expected_quantity is not None
+            and self._cross_canary_reconciliation_verified(
+                reconciled, expected_quantity
+            )
         ):
             fingerprint = self._predict_canary_fingerprint()
             if fingerprint is not None:
@@ -2300,23 +2307,26 @@ class PredictionExecutionService:
 
     @staticmethod
     def _cross_canary_reconciliation_verified(
-        reconciled: Mapping[str, Mapping[str, object]]
+        reconciled: Mapping[str, Mapping[str, object]], expected_quantity: Decimal
     ) -> bool:
-        if set(reconciled) != {"predict.fun", "polymarket"}:
+        if (
+            set(reconciled) != {"predict.fun", "polymarket"}
+            or expected_quantity <= 0
+        ):
             return False
         for venue, value in reconciled.items():
             if value.get("verified") is not True:
                 return False
             filled = _decimal(value.get("filled_quantity"))
             position = _decimal(value.get("position_quantity"))
-            if filled is None or position is None or filled <= 0 or position <= 0:
+            if filled != expected_quantity or position != expected_quantity:
                 return False
             fee = _decimal(value.get("actual_fee"))
             proof = value.get("execution_proof")
             if not isinstance(proof, Mapping) or proof.get("verified") is not True:
                 return False
             proof_fee = _decimal(proof.get("fee", proof.get("actual_fee")))
-            if fee is None and proof_fee is None:
+            if fee is None or proof_fee is None or fee != proof_fee:
                 return False
             if not PredictionExecutionService._proof_has_order_refs(proof, venue):
                 return False
@@ -2333,23 +2343,9 @@ class PredictionExecutionService:
         matched = proof.get("matched_refs")
         if not isinstance(matched, Mapping):
             return False
-        candidate = matched.get(venue)
-        if not isinstance(candidate, Mapping):
-            return False
-        if PredictionExecutionService._has_order_trade_refs(
-            candidate.get("order_ids"),
-            candidate.get("trade_ids"),
-        ):
-            return True
-        for nested in candidate.values():
-            if not isinstance(nested, Mapping):
-                continue
-            if PredictionExecutionService._has_order_trade_refs(
-                nested.get("order_ids"),
-                nested.get("trade_ids"),
-            ):
-                return True
-        return False
+        return PredictionExecutionService._has_order_trade_refs(
+            matched.get("order_ids"), matched.get("trade_ids")
+        )
 
     @staticmethod
     def _has_order_trade_refs(orders: object, trades: object) -> bool:

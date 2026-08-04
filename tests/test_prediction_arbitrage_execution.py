@@ -1219,9 +1219,11 @@ class CrossPolymarketTrading(FakeTrading):
             }
         proof: dict[str, object] = {"verified": True, "venue": "polymarket"}
         if not self.omit_canary_order_proof:
-            proof.update({"order_ids": [result.order_id], "trade_ids": list(result.trade_ids)})
-        if not self.omit_canary_fee_proof:
-            proof["fee"] = leg.maximum_fee
+            proof["matched_refs"] = {
+                "token_id": leg.token_id,
+                "order_ids": [result.order_id],
+                "trade_ids": list(result.trade_ids),
+            }
         result_payload = {
             "status": "verified", "verified": True,
             "filled_quantity": result.filled_quantity,
@@ -1229,8 +1231,6 @@ class CrossPolymarketTrading(FakeTrading):
             "minimum_order_size": leg.minimum_order_size,
             "execution_proof": proof,
         }
-        if not self.omit_canary_fee_proof:
-            result_payload["actual_fee"] = leg.maximum_fee
         return result_payload
 
     def cross_remediation_option(self, **kwargs: object) -> dict[str, object]:
@@ -1601,9 +1601,16 @@ def test_cross_refreshed_preflight_failure_clears_without_submit_or_retry(
 def test_cross_exact_approval_failure_posts_neither_venue(
     tmp_path: Path,
 ) -> None:
-    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
     predict.approval_results.append(
-        {"status": "rejected", "market_id": "predict-market", "allowance": "0"}
+        {
+            "status": "failed",
+            "error_code": "receipt_failed",
+            "possible_mutation": False,
+            "market_id": "predict-market",
+            "allowance": "0",
+            "allowance_raw": "0",
+        }
     )
 
     _accepted, final = _cross_execution(service, idempotency_key="cross-approval-fails")
@@ -1613,6 +1620,38 @@ def test_cross_exact_approval_failure_posts_neither_venue(
     assert predict.approval_calls == [("predict-market", 2_300_000)]
     assert predict.clear_calls == []
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_ambiguous_exact_approval_holds_reservation_and_opens_incident_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {
+            "status": "failed",
+            "error_code": "receipt_ambiguous",
+            "possible_mutation": True,
+            "market_id": "predict-market",
+            "allowance": "0",
+            "allowance_raw": "0",
+        }
+    )
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-ambiguous"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert service._cross_breaker_open is True
+    assert predict.approval_calls == [("predict-market", 2_300_000)]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert incidents[0]["reason"] == "predict_allowance_approval_unverified"
 
 
 def test_cross_post_approval_refresh_breach_clears_allowance_without_submit(
@@ -1987,9 +2026,12 @@ def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verif
             "execution_proof": {
                 "verified": True,
                 "venue": "polymarket",
-                "order_ids": ["poly-order"],
-                "trade_ids": ["poly-trade"],
                 "fee": Decimal("0.05"),
+                "matched_refs": {
+                    "token_id": "poly-no",
+                    "order_ids": ["poly-order"],
+                    "trade_ids": ["poly-trade"],
+                },
             },
         }
     )
@@ -2006,6 +2048,56 @@ def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verif
     assert changed["policy_limits"]["max_normal_cost"] == "5"
     assert cross.max_normal_cost_requests[:2] == [Decimal("5"), Decimal("5")]
     assert cross.max_normal_cost_requests[-2:] == [Decimal("20"), Decimal("5")]
+
+
+@pytest.mark.parametrize(
+    ("venue", "field"),
+    (
+        ("predict.fun", "filled_quantity"),
+        ("predict.fun", "position_quantity"),
+        ("polymarket", "filled_quantity"),
+        ("polymarket", "position_quantity"),
+    ),
+)
+def test_cross_canary_requires_each_adapter_quantity_to_equal_the_exact_intent(
+    venue: str, field: str,
+) -> None:
+    reconciled: dict[str, dict[str, object]] = {
+        "predict.fun": {
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.05"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "predict.fun",
+                "order_ids": ["predict-order"],
+                "trade_ids": ["predict-trade"],
+                "fee": Decimal("0.05"),
+            },
+        },
+        "polymarket": {
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.02496"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "polymarket",
+                "matched_refs": {
+                    "token_id": "poly-no",
+                    "order_ids": ["poly-order"],
+                    "trade_ids": ["poly-trade"],
+                },
+                "fee": Decimal("0.02496"),
+            },
+        },
+    }
+    reconciled[venue][field] = Decimal("4.9")
+
+    assert PredictionExecutionService._cross_canary_reconciliation_verified(
+        reconciled, Decimal("5")
+    ) is False
 
 
 @pytest.mark.parametrize(
@@ -2042,6 +2134,14 @@ def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verif
         (
             "partial_reconciliation",
             lambda _trading, _cross, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "actual_fee": Decimal("0.05"), "execution_proof": {"verified": True, "venue": "predict.fun", "order_ids": ["predict-order"], "trade_ids": ["predict-trade"], "fee": Decimal("0.05")}}),
+        ),
+        (
+            "equal_but_below_expected_quantity",
+            lambda _trading, _cross, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("4.9"), "position_quantity": Decimal("4.9"), "minimum_order_size": Decimal("1"), "actual_fee": Decimal("0.05"), "execution_proof": {"verified": True, "venue": "predict.fun", "order_ids": ["predict-order"], "trade_ids": ["predict-trade"], "fee": Decimal("0.05")}}),
+        ),
+        (
+            "fee_disagreement",
+            lambda _trading, _cross, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("5"), "actual_fee": Decimal("0.04"), "execution_proof": {"verified": True, "venue": "predict.fun", "order_ids": ["predict-order"], "trade_ids": ["predict-trade"], "fee": Decimal("0.05")}}),
         ),
         (
             "missing_fee_proof",
@@ -2250,6 +2350,7 @@ def test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limi
     assert final["state"] == "holding_to_resolution"
     assert predict.submit_calls == 2
     assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.10"
+    assert final["evidence"][-1].get("canary_verified") is not True
 
 
 def test_cross_venue_never_completes_an_opposite_partial_fill(
@@ -2433,6 +2534,7 @@ def test_cross_remediation_completes_from_fresh_bound_option_within_limit(
     assert trading.cross_submit_calls == 2
     assert trading.cross_submitted_legs[-1].max_cost == Decimal("0.95")
     assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.10"
+    assert final["evidence"][-1].get("canary_verified") is not True
 
 
 @pytest.mark.parametrize("option_state", ("stale", "missing", "over_limit"))
@@ -2660,6 +2762,7 @@ def test_cross_venue_reconciliation_contains_independent_outcomes(
         assert evidence["worst_case_loss"] == "0.1"
         assert evidence["reconciliation"]["predict.fun"]["minimum_order_size"] == "1"
         assert evidence["reconciliation"]["polymarket"]["minimum_order_size"] == "1"
+        assert evidence.get("canary_verified") is not True
 
 
 def test_cross_preview_is_server_owned_without_expires_at_or_countdown(

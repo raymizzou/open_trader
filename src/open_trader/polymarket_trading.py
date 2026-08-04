@@ -1715,6 +1715,9 @@ class PolymarketTradingClient:
                 "position_quantity": position_quantity,
                 "execution_proof": {"verified": True, "venue": "polymarket", **proof},
             }
+            actual_fee = proof.get("fee")
+            if isinstance(actual_fee, Decimal) and actual_fee >= 0:
+                reconciled["actual_fee"] = actual_fee
             if minimum_order_size is not None and minimum_order_size > 0:
                 reconciled["minimum_order_size"] = minimum_order_size
             return reconciled
@@ -1974,6 +1977,8 @@ class PolymarketTradingClient:
             }
         since_utc = since.astimezone(UTC) if since.tzinfo else since.replace(tzinfo=UTC)
         quantity = Decimal("0")
+        actual_fee = Decimal("0")
+        fees_verified = True
         seen: set[tuple[str, str]] = set()
         try:
             trades = _collect(
@@ -2025,6 +2030,27 @@ class PolymarketTradingClient:
                 if raw_quantity is None or raw_quantity <= 0:
                     continue
                 quantity += raw_quantity
+                if _safe_string(_field(trade, "trader_side", "")).upper() != "TAKER":
+                    fees_verified = False
+                else:
+                    try:
+                        price = _decimal(_field(trade, "price"))
+                        fee_rate_bps = _decimal(
+                            _field(trade, "fee_rate_bps", _field(trade, "feeRateBps"))
+                        )
+                    except ValueError:
+                        fees_verified = False
+                    else:
+                        if not (Decimal("0") < price <= Decimal("1")) or fee_rate_bps < 0:
+                            fees_verified = False
+                        else:
+                            actual_fee += (
+                                raw_quantity
+                                * fee_rate_bps
+                                / Decimal("10000")
+                                * price
+                                * (Decimal("1") - price)
+                            )
                 if order_ref and order_ref not in matched["order_ids"]:
                     matched["order_ids"].append(order_ref)  # type: ignore[union-attr]
                 if trade_ref and trade_ref not in matched["trade_ids"]:
@@ -2064,12 +2090,15 @@ class PolymarketTradingClient:
                     "token_id": leg.token_id,
                     "quantity": format(position_quantity, "f"),
                 }
-            return quantity, {
+            proof = {
                 "matched_refs": matched,
                 "position_ref": position_ref,
                 "positions_verified": quantity > 0
                 and position_quantity >= quantity,
             }
+            if quantity > 0 and fees_verified:
+                proof["fee"] = actual_fee
+            return quantity, proof
         except Exception:
             return Decimal("0"), {
                 "matched_refs": matched,

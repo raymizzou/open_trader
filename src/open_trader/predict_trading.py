@@ -458,26 +458,57 @@ class PredictTradingClient:
     def set_exact_buy_allowance(self, market_id: str, exact_debit_wei: int) -> Mapping[str, object]:
         amount = _non_negative_int(exact_debit_wei, "approval")
         if amount <= 0:
-            return {"success": False, "status": "rejected", "error_code": "invalid_amount"}
+            return {
+                "success": False,
+                "status": "rejected",
+                "error_code": "invalid_amount",
+                "possible_mutation": False,
+            }
         scope = self._approval_scope_for_market(market_id)
         facts = dict(self._approval_facts_for_scope(scope, exact_debit_wei=amount))
         step = self._approval_step(scope)
         try:
             result = self._builder.set_approval(step, approved=True, amount=amount)
         except Exception:
-            return self._allowance_result(False, "rejected", facts)
+            return self._allowance_result(
+                False, "receipt_ambiguous", facts, possible_mutation=True
+            )
         allowance = self._post_allowance(result, step, expected=amount)
         if allowance is None:
-            return self._allowance_result(False, _receipt_error_code(result), facts)
+            possible_mutation = True
+            initial_allowance = _number(facts.get("allowance_raw"))
+            if _receipt_status(getattr(result, "receipt", None)) == 0:
+                try:
+                    post_allowance = self._raw_allowance(step)
+                except Exception:
+                    pass
+                else:
+                    facts["allowance"] = _usdt_string(post_allowance)
+                    facts["allowance_raw"] = str(post_allowance)
+                    facts["allowance_breaker"] = post_allowance > 0
+                    possible_mutation = not (
+                        initial_allowance == 0 and post_allowance == 0
+                    )
+            return self._allowance_result(
+                False,
+                _receipt_error_code(result),
+                facts,
+                result,
+                possible_mutation=possible_mutation,
+            )
         if allowance != amount:
             facts["allowance"] = _usdt_string(allowance)
             facts["allowance_raw"] = str(allowance)
             facts["allowance_breaker"] = allowance > 0
-            return self._allowance_result(False, "allowance_mismatch", facts, result)
+            return self._allowance_result(
+                False, "allowance_mismatch", facts, result, possible_mutation=True
+            )
         facts["allowance"] = _usdt_string(allowance)
         facts["allowance_raw"] = str(allowance)
         facts["allowance_breaker"] = allowance > 0
-        return self._allowance_result(True, "none", facts, result)
+        return self._allowance_result(
+            True, "none", facts, result, possible_mutation=True
+        )
 
     def clear_buy_allowance(self, market_id: str) -> Mapping[str, object]:
         scope = self._approval_scope_for_market(market_id)
@@ -749,7 +780,7 @@ class PredictTradingClient:
             return None
         try:
             return self._raw_allowance(step)
-        except RuntimeError:
+        except Exception:
             return None
 
     def _allowance_result(
@@ -758,6 +789,8 @@ class PredictTradingClient:
         error_code: str,
         facts: Mapping[str, object],
         result: object | None = None,
+        *,
+        possible_mutation: bool | None = None,
     ) -> Mapping[str, object]:
         receipt = getattr(result, "receipt", None) if result is not None else None
         payload = {
@@ -774,6 +807,8 @@ class PredictTradingClient:
             "exact_debit_wei": facts.get("exact_debit_wei"),
             "checked_at": datetime.now(UTC),
         }
+        if possible_mutation is not None:
+            payload["possible_mutation"] = possible_mutation
         tx_hash = _receipt_hash(receipt)
         if tx_hash:
             payload["transaction_hash"] = tx_hash
@@ -896,7 +931,7 @@ def _receipt_hash(receipt: object) -> str | None:
 def _receipt_error_code(result: object) -> str:
     receipt = getattr(result, "receipt", None)
     status = _receipt_status(receipt)
-    return "receipt_failed" if status is not None else "receipt_ambiguous"
+    return "receipt_failed" if status == 0 else "receipt_ambiguous"
 
 
 def _has_active_execution(open_orders: object) -> bool:

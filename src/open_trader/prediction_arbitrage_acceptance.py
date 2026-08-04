@@ -402,6 +402,12 @@ class _PredictReadOnlyGuard(_PolymarketReadOnlyGuard):
         {"approval", "redemption", "submit_order", "submit_orders"}
     )
 
+    def _kind(self, name: str) -> str | None:
+        normalized = name.lower()
+        if normalized.startswith(("convert_positions", "run_approval")):
+            return "mutation"
+        return super()._kind(name)
+
     def violation(self, name: str, *, kind: str | None = None) -> None:
         del name, kind
         self.mutation_calls += 1

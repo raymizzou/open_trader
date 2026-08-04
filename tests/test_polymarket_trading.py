@@ -1002,7 +1002,9 @@ def test_cross_leg_reconciliation_uses_order_trade_and_position_proof() -> None:
         SimpleNamespace(
             id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
             taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
-            side="BUY", matched_at=datetime.now(UTC),
+            side="BUY", trader_side="TAKER", price=Decimal("0.48"),
+            fee_rate_bps=Decimal("200"),
+            matched_at=datetime.now(UTC),
         )
     ]
     fake.position_rows = [
@@ -1018,6 +1020,40 @@ def test_cross_leg_reconciliation_uses_order_trade_and_position_proof() -> None:
     assert reconciled["verified"] is True
     assert reconciled["position_quantity"] == Decimal("5")
     assert reconciled["filled_quantity"] == Decimal("5")
+    assert reconciled["actual_fee"] == Decimal("0.024960")
+    assert reconciled["execution_proof"]["fee"] == Decimal("0.024960")
+    assert reconciled["execution_proof"]["matched_refs"] == {
+        "token_id": "cross-no-token",
+        "order_ids": ["cross-order"],
+        "trade_ids": ["cross-trade"],
+    }
+
+
+def test_cross_leg_reconciliation_does_not_invent_actual_fee_without_trade_fee_evidence() -> None:
+    adapter, fake = make_adapter()
+    leg = cross_polymarket_leg()
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
+            taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
+            side="BUY", price=Decimal("0.48"), fee_rate_bps=Decimal("200"),
+            matched_at=datetime.now(UTC),
+        )
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": "5"}
+    ]
+    result = ThresholdLegResult(
+        "polymarket", "NO", "condition-cross", "cross-no-token", True,
+        "filled", "cross-order", Decimal("5"), ("cross-trade",), "none",
+    )
+
+    reconciled = adapter.reconcile_cross_leg(leg, result, since=since)
+
+    assert reconciled["verified"] is True
+    assert "actual_fee" not in reconciled
+    assert "fee" not in reconciled["execution_proof"]
 
 
 def test_cross_leg_reconciliation_carries_venue_minimum_order_size() -> None:
