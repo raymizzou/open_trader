@@ -6,10 +6,15 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .account_snapshot import load_account_snapshot, load_worker_git_sha
+from .account_http import (
+    AccountHttpError,
+    DEFAULT_ACCOUNT_API_URL,
+    DEFAULT_ACCOUNT_TIMEOUT_SECONDS,
+    fetch_account_snapshot,
+    fetch_statement_trade_facts,
+)
 from .account_sync_state import STATEMENT_BROKERS
 from .daily_premarket import RunLock
-from .statement_import import load_statement_trade_facts
 from .trend_api_stats import (
     build_statement_actual_stats_payload,
     write_trend_api_stats,
@@ -25,6 +30,7 @@ def consume_accepted_statement_facts(
     reports_dir: Path,
     broker: str,
     generated_at: str | None = None,
+    account_url: str = DEFAULT_ACCOUNT_API_URL,
 ) -> dict[str, object]:
     if broker not in STATEMENT_BROKERS:
         raise ValueError(f"unsupported statement broker: {broker}")
@@ -36,6 +42,7 @@ def consume_accepted_statement_facts(
             reports_dir=reports_dir,
             broker=broker,
             generated_at=generated_at,
+            account_url=account_url,
         )
 
 
@@ -45,35 +52,58 @@ def _consume_accepted_statement_facts(
     reports_dir: Path,
     broker: str,
     generated_at: str | None,
+    account_url: str,
 ) -> dict[str, object]:
-    snapshot = load_account_snapshot(
-        data_dir,
-        api_git_sha=load_worker_git_sha(data_dir),
-        now=(
-            datetime.fromisoformat(generated_at)
-            if generated_at is not None
-            else datetime.now().astimezone()
-        ),
-    )
-    generations = snapshot.payload.get("accepted_statement_generation")
-    account_generation = str(snapshot.payload.get("account_generation") or "")
-    if snapshot.status_code != 200 or not isinstance(generations, dict):
-        return {
-            "schema_version": CONSUMPTION_SCHEMA,
-            "status": "waiting_for_account_publication",
-            "broker": broker,
-            "statement_generation": "",
-            "account_generation": account_generation,
-        }
-    statement_generation = str(generations[broker])
-    if not statement_generation:
-        return {
-            "schema_version": CONSUMPTION_SCHEMA,
-            "status": "waiting_for_promotion",
-            "broker": broker,
-            "statement_generation": "",
-            "account_generation": account_generation,
-        }
+    for attempt_index in range(2):
+        try:
+            snapshot = fetch_account_snapshot(
+                account_url, DEFAULT_ACCOUNT_TIMEOUT_SECONDS
+            )
+        except AccountHttpError as error:
+            return _blocked_status({}, broker, "", error.code, generated_at)
+        generations = snapshot["accepted_statement_generation"]
+        statement_generation = str(generations.get(broker) or "")
+        if not statement_generation:
+            return _waiting_for_promotion_status(snapshot, broker)
+        try:
+            facts_payload = fetch_statement_trade_facts(
+                account_url,
+                broker,
+                statement_generation,
+                DEFAULT_ACCOUNT_TIMEOUT_SECONDS,
+            )
+        except AccountHttpError as error:
+            if (
+                error.code == "accepted_statement_generation_changed"
+                and attempt_index == 0
+            ):
+                continue
+            return _blocked_status(
+                snapshot, broker, statement_generation, error.code, generated_at
+            )
+        return _consume_facts_payload(
+            snapshot=snapshot,
+            facts_payload=facts_payload,
+            data_dir=data_dir,
+            reports_dir=reports_dir,
+            broker=broker,
+            generated_at=generated_at,
+        )
+    raise AssertionError("statement consumption retry loop did not return")
+
+
+def _consume_facts_payload(
+    *,
+    snapshot: dict[str, object],
+    facts_payload: dict[str, object],
+    data_dir: Path,
+    reports_dir: Path,
+    broker: str,
+    generated_at: str | None,
+) -> dict[str, object]:
+    statement_generation = str(facts_payload.get("statement_generation") or "")
+    account_generation = str(snapshot.get("account_generation") or "")
+    snapshot_generation = str(snapshot.get("snapshot_generation") or "")
     status_path = data_dir / "trend_statement_consumption" / f"{broker}.json"
     previous = _read_json(status_path)
     if (
@@ -81,24 +111,31 @@ def _consume_accepted_statement_facts(
         and previous.get("statement_generation") == statement_generation
         and previous.get("account_generation") == account_generation
     ):
-        return {**previous, "status": "already_consumed"}
+        return {
+            **previous,
+            "status": "already_consumed",
+            "snapshot_generation": snapshot_generation,
+        }
 
     consumed_at = generated_at or datetime.now().astimezone().isoformat(
         timespec="seconds"
     )
     try:
-        manifest, facts = load_statement_trade_facts(
-            data_dir, broker, statement_generation
-        )
-        statement_period = manifest.get("statement_period")
-        cutoff = manifest.get("trade_facts_cutoff_at")
+        statement_period = facts_payload.get("statement_period")
+        cutoff = facts_payload.get("trade_facts_cutoff_at")
+        facts = facts_payload.get("facts")
         if not isinstance(statement_period, str) or not isinstance(cutoff, str):
+            raise ValueError("statement trade facts contract is invalid")
+        if not isinstance(facts, list) or any(
+            not isinstance(fact, dict) for fact in facts
+        ):
             raise ValueError("statement trade facts contract is invalid")
         if datetime.fromisoformat(consumed_at) < datetime.fromisoformat(cutoff):
             waiting = {
                 "schema_version": CONSUMPTION_SCHEMA,
                 "status": "waiting_for_statement_cutoff",
                 "broker": broker,
+                "snapshot_generation": snapshot_generation,
                 "statement_generation": statement_generation,
                 "account_generation": account_generation,
                 "attempted_at": consumed_at,
@@ -116,15 +153,16 @@ def _consume_accepted_statement_facts(
             statistics_cutoff_at=cutoff,
         )
         write_trend_api_stats(data_dir, payload)
-    except Exception as error:
+    except Exception:
         failed = {
             "schema_version": CONSUMPTION_SCHEMA,
             "status": "failed",
             "broker": broker,
+            "snapshot_generation": snapshot_generation,
             "statement_generation": statement_generation,
             "account_generation": account_generation,
             "attempted_at": consumed_at,
-            "error_type": type(error).__name__,
+            "reason": "statement_facts_processing_failed",
         }
         _write_json_atomic(status_path, failed)
         return failed
@@ -132,12 +170,47 @@ def _consume_accepted_statement_facts(
         "schema_version": CONSUMPTION_SCHEMA,
         "status": "consumed",
         "broker": broker,
+        "snapshot_generation": snapshot_generation,
         "statement_generation": statement_generation,
         "account_generation": account_generation,
         "consumed_at": consumed_at,
         "statistics_cutoff_at": cutoff,
     }
     _write_json_atomic(status_path, status)
+    return status
+
+
+def _waiting_for_promotion_status(
+    snapshot: dict[str, object], broker: str
+) -> dict[str, object]:
+    return {
+        "schema_version": CONSUMPTION_SCHEMA,
+        "status": "waiting_for_promotion",
+        "broker": broker,
+        "snapshot_generation": str(snapshot.get("snapshot_generation") or ""),
+        "statement_generation": "",
+        "account_generation": str(snapshot.get("account_generation") or ""),
+    }
+
+
+def _blocked_status(
+    snapshot: dict[str, object],
+    broker: str,
+    statement_generation: str,
+    reason: str,
+    generated_at: str | None,
+) -> dict[str, object]:
+    status = {
+        "schema_version": CONSUMPTION_SCHEMA,
+        "status": "blocked",
+        "broker": broker,
+        "snapshot_generation": str(snapshot.get("snapshot_generation") or ""),
+        "statement_generation": statement_generation,
+        "account_generation": str(snapshot.get("account_generation") or ""),
+        "reason": reason,
+    }
+    if generated_at is not None:
+        status["attempted_at"] = generated_at
     return status
 
 
