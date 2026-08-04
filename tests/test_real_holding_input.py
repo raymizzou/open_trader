@@ -84,7 +84,12 @@ def write_rows(data_dir: Path, broker: str, market: str, statement_id: str) -> N
     ) as handle:
         writer = csv.DictWriter(handle, fieldnames=["statement_id", "broker", "currency", "cash_balance"])
         writer.writeheader()
-        writer.writerow({"statement_id": statement_id, "broker": broker, "currency": "USD", "cash_balance": "10"})
+        writer.writerow({
+            "statement_id": statement_id,
+            "broker": broker,
+            "currency": {"CN": "CNY", "HK": "HKD", "US": "USD"}[market],
+            "cash_balance": "10",
+        })
 
 
 @pytest.mark.parametrize(

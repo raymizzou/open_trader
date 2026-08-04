@@ -38,6 +38,7 @@ from open_trader.trend_review import (
     trend_action_key,
     trend_attempt_remark,
 )
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 NOW = datetime.fromisoformat("2026-07-20T09:31:00+08:00")
@@ -1786,6 +1787,84 @@ def test_valid_report_accepts_only_strict_partial_sell_actions(tmp_path: Path) -
     })
     assert not controller._valid_report(
         config, "CN", "2026-07-20", path, conflicting
+    )
+
+
+def test_valid_report_rejects_invalid_frozen_allocation_and_rotation_pair(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    path, report = write_report(config)
+    roots = {
+        market: {
+            "stock": {"asset": stock, "tm_id": index * 10, "as_of_date": "2026-08-03", "global_strength": stock_strength},
+            "etf": {"asset": etf, "tm_id": index * 10 + 1, "as_of_date": "2026-08-03", "global_strength": etf_strength},
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (("CN", "A股", "ETF基金", "90", "80"), ("HK", "港股", "香港ETF", "70", "60"), ("US", "美股", "美国ETF", "50", "40")), 1
+        )
+    }
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03", generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40, roots=roots, previous=None,
+    )
+    daily = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    daily.parent.mkdir(parents=True)
+    body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    daily.write_text(body, encoding="utf-8")
+    report["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "allocation_date": "2026-08-03", "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False, "stale_a_trading_days": 0, "failure_reason": "",
+        "roots": snapshot["roots"], "markets": snapshot["markets"],
+    }
+    report["strategy_snapshot"] = a_share_trend.live_trend_strategy_snapshot(
+        "CN", "test-sha", (622466, 697199),
+        allocation={
+            "daily_path": report["allocation"]["daily_path"],
+            "sha256": report["allocation"]["sha256"],
+            "snapshot": snapshot,
+        },
+    )
+    judgments = report["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["holding_decisions"] = [{"symbol": "WEAK"}]
+    judgments["top10_candidates"] = [{"symbol": "STRONG"}]
+    judgments["simulate_rotation_pairs"] = [{
+        "pair_index": 0, "sell_symbol": "WEAK", "sell_name": "Weak",
+        "sell_futu_symbol": "SH.WEAK", "sell_global_strength": "10",
+        "buy_symbol": "STRONG", "buy_name": "Strong", "buy_futu_symbol": "SH.STRONG",
+        "buy_global_strength": "90", "strength_gap": "80", "target_weight": "0.04",
+        "target_amount": "4000", "estimated_shares": 400, "lot_size": 100,
+        "atr": "0.5", "reason": "relative_rotation", "execution_date": "2026-07-20",
+        "execution_mode": "automatic", "sell_asset": "A股", "buy_asset": "A股",
+        "sell_local_strength": "10", "buy_local_strength": "90",
+        "strength_basis": "local", "sell_compared_strength": "10",
+        "buy_compared_strength": "90", "threshold": "20",
+    }]
+    judgments["simulate_rotation_comparisons"] = [{
+        "pair_index": 0, "sell_symbol": "WEAK", "sell_name": "Weak", "sell_asset": "A股",
+        "sell_local_strength": "10", "sell_global_strength": "10",
+        "buy_symbol": "STRONG", "buy_name": "Strong", "buy_asset": "A股",
+        "buy_local_strength": "90", "buy_global_strength": "90",
+        "strength_basis": "local", "sell_compared_strength": "10",
+        "buy_compared_strength": "90", "strength_gap": "80", "threshold": "20",
+        "outcome": "planned", "reason": "relative_rotation",
+    }]
+    judgments["real_rotation_pairs"] = []
+    judgments["real_rotation_comparisons"] = []
+
+    assert controller._valid_report(config, "CN", "2026-07-20", path, report)
+    malformed = json.loads(json.dumps(report))
+    malformed["strategy_judgments"]["simulate_rotation_pairs"][0]["strength_gap"] = "19.9"
+    assert not controller._valid_report(config, "CN", "2026-07-20", path, malformed)
+    malformed_hash = json.loads(json.dumps(report))
+    malformed_hash["allocation"]["sha256"] = "c" * 64
+    assert not controller._valid_report(config, "CN", "2026-07-20", path, malformed_hash)
+    allocationless_pairs = json.loads(json.dumps(report))
+    del allocationless_pairs["allocation"]
+    assert not controller._valid_report(
+        config, "CN", "2026-07-20", path, allocationless_pairs
     )
 
 
@@ -5895,6 +5974,97 @@ def test_global_execution_noop_protocol_is_removed() -> None:
     assert not hasattr(controller, "_execution_noop_path")
 
 
+def test_relative_rotation_runs_after_ordinary_actions_and_merges_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "strategy_judgments": {
+            "formal_actions": [],
+            "simulate_rotation_pairs": [{"buy_futu_symbol": "SH.STRONG"}],
+            "real_rotation_pairs": [{"buy_futu_symbol": "SH.REAL"}],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    calls: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            assert symbols == ["SH.STRONG"]
+            return {"SH.STRONG": SimpleNamespace(last_price=Decimal("10"))}
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **_kwargs: calls.append("ordinary") or {
+            "status": "unchanged", "submitted_count": 0, "artifact_paths": ["ordinary"],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **_kwargs: calls.append("rotation") or {
+            "status": "submitted", "submitted_count": 2, "artifact_paths": ["rotation"],
+        },
+    )
+
+    result = controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    assert calls == ["ordinary", "rotation"]
+    assert result["submitted_count"] == 2
+    assert result["artifact_paths"] == ["ordinary", "rotation"]
+
+
+def test_execution_completion_audits_relative_rotation_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    report_path = tmp_path / "locked.json"
+    report = {
+        "strategy_judgments": {
+            "formal_actions": [], "simulate_rotation_pairs": [{}],
+            "real_rotation_pairs": [{}],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    batch = config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    batch.parent.mkdir(parents=True)
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1", "market": "CN",
+        "execution_date": "2026-07-20", "report_path": str(report_path),
+        "report_sha256": _report_hash(report),
+    }), encoding="utf-8")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    audited: list[object] = []
+    monkeypatch.setattr(
+        controller, "relative_rotations_completed",
+        lambda *_args, **_kwargs: audited.append(_kwargs["report"]) or False,
+    )
+
+    assert controller._execution_completed(config, cycle) is False
+    assert audited == [report]
+
+
 def test_revision_request_freezes_latest_report_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6380,3 +6550,105 @@ def test_pending_revision_recovers_existing_failed_r1_and_binds_completion(
 
 def test_controller_cycle_has_no_unused_buy_window_field() -> None:
     assert "buy_window_open" not in {field.name for field in fields(ControllerCycle)}
+
+
+def test_controller_never_generates_report_before_allocation_terminal_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_allocation_reference_for_cycle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("allocation has not made a terminal attempt")
+        ),
+    )
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(object()),
+    )
+
+    result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == []
+    assert result["phase"] == "blocked"
+    assert "terminal attempt" in str(result["blocker"])
+
+
+@pytest.mark.parametrize("reference", [
+    {"daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": "a" * 64},
+    None,
+])
+def test_controller_passes_the_terminal_allocation_reference_to_report_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: dict[str, str] | None,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    generated: list[object] = []
+    monkeypatch.setattr(
+        controller, "_allocation_reference_for_cycle", lambda *_args, **_kwargs: reference
+    )
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: generated.append(_args[-1])
+    )
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == [reference]
+
+
+def test_allocation_gate_uses_shared_shanghai_date_for_us_report_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    cycle = replace(active_cn_cycle(), market="US", as_of_date="2026-07-31")
+    captured: dict[str, object] = {}
+
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            captured["calendar"] = kwargs
+            return ["2026-08-03"]
+
+    monkeypatch.setattr(
+        controller,
+        "allocation_reference_for_report",
+        lambda _config, **kwargs: captured.update(kwargs) or {"daily_path": "data/x", "sha256": "a" * 64},
+    )
+
+    result = controller._allocation_reference_for_cycle(
+        config,
+        now=datetime.fromisoformat("2026-08-03T09:31:00-04:00"),
+        quote_client=Quote(),
+    )
+
+    assert result == {"daily_path": "data/x", "sha256": "a" * 64}
+    assert captured["allocation_date"] == "2026-08-03"
+
+
+@pytest.mark.parametrize("market", ["CN", "HK", "US"])
+def test_generate_report_passes_allocation_reference_to_market_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    reference = {"daily_path": "data/x", "sha256": "a" * 64}
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: object())
+    monkeypatch.setattr(
+        controller,
+        "run_a_share_trend_report",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(status="generated"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "run_market_trend_report",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(status="generated"),
+    )
+
+    controller._generate_report(config, market, "2026-08-03", False, reference)
+
+    assert captured["allocation_reference"] is reference

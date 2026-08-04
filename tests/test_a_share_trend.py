@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import open_trader.a_share_trend as trend_module
 import open_trader.trend_delivery as trend_delivery_module
+from open_trader import trend_review
 
 from open_trader.a_share_trend import (
     A_SHARE_INDUSTRY_FIELDS,
@@ -36,6 +37,8 @@ from open_trader.a_share_trend import (
     load_futu_simulate_trend_account,
     load_protection_state,
     load_watch_events,
+    plan_rotation_pairs,
+    plan_rotation_pairs_with_comparisons,
     render_trend_failure_text,
     render_trend_feishu_text,
     render_markdown,
@@ -284,6 +287,7 @@ def test_unified_trend_fields_match_the_paid_catalog_selection() -> None:
 def candidate(
     symbol: str,
     *,
+    tm_id: int | None = None,
     strength: str | None = "96",
     days: int | None = 3,
     amount: str | None = "2",
@@ -303,9 +307,10 @@ def candidate(
     temperature_curr: str | None = "热",
     phase: str | None = "立夏",
     asset: str = "A股",
+    global_strength: str | None = None,
 ) -> CandidateInput:
     return CandidateInput(
-        tm_id=int(symbol),
+        tm_id=(int(symbol) if tm_id is None and symbol.isdigit() else tm_id or 900002),
         symbol=symbol,
         exchange=exchange,
         name=f"股票{symbol}" if name is None else name,
@@ -327,6 +332,9 @@ def candidate(
         temperature_prev=temperature_prev,
         temperature_curr=temperature_curr,
         phase=phase,
+        global_strength=(
+            None if global_strength is None else Decimal(global_strength)
+        ),
     )
 
 
@@ -392,6 +400,7 @@ def serialized_position() -> dict[str, object]:
 def holding(
     symbol: str,
     *,
+    tm_id: int | None = None,
     right_side: bool | None = True,
     danger: bool | None = False,
     boiling: bool | None = False,
@@ -399,6 +408,7 @@ def holding(
     industry: str = "电力",
     industry_tm_id: int | None = 700001,
     industry_temperature: str | None = "热",
+    asset: str = "A股",
     filter_price: str | None = "10",
     market_cap: str | None = "100",
     strength: str | None = "96",
@@ -406,9 +416,10 @@ def holding(
     temperature_curr: str | None = "热",
     phase: str | None = "立夏",
     days: int | None = None,
+    global_strength: str | None = None,
 ) -> HoldingSnapshot:
     return HoldingSnapshot(
-        tm_id=int(symbol),
+        tm_id=(int(symbol) if tm_id is None and symbol.isdigit() else tm_id or 900001),
         symbol=symbol,
         exchange="SH",
         name=f"股票{symbol}",
@@ -417,6 +428,7 @@ def holding(
         danger=danger,
         boiling=boiling,
         champagne=champagne,
+        asset=asset,
         industry=industry,
         industry_tm_id=industry_tm_id,
         industry_temperature=industry_temperature,
@@ -427,7 +439,580 @@ def holding(
         temperature_curr=temperature_curr,
         phase=phase,
         days=days,
+        global_strength=(
+            None if global_strength is None else Decimal(global_strength)
+        ),
     )
+
+
+def test_same_category_rotation_uses_local_strength() -> None:
+    pairs, comparisons = plan_rotation_pairs_with_comparisons(
+        holdings=(
+            holding(
+                "PM", asset="美股", strength="76", global_strength="86.18",
+            ),
+        ),
+        candidates=(
+            candidate(
+                "SHEL", asset="美股", strength="98.6", global_strength="95.36",
+            ),
+        ),
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+        market="US",
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in pairs] == [
+        ("PM", "SHEL"),
+    ]
+    assert comparisons[0].strength_basis == "local"
+    assert comparisons[0].strength_gap == Decimal("22.6")
+    assert comparisons[0].outcome == "planned"
+
+
+def test_cross_category_rotation_uses_global_strength() -> None:
+    pairs, comparisons = plan_rotation_pairs_with_comparisons(
+        holdings=(
+            holding(
+                "SPY", asset="美国ETF", strength="99", global_strength="70",
+            ),
+        ),
+        candidates=(
+            candidate(
+                "SHEL", asset="美股", strength="75", global_strength="90",
+            ),
+        ),
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+        market="US",
+    )
+
+    assert len(pairs) == 1
+    assert comparisons[0].strength_basis == "global"
+    assert comparisons[0].strength_gap == Decimal("20")
+
+
+def test_rotation_comparison_does_not_fallback_between_strength_scopes() -> None:
+    _, same_category = plan_rotation_pairs_with_comparisons(
+        holdings=(holding("PM", asset="美股", strength=None, global_strength="10"),),
+        candidates=(candidate("SHEL", asset="美股", strength="99", global_strength="90"),),
+        entry_weight=Decimal("0.04"), available_slots=0, pair_slots=(0, 1), market="US",
+    )
+    _, cross_category = plan_rotation_pairs_with_comparisons(
+        holdings=(holding("SPY", asset="美国ETF", strength="1", global_strength=None),),
+        candidates=(candidate("SHEL", asset="美股", strength="99", global_strength="90"),),
+        entry_weight=Decimal("0.04"), available_slots=0, pair_slots=(0, 1), market="US",
+    )
+
+    assert same_category[0].outcome == "data_unavailable"
+    assert cross_category[0].outcome == "data_unavailable"
+
+
+def test_rotation_pairs_weakest_with_strongest_at_inclusive_twenty_points() -> None:
+    """A 20-point edge is actionable; 19.9 would not be."""
+    pairs = plan_rotation_pairs(
+        holdings=[
+            holding("100001", strength="10", global_strength="10"),
+            holding("100002", strength="20", global_strength="20"),
+            holding("100003", strength="80", global_strength="80"),
+        ],
+        candidates=[
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+        ],
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol, pair.strength_gap) for pair in pairs] == [
+        ("100001", "200001", Decimal("80")),
+        ("100002", "200002", Decimal("20")),
+    ]
+
+
+def test_rotation_pairs_reject_19_9_and_use_stable_unique_symbols() -> None:
+    pairs = plan_rotation_pairs(
+        holdings=[
+            holding("100002", strength="20", global_strength="20"),
+            holding("100001", strength="20", global_strength="20"),
+        ],
+        candidates=[
+            candidate("200002", strength="39.9", global_strength="39.9"),
+            candidate("200001", strength="40", global_strength="40"),
+            candidate("200001", strength="99", global_strength="99"),
+            candidate("100001", strength="100", global_strength="100"),
+        ],
+        entry_weight=Decimal("0.04"),
+        available_slots=0,
+        pair_slots=(0, 1),
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in pairs] == [
+        ("100001", "200001"),
+    ]
+    assert plan_rotation_pairs(
+        holdings=[holding("100001", global_strength="10")],
+        candidates=[candidate("200001", global_strength="90")],
+        entry_weight=Decimal("0.04"),
+        available_slots=1,
+        pair_slots=(0, 1),
+    ) == ()
+
+
+def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("0"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in held_symbols
+        ),
+        exceptions=(),
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+        ],
+        holding_snapshots={
+            symbol: holding(
+                symbol,
+                strength=("10" if index == 0 else "20"),
+                global_strength=("10" if index == 0 else "20"),
+            )
+            for index, symbol in enumerate(held_symbols)
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.simulate_rotation_pairs] == [
+        ("100000", "200001"),
+        ("100001", "200002"),
+    ]
+    assert built.real_rotation_pairs == ()
+    payload = trend_module._report_payload(built)
+    assert payload["allocation"] == {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation["snapshot"]["roots"],
+        "markets": allocation["snapshot"]["markets"],
+    }
+    assert [
+        (pair["sell_symbol"], pair["buy_symbol"])
+        for pair in payload["strategy_judgments"]["simulate_rotation_pairs"]
+    ] == [("100000", "200001"), ("100001", "200002")]
+    comparisons = payload["strategy_judgments"][
+        "simulate_rotation_comparisons"
+    ]
+    assert comparisons[0]["strength_basis"] == "global"
+    assert comparisons[0]["strength_gap"] == "80"
+    assert comparisons[0]["outcome"] == "planned"
+    assert trend_module.valid_frozen_report_contract(payload)
+    invalid_comparison = json.loads(json.dumps(payload))
+    invalid_comparison["strategy_judgments"][
+        "simulate_rotation_comparisons"
+    ][0]["strength_gap"] = "79"
+    assert not trend_module.valid_frozen_report_contract(invalid_comparison)
+    valid_real_pair = json.loads(json.dumps(payload))
+    real_pair = copy.deepcopy(
+        valid_real_pair["strategy_judgments"]["simulate_rotation_pairs"][0]
+    )
+    real_pair.update(
+        sell_symbol="REAL",
+        sell_name="Real",
+        sell_futu_symbol="SH.REAL",
+        execution_mode="manual",
+    )
+    real_comparison = copy.deepcopy(
+        valid_real_pair["strategy_judgments"]["simulate_rotation_comparisons"][0]
+    )
+    real_comparison.update(sell_symbol="REAL", sell_name="Real")
+    valid_real_pair["strategy_judgments"].update(
+        real_holding_decisions=[{"symbol": "REAL"}],
+        real_holding_decisions_status="available",
+        real_holding_decisions_source={},
+        real_rotation_pairs=[real_pair],
+        real_rotation_comparisons=[real_comparison],
+    )
+    assert trend_module.valid_frozen_report_contract(valid_real_pair)
+
+    allocationless_pairs = json.loads(json.dumps(payload))
+    del allocationless_pairs["allocation"]
+    assert not trend_module.valid_frozen_report_contract(allocationless_pairs)
+    allocation_only_without_snapshot = json.loads(json.dumps(allocationless_pairs))
+    allocation_only_without_snapshot["strategy_judgments"].pop("simulate_rotation_pairs")
+    allocation_only_without_snapshot["strategy_judgments"].pop("real_rotation_pairs")
+    for name in (
+        "allocation_snapshot_path", "allocation_snapshot_sha256",
+        "allocation_rank", "allocation_score", "allocation_score_source",
+        "target_weight", "nominal_weight",
+    ):
+        allocation_only_without_snapshot["strategy_snapshot"]["parameters"].pop(name)
+    assert not trend_module.valid_frozen_report_contract(
+        allocation_only_without_snapshot
+    )
+    for market_value in (None, ""):
+        missing_market = json.loads(json.dumps(allocation_only_without_snapshot))
+        if market_value is None:
+            missing_market["strategy_snapshot"].pop("market")
+        else:
+            missing_market["strategy_snapshot"]["market"] = market_value
+        assert not trend_module.valid_frozen_report_contract(missing_market)
+    historical = json.loads(json.dumps(allocation_only_without_snapshot))
+    historical["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), strategy_version="v10",
+    )
+    historical["metadata"]["market"] = "CN"
+    assert trend_module.valid_frozen_report_contract(historical)
+    mismatched_historical_identity = json.loads(json.dumps(historical))
+    mismatched_historical_identity["strategy_snapshot"]["strategy_id"] = (
+        "trend_animals_warm_to_hot/CN/v11"
+    )
+    assert not trend_module.valid_frozen_report_contract(
+        mismatched_historical_identity
+    )
+    cross_market_historical_identity = json.loads(json.dumps(historical))
+    cross_market_historical_identity["strategy_snapshot"].update(
+        market="HK", strategy_id="trend_animals_warm_to_hot/HK/v10",
+    )
+    assert not trend_module.valid_frozen_report_contract(
+        cross_market_historical_identity
+    )
+    for market, version, pools in (
+        ("CN", "v7", (622466, 697199)),
+        ("US", "v5", (622460, 705013)),
+    ):
+        legacy = json.loads(json.dumps(historical))
+        legacy["metadata"]["market"] = market
+        legacy["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+            market, "abc123", pools, strategy_version=version,
+        )
+        assert trend_module.valid_frozen_report_contract(legacy)
+        wrong_id = json.loads(json.dumps(legacy))
+        wrong_id["strategy_snapshot"]["strategy_id"] = (
+            "trend_animals_warm_to_hot/ZZ/v999"
+        )
+        assert not trend_module.valid_frozen_report_contract(wrong_id)
+        blank_market = json.loads(json.dumps(legacy))
+        blank_market["strategy_snapshot"]["market"] = ""
+        assert not trend_module.valid_frozen_report_contract(blank_market)
+    allocation_parameters_without_snapshot = json.loads(json.dumps(historical))
+    allocation_parameters_without_snapshot["strategy_snapshot"]["parameters"][
+        "allocation_rank"
+    ] = 1
+    assert not trend_module.valid_frozen_report_contract(
+        allocation_parameters_without_snapshot
+    )
+    assert "模拟盘自动轮换" not in render_markdown(
+        replace(built, allocation=None)
+    )
+    markdown = render_markdown(built)
+    comparison_only = replace(
+        built,
+        simulate_rotation_pairs=(),
+        simulate_rotation_comparisons=(replace(
+            built.simulate_rotation_comparisons[0],
+            strength_gap=Decimal("19.9"),
+            outcome="gap_below_threshold",
+            reason="强度差 19.9 小于门槛 20",
+        ),),
+    )
+    comparison_markdown = render_markdown(comparison_only)
+    assert "未触发" in comparison_markdown
+    assert "门槛 20" in comparison_markdown
+    assert "还差 0.1" in comparison_markdown
+    assert "无。" not in comparison_markdown.split("## 模拟盘自动轮换", 1)[1].split("##", 1)[0]
+    ordered_payload = json.loads(json.dumps(payload))
+    ordered_payload["strategy_judgments"]["formal_actions"] = [
+        {"action": "SELL_ALL", "symbol": "EXIT", "name": "Exit", "reason": "danger_signal"},
+        {"action": "BUY", "symbol": "ENTRY", "name": "Entry", "estimated_shares": 100, "target_amount": "1000"},
+    ]
+    _, feishu = render_trend_feishu_text(
+        ordered_payload, broker_label="东方财富", market_label="A股"
+    )
+    for text in (markdown, feishu):
+        assert "市场资源排名" in text
+        assert "模拟盘自动轮换" in text
+        assert "MARKET 卖出全成后才买入" in text
+    assert (
+        feishu.index("市场资源排名")
+        < feishu.index("\n卖出\n")
+        < feishu.index("模拟盘自动轮换")
+        < feishu.index("\n买入\n")
+    )
+
+    invalid_payloads = []
+    wrong_hash = json.loads(json.dumps(payload))
+    wrong_hash["allocation"]["sha256"] = "A" * 64
+    invalid_payloads.append(wrong_hash)
+    moving_pointer = json.loads(json.dumps(payload))
+    moving_pointer["allocation"]["daily_path"] = "data/trend_allocation/latest.json"
+    invalid_payloads.append(moving_pointer)
+    missing_root_date = json.loads(json.dumps(payload))
+    del missing_root_date["allocation"]["roots"]["CN"]["stock"]["as_of_date"]
+    invalid_payloads.append(missing_root_date)
+    duplicate_rank = json.loads(json.dumps(payload))
+    duplicate_rank["allocation"]["markets"]["HK"]["rank"] = 2
+    invalid_payloads.append(duplicate_rank)
+    below_gap = json.loads(json.dumps(payload))
+    below_gap["strategy_judgments"]["simulate_rotation_pairs"][0]["strength_gap"] = "19.9"
+    invalid_payloads.append(below_gap)
+    too_many = json.loads(json.dumps(payload))
+    too_many["strategy_judgments"]["simulate_rotation_pairs"].append(
+        copy.deepcopy(too_many["strategy_judgments"]["simulate_rotation_pairs"][0])
+    )
+    invalid_payloads.append(too_many)
+    wrong_mode = json.loads(json.dumps(payload))
+    wrong_mode["strategy_judgments"]["simulate_rotation_pairs"][0]["execution_mode"] = "manual"
+    invalid_payloads.append(wrong_mode)
+    wrong_real_mode = json.loads(json.dumps(payload))
+    real_pair = copy.deepcopy(
+        wrong_real_mode["strategy_judgments"]["simulate_rotation_pairs"][0]
+    )
+    real_pair["execution_mode"] = "automatic"
+    wrong_real_mode["strategy_judgments"]["real_rotation_pairs"] = [real_pair]
+    invalid_payloads.append(wrong_real_mode)
+    wrong_date = json.loads(json.dumps(payload))
+    wrong_date["strategy_judgments"]["simulate_rotation_pairs"][0]["execution_date"] = "2026-07-16"
+    invalid_payloads.append(wrong_date)
+    absent_candidate = json.loads(json.dumps(payload))
+    absent_candidate["strategy_judgments"]["simulate_rotation_pairs"][0]["buy_symbol"] = "MISSING"
+    invalid_payloads.append(absent_candidate)
+    mismatched_strategy_allocation = json.loads(json.dumps(payload))
+    mismatched_strategy_allocation["strategy_snapshot"]["parameters"].update({
+        "allocation_snapshot_path": "data/trend_allocation/daily/2026-08-04.json",
+        "allocation_snapshot_sha256": "c" * 64,
+        "allocation_rank": 1,
+        "allocation_score": "99",
+        "allocation_score_source": "A股",
+        "target_weight": "0.06",
+        "nominal_weight": "0.60",
+    })
+    invalid_payloads.append(mismatched_strategy_allocation)
+    mismatched_market = json.loads(json.dumps(payload))
+    mismatched_market["metadata"]["market"] = "HK"
+    invalid_payloads.append(mismatched_market)
+    predecessor_with_allocation = json.loads(json.dumps(payload))
+    predecessor_with_allocation["strategy_snapshot"] = (
+        trend_module.live_trend_strategy_snapshot(
+            "CN", "abc123", (622466, 697199), strategy_version="v10",
+        )
+    )
+    invalid_payloads.append(predecessor_with_allocation)
+    boolean_rank = json.loads(json.dumps(payload))
+    boolean_rank["strategy_snapshot"]["parameters"]["allocation_rank"] = True
+    invalid_payloads.append(boolean_rank)
+
+    assert not any(
+        trend_module.valid_frozen_report_contract(invalid)
+        for invalid in invalid_payloads
+    )
+
+
+def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("0"),
+            positions=tuple(
+                AccountPosition(
+                    symbol, symbol, "stock", Decimal("500"), Decimal("10"),
+                    Decimal("5000"),
+                )
+                for symbol in held_symbols
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("200001", global_strength="90")],
+        holding_snapshots={
+            symbol: holding(symbol, global_strength="10")
+            for symbol in held_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        kelly_data_reason="frozen Kelly inputs unavailable",
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert built.risk_summary["status"] == "paused"
+    assert built.simulate_rotation_pairs == ()
+
+
+def test_cold_start_without_allocation_never_plans_rotation() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("0"),
+            positions=tuple(
+                AccountPosition(
+                    symbol, symbol, "stock", Decimal("500"), Decimal("10"),
+                    Decimal("5000"),
+                )
+                for symbol in held_symbols
+            ),
+            exceptions=(),
+        ),
+        candidates=[candidate("200001", global_strength="90")],
+        holding_snapshots={
+            symbol: holding(symbol, global_strength="10")
+            for symbol in held_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert strategy["strategy_version"] == "v10"
+    assert built.simulate_rotation_pairs == ()
+
+
+def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
+    simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
+    real_symbols = tuple(f"30{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in simulated_symbols
+        ),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in real_symbols
+        ),
+        holding_snapshots={
+            symbol: (
+                None
+                if symbol == real_symbols[-1]
+                else holding(symbol, strength="60", global_strength="60")
+            )
+            for symbol in real_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in real_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in real_symbols
+            }
+        },
+        net_value=Decimal("50000"),
+        available_cash=Decimal("10000"),
+        position_count=10,
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[
+            candidate(real_symbols[-1], asset="ETF基金", strength="96", global_strength="100"),
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+        ],
+        holding_snapshots={
+            symbol: holding(symbol, strength="10", global_strength="10")
+            for symbol in simulated_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in simulated_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in simulated_symbols
+            }
+        },
+        real_holdings=real,
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert [pair.sell_symbol for pair in built.simulate_rotation_pairs] == [
+        "100000", "100001",
+    ]
+    assert [pair.buy_symbol for pair in built.simulate_rotation_pairs] == [
+        real_symbols[-1], "200001",
+    ]
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.real_rotation_pairs] == [
+        ("300000", "200001"),
+    ]
 
 
 def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
@@ -443,6 +1028,217 @@ def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
         estimated_api_cost=Decimal("1.20"),
         actual_api_cost=Decimal("1.00"),
     )
+
+
+def allocation_for(
+    market: str,
+    *,
+    rank: int,
+    entry_weight: str,
+) -> dict[str, object]:
+    ranks = {market: rank}
+    for other_market in ("CN", "HK", "US"):
+        if other_market != market:
+            ranks[other_market] = ({1, 2, 3} - set(ranks.values())).pop()
+    strengths = {1: ("90", "80"), 2: ("70", "60"), 3: ("50", "40")}
+    assets = {
+        "CN": ("A股", "ETF基金"),
+        "HK": ("港股", "香港ETF"),
+        "US": ("美股", "美国ETF"),
+    }
+    roots = {
+        item: {
+            role: {
+                "asset": asset,
+                "tm_id": (market_index + 1) * 10 + role_index,
+                "as_of_date": "2026-08-03",
+                "global_strength": strengths[ranks[item]][role_index],
+            }
+            for role_index, (role, asset) in enumerate(
+                zip(("stock", "etf"), assets[item])
+            )
+        }
+        for market_index, item in enumerate(("CN", "HK", "US"))
+    }
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": {
+            "version": 1,
+            "allocation_date": "2026-08-03",
+            "generated_at": "2026-08-03T16:18:00+08:00",
+            "generator_version": "trend-allocation-v1",
+            "git_sha": "a" * 40,
+            "roots": roots,
+            "markets": {
+                item: {
+                    "rank": ranks[item],
+                    "score": strengths[ranks[item]][0],
+                    "score_source": assets[item][0],
+                    "entry_weight": {1: "0.06", 2: "0.04", 3: "0.02"}[ranks[item]],
+                    "nominal_weight": {1: "0.60", 2: "0.40", 3: "0.20"}[ranks[item]],
+                }
+                for item in ("CN", "HK", "US")
+            },
+        },
+    }
+
+
+def test_freeze_allocation_reference_normalizes_success_reason() -> None:
+    allocation = allocation_for("US", rank=2, entry_weight="0.04")
+    allocation["failure_reason"] = None
+
+    frozen = trend_module.freeze_allocation_reference(allocation)
+
+    assert frozen is not None
+    assert frozen["failure_reason"] == ""
+
+
+def test_valid_frozen_allocation_rejects_null_success_reason() -> None:
+    frozen = trend_module.freeze_allocation_reference(
+        allocation_for("US", rank=2, entry_weight="0.04")
+    )
+    assert frozen is not None
+    frozen["failure_reason"] = None
+
+    assert not trend_module.valid_frozen_allocation(frozen)
+
+
+def active_drawdown_for(
+    snapshot: Mapping[str, object], *, equity: str,
+) -> dict[str, object]:
+    market = str(snapshot["market"])
+    version = str(snapshot["strategy_version"])
+    return {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": market,
+        "strategy_id": snapshot["strategy_id"],
+        "strategy_version": version,
+        "kelly_sample_key": (
+            f"{market}|trend_animals_warm_to_hot/{market}/{version}|{version}"
+        ),
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": equity,
+        "high_water_mark": equity,
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-14T18:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "rank", "weight"),
+    [
+        ("CN", "v12", 1, "0.06"),
+        ("HK", "v10", 2, "0.04"),
+        ("US", "v10", 3, "0.02"),
+    ],
+)
+def test_current_allocation_versions_freeze_rank_weight(
+    market: str, version: str, rank: int, weight: str,
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (1, 2),
+        allocation=allocation_for(market, rank=rank, entry_weight=weight),
+    )
+
+    assert snapshot["strategy_version"] == version
+    assert snapshot["parameters"]["allocation_rank"] == rank
+    assert snapshot["parameters"]["target_weight"] == weight
+    assert snapshot["parameters"]["allocation_snapshot_sha256"] == "b" * 64
+    assert trend_review.normalize_trend_strategy_snapshot(snapshot, market) == snapshot
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "pools"),
+    [
+        ("CN", "v10", (622466, 697199)),
+        ("HK", "v8", (622494,)),
+        ("US", "v8", (622460,)),
+    ],
+)
+def test_cold_start_keeps_current_four_percent_versions_without_allocation_fields(
+    market: str, version: str, pools: tuple[int, ...],
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(market, "abc123", pools)
+
+    assert snapshot["strategy_version"] == version
+    assert "allocation_rank" not in snapshot["parameters"]
+    assert "allocation_snapshot_sha256" not in snapshot["parameters"]
+
+
+def test_allocation_cn_v11_applies_rank_weight_only_to_new_hot_and_boiling_buys(
+    tmp_path: Path,
+) -> None:
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), allocation=allocation,
+    )
+    current_account = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+    )
+    automatic_bootstrap_strategy_drawdown(
+        tmp_path,
+        market="CN",
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version=str(snapshot["strategy_version"]),
+        parameters=snapshot["parameters"],
+        baseline_equity=current_account.net_value,
+        source_date="2026-07-14",
+        accepted_git_sha="a" * 40,
+        actor="pytest",
+        occurred_at="2026-07-14T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-07-15",
+    )
+    drawdown = trend_module.observe_strategy_equity(
+        tmp_path,
+        market="CN",
+        strategy_id=str(snapshot["strategy_id"]),
+        strategy_version=str(snapshot["strategy_version"]),
+        current_equity=current_account.net_value,
+        observed_at="2026-07-14T18:00:00+08:00",
+        entry_date="2026-07-15",
+    )
+
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=current_account,
+        candidates=(
+            candidate("600001", temperature_curr="热"),
+            candidate("600002", temperature_curr="沸"),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version="abc123",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=snapshot,
+        position_weight=Decimal("0.06"),
+        position_weight_source="trend_allocation_rank",
+        drawdown_summary=drawdown,
+    )
+
+    assert [action.target_weight for action in built.buy_actions] == [
+        Decimal("0.06"), Decimal("0.06"),
+    ]
+    assert built.metadata["position_weight_source"] == "trend_allocation_rank"
+    trend_module.validate_report_strategy_snapshot(built)
 
 
 def test_new_mapping_report_freezes_actions_and_skips_unmapped_candidate() -> None:
@@ -5226,6 +6022,57 @@ def test_frozen_base_artifact_is_idempotent(tmp_path: Path) -> None:
     assert json.loads(original_json)["execution_date"] == "2026-07-15"
 
 
+def test_receipt_recovery_preserves_frozen_allocation_and_rotation_payload(
+    tmp_path: Path,
+) -> None:
+    protection_state = {"schema_version": 1, "positions": {}}
+    frozen_payload = {
+        "allocation": {
+            "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+            "sha256": "b" * 64,
+        },
+        "strategy_judgments": {
+            "simulate_rotation_pairs": [{
+                "sell_symbol": "SIM", "buy_symbol": "BUY",
+                "execution_date": "2026-08-04", "execution_mode": "automatic",
+            }],
+            "real_rotation_pairs": [{
+                "sell_symbol": "REAL", "buy_symbol": "BUY",
+                "execution_date": "2026-08-04", "execution_mode": "manual",
+            }],
+        },
+        "protection_state": protection_state,
+    }
+    receipt_path = tmp_path / "delivery/2026-08-03.json"
+    trend_module._write_delivery_receipt(
+        receipt_path,
+        status="prepared",
+        generated_at="2026-08-03T16:20:00+08:00",
+        artifact_stem="2026-08-03",
+        markdown="frozen",
+        report_json=json.dumps(frozen_payload, ensure_ascii=False),
+        protection_state=protection_state,
+    )
+    latest = tmp_path / "trend_allocation/latest.json"
+    latest.parent.mkdir(parents=True)
+    latest.write_text(
+        json.dumps({"daily_path": "data/trend_allocation/daily/later.json"}),
+        encoding="utf-8",
+    )
+
+    recovered = trend_module.read_delivery_receipt(
+        receipt_path, artifact_stem="2026-08-03"
+    )
+    assert recovered is not None
+    assert json.loads(str(recovered["report_json"])) == frozen_payload
+    _, replayed_json = trend_module._freeze_receipt_report(
+        receipt=recovered,
+        reports_dir=tmp_path / "reports/trend_a_share",
+        artifact_stem="2026-08-03",
+    )
+    assert json.loads(replayed_json.read_text(encoding="utf-8")) == frozen_payload
+
+
 def test_frozen_revisions_choose_first_free_pair(tmp_path: Path) -> None:
     base = report()
     assert write_frozen_report(base, tmp_path, revision=True)[0].name == "2026-07-14-r1.md"
@@ -5557,6 +6404,7 @@ def test_report_records_generation_time_and_whitelisted_signal_audit(
         "danger": False,
         "boiling": None,
         "champagne": False,
+        "asset": "A股",
         "industry": "电力",
         "industry_tm_id": 700001,
         "industry_temperature": "热",
@@ -6584,7 +7432,7 @@ def test_missing_industry_row_excludes_only_affected_candidate(
 def test_industry_snapshot_failure_blocks_report(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi(
             [], industry_error=TrendAnimalsError("industry unavailable")
         ),
@@ -6804,7 +7652,7 @@ def test_report_runner_waits_once_then_retries_until_ready(tmp_path: Path) -> No
     assert calls[:4] == ["futu.calendar", "api.update_status", "futu.calendar", "api.update_status"]
 
 
-def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Path) -> None:
+def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Path) -> None:
     calls: list[str] = []
     sleeps: list[float] = []
     feishu = RecordingFeishu()
@@ -6813,7 +7661,7 @@ def test_report_runner_failure_owns_day_at_inclusive_1800_deadline(tmp_path: Pat
     config = trend_config(tmp_path)
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-        datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14", now_fn=lambda: next(times),
@@ -6842,7 +7690,7 @@ def test_report_runner_retries_systemic_futu_failure_through_deadline(tmp_path: 
     calls: list[str] = []
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
-        datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14", now_fn=lambda: next(times),
@@ -8001,7 +8849,7 @@ def test_report_runner_degrades_beijing_holding_kline_value_error(
 def test_report_runner_snapshot_date_mismatch_uses_deadline_contract(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_date="2026-07-13"),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -8019,7 +8867,7 @@ def test_report_runner_rejects_snapshot_tm_id_integrity_failures(
 ) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], snapshot_ids=snapshot_ids),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -8031,7 +8879,7 @@ def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_p
     outage = FutuQuoteError("network down", error_type="quote_server_interrupted")
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([]),
         quote_factory=lambda **kwargs: ReadyQuote(
             [], failed_klines={"SH.000001"}, kline_error=outage
@@ -8045,7 +8893,7 @@ def test_report_runner_retries_systemic_kline_outage_without_formal_report(tmp_p
 def test_report_runner_rejects_invalid_live_billing_price(tmp_path: Path) -> None:
     result = run_a_share_trend_report(
         config=trend_config(tmp_path), run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi([], invalid_billing=True),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=RecordingMacOS(),
     )
@@ -8060,7 +8908,7 @@ def test_report_runner_rejects_catalog_cost_drift_before_paid_snapshots(
     result = run_a_share_trend_report(
         config=trend_config(tmp_path),
         run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: ReadyApi(
             calls, catalog_unit_cost="0.072"
         ),
@@ -8230,7 +9078,7 @@ def test_report_runner_redacts_api_key_from_all_outputs(tmp_path: Path) -> None:
 
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14",
-        now_fn=lambda: datetime(2026, 7, 14, 18, 0, tzinfo=SHANGHAI),
+        now_fn=lambda: datetime(2026, 7, 14, 21, 10, tzinfo=SHANGHAI),
         api_factory=lambda **kwargs: SecretApi([]),
         quote_factory=lambda **kwargs: ReadyQuote([]), notifier=notifier,
     )

@@ -53,6 +53,10 @@ def _run_installer(
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     calls_path = tmp_path / "fake-calls"
+    state_dir = tmp_path / "launchd-state"
+    state_dir.mkdir()
+    for label in (SINGLE_LABEL, GATEWAY_LABEL, LEGACY_LABEL):
+        (state_dir / label).touch()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
@@ -61,7 +65,23 @@ def _run_installer(
         launchctl,
         """#!/bin/bash
 echo "launchctl $*" >> "$FAKE_CALLS"
+label="${2##*/}"
+if [[ "$1" == "bootout" ]]; then
+  if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
+    rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+  fi
+  exit 0
+fi
+if [[ "$1" == "bootstrap" ]]; then
+  label="$(basename "$3" .plist)"
+  : > "$FAKE_LAUNCHD_STATE_DIR/$label"
+  exit 0
+fi
 if [[ "$1" == "print" ]]; then
+  if [[ ! -f "$FAKE_LAUNCHD_STATE_DIR/$label" ]]; then
+    echo "Could not find service" >&2
+    exit 113
+  fi
   case "$2" in
     *com.open-trader.dashboard) echo "pid = 4101" ;;
     *com.open-trader.frontend-gateway) echo "pid = 4102" ;;
@@ -142,6 +162,7 @@ exit 0
     env = {
         **os.environ,
         "FAKE_CALLS": str(calls_path),
+        "FAKE_LAUNCHD_STATE_DIR": str(state_dir),
         "LAUNCHCTL_BIN": str(launchctl),
         "LSOF_BIN": str(lsof),
         "CURL_BIN": str(curl),
@@ -254,6 +275,23 @@ def test_stack_cutover_verifies_legacy_before_stopping_single_and_starting_gatew
     assert result.returncode == 0
     assert legacy_ready < single_stop < gateway_start < gateway_ready
     assert not any(" kickstart " in call for call in calls)
+
+
+def test_stack_does_not_bootstrap_while_bootout_remains_loaded(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        FAKE_STUCK_LABEL=LEGACY_LABEL,
+    )
+    domain = f"gui/{os.getuid()}"
+
+    assert result.returncode == 1
+    assert f"launchd job is still loaded: {LEGACY_LABEL}" in result.stderr
+    assert (
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
+        not in calls
+    )
 
 
 def test_gateway_failure_stops_stack_restores_single_and_verifies_public_url(

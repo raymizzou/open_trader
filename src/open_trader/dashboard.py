@@ -25,6 +25,7 @@ from .a_share_trend import (
     live_trend_strategy_snapshot,
     trend_api_cost_label,
     valid_serialized_account,
+    valid_frozen_report_contract,
     valid_v2_risk_contract,
     valid_v3_risk_contract,
     valid_v4_risk_contract,
@@ -83,7 +84,12 @@ from .technical_facts import (
     technical_facts_has_missing_timeframe,
     technical_facts_latest_path,
 )
-from .trend_review import _report_hash, _validate_execution_batch
+from .trend_review import (
+    _report_hash,
+    _rotation_pair_key,
+    _validate_execution_batch,
+    _validate_rotation_event,
+)
 from .trend_market_controller import _valid_status
 from .strategy_drawdown import valid_drawdown_decision
 from .trend_api_stats import load_trend_api_stats
@@ -1137,6 +1143,24 @@ def _project_trend_money_items(
     ]
 
 
+def _project_trend_strength_fields(
+    items: list[dict[str, Any]], snapshots: object,
+) -> list[dict[str, Any]]:
+    by_symbol = (
+        snapshots if isinstance(snapshots, dict) else {}
+    )
+    projected: list[dict[str, Any]] = []
+    for item in items:
+        row = dict(item)
+        snapshot = by_symbol.get(str(row.get("symbol") or ""))
+        if isinstance(snapshot, dict):
+            for key in ("strength", "global_strength"):
+                if row.get(key) in (None, "") and snapshot.get(key) not in (None, ""):
+                    row[key] = snapshot[key]
+        projected.append(row)
+    return projected
+
+
 def _project_trend_order_decimal(value: object) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
@@ -1972,6 +1996,7 @@ def _valid_trend_report_payload(
         and _valid_frozen_trend_facts(payload)
         and _valid_trend_risk_summary(payload)
         and _valid_option_attention(payload, market=market)
+        and valid_frozen_report_contract(payload)
         and as_of_date <= freshness_date <= execution_date
     ):
         return None
@@ -2150,6 +2175,10 @@ def _project_broker_trend_report(
             "hold_actions": [],
             "review_actions": [],
             "real_position_actions": [],
+            "simulate_rotation_pairs": [],
+            "simulate_rotation_comparisons": [],
+            "real_rotation_pairs": [],
+            "real_rotation_comparisons": [],
             "real_position_status": "unavailable",
             "real_position_reason": execution_batch_error,
             "real_position_source": {},
@@ -2180,6 +2209,20 @@ def _project_broker_trend_report(
         _project_trend_actions(payload, executions)
     )
     real_position_actions = _project_trend_real_actions(payload)
+    frozen_signals = payload.get("signal_snapshots")
+    frozen_signals = frozen_signals if isinstance(frozen_signals, dict) else {}
+    buy_actions = _project_trend_strength_fields(
+        buy_actions, frozen_signals.get("candidates")
+    )
+    sell_actions = _project_trend_strength_fields(
+        sell_actions, frozen_signals.get("holdings")
+    )
+    hold_actions = _project_trend_strength_fields(
+        hold_actions, frozen_signals.get("holdings")
+    )
+    real_position_actions = _project_trend_strength_fields(
+        real_position_actions, frozen_signals.get("real_holdings")
+    )
     included_symbols = {
         symbol
         for item in [*buy_actions, *hold_actions]
@@ -2267,11 +2310,22 @@ def _project_broker_trend_report(
     )
     if not isinstance(frozen_parameter_rows, list):
         frozen_parameter_rows = []
+    allocation = payload.get("allocation")
+    current_allocation_reference = (
+        {
+            "daily_path": allocation["daily_path"],
+            "sha256": allocation["sha256"],
+            "snapshot": {"markets": allocation["markets"]},
+        }
+        if isinstance(allocation, dict)
+        else None
+    )
     current_strategy_snapshot = (
         live_trend_strategy_snapshot(
             market,
             str(strategy_snapshot.get("process_version") or ""),
             current_candidate_pool_ids,
+            allocation=current_allocation_reference,
         )
         if isinstance(strategy_snapshot, dict)
         and current_candidate_pool_ids
@@ -2355,6 +2409,38 @@ def _project_broker_trend_report(
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
+        "allocation": payload.get("allocation"),
+        "simulate_rotation_pairs": _project_simulated_rotation_pairs(
+            payload["strategy_judgments"].get("simulate_rotation_pairs", []),
+            data_dir=data_dir,
+            market=market,
+            execution_date=execution_date.isoformat(),
+            report_sha256=report_sha256,
+            account_id=metadata.get("simulate_acc_id"),
+        ) if payload.get("allocation") is not None else [],
+        "real_rotation_pairs": (
+            payload["strategy_judgments"].get("real_rotation_pairs", [])
+            if payload.get("allocation") is not None
+            else []
+        ),
+        "simulate_rotation_comparisons": (
+            copy.deepcopy(
+                payload["strategy_judgments"].get(
+                    "simulate_rotation_comparisons", []
+                )
+            )
+            if payload.get("allocation") is not None
+            else []
+        ),
+        "real_rotation_comparisons": (
+            copy.deepcopy(
+                payload["strategy_judgments"].get(
+                    "real_rotation_comparisons", []
+                )
+            )
+            if payload.get("allocation") is not None
+            else []
+        ),
         "industry_context_status": frozen_industry_context_status,
         "industry_contexts": frozen_industry_contexts,
         "strategy_parameter_rows": frozen_parameter_rows,
@@ -2868,6 +2954,74 @@ def _trend_action_executions(
         *revision_key,
     )
     return copy.deepcopy(cached)
+
+
+def _project_simulated_rotation_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    data_dir: Path,
+    market: str,
+    execution_date: str,
+    report_sha256: str,
+    account_id: object,
+) -> list[dict[str, Any]]:
+    projected = [{**pair, "execution_status": "待执行"} for pair in pairs]
+    if (
+        isinstance(account_id, bool)
+        or not isinstance(account_id, int)
+        or account_id <= 0
+    ):
+        return projected
+    terminal_labels = {
+        "complete": "完成",
+        "failed": "失败",
+        "partial": "部分完成",
+        "incomplete": "未完成",
+        "skipped": "跳过",
+        "missed": "错过执行日",
+    }
+    for pair, output in zip(pairs, projected):
+        pair_index = pair.get("pair_index")
+        if isinstance(pair_index, bool) or not isinstance(pair_index, int):
+            continue
+        pair_key = _rotation_pair_key(
+            market, account_id, execution_date, report_sha256, pair_index
+        )
+        root = (
+            data_dir / "trend_review" / "ledgers" / market / "rotations"
+            / execution_date / pair_key
+        )
+        events: list[dict[str, object]] = []
+        for path in sorted(root.glob("*.json")):
+            try:
+                event = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(event, dict):
+                    continue
+                _validate_rotation_event(event, path)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                continue
+            events.append(event)
+        terminal = next(
+            (
+                terminal_labels.get(str(event.get("status") or ""))
+                for event in events
+                if event.get("kind") == "terminal"
+            ),
+            None,
+        )
+        if terminal:
+            output["execution_status"] = terminal
+        elif any(event.get("kind") == "buy_fill" for event in events):
+            output["execution_status"] = "买入已成交"
+        elif any(event.get("kind") in {"buy_intent", "buy_result"} for event in events):
+            output["execution_status"] = "买入中"
+        elif any(event.get("kind") in {"sell_fill", "sell_observation"} for event in events):
+            output["execution_status"] = "卖出已成交"
+        elif any(event.get("kind") in {"sell_intent", "sell_result"} for event in events):
+            output["execution_status"] = "卖出中"
+        elif any(event.get("kind") == "pending" for event in events):
+            output["execution_status"] = "执行中"
+    return projected
 
 
 @lru_cache(maxsize=256)

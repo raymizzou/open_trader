@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -17,6 +18,25 @@ DECISION_SCHEMA_VERSION = "open_trader.strategy_drawdown.v1"
 DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
+ALLOCATION_PROJECTION_COMPATIBILITY_REVISION = "allocation_projection_v1"
+ALLOCATION_PROJECTION_VERSIONS = {"CN": "v12", "HK": "v10", "US": "v10"}
+# Keep the immediately preceding allocation-era reports readable while the
+# current version owns new state and parameter transitions.
+LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v11", "HK": "v9", "US": "v9"}
+ALLOCATION_PROJECTION_PARAMETER_HASHES = {
+    "CN": (
+        "c9f06d07dfb9d889041c34e99b00b4484d36e48dedb5707cf705a9e152b119f7",
+        "c19f9c14bf7de37be08f8904cfc8e7cbb85df0d86544f9746d4b54ffec33eb38",
+    ),
+    "HK": (
+        "863546b4f2ca645a8555534e43278dcd9f781a3ce1fd2f533917d2c4a22417a6",
+        "ef17ed5d6cc6f6ad537dc45d985f207de62b536c88537614815b02029376f374",
+    ),
+    "US": (
+        "4163c4d7c959ebbd95fef67ba021bc99b70b08841ee4adfd81eedf2d047bc274",
+        "d30cd253f2ed1b780ee00c343ad4e4e11202a9612810f6ca52961e4d38a316f2",
+    ),
+}
 UNIFIED_TREND_V5_PARAMETER_HASHES = {
     "US": (
         "860170403d6241cd3590c02449de7a1bd11842124055587f7c4eec64b927d253",
@@ -35,6 +55,23 @@ OVERHEAT_TRIM_COMPATIBILITY_PARAMETERS = {
     "overheat_trim_below_lot": "no_order_terminal",
     "full_exit_precedes_partial_exit": True,
 }
+ALLOCATION_DYNAMIC_PARAMETER_NAMES = frozenset({
+    "allocation_snapshot_path",
+    "allocation_snapshot_sha256",
+    "allocation_rank",
+    "allocation_score",
+    "allocation_score_source",
+    "target_weight",
+    "nominal_weight",
+})
+ALLOCATION_WEIGHTS = {
+    1: (Decimal("0.06"), Decimal("0.60")),
+    2: (Decimal("0.04"), Decimal("0.40")),
+    3: (Decimal("0.02"), Decimal("0.20")),
+}
+ALLOCATION_DAILY_PATH = re.compile(
+    r"data/trend_allocation/daily/\d{4}-\d{2}-\d{2}(?:-r[1-9]\d*)?\.json\Z"
+)
 DECISION_FIELDS = {
     "schema_version",
     "market",
@@ -276,7 +313,50 @@ def _observe_strategy_equity_locked(
     )
 
 
-def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
+def _strategy_parameter_identity(
+    parameters: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    identity = dict(parameters)
+    allocation_parameters = None
+    allocation_markers = (
+        ALLOCATION_DYNAMIC_PARAMETER_NAMES - {"target_weight"}
+    ) & identity.keys()
+    if allocation_markers:
+        if not ALLOCATION_DYNAMIC_PARAMETER_NAMES <= identity.keys():
+            raise ValueError("allocation strategy parameters are invalid")
+        rank = identity["allocation_rank"]
+        try:
+            score = Decimal(str(identity["allocation_score"]))
+            target_weight = Decimal(str(identity["target_weight"]))
+            nominal_weight = Decimal(str(identity["nominal_weight"]))
+        except (InvalidOperation, ValueError):
+            raise ValueError("allocation strategy parameters are invalid") from None
+        path = identity["allocation_snapshot_path"]
+        sha256 = identity["allocation_snapshot_sha256"]
+        score_source = identity["allocation_score_source"]
+        if (
+            type(rank) is not int
+            or rank not in ALLOCATION_WEIGHTS
+            or not score.is_finite()
+            or not target_weight.is_finite()
+            or not nominal_weight.is_finite()
+            or (target_weight, nominal_weight) != ALLOCATION_WEIGHTS[rank]
+            or not isinstance(path, str)
+            or ALLOCATION_DAILY_PATH.fullmatch(path) is None
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or not isinstance(score_source, str)
+            or not score_source
+        ):
+            raise ValueError("allocation strategy parameters are invalid")
+        allocation_parameters = {
+            name: identity.pop(name) for name in ALLOCATION_DYNAMIC_PARAMETER_NAMES
+        }
+    return identity, allocation_parameters
+
+
+def _canonical_parameter_hash(parameters: Mapping[str, object]) -> str:
     try:
         encoded = json.dumps(
             dict(parameters),
@@ -288,6 +368,11 @@ def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
     except (TypeError, ValueError):
         raise ValueError("strategy parameters must be canonical JSON") from None
     return hashlib.sha256(encoded).hexdigest()
+
+
+def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
+    identity, _allocation_parameters = _strategy_parameter_identity(parameters)
+    return _canonical_parameter_hash(identity)
 
 
 def valid_strategy_parameter_audit_identity(
@@ -309,15 +394,26 @@ def valid_strategy_parameter_audit_identity(
         return False
     old_hash = bootstrap_event.get("parameter_hash")
     if parameter_compatibility_event is not None:
-        return (
+        common = (
             isinstance(parameter_compatibility_event, dict)
             and _valid_parameter_compatibility_event(parameter_compatibility_event)
             and _record_key(parameter_compatibility_event) == key
             and parameter_compatibility_event.get("old_parameter_hash") == old_hash
             and parameter_compatibility_event.get("new_parameter_hash") == current_hash
-            and _compatibility_transition_revision(key, parameters, old_hash) is not None
         )
-    return old_hash == current_hash
+        if not common:
+            return False
+        if (
+            parameter_compatibility_event.get("compatibility_revision")
+            == ALLOCATION_PROJECTION_COMPATIBILITY_REVISION
+        ):
+            return _approved_allocation_projection_transition(
+                key, parameters, old_hash
+            )
+        return _compatibility_transition_revision(key, parameters, old_hash) is not None
+    return old_hash == current_hash or _approved_legacy_allocation_parameter_hash(
+        key, parameters, old_hash
+    )
 
 
 def automatic_bootstrap_strategy_drawdown(
@@ -417,7 +513,7 @@ def automatic_bootstrap_strategy_drawdown(
                 if compatibility_revision is None:
                     raise ValueError("strategy parameters changed without a version bump")
                 assert isinstance(old_hash, str)
-                events.append({
+                compatibility_event = {
                     "event_id": _parameter_compatibility_event_id(
                         key, old_hash, parameter_hash, compatibility_revision
                     ),
@@ -431,7 +527,8 @@ def automatic_bootstrap_strategy_drawdown(
                     "new_parameter_hash": parameter_hash,
                     "compatibility_revision": compatibility_revision,
                     "accepted_git_sha": accepted_git_sha,
-                })
+                }
+                events.append(compatibility_event)
                 _write_state(path, payload)
             assert isinstance(record, dict)
             return _decision_from_record(
@@ -945,7 +1042,7 @@ def _valid_automatic_bootstrap_event(value: object) -> bool:
 
 
 def _valid_parameter_compatibility_event(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    fields = {
         "event_id",
         "event_type",
         "market",
@@ -957,7 +1054,10 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
         "new_parameter_hash",
         "compatibility_revision",
         "accepted_git_sha",
-    }:
+    }
+    if not isinstance(value, dict):
+        return False
+    if set(value) != fields:
         return False
     try:
         key = _strategy_key(
@@ -999,6 +1099,13 @@ def _valid_parameter_compatibility_event(value: object) -> bool:
                 == UNIFIED_TREND_V5_COMPATIBILITY_REVISION
                 and (old_hash, new_hash)
                 == UNIFIED_TREND_V5_PARAMETER_HASHES[key[0]]
+            )
+            or (
+                _allocation_projection_key(key)
+                and value["compatibility_revision"]
+                == ALLOCATION_PROJECTION_COMPATIBILITY_REVISION
+                and (old_hash, new_hash)
+                == ALLOCATION_PROJECTION_PARAMETER_HASHES[key[0]]
             )
         )
         and _is_sha1(value["accepted_git_sha"])
@@ -1051,6 +1158,49 @@ def _approved_unified_trend_v5_transition(
     )
 
 
+def _allocation_projection_key(key: tuple[str, str, str]) -> bool:
+    versions = {
+        ALLOCATION_PROJECTION_VERSIONS.get(key[0]),
+        LEGACY_ALLOCATION_PROJECTION_VERSIONS.get(key[0]),
+    }
+    return key[2] in versions and key[1] == f"trend_animals_warm_to_hot/{key[0]}/{key[2]}"
+
+
+def _approved_legacy_allocation_parameter_hash(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> bool:
+    if not _allocation_projection_key(key) or not _is_sha256(old_hash):
+        return False
+    try:
+        _identity, allocation_parameters = _strategy_parameter_identity(parameters)
+        raw_hash = _canonical_parameter_hash(parameters)
+    except (TypeError, ValueError):
+        return False
+    return allocation_parameters is not None and raw_hash == old_hash
+
+
+def _approved_allocation_projection_transition(
+    key: tuple[str, str, str],
+    parameters: Mapping[str, object],
+    old_hash: object,
+) -> bool:
+    expected = ALLOCATION_PROJECTION_PARAMETER_HASHES.get(key[0])
+    if not _allocation_projection_key(key) or expected is None:
+        return False
+    try:
+        identity, allocation_parameters = _strategy_parameter_identity(parameters)
+        projected_hash = _canonical_parameter_hash(identity)
+    except (TypeError, ValueError):
+        return False
+    return (
+        allocation_parameters is not None
+        and old_hash == expected[0]
+        and projected_hash == expected[1]
+    )
+
+
 def _compatibility_transition_revision(
     key: tuple[str, str, str],
     parameters: Mapping[str, object],
@@ -1060,6 +1210,8 @@ def _compatibility_transition_revision(
         return OVERHEAT_TRIM_COMPATIBILITY_REVISION
     if _approved_unified_trend_v5_transition(key, parameters, old_hash):
         return UNIFIED_TREND_V5_COMPATIBILITY_REVISION
+    if _approved_allocation_projection_transition(key, parameters, old_hash):
+        return ALLOCATION_PROJECTION_COMPATIBILITY_REVISION
     return None
 
 

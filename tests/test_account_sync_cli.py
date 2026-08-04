@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -7,10 +8,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import open_trader.account_sync_controller as controller_module
+import open_trader.account_sync_worker as worker_module
 import open_trader.cli as cli
 import open_trader.dashboard_quotes as quotes_module
-from open_trader.account_sync_controller import AccountSyncControllerConfig
+from open_trader.account_sync_worker import AccountSyncWorkerConfig
 from open_trader.account_sync_state import empty_account_sync_state
 from open_trader.cli import build_parser
 
@@ -18,19 +19,23 @@ from open_trader.cli import build_parser
 def test_parser_exposes_only_account_sync_commands() -> None:
     parser = build_parser()
 
-    controller = parser.parse_args(["account-sync-controller", "--once"])
+    worker = parser.parse_args(["account-sync-worker", "--once"])
     status = parser.parse_args(["account-sync-status", "--json"])
 
-    assert controller.config == Path("config/daily_premarket.env")
-    assert controller.data_dir == Path("data")
-    assert controller.reports_dir == Path("reports")
-    assert controller.portfolio == Path("data/latest/portfolio.csv")
-    assert controller.tiger_config_dir == Path("~/.tigeropen/")
-    assert controller.account_interval_seconds == 60.0
-    assert controller.quote_interval_seconds == 5.0
-    assert controller.once is True
+    assert worker.config == Path("config/daily_premarket.env")
+    assert worker.data_dir == Path("data")
+    assert worker.reports_dir == Path("reports")
+    assert worker.portfolio == Path("data/latest/portfolio.csv")
+    assert worker.tiger_config_dir == Path("~/.tigeropen/")
+    assert worker.account_interval_seconds == 60.0
+    assert worker.quote_interval_seconds == 5.0
+    assert worker.once is True
     assert status.data_dir == Path("data")
     assert status.json is True
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["account-sync-controller"])
+    assert exc_info.value.code == 2
 
     for command in (
         "check-futu-quotes",
@@ -44,7 +49,12 @@ def test_parser_exposes_only_account_sync_commands() -> None:
         assert exc_info.value.code == 2
 
 
-def test_controller_uses_only_futu_connection_env_values(
+def test_old_account_sync_controller_module_is_not_available() -> None:
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("open_trader.account_sync_controller")
+
+
+def test_worker_uses_only_futu_connection_env_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "daily_premarket.env"
@@ -56,21 +66,21 @@ def test_controller_uses_only_futu_connection_env_values(
     )
     captured: dict[str, object] = {}
 
-    def fake_run(config: AccountSyncControllerConfig, *, once: bool) -> int:
+    def fake_run(config: AccountSyncWorkerConfig, *, once: bool) -> int:
         captured.update(config=config, once=once)
         return 0
 
-    monkeypatch.setattr(cli, "run_account_sync_controller", fake_run)
+    monkeypatch.setattr(cli, "run_account_sync_worker", fake_run)
     monkeypatch.setattr(
         cli,
         "load_env_config",
-        lambda *_args, **_kwargs: pytest.fail("controller must not load notifier/LLM config"),
+        lambda *_args, **_kwargs: pytest.fail("worker must not load notifier/LLM config"),
     )
 
     assert (
         cli.main(
             [
-                "account-sync-controller",
+                "account-sync-worker",
                 "--config",
                 str(config_path),
                 "--data-dir",
@@ -92,7 +102,7 @@ def test_controller_uses_only_futu_connection_env_values(
     )
 
     config = captured["config"]
-    assert isinstance(config, AccountSyncControllerConfig)
+    assert isinstance(config, AccountSyncWorkerConfig)
     assert config.futu_host == "10.0.0.7"
     assert config.futu_port == 12345
     assert config.account_interval_seconds == 61.0
@@ -143,8 +153,8 @@ def test_status_reads_only_published_files(
     def fail(*_args: object, **_kwargs: object) -> object:
         pytest.fail("account-sync-status must not construct a live client")
 
-    monkeypatch.setattr(controller_module, "FutuAccountClient", fail)
-    monkeypatch.setattr(controller_module, "TigerAccountClient", fail)
+    monkeypatch.setattr(worker_module, "FutuAccountClient", fail)
+    monkeypatch.setattr(worker_module, "TigerAccountClient", fail)
     monkeypatch.setattr(quotes_module, "FutuQuoteClient", fail)
 
     assert cli.main(["account-sync-status", "--data-dir", str(data_dir), "--json"]) == 0

@@ -25,7 +25,11 @@ const rgb = {
   success: 'rgb(47, 133, 90)',
 } as const;
 
-async function installLedgerFixture(page: Page, tigerStatus: 'ok' | 'failed' | 'stale' | 'unknown' = 'ok') {
+async function installLedgerFixture(
+  page: Page,
+  tigerStatus: 'ok' | 'failed' | 'stale' | 'unknown' = 'ok',
+  includeAllocation = false,
+) {
   await page.route('**/api/dashboard', async (route) => {
     const response = await route.fetch();
     const fixture = await response.json();
@@ -162,6 +166,39 @@ async function installLedgerFixture(page: Page, tigerStatus: 'ok' | 'failed' | '
         },
       },
     };
+    if (includeAllocation) {
+      fixture.trend_reports.eastmoney.allocation = {
+        daily_path: 'data/trend_allocation/daily/2026-08-03.json',
+        sha256: 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+        allocation_date: '2026-08-03',
+        generated_at: '2026-08-03T16:20:00+08:00',
+        reused: false,
+        stale_a_trading_days: 0,
+        failure_reason: '',
+        roots: {
+          CN: { stock: { asset: 'A股', as_of_date: '2026-08-03', global_strength: '62' }, etf: { asset: 'ETF基金', as_of_date: '2026-08-03', global_strength: '61' } },
+          HK: { stock: { asset: '港股', as_of_date: '2026-08-03', global_strength: '72' }, etf: { asset: '香港ETF', as_of_date: '2026-08-03', global_strength: '71' } },
+          US: { stock: { asset: '美股', as_of_date: '2026-08-03', global_strength: '82' }, etf: { asset: '美国ETF', as_of_date: '2026-08-03', global_strength: '81' } },
+        },
+        markets: {
+          CN: { rank: 3, score: '62', score_source: 'A股', entry_weight: '0.02', nominal_weight: '0.20' },
+          HK: { rank: 2, score: '72', score_source: '港股', entry_weight: '0.04', nominal_weight: '0.40' },
+          US: { rank: 1, score: '82', score_source: '美股', entry_weight: '0.06', nominal_weight: '0.60' },
+        },
+      };
+      fixture.trend_reports.eastmoney.simulate_rotation_pairs = [{
+        sell_symbol: '600519', sell_name: '贵州茅台', sell_global_strength: '41',
+        buy_symbol: '600036', buy_name: '招商银行', buy_global_strength: '81',
+        strength_gap: '40', target_weight: '0.02', target_amount: '20000',
+        estimated_shares: '400', execution_date: '2026-08-04', execution_mode: 'automatic',
+      }];
+      fixture.trend_reports.eastmoney.real_rotation_pairs = [{
+        sell_symbol: '600000', sell_name: '浦发银行', sell_global_strength: '42',
+        buy_symbol: '600900', buy_name: '长江电力', buy_global_strength: '82',
+        strength_gap: '40', target_weight: '0.02', target_amount: '20000',
+        estimated_shares: '700', execution_date: '2026-08-04', execution_mode: 'manual',
+      }];
+    }
     fixture.holdings = [
       { market: 'US', symbol: 'AAPL', name: 'Apple', currency: 'USD', total_quantity: '10000', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl_pct: '16.67%', brokers: 'futu', broker_details: [{ broker: 'futu', market: 'US', symbol: 'AAPL', name: 'Apple', quantity: '10000', cost_value: '1800000.00', avg_cost_price: '180.00', market_value_hkd: '16380000.00', unrealized_pnl: '300000.00', unrealized_pnl_pct: '16.67%' }] },
       { market: 'US', symbol: 'QQQ', name: 'Nasdaq 100', currency: 'USD', total_quantity: '2', avg_cost_price: '500.00', market_value_hkd: '7800.00', unrealized_pnl_pct: '-2.00%', brokers: 'tiger', broker_details: [{ broker: 'tiger', market: 'US', symbol: 'QQQ', name: 'Nasdaq 100', quantity: '2', cost_value: '1000.00', avg_cost_price: '500.00', market_value_hkd: '7800.00', unrealized_pnl: '-20.00', unrealized_pnl_pct: '-2.00%' }] },
@@ -633,4 +670,54 @@ test('keeps the A-share report card-based with no page overflow on mobile', asyn
   }
   await expect(page.locator('.cn-trend-buy .cn-trend-card')).toHaveCSS('display', 'grid');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('renders allocation and relative rotation in desktop and mobile report order', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installLedgerFixture(page, 'ok', true);
+  await page.goto('/');
+  await page.getByRole('tab', { name: /东方财富/ }).click();
+  await page.getByRole('tab', { name: '趋势报告', exact: true }).click();
+
+  await expect(page.locator('.trend-allocation-card')).toHaveCount(3);
+  await expect(page.locator('.trend-rotation-group')).toHaveCount(2);
+  await expect(page.getByRole('heading', { name: '模拟盘自动' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '实盘手动' })).toBeVisible();
+  expect(await page.locator('.trend-allocation-cards').evaluate((node) => (
+    getComputedStyle(node).gridTemplateColumns.split(' ').length
+  ))).toBe(3);
+
+  await page.setViewportSize({ width: 375, height: 844 });
+  expect(await page.locator('.trend-allocation-cards').evaluate((node) => (
+    getComputedStyle(node).gridTemplateColumns.split(' ').length
+  ))).toBe(1);
+  expect(await page.locator('.trend-rotation-groups').evaluate((node) => (
+    getComputedStyle(node).gridTemplateColumns.split(' ').length
+  ))).toBe(1);
+  const mobile = await page.evaluate(() => {
+    const selectors = [
+      '.trend-report-header', '.trend-allocation-panel', '.cn-trend-sell',
+      '.trend-rotation-panel', '.cn-trend-buy',
+    ];
+    const order = selectors.map((selector) => {
+      const node = document.querySelector(selector)!;
+      return [...node.parentElement!.children].indexOf(node);
+    });
+    const cards = [...document.querySelectorAll('.trend-allocation-card, .trend-rotation-pair')];
+    const controls = [...document.querySelectorAll(
+      '.trend-report-header button, .trend-allocation-panel button, .trend-rotation-panel button',
+    )];
+    return {
+      order,
+      pageFits: document.documentElement.scrollWidth <= window.innerWidth,
+      cardsFit: cards.every((node) => node.scrollWidth <= node.clientWidth),
+      controlCount: controls.length,
+      controlsFit: controls.every((node) => node.getBoundingClientRect().height >= 44),
+    };
+  });
+  expect(mobile.order.every((value, index) => index === 0 || mobile.order[index - 1] < value)).toBe(true);
+  expect(mobile.pageFits).toBe(true);
+  expect(mobile.cardsFit).toBe(true);
+  expect(mobile.controlCount).toBeGreaterThan(0);
+  expect(mobile.controlsFit).toBe(true);
 });

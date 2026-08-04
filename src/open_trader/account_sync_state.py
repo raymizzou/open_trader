@@ -15,7 +15,6 @@ from typing import Literal, Mapping, Sequence
 from .csv_io import write_rows
 from .fx import StaticMonthEndFxProvider
 from .models import AssetClass, CashBalance, Market, Position
-from . import pipeline
 from .portfolio import (
     PORTFOLIO_FIELDNAMES,
     PortfolioBuildError,
@@ -169,6 +168,8 @@ def _statement_candidate_from_run(
             for row in manifest
         ):
             return None
+        from . import pipeline
+
         candidate = BrokerAccountCandidate(
             broker=broker,
             source_kind="statement",
@@ -1039,6 +1040,14 @@ def _is_valid_state(value: object) -> bool:
         return False
     return all(
         _is_valid_source(brokers[broker], broker) for broker in REQUIRED_BROKERS
+    )
+
+
+def is_valid_account_publication(value: object) -> bool:
+    return (
+        _is_valid_state(value)
+        and isinstance(value, dict)
+        and _is_valid_dashboard_projection(value.get("dashboard_projection"))
     )
 
 

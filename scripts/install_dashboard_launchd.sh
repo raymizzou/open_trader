@@ -157,6 +157,29 @@ wait_http() {
 
 bootout_agent() {
   "$LAUNCHCTL_BIN" bootout "gui/$UID/$1" 2>/dev/null || true
+  wait_agent_absent "$1"
+}
+
+wait_agent_absent() {
+  local label="$1" attempt output status
+  for attempt in 1 2 3 4 5; do
+    if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$label" 2>&1)"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ "$status" -ne 0 && "$output" == *"Could not find service"* ]]; then
+      return 0
+    fi
+    if [[ "$status" -ne 0 ]]; then
+      echo "failed to inspect launchd label: $label" >&2
+      printf '%s\n' "$output" >&2
+      return 1
+    fi
+    [[ "$attempt" -lt 5 ]] && sleep 1
+  done
+  echo "launchd job is still loaded: $label" >&2
+  return 1
 }
 
 bootstrap_agent() {
@@ -170,14 +193,14 @@ bootstrap_agent() {
 
 start_agent() {
   local label="$1" plist="$2"
-  bootout_agent "$label"
+  bootout_agent "$label" || return 1
   bootstrap_agent "$plist"
 }
 
 restore_single() {
-  bootout_agent "$GATEWAY_LABEL"
-  bootout_agent "$LEGACY_LABEL"
-  bootout_agent "$SINGLE_LABEL"
+  bootout_agent "$GATEWAY_LABEL" || return 1
+  bootout_agent "$LEGACY_LABEL" || return 1
+  bootout_agent "$SINGLE_LABEL" || return 1
   bootstrap_agent "$SINGLE_PLIST" || return 1
   wait_http "http://127.0.0.1:8766/"
 }

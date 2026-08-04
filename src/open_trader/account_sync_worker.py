@@ -39,7 +39,7 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
-class AccountSyncControllerConfig:
+class AccountSyncWorkerConfig:
     data_dir: Path
     reports_dir: Path
     portfolio_path: Path
@@ -51,10 +51,10 @@ class AccountSyncControllerConfig:
     quote_interval_seconds: float = 5.0
 
 
-class AccountSyncController:
+class AccountSyncWorker:
     def __init__(
         self,
-        config: AccountSyncControllerConfig,
+        config: AccountSyncWorkerConfig,
         *,
         clock: Callable[[], float] = time.monotonic,
         now_text: Callable[[], str] | None = None,
@@ -319,8 +319,8 @@ def _now_text() -> str:
     return datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds")
 
 
-def run_account_sync_controller(
-    config: AccountSyncControllerConfig,
+def run_account_sync_worker(
+    config: AccountSyncWorkerConfig,
     *,
     once: bool = False,
     clock: Callable[[], float] = time.monotonic,
@@ -332,20 +332,20 @@ def run_account_sync_controller(
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print("已有同步控制器运行", file=sys.stderr)
+            print("已有账户同步 Worker 运行", file=sys.stderr)
             return 1
         try:
-            controller = AccountSyncController(config, clock=clock)
+            worker = AccountSyncWorker(config, clock=clock)
             while True:
                 now = clock()
-                if controller.account_due(now):
-                    controller.account_loop = _run_loop(controller.sync_accounts_once)
-                if controller.quote_due(now):
-                    controller.quote_loop = _run_loop(controller.sync_quotes_once)
-                controller.write_heartbeat()
+                if worker.account_due(now):
+                    worker.account_loop = _run_loop(worker.sync_accounts_once)
+                if worker.quote_due(now):
+                    worker.quote_loop = _run_loop(worker.sync_quotes_once)
+                worker.write_heartbeat()
                 if once:
                     return 0
-                sleep_fn(_next_sleep(controller, clock()))
+                sleep_fn(_next_sleep(worker, clock()))
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -361,16 +361,16 @@ def _is_due(last_attempt: float | None, now: float, interval: float) -> bool:
     return last_attempt is None or now - last_attempt >= interval
 
 
-def _next_sleep(controller: AccountSyncController, now: float) -> float:
+def _next_sleep(worker: AccountSyncWorker, now: float) -> float:
     account_due = _next_due(
-        controller._last_account_attempt,
+        worker._last_account_attempt,
         now,
-        controller.config.account_interval_seconds,
+        worker.config.account_interval_seconds,
     )
     quote_due = _next_due(
-        controller._last_quote_attempt,
+        worker._last_quote_attempt,
         now,
-        controller.config.quote_interval_seconds,
+        worker.config.quote_interval_seconds,
     )
     return max(0.0, min(account_due, quote_due) - now)
 

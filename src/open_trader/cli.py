@@ -28,9 +28,9 @@ from .a_share_trend import (
     load_futu_simulate_trend_account,
 )
 from .backtest import run_backtest
-from .account_sync_controller import (
-    AccountSyncControllerConfig,
-    run_account_sync_controller,
+from .account_sync_worker import (
+    AccountSyncWorkerConfig,
+    run_account_sync_worker,
 )
 from .account_sync_state import project_account_sync_health
 from .daily_premarket import (
@@ -143,6 +143,11 @@ from .trend_review import (
 from .trend_market_controller import (
     load_trend_market_status,
     run_trend_market_controller,
+)
+from .trend_allocation import (
+    allocation_reference_for_report,
+    load_trend_allocation_status,
+    run_trend_allocation_controller,
 )
 from .strategy_drawdown import manual_unlock_strategy_drawdown
 from .drawdown_preflight import (
@@ -548,6 +553,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
 
+    trend_allocation = subparsers.add_parser(
+        "trend-allocation", help="Run and inspect the shared Trend Animals allocation"
+    )
+    trend_allocation_commands = trend_allocation.add_subparsers(
+        dest="trend_allocation_command", required=True
+    )
+    trend_allocation_run = trend_allocation_commands.add_parser("run")
+    trend_allocation_run.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_allocation_once = trend_allocation_commands.add_parser("once")
+    trend_allocation_once.add_argument("--date", dest="allocation_date", type=canonical_date, required=True)
+    trend_allocation_once.add_argument("--revision", action="store_true")
+    trend_allocation_once.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_allocation_status = trend_allocation_commands.add_parser("status")
+    trend_allocation_status.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+
     drawdown_unlock = subparsers.add_parser(
         "trend-drawdown-unlock",
         help="Manually unlock and rebase one simulated trend strategy",
@@ -840,27 +866,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch one market-data snapshot and exit",
     )
 
-    account_sync_controller = subparsers.add_parser(
-        "account-sync-controller", help="Run the sole account and quote publisher"
+    account_sync_worker = subparsers.add_parser(
+        "account-sync-worker", help="Run the sole account and quote publisher"
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    account_sync_controller.add_argument("--data-dir", type=Path, default=Path("data"))
-    account_sync_controller.add_argument("--reports-dir", type=Path, default=Path("reports"))
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument("--data-dir", type=Path, default=Path("data"))
+    account_sync_worker.add_argument("--reports-dir", type=Path, default=Path("reports"))
+    account_sync_worker.add_argument(
         "--portfolio", type=Path, default=Path("data/latest/portfolio.csv")
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--account-interval-seconds", type=positive_float, default=60.0
     )
-    account_sync_controller.add_argument(
+    account_sync_worker.add_argument(
         "--quote-interval-seconds", type=positive_float, default=5.0
     )
-    account_sync_controller.add_argument("--once", action="store_true")
+    account_sync_worker.add_argument("--once", action="store_true")
 
     account_sync_status = subparsers.add_parser(
         "account-sync-status", help="Show accepted account-sync file health"
@@ -1323,10 +1349,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "account-sync-controller":
+    if args.command == "account-sync-worker":
         try:
             values = _read_env_file(args.config)
-            config = AccountSyncControllerConfig(
+            config = AccountSyncWorkerConfig(
                 data_dir=args.data_dir,
                 reports_dir=args.reports_dir,
                 portfolio_path=args.portfolio,
@@ -1339,27 +1365,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
             parser.error(str(exc))
-        return run_account_sync_controller(config, once=args.once)
+        return run_account_sync_worker(config, once=args.once)
 
     if args.command == "account-sync-status":
         state = _load_optional_json(args.data_dir / "latest" / "account_sync_state.json") or {}
-        controller = _load_optional_json(args.data_dir / "account_sync" / "controller_status.json") or {}
+        worker_document = _load_optional_json(
+            args.data_dir / "account_sync" / "controller_status.json"
+        ) or {}
         quotes = _load_optional_json(args.data_dir / "latest" / "quotes.json") or {}
         health = project_account_sync_health(
-            state, controller, quotes, now=datetime.now().astimezone()
+            state, worker_document, quotes, now=datetime.now().astimezone()
         )
         if args.json:
             print(json.dumps(health, ensure_ascii=False))
         else:
             print(f"status: {health['status']}")
             print(f"reason: {health['reason']}")
-            controller_status = health["controller"]
-            assert isinstance(controller_status, dict)
+            worker_status = health["controller"]
+            assert isinstance(worker_status, dict)
             print(
-                "controller: "
-                f"pid={controller_status.get('pid', '')} "
-                f"sha={controller_status.get('git_sha', '')} "
-                f"heartbeat={controller_status.get('heartbeat_at', '')}"
+                "worker: "
+                f"pid={worker_status.get('pid', '')} "
+                f"sha={worker_status.get('git_sha', '')} "
+                f"heartbeat={worker_status.get('heartbeat_at', '')}"
             )
             print(f"quotes: {health['quotes']['status']}")
             for broker, source in health["brokers"].items():
@@ -1557,6 +1585,43 @@ def main(argv: list[str] | None = None) -> int:
             print(f"result: {'PASS' if status not in {'unavailable', 'error'} else 'BLOCKED'}")
             return 0 if status not in {"unavailable", "error"} else 2
 
+    if args.command == "trend-allocation":
+        try:
+            config = load_env_config(args.config, dry_run=False)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if args.trend_allocation_command in {"run", "once"}:
+            try:
+                require_trend_executor(config, hostname_fn=socket.gethostname)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+        try:
+            if args.trend_allocation_command == "status":
+                result = load_trend_allocation_status(config)
+            else:
+                runtime = replace(
+                    config,
+                    repo=Path.cwd().resolve(),
+                    python=Path(sys.executable).resolve(),
+                )
+                result = run_trend_allocation_controller(
+                    runtime,
+                    once=args.trend_allocation_command == "once",
+                    allocation_date=(
+                        args.allocation_date
+                        if args.trend_allocation_command == "once"
+                        else None
+                    ),
+                    revision=(args.revision if args.trend_allocation_command == "once" else False),
+                )
+        except (FileNotFoundError, ValueError, RuntimeError, ZoneInfoNotFoundError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
     if args.command == "trend-market":
         if args.trend_market_command == "resolve":
             order_id = str(args.futu_order_id or "").strip()
@@ -1637,6 +1702,39 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("drawdown preflight clock must be timezone-aware")
             occurred_at = now.isoformat(timespec="seconds")
             quote = FutuQuoteClient(host=config.futu_host, port=config.futu_port)
+            allocation = None
+            allocation_calendar_error: str | None = None
+            allocation_date = now.astimezone(
+                ZoneInfo("Asia/Shanghai")
+            ).date().isoformat()
+            allocation_status_path = (
+                config.data_dir / "trend_allocation/controller_status.json"
+            )
+            if allocation_status_path.is_file():
+                allocation_status = load_trend_allocation_status(config, now=now)
+                if (
+                    allocation_status.get("attempted_for") == allocation_date
+                    and allocation_status.get("phase")
+                    in {"ready", "fallback", "holiday"}
+                ):
+                    allocation_day = date.fromisoformat(allocation_date)
+                    try:
+                        allocation_days = quote.get_trading_days(
+                            market="CN",
+                            start=(allocation_day - timedelta(days=35)).isoformat(),
+                            end=(allocation_day + timedelta(days=1)).isoformat(),
+                        )
+                    except (FutuQuoteError, OSError) as exc:
+                        allocation_calendar_error = str(exc) or exc.__class__.__name__
+                    else:
+                        allocation = allocation_reference_for_report(
+                            config,
+                            allocation_date=allocation_date,
+                            a_trading_days=allocation_days,
+                        )
+            allocation_kwargs = (
+                {"allocation": allocation} if allocation is not None else {}
+            )
             inputs: dict[str, DrawdownMarketInput] = {}
             for market in ("CN", "HK", "US"):
                 pool_ids = {
@@ -1647,23 +1745,36 @@ def main(argv: list[str] | None = None) -> int:
                     "HK": config.trend_animals_hk_tm_ids,
                     "US": config.trend_animals_us_tm_ids,
                 }[market]
-                strategy: dict[str, object] | None = None
-                try:
+                calendar_error = allocation_calendar_error
+                source_date = None
+                entry_eligible_from = None
+                if calendar_error is None:
                     today = now.date()
-                    trading_days = quote.get_trading_days(
-                        market=market,
-                        start=(today - timedelta(days=14)).isoformat(),
-                        end=(today + timedelta(days=21)).isoformat(),
-                    )
-                    source_date, entry_eligible_from = market_preflight_dates(
-                        market, now=now, trading_days=trading_days
-                    )
-                    strategy = live_trend_strategy_snapshot(
-                        market,
-                        accepted_git_sha,
-                        pool_ids,
-                        execution_date=entry_eligible_from,
-                    )
+                    try:
+                        trading_days = quote.get_trading_days(
+                            market=market,
+                            start=(today - timedelta(days=14)).isoformat(),
+                            end=(today + timedelta(days=21)).isoformat(),
+                        )
+                    except (FutuQuoteError, OSError) as exc:
+                        calendar_error = str(exc) or exc.__class__.__name__
+                    else:
+                        try:
+                            source_date, entry_eligible_from = market_preflight_dates(
+                                market, now=now, trading_days=trading_days
+                            )
+                        except ValueError as exc:
+                            calendar_error = str(exc) or exc.__class__.__name__
+                strategy = live_trend_strategy_snapshot(
+                    market,
+                    accepted_git_sha,
+                    pool_ids,
+                    execution_date=(
+                        entry_eligible_from or now.date().isoformat()
+                    ),
+                    **allocation_kwargs,
+                )
+                if calendar_error is None:
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
@@ -1671,21 +1782,14 @@ def main(argv: list[str] | None = None) -> int:
                         source_date=source_date,
                         entry_eligible_from=entry_eligible_from,
                     )
-                except Exception as exc:
-                    if strategy is None:
-                        strategy = live_trend_strategy_snapshot(
-                            market,
-                            accepted_git_sha,
-                            pool_ids,
-                            execution_date=now.date().isoformat(),
-                        )
+                else:
                     inputs[market] = DrawdownMarketInput(
                         market=market,
                         strategy_snapshot=strategy,
                         baseline_equity=None,
                         source_date=None,
                         entry_eligible_from=None,
-                        error=str(exc),
+                        error=calendar_error,
                     )
             result = run_drawdown_preflight(
                 data_dir=config.data_dir,

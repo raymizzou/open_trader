@@ -1911,6 +1911,156 @@ table {
   font-weight: 700;
 }
 
+.trend-allocation-panel,
+.trend-rotation-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 12px;
+}
+
+.trend-allocation-panel > header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.trend-allocation-panel h2,
+.trend-allocation-panel h3,
+.trend-allocation-panel p,
+.trend-allocation-panel dl,
+.trend-allocation-panel dd,
+.trend-rotation-panel h2,
+.trend-rotation-panel h3,
+.trend-rotation-panel p,
+.trend-rotation-panel dl,
+.trend-rotation-panel dd {
+  margin: 0;
+}
+
+.trend-allocation-panel > header span,
+.trend-allocation-card header span,
+.trend-allocation-card dt,
+.trend-allocation-card p,
+.trend-allocation-meta,
+.trend-rotation-route span,
+.trend-rotation-route small,
+.trend-rotation-pair dt,
+.trend-rotation-pair p {
+  color: var(--muted);
+}
+
+.trend-allocation-panel > header span,
+.trend-allocation-card header span {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+
+.trend-allocation-cards {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.trend-allocation-card,
+.trend-rotation-group,
+.trend-rotation-pair {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.trend-allocation-card {
+  padding: 10px;
+}
+
+.trend-allocation-card header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.trend-allocation-card dl,
+.trend-rotation-pair dl {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.trend-allocation-card dl div,
+.trend-rotation-pair dl div {
+  background: var(--surface);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 7px 8px;
+}
+
+.trend-allocation-card dd,
+.trend-rotation-pair dd {
+  font-weight: 700;
+}
+
+.trend-allocation-card > p,
+.trend-allocation-meta,
+.trend-allocation-warning,
+.trend-rotation-pair > p {
+  margin-top: 9px;
+  overflow-wrap: anywhere;
+}
+
+.trend-allocation-warning {
+  color: var(--warning);
+}
+
+.trend-rotation-panel {
+  border-left-color: var(--warning);
+}
+
+.trend-rotation-groups {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.trend-rotation-group {
+  padding: 10px;
+}
+
+.trend-rotation-group > p {
+  margin-top: 8px;
+}
+
+.trend-rotation-pair {
+  background: var(--surface);
+  margin-top: 8px;
+  padding: 9px;
+}
+
+.trend-rotation-route {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.trend-rotation-route div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .trend-discipline-workspace,
 .trend-industry-context {
   display: grid;
@@ -4871,6 +5021,11 @@ tbody tr.active-row,
 .trend-audit-reason-counts span,
 .trend-review-comparison,
 .trend-report-facts span,
+.trend-allocation-panel > header span,
+.trend-allocation-card,
+.trend-allocation-card header span,
+.trend-rotation-group,
+.trend-rotation-pair,
 .trend-discipline-card,
 .trend-industry-context-card,
 .trend-discipline-category,
@@ -5047,18 +5202,31 @@ table {
 
   .cn-trend-report > * { order: initial; }
   .cn-trend-report > .trend-report-header { order: 1; }
+  .cn-trend-report > .trend-allocation-panel { order: 2; }
   .cn-trend-report > .trend-execution-batch-error,
-  .cn-trend-report > .trend-revision-anomaly { order: 2; }
-  .cn-trend-report > .trend-stage.cn-trend-sell { order: 3; }
-  .cn-trend-report > .trend-stage.cn-trend-buy { order: 4; }
-  .cn-trend-report > .trend-stage.cn-trend-review { order: 5; }
-  .cn-trend-report > .trend-stage.cn-trend-hold { order: 6; }
-  .cn-trend-report > .trend-industry-context { order: 7; }
-  .cn-trend-report > .trend-discipline-workspace { order: 8; }
-  .cn-trend-report > .trend-risk-summary { order: 9; }
-  .cn-trend-report > .trend-controller-status { order: 10; }
+  .cn-trend-report > .trend-revision-anomaly { order: 3; }
+  .cn-trend-report > .trend-stage.cn-trend-sell { order: 4; }
+  .cn-trend-report > .trend-rotation-panel { order: 5; }
+  .cn-trend-report > .trend-stage.cn-trend-buy { order: 6; }
+  .cn-trend-report > .trend-stage.cn-trend-review { order: 7; }
+  .cn-trend-report > .trend-stage.cn-trend-hold { order: 8; }
+  .cn-trend-report > .trend-industry-context { order: 9; }
+  .cn-trend-report > .trend-discipline-workspace { order: 10; }
+  .cn-trend-report > .trend-risk-summary { order: 11; }
+  .cn-trend-report > .trend-controller-status { order: 12; }
   .cn-trend-report > .trend-audit,
-  .cn-trend-report > .cn-trend-audit { order: 11; }
+  .cn-trend-report > .cn-trend-audit { order: 13; }
+
+  .trend-allocation-cards,
+  .trend-rotation-groups {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-allocation-card dl,
+  .trend-rotation-pair dl,
+  .trend-rotation-route {
+    grid-template-columns: minmax(0, 1fr);
+  }
 
   .trend-risk-summary {
     padding: 12px;

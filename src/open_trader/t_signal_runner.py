@@ -257,7 +257,9 @@ def _blocked_reason(
         "",
     )
     if controller_status != "ok":
-        return _blocked_message(f"账户同步控制器心跳{_status_label(controller_status)}", last_success)
+        return _blocked_message(
+            f"账户同步 Worker 心跳{_status_label(controller_status)}", last_success
+        )
     for broker in broker_names:
         status, last_success = source_statuses.get(broker, ("unknown", ""))
         if status != "ok":

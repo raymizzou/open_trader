@@ -3,32 +3,22 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.open-trader.account-sync-controller</string>
+  <string>com.open-trader.account-api</string>
   <key>WorkingDirectory</key>
   <string>OPEN_TRADER_REPO</string>
-
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONPATH</key>
     <string>OPEN_TRADER_REPO/src</string>
   </dict>
-
   <key>ProgramArguments</key>
   <array>
     <string>OPEN_TRADER_PYTHON</string>
     <string>-m</string>
     <string>open_trader</string>
-    <string>account-sync-worker</string>
-    <string>--config</string>
-    <string>OPEN_TRADER_DAILY_CONFIG</string>
+    <string>account-api</string>
     <string>--data-dir</string>
     <string>OPEN_TRADER_DATA_DIR</string>
-    <string>--reports-dir</string>
-    <string>OPEN_TRADER_REPORTS_DIR</string>
-    <string>--portfolio</string>
-    <string>OPEN_TRADER_PORTFOLIO</string>
-    <string>--tiger-config-dir</string>
-    <string>OPEN_TRADER_TIGER_CONFIG_DIR</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -39,8 +29,8 @@
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>OPEN_TRADER_REPO/logs/account_sync/launchd.out.log</string>
+  <string>OPEN_TRADER_REPO/logs/account_api/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>OPEN_TRADER_REPO/logs/account_sync/launchd.err.log</string>
+  <string>OPEN_TRADER_REPO/logs/account_api/launchd.err.log</string>
 </dict>
 </plist>

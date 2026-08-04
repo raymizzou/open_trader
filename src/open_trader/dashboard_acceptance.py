@@ -13,12 +13,14 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+from .a_share_trend import valid_frozen_report_contract
 from .account_sync_state import DASHBOARD_POSITION_FIELDS
 from .dashboard import (
     SHANGHAI,
     _is_dashboard_holding,
     _project_trend_actions,
     _project_trend_money_fields,
+    _project_trend_strength_fields,
     _read_csv_rows,
     _valid_partial_trend_action,
 )
@@ -61,9 +63,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10"}),
-    "US": frozenset({"v4", "v5", "v6", "v7", "v8"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7", "v8"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
 }
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
@@ -367,7 +369,7 @@ def _account_sync_errors(payload: Mapping[str, Any]) -> list[str]:
         errors.append("账户同步状态异常")
     controller = account_sync.get("controller")
     if not isinstance(controller, Mapping) or controller.get("status") != "ok":
-        errors.append("账户同步控制器不可用")
+        errors.append("账户同步 Worker 不可用")
     brokers = account_sync.get("brokers")
     if not isinstance(brokers, Mapping):
         return [*errors, "账户同步券商状态缺失"]
@@ -411,39 +413,39 @@ def _is_accepted_dashboard_holding(row: Mapping[str, Any]) -> bool:
     return _is_dashboard_holding(normalized)
 
 
-def _account_sync_controller_errors(
+def _account_sync_worker_errors(
     root: Path, *, expected_root: Path, expected_sha: str, now: datetime | None = None,
 ) -> list[str]:
     path = _project_data_dir(root) / "account_sync/controller_status.json"
     try:
         controller = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return ["账户同步控制器状态缺失"]
+        return ["账户同步 Worker 状态缺失"]
     if not isinstance(controller, Mapping):
-        return ["账户同步控制器状态缺失"]
+        return ["账户同步 Worker 状态缺失"]
 
     errors: list[str] = []
     pid = controller.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        errors.append("账户同步控制器 PID 无效")
+        errors.append("账户同步 Worker PID 无效")
     else:
         try:
             os.kill(pid, 0)
         except OSError as exc:
-            errors.append(f"账户同步控制器 PID 不存活：{pid}（{exc}）")
+            errors.append(f"账户同步 Worker PID 不存活：{pid}（{exc}）")
     working_directory = controller.get("working_directory")
     if not isinstance(working_directory, str) or Path(working_directory).resolve() != expected_root.resolve():
-        errors.append("账户同步控制器工作目录不匹配")
+        errors.append("账户同步 Worker 工作目录不匹配")
     if controller.get("git_sha") != expected_sha:
-        errors.append("账户同步控制器 Git SHA 不匹配")
+        errors.append("账户同步 Worker Git SHA 不匹配")
     try:
         heartbeat = datetime.fromisoformat(str(controller.get("heartbeat_at") or ""))
         if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
             raise ValueError
         if abs((now or datetime.now().astimezone()) - heartbeat) > timedelta(minutes=2):
-            errors.append("账户同步控制器心跳不新鲜")
+            errors.append("账户同步 Worker 心跳不新鲜")
     except (TypeError, ValueError):
-        errors.append("账户同步控制器心跳无效")
+        errors.append("账户同步 Worker 心跳无效")
     return errors
 
 
@@ -717,6 +719,9 @@ def validate_integrated_candidate(
             path = reports_dir / TREND_REPORT_DIRECTORIES[broker] / artifact
             frozen = json.loads(path.read_text(encoding="utf-8"))
             assert isinstance(frozen, Mapping), f"{broker} 冻结报告不是对象"
+            assert valid_frozen_report_contract(frozen), (
+                f"{broker} 冻结报告契约无效"
+            )
             assert report.get("report_sha256") == _report_hash(frozen), (
                 f"{broker} 报告哈希与冻结产物不一致"
             )
@@ -760,9 +765,22 @@ def validate_integrated_candidate(
             target_values = (
                 target.values() if isinstance(target, Mapping) else (target,)
             )
+            expected_target_weight = Decimal("0.04")
+            allocation = frozen.get("allocation")
+            if isinstance(allocation, Mapping):
+                markets = allocation.get("markets")
+                allocation_market = (
+                    markets.get(market) if isinstance(markets, Mapping) else None
+                )
+                assert isinstance(allocation_market, Mapping), (
+                    f"{broker} 资源排名市场缺失"
+                )
+                expected_target_weight = _position_decimal(
+                    allocation_market.get("entry_weight"), "资源排名仓位"
+                )
             assert target_values and max(
                 _position_decimal(value, "名义仓位上限") for value in target_values
-            ) == Decimal("0.04"), f"{broker} 固定名义仓位上限不是 4%"
+            ) == expected_target_weight, f"{broker} 目标仓位与资源排名不一致"
 
             summary = report.get("risk_summary")
             assert isinstance(summary, Mapping), f"{broker} 缺少风险摘要"
@@ -829,8 +847,8 @@ def validate_integrated_candidate(
                     and lot == lot.to_integral_value()
                     and quantity % lot == 0
                 ), f"{broker} 买入数量未按整手向下取整"
-                assert Decimal("0") < weight <= Decimal("0.04"), (
-                    f"{broker} 买入目标超过固定名义仓位上限"
+                assert Decimal("0") < weight <= expected_target_weight, (
+                    f"{broker} 买入目标超过资源排名仓位上限"
                 )
 
             drawdown = report.get("drawdown_summary")
@@ -1678,6 +1696,7 @@ def _check_trend_account_views(
         )
         _check_integrated_trend_ui(report_root, report, broker)
         _check_frozen_trend_disciplines(report_root, report, broker, page=page)
+        _check_trend_rotation_visibility(report_root, report, broker)
         assert _plain(report.get("report_date")) in report_root.inner_text(), (
             f"{broker} 当前趋势报告日期未显示"
         )
@@ -2265,6 +2284,53 @@ def _check_integrated_trend_ui(
         risk.locator(":scope > summary").click()
 
 
+def _check_trend_rotation_visibility(
+    report_root: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    if not report.get("allocation"):
+        assert report_root.locator(".trend-rotation-panel").count() == 0, (
+            f"{broker} 无资源排名时仍显示轮换面板"
+        )
+        return
+    panel = report_root.locator(".trend-rotation-panel")
+    assert panel.count() == 1, f"{broker} 缺少相对强度轮换面板"
+    for mode, key in (
+        ("automatic", "simulate_rotation_comparisons"),
+        ("manual", "real_rotation_comparisons"),
+    ):
+        comparisons = report.get(key)
+        comparisons = comparisons if isinstance(comparisons, list) else []
+        group = panel.locator(f'.trend-rotation-group[data-mode="{mode}"]')
+        assert group.count() == 1, f"{broker} 缺少 {mode} 轮换组"
+        text = group.inner_text()
+        for comparison in comparisons:
+            assert isinstance(comparison, Mapping), f"{broker} 轮换比较格式无效"
+            for value in (
+                comparison.get("sell_symbol"), comparison.get("sell_name"),
+                comparison.get("buy_symbol"), comparison.get("buy_name"),
+            ):
+                if value:
+                    assert str(value) in text, f"{broker} 轮换比较缺少 {value}"
+            basis = comparison.get("strength_basis")
+            basis_label = {
+                "local": "大类内强度",
+                "global": "全局强度",
+            }.get(str(basis), "数据不可用")
+            assert basis_label in text, f"{broker} 轮换比较缺少比较口径"
+            assert f"强度差" in text, f"{broker} 轮换比较缺少强度差"
+            outcome = str(comparison.get("outcome") or "")
+            if outcome == "gap_below_threshold":
+                assert "未触发 · 门槛" in text and "还差" in text, (
+                    f"{broker} 轮换比较缺少门槛未触发原因"
+                )
+            elif outcome == "sizing_blocked":
+                assert "未执行" in text, f"{broker} 轮换比较缺少仓位阻断原因"
+            elif outcome == "data_unavailable":
+                assert "数据不可用" in text or "未触发" in text, (
+                    f"{broker} 轮换比较缺少数据不可用原因"
+                )
+
+
 def _display_number(value: Any) -> str:
     raw = _plain(value).strip()
     match = re.fullmatch(r"([+-]?)(\d+)(?:\.(\d+))?", raw)
@@ -2429,6 +2495,17 @@ def _check_trend_artifact_projection(
         "hold_actions": holds,
         "review_actions": reviews,
     }
+    frozen_signals = payload.get("signal_snapshots")
+    frozen_signals = frozen_signals if isinstance(frozen_signals, Mapping) else {}
+    expected_actions["buy_actions"] = _project_trend_strength_fields(
+        expected_actions["buy_actions"], frozen_signals.get("candidates")
+    )
+    expected_actions["sell_actions"] = _project_trend_strength_fields(
+        expected_actions["sell_actions"], frozen_signals.get("holdings")
+    )
+    expected_actions["hold_actions"] = _project_trend_strength_fields(
+        expected_actions["hold_actions"], frozen_signals.get("holdings")
+    )
     assert all(
         isinstance(projected := report.get(key), list)
         and all(isinstance(item, Mapping) for item in projected)
@@ -2442,6 +2519,11 @@ def _check_trend_artifact_projection(
         ] == value
         for key, value in expected_actions.items()
     ), f"{broker} 冻结报告动作与 API 投影不一致"
+    for key in ("simulate_rotation_comparisons", "real_rotation_comparisons"):
+        expected = judgments.get(key, [])
+        assert isinstance(expected, list) and report.get(key, []) == expected, (
+            f"{broker} 冻结报告轮换比较与 API 投影不一致：{key}"
+        )
     assert report.get("counts") == {
         "sell": len(sells),
         "buy": len(buys),
@@ -2482,10 +2564,13 @@ def _trend_action_reason_label(
     ) in {
         ("CN", "v9"),
         ("CN", "v10"),
+        ("CN", "v12"),
         ("US", "v6"),
         ("US", "v7"),
+        ("US", "v10"),
         ("HK", "v6"),
         ("HK", "v7"),
+        ("HK", "v10"),
     }:
         try:
             initial = Decimal(str(item.get("initial_line")))
@@ -2915,7 +3000,7 @@ def _check_trend_holding_tabs(
     )
 
     headings = (
-        "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+        "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业",
         "当前判断", "活动保护线", "持仓提示",
     )
     real_panel = section.locator('[data-trend-holding-panel="real"]')
@@ -4253,7 +4338,7 @@ def _browser_check(
     except ImportError:
         return [], "Playwright 未安装"
     errors: list[str] = []
-    screenshot_started_at_ns = _prepare_acceptance_screenshots()
+    _prepare_acceptance_screenshots()
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome", headless=True)
@@ -4370,7 +4455,6 @@ def _browser_check(
             browser.close()
     except Exception as exc:
         return errors, f"浏览器不可用：{type(exc).__name__}: {exc}"
-    errors.extend(_validate_acceptance_screenshots(screenshot_started_at_ns))
     return errors, None
 
 
@@ -4746,7 +4830,7 @@ def main(argv: list[str] | None = None) -> int:
         phillips_total, phillips_period = _latest_phillips_expectation(
             project_data_dir
         )
-        errors.extend(_account_sync_controller_errors(
+        errors.extend(_account_sync_worker_errors(
             args.expected_root, expected_root=args.expected_root, expected_sha=expected_sha,
         ))
         first = _fetch_payload(args.url)

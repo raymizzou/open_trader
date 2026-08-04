@@ -14,6 +14,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from open_trader import dashboard_acceptance
+from open_trader.a_share_trend import (
+    freeze_allocation_reference,
+    live_trend_strategy_snapshot,
+)
+import open_trader.prediction_arbitrage_acceptance as prediction_acceptance
 from open_trader.prediction_arbitrage_acceptance import (
     LiveReadinessReport,
     ReadinessCheck,
@@ -33,14 +38,16 @@ from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     strategy_parameter_hash,
 )
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 MISSING_FRESH = object()
 
 
-def test_dashboard_acceptance_allows_current_market_v8() -> None:
-    assert "v8" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
-    assert "v8" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
+def test_dashboard_acceptance_allows_current_market_versions() -> None:
+    assert "v11" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["CN"]
+    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["US"]
+    assert "v9" in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS["HK"]
 
 
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
@@ -465,7 +472,7 @@ def _run_acceptance_main_with_reports(
     )
     monkeypatch.setattr(
         dashboard_acceptance,
-        "_account_sync_controller_errors",
+        "_account_sync_worker_errors",
         lambda *args, **kwargs: [],
     )
     monkeypatch.setattr(
@@ -851,7 +858,9 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
             }],
             "top10_candidates": [],
         },
-        "signal_snapshots": {"holdings": {"EOG": {"phase": "立夏"}}},
+        "signal_snapshots": {
+            "holdings": {"EOG": {"phase": "立夏", "global_strength": "92.0"}},
+        },
         "excluded": {},
         "industry_concentration": [],
         "data_sources": [],
@@ -868,6 +877,7 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
         "hold_actions": [{
             "action": "HOLD", "symbol": "EOG", "reason": "trend_intact",
             "phase": "立夏",
+            "global_strength": "92.0",
             "trend_report_state": "included",
             "option_anomaly": {
                 "available": False,
@@ -1536,13 +1546,59 @@ def integrated_v4_payload(
         "phillips": "trend_hk_phillips",
         "eastmoney": "trend_a_share",
     }
+    allocation_reference: dict[str, object] | None = None
+    frozen_allocation: dict[str, object] | None = None
+    allocation_snapshot: dict[str, object] | None = None
+    if current_live_versions:
+        root_specs = {
+            "CN": (("A股", "45.72"), ("ETF基金", "50.39")),
+            "HK": (("港股", "86.97"), ("香港ETF", "78.07")),
+            "US": (("美股", "81.13"), ("美国ETF", "80.12")),
+        }
+        roots = {
+            market: {
+                role: {
+                    "asset": asset,
+                    "tm_id": market_index * 10 + role_index,
+                    "as_of_date": "2026-08-03",
+                    "global_strength": strength,
+                }
+                for role_index, (role, (asset, strength)) in enumerate(
+                    zip(("stock", "etf"), specs), 1
+                )
+            }
+            for market_index, (market, specs) in enumerate(root_specs.items(), 1)
+        }
+        allocation_snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=roots,
+            previous=None,
+        )
+        allocation_reference = {
+            "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+            "sha256": "b" * 64,
+            "snapshot": allocation_snapshot,
+        }
+        frozen_allocation = freeze_allocation_reference(allocation_reference)
     for broker, market in dashboard_acceptance.TREND_SIMULATE_MARKETS.items():
         strategy_version = (
-            ("v10" if market == "CN" else "v8")
+            {"CN": "v12", "HK": "v10", "US": "v10"}[market]
             if current_live_versions
             else ("v7" if market == "CN" else "v4")
         )
-        pending = market == "HK"
+        allocation_market = (
+            allocation_snapshot["markets"][market]  # type: ignore[index]
+            if allocation_snapshot is not None
+            else None
+        )
+        position_weight = (
+            str(allocation_market["entry_weight"])
+            if isinstance(allocation_market, Mapping)
+            else "0.04"
+        )
+        pending = market == "HK" and not current_live_versions
         lot_size = 100 if market in {"CN", "HK"} else 1
         risk_summary = {
             "status": "active",
@@ -1561,7 +1617,7 @@ def integrated_v4_payload(
         buy = {
             "action": "BUY",
             "symbol": {"CN": "600001", "HK": "00700", "US": "AAPL"}[market],
-            "target_weight": "0.04",
+            "target_weight": position_weight,
             "estimated_shares": lot_size * 3,
             "lot_size": lot_size,
         }
@@ -1573,9 +1629,19 @@ def integrated_v4_payload(
                 "market": market,
                 "broker": broker,
                 "simulate_acc_id": account_ids[broker],
+                **({
+                    "position_weight": position_weight,
+                    "position_weight_source": "trend_allocation_rank",
+                    "rotation_allocation_sha256": "b" * 64,
+                } if current_live_versions else {}),
             },
             "account": serialized_trend_account(fresh=True),
-            "strategy_snapshot": {
+            "strategy_snapshot": live_trend_strategy_snapshot(
+                market,
+                "a" * 40,
+                (622466, 697199),
+                allocation=allocation_reference,
+            ) if current_live_versions else {
                 "strategy_id": (
                     f"trend_animals_warm_to_hot/{market}/{strategy_version}"
                 ),
@@ -1603,6 +1669,12 @@ def integrated_v4_payload(
                 "holding_decisions": [],
                 "top10_candidates": [],
                 "risk_skips": [],
+                **({
+                    "simulate_rotation_pairs": [],
+                    "real_rotation_pairs": [],
+                    "simulate_rotation_comparisons": [],
+                    "real_rotation_comparisons": [],
+                } if current_live_versions else {}),
             },
             "risk_summary": risk_summary,
             "drawdown_summary": {
@@ -1627,6 +1699,7 @@ def integrated_v4_payload(
                 },
             },
             "data_sources": [f"Futu {market} SIMULATE account"],
+            **({"allocation": frozen_allocation} if current_live_versions else {}),
         }
         frozen["drawdown_summary"]["bootstrap_event"][  # type: ignore[index]
             "parameter_hash"
@@ -2962,7 +3035,7 @@ class TabbedAccountLocator:
             if suffix == ".cn-trend-table":
                 return int(view == "simulate" or report.get("real_position_status") == "available")
             if suffix == ".cn-trend-table thead th":
-                return 10 if (view == "simulate" or report.get("real_position_status") == "available") else 0
+                return 11 if (view == "simulate" or report.get("real_position_status") == "available") else 0
             if suffix == ".cn-trend-card":
                 return len(items)
         if self.selector in {
@@ -3450,7 +3523,7 @@ class TabbedAccountLocator:
             '[data-trend-holding-panel="simulate"] .cn-trend-table thead th',
         }:
             return [
-                "标的", "动作", "执行参考价", "温度变化", "节气", "强度", "行业",
+                "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业",
                 "当前判断", "活动保护线", "持仓提示",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-report-header dd":
@@ -5003,11 +5076,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         "http://dashboard", 5, payload, simulate_payloads={}, history_expectations={}
     )
 
-    assert errors == [
-        "wide_desktop：RuntimeError: navigation failed",
-        "验收截图缺失：wide_desktop-portfolio.png",
-        "验收截图缺失：1920-trend-report.png",
-    ]
+    assert errors == ["wide_desktop：RuntimeError: navigation failed"]
     assert blocker is None
     assert visited == ["wide_desktop", "desktop", "tablet", "mobile"]
     assert viewport_widths == [1920, 1440, 760, 375]
@@ -5229,7 +5298,7 @@ def test_validate_dashboard_payload_rejects_unsafe_account_sync_and_wrong_accept
     errors = validate_dashboard_payload(payload, expected_cn=5)
 
     assert "账户同步状态异常" in errors
-    assert "账户同步控制器不可用" in errors
+    assert "账户同步 Worker 不可用" in errors
     assert "tiger 账户同步状态不是正常" in errors
     assert "phillips 账户同步状态不是正常" in errors
     assert "eastmoney 账户同步状态不是正常" in errors
@@ -5263,7 +5332,7 @@ def test_check_account_holdings_counts_only_actual_accepted_holdings() -> None:
     dashboard_acceptance._check_account_holdings(page, payload)
 
 
-def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
+def test_acceptance_rejects_missing_or_unhealthy_account_sync_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_dir = tmp_path / "data"
@@ -5271,9 +5340,9 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
         dashboard_acceptance, "_project_data_dir", lambda _root: data_dir
     )
     now = datetime.fromisoformat("2026-07-30T12:10:00+08:00")
-    assert dashboard_acceptance._account_sync_controller_errors(
+    assert dashboard_acceptance._account_sync_worker_errors(
         tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
-    ) == ["账户同步控制器状态缺失"]
+    ) == ["账户同步 Worker 状态缺失"]
 
     status_path = data_dir / "account_sync/controller_status.json"
     status_path.parent.mkdir(parents=True)
@@ -5284,7 +5353,7 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
         "heartbeat_at": "2026-07-30T12:00:00+08:00",
     }), encoding="utf-8")
 
-    errors = dashboard_acceptance._account_sync_controller_errors(
+    errors = dashboard_acceptance._account_sync_worker_errors(
         tmp_path, expected_root=tmp_path, expected_sha="accepted", now=now,
     )
 
@@ -5292,7 +5361,7 @@ def test_acceptance_rejects_missing_or_unhealthy_account_sync_controller(
         assert any(required in error for error in errors)
 
 
-def test_acceptance_reads_account_sync_controller_from_shared_project_data_dir(
+def test_acceptance_reads_account_sync_worker_from_shared_project_data_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worktree = tmp_path / "worktree"
@@ -5311,7 +5380,7 @@ def test_acceptance_reads_account_sync_controller_from_shared_project_data_dir(
         dashboard_acceptance, "_project_data_dir", lambda _root: shared_data
     )
 
-    assert dashboard_acceptance._account_sync_controller_errors(
+    assert dashboard_acceptance._account_sync_worker_errors(
         worktree, expected_root=worktree, expected_sha="accepted", now=now,
     ) == []
 

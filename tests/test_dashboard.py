@@ -43,6 +43,7 @@ from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 from open_trader.technical_facts import source_hash
 from open_trader.trade_actions import TRADE_ACTION_FIELDNAMES
 from open_trader.trading_plan import TRADING_PLAN_FIELDNAMES
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 POSITION_FIELDNAMES = [
@@ -1707,6 +1708,7 @@ def _valid_v3_dashboard_trend_payload() -> dict[str, object]:
     summary = payload["risk_summary"]
     assert isinstance(snapshot, dict) and isinstance(summary, dict)
     snapshot["strategy_version"] = "v3"
+    snapshot["strategy_id"] = "trend_animals_warm_to_hot/CN/v3"
     parameters = snapshot["parameters"]
     assert isinstance(parameters, dict)
     parameters.update(
@@ -1920,6 +1922,152 @@ def test_dashboard_projects_frozen_cost_contexts_and_parameter_rows(
         "estimated_api_cost"
     ]
     assert projected["audit"]["actual_api_cost"] == payload["actual_api_cost"]
+
+
+def test_dashboard_projects_only_valid_frozen_allocation_contract(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    roots = {
+        market: {
+            "stock": {"asset": stock, "tm_id": index * 10, "as_of_date": "2026-08-03", "global_strength": stock_strength},
+            "etf": {"asset": etf, "tm_id": index * 10 + 1, "as_of_date": "2026-08-03", "global_strength": etf_strength},
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (("CN", "A股", "ETF基金", "90", "80"), ("HK", "港股", "香港ETF", "70", "60"), ("US", "美股", "美国ETF", "50", "40")), 1
+        )
+    }
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03", generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40, roots=roots, previous=None,
+    )
+    payload = _dashboard_frozen_report_payload()
+    payload["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json", "sha256": "b" * 64,
+        "allocation_date": "2026-08-03", "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False, "stale_a_trading_days": 0, "failure_reason": "",
+        "roots": snapshot["roots"], "markets": snapshot["markets"],
+    }
+    payload["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation={
+            "daily_path": payload["allocation"]["daily_path"],
+            "sha256": payload["allocation"]["sha256"],
+            "snapshot": snapshot,
+        },
+    )
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulate_rotation_pairs"] = []
+    judgments["simulate_rotation_comparisons"] = []
+    judgments["real_rotation_pairs"] = []
+    judgments["real_rotation_comparisons"] = []
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    projected = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+        current_candidate_pool_ids={"CN": (622466, 697199)},
+    )["eastmoney"]
+    assert projected["allocation"] == payload["allocation"]
+    assert projected["simulate_rotation_pairs"] == []
+    assert projected["current_strategy_version"] == "v12"
+    assert next(
+        row["value"]
+        for row in projected["current_strategy_parameter_rows"]
+        if row["name"] == "目标仓位"
+    ) == "账户净值的 6%"
+
+    payload["allocation"]["daily_path"] = "data/trend_allocation/latest.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]["available"] is False
+
+
+def test_dashboard_projects_frozen_rotation_comparisons_and_signal_strengths(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = _dashboard_frozen_report_payload()
+    payload["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": {},
+        "markets": {},
+    }
+    payload["signal_snapshots"] = {
+        "holdings": {"SELL": {"strength": "76", "global_strength": "61"}},
+        "candidates": {"BUY": {"strength": "88", "global_strength": "96"}},
+    }
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["formal_actions"] = [{"action": "BUY", "symbol": "BUY", "strength": "88"}]
+    judgments["simulate_rotation_pairs"] = []
+    judgments["real_rotation_pairs"] = []
+    comparison = {
+        "pair_index": 0,
+        "sell_symbol": "SELL",
+        "sell_name": "弱势股票",
+        "sell_asset": "A股",
+        "sell_local_strength": "76",
+        "sell_global_strength": "61",
+        "buy_symbol": "BUY",
+        "buy_name": "强势ETF",
+        "buy_asset": "ETF基金",
+        "buy_local_strength": "88",
+        "buy_global_strength": "96",
+        "strength_basis": "global",
+        "sell_compared_strength": "61",
+        "buy_compared_strength": "96",
+        "strength_gap": "35",
+        "threshold": "20",
+        "outcome": "planned",
+        "reason": "relative_rotation",
+    }
+    judgments["simulate_rotation_comparisons"] = [comparison]
+    judgments["real_rotation_comparisons"] = []
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    projected = dashboard_module._project_broker_trend_report(
+        selected=(
+            path, payload, date(2026, 7, 15), date(2026, 7, 15),
+            date(2026, 7, 15), datetime.fromisoformat("2026-07-15T20:00:00+08:00"),
+        ),
+        data_dir=config.data_dir,
+        reports_dir=path.parent,
+        broker="eastmoney", market="CN", market_label="A股", broker_label="东方财富",
+        buy_window="09:30–10:00", report_date="2026-07-15",
+    )
+    assert projected["simulate_rotation_comparisons"] == [comparison]
+    assert projected["buy_actions"][0]["global_strength"] == "96"
+
+    historical = _dashboard_frozen_report_payload()
+    path.write_text(json.dumps(historical, ensure_ascii=False), encoding="utf-8")
+    historical_projected = dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]
+    assert historical_projected["available"] is True
+    assert historical_projected["simulate_rotation_pairs"] == []
+    assert historical_projected["real_rotation_pairs"] == []
+
+    allocationless_pairs = _dashboard_frozen_report_payload()
+    judgments = allocationless_pairs["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulate_rotation_pairs"] = []
+    judgments["real_rotation_pairs"] = []
+    path.write_text(json.dumps(allocationless_pairs, ensure_ascii=False), encoding="utf-8")
+    assert dashboard_module._load_trend_reports(
+        config.data_dir, config.reports_dir, today=date(2026, 7, 15),
+    )["eastmoney"]["available"] is False
 
 
 def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(
