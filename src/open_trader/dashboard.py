@@ -2951,11 +2951,19 @@ def _trend_action_executions(
         / "actions"
         / execution_date
     )
+    revision_key = (-1, -1)
     try:
-        revision = root.stat()
-        revision_key = (revision.st_mtime_ns, revision.st_ctime_ns)
+        candidates = (root, *root.iterdir())
     except OSError:
-        revision_key = (-1, -1)
+        candidates = ()
+    for candidate in candidates:
+        try:
+            revision = candidate.stat()
+        except OSError:
+            continue
+        revision_key = max(
+            revision_key, (revision.st_mtime_ns, revision.st_ctime_ns)
+        )
     cached = _trend_action_executions_cached(
         str(data_dir.resolve()),
         market,

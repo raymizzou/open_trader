@@ -356,6 +356,40 @@ def test_dashboard_uses_latest_action_event_across_timezone_offsets(
     assert executions[("TRV", "buy")]["status"] == "filled"
 
 
+def test_dashboard_refreshes_cached_execution_when_action_event_is_appended(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _trend_action_executions
+
+    root = tmp_path / "trend_review/ledgers/HK/actions/2026-08-04/key"
+    root.mkdir(parents=True)
+    common = {
+        "report_sha256": "a" * 64,
+        "symbol": "01288",
+        "side": "sell",
+    }
+    (root / "submitted.json").write_text(json.dumps({
+        **common,
+        "status": "submitted",
+        "recorded_at": "2026-08-04T09:30:00+08:00",
+    }), encoding="utf-8")
+    assert _trend_action_executions(
+        tmp_path, market="HK", execution_date="2026-08-04",
+        report_sha256="a" * 64,
+    )[("01288", "sell")]["status"] == "submitted"
+
+    (root / "filled.json").write_text(json.dumps({
+        **common,
+        "status": "filled",
+        "recorded_at": "2026-08-04T09:30:06+08:00",
+    }), encoding="utf-8")
+
+    assert _trend_action_executions(
+        tmp_path, market="HK", execution_date="2026-08-04",
+        report_sha256="a" * 64,
+    )[("01288", "sell")]["status"] == "filled"
+
+
 def test_dashboard_projects_locked_batch_when_latest_report_is_a_revision(
     tmp_path: Path,
 ) -> None:
