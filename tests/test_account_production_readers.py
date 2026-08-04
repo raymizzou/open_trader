@@ -56,20 +56,26 @@ def _matches() -> list[tuple[str, int, str, str]]:
     source_root = Path(__file__).parents[1] / "src" / "open_trader"
     matches: list[tuple[str, int, str, str]] = []
     for path in sorted(source_root.rglob("*.py")):
-        if path.name in OWNER_MODULES:
+        relative_path = path.relative_to(source_root).as_posix()
+        if relative_path in OWNER_MODULES:
             continue
         for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             for pattern in FORBIDDEN_PATTERNS:
                 if re.search(pattern, line):
                     matches.append(
                         (
-                            path.relative_to(source_root).as_posix(),
+                            relative_path,
                             line_number,
                             pattern,
                             line.strip(),
                         )
                     )
     return matches
+
+
+def test_owner_exclusions_are_exact_relative_paths() -> None:
+    assert "account_api.py" in OWNER_MODULES
+    assert "nested/account_api.py" not in OWNER_MODULES
 
 
 def _fingerprint(matches: list[tuple[str, int, str, str]]) -> str:
