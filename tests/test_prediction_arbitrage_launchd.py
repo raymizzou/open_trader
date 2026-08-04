@@ -77,7 +77,7 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
         runtime_root / "config/daily_premarket.env"
     )
     assert args[args.index("--prediction-config") + 1] == str(
-        ROOT / "config/prediction_arbitrage.json"
+        runtime_root / "config/prediction_arbitrage.json"
     )
     assert not list(agents.iterdir())
     assert "127.0.0.1" in result.stdout
