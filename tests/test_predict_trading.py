@@ -635,7 +635,7 @@ def test_reconcile_rejects_match_for_a_different_owned_order_hash() -> None:
         if request.full_url.endswith("/v1/account/activity"):
             return FakeResponse({"data": [{"transactionHash": "tx", "amountFilled": "1", "order": {"hash": "order-hash", "fee": {"amount": "0", "type": "COLLATERAL"}}, "market": {"id": 896}, "outcome": {"onChainId": "yes-token"}}]})
         if request.full_url.endswith("/v1/positions?marketId=896"):
-            return FakeResponse({"data": [{"market": {"id": 896}, "outcome": {"onChainId": "yes-token"}, "amount": "1"}]})
+            return FakeResponse({"data": [{"market": {"id": 896}, "outcome": {"onChainId": "yes-token"}, "amount": "1000000000000000000"}]})
         raise AssertionError(request.full_url)
 
     result = make_client(urlopen_fn)[0].reconcile_buy("896", "yes-token", "order-hash")
