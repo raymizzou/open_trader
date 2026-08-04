@@ -613,8 +613,11 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
         jwt = client._authenticate()  # type: ignore[attr-defined]
         if market is None:
             return _blocked("Predict market/account readiness unavailable")
-        market_id = "" if market is _NO_PREDICT_MARKET else market.market_id
-        facts = client.approval_facts(market_id, exact_debit_wei=0)  # type: ignore[attr-defined]
+        facts = (
+            client.account_snapshot()  # type: ignore[attr-defined]
+            if market is _NO_PREDICT_MARKET
+            else client.approval_facts(market.market_id, exact_debit_wei=0)  # type: ignore[attr-defined]
+        )
     except KeychainError:
         return _blocked("Predict Keychain environment unavailable")
     except Exception as exc:
@@ -622,6 +625,7 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
             return _blocked("Predict account environment unavailable")
         return _failed("predict account read failed")
     try:
+        predict_account = facts["predict_account"]
         gas_signer = facts["gas_signer"]
         balance = _decimal_fact(facts, "available_usdt")
         allowance = _decimal_fact(facts, "allowance")
@@ -633,9 +637,18 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
     if (
         not isinstance(jwt, str)
         or not jwt
+        or not isinstance(predict_account, str)
+        or not predict_account
         or not isinstance(gas_signer, str)
         or not gas_signer
         or facts.get("scope_ready") is not True
+    ):
+        return _failed("predict account read failed")
+    wallet_address = facts.get("wallet_address")
+    if wallet_address is not None and (
+        not isinstance(wallet_address, str)
+        or not wallet_address
+        or wallet_address.casefold() != predict_account.casefold()
     ):
         return _failed("predict account read failed")
     if minimum_top_up_bnb > 0 or bnb_balance < required_bnb:

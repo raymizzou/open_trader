@@ -63,9 +63,9 @@ class PredictClient:
 
     def __init__(self) -> None:
         self.approval_fact_calls: list[tuple[str, int]] = []
+        self.account_snapshot_calls = 0
 
-    def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
-        self.approval_fact_calls.append((market_id, exact_debit_wei))
+    def _account_facts(self) -> dict[str, object]:
         return {
             "predict_account": CONFIG.predict.wallet_address if CONFIG.predict else "",
             "gas_signer": CONFIG.signer_address,
@@ -76,6 +76,21 @@ class PredictClient:
             "bnb_balance": "0.002",
             "required_bnb": "0.001",
             "minimum_top_up_bnb": "0",
+        }
+
+    def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
+        self.approval_fact_calls.append((market_id, exact_debit_wei))
+        return self._account_facts()
+
+    def account_snapshot(self) -> dict[str, object]:
+        self.account_snapshot_calls += 1
+        return {
+            "wallet_address": CONFIG.predict.wallet_address if CONFIG.predict else "",
+            **self._account_facts(),
+            "gas_ready": True,
+            "allowance_breaker": False,
+            "open_orders": (),
+            "positions": (),
         }
 
     def _authenticate(self) -> str:
@@ -196,7 +211,11 @@ def test_readiness_report_distinguishes_all_no_submit_facts(tmp_path: Path) -> N
 def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     tmp_path: Path,
 ) -> None:
-    client = PredictClient()
+    class SnapshotOnlyPredictClient(PredictClient):
+        def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
+            raise AssertionError((market_id, exact_debit_wei))
+
+    client = SnapshotOnlyPredictClient()
 
     class EmptyPredictSource(PredictSource):
         async def list_open_markets(self) -> tuple[Market, ...]:
@@ -213,7 +232,7 @@ def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     assert report.predict_preflight.status == "NOT_APPLICABLE"
     assert report.mutation_calls == 0
     assert report.live_notifications == 0
-    assert client.approval_fact_calls == [("", 0)]
+    assert client.account_snapshot_calls == 1
 
 
 def test_predict_account_readiness_uses_exact_approval_facts_not_satisfied_flag(
@@ -245,6 +264,7 @@ def test_predict_account_readiness_uses_exact_approval_facts_not_satisfied_flag(
     assert report.mutation_calls == 0
     assert report.live_notifications == 0
     assert client.approval_fact_calls == [("predict-market", 0)]
+    assert client.account_snapshot_calls == 0
 
 
 @pytest.mark.parametrize("empty_scan", (False, True))
@@ -261,8 +281,8 @@ def test_predict_account_readiness_fails_closed_on_missing_or_malformed_gas_fact
     tmp_path: Path, empty_scan: bool, overrides: dict[str, object]
 ) -> None:
     class GasFactsPredictClient(PredictClient):
-        def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
-            facts = super().approval_facts(market_id, exact_debit_wei)
+        def _account_facts(self) -> dict[str, object]:
+            facts = super()._account_facts()
             facts.update(overrides)
             return facts
 
@@ -286,13 +306,46 @@ def test_predict_account_readiness_fails_closed_on_missing_or_malformed_gas_fact
     assert report.live_notifications == 0
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"predict_account": ""},
+        {"wallet_address": ""},
+        {"wallet_address": "0x4444444444444444444444444444444444444444"},
+    ),
+)
+def test_empty_predict_account_snapshot_fails_closed_on_missing_or_mismatched_identity(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    class IdentityPredictClient(PredictClient):
+        def _account_facts(self) -> dict[str, object]:
+            facts = super()._account_facts()
+            facts.update(overrides)
+            return facts
+
+    class EmptyPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=lambda _config, *, urlopen_fn: EmptyPredictSource(),
+        predict_client_factory=lambda _config, *, urlopen_fn: IdentityPredictClient(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.predict_account.status == "FAIL"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
 @pytest.mark.parametrize("empty_scan", (False, True))
 def test_predict_account_readiness_fails_closed_on_insufficient_signer_bnb(
     tmp_path: Path, empty_scan: bool
 ) -> None:
     class LowGasPredictClient(PredictClient):
-        def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
-            facts = super().approval_facts(market_id, exact_debit_wei)
+        def _account_facts(self) -> dict[str, object]:
+            facts = super()._account_facts()
             facts["minimum_top_up_bnb"] = "0.001"
             return facts
 
