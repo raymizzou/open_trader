@@ -30,10 +30,9 @@ from open_trader.a_share_trend import (
     TrendReport,
     atr14,
     build_candidate_list,
-    build_report,
+    build_report as _build_report,
     estimate_buy_actions,
     evaluate_candidate,
-    load_eastmoney_account,
     load_futu_simulate_trend_account,
     load_protection_state,
     load_watch_events,
@@ -64,6 +63,65 @@ from open_trader.trend_industry_context import _context_to_mapping
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MISSING_FRESH = object()
+ACCOUNT_SNAPSHOT = {
+    "snapshot_generation": "sha256:" + "a" * 64,
+    "account_generation": "sha256:" + "b" * 64,
+    "status": "healthy",
+    "sources": {
+        "account": {
+            "status": "healthy",
+            "as_of": "2026-07-14T12:00:00+08:00",
+            "reason": None,
+            "brokers": {
+                broker: {
+                    "source_kind": "live" if broker == "tiger" else "statement",
+                    "data_as_of": "2026-07-14T12:00:00+08:00",
+                    "last_success_at": "2026-07-14T12:00:00+08:00",
+                    "status": "healthy",
+                    "reason": None,
+                }
+                for broker in ("eastmoney", "futu", "phillips", "tiger")
+            },
+        },
+        "quotes": {
+            "status": "healthy",
+            "as_of": "2026-07-14T12:00:00+08:00",
+            "reason": None,
+        },
+    },
+    "positions": [],
+    "cash_balances": [
+        {
+            "broker": broker,
+            "account_alias": f"{broker}_main",
+            "currency": currency,
+            "cash_balance": "0",
+            "available_balance": "0",
+        }
+        for broker, currency in (
+            ("eastmoney", "CNY"), ("phillips", "HKD"), ("tiger", "USD")
+        )
+    ],
+}
+ACCOUNT_INPUT = {
+    key: ACCOUNT_SNAPSHOT[key]
+    for key in ("snapshot_generation", "account_generation", "status")
+}
+
+
+def build_report(*args: object, **kwargs: object) -> TrendReport:
+    kwargs.setdefault("account_input", ACCOUNT_INPUT)
+    return _build_report(*args, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True)
+def account_http_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        trend_module,
+        "fetch_account_snapshot",
+        lambda: copy.deepcopy(ACCOUNT_SNAPSHOT),
+        raising=False,
+    )
 
 
 class DefaultSimAccountClient:
@@ -690,11 +748,22 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
             missing_market["strategy_snapshot"]["market"] = market_value
         assert not trend_module.valid_frozen_report_contract(missing_market)
     historical = json.loads(json.dumps(allocation_only_without_snapshot))
+    historical.pop("account_input", None)
     historical["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199), strategy_version="v10",
     )
     historical["metadata"]["market"] = "CN"
     assert trend_module.valid_frozen_report_contract(historical)
+    with_account_input = copy.deepcopy(historical)
+    with_account_input["account_input"] = {
+        "snapshot_generation": "sha256:" + "a" * 64,
+        "account_generation": "sha256:" + "b" * 64,
+        "status": "healthy",
+    }
+    assert trend_module.valid_frozen_report_contract(with_account_input)
+    invalid_account_input = copy.deepcopy(with_account_input)
+    invalid_account_input["account_input"]["status"] = "unavailable"
+    assert not trend_module.valid_frozen_report_contract(invalid_account_input)
     mismatched_historical_identity = json.loads(json.dumps(historical))
     mismatched_historical_identity["strategy_snapshot"]["strategy_id"] = (
         "trend_animals_warm_to_hot/CN/v11"
@@ -840,6 +909,34 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
     )
 
 
+def test_new_report_construction_and_serialization_require_account_input() -> None:
+    with pytest.raises(
+        ValueError,
+        match="new Trend reports require Account snapshot identity",
+    ):
+        _build_report(
+            as_of_date="2026-07-14",
+            execution_date="2026-07-15",
+            account=AccountSnapshot(
+                source_date="2026-07-14",
+                fresh=True,
+                net_value=Decimal("1000"),
+                available_cash=Decimal("1000"),
+                positions=(),
+                exceptions=(),
+            ),
+            candidates=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="new Trend reports require Account snapshot identity",
+    ):
+        trend_module._report_payload(replace(report(), account_input={}))
+
+
 def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
     held_symbols = tuple(f"10{index:04d}" for index in range(10))
     strategy = trend_module.live_trend_strategy_snapshot(
@@ -971,6 +1068,12 @@ def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
         net_value=Decimal("50000"),
         available_cash=Decimal("10000"),
         position_count=10,
+        instrument_ids_by_symbol={
+            symbol: f"ins_{symbol}" for symbol in real_symbols
+        },
+        blocked_instrument_ids={
+            f"ins_{real_symbols[0]}": "account_broker_stale:eastmoney"
+        },
     )
     strategy = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199),
@@ -1010,8 +1113,11 @@ def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
     assert [pair.buy_symbol for pair in built.simulate_rotation_pairs] == [
         real_symbols[-1], "200001",
     ]
+    assert (built.real_holdings[0].action, built.real_holdings[0].reason) == (
+        "MANUAL_REVIEW", "account_broker_stale:eastmoney"
+    )
     assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.real_rotation_pairs] == [
-        ("300000", "200001"),
+        ("300001", "200001"),
     ]
 
 
@@ -5129,61 +5235,6 @@ def test_protection_state_round_trips_and_jsonl_trigger_replays(tmp_path: Path) 
     assert load_protection_state(state_path) == state
 
 
-def test_load_account_uses_only_exact_eastmoney_rows_and_keeps_exceptions(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "portfolio.csv"
-    write_portfolio(
-        path,
-        [
-            portfolio_row(symbol="600001", market_value="1000"),
-            portfolio_row(
-                market="CASH",
-                asset_class="cash",
-                symbol="CNY_CASH",
-                name="人民币现金",
-                total_quantity="500",
-                market_value="500",
-            ),
-            portfolio_row(symbol="600002", brokers="futu", market_value="9999"),
-            portfolio_row(
-                symbol="110001",
-                name="可转债",
-                asset_class="bond",
-                market_value="200",
-            ),
-        ],
-    )
-    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
-    os.utime(path, (timestamp, timestamp))
-
-    snapshot = load_eastmoney_account(path, expected_date="2026-07-14")
-
-    assert snapshot.fresh is True
-    assert (snapshot.net_value, snapshot.available_cash) == (
-        Decimal("1700"),
-        Decimal("500"),
-    )
-    assert [item.symbol for item in snapshot.positions] == ["600001"]
-    assert any("110001" in exception for exception in snapshot.exceptions)
-
-
-def test_load_account_marks_stale_mtime(tmp_path: Path) -> None:
-    path = tmp_path / "portfolio.csv"
-    write_portfolio(path, [portfolio_row()])
-    timestamp = datetime(2026, 7, 13, 23, 59, tzinfo=SHANGHAI).timestamp()
-    os.utime(path, (timestamp, timestamp))
-    snapshot = load_eastmoney_account(path, expected_date="2026-07-14")
-    assert (snapshot.source_date, snapshot.fresh) == ("2026-07-13", False)
-
-
-def test_load_account_rejects_mixed_eastmoney_broker_row(tmp_path: Path) -> None:
-    path = tmp_path / "portfolio.csv"
-    write_portfolio(path, [portfolio_row(brokers="futu;eastmoney")])
-    with pytest.raises(ValueError, match="mixes Eastmoney"):
-        load_eastmoney_account(path, expected_date="2026-07-14")
-
-
 def test_markdown_prioritizes_actions_before_source_summary() -> None:
     markdown = render_markdown(report(candidates=(candidate("600001"),)))
     assert markdown.index("## 09:30–10:00：按顺序考虑买入") < markdown.index(
@@ -5879,17 +5930,16 @@ def test_markdown_translates_account_exceptions_without_raw_details() -> None:
     assert "future account exception payload" not in markdown
 
 
-def test_markdown_translates_missing_account_exception_fields(tmp_path: Path) -> None:
-    path = tmp_path / "portfolio.csv"
-    write_portfolio(
-        path,
-        [portfolio_row(symbol="", name="", asset_class="bond")],
-    )
-    timestamp = datetime(2026, 7, 14, 12, tzinfo=SHANGHAI).timestamp()
-    os.utime(path, (timestamp, timestamp))
+def test_markdown_translates_missing_account_exception_fields() -> None:
+    built = report()
     built = replace(
-        report(),
-        account=load_eastmoney_account(path, expected_date="2026-07-14"),
+        built,
+        account=replace(
+            built.account,
+            exceptions=(
+                "unsupported Eastmoney asset: <missing-symbol> <missing-name> (CN/bond)",
+            ),
+        ),
     )
 
     markdown = render_markdown(built)
@@ -6827,6 +6877,11 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
         ([700001], trend_module.INDUSTRY_STATE_FIELDS),
     ]
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["account_input"] == {
+        "snapshot_generation": "sha256:" + "a" * 64,
+        "account_generation": "sha256:" + "b" * 64,
+        "status": "healthy",
+    }
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
     assert payload["strategy_snapshot"]["strategy_version"] == "v8"
@@ -6847,6 +6902,42 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["query"]["component_pool_ids"] == [622466, 697199]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
+
+
+def test_a_share_report_pins_one_account_snapshot_through_internal_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    fetches = 0
+    seen: list[object] = []
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        return snapshot
+
+    def attempt(**kwargs: object) -> AShareTrendRunResult:
+        seen.append(kwargs.get("account_snapshot"))
+        return AShareTrendRunResult(
+            "waiting" if len(seen) == 1 else "generated",
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch, raising=False)
+    monkeypatch.setattr(trend_module, "_attempt_report", attempt)
+
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 17, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.status == "generated"
+    assert fetches == 1
+    assert seen == [snapshot, snapshot]
+    assert all(item is snapshot for item in seen)
 
 
 def test_report_runner_includes_simulated_holding_only_industry(

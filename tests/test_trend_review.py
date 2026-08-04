@@ -20,7 +20,7 @@ from open_trader.a_share_trend import (
     CandidateInput,
     RealHoldingInput,
     _report_payload,
-    build_report,
+    build_report as _build_report,
     live_trend_strategy_snapshot,
     trend_strategy_snapshot,
     load_protection_state,
@@ -32,6 +32,18 @@ from open_trader.strategy_drawdown import (
 )
 from open_trader.models import Market, TradeFill
 from open_trader.trend_industry_context import IndustryContext
+
+
+ACCOUNT_INPUT = {
+    "snapshot_generation": "sha256:" + "a" * 64,
+    "account_generation": "sha256:" + "b" * 64,
+    "status": "healthy",
+}
+
+
+def build_report(*args: object, **kwargs: object) -> object:
+    kwargs.setdefault("account_input", ACCOUNT_INPUT)
+    return _build_report(*args, **kwargs)  # type: ignore[arg-type]
 
 
 def test_rotation_reservations_keep_two_immutable_slots_across_revisions(

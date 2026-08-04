@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 
 import pytest
 
-from open_trader.a_share_trend import load_eastmoney_account
+from open_trader.a_share_trend import AccountPosition, AccountSnapshot
 from open_trader.a_share_trend_watch import (
     _deliver_trigger_notification,
     _notify_trend_review_deadline,
@@ -19,7 +19,7 @@ from open_trader.a_share_trend_watch import (
 
 
 def watch_a_share_protection(**kwargs: object) -> object:
-    kwargs.setdefault("account_loader", load_eastmoney_account)
+    kwargs.setdefault("account_loader", _load_watch_account_fixture)
     return _watch_a_share_protection(**kwargs)
 from open_trader.daily_premarket import RunLock
 from open_trader.futu_quote import FutuQuoteError
@@ -142,6 +142,45 @@ class SuppressedXiaoaiNotifier(RecordingXiaoaiNotifier):
     def notify(self, title: str, message: str) -> None:
         self.attempt_count += 1
         raise XiaoaiVoiceSuppressed("quiet hours")
+
+
+def _load_watch_account_fixture(
+    path: Path,
+    *,
+    expected_date: str,
+    timezone: object,
+) -> AccountSnapshot:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    positions = tuple(
+        AccountPosition(
+            symbol=row["symbol"].strip(),
+            name=row["name"].strip(),
+            asset_class=row["asset_class"].strip().lower(),
+            quantity=Decimal(row["total_quantity"]),
+            avg_cost_price=Decimal(row["avg_cost_price"]),
+            market_value=Decimal(row["market_value"]),
+        )
+        for row in rows
+        if row.get("brokers", "").strip().lower() == "eastmoney"
+        and row.get("market", "").strip().upper() == "CN"
+        and row.get("asset_class", "").strip().lower() in {"stock", "etf"}
+        and Decimal(row.get("total_quantity", "0")) > 0
+    )
+    source_date = (
+        datetime.fromtimestamp(path.stat().st_mtime, timezone)  # type: ignore[arg-type]
+        .date()
+        .isoformat()
+    )
+    return AccountSnapshot(
+        source_date=source_date,
+        fresh=source_date == expected_date,
+        net_value=sum((item.market_value for item in positions), Decimal("0")),
+        available_cash=Decimal("0"),
+        positions=positions,
+        exceptions=(),
+        position_count=len(positions),
+    )
 
 
 def portfolio(

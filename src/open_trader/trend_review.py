@@ -512,6 +512,7 @@ def freeze_report_evidence(
     metadata = getattr(report, "metadata")
     strategy_snapshot = getattr(report, "strategy_snapshot")
     risk_summary = getattr(report, "risk_summary")
+    account_input = getattr(report, "account_input", {})
     frozen_allocation = getattr(report, "allocation", None)
     allocation_evidence: dict[str, object] | None = None
     if frozen_allocation is not None:
@@ -584,6 +585,11 @@ def freeze_report_evidence(
             ),
             "kelly_rounds": kelly_rounds,
             "kelly_data_reason": kelly_data_reason,
+            **(
+                {"account_input": dict(account_input)}
+                if isinstance(account_input, Mapping) and account_input
+                else {}
+            ),
             **(
                 {"real_holdings": real_holdings_input}
                 if real_holdings_input is not None
@@ -8143,6 +8149,14 @@ def rebuild_trend_report_from_evidence(
                 )
         else:
             real_prior_state = None
+        instrument_ids = real_raw.get("instrument_ids_by_symbol") or {}
+        blocked_instruments = real_raw.get("blocked_instrument_ids") or {}
+        if not isinstance(instrument_ids, Mapping) or not isinstance(
+            blocked_instruments, Mapping
+        ):
+            raise TrendReplayIncompleteError(
+                "invalid original input: real_holdings"
+            )
         real_holdings_input = RealHoldingInput(
             status=str(real_status),
             reason=real_reason,
@@ -8162,6 +8176,14 @@ def rebuild_trend_report_from_evidence(
                 and not isinstance(real_raw.get("position_count"), bool)
                 else None
             ),
+            instrument_ids_by_symbol={
+                str(key): str(value)
+                for key, value in instrument_ids.items()
+            },
+            blocked_instrument_ids={
+                str(key): str(value)
+                for key, value in blocked_instruments.items()
+            },
         )
     process_version = str(evidence.get("process_version") or "")
     normalize_trend_strategy_snapshot(snapshot, str(inputs["market"]))
@@ -8249,6 +8271,12 @@ def rebuild_trend_report_from_evidence(
             raise TrendReplayIncompleteError(
                 "invalid original input: allocation"
             ) from None
+    historical_account_input = "account_input" not in inputs
+    raw_account_input = inputs.get("account_input")
+    if not historical_account_input and not isinstance(raw_account_input, Mapping):
+        raise TrendReplayIncompleteError(
+            "invalid original input: account_input"
+        )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -8302,6 +8330,12 @@ def rebuild_trend_report_from_evidence(
         estimated_api_cost_complete=estimated_api_cost_complete,
         real_holdings=real_holdings_input,
         allocation_reference=allocation_reference,
+        account_input=(
+            dict(raw_account_input)
+            if isinstance(raw_account_input, Mapping)
+            else None
+        ),
+        _allow_historical_account_input=historical_account_input,
     )
     market = str(inputs["market"]).upper()
     if market in {"US", "HK"}:
@@ -8410,7 +8444,10 @@ def rebuild_trend_report_from_evidence(
                 "real_rotation_comparisons"
             ),
         )
-    payload = _report_payload(report)
+    payload = _report_payload(
+        report,
+        _allow_historical_account_input=historical_account_input,
+    )
     if market in {"US", "HK"}:
         attention_input = inputs.get("option_attention")
         if not isinstance(attention_input, Mapping):

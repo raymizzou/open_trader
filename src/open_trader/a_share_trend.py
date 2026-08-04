@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import re
@@ -16,13 +15,13 @@ from time import sleep
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from .account_http import fetch_account_snapshot
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
     require_trend_review_config,
     send_notification_with_results,
 )
-from .broker_details import load_broker_detail_snapshot
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
@@ -919,6 +918,10 @@ def _valid_rotation_comparison(
 
 def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     """Validate the allocation-era fields once for every frozen-report reader."""
+    if "account_input" in payload and not _valid_account_input(
+        payload.get("account_input")
+    ):
+        return False
     allocation = payload.get("allocation")
     judgments = payload.get("strategy_judgments")
     metadata = payload.get("metadata")
@@ -1950,6 +1953,8 @@ class RealHoldingInput:
     net_value: Decimal = Decimal("0")
     available_cash: Decimal = Decimal("0")
     position_count: int | None = None
+    instrument_ids_by_symbol: Mapping[str, str] = field(default_factory=dict)
+    blocked_instrument_ids: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1985,6 +1990,7 @@ class TrendReport:
     industry_contexts: tuple[IndustryContext, ...]
     industry_context_status: dict[str, object]
     estimated_api_cost_complete: bool
+    account_input: dict[str, object] = field(default_factory=dict)
     drawdown_summary: dict[str, object] | None = None
     replay_evidence: dict[str, str] | None = None
     real_holdings: tuple[HoldingDecision, ...] = ()
@@ -1999,15 +2005,6 @@ class TrendReport:
     real_rotation_comparisons: tuple[RotationComparison, ...] = ()
 
 
-def _broker_set(value: str) -> set[str]:
-    return {
-        part.strip().lower()
-        for chunk in value.split(",")
-        for part in chunk.split(";")
-        if part.strip()
-    }
-
-
 def _decimal(value: object) -> Decimal:
     try:
         result = Decimal(str(value).strip())
@@ -2016,6 +2013,31 @@ def _decimal(value: object) -> Decimal:
     if not result.is_finite():
         raise ValueError(f"invalid decimal value: {value!r}")
     return result
+
+
+def _valid_account_input(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {
+            "snapshot_generation", "account_generation", "status",
+        }
+        and value.get("status") in {"healthy", "stale"}
+        and all(
+            isinstance(value.get(field), str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", value[field]) is not None
+            for field in ("snapshot_generation", "account_generation")
+        )
+    )
+
+
+def _account_input(account_snapshot: Mapping[str, object]) -> dict[str, object]:
+    value = {
+        field: account_snapshot.get(field)
+        for field in ("snapshot_generation", "account_generation", "status")
+    }
+    if not _valid_account_input(value):
+        raise ValueError("Account snapshot identity is invalid")
+    return value
 
 
 def _format_api_cost(value: Decimal) -> str:
@@ -2082,26 +2104,8 @@ def _ticker_labels(value: object) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(";") if part.strip())
 
 
-def _account_exceptions(rows: Sequence[Mapping[str, str]]) -> list[str]:
-    exceptions: list[str] = []
-    for row in rows:
-        market = row.get("market", "").strip().upper()
-        asset_class = row.get("asset_class", "").strip().lower()
-        currency = row.get("currency", "").strip().upper()
-        if market == "CN" and asset_class in {"stock", "etf"}:
-            continue
-        if market == "CASH" and asset_class == "cash" and currency == "CNY":
-            continue
-        symbol = row.get("symbol", "").strip() or "<missing-symbol>"
-        name = row.get("name", "").strip() or "<missing-name>"
-        exceptions.append(
-            f"unsupported Eastmoney asset: {symbol} {name} ({market}/{asset_class})"
-        )
-    return exceptions
-
-
 def load_real_holding_input(
-    data_dir: Path,
+    account_snapshot: Mapping[str, object],
     market: str,
     *,
     state_path: Path,
@@ -2116,27 +2120,50 @@ def load_real_holding_input(
         broker, broker_label = broker_by_market[normalized_market]
     except KeyError:
         raise ValueError(f"unsupported real holding market: {market}") from None
-    detail = load_broker_detail_snapshot(data_dir, broker)
-    source = {
-        "broker": broker,
-        "broker_label": broker_label,
-        "snapshot_period": detail.snapshot_period,
-        "source_kind": detail.source_kind,
-        "freshness_text": (
-            "实时" if detail.source_kind == "live_account" else "非实时"
-        ),
-        "read_only_text": "只读，不自动下单",
-    }
-    if not detail.available:
+    sources = account_snapshot.get("sources")
+    account_source = sources.get("account") if isinstance(sources, Mapping) else None
+    broker_sources = (
+        account_source.get("brokers")
+        if isinstance(account_source, Mapping)
+        else None
+    )
+    broker_source = (
+        broker_sources.get(broker)
+        if isinstance(broker_sources, Mapping)
+        else None
+    )
+    quote_source = sources.get("quotes") if isinstance(sources, Mapping) else None
+    positions_value = account_snapshot.get("positions")
+    cash_value = account_snapshot.get("cash_balances")
+    if (
+        not isinstance(broker_source, Mapping)
+        or not isinstance(quote_source, Mapping)
+        or not isinstance(positions_value, list)
+        or not all(isinstance(row, Mapping) for row in positions_value)
+        or not isinstance(cash_value, list)
+        or not all(isinstance(row, Mapping) for row in cash_value)
+    ):
         return RealHoldingInput(
             status="unavailable",
-            reason=detail.reason,
-            source=source,
+            reason="Account 快照账户事实不可用",
+            source={"broker": broker, "broker_label": broker_label},
             positions=(),
             holding_snapshots={},
             bars_by_symbol={},
             prior_state=None,
         )
+    source_kind = str(broker_source.get("source_kind") or "")
+    data_as_of = str(broker_source.get("data_as_of") or "")
+    source = {
+        "broker": broker,
+        "broker_label": broker_label,
+        "snapshot_period": data_as_of,
+        "source_kind": source_kind,
+        "freshness_text": (
+            "实时" if source_kind in {"live", "live_account"} else "非实时"
+        ),
+        "read_only_text": "只读，不自动下单",
+    }
     try:
         prior_state = load_protection_state(state_path)
     except ValueError as exc:
@@ -2150,25 +2177,39 @@ def load_real_holding_input(
             prior_state=None,
         )
     positions: list[AccountPosition] = []
-    for row in detail.positions:
-        if row.get("market", "").strip().upper() != normalized_market:
+    instrument_ids_by_symbol: dict[str, str] = {}
+    blocked_instrument_ids: dict[str, str] = {}
+    account_currency = {"CN": "CNY", "HK": "HKD", "US": "USD"}[
+        normalized_market
+    ]
+    for row in positions_value:
+        assert isinstance(row, Mapping)
+        if str(row.get("broker") or "").strip().lower() != broker:
             continue
-        symbol_text = row.get("symbol", "").strip()
-        name = row.get("name", "").strip() or symbol_text
-        asset_class = row.get("asset_class", "").strip().lower()
+        if str(row.get("market") or "").strip().upper() != normalized_market:
+            continue
+        symbol_text = str(row.get("symbol") or "").strip()
+        name = str(row.get("name") or "").strip() or symbol_text
+        asset_class = str(row.get("asset_class") or "").strip().lower()
         if not asset_class:
             asset_class = detect_asset_class(symbol_text, name).value
         if asset_class not in {"stock", "etf"}:
             continue
-        try:
-            quantity = _decimal(row.get("quantity", ""))
-            market_value_text = row.get("market_value", "").strip()
-            market_value = (
-                Decimal("0")
-                if not market_value_text
-                else _decimal(market_value_text)
+        currency = str(row.get("currency") or "").strip().upper()
+        if currency != account_currency:
+            return RealHoldingInput(
+                status="unavailable",
+                reason=f"真实持仓币种不可用：{symbol_text or '<missing>'}",
+                source=source,
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
             )
-            avg_cost_price = _optional_decimal(row.get("cost_price", ""))
+        try:
+            quantity = _decimal(row.get("quantity"))
+            market_value = _decimal(row.get("market_value"))
+            avg_cost_price = _optional_decimal(row.get("cost_price"))
             if quantity <= 0:
                 continue
             futu_symbol = to_futu_symbol(normalized_market, symbol_text)
@@ -2193,6 +2234,32 @@ def load_real_holding_input(
                 bars_by_symbol={},
                 prior_state=None,
             )
+        instrument_id = str(row.get("instrument_id") or "").strip()
+        if not instrument_id:
+            return RealHoldingInput(
+                status="unavailable",
+                reason=f"真实持仓 Account 标识不可用：{symbol}",
+                source=source,
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
+            )
+        previous_id = instrument_ids_by_symbol.setdefault(symbol, instrument_id)
+        if previous_id != instrument_id:
+            return RealHoldingInput(
+                status="unavailable",
+                reason=f"真实持仓 Account 标识冲突：{symbol}",
+                source=source,
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
+            )
+        if broker_source.get("status") != "healthy":
+            blocked_instrument_ids[instrument_id] = f"account_broker_stale:{broker}"
+        elif quote_source.get("status") != "healthy":
+            blocked_instrument_ids[instrument_id] = "account_quotes_stale"
         positions.append(
             AccountPosition(
                 symbol=symbol,
@@ -2204,16 +2271,20 @@ def load_real_holding_input(
                 futu_symbol=futu_symbol,
             )
         )
-    account_currency = {"CN": "CNY", "HK": "HKD", "US": "USD"}[
-        normalized_market
-    ]
     cash_values: list[Decimal] = []
     cash_reason = ""
-    for row in detail.cash:
-        value = _optional_decimal(
-            row.get("available_balance", row.get("cash_balance", ""))
-        )
-        currency = row.get("currency", "").strip().upper()
+    for row in cash_value:
+        assert isinstance(row, Mapping)
+        if str(row.get("broker") or "").strip().lower() != broker:
+            continue
+        try:
+            value = _optional_decimal(
+                row.get("available_balance", row.get("cash_balance", ""))
+            )
+        except ValueError:
+            cash_reason = "真实账户可用现金不可用"
+            break
+        currency = str(row.get("currency") or "").strip().upper()
         if value is None or not value.is_finite() or value < 0:
             cash_reason = "真实账户可用现金不可用"
             break
@@ -2244,6 +2315,8 @@ def load_real_holding_input(
         net_value=sum((position.market_value for position in positions), available_cash),
         available_cash=available_cash,
         position_count=len(positions),
+        instrument_ids_by_symbol=instrument_ids_by_symbol,
+        blocked_instrument_ids=blocked_instrument_ids,
     )
 
 
@@ -2481,59 +2554,6 @@ def _remember_verified_symbol_row(
 def _supports_symbol_mapping_contract(api: object) -> bool:
     return callable(getattr(api, "remember_symbol_row", None)) and callable(
         getattr(api, "symbol_mapping", None)
-    )
-
-
-def load_eastmoney_account(
-    path: Path,
-    *,
-    expected_date: str,
-    timezone: ZoneInfo = ZoneInfo("Asia/Shanghai"),
-) -> AccountSnapshot:
-    source_date = datetime.fromtimestamp(path.stat().st_mtime, timezone).date().isoformat()
-    with path.open(encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    for row in rows:
-        brokers = _broker_set(row.get("brokers", ""))
-        if "eastmoney" in brokers and brokers != {"eastmoney"}:
-            raise ValueError(
-                f"portfolio row {row.get('symbol', '')} mixes Eastmoney with other brokers"
-            )
-    eastmoney = [
-        row for row in rows if _broker_set(row.get("brokers", "")) == {"eastmoney"}
-    ]
-    net_value = sum((_decimal(row["market_value"]) for row in eastmoney), Decimal("0"))
-    cash = sum(
-        (
-            _decimal(row["market_value"])
-            for row in eastmoney
-            if row.get("market", "").strip().upper() == "CASH"
-            and row.get("currency", "").strip().upper() == "CNY"
-        ),
-        Decimal("0"),
-    )
-    positions = tuple(
-        AccountPosition(
-            symbol=row["symbol"].strip(),
-            name=row["name"].strip(),
-            asset_class=row["asset_class"].strip().lower(),
-            quantity=_decimal(row["total_quantity"]),
-            avg_cost_price=_optional_decimal(row.get("avg_cost_price", "")),
-            market_value=_decimal(row["market_value"]),
-        )
-        for row in eastmoney
-        if row.get("market", "").strip().upper() == "CN"
-        and row.get("asset_class", "").strip().lower() in {"stock", "etf"}
-        and _decimal(row.get("total_quantity", "")) > 0
-    )
-    return AccountSnapshot(
-        source_date=source_date,
-        fresh=source_date == expected_date,
-        net_value=net_value,
-        available_cash=cash,
-        positions=positions,
-        exceptions=tuple(_account_exceptions(eastmoney)),
-        position_count=len(positions),
     )
 
 
@@ -3395,6 +3415,7 @@ def _plan_account_rotation_pairs(
     kelly_state: TrendKellyState | None,
     critical_data_reason: str,
     require_mapping: bool,
+    excluded_sell_symbols: Sequence[str] = (),
 ) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Pair first, then reuse ordinary entry sizing with each sell's proceeds."""
     positions_by_symbol = {item.symbol: item for item in account.positions}
@@ -3402,6 +3423,7 @@ def _plan_account_rotation_pairs(
         snapshot
         for decision in holdings
         if decision.action == "HOLD"
+        and decision.symbol not in excluded_sell_symbols
         and (snapshot := holding_snapshots.get(decision.symbol)) is not None
     ]
     proposed, comparisons = plan_rotation_pairs_with_comparisons(
@@ -4531,6 +4553,7 @@ def _evaluate_holding_positions(
     current_exit_discipline: bool,
     read_only_real: bool,
     trend_excluded_symbols: Sequence[str] = (),
+    blocked_symbols: Mapping[str, str] | None = None,
 ) -> HoldingEvaluation:
     old_positions = _state_positions(prior_state)
     decisions: list[HoldingDecision] = []
@@ -4649,6 +4672,8 @@ def _evaluate_holding_positions(
             action, reason = "MANUAL_REVIEW", "holding_signal_unknown"
         if read_only_real and symbol in trend_excluded_symbols:
             action, reason = "MANUAL_REVIEW", "holding_trend_excluded"
+        if read_only_real and symbol in (blocked_symbols or {}):
+            action, reason = "MANUAL_REVIEW", str(blocked_symbols[symbol])
         effective_atr = current_atr if current_atr is not None else old_atr
         target_fraction: Decimal | None = None
         estimated_shares: int | None = None
@@ -4799,7 +4824,15 @@ def build_report(
     estimated_api_cost_complete: bool = True,
     real_holdings: RealHoldingInput | None = None,
     allocation_reference: Mapping[str, object] | None = None,
+    account_input: Mapping[str, object] | None = None,
+    _allow_historical_account_input: bool = False,
 ) -> TrendReport:
+    resolved_account_input = dict(account_input or {})
+    if not resolved_account_input:
+        if not _allow_historical_account_input:
+            raise ValueError("new Trend reports require Account snapshot identity")
+    elif not _valid_account_input(resolved_account_input):
+        raise ValueError("Account snapshot identity is invalid")
     symbol_mapping_required = (
         (metadata or {}).get("symbol_mapping_schema")
         == TREND_SYMBOL_MAPPING_SCHEMA
@@ -4955,6 +4988,11 @@ def build_report(
     )
     real_decisions: tuple[HoldingDecision, ...] = ()
     real_protection_state: dict[str, object] | None = None
+    real_blocked_symbols = {
+        symbol: real_holdings.blocked_instrument_ids[instrument_id]
+        for symbol, instrument_id in real_holdings.instrument_ids_by_symbol.items()
+        if instrument_id in real_holdings.blocked_instrument_ids
+    } if real_holdings is not None else {}
     if real_holdings is not None and real_holdings.status == "available":
         real_evaluation = _evaluate_holding_positions(
             positions=real_holdings.positions,
@@ -4968,6 +5006,7 @@ def build_report(
             current_exit_discipline=current_exit_discipline,
             read_only_real=True,
             trend_excluded_symbols=real_holdings.trend_excluded_symbols,
+            blocked_symbols=real_blocked_symbols,
         )
         real_decisions = real_evaluation.decisions
         real_protection_state = real_evaluation.protection_state
@@ -5169,6 +5208,7 @@ def build_report(
             kelly_state=kelly_state,
             critical_data_reason=kelly_data_reason,
             require_mapping=symbol_mapping_required,
+            excluded_sell_symbols=(),
         )
         simulate_rotation_pairs = tuple(
             replace(
@@ -5220,6 +5260,7 @@ def build_report(
                 kelly_state=kelly_state,
                 critical_data_reason=kelly_data_reason,
                 require_mapping=symbol_mapping_required,
+                excluded_sell_symbols=tuple(real_blocked_symbols),
             )
             real_rotation_pairs = tuple(
                 replace(
@@ -5353,6 +5394,7 @@ def build_report(
         real_rotation_pairs=real_rotation_pairs,
         simulate_rotation_comparisons=simulate_rotation_comparisons,
         real_rotation_comparisons=real_rotation_comparisons,
+        account_input=resolved_account_input,
     )
 
 
@@ -6660,7 +6702,16 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             raise ValueError("strategy snapshot does not match report actions")
 
 
-def _report_payload(report: TrendReport) -> dict[str, object]:
+def _report_payload(
+    report: TrendReport,
+    *,
+    _allow_historical_account_input: bool = False,
+) -> dict[str, object]:
+    if not report.account_input:
+        if not _allow_historical_account_input:
+            raise ValueError("new Trend reports require Account snapshot identity")
+    elif not _valid_account_input(report.account_input):
+        raise ValueError("Account snapshot identity is invalid")
     validate_report_strategy_snapshot(report)
     market = str(report.metadata.get("market") or "CN").upper()
     legacy_v1 = report.strategy_snapshot.get("strategy_version") == "v1"
@@ -6791,6 +6842,8 @@ def _report_payload(report: TrendReport) -> dict[str, object]:
         "strategy_snapshot": _json_value(report.strategy_snapshot),
         "disclaimer": DISCLAIMER_TEXT,
     }
+    if report.account_input:
+        payload["account_input"] = dict(report.account_input)
     if report.allocation is not None:
         payload["allocation"] = dict(report.allocation)
     if report.drawdown_summary is not None:
@@ -7711,6 +7764,7 @@ def _attempt_report(
     quote_factory: Callable[..., object],
     account_factory: Callable[..., object],
     notifier: Notifier,
+    account_snapshot: Mapping[str, object],
     allocation_reference: Mapping[str, object] | None = None,
 ) -> AShareTrendRunResult:
     run_day = date.fromisoformat(run_date)
@@ -7772,7 +7826,7 @@ def _attempt_report(
             account_factory=account_factory,
         )
         real_holdings = load_real_holding_input(
-            config.data_dir,
+            account_snapshot,
             "CN",
             state_path=config.data_dir
             / "trend_a_share/real_protection_state.json",
@@ -8084,6 +8138,7 @@ def _attempt_report(
             kelly_data_reason=kelly_data_reason,
             real_holdings=real_holdings,
             allocation_reference=allocation_reference,
+            account_input=_account_input(account_snapshot),
         )
         report = freeze_report_rotation_pairs(report, config.data_dir)
         report = replace(
@@ -8278,6 +8333,7 @@ def run_a_share_trend_report(
         )
         if recovered is not None:
             return recovered
+        account_snapshot = fetch_account_snapshot()
         version = _process_version(config.repo)
         log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
         deadline = datetime.combine(run_day, time(19, 0), tzinfo=SHANGHAI)
@@ -8301,6 +8357,7 @@ def run_a_share_trend_report(
                         account_factory or FutuSimulateOrderExecutionClient
                     ),
                     "notifier": notifier,
+                    "account_snapshot": account_snapshot,
                 }
                 if allocation_reference is not None:
                     attempt_kwargs["allocation_reference"] = allocation_reference

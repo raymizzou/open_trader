@@ -19,6 +19,7 @@ import pytest
 
 from open_trader import a_share_trend as a_share_trend
 from open_trader import trend_market_controller as controller
+from open_trader.account_http import AccountHttpError
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_symbols import to_futu_symbol
 from open_trader.kelly_order_execution import FutuOrderExecutionError
@@ -6573,6 +6574,27 @@ def test_controller_never_generates_report_before_allocation_terminal_attempt(
     assert generated == []
     assert result["phase"] == "blocked"
     assert "terminal attempt" in str(result["blocker"])
+
+
+def test_controller_exposes_account_snapshot_failure_as_report_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(controller_config(tmp_path), trend_animals_api_key="test-key")
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_allocation_reference_for_cycle", lambda *_args, **_kwargs: None
+    )
+
+    def fail(*_args: object) -> None:
+        raise AccountHttpError("account_unavailable")
+
+    monkeypatch.setattr(controller, "_generate_report", fail)
+
+    result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert result["phase"] == "recovering_report"
+    assert result["blocker"] == "report generation failed: account_unavailable"
+    assert not list(config.reports_dir.rglob("*.json"))
 
 
 @pytest.mark.parametrize("reference", [

@@ -1916,6 +1916,11 @@ def _dashboard_frozen_report_payload(
         actual_api_cost=None,
         estimated_api_cost_complete=False,
         candidate_pool_ids=candidate_pool_ids,
+        account_input={
+            "snapshot_generation": "sha256:" + "a" * 64,
+            "account_generation": "sha256:" + "b" * 64,
+            "status": "healthy",
+        },
     )
     payload = trend_module._report_payload(report)
     if market != "CN":
@@ -3865,6 +3870,11 @@ def test_dashboard_real_cn_report_only_allows_empty_option_attention(
         holding_snapshots={},
         bars_by_symbol={},
         metadata={"market": "CN", "broker": "eastmoney"},
+        account_input={
+            "snapshot_generation": "sha256:" + "a" * 64,
+            "account_generation": "sha256:" + "b" * 64,
+            "status": "healthy",
+        },
     )
     payload = trend_module._report_payload(report)
     assert "option_attention" not in payload

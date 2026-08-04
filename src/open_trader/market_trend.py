@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import re
 from collections import defaultdict
@@ -13,15 +12,15 @@ from time import sleep
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .account_http import fetch_account_snapshot
 from .a_share_trend import (
     A_SHARE_INDUSTRY_FIELDS,
     AShareTrendRunResult,
-    AccountPosition,
-    AccountSnapshot,
     INDUSTRY_MEMBER_FIELDS,
     INDUSTRY_STATE_FIELDS,
     UNIFIED_TREND_FIELDS,
     _balance,
+    _account_input,
     _allocation_market_for,
     _billing_field,
     _billing_price,
@@ -60,7 +59,6 @@ from .a_share_trend import (
     render_markdown,
     write_protection_state,
 )
-from .broker_details import load_broker_detail_snapshot
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
@@ -72,7 +70,6 @@ from .trend_kelly import load_trend_kelly_rounds
 from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
-from .parsers.base import detect_asset_class
 from .trend_animals import (
     TREND_SYMBOL_MAPPING_SCHEMA,
     TrendAnimalsClient,
@@ -99,8 +96,6 @@ MARKET_NOTIFICATION_LABELS = {
     "US": ("老虎", "美股", "确认 Trend Animals 与老虎账户状态后手动重跑老虎报告"),
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
-USD_TO_HKD = Decimal("7.85")
-SOURCE_DATE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 ATTENTION_CHANGE_FIELDS = (
     "right_side",
     "temperature_curr",
@@ -154,20 +149,6 @@ def market_paths(data_dir: Path, reports_dir: Path, market: str) -> MarketTrendP
     )
 
 
-def _read_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8-sig", newline="") as handle:
-        return [dict(row) for row in csv.DictReader(handle)]
-
-
-def _latest_broker_rows(
-    data_dir: Path, broker: str
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    snapshot = load_broker_detail_snapshot(data_dir, broker)
-    return list(snapshot.positions), list(snapshot.cash)
-
-
 def _decimal(value: object, *, default: Decimal | None = None) -> Decimal:
     try:
         parsed = Decimal(str(value).strip())
@@ -182,304 +163,12 @@ def _decimal(value: object, *, default: Decimal | None = None) -> Decimal:
     return parsed
 
 
-def _optional_decimal(value: object) -> Decimal | None:
-    if value is None or not str(value).strip():
-        return None
-    return _decimal(value)
-
-
-def _source_date(rows: Sequence[Mapping[str, str]]) -> str:
-    dates = []
-    for row in rows:
-        match = SOURCE_DATE.match(row.get("statement_id", "").strip())
-        if match:
-            dates.append(match.group(1))
-    return max(dates) if dates else "unknown"
-
-
 def _normalized_symbol(market: str, value: str) -> str:
     normalized = value.strip().upper()
     suffix = f".{market}"
     if normalized.endswith(suffix):
         normalized = normalized[: -len(suffix)]
     return to_futu_symbol(market, normalized).split(".", 1)[1]
-
-
-def load_market_account(
-    *,
-    data_dir: Path,
-    broker: str,
-    market: str,
-    expected_date: str,
-    managed_symbols: set[str],
-) -> AccountSnapshot:
-    market = _market(market)
-    settings = MARKET_SETTINGS[market]
-    if broker != settings["broker"]:
-        raise ValueError(f"{market} trend account must use {settings['broker']}")
-    currency = str(settings["currency"])
-    position_rows, cash_rows = _latest_broker_rows(data_dir, broker)
-    if not position_rows and not cash_rows:
-        raise FileNotFoundError(f"no {broker} account details found")
-    source_date = _source_date([*position_rows, *cash_rows])
-    normalized_managed = {
-        _normalized_symbol(market, symbol) for symbol in managed_symbols
-    }
-    market_rows = [
-        row for row in position_rows
-        if row.get("market", "").strip().upper() == market
-        and row.get("currency", "").strip().upper() == currency
-    ]
-    native_cash_rows = [
-        row for row in cash_rows
-        if row.get("currency", "").strip().upper() == currency
-    ]
-    exceptions: list[str] = []
-    positions: list[AccountPosition] = []
-    for row in market_rows:
-        try:
-            symbol = _normalized_symbol(market, row.get("symbol", ""))
-        except ValueError:
-            continue
-        quantity = _decimal(row.get("quantity", "0"), default=Decimal("0"))
-        if market != "US" and symbol not in normalized_managed:
-            continue
-        asset_class = row.get("asset_class", "").strip().lower()
-        if asset_class not in {"stock", "etf"}:
-            exceptions.append(
-                f"趋势判断不支持当前持仓：{symbol}（{asset_class or 'unknown'}）"
-            )
-            continue
-        if quantity <= 0:
-            exceptions.append(f"趋势判断不支持非多头持仓：{symbol}")
-            continue
-        positions.append(
-            AccountPosition(
-                symbol=symbol,
-                name=row.get("name", "").strip() or symbol,
-                asset_class=asset_class,
-                quantity=quantity,
-                avg_cost_price=_optional_decimal(row.get("cost_price")),
-                market_value=_decimal(row.get("market_value")),
-            )
-        )
-    if market == "US":
-        exceptions.extend(
-            f"现金类资产不参与趋势判断：{row.get('symbol', '').strip()}（{row.get('asset_class', '').strip().lower() or 'unknown'}）"
-            for row in position_rows
-            if row.get("market", "").strip().upper() == "CASH"
-            or row.get("asset_class", "").strip().lower()
-            in {"cash", "money_market_fund"}
-        )
-    position_value = sum(
-        (_decimal(row.get("market_value"), default=Decimal("0")) for row in market_rows),
-        Decimal("0"),
-    )
-    cash_balance = sum(
-        (_decimal(row.get("cash_balance"), default=Decimal("0")) for row in native_cash_rows),
-        Decimal("0"),
-    )
-    available_cash = sum(
-        (
-            _decimal(
-                row.get("available_balance"),
-                default=_decimal(row.get("cash_balance"), default=Decimal("0")),
-            )
-            if broker == "futu"
-            else min(
-                _decimal(row.get("cash_balance"), default=Decimal("0")),
-                _decimal(
-                    row.get("available_balance"),
-                    default=_decimal(row.get("cash_balance"), default=Decimal("0")),
-                ),
-            )
-            for row in native_cash_rows
-        ),
-        Decimal("0"),
-    )
-    net_value = position_value + cash_balance
-    if broker == "futu" and market == "US":
-        fx = StaticMonthEndFxProvider(expected_date[:7], DEFAULT_RATES_TO_HKD)
-        target_rate = fx.get_rate_to_hkd(currency).rate
-        net_value = sum(
-            (
-                _decimal(row.get("market_value"), default=Decimal("0"))
-                * fx.get_rate_to_hkd(row.get("currency", currency)).rate
-                / target_rate
-                for row in position_rows
-            ),
-            Decimal("0"),
-        ) + sum(
-            (
-                _decimal(row.get("cash_balance"), default=Decimal("0"))
-                * fx.get_rate_to_hkd(row.get("currency", currency)).rate
-                / target_rate
-                for row in cash_rows
-            ),
-            Decimal("0"),
-        )
-    return AccountSnapshot(
-        source_date=source_date,
-        fresh=source_date == expected_date,
-        net_value=net_value,
-        available_cash=max(Decimal("0"), available_cash),
-        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
-        exceptions=tuple(exceptions),
-        position_count=len(positions),
-    )
-
-
-def _tiger_fx_to_hkd(row: Mapping[str, object]) -> Decimal:
-    currency = str(row.get("currency") or "").strip().upper()
-    if currency == "USD":
-        return USD_TO_HKD
-    if currency == "HKD":
-        return Decimal("1")
-    rate = _decimal(row.get("fx_to_hkd"))
-    if not currency or rate <= 0:
-        raise ValueError("Tiger account snapshot has invalid currency FX")
-    return rate
-
-
-def _load_tiger_snapshot(
-    path: Path, *, source_date: str, expected_date: str, managed_symbols: set[str]
-) -> AccountSnapshot:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError("Tiger account snapshot must be an object")
-    cash_rows = payload.get("cash_records")
-    position_rows = payload.get("position_records")
-    if not isinstance(cash_rows, list) or not all(isinstance(row, Mapping) for row in cash_rows):
-        raise ValueError("Tiger account cash records are invalid")
-    if not isinstance(position_rows, list) or not all(
-        isinstance(row, Mapping) for row in position_rows
-    ):
-        raise ValueError("Tiger account position records are invalid")
-
-    totals = [
-        row for row in cash_rows
-        if row.get("record_type") == "account_total"
-        and str(row.get("currency") or "").strip().upper() == "USD"
-    ]
-    if len(totals) != 1:
-        raise ValueError("Tiger account snapshot requires exactly one USD account_total")
-    net_value = _decimal(totals[0].get("account_total")) * USD_TO_HKD
-    available_cash = sum(
-        (
-            min(
-                _decimal(row.get("cash_balance")),
-                _decimal(row.get("available_balance")),
-            ) * _tiger_fx_to_hkd(row)
-            for row in cash_rows
-            if row.get("record_type") != "account_total"
-        ),
-        Decimal("0"),
-    )
-
-    normalized_managed = {_normalized_symbol("US", symbol) for symbol in managed_symbols}
-    exceptions: list[str] = []
-    position_count = 0
-    positions: list[AccountPosition] = []
-    for row in position_rows:
-        if str(row.get("market") or "").strip().upper() != "US":
-            continue
-        if str(row.get("sec_type") or "").strip().upper() != "STK":
-            continue
-        quantity = _decimal(row.get("position_qty"))
-        if quantity <= 0:
-            continue
-        symbol = _normalized_symbol("US", str(row.get("symbol") or ""))
-        name = str(row.get("name") or "").strip() or symbol
-        asset_class = str(row.get("asset_class") or "").strip().lower()
-        if not asset_class:
-            asset_class = detect_asset_class(symbol, name).value
-        if asset_class not in {"stock", "etf"}:
-            if symbol in normalized_managed:
-                exceptions.append(
-                    f"unsupported managed asset: {symbol} ({asset_class or 'unknown'})"
-                )
-            continue
-        position_count += 1
-        if symbol not in normalized_managed:
-            continue
-        fx = _tiger_fx_to_hkd(row)
-        avg_cost = _optional_decimal(row.get("average_cost"))
-        positions.append(AccountPosition(
-            symbol=symbol,
-            name=name,
-            asset_class=asset_class,
-            quantity=quantity,
-            avg_cost_price=avg_cost * fx if avg_cost is not None else None,
-            market_value=_decimal(row.get("market_value")) * fx,
-        ))
-    return AccountSnapshot(
-        source_date=source_date,
-        fresh=source_date == expected_date,
-        net_value=net_value,
-        available_cash=max(Decimal("0"), available_cash),
-        positions=tuple(sorted(positions, key=lambda item: item.symbol)),
-        exceptions=tuple(exceptions),
-        position_count=position_count,
-    )
-
-
-def load_tiger_trend_account(
-    *,
-    data_dir: Path,
-    expected_date: str,
-    managed_symbols: set[str],
-    snapshot_before: str | None = None,
-) -> AccountSnapshot:
-    runs = data_dir / "runs"
-    if not runs.exists():
-        raise FileNotFoundError("no Tiger account snapshot found")
-    last_error: Exception | None = None
-    for run_dir in sorted((item for item in runs.iterdir() if item.is_dir()), reverse=True):
-        try:
-            date.fromisoformat(run_dir.name)
-        except ValueError:
-            continue
-        if snapshot_before is not None and run_dir.name >= snapshot_before:
-            continue
-        path = run_dir / "tiger_account_snapshot.json"
-        if not path.exists():
-            continue
-        try:
-            return _load_tiger_snapshot(
-                path,
-                source_date=run_dir.name,
-                expected_date=expected_date,
-                managed_symbols=managed_symbols,
-            )
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            last_error = exc
-    if last_error is not None:
-        raise ValueError("no valid Tiger account snapshot found") from last_error
-    raise FileNotFoundError("no Tiger account snapshot found")
-
-
-def load_trend_account(
-    *,
-    data_dir: Path,
-    market: str,
-    expected_date: str,
-    managed_symbols: set[str],
-    snapshot_before: str | None = None,
-) -> AccountSnapshot:
-    if _market(market) == "US":
-        return load_tiger_trend_account(
-            data_dir=data_dir,
-            expected_date=expected_date,
-            managed_symbols=managed_symbols,
-            snapshot_before=snapshot_before,
-        )
-    return load_market_account(
-        data_dir=data_dir,
-        broker="phillips",
-        market="HK",
-        expected_date=expected_date,
-        managed_symbols=managed_symbols,
-    )
 
 
 def resolve_market_dates(quote: object, *, market: str, run_date: str) -> tuple[str, str]:
@@ -878,6 +567,7 @@ def _attempt_market_report(
     run_date: str,
     revision: bool,
     notifier: Notifier,
+    account_snapshot: Mapping[str, object],
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
     account_factory: Callable[..., object] | None = None,
@@ -942,7 +632,7 @@ def _attempt_market_report(
             account_factory=account_factory or FutuSimulateOrderExecutionClient,
         )
         real_holdings = load_real_holding_input(
-            config.data_dir,
+            account_snapshot,
             market,
             state_path=paths.real_state,
         )
@@ -1357,6 +1047,7 @@ def _attempt_market_report(
             kelly_data_reason=kelly_data_reason or industry_data_reason,
             real_holdings=real_holdings,
             allocation_reference=allocation_reference,
+            account_input=_account_input(account_snapshot),
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         report = freeze_report_rotation_pairs(report, config.data_dir)
@@ -1511,6 +1202,7 @@ def run_market_trend_report(
         raise ValueError(f"Trend Animals {market} tmId list is required")
     with RunLock(paths.report_lock):
         report_dependencies = dict(attempt_dependencies)
+        report_dependencies["account_snapshot"] = fetch_account_snapshot()
         if allocation_reference is not None:
             report_dependencies["allocation_reference"] = allocation_reference
         return _run_market_trend_retry(

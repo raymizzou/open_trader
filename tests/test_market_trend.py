@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv
+import copy
 import json
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -13,8 +13,6 @@ import open_trader.a_share_trend as trend_module
 from open_trader import market_trend, trend_review
 from open_trader.a_share_trend import (
     AShareTrendRunResult,
-    CandidateInput,
-    build_report,
     write_protection_state,
 )
 from open_trader.daily_premarket import DailyPremarketConfig
@@ -24,7 +22,6 @@ from open_trader.market_trend import (
     MARKET_SETTINGS,
     MarketHoliday,
     _candidate_pool_components,
-    load_market_account,
     market_paths,
     resolve_market_dates,
     run_market_trend_report,
@@ -55,6 +52,56 @@ from open_trader.trend_api_stats import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+ACCOUNT_SNAPSHOT = {
+    "snapshot_generation": "sha256:" + "c" * 64,
+    "account_generation": "sha256:" + "d" * 64,
+    "status": "healthy",
+    "sources": {
+        "account": {
+            "status": "healthy",
+            "as_of": "2026-07-15T12:00:00+08:00",
+            "reason": None,
+            "brokers": {
+                broker: {
+                    "source_kind": "live" if broker == "tiger" else "statement",
+                    "data_as_of": "2026-07-15T12:00:00+08:00",
+                    "last_success_at": "2026-07-15T12:00:00+08:00",
+                    "status": "healthy",
+                    "reason": None,
+                }
+                for broker in ("eastmoney", "futu", "phillips", "tiger")
+            },
+        },
+        "quotes": {
+            "status": "healthy",
+            "as_of": "2026-07-15T12:00:00+08:00",
+            "reason": None,
+        },
+    },
+    "positions": [],
+    "cash_balances": [
+        {
+            "broker": broker,
+            "account_alias": f"{broker}_main",
+            "currency": currency,
+            "cash_balance": "0",
+            "available_balance": "0",
+        }
+        for broker, currency in (
+            ("eastmoney", "CNY"), ("phillips", "HKD"), ("tiger", "USD")
+        )
+    ],
+}
+
+
+@pytest.fixture(autouse=True)
+def account_http_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: copy.deepcopy(ACCOUNT_SNAPSHOT),
+        raising=False,
+    )
 
 
 def unlock_live_drawdown(
@@ -314,287 +361,6 @@ def config(tmp_path: Path) -> DailyPremarketConfig:
         trend_review_us_simulate_acc_id=102,
         trend_review_hk_simulate_acc_id=103,
     )
-
-
-def write_details(
-    root: Path,
-    run: str,
-    *,
-    positions: list[dict[str, str]],
-    cash: list[dict[str, str]],
-) -> None:
-    run_dir = root / "runs" / run
-    run_dir.mkdir(parents=True)
-    for name, rows in (("extracted_positions.csv", positions), ("extracted_cash.csv", cash)):
-        path = run_dir / name
-        fieldnames = list(rows[0])
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-
-def write_tiger_snapshot(
-    data_dir: Path,
-    run_date: str,
-    *,
-    cash_records: list[dict[str, object]],
-    position_records: list[dict[str, object]],
-) -> None:
-    path = data_dir / "runs" / run_date / "tiger_account_snapshot.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({
-            "accounts": [],
-            "cash_records": cash_records,
-            "position_records": position_records,
-        }),
-        encoding="utf-8",
-    )
-
-
-def test_load_tiger_account_separates_managed_positions_from_account_count(
-    tmp_path: Path,
-) -> None:
-    write_tiger_snapshot(
-        tmp_path / "data",
-        "2026-07-15",
-        cash_records=[
-            {
-                "record_type": "account_total", "currency": "USD",
-                "account_total": "100000",
-            },
-            {
-                "currency": "USD", "cash_balance": "12000",
-                "available_balance": "10000",
-            },
-            {
-                "currency": "HKD", "cash_balance": "20000",
-                "available_balance": "25000",
-            },
-        ],
-        position_records=[
-            {
-                "market": "US", "sec_type": "STK", "symbol": "AAPL",
-                "name": "Apple", "currency": "USD", "position_qty": "2",
-                "average_cost": "200", "market_value": "420",
-            },
-            {
-                "market": "US", "sec_type": "STK", "symbol": "QQQ",
-                "name": "Invesco QQQ ETF", "currency": "USD", "position_qty": "3",
-                "average_cost": "500", "market_value": "1600",
-            },
-            {
-                "market": "HK", "sec_type": "STK", "symbol": "00700",
-                "name": "Tencent", "currency": "HKD", "position_qty": "100",
-                "average_cost": "400", "market_value": "50000",
-            },
-            {
-                "market": "US", "sec_type": "OPT", "symbol": "AAPL 260717C00200000",
-                "name": "Apple Call", "currency": "USD", "position_qty": "1",
-                "average_cost": "10", "market_value": "20",
-            },
-            {
-                "market": "US", "sec_type": "STK", "symbol": "ZERO",
-                "name": "Zero", "currency": "USD", "position_qty": "0",
-                "average_cost": "1", "market_value": "0",
-            },
-            {
-                "market": "US", "sec_type": "STK", "symbol": "CALL",
-                "name": "Synthetic Call Option", "currency": "USD",
-                "position_qty": "1", "average_cost": "1", "market_value": "1",
-            },
-            {
-                "market": "US", "sec_type": "STK", "symbol": "BOND",
-                "name": "Treasury Bond", "asset_class": "bond", "currency": "USD",
-                "position_qty": "1", "average_cost": "1", "market_value": "1",
-            },
-            {
-                "market": "US", "sec_type": "STK", "symbol": "MMF",
-                "name": "USD Money Market Fund", "currency": "USD",
-                "position_qty": "1", "average_cost": "1", "market_value": "1",
-            },
-        ],
-    )
-
-    account = market_trend.load_trend_account(
-        data_dir=tmp_path / "data",
-        market="US",
-        expected_date="2026-07-15",
-        managed_symbols={"AAPL"},
-    )
-
-    assert account.source_date == "2026-07-15"
-    assert account.fresh is True
-    assert account.net_value == Decimal("785000")
-    assert account.available_cash == Decimal("98500")
-    assert account.position_count == 2
-    assert [(item.symbol, item.asset_class) for item in account.positions] == [
-        ("AAPL", "stock"),
-    ]
-    assert account.exceptions == ()
-    assert account.positions[0].market_value == Decimal("3297.00")
-    assert market_trend.load_trend_account(
-        data_dir=tmp_path / "data",
-        market="US",
-        expected_date="2026-07-16",
-        managed_symbols={"AAPL"},
-    ).fresh is False
-
-
-def test_tiger_unmanaged_holdings_fill_position_cap_without_entering_decisions(
-    tmp_path: Path,
-) -> None:
-    symbols = [
-        "AAPL", "AMZN", "AVGO", "COST", "GOOGL",
-        "META", "MSFT", "NFLX", "NVDA", "TSLA",
-    ]
-    write_tiger_snapshot(
-        tmp_path / "data",
-        "2026-07-15",
-        cash_records=[
-            {
-                "record_type": "account_total", "currency": "USD",
-                "account_total": "100000",
-            },
-            {
-                "currency": "USD", "cash_balance": "10000",
-                "available_balance": "10000",
-            },
-        ],
-        position_records=[
-            {
-                "market": "US", "sec_type": "STK", "symbol": symbol,
-                "name": symbol, "currency": "USD", "position_qty": "1",
-                "average_cost": "100", "market_value": "100",
-            }
-            for symbol in symbols
-        ],
-    )
-    account = market_trend.load_trend_account(
-        data_dir=tmp_path / "data",
-        market="US",
-        expected_date="2026-07-15",
-        managed_symbols={"AAPL"},
-    )
-    candidate = CandidateInput(
-        tm_id=1,
-        symbol="QQQ",
-        exchange="US",
-        name="Invesco QQQ ETF",
-        asset="美股",
-        industry="ETF",
-        as_of_date="2026-07-14",
-        tradable=True,
-        amount=Decimal("2"),
-        right_side=True,
-        days=3,
-        strength=Decimal("96"),
-        danger=False,
-        close=Decimal("100"),
-        atr=Decimal("5"),
-    )
-    end = datetime(2026, 7, 14)
-    bars = [
-        DailyKlineBar(
-            date=(end - timedelta(days=14 - index)).date().isoformat(),
-            open=100,
-            high=101,
-            low=99,
-            close=100,
-            volume=100,
-        )
-        for index in range(15)
-    ]
-
-    report = build_report(
-        as_of_date="2026-07-14",
-        execution_date="2026-07-15",
-        account=account,
-        candidates=[candidate],
-        holding_snapshots={symbol: None for symbol in symbols},
-        bars_by_symbol={symbol: bars for symbol in symbols},
-        market="US",
-        price_fx_to_account_currency=Decimal("7.85"),
-    )
-
-    assert account.position_count == 10
-    assert [item.symbol for item in account.positions] == ["AAPL"]
-    assert [item.symbol for item in report.candidates] == ["QQQ"]
-    assert report.buy_actions == ()
-    assert [item.symbol for item in report.holdings] == ["AAPL"]
-    assert {item.action for item in report.holdings} == {"MANUAL_REVIEW"}
-    assert list(report.protection_state["positions"]) == ["AAPL"]
-
-
-def test_load_tiger_account_uses_latest_valid_snapshot_and_clamps_cash(
-    tmp_path: Path,
-) -> None:
-    data_dir = tmp_path / "data"
-    write_tiger_snapshot(
-        data_dir,
-        "2026-07-14",
-        cash_records=[
-            {"record_type": "account_total", "currency": "USD", "account_total": "100"},
-            {"currency": "USD", "cash_balance": "-1000", "available_balance": "-900"},
-            {"currency": "SGD", "cash_balance": "100", "available_balance": "80", "fx_to_hkd": "5.8"},
-        ],
-        position_records=[],
-    )
-    write_tiger_snapshot(
-        data_dir,
-        "2026-07-15",
-        cash_records=[],
-        position_records=[],
-    )
-
-    account = market_trend.load_trend_account(
-        data_dir=data_dir,
-        market="US",
-        expected_date="2026-07-15",
-        managed_symbols=set(),
-    )
-
-    assert account.source_date == "2026-07-14"
-    assert account.fresh is False
-    assert account.available_cash == Decimal("0")
-
-
-def test_load_phillips_statement_can_be_stale_and_caps_cash_to_known_balance(
-    tmp_path: Path,
-) -> None:
-    write_details(
-        tmp_path / "data",
-        "2026-06",
-        positions=[{
-            "statement_id": "2026-06-phillips", "broker": "phillips",
-            "market": "HK", "asset_class": "stock", "symbol": "700",
-            "name": "腾讯", "currency": "HKD", "quantity": "100",
-            "cost_price": "400", "market_value": "50000",
-        }, {
-            "statement_id": "2026-06-phillips", "broker": "phillips",
-            "market": "HK", "asset_class": "stock", "symbol": "UT.SI",
-            "name": "Unmanaged foreign holding", "currency": "HKD", "quantity": "10",
-            "cost_price": "1", "market_value": "100",
-        }],
-        cash=[{
-            "statement_id": "2026-06-phillips", "broker": "phillips",
-            "currency": "HKD", "cash_balance": "20000", "available_balance": "15000",
-        }],
-    )
-
-    account = load_market_account(
-        data_dir=tmp_path / "data",
-        broker="phillips",
-        market="HK",
-        expected_date="2026-07-15",
-        managed_symbols={"00700"},
-    )
-
-    assert account.source_date == "2026-06"
-    assert account.fresh is False
-    assert account.available_cash == Decimal("15000")
-    assert account.positions[0].symbol == "00700"
 
 
 def test_market_paths_are_completely_separate() -> None:
@@ -874,6 +640,44 @@ def test_market_report_retries_every_ten_minutes_and_stops_after_success(
     assert sleeps == [600.0]
 
 
+def test_market_report_pins_one_account_snapshot_through_internal_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    fetches = 0
+    seen: list[object] = []
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        return snapshot
+
+    def attempt(**kwargs: object) -> AShareTrendRunResult:
+        seen.append(kwargs.get("account_snapshot"))
+        return AShareTrendRunResult(
+            "waiting" if len(seen) == 1 else "generated",
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(market_trend, "fetch_account_snapshot", fetch, raising=False)
+
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=attempt,
+        now_fn=lambda: datetime(2026, 7, 15, 9, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.status == "generated"
+    assert fetches == 1
+    assert seen == [snapshot, snapshot]
+    assert all(item is snapshot for item in seen)
+
+
 def test_market_report_keeps_retrying_after_old_ten_deadline(
     tmp_path: Path,
 ) -> None:
@@ -949,19 +753,35 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             },
         },
     )
-    write_details(
-        cfg.data_dir,
-        "2026-06",
-        positions=[{
-            "statement_id": "2026-06-phillips", "broker": "phillips",
-            "market": "HK", "asset_class": "stock", "symbol": "700",
-            "name": "腾讯", "currency": "HKD", "quantity": "100",
-            "cost_price": "400", "market_value": "50000",
-        }],
-        cash=[{
-            "statement_id": "2026-06-phillips", "broker": "phillips",
-            "currency": "HKD", "cash_balance": "50000", "available_balance": "50000",
-        }],
+    account_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    account_snapshot["sources"]["account"]["brokers"]["phillips"].update({
+        "data_as_of": "2026-06-30T00:00:00+08:00",
+        "status": "stale",
+        "reason": "statement_stale",
+    })
+    account_snapshot["positions"] = [{
+        "instrument_id": "phillips:HK:00700",
+        "broker": "phillips",
+        "market": "HK",
+        "asset_class": "stock",
+        "symbol": "00700",
+        "name": "腾讯",
+        "currency": "HKD",
+        "quantity": "100",
+        "cost_price": "400",
+        "market_value": "50000",
+    }]
+    account_snapshot["cash_balances"] = [{
+        "broker": "phillips",
+        "account_alias": "phillips_main",
+        "currency": "HKD",
+        "cash_balance": "50000",
+        "available_balance": "50000",
+    }]
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: account_snapshot,
     )
 
     def snapshot(tm_id: int, symbol: str, name: str) -> dict[str, object]:
@@ -1109,8 +929,6 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
             self.closed = True
 
     notifier = RecordingFeishu()
-    from open_trader import market_trend
-
     holding_context_snapshots: list[object] = []
     original_collect = market_trend.collect_industry_contexts
 
@@ -1419,6 +1237,11 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     assert result.status == "generated"
     assert result.json_path is not None
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["account_input"] == {
+        "snapshot_generation": "sha256:" + "c" * 64,
+        "account_generation": "sha256:" + "d" * 64,
+        "status": "healthy",
+    }
     judgments = payload["strategy_judgments"]
     assert payload["strategy_snapshot"]["strategy_version"] == "v8"
     assert payload["excluded"][symbol] == [expected_reason]
@@ -1559,8 +1382,8 @@ def test_market_report_keeps_futu_holding_price_when_trend_mapping_is_unavailabl
     assert "US.VIXY" in quote_requests
 
 
-def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
-    tmp_path: Path,
+def test_account_snapshot_does_not_change_us_simulation_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = config(tmp_path)
     fills = []
@@ -1632,31 +1455,30 @@ def test_actual_tiger_snapshots_do_not_change_us_simulation_report(
             },
         },
     )
-    write_tiger_snapshot(
-        cfg.data_dir,
-        "2026-07-14",
-        cash_records=[
-            {"record_type": "account_total", "currency": "USD", "account_total": "100000"},
-            {"currency": "USD", "cash_balance": "10000", "available_balance": "10000"},
-        ],
-        position_records=[{
-            "market": "US", "sec_type": "STK", "symbol": "VIXY",
-            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
-            "average_cost": "40", "market_value": "500",
-        }],
-    )
-    write_tiger_snapshot(
-        cfg.data_dir,
-        "2026-07-15",
-        cash_records=[
-            {"record_type": "account_total", "currency": "USD", "account_total": "200000"},
-            {"currency": "USD", "cash_balance": "20000", "available_balance": "20000"},
-        ],
-        position_records=[{
-            "market": "US", "sec_type": "STK", "symbol": "VIXY",
-            "name": "VIX Short ETF", "currency": "USD", "position_qty": "10",
-            "average_cost": "40", "market_value": "500",
-        }],
+    account_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    account_snapshot["positions"] = [{
+        "instrument_id": "tiger:US:VIXY",
+        "broker": "tiger",
+        "market": "US",
+        "asset_class": "etf",
+        "symbol": "VIXY",
+        "name": "VIX Short ETF",
+        "currency": "USD",
+        "quantity": "10",
+        "cost_price": "40",
+        "market_value": "200000",
+    }]
+    account_snapshot["cash_balances"] = [{
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "currency": "USD",
+        "cash_balance": "20000",
+        "available_balance": "20000",
+    }]
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: account_snapshot,
     )
 
     class Api:
@@ -1873,19 +1695,6 @@ def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
     tmp_path: Path,
 ) -> None:
     cfg = config(tmp_path)
-    write_tiger_snapshot(
-        cfg.data_dir,
-        "2026-07-15",
-        cash_records=[
-            {"record_type": "account_total", "currency": "USD", "account_total": "1210"},
-            {"currency": "USD", "cash_balance": "1000", "available_balance": "1000"},
-        ],
-        position_records=[{
-            "market": "US", "sec_type": "STK", "symbol": "AAPL",
-            "name": "Apple", "currency": "USD", "position_qty": "1",
-            "average_cost": "200", "market_value": "210",
-        }],
-    )
     snapshot_calls: list[object] = []
 
     class Api:
