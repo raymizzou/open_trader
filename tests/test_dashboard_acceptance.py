@@ -1550,7 +1550,7 @@ def test_acceptance_source_panel_uses_current_page_dashboard_payload() -> None:
 
     class DashboardPage:
         def evaluate(self, expression: str) -> object:
-            assert expression == "() => state.dashboard"
+            assert "state.accountSnapshot" in expression
             return current
 
     assert dashboard_acceptance._page_dashboard_payload(DashboardPage()) is current
@@ -3835,7 +3835,7 @@ class TabbedAccountPage:
     def evaluate(
         self, expression: str, argument: object | None = None,
     ) -> bool | list[int] | list[dict[str, object]] | dict[str, object] | Mapping[str, object] | int | None:
-        if expression == "() => state.dashboard?.broker_positions ?? []":
+        if expression == "() => state.accountSnapshot?.positions ?? []":
             return self.broker_positions
         if expression == "broker => state.dashboard?.trend_controllers?.[broker] ?? null":
             return self.controllers.get(str(argument))
@@ -5078,9 +5078,9 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
         def evaluate(
             self, expression: str, argument: object | None = None
         ) -> object:
-            if expression == "() => state.dashboard?.broker_positions ?? []":
+            if expression == "() => state.accountSnapshot?.positions ?? []":
                 return super().evaluate(expression, argument)
-            if expression == "() => state.dashboard":
+            if "const dashboard = state.dashboard" in expression:
                 return self.payload
             if "clearInterval(state.quoteIntervalId)" in expression:
                 assert "clearInterval(state.accountIntervalId)" in expression
@@ -5368,7 +5368,7 @@ def test_check_controller_owned_rows_uses_current_page_projection() -> None:
     class Page:
         def evaluate(self, expression: str) -> list[dict[str, str]]:
             assert expression == (
-                "() => state.dashboard?.broker_positions ?? []"
+                "() => state.accountSnapshot?.positions ?? []"
             )
             return [page_position, other_position]
 

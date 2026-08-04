@@ -3135,7 +3135,7 @@ def _check_trend_holding_tabs(
 
 def _check_controller_owned_rows(page: Any, section: Any, broker: str) -> None:
     positions = page.evaluate(
-        "() => state.dashboard?.broker_positions ?? []"
+        "() => state.accountSnapshot?.positions ?? []"
     )
     assert isinstance(positions, list), "页面持仓状态无效"
     expected = [
@@ -4161,7 +4161,21 @@ def _check_source_status_panel(page: Any, payload: Mapping[str, object]) -> None
 
 
 def _page_dashboard_payload(page: Any) -> Mapping[str, object]:
-    payload = page.evaluate("() => state.dashboard")
+    payload = page.evaluate(
+        """() => {
+          const dashboard = state.dashboard;
+          const live = state.accountSnapshot?.sources?.account?.brokers;
+          if (!dashboard || !live) return dashboard;
+          const brokers = {...(dashboard.account_sync?.brokers || {})};
+          for (const broker of ["futu", "tiger"]) {
+            if (live[broker]) brokers[broker] = {...brokers[broker], ...live[broker]};
+          }
+          return {
+            ...dashboard,
+            account_sync: {...(dashboard.account_sync || {}), brokers},
+          };
+        }"""
+    )
     assert isinstance(payload, Mapping), "Dashboard 当前页面数据无效"
     return payload
 
@@ -4444,8 +4458,7 @@ def _browser_check(
                     page.on(
                         "request",
                         lambda request: browser_requests.append((
-                            request, request.url,
-                            request.header_value("if-none-match"),
+                            request, request.url, None,
                         )),
                     )
                     page.on("response", lambda response: browser_errors.append(
@@ -4471,7 +4484,14 @@ def _browser_check(
                     errors.extend(
                         f"{name}：{message}"
                         for message in _browser_account_network_errors(
-                            browser_requests,
+                            [
+                                (
+                                    request,
+                                    request_url,
+                                    request.header_value("if-none-match"),
+                                )
+                                for request, request_url, _ in browser_requests
+                            ],
                             [_browser_response_record(response) for response in browser_responses],
                             url,
                             expected_sha=expected_sha,
