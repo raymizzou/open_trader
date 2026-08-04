@@ -35,7 +35,8 @@ class Market:
 
 
 class PredictSource:
-    async def list_open_markets(self) -> tuple[Market, ...]:
+    async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+        assert limit == 1
         return (Market(),)
 
     async def get_order_book(self, market_id: str) -> object:
@@ -221,7 +222,8 @@ def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     client = SnapshotOnlyPredictClient()
 
     class EmptyPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
     report = readiness_report(
@@ -242,7 +244,8 @@ def test_invalid_predict_market_scan_fails_instead_of_passing_as_empty(
     tmp_path: Path,
 ) -> None:
     class InvalidPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
         def snapshot(self) -> dict[str, object]:
@@ -288,7 +291,8 @@ def test_empty_scan_uses_production_predict_client_for_safe_order_reads(
     monkeypatch.setattr(acceptance, "ReadOnlyTransport", lambda: transport)
 
     class EmptyPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
     def production_client(_config: object, *, urlopen_fn: object) -> PredictTradingClient:
@@ -384,7 +388,8 @@ def test_predict_account_readiness_fails_closed_on_missing_or_malformed_gas_fact
             return facts
 
     class EmptyPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
     report = readiness_report(
@@ -421,7 +426,8 @@ def test_empty_predict_account_snapshot_fails_closed_on_missing_or_mismatched_id
             return facts
 
     class EmptyPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
     report = readiness_report(
@@ -447,7 +453,8 @@ def test_predict_account_readiness_fails_closed_on_insufficient_signer_bnb(
             return facts
 
     class EmptyPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
     report = readiness_report(
@@ -485,7 +492,8 @@ def test_predict_account_readiness_fails_on_any_residual_allowance_signal(
             return facts
 
     class EmptyPredictSource(PredictSource):
-        async def list_open_markets(self) -> tuple[Market, ...]:
+        async def list_open_markets(self, *, limit: int | None = None) -> tuple[Market, ...]:
+            assert limit == 1
             return ()
 
     report = readiness_report(

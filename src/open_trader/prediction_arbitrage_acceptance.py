@@ -637,7 +637,7 @@ def _failed_report(
 
 
 async def _predict_market_book(source: object, *, timeout: float) -> object:
-    markets = await asyncio.wait_for(source.list_open_markets(), timeout=timeout)  # type: ignore[attr-defined]
+    markets = await asyncio.wait_for(source.list_open_markets(limit=1), timeout=timeout)  # type: ignore[attr-defined]
     if not markets:
         _raise_source_status(source, "rest")
         return _NO_PREDICT_MARKET

@@ -86,7 +86,9 @@ class PredictSource:
         self._failure_reason: dict[str, str | None] = {"rest": None, "ws": None}
         self._ws_generation = 0
 
-    async def list_open_markets(self) -> tuple[PredictMarket, ...]:
+    async def list_open_markets(self, *, limit: int | None = None) -> tuple[PredictMarket, ...]:
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("limit must be a positive integer")
         cursor: str | None = None
         seen_cursors: set[str] = set()
         markets: list[PredictMarket] = []
@@ -102,13 +104,17 @@ class PredictSource:
                 self._mark_stale("rest")
                 return ()
             for row in rows:
+                if _explicitly_out_of_scope(row):
+                    continue
                 category_slug = _text(row.get("categorySlug")) if isinstance(row, dict) else ""
                 category = await self._category(category_slug) if category_slug else None
                 market = _normalise_market(row, category)
                 if market is not None:
                     self._markets[market.market_id] = market
                     markets.append(market)
-                elif not _explicitly_out_of_scope(row, category):
+                    if limit is not None and len(markets) >= limit:
+                        return tuple(markets)
+                else:
                     self._mark_stale("rest")
                     return ()
             next_cursor = payload.get("cursor")
@@ -499,28 +505,29 @@ def _normalise_market(
     )
 
 
-def _explicitly_out_of_scope(
-    payload: object, category: dict[str, object] | None
-) -> bool:
+def _explicitly_out_of_scope(payload: object) -> bool:
     if not isinstance(payload, dict):
         return False
-    candidate = dict(payload)
-    changed = False
-    for name in ("isNegRisk", "isYieldBearing"):
-        if candidate.get(name) is True:
-            candidate[name] = False
-            changed = True
-    if isinstance(candidate.get("tradingStatus"), str) and candidate["tradingStatus"] != "OPEN":
-        candidate["tradingStatus"] = "OPEN"
-        changed = True
-    if candidate.get("isVisible") is False:
-        candidate["isVisible"] = True
-        changed = True
-    variant = candidate.get("marketVariant")
-    if isinstance(variant, str) and variant and variant not in {"DEFAULT", "STANDARD"}:
-        candidate["marketVariant"] = "DEFAULT"
-        changed = True
-    return changed and _normalise_market(candidate, category) is not None
+    trading_status = payload.get("tradingStatus")
+    variant = payload.get("marketVariant")
+    outcomes = payload.get("outcomes")
+    outcome_names = (
+        {
+            name
+            for item in outcomes
+            if isinstance(item, dict) and (name := _text(item.get("name")).upper())
+        }
+        if isinstance(outcomes, list)
+        else set()
+    )
+    return (
+        payload.get("isNegRisk") is True
+        or payload.get("isYieldBearing") is True
+        or isinstance(trading_status, str) and trading_status != "OPEN"
+        or payload.get("isVisible") is False
+        or isinstance(variant, str) and bool(variant) and variant not in {"DEFAULT", "STANDARD"}
+        or bool(outcome_names - {"YES", "NO"})
+    )
 
 
 def _levels(value: object, tick_size: Decimal, *, ascending: bool) -> tuple[BookLevel, ...]:

@@ -249,6 +249,17 @@ def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_m
     ]
 
 
+def test_list_open_markets_limit_stops_after_first_eligible_market() -> None:
+    source, requests = source_with_responses(
+        [{"success": True, "cursor": "next", "data": [market()]}]
+    )
+
+    markets = asyncio.run(source.list_open_markets(limit=1))
+
+    assert [item.market_id for item in markets] == ["123"]
+    assert not any("after=" in request.full_url for request in requests)
+
+
 @pytest.mark.parametrize(
     "changes",
     (
@@ -262,8 +273,31 @@ def test_list_open_markets_uses_mainnet_api_key_and_keeps_only_standard_binary_m
 def test_explicitly_out_of_scope_markets_are_a_healthy_empty_scan(
     changes: dict[str, object],
 ) -> None:
-    source, _ = source_with_responses(
+    source, requests = source_with_responses(
         [{"success": True, "cursor": None, "data": [market(**changes)]}]
+    )
+
+    assert asyncio.run(source.list_open_markets()) == ()
+    assert source.snapshot()["rest"] == "ready"
+    assert len(requests) == 1
+
+
+def test_non_yes_no_market_is_a_healthy_empty_scan() -> None:
+    source, _ = source_with_responses(
+        [
+            {
+                "success": True,
+                "cursor": None,
+                "data": [
+                    market(
+                        outcomes=[
+                            {"name": "Doosan Bears", "onChainId": "predict-home"},
+                            {"name": "KT Wiz", "onChainId": "predict-away"},
+                        ]
+                    )
+                ],
+            }
+        ]
     )
 
     assert asyncio.run(source.list_open_markets()) == ()
@@ -275,6 +309,15 @@ def test_explicitly_out_of_scope_markets_are_a_healthy_empty_scan(
     (
         ({"conditionId": None}, {}),
         ({"feeRateBps": "bad"}, {}),
+        (
+            {
+                "outcomes": [
+                    {"name": "YES", "onChainId": "predict-yes"},
+                    {"name": None, "onChainId": "predict-no"},
+                ]
+            },
+            {},
+        ),
         ({}, {"endsAt": "bad"}),
     ),
 )
