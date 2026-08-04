@@ -25,8 +25,8 @@ from .account_sync_state import ACCOUNT_STALE_SECONDS, REQUIRED_BROKERS
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 _PARITY_ATTEMPTS = 3
 AccountApiMode = Literal["shadow", "production"]
-_ACCOUNT_ROUTE_HEADER = "X-Open-Trader-Account-Route"
-_PRODUCTION_ROUTE_MARKER = "production"
+ACCOUNT_ROUTE_HEADER = "X-Open-Trader-Account-Route"
+PRODUCTION_ROUTE_MARKER = "production"
 _FUTU_NAIVE_PRICE_TIME_RE = re.compile(
     r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\Z"
 )
@@ -121,7 +121,7 @@ def create_account_api(
                 )
                 return
             if path == "/api/v1/account/snapshot":
-                if mode == "shadow" and self.headers.get(_ACCOUNT_ROUTE_HEADER) == _PRODUCTION_ROUTE_MARKER:
+                if mode == "shadow" and self.headers.get(ACCOUNT_ROUTE_HEADER) == PRODUCTION_ROUTE_MARKER:
                     self._send_json(
                         {
                             "schema_version": 1,
